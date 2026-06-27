@@ -51,7 +51,10 @@ function fail(msg) {
 
 function resolveBinaryPath() {
   const override = process.env.HR_BINARY_PATH;
-  if (override && fs.existsSync(override)) return override;
+  if (override) {
+    if (fs.existsSync(override)) return override;
+    console.warn(`[harness-router] HR_BINARY_PATH is set to "${override}" but that path does not exist — ignoring it.`);
+  }
 
   const key = platformKey();
   const pkg = PLATFORM_PACKAGES[key];

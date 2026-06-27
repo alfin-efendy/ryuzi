@@ -10,7 +10,8 @@ test("launcher execs the binary pointed to by HR_BINARY_PATH and forwards args +
   const src = `console.log("ARGS=" + process.argv.slice(2).join(",")); process.exit(7);`;
   const tmpSrc = `${tmp}-src.ts`;
   await Bun.write(tmpSrc, src);
-  Bun.spawnSync(["bun", "build", tmpSrc, "--compile", "--outfile", tmp]);
+  const build = Bun.spawnSync(["bun", "build", tmpSrc, "--compile", "--outfile", tmp]);
+  if (build.exitCode !== 0) throw new Error("fixture build failed: " + (build.stderr?.toString() ?? ""));
 
   let out = "";
   let code = 0;
