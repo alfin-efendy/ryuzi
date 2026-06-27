@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
 import type { AppController } from "./controller";
@@ -11,10 +11,10 @@ type Phase = "gateways" | "runtimes" | "fields";
 /** Re-order missing fields: provider fields (gateway then runtime) before global fields */
 function orderFields(controller: AppController, missing: ConfigField[]): ConfigField[] {
   const gwKeys = new Set(
-    controller.gatewayDescriptors().flatMap((g) => g.fields.map((f) => f.key))
+    controller.enabledGateways().flatMap((id) => controller.gatewayFields(id).map((f) => f.key)),
   );
   const rtKeys = new Set(
-    controller.runtimeDescriptors().flatMap((r) => r.fields.map((f) => f.key))
+    controller.enabledRuntimes().flatMap((id) => controller.runtimeFields(id).map((f) => f.key)),
   );
   const providerFields = missing.filter((f) => gwKeys.has(f.key) || rtKeys.has(f.key));
   const globalFields = missing.filter((f) => !gwKeys.has(f.key) && !rtKeys.has(f.key));
@@ -47,7 +47,8 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
       controller.setEnabledGateways([...gwSel]); setPhase("runtimes");
     } else if (phase === "runtimes" && key.return && rtSel.size > 0) {
       controller.setEnabledRuntimes([...rtSel]);
-      controller.setDefaultRuntime([...rtSel][0]!);
+      const orderedRt = controller.runtimeDescriptors().filter((r) => rtSel.has(r.id)).map((r) => r.id);
+      controller.setDefaultRuntime(orderedRt[0]!);
       const missing = orderFields(controller, controller.requiredMissingFields());
       if (missing.length === 0) onDone();
       else { setFields(missing); setPhase("fields"); }
