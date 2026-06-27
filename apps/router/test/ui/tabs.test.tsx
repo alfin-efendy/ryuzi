@@ -29,14 +29,18 @@ test("SessionsTab shows empty state", () => {
   expect(render(<SessionsTab controller={ctl()} />).lastFrame()).toContain("no sessions");
 });
 
-test("ConfigTab edits a setting via Enter + typing + Enter", async () => {
+test("ConfigTab shows grouped labels/help and edits a field", async () => {
   const c = ctl();
+  c.setEnabledGateways(["discord"]); c.setEnabledRuntimes(["claude-code"]);
   const { stdin, lastFrame } = render(<ConfigTab controller={c} setEditing={() => {}} />);
   await flush();
-  expect(lastFrame()).toContain("discord.token");
-  // first key is the first row (workdir_root); press Enter to edit it, type, submit
-  stdin.write("\r"); await flush();         // enter edit on row 0
-  stdin.write("/repos"); await flush();
-  stdin.write("\r"); await flush();          // submit
-  expect(c.get("workdir_root")).toBe("/repos");
+  const f = lastFrame()!;
+  expect(f).toContain("General");
+  expect(f).toContain("Discord");        // gateway group header (label)
+  expect(f).toContain("Workdir root");   // a field label, not the raw key
+  // first selectable row is the first general field (workdir_root); edit it
+  stdin.write("\r"); await flush();      // enter edit
+  stdin.write("/tmp/x"); await flush();
+  stdin.write("\r"); await flush();      // submit
+  expect(c.get("workdir_root")).toBe("/tmp/x");
 });
