@@ -48,6 +48,31 @@ test("startDaemon records lastError when required settings missing", async () =>
   expect(c.daemon().lastError).toMatch(/missing/i);
 });
 
+test("startDaemon exposes a transient connecting state", async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => { release = r; });
+  class SlowPort extends FakePort {
+    override async connect(h: Parameters<DiscordPort["connect"]>[0]) { await gate; return super.connect(h); }
+  }
+  const root = mkdtempSync(join(tmpdir(), "hr-daemon-slow-"));
+  const c = new AppController({
+    dbPath: join(root, "db.sqlite"),
+    detect: { claude: detectClaude, git: detectGit },
+    portFactory: () => new SlowPort(),
+  });
+  for (const [k, v] of [["discord_token","t"],["discord_app_id","a"],["discord_guild_id","g"],["workdir_root",root]] as const) c.set(k, v);
+
+  const p = c.startDaemon();              // do NOT await yet
+  await new Promise((r) => setTimeout(r, 10));
+  expect(c.daemon().starting).toBe(true);
+  expect(c.daemon().running).toBe(false);
+  release();                              // let connect resolve
+  await p;
+  expect(c.daemon().starting).toBe(false);
+  expect(c.daemon().running).toBe(true);
+  c.stopDaemon();
+});
+
 test("sessions() merges persisted rows with live overlay", async () => {
   const c = configured();
   await c.startDaemon();

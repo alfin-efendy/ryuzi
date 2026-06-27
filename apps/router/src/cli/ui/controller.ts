@@ -24,7 +24,7 @@ export interface ControllerDeps {
   harnessFactory?: () => Harness;
 }
 
-export interface DaemonState { running: boolean; startedAt?: number; lastError?: string }
+export interface DaemonState { running: boolean; startedAt?: number; lastError?: string; starting?: boolean }
 export interface SessionRow { sessionPk: string; projectId: string; status: string; title?: string; startedBy?: string; lastText?: string }
 
 class SinkTelemetry implements Telemetry {
@@ -104,14 +104,16 @@ export class AppController extends EventEmitter {
     });
     this.daemonCp = daemon.cp;
     this.cpUnsub = daemon.cp.subscribe((e: CoreEvent) => { reduceSessions(this.live, e); this.emitChange(); });
+    this.daemonState = { ...this.daemonState, starting: true, lastError: undefined };
+    this.emitChange();
     try {
       await daemon.start();
       this.daemonHandle = daemon;
-      this.daemonState = { running: true, startedAt: Date.now() };
+      this.daemonState = { running: true, startedAt: Date.now(), starting: false };
       this.pushLog("daemon started");
     } catch (e) {
       this.cpUnsub?.(); this.cpUnsub = undefined; this.daemonCp = undefined;
-      this.daemonState = { running: false, lastError: (e as Error).message };
+      this.daemonState = { running: false, starting: false, lastError: (e as Error).message };
       this.emitChange();
     }
   }
