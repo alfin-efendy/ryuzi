@@ -12,6 +12,7 @@ import { catalog as defaultCatalog } from "../../providers/catalog";
 import type { ProviderCatalog, GatewayDescriptor, RuntimeDescriptor, ConfigField } from "../../providers/types";
 import { missingRequiredSettings, isConfigured as isConfiguredFn, requiredMissingFields, csv } from "../../config/required";
 import { readStatus, writeStatus, clearStatus, isAlive, deriveState, type DaemonState } from "../daemon-status";
+import { isCompiledExecutable, daemonRelaunchCmd } from "../daemon-spawn";
 
 export type { DaemonState } from "../daemon-status";
 
@@ -173,7 +174,11 @@ export class AppController extends EventEmitter {
       return;
     }
     clearStatus(this.dataDir);
-    const cmd = [process.execPath, process.argv[1]!, "__daemon"];
+    const cmd = daemonRelaunchCmd({
+      execPath: process.execPath,
+      main: Bun.main,
+      compiled: isCompiledExecutable(),
+    });
     const spawn = this.deps.spawnDaemon ?? defaultSpawnDaemon;
     spawn(cmd, { logPath: join(this.dataDir, "daemon.log") });
     this.emitChange();

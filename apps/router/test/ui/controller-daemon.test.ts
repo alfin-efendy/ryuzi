@@ -37,7 +37,7 @@ test("startDaemon spawns the detached __daemon process when configured", async (
   await c.startDaemon();
   expect(spawns).toHaveLength(1);
   expect(spawns[0]![0]).toBe(process.execPath);
-  expect(spawns[0]![1]).toBe(process.argv[1]);
+  expect(spawns[0]![1]).toBe(Bun.main); // dev mode passes the script path
   expect(spawns[0]!.at(-1)).toBe("__daemon");
 });
 
