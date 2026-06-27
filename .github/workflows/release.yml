@@ -95,11 +95,24 @@ jobs:
       - name: Publish platform packages first
         run: |
           for dir in npm/platform/*/; do
-            npm publish "$dir" --access public
+            name=$(node -p "require('./${dir}package.json').name")
+            ver=$(node -p "require('./${dir}package.json').version")
+            if npm view "${name}@${ver}" version >/dev/null 2>&1; then
+              echo "skip ${name}@${ver} (already published)"
+            else
+              npm publish "$dir" --access public
+            fi
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish main package last
-        run: npm publish npm/harness-router --access public
+        run: |
+          name=$(node -p "require('./npm/harness-router/package.json').name")
+          ver=$(node -p "require('./npm/harness-router/package.json').version")
+          if npm view "${name}@${ver}" version >/dev/null 2>&1; then
+            echo "skip ${name}@${ver} (already published)"
+          else
+            npm publish ./npm/harness-router --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
