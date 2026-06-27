@@ -1,11 +1,8 @@
 {
-  "name": "@alfin-efendy/harness-router",
+  "name": "hrctl",
   "version": "0.0.0",
   "description": "harness-router CLI (hr) — gateway-agnostic control plane for agent harnesses.",
   "license": "MIT",
-  "publishConfig": {
-    "access": "public"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/alfin-efendy/herness-router.git"
