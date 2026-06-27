@@ -1,19 +1,28 @@
 import { EventEmitter } from "node:events";
+import { existsSync, readFileSync, openSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../../store/db";
 import { SettingsStore } from "../../config/store";
 import { SETTING_DEFS, GLOBAL_FIELDS, allFields } from "../../config/schema";
 import type { detectClaude, detectGit } from "../../harness/detect";
 import type { ToolInfo } from "../../harness/detect";
-import { buildDaemon } from "../start-command";
-import { reduceSessions, type LiveSession } from "./sessions-reducer";
 import { SessionsStore } from "../../store/sessions";
-import type { ControlPlane } from "../../core/control-plane";
-import type { CoreEvent, Unsubscribe } from "@harness/protocol";
-import type { Telemetry, Span, Attrs } from "../../observability/types";
 import { catalog as defaultCatalog } from "../../providers/catalog";
 import type { ProviderCatalog, GatewayDescriptor, RuntimeDescriptor, ConfigField } from "../../providers/types";
 import { missingRequiredSettings, isConfigured as isConfiguredFn, requiredMissingFields, csv } from "../../config/required";
+import { readStatus, writeStatus, clearStatus, isAlive, deriveState, type DaemonState } from "../daemon-status";
+
+export type { DaemonState } from "../daemon-status";
+
+export type SpawnDaemon = (cmd: string[], opts: { logPath: string }) => { pid: number };
+
+const defaultSpawnDaemon: SpawnDaemon = (cmd, { logPath }) => {
+  const fd = openSync(logPath, "a");
+  const proc = Bun.spawn({ cmd, detached: true, stdio: ["ignore", fd, fd] });
+  proc.unref();
+  return { pid: proc.pid };
+};
 
 const GLOBAL_KEYS = new Set(GLOBAL_FIELDS.map((f) => f.key));
 
@@ -22,29 +31,19 @@ export interface ControllerDeps {
   detect: { claude: typeof detectClaude; git: typeof detectGit };
   db?: Database;
   catalog?: ProviderCatalog;
+  dataDir?: string;
+  spawnDaemon?: SpawnDaemon;
+  killDaemon?: (pid: number, signal: NodeJS.Signals | number) => void;
 }
 
-export interface DaemonState { running: boolean; startedAt?: number; lastError?: string; starting?: boolean }
 export interface SessionRow { sessionPk: string; projectId: string; status: string; title?: string; startedBy?: string; lastText?: string }
-
-class SinkTelemetry implements Telemetry {
-  constructor(private sink: (line: string) => void) {}
-  startSpan(_n: string, _a?: Attrs): Span { return { setAttribute() {}, setError: (m) => this.sink("error: " + m), end() {} }; }
-  count(name: string, _a?: Attrs): void { this.sink(name); }
-  record(_n: string, _v: number, _a?: Attrs): void {}
-}
 
 export class AppController extends EventEmitter {
   readonly db: Database;
   readonly settings: SettingsStore;
   protected catalog: ProviderCatalog;
   private fieldIndex: Map<string, ConfigField>;
-  private daemonHandle?: { stop(): void };
-  private daemonCp?: ControlPlane;
-  private daemonState: DaemonState = { running: false };
-  private logLines: string[] = [];
-  private live = new Map<string, LiveSession>();
-  private cpUnsub?: Unsubscribe;
+  private dataDir: string;
 
   constructor(protected deps: ControllerDeps) {
     super();
@@ -52,6 +51,7 @@ export class AppController extends EventEmitter {
     this.settings = new SettingsStore(this.db);
     this.catalog = deps.catalog ?? defaultCatalog;
     this.fieldIndex = new Map(allFields(this.catalog).map((f) => [f.key, f]));
+    this.dataDir = deps.dataDir ?? dirname(deps.dbPath);
   }
 
   protected emitChange(): void { this.emit("change"); }
@@ -85,62 +85,53 @@ export class AppController extends EventEmitter {
     return { git, claude };
   }
 
-  daemon(): DaemonState { return this.daemonState; }
-  logs(): string[] { return this.logLines; }
+  daemon(): DaemonState {
+    const s = readStatus(this.dataDir);
+    const st = deriveState(s, isAlive);
+    if (s && !st.running && !st.starting && s.state !== "error") clearStatus(this.dataDir);
+    return st;
+  }
 
-  private pushLog(line: string): void {
-    this.logLines.push(line);
-    if (this.logLines.length > 200) this.logLines.shift();
-    this.emitChange();
+  logs(): string[] {
+    const p = join(this.dataDir, "daemon.log");
+    if (!existsSync(p)) return [];
+    try { return readFileSync(p, "utf8").split("\n").filter(Boolean).slice(-200); } catch { return []; }
   }
 
   sessions(): SessionRow[] {
     const store = new SessionsStore(this.db);
-    return store.list().map((s) => {
-      const live = this.live.get(s.sessionPk);
-      return {
-        sessionPk: s.sessionPk, projectId: s.projectId,
-        status: live?.status ?? s.status, title: s.title,
-        startedBy: s.startedBy, lastText: live?.lastText,
-      };
-    });
+    return store.list().map((s) => ({
+      sessionPk: s.sessionPk, projectId: s.projectId, status: s.status, title: s.title, startedBy: s.startedBy,
+    }));
   }
 
   async startDaemon(): Promise<void> {
-    if (this.daemonState.running || this.daemonState.starting) return;
+    const cur = this.daemon();
+    if (cur.running || cur.starting) return;
     const missing = this.missingRequired();
     if (missing.length || this.enabledGateways().length === 0) {
       const why = missing.length ? `missing settings: ${missing.join(", ")}` : "no gateways enabled";
-      this.daemonState = { running: false, lastError: why };
+      writeStatus(this.dataDir, { pid: -1, state: "error", startedAt: Date.now(), lastError: why });
       this.emitChange();
       return;
     }
-    const telemetry = new SinkTelemetry((line) => this.pushLog(line));
-    const daemon = buildDaemon({ dbPath: this.deps.dbPath, db: this.db, telemetry, catalog: this.catalog });
-    this.daemonCp = daemon.cp;
-    this.cpUnsub = daemon.cp.subscribe((e: CoreEvent) => { reduceSessions(this.live, e); this.emitChange(); });
-    this.daemonState = { ...this.daemonState, starting: true, lastError: undefined };
+    clearStatus(this.dataDir);
+    const cmd = [process.execPath, process.argv[1]!, "__daemon"];
+    const spawn = this.deps.spawnDaemon ?? defaultSpawnDaemon;
+    spawn(cmd, { logPath: join(this.dataDir, "daemon.log") });
     this.emitChange();
-    try {
-      await daemon.start();
-      this.daemonHandle = daemon;
-      this.daemonState = { running: true, startedAt: Date.now(), starting: false };
-      this.pushLog("daemon started");
-    } catch (e) {
-      this.cpUnsub?.(); this.cpUnsub = undefined; this.daemonCp = undefined;
-      this.daemonState = { running: false, starting: false, lastError: (e as Error).message };
-      this.emitChange();
-    }
   }
 
   stopDaemon(): void {
-    this.daemonHandle?.stop();
-    this.cpUnsub?.(); this.cpUnsub = undefined; this.daemonCp = undefined; this.daemonHandle = undefined;
-    this.daemonState = { ...this.daemonState, running: false, startedAt: undefined };
-    this.pushLog("daemon stopped");
+    const s = readStatus(this.dataDir);
+    if (s && s.pid > 0 && isAlive(s.pid)) {
+      const kill = this.deps.killDaemon ?? ((pid, sig) => process.kill(pid, sig));
+      try { kill(s.pid, "SIGTERM"); } catch { /* already gone */ }
+    }
+    this.emitChange();
   }
 
   async toggleDaemon(): Promise<void> {
-    if (this.daemonState.running) this.stopDaemon(); else await this.startDaemon();
+    if (this.daemon().running) this.stopDaemon(); else await this.startDaemon();
   }
 }

@@ -8,6 +8,5 @@ export async function launchUi(deps: CliDeps): Promise<number> {
   const controller = new AppController({ dbPath: deps.dbPath, detect: deps.detect });
   const { waitUntilExit } = render(<App controller={controller} />, { alternateScreen: true, exitOnCtrlC: true });
   await waitUntilExit();
-  controller.stopDaemon();
   return 0;
 }
