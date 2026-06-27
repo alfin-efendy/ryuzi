@@ -1,3 +1,5 @@
+![Harness Router wordmark](assets/brand/harness-router/wordmark.svg)
+
 # harness-router (monorepo)
 
 Gateway-agnostic **control plane** for running agent harnesses (starting with Claude Code) and driving them from many clients (starting with Discord).

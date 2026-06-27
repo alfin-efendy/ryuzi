@@ -10,6 +10,7 @@ import { SessionsTab } from "./tabs/sessions";
 import { ConfigTab } from "./tabs/config";
 import { Wizard } from "./wizard";
 import { theme } from "./theme";
+import { brandGlyph, brandName } from "../brand";
 
 const TABS = ["Status", "Daemon", "Sessions", "Config"] as const;
 
@@ -39,7 +40,11 @@ export function App({ controller }: { controller: AppController }) {
 
   return (
     <Box flexDirection="column" padding={1}>
-      <Text bold color={theme.accent}>hr</Text>
+      <Box>
+        <Text bold color={theme.accent}>{brandGlyph}</Text>
+        <Text bold> {brandName}</Text>
+        <Text color={theme.dim}> hr</Text>
+      </Box>
       <Box marginY={1}><TabBar tabs={[...TABS]} active={active} /></Box>
       {active === 0 && <StatusTab controller={controller} />}
       {active === 1 && <DaemonTab controller={controller} />}

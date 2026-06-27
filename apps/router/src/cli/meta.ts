@@ -1,4 +1,5 @@
 import pkg from "../../package.json";
+import { brandName } from "./brand";
 
 export function version(): string {
   return (pkg as { version?: string }).version ?? "0.0.0";
@@ -6,7 +7,7 @@ export function version(): string {
 
 export function helpText(): string {
   return [
-    "hr — drive Claude Code from chat and terminal",
+    `${brandName} — drive Claude Code from chat and terminal`,
     "",
     "USAGE",
     "  hr                 open the dashboard (first run launches setup)",

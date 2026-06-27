@@ -26,6 +26,7 @@ test("unconfigured app starts in the wizard", async () => {
 test("configured app shows the dashboard and switches tabs", async () => {
   const { stdin, lastFrame } = render(<App controller={configured()} />);
   await flush();
+  expect(lastFrame()).toContain("マ Harness Router");
   expect(lastFrame()).toContain("Status");
   stdin.write("2"); await flush();           // jump to Daemon tab
   expect(lastFrame()).toContain("press s to start");
