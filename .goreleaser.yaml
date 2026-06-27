@@ -75,6 +75,47 @@ scoops:
     license: MIT
     commit_msg_template: "Scoop update for {{ .ProjectName }} version {{ .Tag }}"
 
+dockers:
+  - id: amd64
+    ids: [harness-router-musl]
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile
+    use: buildx
+    image_templates:
+      - "ghcr.io/alfin-efendy/herness-router:{{ .Version }}-amd64"
+    build_flag_templates:
+      - "--pull"
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.source=https://github.com/alfin-efendy/herness-router"
+
+  - id: arm64
+    ids: [harness-router-musl]
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile
+    use: buildx
+    image_templates:
+      - "ghcr.io/alfin-efendy/herness-router:{{ .Version }}-arm64"
+    build_flag_templates:
+      - "--pull"
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.source=https://github.com/alfin-efendy/herness-router"
+
+docker_manifests:
+  - name_template: "ghcr.io/alfin-efendy/herness-router:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/alfin-efendy/herness-router:{{ .Version }}-amd64"
+      - "ghcr.io/alfin-efendy/herness-router:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/alfin-efendy/herness-router:latest"
+    image_templates:
+      - "ghcr.io/alfin-efendy/herness-router:{{ .Version }}-amd64"
+      - "ghcr.io/alfin-efendy/herness-router:{{ .Version }}-arm64"
+
 release:
   github:
     owner: alfin-efendy
