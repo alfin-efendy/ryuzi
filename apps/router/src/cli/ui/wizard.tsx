@@ -60,7 +60,7 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
     return (
       <Box flexDirection="column" padding={1}>
         <Text bold color={theme.accent}>hr setup — Choose gateways</Text>
-        <Text color={theme.dim}>Space toggles · Enter continues · Esc cancels</Text>
+        <Text color={theme.dim}>Space toggles · Enter continues · Esc cancels · pick at least one</Text>
         <Box marginTop={1}><MultiSelectList items={items} selected={gwSel} onToggle={(id) => setGwSel((s) => toggle(s, id))} /></Box>
       </Box>
     );
@@ -70,7 +70,7 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
     return (
       <Box flexDirection="column" padding={1}>
         <Text bold color={theme.accent}>hr setup — Choose runtimes</Text>
-        <Text color={theme.dim}>Space toggles · Enter continues · Esc cancels</Text>
+        <Text color={theme.dim}>Space toggles · Enter continues · Esc cancels · pick at least one</Text>
         <Box marginTop={1}>
           <MultiSelectList items={items} selected={rtSel} onToggle={(id) => setRtSel((s) => toggle(s, id))} renderRight={(id) => detected[id] ?? "…"} />
         </Box>

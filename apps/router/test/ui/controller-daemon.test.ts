@@ -42,6 +42,7 @@ test("startDaemon runs, stopDaemon stops, change events fire", async () => {
   let changes = 0; c.on("change", () => { changes++; });
   await c.startDaemon();
   expect(c.daemon().running).toBe(true);
+  expect(c.daemon().startedAt).toBeGreaterThan(0);
   c.stopDaemon();
   expect(c.daemon().running).toBe(false);
   expect(changes).toBeGreaterThan(0);

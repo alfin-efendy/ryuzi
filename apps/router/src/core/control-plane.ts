@@ -155,7 +155,7 @@ export class ControlPlane implements ControlPlaneApi {
       name,
       workdir,
       source,
-      harness: s.harness ?? "claude-code",
+      harness: s.harness ?? (this.deps.settings.get("default_runtime") || "claude-code"),
       model: s.model ?? (this.deps.settings.get("default_model") || undefined),
       effort: s.effort ?? (this.deps.settings.get("default_effort") || undefined),
       permMode: s.permMode ?? ((this.deps.settings.get("default_perm_mode") as Project["permMode"]) ?? "default"),

@@ -91,6 +91,7 @@ function toggleProvider(c: AppController, row: { id: string; group: "gateway" | 
     const on = new Set(c.enabledRuntimes());
     on.has(row.id) ? on.delete(row.id) : on.add(row.id);
     c.setEnabledRuntimes([...on]);
-    if (!on.has(c.defaultRuntime()) && on.size) c.setDefaultRuntime([...on][0]!);
+    if (on.size === 0) c.setDefaultRuntime("");
+    else if (!on.has(c.defaultRuntime())) c.setDefaultRuntime([...on][0]!);
   }
 }

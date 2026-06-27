@@ -33,3 +33,21 @@ test("buildDaemon builds + starts only enabled gateways and exposes cp", async (
     expect(typeof daemon.cp.subscribe).toBe("function");
   } finally { daemon.stop(); }
 });
+
+test("buildDaemon accepts injected telemetry and builds/starts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hr-daemon-tel-"));
+  const dbPath = join(root, "db.sqlite");
+  const s = new SettingsStore(openDb(dbPath));
+  s.set("workdir_root", root); s.set("enabled_gateways", "fake"); s.set("enabled_runtimes", "");
+  const gw: GatewayDescriptor = { id: "fake", label: "Fake", description: "", kind: "gateway", fields: [], build: () => new FakeGateway() };
+  const telemetry = {
+    startSpan: () => ({ setAttribute() {}, setError() {}, end() {} }),
+    count: () => {},
+    record: () => {},
+  };
+  const daemon = buildDaemon({ dbPath, catalog: makeCatalog([gw], []), telemetry });
+  try {
+    await daemon.start();
+    expect(typeof daemon.stop).toBe("function");
+  } finally { daemon.stop(); }
+});

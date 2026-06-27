@@ -15,7 +15,7 @@ function setup() {
   settings.set("workdir_root", root);
   const projects = new ProjectsStore(db);
   const cp = new ControlPlane({ projects, sessions: new SessionsStore(db), settings, workdirRoot: root });
-  return { cp, projects, root };
+  return { cp, projects, settings, root };
 }
 
 test("connectProject by name creates a git repo + binds it", async () => {
@@ -36,6 +36,19 @@ test("connectProject rejects unsafe names", async () => {
 test("connectProject without name or gitUrl throws", async () => {
   const { cp } = setup();
   await expect(cp.connectProject({ gateway: "discord", workspaceId: "c" })).rejects.toThrow(/name or gitUrl/i);
+});
+
+test("connectProject uses default_runtime when harness not specified", async () => {
+  const { cp, settings } = setup();
+  settings.set("default_runtime", "my-custom-runtime");
+  const p = await cp.connectProject({ gateway: "discord", workspaceId: "chan-dr", actor: "u1", name: "bar" });
+  expect(p.harness).toBe("my-custom-runtime");
+});
+
+test("connectProject falls back to claude-code when default_runtime unset", async () => {
+  const { cp } = setup();
+  const p = await cp.connectProject({ gateway: "discord", workspaceId: "chan-fb", actor: "u1", name: "baz" });
+  expect(p.harness).toBe("claude-code");
 });
 
 test("connectProject by gitUrl clones a local repo", async () => {
