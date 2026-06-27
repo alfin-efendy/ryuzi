@@ -51,6 +51,11 @@ echo "install: downloading $asset ($tag)"
 curl -fsSL "$base/$asset" -o "$tmp/$asset" || err "download failed: $base/$asset"
 curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt" || err "checksums download failed"
 
+# sha256sum compatibility: macOS ships shasum, not sha256sum
+if ! command -v sha256sum >/dev/null 2>&1; then
+  sha256sum() { shasum -a 256 "$@"; }
+fi
+
 # verify checksum
 ( cd "$tmp" && grep " $asset\$" checksums.txt | sha256sum -c - ) \
   || err "checksum verification failed for $asset"
