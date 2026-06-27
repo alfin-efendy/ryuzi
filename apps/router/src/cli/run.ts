@@ -3,9 +3,9 @@ import { SettingsStore } from "../config/store";
 import { SETTING_DEFS } from "../config/schema";
 import type { detectClaude, detectGit } from "../harness/detect";
 import type { Harness } from "../harness/types";
-import { runInit } from "./wizard";
 import { cmdRun } from "./run-command";
-import { cmdStart } from "./start-command";
+import { launchUi } from "./ui/launch";
+import { helpText, version } from "./meta";
 
 export interface IO {
   out(s: string): void;
@@ -29,13 +29,13 @@ async function cmdConfig(args: string[], deps: CliDeps): Promise<number> {
   const sub = args[0];
   if (sub === "get") {
     const key = args[1];
-    if (!key) { deps.io.err("usage: harness config get <key>"); return 1; }
+    if (!key) { deps.io.err("usage: hr config get <key>"); return 1; }
     deps.io.out(settings.get(key) ?? "");
     return 0;
   }
   if (sub === "set") {
     const [, key, value] = args;
-    if (!key || value === undefined) { deps.io.err("usage: harness config set <key> <value>"); return 1; }
+    if (!key || value === undefined) { deps.io.err("usage: hr config set <key> <value>"); return 1; }
     try {
       settings.set(key, value);
       deps.io.out(`set ${key}`);
@@ -62,7 +62,7 @@ async function cmdConfig(args: string[], deps: CliDeps): Promise<number> {
     }
     return 0;
   }
-  deps.io.err("usage: harness config <get|set|list> ...");
+  deps.io.err("usage: hr config <get|set|list> ...");
   return 1;
 }
 
@@ -85,22 +85,25 @@ async function cmdDoctor(deps: CliDeps): Promise<number> {
 export async function runCli(args: string[], deps: CliDeps): Promise<number> {
   const [cmd, ...rest] = args;
   switch (cmd) {
-    case "config":
-      return cmdConfig(rest, deps);
     case "doctor":
       return cmdDoctor(deps);
-    case "init":
-      return runInit(deps);
     case "run":
       return cmdRun(rest, deps);
-    case "start":
-      return cmdStart(deps);
-    case undefined:
-    case "help":
-      deps.io.out("harness <config|doctor|init|run|start>");
+    case "config": // hidden: kept for headless automation
+      return cmdConfig(rest, deps);
+    case "-v":
+    case "--version":
+      deps.io.out(version());
       return 0;
+    case "-h":
+    case "--help":
+    case "help":
+      deps.io.out(helpText());
+      return 0;
+    case undefined:
+      return launchUi(deps);
     default:
-      deps.io.err(`unknown command: ${cmd}`);
+      deps.io.err(`unknown command: ${cmd} — run \`hr --help\``);
       return 1;
   }
 }

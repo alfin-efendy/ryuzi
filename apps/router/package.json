@@ -5,7 +5,7 @@
   "type": "module",
   "module": "src/cli/index.ts",
   "bin": {
-    "harness": "./src/cli/index.ts"
+    "hr": "./src/cli/index.ts"
   },
   "dependencies": {
     "@harness/protocol": "workspace:*",

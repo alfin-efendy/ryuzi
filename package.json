@@ -9,7 +9,7 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "harness": "bun run apps/router/src/cli/index.ts"
+    "hr": "bun run apps/router/src/cli/index.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

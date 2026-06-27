@@ -28,7 +28,7 @@ export async function cmdRun(args: string[], deps: CliDeps): Promise<number> {
     return 1;
   }
   if (!dir || !prompt) {
-    deps.io.err("usage: harness run --dir <git-repo> --prompt <text> [--model x] [--effort y] [--mode m]");
+    deps.io.err("usage: hr run --dir <git-repo> --prompt <text> [--model x] [--effort y] [--mode m]");
     return 1;
   }
   if (mode && !(PERM_MODES as readonly string[]).includes(mode)) {

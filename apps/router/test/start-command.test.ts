@@ -7,8 +7,6 @@ import { buildDaemon } from "../src/cli/start-command";
 import type { DiscordPort, InboundMessage, InboundInteraction } from "../src/gateways/discord/index";
 import { openDb } from "../src/store/db";
 import { SettingsStore } from "../src/config/store";
-import { runCli, type CliDeps, type IO } from "../src/cli/run";
-import { detectClaude, detectGit } from "../src/harness/detect";
 
 class FakePort implements DiscordPort {
   connected = false;
@@ -60,13 +58,4 @@ test("buildDaemon passes telemetry through to the ControlPlane", async () => {
   } finally {
     daemon.stop?.();
   }
-});
-
-test("harness start fails with missing settings", async () => {
-  const lines: string[] = [];
-  const io: IO = { out: (s) => lines.push(s), err: (s) => lines.push("ERR " + s), prompt: async () => "" };
-  const deps: CliDeps = { io, dbPath: ":memory:", detect: { claude: detectClaude, git: detectGit } };
-  const code = await runCli(["start"], deps);
-  expect(code).toBe(1);
-  expect(lines.join("\n")).toMatch(/missing settings/i);
 });
