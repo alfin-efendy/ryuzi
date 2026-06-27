@@ -1,4 +1,4 @@
-![Harness Router wordmark](assets/brand/harness-router/wordmark.svg)
+![Harness Router wordmark](assets/brand/wordmark.svg)
 
 # harness-router (monorepo)
 

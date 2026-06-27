@@ -37,10 +37,20 @@ test("brand metadata points to packaged logo assets", () => {
   ]);
   for (const asset of Object.values(brandAssets)) {
     const path = fileURLToPath(asset);
-    expect(path).toContain("/assets/brand/harness-router/");
+    expect(path).toContain("/assets/brand/");
+    expect(path).not.toContain("/assets/brand/harness-router/");
     expect(path).not.toContain("/apps/router/assets/");
     expect(existsSync(path)).toBe(true);
   }
+});
+
+test("brand usage guide documents the shared root assets", () => {
+  const guidePath = fileURLToPath(new URL("../../../../assets/brand/README.md", import.meta.url));
+  const guide = readFileSync(guidePath, "utf8");
+  expect(guide).toContain("wordmark.svg");
+  expect(guide).toContain("mark.svg");
+  expect(guide).toContain("outputs/logos/");
+  expect(guide).not.toContain("assets/brand/harness-router");
 });
 
 test("brand svg assets are light, dark, and adaptive safe", () => {
