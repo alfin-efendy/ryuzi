@@ -18,7 +18,8 @@ export function SessionsTab({ controller }: { controller: AppController }) {
   if (sessions.length === 0) {
     return <Text color={theme.dim}>no sessions yet — start the daemon and run from Discord</Text>;
   }
-  const sel = sessions[Math.min(idx, sessions.length - 1)]!;
+  const sel = sessions[Math.max(0, Math.min(idx, sessions.length - 1))];
+  if (!sel) return <Text color={theme.dim}>no sessions yet — start the daemon and run from Discord</Text>;
   if (open) {
     return (
       <Box flexDirection="column">
