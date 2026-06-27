@@ -1,4 +1,6 @@
 import type { GatewayDescriptor, RuntimeDescriptor, ProviderCatalog } from "./types";
+import { discordGateway } from "./gateways/discord";
+import { claudeCodeRuntime } from "./runtimes/claude-code";
 
 export function makeCatalog(gateways: GatewayDescriptor[], runtimes: RuntimeDescriptor[]): ProviderCatalog {
   return {
@@ -8,3 +10,5 @@ export function makeCatalog(gateways: GatewayDescriptor[], runtimes: RuntimeDesc
     runtime: (id) => runtimes.find((r) => r.id === id),
   };
 }
+
+export const catalog: ProviderCatalog = makeCatalog([discordGateway], [claudeCodeRuntime]);

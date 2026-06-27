@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { makeCatalog } from "../../src/providers/catalog";
+import { makeCatalog, catalog } from "../../src/providers/catalog";
 import type { GatewayDescriptor, RuntimeDescriptor } from "../../src/providers/types";
 
 const gw: GatewayDescriptor = { id: "g1", label: "G1", description: "d", kind: "gateway", fields: [], build: () => ({}) as any };
@@ -12,4 +12,9 @@ test("makeCatalog exposes arrays and id lookups", () => {
   expect(cat.gateway("g1")).toBe(gw);
   expect(cat.runtime("r1")).toBe(rt);
   expect(cat.gateway("nope")).toBeUndefined();
+});
+
+test("default catalog contains discord + claude-code", () => {
+  expect(catalog.gateway("discord")?.label).toBe("Discord");
+  expect(catalog.runtime("claude-code")?.label).toBe("Claude Code");
 });
