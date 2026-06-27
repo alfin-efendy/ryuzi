@@ -29,6 +29,16 @@ Use the adaptive files when the surface follows the user's global light or dark 
 <img src="/assets/brand/wordmark.svg" alt="Harness Router">
 ```
 
+For Markdown documentation, prefer explicit light and dark sources. Some renderers do not apply the SVG's internal `prefers-color-scheme` styles when the SVG is loaded through a plain Markdown image.
+
+```html
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="/assets/brand/wordmark-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="/assets/brand/wordmark-light.svg">
+  <img src="/assets/brand/wordmark-light.svg" alt="Harness Router" width="560">
+</picture>
+```
+
 Use explicit variants when the logo is placed on a custom background that may not match the global theme:
 
 ```html

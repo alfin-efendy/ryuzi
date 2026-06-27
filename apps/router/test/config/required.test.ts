@@ -11,7 +11,12 @@ const gw: GatewayDescriptor = { id: "g", label: "G", description: "", kind: "gat
 const rt: RuntimeDescriptor = { id: "r", label: "R", description: "", kind: "runtime", fields: [], detect: async () => ({ found: true }), build: () => ({}) as any };
 const cat = makeCatalog([gw], [rt]);
 
-function store() { const db = new Database(":memory:"); migrate(db); return new SettingsStore(db); }
+function setup() {
+  const db = new Database(":memory:");
+  migrate(db);
+  const raw = (k: string, v: string) => db.run("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [k, v]);
+  return { s: new SettingsStore(db), raw };
+}
 
 test("csv splits and trims", () => {
   expect(csv("a, b ,,c")).toEqual(["a", "b", "c"]);
@@ -19,13 +24,13 @@ test("csv splits and trims", () => {
 });
 
 test("missingRequired counts only enabled providers + global", () => {
-  const s = store();
-  s.set("enabled_gateways", ""); s.set("enabled_runtimes", "r");
+  const { s, raw } = setup();
+  raw("enabled_gateways", ""); raw("enabled_runtimes", "r");
   // g not enabled -> g.tok not required; workdir_root (global required) missing
   expect(missingRequiredSettings(s, cat)).toEqual(["workdir_root"]);
-  s.set("enabled_gateways", "g");
+  raw("enabled_gateways", "g");
   expect(missingRequiredSettings(s, cat).sort()).toEqual(["g.tok", "workdir_root"]);
   expect(isConfigured(s, cat)).toBe(false);
-  s.set("g.tok", "x"); s.set("workdir_root", "/r");
+  raw("g.tok", "x"); raw("workdir_root", "/r");
   expect(isConfigured(s, cat)).toBe(true);
 });

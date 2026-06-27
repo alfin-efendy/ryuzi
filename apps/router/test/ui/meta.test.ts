@@ -49,8 +49,20 @@ test("brand usage guide documents the shared root assets", () => {
   const guide = readFileSync(guidePath, "utf8");
   expect(guide).toContain("wordmark.svg");
   expect(guide).toContain("mark.svg");
+  expect(guide).toContain("<picture>");
+  expect(guide).toContain("prefers-color-scheme");
   expect(guide).toContain("outputs/logos/");
   expect(guide).not.toContain("assets/brand/harness-router");
+});
+
+test("root readme uses explicit light and dark wordmark sources", () => {
+  const readmePath = fileURLToPath(new URL("../../../../README.md", import.meta.url));
+  const readme = readFileSync(readmePath, "utf8");
+  expect(readme).toContain("<picture>");
+  expect(readme).toContain('media="(prefers-color-scheme: dark)"');
+  expect(readme).toContain("assets/brand/wordmark-dark.svg");
+  expect(readme).toContain("assets/brand/wordmark-light.svg");
+  expect(readme).not.toContain("![Harness Router wordmark](assets/brand/wordmark.svg)");
 });
 
 test("brand svg assets are light, dark, and adaptive safe", () => {

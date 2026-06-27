@@ -1,4 +1,8 @@
-![Harness Router wordmark](assets/brand/wordmark.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/wordmark-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/brand/wordmark-light.svg">
+  <img src="assets/brand/wordmark-light.svg" alt="Harness Router" width="560">
+</picture>
 
 # harness-router (monorepo)
 

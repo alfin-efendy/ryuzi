@@ -13,11 +13,8 @@ export class SettingsStore {
   }
 
   set(key: string, value: string): void {
-    // Only validate against SETTING_DEFS for known keys; provider/control fields are always allowed
-    if (key in SETTING_DEFS) {
-      const err = validateSetting(key, value);
-      if (err) throw new Error(err);
-    }
+    const err = validateSetting(key, value);
+    if (err) throw new Error(err);
     this.db.run(
       "INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       [key, value],
