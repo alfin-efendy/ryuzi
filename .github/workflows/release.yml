@@ -41,3 +41,56 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  binaries:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: ./scripts/build-binaries.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: out/
+          retention-days: 1
+
+  npm:
+    needs: [release-please, binaries]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: out/
+      - name: Stamp version + assemble packages
+        run: |
+          VERSION="${TAG#v}"
+          bun scripts/npm/set-version.ts "$VERSION"
+          ./scripts/npm/assemble.sh
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+      - name: Publish platform packages first
+        run: |
+          for dir in npm/platform/*/; do
+            npm publish "$dir" --access public
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish main package last
+        run: npm publish npm/harness-router --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
