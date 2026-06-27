@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-"use strict";
 
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -59,10 +58,7 @@ function resolveBinaryPath() {
   const key = platformKey();
   const pkg = PLATFORM_PACKAGES[key];
   if (!pkg) {
-    fail(
-      `no prebuilt binary for your platform (${key}).\n` +
-        `Supported: ${Object.keys(PLATFORM_PACKAGES).join(", ")}.`,
-    );
+    fail(`no prebuilt binary for your platform (${key}).\n` + `Supported: ${Object.keys(PLATFORM_PACKAGES).join(", ")}.`);
   }
   try {
     return require.resolve(`${pkg}/${BINARY_NAME}`);
