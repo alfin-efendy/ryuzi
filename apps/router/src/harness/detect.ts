@@ -7,10 +7,16 @@ export interface ToolInfo {
 export type Runner = (cmd: string[]) => Promise<{ exitCode: number; stdout: string }>;
 
 export const defaultRunner: Runner = async (cmd) => {
-  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
-  const stdout = await new Response(proc.stdout).text();
-  const exitCode = await proc.exited;
-  return { exitCode, stdout: stdout.trim() };
+  try {
+    const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+    return { exitCode, stdout: stdout.trim() };
+  } catch {
+    // Spawn throws (ENOENT) when the executable is not installed — treat that
+    // as "not found" rather than crashing detection (e.g. `claude` absent).
+    return { exitCode: 127, stdout: "" };
+  }
 };
 
 export async function detectGit(run: Runner = defaultRunner): Promise<ToolInfo> {
