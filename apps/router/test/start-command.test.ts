@@ -32,6 +32,8 @@ test("buildDaemon wires the graph, registers the gateway, and starts the approva
     await daemon.start();
     expect(port.connected).toBe(true);
     expect(daemon.gateway.id).toBe("discord");
+    expect(daemon.cp).toBeDefined();
+    expect(typeof daemon.cp.subscribe).toBe("function");
     expect(typeof daemon.stop).toBe("function");
   } finally {
     daemon.stop?.();

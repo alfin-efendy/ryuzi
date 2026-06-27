@@ -18,7 +18,7 @@ import type { Database } from "bun:sqlite";
 import { expandHome } from "../config/paths";
 
 export function buildDaemon(deps: { dbPath: string; port: DiscordPort; harnessFactory?: () => Harness; db?: Database; telemetry?: Telemetry }): {
-  gateway: DiscordGateway; start(): Promise<void>; stop(): void;
+  gateway: DiscordGateway; cp: ControlPlane; start(): Promise<void>; stop(): void;
 } {
   const db = deps.db ?? openDb(deps.dbPath);
   const projects = new ProjectsStore(db);
@@ -49,7 +49,7 @@ export function buildDaemon(deps: { dbPath: string; port: DiscordPort; harnessFa
   const ipc = startApprovalServer(cp);
   cp.approvalUrl = ipc.url;
   cp.hookBinPath = `${import.meta.dir}/../hook/pretooluse-bin.ts`;
-  return { gateway, start: () => gateway.start(), stop: () => { void telemetry.shutdown?.(); ipc.stop(); } };
+  return { gateway, cp, start: () => gateway.start(), stop: () => { void telemetry.shutdown?.(); ipc.stop(); } };
 }
 
 export async function cmdStart(deps: CliDeps): Promise<number> {
