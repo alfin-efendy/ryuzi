@@ -1,6 +1,7 @@
 import React from "react";
-import { Box, Text } from "ink";
-import { theme } from "../theme";
+import { Text } from "ink";
+import { palette } from "../theme";
+import { Panel } from "./panel";
 
 const BINDINGS: Array<[string, string]> = [
   ["Tab / 1-4 / arrows", "switch tabs"],
@@ -13,15 +14,13 @@ const BINDINGS: Array<[string, string]> = [
 
 export function OptionsOverlay() {
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={theme.accent} paddingX={1}>
-      <Text bold color={theme.accent}>
-        Options
-      </Text>
+    <Panel focus>
+      <Text bold color={palette.signature}>Options</Text>
       {BINDINGS.map(([k, d]) => (
         <Text key={k}>
-          <Text color={theme.warn}>{k.padEnd(20)}</Text> {d}
+          <Text color={palette.signature}>{k.padEnd(20)}</Text> {d}
         </Text>
       ))}
-    </Box>
+    </Panel>
   );
 }
