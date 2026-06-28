@@ -102,12 +102,12 @@ Settings live in a local SQLite database at `~/.local/share/harness-router/harne
 | `workdir_root` | *(required)* | Parent directory where your project repos live. |
 | `default_model` | harness default | Default model for new projects. |
 | `default_effort` | `medium` | Default reasoning effort for new projects. |
-| `default_perm_mode` | `default` | Default approval mode: `default`, `acceptEdits`, or `bypassPermissions`. |
+| `default_perm_mode` | `default` | Default approval mode: `default`, `acceptEdits`, or `bypassPermissions`. `bypassPermissions` selected via Discord `/connect` is allowed only for admins (see `admin_role_ids`). |
 | `max_concurrent_runs` | `3` | Max simultaneous sessions. |
 | `approval_timeout_ms` | `300000` | How long to wait for a tool approval. |
 | `otel_endpoint` | *(blank)* | OpenTelemetry OTLP/HTTP endpoint (blank = console telemetry). |
-| `admin_role_ids` | *(blank)* | Comma-separated role IDs allowed to administer. |
-| `approver_role_ids` | *(blank)* | Comma-separated role IDs allowed to approve tool use. |
+| `admin_role_ids` | *(blank)* | Comma-separated Discord role IDs allowed to administer. **Blank = everyone is admin.** When set, only these roles may select `bypassPermissions` on `/connect`. |
+| `approver_role_ids` | *(blank)* | Comma-separated role IDs allowed to approve tool use. **Blank = only the session starter may approve.** |
 | `discord.token` | *(required for Discord)* | Bot token (secret). |
 | `discord.app_id` | *(required for Discord)* | Application ID. |
 | `discord.guild_id` | *(required for Discord)* | Server (guild) ID. |
