@@ -14,11 +14,13 @@ export async function handleApprove(body: ApproveBody, approver: Approver): Prom
 }
 
 export function startApprovalServer(approver: Approver): { url: string; stop(): void } {
+  const token = crypto.randomUUID();
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
     async fetch(req) {
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+      if (new URL(req.url).pathname !== `/${token}`) return new Response("forbidden", { status: 403 });
       let body: ApproveBody;
       try {
         body = (await req.json()) as ApproveBody;
@@ -28,5 +30,5 @@ export function startApprovalServer(approver: Approver): { url: string; stop(): 
       return Response.json(await handleApprove(body, approver));
     },
   });
-  return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
+  return { url: `http://127.0.0.1:${server.port}/${token}`, stop: () => server.stop(true) };
 }
