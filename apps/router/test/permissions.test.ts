@@ -22,3 +22,29 @@ test("summarizeTool", () => {
   expect(summarizeTool("Edit", { file_path: "src/a.ts" })).toBe("Edit: src/a.ts");
   expect(summarizeTool("Glob", {})).toBe("Glob");
 });
+
+import { isAdmin, gatePermMode, parseRoleIds } from "../src/core/permissions";
+
+test("parseRoleIds splits, trims, drops empties", () => {
+  expect(parseRoleIds("a, b ,,c")).toEqual(["a", "b", "c"]);
+  expect(parseRoleIds("")).toEqual([]);
+  expect(parseRoleIds(undefined)).toEqual([]);
+});
+
+test("isAdmin: blank admin roles => everyone is admin", () => {
+  expect(isAdmin({ userRoleIds: [], adminRoleIds: [] })).toBe(true);
+  expect(isAdmin({ userRoleIds: ["x"], adminRoleIds: [] })).toBe(true);
+});
+
+test("isAdmin: configured admin roles gate membership", () => {
+  expect(isAdmin({ userRoleIds: ["admin"], adminRoleIds: ["admin"] })).toBe(true);
+  expect(isAdmin({ userRoleIds: ["other"], adminRoleIds: ["admin"] })).toBe(false);
+  expect(isAdmin({ userRoleIds: [], adminRoleIds: ["admin"] })).toBe(false);
+});
+
+test("gatePermMode: only non-admin bypassPermissions is clamped", () => {
+  expect(gatePermMode("bypassPermissions", false)).toEqual({ mode: "default", downgraded: true });
+  expect(gatePermMode("bypassPermissions", true)).toEqual({ mode: "bypassPermissions", downgraded: false });
+  expect(gatePermMode("acceptEdits", false)).toEqual({ mode: "acceptEdits", downgraded: false });
+  expect(gatePermMode("default", false)).toEqual({ mode: "default", downgraded: false });
+});

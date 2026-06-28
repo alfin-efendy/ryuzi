@@ -23,6 +23,30 @@ export function canApprove(o: { clickerRoleIds: string[]; approverRoleIds: strin
   return o.clickerRoleIds.some((r) => o.approverRoleIds.includes(r));
 }
 
+/** Split a comma-separated role-id setting into a trimmed, non-empty list. */
+export function parseRoleIds(raw: string | undefined): string[] {
+  return (raw ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * Whether a user holds an admin role. If NO admin roles are configured, everyone
+ * is treated as admin (optional gating — preserves the zero-config single-user UX).
+ */
+export function isAdmin(o: { userRoleIds: string[]; adminRoleIds: string[] }): boolean {
+  if (o.adminRoleIds.length === 0) return true;
+  return o.userRoleIds.some((r) => o.adminRoleIds.includes(r));
+}
+
+/**
+ * Clamp a privileged permission mode for non-admins. Only bypassPermissions is
+ * gated (it disables all tool approval). Returns the effective mode and whether
+ * it was downgraded so the caller can warn the user.
+ */
+export function gatePermMode(requested: PermMode, isAdminUser: boolean): { mode: PermMode; downgraded: boolean } {
+  if (!isAdminUser && requested === "bypassPermissions") return { mode: "default", downgraded: true };
+  return { mode: requested, downgraded: false };
+}
+
 export function summarizeTool(toolName: string, input: unknown): string {
   const obj = (input ?? {}) as Record<string, unknown>;
   if (toolName === "Bash" && typeof obj.command === "string") return `Bash: ${obj.command.slice(0, 80)}`;
