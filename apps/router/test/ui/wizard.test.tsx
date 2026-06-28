@@ -22,12 +22,12 @@ test("wizard: pick gateway -> pick runtime -> fill fields -> done", async () => 
     />,
   );
   await flush();
-  expect(lastFrame()).toContain("Choose gateways");
+  expect(lastFrame()).toContain("CHOOSE GATEWAYS");
   stdin.write(" ");
   await flush(); // toggle the highlighted gateway (discord)
   stdin.write("\r");
   await flush(); // confirm gateways -> runtimes step
-  expect(lastFrame()).toContain("Choose runtimes");
+  expect(lastFrame()).toContain("CHOOSE RUNTIMES");
   stdin.write(" ");
   await flush(); // toggle claude-code
   stdin.write("\r");

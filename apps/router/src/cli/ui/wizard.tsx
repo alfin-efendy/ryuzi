@@ -4,7 +4,9 @@ import TextInput from "ink-text-input";
 import type { AppController } from "./controller";
 import type { ConfigField } from "../../providers/types";
 import { MultiSelectList } from "./components/multi-select-list";
-import { theme } from "./theme";
+import { Panel } from "./components/panel";
+import { palette, symbols } from "./theme";
+import { brandName } from "../brand";
 
 type Phase = "gateways" | "runtimes" | "fields";
 
@@ -67,13 +69,13 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
     const items = controller.gatewayDescriptors().map((g) => ({ id: g.id, label: g.label, description: g.description }));
     return (
       <Box flexDirection="column" padding={1}>
-        <Text bold color={theme.accent}>
-          hr setup — Choose gateways
-        </Text>
-        <Text color={theme.dim}>Space toggles · Enter continues · Esc cancels · pick at least one</Text>
-        <Box marginTop={1}>
-          <MultiSelectList items={items} selected={gwSel} onToggle={(id) => setGwSel((s) => toggle(s, id))} />
-        </Box>
+        <Text bold><Text color={palette.signature}>{symbols().glyph}</Text> {brandName} · setup</Text>
+        <Panel title="Choose gateways">
+          <Text color={palette.dim}>Space toggles · Enter continues · Esc cancels · pick at least one</Text>
+          <Box marginTop={1}>
+            <MultiSelectList items={items} selected={gwSel} onToggle={(id) => setGwSel((s) => toggle(s, id))} />
+          </Box>
+        </Panel>
       </Box>
     );
   }
@@ -81,18 +83,18 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
     const items = controller.runtimeDescriptors().map((r) => ({ id: r.id, label: r.label, description: r.description }));
     return (
       <Box flexDirection="column" padding={1}>
-        <Text bold color={theme.accent}>
-          hr setup — Choose runtimes
-        </Text>
-        <Text color={theme.dim}>Space toggles · Enter continues · Esc cancels · pick at least one</Text>
-        <Box marginTop={1}>
-          <MultiSelectList
-            items={items}
-            selected={rtSel}
-            onToggle={(id) => setRtSel((s) => toggle(s, id))}
-            renderRight={(id) => detected[id] ?? "…"}
-          />
-        </Box>
+        <Text bold><Text color={palette.signature}>{symbols().glyph}</Text> {brandName} · setup</Text>
+        <Panel title="Choose runtimes">
+          <Text color={palette.dim}>Space toggles · Enter continues · Esc cancels · pick at least one</Text>
+          <Box marginTop={1}>
+            <MultiSelectList
+              items={items}
+              selected={rtSel}
+              onToggle={(id) => setRtSel((s) => toggle(s, id))}
+              renderRight={(id) => detected[id] ?? "…"}
+            />
+          </Box>
+        </Panel>
       </Box>
     );
   }
@@ -112,19 +114,19 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
   };
   return (
     <Box flexDirection="column" padding={1}>
-      <Text bold color={theme.accent}>
-        hr setup — Settings ({fieldIdx + 1}/{fields.length})
-      </Text>
-      <Text>{f.label}</Text>
-      <Text color={theme.dim}>
-        {f.help}
-        {f.example ? `  (e.g. ${f.example})` : ""}
-      </Text>
-      <Box marginTop={1}>
-        <Text>{"› "}</Text>
-        <TextInput value={draft} onChange={setDraft} onSubmit={submit} mask={f.secret ? "•" : undefined} />
-      </Box>
-      {error && <Text color={theme.bad}>✗ {error}</Text>}
+      <Text bold><Text color={palette.signature}>{symbols().glyph}</Text> {brandName} · setup</Text>
+      <Panel title={`Settings (${fieldIdx + 1}/${fields.length})`}>
+        <Text>{f.label}</Text>
+        <Text color={palette.dim}>
+          {f.help}
+          {f.example ? `  (e.g. ${f.example})` : ""}
+        </Text>
+        <Box marginTop={1}>
+          <Text>{"› "}</Text>
+          <TextInput value={draft} onChange={setDraft} onSubmit={submit} mask={f.secret ? "•" : undefined} />
+        </Box>
+        {error && <Text color={palette.bad}>{symbols().bad} {error}</Text>}
+      </Panel>
     </Box>
   );
 }

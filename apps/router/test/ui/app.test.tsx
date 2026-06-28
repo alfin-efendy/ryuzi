@@ -26,7 +26,7 @@ function configured() {
 test("unconfigured app starts in the wizard", async () => {
   const f = render(<App controller={ctl()} />);
   await flush();
-  expect(f.lastFrame()).toContain("hr setup");
+  expect(f.lastFrame()).toContain("Harness Router · setup");
 });
 
 test("configured app shows the dashboard and switches tabs", async () => {
