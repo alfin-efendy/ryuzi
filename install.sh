@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="alfin-efendy/herness-router"
+REPO="alfin-efendy/harness-router"
 INSTALL_DIR="${HR_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${HR_VERSION:-latest}"
 

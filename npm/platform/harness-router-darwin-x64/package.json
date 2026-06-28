@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/alfin-efendy/herness-router.git"
+    "url": "git+https://github.com/alfin-efendy/harness-router.git"
   },
   "engines": {
     "node": ">=18"

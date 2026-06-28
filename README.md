@@ -7,7 +7,7 @@
 # harness-router
 
 [![npm version](https://img.shields.io/npm/v/hrctl.svg)](https://www.npmjs.com/package/hrctl)
-[![CI](https://github.com/alfin-efendy/herness-router/actions/workflows/ci.yml/badge.svg)](https://github.com/alfin-efendy/herness-router/actions/workflows/ci.yml)
+[![CI](https://github.com/alfin-efendy/harness-router/actions/workflows/ci.yml/badge.svg)](https://github.com/alfin-efendy/harness-router/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Gateway-agnostic **control plane** for running agent harnesses (starting with Claude Code) and driving them from many clients (starting with Discord). The CLI is `hr` — *drive Claude Code from chat and terminal*.
