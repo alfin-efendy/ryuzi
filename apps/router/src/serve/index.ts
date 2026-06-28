@@ -129,7 +129,7 @@ export function startServeServer(cp: ControlPlane, opts: ServeOptions): { url: s
 
   return {
     url: `http://${server.hostname}:${server.port}`,
-    port: server.port,
+    port: server.port!,
     stop: () => {
       unsubscribe();
       server.stop(true);

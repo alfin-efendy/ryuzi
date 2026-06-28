@@ -24,7 +24,7 @@ const TICKET_TTL_MS = 30_000;
 function bearer(authHeader: string | null): string | null {
   if (!authHeader) return null;
   const m = /^Bearer (.+)$/.exec(authHeader);
-  return m ? m[1] : null;
+  return m ? (m[1] ?? null) : null;
 }
 
 export function createAuthenticator(deps: AuthDeps): Authenticator {
