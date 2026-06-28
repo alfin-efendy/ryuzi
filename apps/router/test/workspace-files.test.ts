@@ -108,3 +108,25 @@ test("readFile missing path throws 'not found' without leaking absolute root", (
   expect(err!.message).not.toContain(root);
   rmSync(root, { recursive: true, force: true });
 });
+
+test(".gitignore and .github stay readable (.git block is exact-segment)", () => {
+  const root = makeWorktree();
+  mkdirSync(join(root, ".github"));
+  writeFileSync(join(root, ".gitignore"), "node_modules\n");
+  writeFileSync(join(root, ".github", "ci.yml"), "name: CI\n");
+
+  const gitignore = readFile(root, ".gitignore");
+  expect(gitignore.binary).toBe(false);
+  expect(gitignore.encoding).toBe("utf8");
+  expect(gitignore.content).toBe("node_modules\n");
+
+  const ciYml = readFile(root, ".github/ci.yml");
+  expect(ciYml.binary).toBe(false);
+  expect(ciYml.encoding).toBe("utf8");
+  expect(ciYml.content).toBe("name: CI\n");
+
+  const ghEntries = listDir(root, ".github");
+  expect(ghEntries.find((e) => e.name === "ci.yml")).toBeDefined();
+
+  rmSync(root, { recursive: true, force: true });
+});
