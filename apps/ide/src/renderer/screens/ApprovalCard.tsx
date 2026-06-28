@@ -1,11 +1,10 @@
-// apps/ide/src/renderer/screens/ApprovalsRail.tsx
 import React, { useEffect, useState } from "react";
 import type { ApprovalRequestFrame } from "@harness/protocol";
 import { useStore } from "../store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 
-function ApprovalCard({ req }: { req: ApprovalRequestFrame }) {
+export function ApprovalCard({ req }: { req: ApprovalRequestFrame }) {
   const removeApproval = useStore((s) => s.removeApproval);
   const [remaining, setRemaining] = useState(Math.ceil(req.timeoutMs / 1000));
 
@@ -14,7 +13,7 @@ function ApprovalCard({ req }: { req: ApprovalRequestFrame }) {
       setRemaining((r) => {
         if (r <= 1) {
           clearInterval(id);
-          removeApproval(req.requestId); // server already denies on timeout
+          removeApproval(req.requestId);
           return 0;
         }
         return r - 1;
@@ -29,7 +28,7 @@ function ApprovalCard({ req }: { req: ApprovalRequestFrame }) {
   }
 
   return (
-    <Card className="m-2">
+    <Card className="my-2">
       <CardHeader className="p-3">
         <CardTitle className="text-sm">{req.tool}</CardTitle>
       </CardHeader>
@@ -46,19 +45,5 @@ function ApprovalCard({ req }: { req: ApprovalRequestFrame }) {
         </div>
       </CardContent>
     </Card>
-  );
-}
-
-export function ApprovalsRail() {
-  const pending = useStore((s) => s.pendingApprovals);
-  return (
-    <div data-testid="approvals-rail">
-      <div className="border-b p-2 text-xs uppercase tracking-wide text-muted-foreground">Approvals</div>
-      {pending.length === 0 ? (
-        <p className="p-3 text-xs text-muted-foreground">No pending approvals.</p>
-      ) : (
-        pending.map((req) => <ApprovalCard key={req.requestId} req={req} />)
-      )}
-    </div>
   );
 }

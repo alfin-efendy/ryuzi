@@ -2,6 +2,7 @@
 import React, { useState } from "react";
 import { useStore } from "../store";
 import type { CoreEvent } from "@harness/protocol";
+import { ApprovalCard } from "./ApprovalCard";
 
 const EMPTY_EVENTS: CoreEvent[] = [];
 
@@ -10,6 +11,7 @@ export function SessionTranscript() {
   const connId = useStore((s) => s.connId);
   const projects = useStore((s) => s.projects);
   const events = useStore((s) => (s.activeSessionPk ? (s.transcripts[s.activeSessionPk] ?? EMPTY_EVENTS) : EMPTY_EVENTS));
+  const pendingApprovals = useStore((s) => s.pendingApprovals);
   const [prompt, setPrompt] = useState("");
 
   async function send() {
@@ -38,6 +40,11 @@ export function SessionTranscript() {
             {e.kind === "text" || e.kind === "status" ? e.text : e.kind === "error" ? e.message : `[${e.kind}]`}
           </div>
         ))}
+        {pendingApprovals
+          .filter((a) => a.sessionPk === activeSessionPk)
+          .map((a) => (
+            <ApprovalCard key={a.requestId} req={a} />
+          ))}
       </div>
       <div className="flex gap-2 border-t p-2">
         <input
