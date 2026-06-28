@@ -48,6 +48,15 @@ function makeHarness(): HarnessBridge {
     getConnId: mock(async () => null as string | null),
     onEvent: mock((_cb: Parameters<HarnessBridge["onEvent"]>[0]) => () => {}),
     onConnectionChange: mock((_cb: Parameters<HarnessBridge["onConnectionChange"]>[0]) => () => {}),
+    connectProject: mock(async (_input: { gitUrl?: string; name?: string }) => ({
+      projectId: "",
+      name: "",
+      workdir: "",
+      harness: "",
+      permMode: "default" as const,
+    })),
+    onApprovalRequest: mock((_cb: Parameters<HarnessBridge["onApprovalRequest"]>[0]) => () => {}),
+    resolveApproval: mock((_requestId: string, _decision: "allow" | "deny") => undefined),
   };
 }
 

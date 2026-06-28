@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { EVENT_CHANNEL, CONNECTION_CHANNEL, type HarnessBridge } from "../shared/ipc-contract";
+import { EVENT_CHANNEL, CONNECTION_CHANNEL, APPROVAL_CHANNEL, type HarnessBridge } from "../shared/ipc-contract";
 
 const bridge: HarnessBridge = {
   listProjects: () => ipcRenderer.invoke("listProjects"),
@@ -19,6 +19,13 @@ const bridge: HarnessBridge = {
     const handler = (_e: unknown, payload: Parameters<typeof cb>[0]) => cb(payload);
     ipcRenderer.on(CONNECTION_CHANNEL, handler);
     return () => ipcRenderer.removeListener(CONNECTION_CHANNEL, handler);
+  },
+  connectProject: (input) => ipcRenderer.invoke("connectProject", input),
+  resolveApproval: (requestId, decision) => ipcRenderer.invoke("resolveApproval", requestId, decision),
+  onApprovalRequest: (cb) => {
+    const handler = (_e: unknown, payload: Parameters<typeof cb>[0]) => cb(payload);
+    ipcRenderer.on(APPROVAL_CHANNEL, handler);
+    return () => ipcRenderer.removeListener(APPROVAL_CHANNEL, handler);
   },
 };
 

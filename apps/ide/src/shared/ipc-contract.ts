@@ -1,4 +1,4 @@
-import type { Project, Session, CoreEvent, StartSessionRequest, ContinueSessionRequest } from "@harness/protocol";
+import type { Project, Session, CoreEvent, StartSessionRequest, ContinueSessionRequest, ApprovalRequestFrame } from "@harness/protocol";
 
 export const IPC_COMMANDS = [
   "listProjects",
@@ -9,11 +9,14 @@ export const IPC_COMMANDS = [
   "stopSession",
   "endSession",
   "getConnId",
+  "connectProject",
+  "resolveApproval",
 ] as const;
 export type IpcCommand = (typeof IPC_COMMANDS)[number];
 
 export const EVENT_CHANNEL = "harness:event";
 export const CONNECTION_CHANNEL = "harness:connection";
+export const APPROVAL_CHANNEL = "harness:approval";
 export type ConnState = "connecting" | "open" | "closed";
 
 export interface HarnessBridge {
@@ -27,6 +30,9 @@ export interface HarnessBridge {
   getConnId(): Promise<string | null>;
   onEvent(cb: (e: CoreEvent) => void): () => void;
   onConnectionChange(cb: (s: ConnState) => void): () => void;
+  connectProject(input: { gitUrl?: string; name?: string }): Promise<Project>;
+  onApprovalRequest(cb: (r: ApprovalRequestFrame) => void): () => void;
+  resolveApproval(requestId: string, decision: "allow" | "deny"): void;
 }
 
 declare global {

@@ -11,5 +11,7 @@ test("IPC_COMMANDS covers the 2a command surface", () => {
     "stopSession",
     "endSession",
     "getConnId",
+    "connectProject",
+    "resolveApproval",
   ]);
 });
