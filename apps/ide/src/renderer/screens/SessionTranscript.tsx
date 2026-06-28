@@ -1,12 +1,15 @@
 // apps/ide/src/renderer/screens/SessionTranscript.tsx
 import React, { useState } from "react";
 import { useStore } from "../store";
+import type { CoreEvent } from "@harness/protocol";
+
+const EMPTY_EVENTS: CoreEvent[] = [];
 
 export function SessionTranscript() {
   const activeSessionPk = useStore((s) => s.activeSessionPk);
   const connId = useStore((s) => s.connId);
   const projects = useStore((s) => s.projects);
-  const events = useStore((s) => (s.activeSessionPk ? (s.transcripts[s.activeSessionPk] ?? []) : []));
+  const events = useStore((s) => (s.activeSessionPk ? (s.transcripts[s.activeSessionPk] ?? EMPTY_EVENTS) : EMPTY_EVENTS));
   const [prompt, setPrompt] = useState("");
 
   async function send() {
