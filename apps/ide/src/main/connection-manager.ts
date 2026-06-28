@@ -8,12 +8,18 @@ import { runLoopbackAuth } from "./oidc";
 import type { ClientHandle } from "./client";
 import { discoverLocalRouter, type RouterInfo } from "./discover";
 
+interface MakeClientOpts {
+  baseUrl: string;
+  getToken: () => Promise<string>;
+  send: (channel: string, payload: unknown) => void;
+}
+
 interface Deps {
   store: ConnectionsStore;
   tokens: TokenStore;
   oidc: OidcClient;
   send: (channel: string, payload: unknown) => void;
-  makeClient: (info: RouterInfo, send: (c: string, p: unknown) => void) => ClientHandle;
+  makeClient: (opts: MakeClientOpts) => ClientHandle;
   openExternal: (url: string) => void;
   discoverLocal?: () => RouterInfo | null;
 }
@@ -86,7 +92,11 @@ export class ConnectionManager {
       this.emit();
       return;
     }
-    this.handle = this.d.makeClient({ url: p.baseUrl, token }, this.d.send);
+    this.handle = this.d.makeClient({
+      baseUrl: p.baseUrl,
+      getToken: async () => (await this.tokenFor(id)) ?? "",
+      send: this.d.send,
+    });
     await this.handle.connect().catch((e) => console.error("connect failed:", e));
     this.emit();
   }

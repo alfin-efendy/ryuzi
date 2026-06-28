@@ -60,7 +60,18 @@ export function ConnectionsDialog({ defaultOpen = false }: { defaultOpen?: boole
                     Sign out
                   </Button>
                 ) : (
-                  <Button size="sm" variant="ghost" onClick={() => void window.harness.signIn(c.id)}>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={async () => {
+                      setError(null);
+                      try {
+                        await window.harness.signIn(c.id);
+                      } catch (e) {
+                        setError((e as Error).message);
+                      }
+                    }}
+                  >
                     Sign in
                   </Button>
                 ))}

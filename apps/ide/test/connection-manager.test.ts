@@ -18,9 +18,10 @@ function setup() {
   store.setLocal({ url: "http://127.0.0.1:8787" });
   const tokens = new TokenStore(join(tmpdir(), `cm-tok-${crypto.randomUUID()}`), vault);
   const sends: unknown[] = [];
-  const connectCalls: { url: string; token: string }[] = [];
-  const makeClient = (info: { url: string; token: string }) => {
-    connectCalls.push({ url: info.url, token: info.token });
+  type CapturedOpts = { baseUrl: string; getToken: () => Promise<string>; send: (c: string, p: unknown) => void };
+  const capturedOpts: CapturedOpts[] = [];
+  const makeClient = (opts: CapturedOpts) => {
+    capturedOpts.push(opts);
     return { client: { connId: "c" } as any, connect: async () => {}, dispose: () => {} };
   };
   const mgr = new ConnectionManager({
@@ -32,14 +33,16 @@ function setup() {
     openExternal: () => {},
     discoverLocal: () => ({ url: "http://127.0.0.1:8787", token: "tok" }),
   });
-  return { mgr, store, sends, connectCalls };
+  return { mgr, store, sends, capturedOpts };
 }
 
 test("select(local) builds a loopback client with the serve token", async () => {
-  const { mgr, connectCalls } = setup();
+  const { mgr, capturedOpts } = setup();
   await mgr.select("local");
-  expect(connectCalls.at(-1)?.url).toBe("http://127.0.0.1:8787");
-  expect(connectCalls.at(-1)?.token).toBe("tok");
+  const last = capturedOpts.at(-1)!;
+  expect(last.baseUrl).toBe("http://127.0.0.1:8787");
+  // Live resolver — calling getToken() re-invokes tokenFor which reads discoverLocal fresh
+  expect(await last.getToken()).toBe("tok");
   expect(mgr.getClient()).not.toBeNull();
   // local is loopback -> summaries mark it active + signedIn
   expect(mgr.list().find((c) => c.id === "local")?.active).toBe(true);

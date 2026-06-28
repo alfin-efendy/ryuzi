@@ -50,6 +50,7 @@ beforeEach(() => {
   (window as any).harness = {
     selectConnection: mock(async () => {}),
     signIn: mock(async () => {}),
+    signOut: mock(async () => {}),
     addConnection: mock(async () => {}),
     removeConnection: mock(async () => {}),
     listConnections: mock(async () => []),

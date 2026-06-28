@@ -31,7 +31,7 @@ if (!gotLock) {
       tokens,
       oidc: createOidcClient(),
       send,
-      makeClient: (info, s) => createSession({ info, send: s }),
+      makeClient: (opts) => createSession(opts),
       openExternal: (url) => void shell.openExternal(url),
     });
     registerIpc(() => manager?.getClient() ?? null);
