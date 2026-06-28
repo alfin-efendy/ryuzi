@@ -103,3 +103,5 @@ export interface ControlPlaneApi {
   requestApproval(req: { sessionPk: string; tool: string; input: unknown }): Promise<"allow" | "deny">;
   subscribe(handler: (e: CoreEvent) => void): Unsubscribe;
 }
+
+export * from "./wire";
