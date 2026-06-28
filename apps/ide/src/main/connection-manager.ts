@@ -15,12 +15,16 @@ interface Deps {
   send: (channel: string, payload: unknown) => void;
   makeClient: (info: RouterInfo, send: (c: string, p: unknown) => void) => ClientHandle;
   openExternal: (url: string) => void;
+  discoverLocal?: () => RouterInfo | null;
 }
 
 export class ConnectionManager {
   private handle: ClientHandle | null = null;
+  private discoverLocal: () => RouterInfo | null;
 
-  constructor(private d: Deps) {}
+  constructor(private d: Deps) {
+    this.discoverLocal = d.discoverLocal ?? discoverLocalRouter;
+  }
 
   getClient(): RemoteControlPlane | null {
     return this.handle?.client ?? null;
@@ -35,7 +39,8 @@ export class ConnectionManager {
   }
 
   async startup(): Promise<void> {
-    this.d.store.setLocal(discoverLocalRouter());
+    const localInfo = this.discoverLocal();
+    this.d.store.setLocal(localInfo ? { url: localInfo.url } : null);
     const activeId = this.d.store.getActiveId();
     const target = activeId ?? (this.d.store.get("local") ? "local" : null);
     if (target) await this.select(target).catch(() => {});
@@ -62,9 +67,7 @@ export class ConnectionManager {
     const p = this.d.store.get(profileId);
     if (!p) return null;
     if (p.authMode === "loopback") {
-      // For loopback, use the serve-token from discoverLocalRouter; fall back to empty string
-      // so the client can still be built when serve.json is temporarily unavailable.
-      return discoverLocalRouter()?.token ?? "";
+      return this.discoverLocal()?.token ?? null;
     }
     return this.d.tokens.getAccessToken(p.id, (rt) =>
       this.d.oidc.refresh({ issuer: p.oidc!.issuer, clientId: p.oidc!.clientId, scopes: p.oidc!.scopes }, rt),
