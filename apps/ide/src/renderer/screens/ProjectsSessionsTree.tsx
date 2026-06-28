@@ -1,6 +1,7 @@
 // apps/ide/src/renderer/screens/ProjectsSessionsTree.tsx
 import React from "react";
 import { useStore } from "../store";
+import { NewSessionDialog } from "./NewSessionDialog";
 
 export function ProjectsSessionsTree() {
   const projects = useStore((s) => s.projects);
@@ -11,7 +12,10 @@ export function ProjectsSessionsTree() {
     <div className="p-2 text-sm" data-testid="tree">
       {projects.map((p) => (
         <div key={p.projectId} className="mb-2">
-          <div className="font-medium">{p.name}</div>
+          <div className="flex items-center justify-between">
+            <span className="font-medium">{p.name}</span>
+            <NewSessionDialog projectId={p.projectId} />
+          </div>
           {sessions
             .filter((s) => s.projectId === p.projectId)
             .map((s) => (
