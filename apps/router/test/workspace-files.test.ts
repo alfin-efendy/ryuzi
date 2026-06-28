@@ -64,3 +64,47 @@ test("readFile truncates files over the cap", () => {
   expect(r.content.length).toBe(2 * 1024 * 1024);
   rmSync(root, { recursive: true, force: true });
 });
+
+test(".git subtree is blocked: readFile(.git/config) throws", () => {
+  const root = makeWorktree();
+  writeFileSync(join(root, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+  expect(() => readFile(root, ".git/config")).toThrow();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test(".git subtree is blocked: listDir(.git) throws", () => {
+  const root = makeWorktree();
+  expect(() => listDir(root, ".git")).toThrow();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("readFile detects invalid UTF-8 (no NUL) as binary", () => {
+  const root = makeWorktree();
+  // 0xff 0xfe 0x41 — invalid UTF-8 sequence, no NUL byte
+  writeFileSync(join(root, "latin.bin"), Buffer.from([0xff, 0xfe, 0x41]));
+  const r = readFile(root, "latin.bin");
+  expect(r.binary).toBe(true);
+  expect(r.encoding).toBe("base64");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("readFile returns utf8 for a normal text file (regression guard)", () => {
+  const root = makeWorktree();
+  const r = readFile(root, "README.md");
+  expect(r.binary).toBe(false);
+  expect(r.encoding).toBe("utf8");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("readFile missing path throws 'not found' without leaking absolute root", () => {
+  const root = makeWorktree();
+  let err: Error | undefined;
+  try {
+    readFile(root, "does/not/exist");
+  } catch (e) {
+    err = e as Error;
+  }
+  expect(err).toBeDefined();
+  expect(err!.message).not.toContain(root);
+  rmSync(root, { recursive: true, force: true });
+});
