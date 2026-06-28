@@ -113,6 +113,7 @@ export function createControlPlaneClient(opts: ClientOptions): RemoteControlPlan
       else if (frame.t === "approval.request") for (const cb of approvalCbs) cb(frame);
     };
     sock.onclose = () => {
+      ws = null;
       connId = null;
       setState("closed");
       if (!closedByUser && autoReconnect) {
@@ -136,7 +137,9 @@ export function createControlPlaneClient(opts: ClientOptions): RemoteControlPlan
       return connId;
     },
     connect: () => {
+      if (ws && ws.readyState < 2) return Promise.resolve();
       closedByUser = false;
+      attempt = 0;
       return openSocket();
     },
     close: () => {

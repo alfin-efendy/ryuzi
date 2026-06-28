@@ -54,6 +54,22 @@ test("connect performs hello handshake and forwards events", async () => {
   expect(events).toEqual(["status"]);
 });
 
+test("onConnectionChange emits connecting then open on connect()", async () => {
+  const states: string[] = [];
+  const client = createControlPlaneClient({
+    baseUrl: "http://router.test",
+    getToken: async () => "tok",
+    fetchImpl: ticketFetch(),
+    WebSocketImpl: FakeWS as unknown as typeof WebSocket,
+    autoReconnect: false,
+  });
+  client.onConnectionChange((s) => states.push(s));
+  await client.connect();
+  // FakeWS queues onopen via queueMicrotask; await a microtask turn to let it fire
+  await Bun.sleep(0);
+  expect(states).toEqual(["connecting", "open"]);
+});
+
 test("approval request is delivered and resolveApproval sends a frame", async () => {
   const reqs: string[] = [];
   const client = createControlPlaneClient({
