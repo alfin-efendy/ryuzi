@@ -9,7 +9,8 @@ export async function runHook(deps: {
     const sessionPk = deps.env.HARNESS_SESSION_PK;
     const parsed = JSON.parse(deps.input) as { tool_name?: string; tool_input?: unknown };
     if (url && sessionPk) {
-      const res = await deps.fetchFn(`${url}/approve`, {
+      // POST to the tokenized URL as-is — the token is the full path (see approval-server.ts)
+      const res = await deps.fetchFn(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ sessionPk, tool: parsed.tool_name ?? "", input: parsed.tool_input ?? {} }),

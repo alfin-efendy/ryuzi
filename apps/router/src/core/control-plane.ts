@@ -236,10 +236,7 @@ export class ControlPlane implements ControlPlaneApi {
       const rawTimeout = Number(this.deps.settings.get("approval_timeout_ms") ?? "300000");
       const timeoutMs = Number.isFinite(rawTimeout) ? rawTimeout : 300000;
 
-      const approverRoleIds = (this.deps.settings.get("approver_role_ids") ?? "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
+      const approverRoleIds = parseRoleIds(this.deps.settings.get("approver_role_ids"));
       const startedBy = session.startedBy;
 
       this.events.emit({ kind: "approval.requested", sessionPk: req.sessionPk, requestId, tool: req.tool, summary });
