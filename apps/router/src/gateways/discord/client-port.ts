@@ -68,6 +68,7 @@ export class DiscordClientPort implements DiscordPort {
             effort: interaction.options.getString("effort") ?? undefined,
             mode: interaction.options.getString("mode") ?? undefined,
           },
+          roleIds: interaction.member instanceof GuildMember ? [...interaction.member.roles.cache.keys()] : [],
         },
         async (text) => {
           await interaction.editReply(text);

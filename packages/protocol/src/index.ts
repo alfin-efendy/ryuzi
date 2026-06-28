@@ -87,6 +87,7 @@ export interface ConnectProjectRequest {
   name?: string;
   gitUrl?: string;
   settings?: ProjectSettings;
+  actorRoleIds?: string[];
 }
 
 // Client-facing API contract. All core methods are implemented.

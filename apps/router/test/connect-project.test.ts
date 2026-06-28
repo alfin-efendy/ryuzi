@@ -63,3 +63,44 @@ test("connectProject by gitUrl clones a local repo", async () => {
   expect(existsSync(join(p.workdir, ".git"))).toBe(true);
   expect(p.source).toBe(`${src}/.git`);
 });
+
+test("connectProject clamps bypassPermissions for a non-admin when admin roles are set", async () => {
+  const { cp, settings } = setup();
+  settings.set("admin_role_ids", "adminRole");
+  const p = await cp.connectProject({
+    gateway: "discord",
+    workspaceId: "chan-nonadmin",
+    actor: "u1",
+    name: "p1",
+    actorRoleIds: [],
+    settings: { permMode: "bypassPermissions" },
+  });
+  expect(p.permMode).toBe("default");
+});
+
+test("connectProject honors bypassPermissions for an admin", async () => {
+  const { cp, settings } = setup();
+  settings.set("admin_role_ids", "adminRole");
+  const p = await cp.connectProject({
+    gateway: "discord",
+    workspaceId: "chan-admin",
+    actor: "u2",
+    name: "p2",
+    actorRoleIds: ["adminRole"],
+    settings: { permMode: "bypassPermissions" },
+  });
+  expect(p.permMode).toBe("bypassPermissions");
+});
+
+test("connectProject: blank admin_role_ids means everyone may use bypassPermissions", async () => {
+  const { cp } = setup();
+  const p = await cp.connectProject({
+    gateway: "discord",
+    workspaceId: "chan-open",
+    actor: "u3",
+    name: "p3",
+    actorRoleIds: [],
+    settings: { permMode: "bypassPermissions" },
+  });
+  expect(p.permMode).toBe("bypassPermissions");
+});

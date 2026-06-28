@@ -37,15 +37,16 @@ export class Router {
   async onConnect(
     gatewayId: string,
     actor: string,
-    opts: { name?: string; gitUrl?: string; settings?: ProjectSettings },
-  ): Promise<{ workspaceId: string; project: Project }> {
+    opts: { name?: string; gitUrl?: string; settings?: ProjectSettings; actorRoleIds?: string[] },
+  ): Promise<{ workspaceId: string; project: Project; permModeDowngraded: boolean }> {
     const gw = this.core.gateways.get(gatewayId);
     if (!gw) throw new Error(`unknown gateway: ${gatewayId}`);
     const display = opts.name ?? (opts.gitUrl ? basename(opts.gitUrl).replace(/\.git$/, "") : undefined);
     if (!display) throw new Error("connect requires name or gitUrl");
     const workspaceId = await gw.createWorkspace(display);
     const project = await this.core.connectProject({ gateway: gatewayId, workspaceId, actor, ...opts });
-    return { workspaceId, project };
+    const permModeDowngraded = opts.settings?.permMode === "bypassPermissions" && project.permMode !== "bypassPermissions";
+    return { workspaceId, project, permModeDowngraded };
   }
 
   async onStart(gatewayId: string, workspaceId: string, actor: string, prompt: string): Promise<void> {
