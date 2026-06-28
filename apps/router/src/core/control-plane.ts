@@ -24,6 +24,8 @@ import { Registry } from "./registry";
 import { GatewayRegistry } from "./gateway-registry";
 import { EventBus } from "./events";
 import { resolveToolPolicy, summarizeTool } from "./permissions";
+import { listDir as wsListDir, readFile as wsReadFile } from "./workspace-files";
+import type { DirEntry, ReadFileResult } from "@harness/protocol";
 
 export interface WorktreeOps {
   pathFor: (workdirRoot: string, projectId: string, sessionPk: string) => string;
@@ -66,6 +68,16 @@ export class ControlPlane implements ControlPlaneApi {
   }
   listSessions(projectId?: string): Session[] {
     return this.deps.sessions.list(projectId);
+  }
+  async listDir(req: { sessionPk: string; path: string }): Promise<DirEntry[]> {
+    const session = this.deps.sessions.get(req.sessionPk);
+    if (!session?.worktreePath) throw new Error("session has no worktree");
+    return wsListDir(session.worktreePath, req.path);
+  }
+  async readFile(req: { sessionPk: string; path: string }): Promise<ReadFileResult> {
+    const session = this.deps.sessions.get(req.sessionPk);
+    if (!session?.worktreePath) throw new Error("session has no worktree");
+    return wsReadFile(session.worktreePath, req.path);
   }
   subscribe(handler: (e: CoreEvent) => void): Unsubscribe {
     return this.events.subscribe(handler);

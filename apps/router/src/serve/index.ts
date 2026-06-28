@@ -43,6 +43,10 @@ async function dispatch(cp: ControlPlane, method: RpcMethod, params: any, actor:
       return cp.stopSession(p.sessionPk);
     case "endSession":
       return cp.endSession(p.sessionPk, p.opts);
+    case "listDir":
+      return cp.listDir(p);
+    case "readFile":
+      return cp.readFile(p);
     default:
       throw new Error("unhandled method: " + method);
   }
