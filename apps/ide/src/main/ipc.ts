@@ -24,6 +24,8 @@ export function registerIpc(getClient: () => RemoteControlPlane | null): void {
   ipcMain.handle("resolveApproval", async (_e, requestId: string, decision: "allow" | "deny") => {
     getClient()?.resolveApproval(requestId, decision);
   });
+  ipcMain.handle("listDir", async (_e, req: { sessionPk: string; path: string }) => need().listDir(req));
+  ipcMain.handle("readFile", async (_e, req: { sessionPk: string; path: string }) => need().readFile(req));
 }
 
 export function registerConnectionIpc(manager: ConnectionManager): void {

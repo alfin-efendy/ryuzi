@@ -1,4 +1,15 @@
-import type { Project, Session, CoreEvent, StartSessionRequest, ContinueSessionRequest, ApprovalRequestFrame } from "@harness/protocol";
+import type {
+  Project,
+  Session,
+  CoreEvent,
+  StartSessionRequest,
+  ContinueSessionRequest,
+  ApprovalRequestFrame,
+  DirEntry,
+  ReadFileResult,
+} from "@harness/protocol";
+
+export type { DirEntry, ReadFileResult } from "@harness/protocol";
 
 export const IPC_COMMANDS = [
   "listProjects",
@@ -17,6 +28,8 @@ export const IPC_COMMANDS = [
   "selectConnection",
   "signIn",
   "signOut",
+  "listDir",
+  "readFile",
 ] as const;
 export type IpcCommand = (typeof IPC_COMMANDS)[number];
 
@@ -63,6 +76,8 @@ export interface HarnessBridge {
   signIn(id: string): Promise<void>;
   signOut(id: string): Promise<void>;
   onConnectionsChange(cb: (list: ConnectionSummary[]) => void): () => void;
+  listDir(req: { sessionPk: string; path: string }): Promise<DirEntry[]>;
+  readFile(req: { sessionPk: string; path: string }): Promise<ReadFileResult>;
 }
 
 declare global {

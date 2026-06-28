@@ -46,6 +46,8 @@ const bridge: HarnessBridge = {
     ipcRenderer.on(CONNECTIONS_CHANNEL, handler);
     return () => ipcRenderer.removeListener(CONNECTIONS_CHANNEL, handler);
   },
+  listDir: (req) => ipcRenderer.invoke("listDir", req),
+  readFile: (req) => ipcRenderer.invoke("readFile", req),
 };
 
 contextBridge.exposeInMainWorld("harness", bridge);

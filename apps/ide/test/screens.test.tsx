@@ -64,6 +64,13 @@ function makeHarness(): HarnessBridge {
     signIn: mock(async (_id: string) => undefined),
     signOut: mock(async (_id: string) => undefined),
     onConnectionsChange: mock((_cb: Parameters<HarnessBridge["onConnectionsChange"]>[0]) => () => {}),
+    listDir: mock(async (_req: { sessionPk: string; path: string }) => []),
+    readFile: mock(async (_req: { sessionPk: string; path: string }) => ({
+      content: "",
+      encoding: "utf8" as const,
+      binary: false,
+      truncated: false,
+    })),
   };
 }
 

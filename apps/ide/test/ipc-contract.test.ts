@@ -19,5 +19,7 @@ test("IPC_COMMANDS covers the 2a command surface", () => {
     "selectConnection",
     "signIn",
     "signOut",
+    "listDir",
+    "readFile",
   ]);
 });
