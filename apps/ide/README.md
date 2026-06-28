@@ -42,9 +42,34 @@ This milestone completes Plan 2 (the cockpit app). The cockpit now manages a lis
 
 **Test coverage:** unit tests mock the `OidcClient` seam and use a fake `Vault` (in-memory token store) — no display or IdP is required. The real OIDC browser flow (system browser ↔ IdP ↔ loopback callback) is verified by manual smoke test only; it cannot be automated in CI without a display and a live identity provider.
 
+### Workspace tools — Phase 3 / milestone 3a
+
+This milestone adds the read-only **Files** tab to a new resizable, tabbed **Right Panel** and relocates tool-approval cards inline into the session transcript.
+
+**Files tab — worktree browser + CodeMirror viewer:**
+
+- A lazy-loading directory tree lets you browse the active session's worktree.
+- Clicking a file opens it in a read-only [CodeMirror](https://codemirror.net/) viewer with syntax highlighting.
+- **Read-only — no editing or saving.** The viewer is intentionally non-editable.
+- Backed by two new RPCs (`listDir` / `readFile`) exposed on `ControlPlaneApi` and implemented in `@harness/client`.
+- **Path confinement:** every path is resolved via `realpathSync` and rejected if it escapes the worktree root; the `.git` directory is hidden from listings.
+- **2 MB cap:** files larger than 2 MB are refused; binary files are surfaced as a base64/placeholder message rather than raw bytes.
+
+**Inline approvals:**
+
+- Tool-approval cards (Allow / Deny + countdown timer) now appear **inline in the session transcript**, directly after the event that triggered them.
+- The separate right-rail `ApprovalsRail` component has been removed.
+
+**Upcoming tabs (disabled placeholders today):**
+
+- **Git review (3b)** — `gitStatus` / `getDiff` RPCs + read-only diff view.
+- **Terminal (3c)** — PTY over a dedicated WebSocket channel + xterm.js renderer.
+
 ## What is NOT built yet
 
-- **Monaco editor + xterm terminal** — future milestone (Phase 2 of the cockpit spec).
+- **Git review tab** — planned for Phase 3b (read-only diff; no write operations).
+- **Terminal tab** — planned for Phase 3c (PTY/xterm.js).
+- **File editing/saving** — the Files tab is intentionally read-only; no `writeFile` RPC exists.
 - **Multi-org / multi-active connections** — currently a single active connection at a time.
 - **Remote settings editing** — reading and writing router config from the cockpit.
 
