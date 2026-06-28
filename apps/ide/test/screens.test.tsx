@@ -1,8 +1,12 @@
 // apps/ide/test/screens.test.tsx
-import { test, expect, mock, beforeAll } from "bun:test";
+import { test, expect, mock, beforeAll, afterAll } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 beforeAll(() => {
   if (!globalThis.document) GlobalRegistrator.register();
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+});
+afterAll(() => {
+  GlobalRegistrator.unregister();
 });
 
 import React from "react";
