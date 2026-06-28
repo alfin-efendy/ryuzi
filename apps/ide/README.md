@@ -1,8 +1,8 @@
-# @harness/ide — Electron Cockpit (milestone 2b)
+# @harness/ide — Electron Cockpit (milestone 2c)
 
 `@harness/ide` is an Electron desktop app that connects to a locally running `hr serve` instance and provides a visual cockpit for managing Claude Code sessions.
 
-## What's built (milestone 2b)
+## What's built (milestone 2c)
 
 ### Milestone 2a
 
@@ -20,9 +20,33 @@
 - **"+ Connect project" dialog:** a dialog in the left pane lets the user link a workspace to the router by entering a git URL or a local directory name; the IPC bridge calls `connectProject` which invokes `@harness/client` with the `ide` gateway and the current workspace ID.
 - **Per-project "+ New session" dialog:** each project in the tree exposes a button that opens a dialog to start a new session, pre-scoped to that project.
 
+### Milestone 2c — Cloud connections (OIDC + keychain + profiles)
+
+This milestone completes Plan 2 (the cockpit app). The cockpit now manages a list of **connection profiles** — a synthetic local profile (the auto-discovered `hr serve` instance) plus any number of user-added remote router profiles — and lets the user switch the single active connection at any time.
+
+**Connection management (main process):**
+
+- **ConnectionsStore** — persists connection profiles to `~/.local/share/harness-router/connections.json`. Each profile carries a name, URL, and auth mode (`local` or `oidc`).
+- **TokenStore + safeStorage** — OIDC access/refresh tokens are stored in the OS keychain via Electron's `safeStorage` API (AES-256 encryption backed by the platform secret service / Keychain / DPAPI). Tokens are loaded on startup, refreshed silently before expiry, and cleared on sign-out.
+- **OIDC Authorization Code + PKCE (RFC 8252 loopback redirect)** — signing in to a remote router opens the system browser at the IdP's authorization URL. A short-lived local HTTP server on a random port receives the callback, exchanges the code for tokens via `openid-client`, and shuts down. No custom URI scheme is used.
+- **ConnectionManager** — owns the active `@harness/client` instance; handles `select`, `add`, `remove`, `signIn`, and `signOut` commands, rebuilding the client whenever the active profile changes.
+- **IPC surface** — six typed commands (`CONNECTIONS_CHANNEL`: `listConnections`, `addConnection`, `removeConnection`, `selectConnection`, `signIn`, `signOut`) plus a push event that streams `ConnectionSummary[]` snapshots to the renderer after every state change.
+
+**Renderer:**
+
+- **ConnectionsStore (Zustand)** — mirrors the main-process summary list and the active connection ID; updated via the IPC push event.
+- **ConnectionsDialog** — lets the user view all profiles, switch the active connection, add a new remote (name + URL), sign in / sign out of remote profiles, and remove profiles.
+- **TopBar trigger** — a "Connections" button in the top bar opens the dialog; the active connection name is displayed next to it.
+
+**No-keyring limitation (Linux):** on a bare Linux system without a running secret-service (e.g. headless CI, plain WSL), `safeStorage` is unavailable. In that case the app falls back to session-only token storage: tokens are held in memory for the lifetime of the process and are never written to disk in plaintext. Re-authentication is required on every launch; no credentials are persisted.
+
+**Test coverage:** unit tests mock the `OidcClient` seam and use a fake `Vault` (in-memory token store) — no display or IdP is required. The real OIDC browser flow (system browser ↔ IdP ↔ loopback callback) is verified by manual smoke test only; it cannot be automated in CI without a display and a live identity provider.
+
 ## What is NOT built yet
 
-- **Cloud OIDC connections** (milestone 2c) — only loopback bearer-token auth is wired; no PKCE browser flow or keychain storage.
+- **Monaco editor + xterm terminal** — future milestone (Phase 2 of the cockpit spec).
+- **Multi-org / multi-active connections** — currently a single active connection at a time.
+- **Remote settings editing** — reading and writing router config from the cockpit.
 
 ## Prerequisites
 
@@ -51,6 +75,6 @@ bun run start   # launch Electron against an existing dist/
 bun test   # runs the full monorepo suite including IDE unit + component tests
 ```
 
-Covered: `discoverLocalRouter`, IPC handlers, zustand store reducers, `ProjectsSessionsTree` / `SessionTranscript` / `TopBar` component rendering, `ApprovalsRail` (card rendering + countdown + Allow/Deny interaction), `ConnectProjectDialog`, and `NewSessionDialog`.
+Covered: `discoverLocalRouter`, IPC handlers, zustand store reducers, `ProjectsSessionsTree` / `SessionTranscript` / `TopBar` component rendering, `ApprovalsRail` (card rendering + countdown + Allow/Deny interaction), `ConnectProjectDialog`, `NewSessionDialog`, `ConnectionsStore` (CRUD + persistence), `TokenStore` (save / load / clear / refresh with a fake `Vault`), loopback OIDC flow (`runLoopbackAuth` with a mock `OidcClient`), `ConnectionManager` (select / signIn / signOut / add / remove), `ConnectionsDialog` rendering + IPC call-arg assertions, and the 2c renderer Zustand store.
 
-> **Note:** the GUI has not been headless-smoke-tested end-to-end; unit and component tests cover rendering and IPC call-arg assertions.
+> **Note:** the GUI has not been headless-smoke-tested end-to-end; unit and component tests cover rendering and IPC call-arg assertions. The real OIDC browser flow requires a display and a live IdP and is verified by manual smoke test only.
