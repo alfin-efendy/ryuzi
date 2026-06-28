@@ -1,12 +1,15 @@
 import React, { useState } from "react";
 import { Box, Text, useInput } from "ink";
 import type { AppController } from "../controller";
-import { theme } from "../theme";
+import { Panel } from "../components/panel";
+import { Badge } from "../components/badge";
+import { palette, symbols } from "../theme";
 
 export function SessionsTab({ controller }: { controller: AppController }) {
   const sessions = controller.sessions();
   const [idx, setIdx] = useState(0);
   const [open, setOpen] = useState(false);
+  const s = symbols();
 
   useInput((_in, key) => {
     if (open) {
@@ -19,33 +22,44 @@ export function SessionsTab({ controller }: { controller: AppController }) {
   });
 
   if (sessions.length === 0) {
-    return <Text color={theme.dim}>no sessions yet — start the daemon and run from Discord</Text>;
+    return (
+      <Panel title="Sessions">
+        <Text color={palette.dim}>no sessions yet — start the daemon and run from Discord</Text>
+      </Panel>
+    );
   }
   const sel = sessions[Math.max(0, Math.min(idx, sessions.length - 1))];
-  if (!sel) return <Text color={theme.dim}>no sessions yet — start the daemon and run from Discord</Text>;
+  if (!sel) {
+    return (
+      <Panel title="Sessions">
+        <Text color={palette.dim}>no sessions yet — start the daemon and run from Discord</Text>
+      </Panel>
+    );
+  }
   if (open) {
     return (
-      <Box flexDirection="column">
-        <Text bold>{sel.title ?? sel.sessionPk.slice(0, 8)}</Text>
-        <Text color={theme.dim}>
+      <Panel title={sel.title ?? sel.sessionPk.slice(0, 8)} focus>
+        <Text color={palette.dim}>
           project {sel.projectId} · {sel.status} · by {sel.startedBy ?? "?"}
         </Text>
         <Box marginTop={1}>
           <Text>{sel.lastText ?? "(no output captured)"}</Text>
         </Box>
-        <Text color={theme.dim}>Esc back</Text>
-      </Box>
+      </Panel>
     );
   }
   return (
-    <Box flexDirection="column">
-      {sessions.map((s, i) => (
-        <Text key={s.sessionPk} color={i === idx ? theme.accent : theme.text}>
-          {i === idx ? "› " : "  "}
-          {(s.title ?? s.sessionPk.slice(0, 8)).padEnd(28)} {s.status}
-        </Text>
-      ))}
-      <Text color={theme.dim}>↑↓ select · Enter open</Text>
-    </Box>
+    <Panel title="Sessions" focus>
+      {sessions.map((row, i) => {
+        const selected = i === idx;
+        return (
+          <Box key={row.sessionPk}>
+            <Text color={palette.signature}>{selected ? s.marker + " " : "  "}</Text>
+            <Text color={selected ? palette.text : palette.dim}>{(row.title ?? row.sessionPk.slice(0, 8)).padEnd(28)}</Text>
+            <Badge tone={row.status === "running" ? "ok" : "dim"}> {row.status}</Badge>
+          </Box>
+        );
+      })}
+    </Panel>
   );
 }

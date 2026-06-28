@@ -1,18 +1,34 @@
 import React, { useEffect, useReducer, useState } from "react";
-import { Box, Text, useApp, useInput } from "ink";
+import { Box, useApp, useInput } from "ink";
 import type { AppController } from "./controller";
 import { useController } from "./use-controller";
-import { TabBar } from "./components/tab-bar";
+import { Header } from "./components/header";
+import { StatusBar, type Hint } from "./components/status-bar";
 import { OptionsOverlay } from "./components/options-overlay";
 import { StatusTab } from "./tabs/status";
 import { DaemonTab } from "./tabs/daemon";
 import { SessionsTab } from "./tabs/sessions";
 import { ConfigTab } from "./tabs/config";
 import { Wizard } from "./wizard";
-import { theme } from "./theme";
-import { brandGlyph, brandName } from "../brand";
 
 const TABS = ["Status", "Daemon", "Sessions", "Config"] as const;
+
+function hintsFor(active: number, daemonRunning: boolean): Hint[] {
+  const base: Hint[] = [{ k: "Tab", label: "switch" }];
+  const perTab: Hint[][] = [
+    [],
+    [{ k: "s", label: daemonRunning ? "stop" : "start" }],
+    [
+      { k: "↑↓", label: "select" },
+      { k: "Enter", label: "open" },
+    ],
+    [
+      { k: "↑↓", label: "select" },
+      { k: "Enter", label: "edit" },
+    ],
+  ];
+  return [...base, ...(perTab[active] ?? []), { k: "?", label: "options" }, { k: "q", label: "quit" }];
+}
 
 export function App({ controller }: { controller: AppController }) {
   useController(controller);
@@ -30,30 +46,12 @@ export function App({ controller }: { controller: AppController }) {
 
   useInput(
     (input, key) => {
-      if (input === "q") {
-        exit();
-        return;
-      }
-      if (input === "?") {
-        setShowOptions((v) => !v);
-        return;
-      }
-      if (key.tab || key.rightArrow) {
-        setActive((a) => (a + 1) % TABS.length);
-        return;
-      }
-      if (key.leftArrow) {
-        setActive((a) => (a - 1 + TABS.length) % TABS.length);
-        return;
-      }
-      if (/^[1-4]$/.test(input)) {
-        setActive(Number(input) - 1);
-        return;
-      }
-      if (input === "s" && active === 1) {
-        void controller.toggleDaemon();
-        return;
-      }
+      if (input === "q") return void exit();
+      if (input === "?") return void setShowOptions((v) => !v);
+      if (key.tab || key.rightArrow) return void setActive((a) => (a + 1) % TABS.length);
+      if (key.leftArrow) return void setActive((a) => (a - 1 + TABS.length) % TABS.length);
+      if (/^[1-4]$/.test(input)) return void setActive(Number(input) - 1);
+      if (input === "s" && active === 1) return void controller.toggleDaemon();
     },
     { isActive: mode === "dashboard" && !editing },
   );
@@ -64,28 +62,19 @@ export function App({ controller }: { controller: AppController }) {
 
   return (
     <Box flexDirection="column" padding={1}>
-      <Box>
-        <Text bold color={theme.accent}>
-          {brandGlyph}
-        </Text>
-        <Text bold> {brandName}</Text>
-        <Text color={theme.dim}> hr</Text>
+      <Header tabs={[...TABS]} active={active} />
+      <Box marginY={1} flexDirection="column">
+        {active === 0 && <StatusTab controller={controller} />}
+        {active === 1 && <DaemonTab controller={controller} />}
+        {active === 2 && <SessionsTab controller={controller} />}
+        {active === 3 && <ConfigTab controller={controller} setEditing={setEditing} />}
       </Box>
-      <Box marginY={1}>
-        <TabBar tabs={[...TABS]} active={active} />
-      </Box>
-      {active === 0 && <StatusTab controller={controller} />}
-      {active === 1 && <DaemonTab controller={controller} />}
-      {active === 2 && <SessionsTab controller={controller} />}
-      {active === 3 && <ConfigTab controller={controller} setEditing={setEditing} />}
       {showOptions && (
-        <Box marginTop={1}>
+        <Box marginBottom={1}>
           <OptionsOverlay />
         </Box>
       )}
-      <Box marginTop={1}>
-        <Text color={theme.dim}>Tab switch · ? options · q quit</Text>
-      </Box>
+      <StatusBar hints={hintsFor(active, controller.daemon().running)} />
     </Box>
   );
 }

@@ -3,7 +3,8 @@ import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
 import type { AppController } from "../controller";
 import type { ConfigField } from "../../../providers/types";
-import { theme } from "../theme";
+import { Panel } from "../components/panel";
+import { palette, symbols } from "../theme";
 
 type Row =
   | { kind: "header"; label: string }
@@ -72,19 +73,19 @@ export function ConfigTab({ controller, setEditing }: { controller: AppControlle
   );
 
   return (
-    <Box flexDirection="column">
+    <Panel title="Configuration" focus>
       {rows.map((r, i) => {
         if (r.kind === "header")
           return (
-            <Text key={`h${i}`} bold color={theme.accent}>
+            <Text key={`h${i}`} bold color={palette.signature}>
               {r.label}
             </Text>
           );
         const sel = i === curRowIdx;
         if (r.kind === "toggle") {
           return (
-            <Text key={`t${i}`} color={sel ? theme.accent : theme.dim}>
-              {sel ? "› " : "  "}[{r.on ? "x" : " "}] {r.label}
+            <Text key={`t${i}`} color={sel ? palette.signature : palette.dim}>
+              {sel ? `${symbols().caret} ` : "  "}[{r.on ? "x" : " "}] {r.label}
             </Text>
           );
         }
@@ -94,7 +95,7 @@ export function ConfigTab({ controller, setEditing }: { controller: AppControlle
         if (sel && editing) {
           return (
             <Box key={`f${i}`}>
-              <Text color={theme.accent}>{"› " + f.label.padEnd(22)}</Text>
+              <Text color={palette.signature}>{`${symbols().caret} ` + f.label.padEnd(22)}</Text>
               <TextInput
                 value={draft}
                 onChange={setDraft}
@@ -116,11 +117,11 @@ export function ConfigTab({ controller, setEditing }: { controller: AppControlle
         return (
           <Box key={`f${i}`} flexDirection="column">
             <Box>
-              <Text color={sel ? theme.accent : theme.dim}>{(sel ? "› " : "  ") + f.label.padEnd(22)}</Text>
+              <Text color={sel ? palette.signature : palette.dim}>{(sel ? `${symbols().caret} ` : "  ") + f.label.padEnd(22)}</Text>
               <Text>{shown}</Text>
             </Box>
             {sel && (
-              <Text color={theme.dim}>
+              <Text color={palette.dim}>
                 {" "}
                 {f.help}
                 {f.example ? `  (e.g. ${f.example})` : ""}
@@ -129,9 +130,13 @@ export function ConfigTab({ controller, setEditing }: { controller: AppControlle
           </Box>
         );
       })}
-      {error && <Text color={theme.bad}>✗ {error}</Text>}
-      <Text color={theme.dim}>↑↓ select · Enter edit · Space toggle provider · Esc cancel</Text>
-    </Box>
+      {error && (
+        <Text color={palette.bad}>
+          {symbols().bad} {error}
+        </Text>
+      )}
+      <Text color={palette.dim}>↑↓ select · Enter edit · Space toggle provider · Esc cancel</Text>
+    </Panel>
   );
 }
 

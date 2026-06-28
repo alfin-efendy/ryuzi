@@ -26,7 +26,7 @@ function configured() {
 test("unconfigured app starts in the wizard", async () => {
   const f = render(<App controller={ctl()} />);
   await flush();
-  expect(f.lastFrame()).toContain("hr setup");
+  expect(f.lastFrame()).toContain("Harness Router · setup");
 });
 
 test("configured app shows the dashboard and switches tabs", async () => {
@@ -35,8 +35,8 @@ test("configured app shows the dashboard and switches tabs", async () => {
   expect(lastFrame()).toContain("マ Harness Router");
   expect(lastFrame()).toContain("Status");
   stdin.write("2");
-  await flush(); // jump to Daemon tab
-  expect(lastFrame()).toContain("press s to start");
+  await flush();
+  expect(lastFrame()).toContain("start"); // status bar shows "s start" on the Daemon tab
 });
 
 test("? toggles the options overlay", async () => {

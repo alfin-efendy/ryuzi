@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Box, Text, useInput } from "ink";
-import { theme } from "../theme";
+import { palette, symbols } from "../theme";
 
 export interface MultiSelectItem {
   id: string;
@@ -20,6 +20,7 @@ export function MultiSelectList({
   renderRight?: (id: string) => string;
 }) {
   const [idx, setIdx] = useState(0);
+  const s = symbols();
   useInput((input, key) => {
     if (key.upArrow) setIdx((i) => (i > 0 ? i - 1 : items.length - 1));
     else if (key.downArrow) setIdx((i) => (i < items.length - 1 ? i + 1 : 0));
@@ -29,9 +30,10 @@ export function MultiSelectList({
     <Box flexDirection="column">
       {items.map((it, i) => {
         const right = renderRight?.(it.id) ?? "";
+        const cur = i === idx;
         return (
-          <Text key={it.id} color={i === idx ? theme.accent : theme.text}>
-            {i === idx ? "› " : "  "}[{selected.has(it.id) ? "x" : " "}] {it.label}
+          <Text key={it.id} color={cur ? palette.signature : palette.text}>
+            {cur ? s.caret + " " : "  "}[{selected.has(it.id) ? "x" : " "}] {it.label}
             {it.description ? ` — ${it.description}` : ""}
             {right ? `  ${right}` : ""}
           </Text>
