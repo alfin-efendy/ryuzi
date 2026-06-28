@@ -19,6 +19,7 @@ interface CockpitState {
   applyEvent: (e: CoreEvent) => void;
   addApproval: (r: ApprovalRequestFrame) => void;
   removeApproval: (requestId: string) => void;
+  clearApprovals: () => void;
 }
 
 export const useStore = create<CockpitState>((set) => ({
@@ -49,4 +50,5 @@ export const useStore = create<CockpitState>((set) => ({
     set((st) => ({
       pendingApprovals: st.pendingApprovals.filter((a) => a.requestId !== requestId),
     })),
+  clearApprovals: () => set({ pendingApprovals: [] }),
 }));

@@ -73,6 +73,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { useStore } from "../src/renderer/store";
 import { ConnectProjectDialog } from "../src/renderer/screens/ConnectProjectDialog";
+import { NewSessionDialog } from "../src/renderer/screens/NewSessionDialog";
 
 function props(el: Element) {
   const k = Object.keys(el).find((x) => x.startsWith("__reactProps$"))!;
@@ -80,7 +81,7 @@ function props(el: Element) {
 }
 
 beforeEach(() => {
-  useStore.setState({ projects: [] });
+  useStore.setState({ projects: [], sessions: [], activeSessionPk: null, connId: "conn-1" });
   (window as any).harness = {
     connectProject: mock(async (input: any) => ({
       projectId: "p1",
@@ -91,7 +92,57 @@ beforeEach(() => {
       ...input,
     })),
     listProjects: mock(async () => [{ projectId: "p1", name: "y", workdir: "/w", harness: "fake", permMode: "default" }]),
+    startSession: mock(async (_input: any) => ({ sessionPk: "sess-1" })),
+    listSessions: mock(async () => []),
   };
+});
+
+test("NewSessionDialog shows inline error and stays open when startSession rejects", async () => {
+  (window as any).harness.startSession = mock(async () => {
+    throw new Error("gateway unavailable");
+  });
+
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+
+  // Render with dialog open by wrapping in a controlled parent
+  await act(async () => {
+    root.render(<NewSessionDialog projectId="p1" />);
+  });
+
+  // Open the dialog via the trigger button
+  const trigger = [...document.body.querySelectorAll("button")].find((b) => /new session/i.test(b.textContent ?? ""))!;
+  await act(async () => {
+    props(trigger).onClick({ preventDefault() {} });
+  });
+
+  // Type a prompt
+  const input = document.body.querySelector("input")!;
+  await act(async () => {
+    props(input).onChange({ target: { value: "do something" } });
+  });
+
+  // Click Start
+  const startBtn = [...document.body.querySelectorAll("button")].find((b) => /start/i.test(b.textContent ?? ""))!;
+  await act(async () => {
+    props(startBtn).onClick({ preventDefault() {} });
+  });
+
+  // Error message should be visible
+  const errorEl = document.body.querySelector("p.text-xs");
+  expect(errorEl?.textContent).toBe("gateway unavailable");
+
+  // Dialog should still be open — the input is still present
+  expect(document.body.querySelector("input")).not.toBeNull();
+
+  // setActive should NOT have been called
+  expect(useStore.getState().activeSessionPk).toBeNull();
+
+  await act(async () => {
+    root.unmount();
+  });
+  container.remove();
 });
 
 test("ConnectProjectDialog submits gitUrl and refreshes projects", async () => {

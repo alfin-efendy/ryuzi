@@ -18,3 +18,9 @@ test("addApproval appends, removeApproval filters by requestId", () => {
   useStore.getState().removeApproval("r1");
   expect(useStore.getState().pendingApprovals.map((a) => a.requestId)).toEqual(["r2"]);
 });
+
+test("clearApprovals empties pendingApprovals", () => {
+  useStore.setState({ pendingApprovals: [frame("r1"), frame("r2")] });
+  useStore.getState().clearApprovals();
+  expect(useStore.getState().pendingApprovals).toEqual([]);
+});
