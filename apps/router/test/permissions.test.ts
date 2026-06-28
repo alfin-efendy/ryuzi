@@ -12,7 +12,7 @@ test("resolveToolPolicy by mode and tool", () => {
 
 test("canApprove gating", () => {
   expect(canApprove({ clickerRoleIds: [], approverRoleIds: [], isStarter: true })).toBe(true);
-  expect(canApprove({ clickerRoleIds: [], approverRoleIds: [], isStarter: false })).toBe(true); // none configured
+  expect(canApprove({ clickerRoleIds: [], approverRoleIds: [], isStarter: false })).toBe(false); // none configured => only starter
   expect(canApprove({ clickerRoleIds: ["r1"], approverRoleIds: ["r1"], isStarter: false })).toBe(true);
   expect(canApprove({ clickerRoleIds: ["r2"], approverRoleIds: ["r1"], isStarter: false })).toBe(false);
 });

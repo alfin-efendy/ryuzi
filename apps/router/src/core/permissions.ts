@@ -13,13 +13,13 @@ export function resolveToolPolicy(permMode: PermMode, toolName: string): ToolDec
 }
 
 /**
- * Whether a clicker may approve a tool. Starter always may. If NO approver roles are
- * configured, ANY thread participant may approve (by design — roles are optional gating).
+ * Whether a clicker may approve a tool. The session starter always may. If NO
+ * approver roles are configured, only the starter may approve (safe-by-default).
  * Otherwise the clicker must hold one of the approver roles.
  */
 export function canApprove(o: { clickerRoleIds: string[]; approverRoleIds: string[]; isStarter: boolean }): boolean {
   if (o.isStarter) return true;
-  if (o.approverRoleIds.length === 0) return true;
+  if (o.approverRoleIds.length === 0) return false;
   return o.clickerRoleIds.some((r) => o.approverRoleIds.includes(r));
 }
 
