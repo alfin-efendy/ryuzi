@@ -1,6 +1,6 @@
 // apps/router/src/cli/serve-command.ts
 import { dirname, join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { buildDaemon } from "./start-command";
 import { startServeServer } from "../serve/index";
 import { SettingsStore } from "../config/store";
@@ -21,6 +21,24 @@ export function ensureLocalToken(dbPath: string): string {
   return token;
 }
 
+export function serveInfoPath(dbPath: string): string {
+  return join(dirname(dbPath), "serve.json");
+}
+
+export function writeServeInfo(dbPath: string, info: { url: string; token: string }): void {
+  const p = serveInfoPath(dbPath);
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(info), { mode: 0o600 });
+}
+
+export function removeServeInfo(dbPath: string): void {
+  try {
+    rmSync(serveInfoPath(dbPath), { force: true });
+  } catch {
+    // best-effort cleanup
+  }
+}
+
 export async function cmdServe(_args: string[], deps: CliDeps): Promise<number> {
   const db = openDb(deps.dbPath);
   const settings = new SettingsStore(db);
@@ -31,10 +49,12 @@ export async function cmdServe(_args: string[], deps: CliDeps): Promise<number> 
   const port = Number(settings.get("serve.port") ?? "8787");
   const localToken = ensureLocalToken(deps.dbPath);
   const server = startServeServer(daemon.cp, { settings, host, port, localToken });
+  writeServeInfo(deps.dbPath, { url: server.url, token: localToken });
 
   deps.io.out(`serve: listening on ${server.url} (auth: ${settings.get("serve.auth_mode") ?? "loopback"})`);
 
   const shutdown = () => {
+    removeServeInfo(deps.dbPath);
     server.stop();
     void daemon.stop();
   };
