@@ -15,6 +15,8 @@ import type {
   ClientFrame,
   ApprovalRequestFrame,
   WsTicketResponse,
+  DirEntry,
+  ReadFileResult,
 } from "@harness/protocol";
 
 export type ConnState = "connecting" | "open" | "closed";
@@ -38,6 +40,8 @@ export interface RemoteControlPlane {
   connectProject(req: ConnectProjectRequest): Promise<Project>;
   stopSession(sessionPk: string): Promise<void>;
   endSession(sessionPk: string, opts?: { keepBranch?: boolean }): Promise<void>;
+  listDir(req: { sessionPk: string; path: string }): Promise<DirEntry[]>;
+  readFile(req: { sessionPk: string; path: string }): Promise<ReadFileResult>;
   connId: string | null;
   connect(): Promise<void>;
   close(): void;
@@ -133,6 +137,8 @@ export function createControlPlaneClient(opts: ClientOptions): RemoteControlPlan
     connectProject: (req) => rpc("connectProject", req),
     stopSession: (sessionPk) => rpc("stopSession", { sessionPk }).then(() => undefined),
     endSession: (sessionPk, options) => rpc("endSession", { sessionPk, opts: options }).then(() => undefined),
+    listDir: (req) => rpc("listDir", req),
+    readFile: (req) => rpc("readFile", req),
     get connId() {
       return connId;
     },
