@@ -19,9 +19,7 @@ export interface RpcRequest {
   params?: unknown;
 }
 
-export type RpcResponse =
-  | { id: string; ok: true; result: unknown }
-  | { id: string; ok: false; error: string };
+export type RpcResponse = { id: string; ok: true; result: unknown } | { id: string; ok: false; error: string };
 
 // Named so @harness/client can reference the same shape. Distinct from the
 // in-process `ApprovalRequest` interface in index.ts (which has no `t`/`sessionPk`).
@@ -34,15 +32,9 @@ export interface ApprovalRequestFrame {
   timeoutMs: number;
 }
 
-export type ServerFrame =
-  | { t: "hello"; connId: string }
-  | { t: "event"; event: CoreEvent }
-  | ApprovalRequestFrame
-  | { t: "pong" };
+export type ServerFrame = { t: "hello"; connId: string } | { t: "event"; event: CoreEvent } | ApprovalRequestFrame | { t: "pong" };
 
-export type ClientFrame =
-  | { t: "approval.resolve"; requestId: string; decision: "allow" | "deny" }
-  | { t: "ping" };
+export type ClientFrame = { t: "approval.resolve"; requestId: string; decision: "allow" | "deny" } | { t: "ping" };
 
 export interface WsTicketResponse {
   ticket: string;
