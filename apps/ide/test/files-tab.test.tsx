@@ -6,7 +6,12 @@ import { GlobalRegistrator } from "@happy-dom/global-registrator";
 mock.module("@uiw/react-codemirror", () => {
   const React = require("react");
   return {
-    default: (props: any) => React.createElement("pre", { "data-testid": "cm", "data-readonly": String(props.readOnly) }, props.value),
+    default: (props: any) =>
+      React.createElement(
+        "pre",
+        { "data-testid": "cm", "data-readonly": String(props.readOnly), "data-editable": String(props.editable) },
+        props.value,
+      ),
   };
 });
 mock.module("@uiw/codemirror-extensions-langs", () => ({ loadLanguage: () => null }));
@@ -71,7 +76,10 @@ test("renders the worktree root tree and opens a file on click", async () => {
   });
   await act(async () => {}); // flush any remaining microtasks/state updates
   expect((window as any).harness.readFile).toHaveBeenCalledWith({ sessionPk: "s1", path: "README.md" });
-  expect(el.querySelector("[data-testid=cm]")?.textContent).toBe("# hi");
+  const cmEl = el.querySelector("[data-testid=cm]")!;
+  expect(cmEl.textContent).toBe("# hi");
+  expect(cmEl.getAttribute("data-readonly")).toBe("true");
+  expect(cmEl.getAttribute("data-editable")).toBe("false");
 });
 
 test("empty state when no active session", async () => {
