@@ -34,5 +34,9 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "include": ["apps", "packages"]
+  // apps/ide is a DOM/renderer app (needs the DOM lib); it is typechecked on its
+  // own via `tsc -p apps/ide/tsconfig.json` so the server stays Bun-pure here
+  // (the DOM lib's ReadableStream is not async-iterable and would break the harness).
+  "include": ["apps", "packages"],
+  "exclude": ["apps/ide", "**/node_modules", "**/dist"]
 }

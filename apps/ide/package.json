@@ -1,5 +1,22 @@
 {
   "name": "@harness/ide",
   "private": true,
-  "type": "module"
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "dev": "bun run scripts/dev.ts",
+    "start": "electron dist/main/index.js"
+  },
+  "dependencies": {
+    "@harness/client": "workspace:*",
+    "@harness/protocol": "workspace:*",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zustand": "^5.0.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0"
+  }
 }

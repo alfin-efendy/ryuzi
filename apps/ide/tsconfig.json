@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    // A child `paths` replaces the parent's, so re-declare the workspace maps
+    // (relative to this file) alongside the renderer `@/` alias.
+    "paths": {
+      "@/*": ["./src/renderer/*"],
+      "@harness/protocol": ["../../packages/protocol/src/index.ts"],
+      "@harness/client": ["../../packages/client/src/index.ts"]
+    }
+  },
+  // Override the root's `exclude: ["apps/ide", ...]` (inherited via extends),
+  // which would otherwise exclude this app's own sources.
+  "exclude": [],
+  "include": ["src", "scripts", "test"]
+}
