@@ -20,12 +20,11 @@ export function DaemonTab({ controller }: { controller: AppController }) {
     <Box flexDirection="column">
       <Panel title="Daemon" focus>
         <Box>
-          {d.starting ? (
-            <Badge tone="warn">● connecting…</Badge>
-          ) : (
-            <StatusDot on={d.running} label={d.running ? "running" : "stopped"} />
-          )}
-          <Text color={palette.dim}>{"    uptime "}{uptime(d.startedAt)}</Text>
+          {d.starting ? <Badge tone="warn">● connecting…</Badge> : <StatusDot on={d.running} label={d.running ? "running" : "stopped"} />}
+          <Text color={palette.dim}>
+            {"    uptime "}
+            {uptime(d.startedAt)}
+          </Text>
         </Box>
         {d.lastError && <Text color={palette.bad}>error {d.lastError}</Text>}
       </Panel>

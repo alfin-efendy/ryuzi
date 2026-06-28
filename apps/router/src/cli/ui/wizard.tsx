@@ -69,7 +69,9 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
     const items = controller.gatewayDescriptors().map((g) => ({ id: g.id, label: g.label, description: g.description }));
     return (
       <Box flexDirection="column" padding={1}>
-        <Text bold><Text color={palette.signature}>{symbols().glyph}</Text> {brandName} · setup</Text>
+        <Text bold>
+          <Text color={palette.signature}>{symbols().glyph}</Text> {brandName} · setup
+        </Text>
         <Panel title="Choose gateways">
           <Text color={palette.dim}>Space toggles · Enter continues · Esc cancels · pick at least one</Text>
           <Box marginTop={1}>
@@ -83,7 +85,9 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
     const items = controller.runtimeDescriptors().map((r) => ({ id: r.id, label: r.label, description: r.description }));
     return (
       <Box flexDirection="column" padding={1}>
-        <Text bold><Text color={palette.signature}>{symbols().glyph}</Text> {brandName} · setup</Text>
+        <Text bold>
+          <Text color={palette.signature}>{symbols().glyph}</Text> {brandName} · setup
+        </Text>
         <Panel title="Choose runtimes">
           <Text color={palette.dim}>Space toggles · Enter continues · Esc cancels · pick at least one</Text>
           <Box marginTop={1}>
@@ -114,7 +118,9 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
   };
   return (
     <Box flexDirection="column" padding={1}>
-      <Text bold><Text color={palette.signature}>{symbols().glyph}</Text> {brandName} · setup</Text>
+      <Text bold>
+        <Text color={palette.signature}>{symbols().glyph}</Text> {brandName} · setup
+      </Text>
       <Panel title={`Settings (${fieldIdx + 1}/${fields.length})`}>
         <Text>{f.label}</Text>
         <Text color={palette.dim}>
@@ -125,7 +131,11 @@ export function Wizard({ controller, onDone }: { controller: AppController; onDo
           <Text>{"› "}</Text>
           <TextInput value={draft} onChange={setDraft} onSubmit={submit} mask={f.secret ? "•" : undefined} />
         </Box>
-        {error && <Text color={palette.bad}>{symbols().bad} {error}</Text>}
+        {error && (
+          <Text color={palette.bad}>
+            {symbols().bad} {error}
+          </Text>
+        )}
       </Panel>
     </Box>
   );

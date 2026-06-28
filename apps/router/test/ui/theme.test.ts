@@ -1,11 +1,11 @@
 // apps/router/test/ui/theme.test.ts
 import { test, expect } from "bun:test";
-import { palette, theme, symbols, borderStyle, colorEnabled, paint } from "../../src/cli/ui/theme";
+import { palette, symbols, borderStyle, colorEnabled, paint } from "../../src/cli/ui/theme";
 
-test("palette and back-compat theme expose hex tokens", () => {
+test("palette exposes hex tokens", () => {
   expect(palette.signature).toBe("#ff2d95");
-  expect(theme.accent).toBe(palette.accent); // existing code reads theme.accent
-  expect(theme.ok).toBe(palette.ok);
+  expect(palette.accent).toBe("#37c9e6");
+  expect(palette.ok).toBe("#36f9c3");
 });
 
 test("symbols default to unicode, ascii only under HR_ASCII", () => {

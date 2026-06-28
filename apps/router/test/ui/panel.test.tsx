@@ -6,7 +6,11 @@ import { Panel } from "../../src/cli/ui/components/panel";
 import { StatusDot } from "../../src/cli/ui/components/status-dot";
 
 test("Panel shows its title and children", () => {
-  const f = render(<Panel title="Services"><Text>Daemon</Text></Panel>).lastFrame()!;
+  const f = render(
+    <Panel title="Services">
+      <Text>Daemon</Text>
+    </Panel>,
+  ).lastFrame()!;
   expect(f).toContain("SERVICES"); // titles render uppercase
   expect(f).toContain("Daemon");
 });

@@ -9,7 +9,14 @@ test("Badge renders its text", () => {
 });
 
 test("StatusBar renders all key hints", () => {
-  const f = render(<StatusBar hints={[{ k: "Tab", label: "switch" }, { k: "q", label: "quit" }]} />).lastFrame()!;
+  const f = render(
+    <StatusBar
+      hints={[
+        { k: "Tab", label: "switch" },
+        { k: "q", label: "quit" },
+      ]}
+    />,
+  ).lastFrame()!;
   expect(f).toContain("Tab");
   expect(f).toContain("switch");
   expect(f).toContain("quit");

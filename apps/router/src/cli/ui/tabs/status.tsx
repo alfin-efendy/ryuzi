@@ -11,7 +11,9 @@ export function StatusTab({ controller }: { controller: AppController }) {
   useEffect(() => {
     let on = true;
     controller.checkEnv().then((e) => on && setEnv(e));
-    return () => { on = false; };
+    return () => {
+      on = false;
+    };
   }, [controller]);
 
   const d = controller.daemon();
@@ -46,7 +48,9 @@ export function StatusTab({ controller }: { controller: AppController }) {
       </Panel>
       {missing.length > 0 && (
         <Panel title="Action needed" focus>
-          <Text color={palette.warn}>{s.warn} missing settings: {missing.join(", ")} — open Config (4)</Text>
+          <Text color={palette.warn}>
+            {s.warn} missing settings: {missing.join(", ")} — open Config (4)
+          </Text>
         </Panel>
       )}
     </Box>

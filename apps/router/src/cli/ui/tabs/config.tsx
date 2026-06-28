@@ -130,7 +130,11 @@ export function ConfigTab({ controller, setEditing }: { controller: AppControlle
           </Box>
         );
       })}
-      {error && <Text color={palette.bad}>{symbols().bad} {error}</Text>}
+      {error && (
+        <Text color={palette.bad}>
+          {symbols().bad} {error}
+        </Text>
+      )}
       <Text color={palette.dim}>↑↓ select · Enter edit · Space toggle provider · Esc cancel</Text>
     </Panel>
   );

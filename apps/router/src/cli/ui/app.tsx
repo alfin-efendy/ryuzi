@@ -18,8 +18,14 @@ function hintsFor(active: number, daemonRunning: boolean): Hint[] {
   const perTab: Hint[][] = [
     [],
     [{ k: "s", label: daemonRunning ? "stop" : "start" }],
-    [{ k: "↑↓", label: "select" }, { k: "Enter", label: "open" }],
-    [{ k: "↑↓", label: "select" }, { k: "Enter", label: "edit" }],
+    [
+      { k: "↑↓", label: "select" },
+      { k: "Enter", label: "open" },
+    ],
+    [
+      { k: "↑↓", label: "select" },
+      { k: "Enter", label: "edit" },
+    ],
   ];
   return [...base, ...(perTab[active] ?? []), { k: "?", label: "options" }, { k: "q", label: "quit" }];
 }

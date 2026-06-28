@@ -17,7 +17,9 @@ export function OptionsOverlay() {
     <>
       {/* title rendered manually as a child: Panel.title uppercases, which would break the "Options" test */}
       <Panel focus>
-        <Text bold color={palette.signature}>Options</Text>
+        <Text bold color={palette.signature}>
+          Options
+        </Text>
         {BINDINGS.map(([k, d]) => (
           <Text key={k}>
             <Text color={palette.signature}>{k.padEnd(20)}</Text> {d}

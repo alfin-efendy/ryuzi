@@ -39,8 +39,12 @@ export function SessionsTab({ controller }: { controller: AppController }) {
   if (open) {
     return (
       <Panel title={sel.title ?? sel.sessionPk.slice(0, 8)} focus>
-        <Text color={palette.dim}>project {sel.projectId} · {sel.status} · by {sel.startedBy ?? "?"}</Text>
-        <Box marginTop={1}><Text>{sel.lastText ?? "(no output captured)"}</Text></Box>
+        <Text color={palette.dim}>
+          project {sel.projectId} · {sel.status} · by {sel.startedBy ?? "?"}
+        </Text>
+        <Box marginTop={1}>
+          <Text>{sel.lastText ?? "(no output captured)"}</Text>
+        </Box>
       </Panel>
     );
   }
@@ -51,9 +55,7 @@ export function SessionsTab({ controller }: { controller: AppController }) {
         return (
           <Box key={row.sessionPk}>
             <Text color={palette.signature}>{selected ? s.marker + " " : "  "}</Text>
-            <Text color={selected ? palette.text : palette.dim}>
-              {(row.title ?? row.sessionPk.slice(0, 8)).padEnd(28)}
-            </Text>
+            <Text color={selected ? palette.text : palette.dim}>{(row.title ?? row.sessionPk.slice(0, 8)).padEnd(28)}</Text>
             <Badge tone={row.status === "running" ? "ok" : "dim"}> {row.status}</Badge>
           </Box>
         );

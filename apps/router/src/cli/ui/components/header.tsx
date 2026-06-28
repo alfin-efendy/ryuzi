@@ -8,7 +8,9 @@ export function Header({ tabs, active }: { tabs: string[]; active: number }) {
   return (
     <Box flexDirection="column">
       <Box>
-        <Text bold color={palette.signature}>{symbols().glyph}</Text>
+        <Text bold color={palette.signature}>
+          {symbols().glyph}
+        </Text>
         <Text bold> {brandName}</Text>
       </Box>
       <Box marginTop={1}>

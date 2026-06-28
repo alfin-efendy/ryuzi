@@ -9,7 +9,10 @@ export interface MultiSelectItem {
 }
 
 export function MultiSelectList({
-  items, selected, onToggle, renderRight,
+  items,
+  selected,
+  onToggle,
+  renderRight,
 }: {
   items: MultiSelectItem[];
   selected: Set<string>;

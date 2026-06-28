@@ -11,7 +11,7 @@ test("doctor output stays plain & format-stable under non-TTY (CI/test)", async 
   const deps: CliDeps = { io, dbPath: ":memory:", detect: { claude: () => detectClaude(okRun), git: () => detectGit(okRun) } };
   await runCli(["doctor"], deps);
   const out = lines.join("\n");
-  expect(out).toContain("git:    OK 2.45.0");      // exact format preserved
-  expect(out).toContain("doctor: FAIL");           // settings missing → FAIL, plain
-  expect(out).not.toContain("\x1b[");              // no escape codes when not a TTY
+  expect(out).toContain("git:    OK 2.45.0"); // exact format preserved
+  expect(out).toContain("doctor: FAIL"); // settings missing → FAIL, plain
+  expect(out).not.toContain("\x1b["); // no escape codes when not a TTY
 });
