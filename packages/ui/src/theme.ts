@@ -37,7 +37,7 @@ export function accentVars(accent: Accent): Record<string, string> {
   }
   if (accent === "neutral") return {};
   const e = ACCENTS.find((a) => a.key === accent);
-  if (!e || !e.primary) return {};
+  if (!e?.primary) return {};
   return { "--primary": e.primary, "--primary-foreground": e.primaryForeground, "--ring": e.primary, "--sidebar-primary": e.primary };
 }
 
