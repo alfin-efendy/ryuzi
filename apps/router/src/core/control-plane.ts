@@ -24,6 +24,8 @@ import { Registry } from "./registry";
 import { GatewayRegistry } from "./gateway-registry";
 import { EventBus } from "./events";
 import { resolveToolPolicy, summarizeTool } from "./permissions";
+import { materializeAttachments, buildManifest, parseAllowedExt } from "./attachments";
+import type { AttachmentRef } from "@harness/protocol";
 
 export interface WorktreeOps {
   pathFor: (workdirRoot: string, projectId: string, sessionPk: string) => string;
@@ -38,6 +40,7 @@ export interface ControlPlaneDeps {
   workdirRoot: string;
   worktree?: WorktreeOps;
   telemetry?: Telemetry;
+  fetchImpl?: typeof fetch;
 }
 
 const allowAll = async () => ({ behavior: "allow" as const });
@@ -111,7 +114,10 @@ export class ControlPlane implements ControlPlaneApi {
       await this.worktree.remove(project.workdir, worktreePath).catch(() => {});
       throw e;
     }
-    await this.serial(sessionPk, () => this.runHarness(project, sessionPk, req.prompt, undefined));
+    await this.serial(sessionPk, async () => {
+      const finalPrompt = await this.withAttachments(sessionPk, req.prompt, req.attachments);
+      return this.runHarness(project, sessionPk, finalPrompt, undefined);
+    });
     return this.deps.sessions.get(sessionPk)!;
   }
 
@@ -121,9 +127,10 @@ export class ControlPlane implements ControlPlaneApi {
     const project = this.deps.projects.get(session.projectId);
     if (!project) throw new Error(`unknown project: ${session.projectId}`);
     this.deps.sessions.update(req.sessionPk, { status: "running" });
-    await this.serial(req.sessionPk, () => {
+    await this.serial(req.sessionPk, async () => {
       const fresh = this.deps.sessions.get(req.sessionPk);
-      return this.runHarness(project, req.sessionPk, req.prompt, fresh?.agentSessionId);
+      const finalPrompt = await this.withAttachments(req.sessionPk, req.prompt, req.attachments);
+      return this.runHarness(project, req.sessionPk, finalPrompt, fresh?.agentSessionId);
     });
   }
 
@@ -205,6 +212,8 @@ export class ControlPlane implements ControlPlaneApi {
     if (project && session.worktreePath) {
       await this.worktree.remove(project.workdir, session.worktreePath).catch(() => {});
     }
+    const attRoot = expandHome(this.deps.settings.get("workdir_root") ?? "");
+    rmSync(join(attRoot, ".harness-attachments", sessionPk), { recursive: true, force: true });
     this.deps.sessions.update(sessionPk, { status: "ended" });
     this.events.emit({ kind: "session.ended", sessionPk });
   }
@@ -260,6 +269,29 @@ export class ControlPlane implements ControlPlaneApi {
     const decision = await decide();
     this.telemetry.count("approval." + decision, { tool: req.tool });
     return decision;
+  }
+
+  private async withAttachments(sessionPk: string, prompt: string, attachments?: AttachmentRef[]): Promise<string> {
+    if (!attachments || attachments.length === 0) return prompt;
+    const maxCount = Number(this.deps.settings.get("attachment_max_count") ?? "10");
+    if (maxCount <= 0) return prompt || "User sent attachments, but attachment support is disabled."; // feature disabled
+    const root = expandHome(this.deps.settings.get("workdir_root") ?? "");
+    const destDir = join(root, ".harness-attachments", sessionPk);
+    const result = await materializeAttachments(attachments, {
+      destDir,
+      maxBytes: Number(this.deps.settings.get("attachment_max_bytes") ?? "26214400"),
+      maxCount,
+      allowedExt: parseAllowedExt(this.deps.settings.get("attachment_allowed_ext")),
+      fetchImpl: this.deps.fetchImpl,
+    });
+    const manifest = buildManifest(result);
+    if (!manifest) return prompt;
+    if (!prompt) {
+      return result.saved.length > 0
+        ? `User sent attachments with no message text.\n\n${manifest}`
+        : `User sent attachments but none could be processed:\n${manifest}`;
+    }
+    return `${prompt}\n\n${manifest}`;
   }
 
   private async runHarness(project: Project, sessionPk: string, prompt: string, resume?: string): Promise<void> {
