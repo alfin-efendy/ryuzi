@@ -88,7 +88,10 @@ export function parseAllowedExt(raw: string | undefined): string[] {
 }
 
 export function parseAllowedHosts(raw: string | undefined): string[] {
-  return (raw ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return (raw ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
 }
 
 function formatBytes(n: number): string {
@@ -98,7 +101,9 @@ function formatBytes(n: number): string {
 }
 
 function displayName(name: string): string {
-  return name.replace(/[\r\n\t\x00-\x1f]/g, " ").slice(0, 120);
+  return Array.from(name, (ch) => (ch.charCodeAt(0) < 32 ? " " : ch))
+    .join("")
+    .slice(0, 120);
 }
 
 async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array | null> {

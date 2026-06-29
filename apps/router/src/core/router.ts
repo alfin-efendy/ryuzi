@@ -49,13 +49,7 @@ export class Router {
     return { workspaceId, project, permModeDowngraded };
   }
 
-  async onStart(
-    gatewayId: string,
-    workspaceId: string,
-    actor: string,
-    prompt: string,
-    attachments?: AttachmentRef[],
-  ): Promise<void> {
+  async onStart(gatewayId: string, workspaceId: string, actor: string, prompt: string, attachments?: AttachmentRef[]): Promise<void> {
     const project = this.projects.resolveByWorkspace(gatewayId, workspaceId);
     if (!project) return;
     const gw = this.core.gateways.get(gatewayId);
@@ -70,13 +64,7 @@ export class Router {
     });
   }
 
-  async onReply(
-    gatewayId: string,
-    conversationId: string,
-    actor: string,
-    prompt: string,
-    attachments?: AttachmentRef[],
-  ): Promise<void> {
+  async onReply(gatewayId: string, conversationId: string, actor: string, prompt: string, attachments?: AttachmentRef[]): Promise<void> {
     const session = this.sessions.resolveByConversation(gatewayId, conversationId);
     if (!session) return;
     await this.core.continueSession({ sessionPk: session.sessionPk, prompt, actor, attachments });

@@ -1,6 +1,14 @@
 import { test, expect } from "bun:test";
 import { PERM_MODES, SESSION_STATUSES } from "../src/index";
-import type { Project, Session, CoreEvent, ControlPlaneApi, AttachmentRef, StartSessionRequest, ContinueSessionRequest } from "../src/index";
+import type {
+  Project,
+  Session,
+  CoreEvent,
+  ControlPlaneApi,
+  AttachmentRef,
+  StartSessionRequest,
+  ContinueSessionRequest,
+} from "../src/index";
 
 test("protocol runtime enums are exported", () => {
   expect([...PERM_MODES]).toEqual(["default", "acceptEdits", "bypassPermissions"]);

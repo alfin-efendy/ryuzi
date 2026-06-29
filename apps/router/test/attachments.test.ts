@@ -60,10 +60,7 @@ test("skips oversize before downloading", async () => {
 test("enforces max count, extras skipped as too many", async () => {
   const dir = mkdtempSync(join(tmpdir(), "att-"));
   const refs = [ref({ url: "u1" }), ref({ url: "u2" }), ref({ url: "u3" })];
-  const res = await materializeAttachments(
-    refs,
-    opts(dir, { maxCount: 2, fetchImpl: fakeFetch({ u1: PNG, u2: PNG, u3: PNG }) }),
-  );
+  const res = await materializeAttachments(refs, opts(dir, { maxCount: 2, fetchImpl: fakeFetch({ u1: PNG, u2: PNG, u3: PNG }) }));
   expect(res.saved.length).toBe(2);
   expect(res.skipped.filter((s) => /too many/.test(s.reason)).length).toBe(1);
 });
@@ -80,10 +77,7 @@ test("extension allowlist filters by extension", async () => {
 
 test("rejects content that contradicts its extension (anti-spoof)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "att-"));
-  const res = await materializeAttachments(
-    [ref({ name: "evil.png", url: "u1" })],
-    opts(dir, { fetchImpl: fakeFetch({ u1: ELF }) }),
-  );
+  const res = await materializeAttachments([ref({ name: "evil.png", url: "u1" })], opts(dir, { fetchImpl: fakeFetch({ u1: ELF }) }));
   expect(res.saved.length).toBe(0);
   expect(res.skipped[0]!.reason).toMatch(/does not match extension/);
 });
@@ -110,7 +104,11 @@ test("download failure skips the file, others continue", async () => {
 test("sanitizes traversal names and dedupes collisions", async () => {
   const dir = mkdtempSync(join(tmpdir(), "att-"));
   const res = await materializeAttachments(
-    [ref({ name: "shot.png", url: "u1" }), ref({ name: "shot.png", url: "u2" }), ref({ name: "../../etc/passwd", url: "u3", contentType: "text/plain" })],
+    [
+      ref({ name: "shot.png", url: "u1" }),
+      ref({ name: "shot.png", url: "u2" }),
+      ref({ name: "../../etc/passwd", url: "u3", contentType: "text/plain" }),
+    ],
     opts(dir, { fetchImpl: fakeFetch({ u1: PNG, u2: PNG, u3: TXT }) }),
   );
   const bases = res.saved.map((s) => s.path.slice(dir.length + 1));
@@ -175,10 +173,7 @@ test("host allowlist: allows trusted https host, blocks untrusted host and http"
   const evilRef = ref({ name: "b.png", url: "https://evil.com/x", size: PNG.byteLength });
   const httpRef = ref({ name: "c.png", url: "http://cdn.discordapp.com/x", size: PNG.byteLength });
 
-  const res = await materializeAttachments(
-    [discordRef, evilRef, httpRef],
-    opts(dir, { allowedHosts: ["cdn.discordapp.com"], fetchImpl }),
-  );
+  const res = await materializeAttachments([discordRef, evilRef, httpRef], opts(dir, { allowedHosts: ["cdn.discordapp.com"], fetchImpl }));
 
   expect(res.saved.length).toBe(1);
   expect(res.saved[0]!.name).toBe("a.png");

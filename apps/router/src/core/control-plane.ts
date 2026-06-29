@@ -25,7 +25,7 @@ import { Registry } from "./registry";
 import { GatewayRegistry } from "./gateway-registry";
 import { EventBus } from "./events";
 import { resolveToolPolicy, summarizeTool, isAdmin, gatePermMode, parseRoleIds } from "./permissions";
-import { materializeAttachments, buildManifest, parseAllowedExt, parseAllowedHosts } from "./attachments";
+import { materializeAttachments, buildManifest, parseAllowedExt, parseAllowedHosts, type MaterializeResult } from "./attachments";
 import type { AttachmentRef } from "@harness/protocol";
 
 export interface WorktreeOps {
@@ -283,7 +283,7 @@ export class ControlPlane implements ControlPlaneApi {
     if (maxCount <= 0) return prompt || "User sent attachments, but attachment support is disabled."; // feature disabled
     const root = expandHome(this.deps.settings.get("workdir_root") ?? "");
     const destDir = join(root, ".harness-attachments", sessionPk);
-    let result;
+    let result: MaterializeResult;
     try {
       result = await materializeAttachments(attachments, {
         destDir,
