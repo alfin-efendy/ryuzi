@@ -42,7 +42,7 @@ export function accentVars(accent: Accent): Record<string, string> {
 }
 
 export function applyTheme(mode: Mode, accent: Accent): void {
-  if (typeof document === "undefined") return;
+  if (typeof document === "undefined" || typeof window === "undefined") return;
   const root = document.documentElement;
   const sysDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   root.classList.toggle("dark", resolveDark(mode, sysDark));
