@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0](https://github.com/alfin-efendy/harness-router/compare/v0.1.0...v0.2.0) (2026-06-29)
+
+
+### Features
+
+* **cli-ui:** TUI Pro visual enhancement for hr across all surfaces ([#8](https://github.com/alfin-efendy/harness-router/issues/8)) ([63fa565](https://github.com/alfin-efendy/harness-router/commit/63fa5659e748cbaa55cd268c104fb76f99aab519))
+* **discord:** receive attachments from Discord and forward them to Claude ([#15](https://github.com/alfin-efendy/harness-router/issues/15)) ([f8ee210](https://github.com/alfin-efendy/harness-router/commit/f8ee210bbda73df6333e1d407747e85c7e78d0ef))
+
 ## 0.1.0 (2026-06-27)
 
 
