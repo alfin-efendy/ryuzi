@@ -11,14 +11,8 @@
         "typescript": "^5",
       },
     },
-    "apps/mission-control": {
-      "name": "@harness/mission-control",
-    },
-    "apps/mobile": {
-      "name": "@harness/mobile",
-    },
-    "apps/router": {
-      "name": "@harness/router",
+    "apps/cli": {
+      "name": "@harness/cli",
       "version": "0.2.0",
       "bin": {
         "hr": "./src/cli/index.ts",
@@ -26,14 +20,6 @@
       "dependencies": {
         "@harness/core": "workspace:*",
         "@harness/protocol": "workspace:*",
-        "@opentelemetry/api": "^1.9.1",
-        "@opentelemetry/exporter-metrics-otlp-http": "^0.219.0",
-        "@opentelemetry/exporter-trace-otlp-http": "^0.219.0",
-        "@opentelemetry/resources": "^2.8.0",
-        "@opentelemetry/sdk-metrics": "^2.8.0",
-        "@opentelemetry/sdk-trace-base": "^2.8.0",
-        "@opentelemetry/semantic-conventions": "^1.41.1",
-        "discord.js": "^14.26.4",
         "ink": "^7.1.0",
         "ink-spinner": "^5.0.0",
         "ink-text-input": "^6.0.0",
@@ -43,6 +29,12 @@
         "@types/react": "^19.2.17",
         "ink-testing-library": "^4.0.0",
       },
+    },
+    "apps/mission-control": {
+      "name": "@harness/mission-control",
+    },
+    "apps/mobile": {
+      "name": "@harness/mobile",
     },
     "packages/core": {
       "name": "@harness/core",
@@ -96,6 +88,8 @@
 
     "@discordjs/ws": ["@discordjs/ws@1.2.3", "", { "dependencies": { "@discordjs/collection": "^2.1.0", "@discordjs/rest": "^2.5.1", "@discordjs/util": "^1.1.0", "@sapphire/async-queue": "^1.5.2", "@types/ws": "^8.5.10", "@vladfrangu/async_event_emitter": "^2.2.4", "discord-api-types": "^0.38.1", "tslib": "^2.6.2", "ws": "^8.17.0" } }, "sha512-wPlQDxEmlDg5IxhJPuxXr3Vy9AjYq5xCvFWGJyD7w7Np8ZGu+Mc+97LCoEc/+AYCo2IDpKioiH0/c/mj5ZR9Uw=="],
 
+    "@harness/cli": ["@harness/cli@workspace:apps/cli"],
+
     "@harness/core": ["@harness/core@workspace:packages/core"],
 
     "@harness/mission-control": ["@harness/mission-control@workspace:apps/mission-control"],
@@ -103,8 +97,6 @@
     "@harness/mobile": ["@harness/mobile@workspace:apps/mobile"],
 
     "@harness/protocol": ["@harness/protocol@workspace:packages/protocol"],
-
-    "@harness/router": ["@harness/router@workspace:apps/router"],
 
     "@opentelemetry/api": ["@opentelemetry/api@1.9.1", "", {}, "sha512-gLyJlPHPZYdAk1JENA9LeHejZe1Ti77/pTeFm/nMXmQH/HFZlcS/O2XJB+L8fkbrNSqhdtlvjBVjxwUYanNH5Q=="],
 
