@@ -10,9 +10,11 @@ type State = {
   transcripts: Record<string, Line[]>;
   pendingApprovals: PendingApproval[];
   focusedSessionPk: string | null;
+  selectedProjectId: string | null;
   applyCoreEvent: (e: CoreEvent) => void;
   clearApproval: (requestId: string) => void;
   setFocused: (pk: string | null) => void;
+  selectProject: (id: string | null) => void;
   refresh: () => Promise<void>;
   addProject: () => Promise<void>;
   start: (projectId: string, prompt: string) => Promise<void>;
@@ -33,6 +35,7 @@ export const useStore = create<State>((set, get) => ({
   transcripts: {},
   pendingApprovals: [],
   focusedSessionPk: null,
+  selectedProjectId: null,
 
   applyCoreEvent: (e) =>
     set((st) => {
@@ -63,6 +66,8 @@ export const useStore = create<State>((set, get) => ({
     set((st) => ({ pendingApprovals: st.pendingApprovals.filter((a) => a.requestId !== requestId) })),
 
   setFocused: (pk) => set({ focusedSessionPk: pk }),
+  // Selecting a project clears the focused session so the center shows the "start a new session" composer.
+  selectProject: (id) => set({ selectedProjectId: id, focusedSessionPk: null }),
 
   refresh: async () => {
     const projects = await commands.listProjects();

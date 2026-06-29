@@ -2,8 +2,16 @@ import { test, expect } from "bun:test";
 import { useStore } from "./store";
 
 function reset() {
-  useStore.setState({ projects: [], sessions: [], transcripts: {}, pendingApprovals: [], focusedSessionPk: null });
+  useStore.setState({ projects: [], sessions: [], transcripts: {}, pendingApprovals: [], focusedSessionPk: null, selectedProjectId: null });
 }
+
+test("selectProject sets the selected project and clears the focused session", () => {
+  reset();
+  useStore.setState({ focusedSessionPk: "s1" });
+  useStore.getState().selectProject("p1");
+  expect(useStore.getState().selectedProjectId).toBe("p1");
+  expect(useStore.getState().focusedSessionPk).toBeNull();
+});
 
 test("text and status events append lines to the session transcript", () => {
   reset();

@@ -9,14 +9,23 @@ const DOT: Record<string, string> = {
 };
 
 export function ProjectsTree() {
-  const { projects, sessions, focusedSessionPk, setFocused, addProject } = useStore();
+  const { projects, sessions, focusedSessionPk, selectedProjectId, setFocused, selectProject, addProject } = useStore();
   return (
     <div className="flex h-full flex-col gap-2 p-2">
       <Button size="sm" variant="secondary" onClick={() => addProject()}>+ Add project</Button>
       <div className="flex-1 overflow-auto">
         {projects.map((p) => (
           <div key={p.projectId} className="mb-2">
-            <div className="px-2 py-1 text-xs font-semibold text-zinc-500">{p.name}</div>
+            <button
+              onClick={() => selectProject(p.projectId)}
+              title="New session on this project"
+              className={`flex w-full items-center gap-1 rounded px-2 py-1 text-left text-xs font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 ${
+                selectedProjectId === p.projectId && !focusedSessionPk ? "bg-zinc-100 dark:bg-zinc-900" : ""
+              }`}
+            >
+              <span className="truncate">{p.name}</span>
+              <span className="ml-auto text-zinc-400">＋</span>
+            </button>
             {sessions.filter((s) => s.projectId === p.projectId).map((s) => (
               <button
                 key={s.sessionPk}

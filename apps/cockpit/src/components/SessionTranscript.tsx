@@ -3,10 +3,25 @@ import { Composer } from "./Composer";
 import { ApprovalPrompt } from "./ApprovalPrompt";
 
 export function SessionTranscript() {
-  const { focusedSessionPk, transcripts, sessions, send } = useStore();
+  const { focusedSessionPk, transcripts, sessions, send, start, selectedProjectId, projects } = useStore();
 
   if (!focusedSessionPk) {
-    return <div className="flex h-full items-center justify-center text-sm text-zinc-500">Select or start a session.</div>;
+    // A project is selected but no session focused → let the user start a new session on it.
+    if (selectedProjectId) {
+      const project = projects.find((p) => p.projectId === selectedProjectId);
+      return (
+        <div className="flex h-full flex-col">
+          <div className="border-b border-zinc-200 px-4 py-2 text-sm font-medium dark:border-zinc-800">
+            New session on <span className="font-semibold">{project?.name ?? selectedProjectId}</span>
+          </div>
+          <div className="flex flex-1 items-center justify-center px-4 text-center text-sm text-zinc-500">
+            Type a first message below to start a session.
+          </div>
+          <Composer onSubmit={(t) => start(selectedProjectId, t)} />
+        </div>
+      );
+    }
+    return <div className="flex h-full items-center justify-center text-sm text-zinc-500">Select a project (left) to start a session.</div>;
   }
   const lines = transcripts[focusedSessionPk] ?? [];
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
