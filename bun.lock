@@ -21,9 +21,10 @@
       "name": "@harness/router",
       "version": "0.2.0",
       "bin": {
-        "harness": "./src/cli/index.ts",
+        "hr": "./src/cli/index.ts",
       },
       "dependencies": {
+        "@harness/core": "workspace:*",
         "@harness/protocol": "workspace:*",
         "@opentelemetry/api": "^1.9.1",
         "@opentelemetry/exporter-metrics-otlp-http": "^0.219.0",
