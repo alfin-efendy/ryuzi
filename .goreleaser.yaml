@@ -5,7 +5,7 @@ builds:
   - id: harness-router-gnu-other
     builder: bun
     binary: hr
-    main: apps/router/src/cli/index.ts
+    main: apps/cli/src/cli/index.ts
     targets:
       - linux-x64
       - linux-arm64
@@ -19,7 +19,7 @@ builds:
   - id: harness-router-musl
     builder: bun
     binary: hr
-    main: apps/router/src/cli/index.ts
+    main: apps/cli/src/cli/index.ts
     targets:
       - linux-x64-musl
       - linux-arm64-musl

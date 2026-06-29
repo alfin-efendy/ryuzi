@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENTRY="apps/router/src/cli/index.ts"
+ENTRY="apps/cli/src/cli/index.ts"
 OUT="out"
 rm -rf "$OUT"
 

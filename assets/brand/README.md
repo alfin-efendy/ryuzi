@@ -46,4 +46,4 @@ Use explicit variants when the logo is placed on a custom background that may no
 <img src="/assets/brand/wordmark-dark.svg" alt="Harness Router">
 ```
 
-For CLI text surfaces, use the text identity from `apps/router/src/cli/brand.ts`: the glyph is `マ`, and the brand name is `Harness Router`.
+For CLI text surfaces, use the text identity from `apps/cli/src/cli/brand.ts`: the glyph is `マ`, and the brand name is `Harness Router`.

@@ -18,7 +18,8 @@
     // Monorepo: resolve workspace packages for `tsc --noEmit`
     // (paths without baseUrl resolve relative to this tsconfig)
     "paths": {
-      "@harness/protocol": ["./packages/protocol/src/index.ts"]
+      "@harness/protocol": ["./packages/protocol/src/index.ts"],
+      "@harness/core": ["./packages/core/src/index.ts"]
     },
 
     // Best practices

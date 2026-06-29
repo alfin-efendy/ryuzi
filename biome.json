@@ -11,8 +11,8 @@
       "!README.md",
       "!assets/**",
       "!outputs/**",
-      "!apps/router/src/cli/brand.ts",
-      "!apps/router/src/cli/meta.ts"
+      "!apps/cli/src/cli/brand.ts",
+      "!apps/cli/src/cli/meta.ts"
     ]
   },
   "formatter": {

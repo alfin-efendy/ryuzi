@@ -128,7 +128,7 @@ This is a Bun workspaces monorepo. From the repo root:
 
 ```bash
 bun install          # link workspaces
-bun run hr ...       # run the router CLI from source
+bun run hr ...       # run the hr CLI from source
 bun test             # run all package tests
 bun run typecheck    # tsc --noEmit across the repo
 bun run lint         # biome ci .
@@ -139,11 +139,12 @@ bun run format       # biome check --write .
 
 ```
 apps/
-  router/            # @harness/router — backend daemon + CLI + Discord gateway + Claude harness (Phase 1)
+  cli/               # @harness/cli — the hr CLI + ink TUI (thin app over @harness/core)
   mission-control/   # @harness/mission-control — web app (planned)
   ide/               # @harness/ide — desktop app (planned)
   mobile/            # @harness/mobile — mobile app (planned)
 packages/
+  core/              # @harness/core — engine: control plane, store, providers, agents, gateways, observability
   protocol/          # @harness/protocol — shared contracts: domain models, events, ControlPlane API
 docs/superpowers/    # specs & implementation plans
 ```

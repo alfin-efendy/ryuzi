@@ -10,8 +10,8 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      release_created: ${{ steps.rp.outputs['apps/router--release_created'] }}
-      tag_name: ${{ steps.rp.outputs['apps/router--tag_name'] }}
+      release_created: ${{ steps.rp.outputs['apps/cli--release_created'] }}
+      tag_name: ${{ steps.rp.outputs['apps/cli--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: rp
