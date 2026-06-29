@@ -23,12 +23,15 @@ pub fn resolve_claude_binary() -> String {
         for p in [
             format!("{home}/.local/bin/claude"),
             format!("{home}/.bun/bin/claude"),
-            "/usr/local/bin/claude".to_string(),
-            "/opt/homebrew/bin/claude".to_string(),
         ] {
             if Path::new(&p).exists() {
                 return p;
             }
+        }
+    }
+    for p in ["/usr/local/bin/claude", "/opt/homebrew/bin/claude"] {
+        if Path::new(p).exists() {
+            return p.to_string();
         }
     }
     "claude".to_string()
@@ -79,6 +82,12 @@ impl ClaudeRunner for ProcessRunner {
                     return;
                 }
             };
+            if let Some(stderr) = child.stderr.take() {
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(_)) = lines.next_line().await {}
+                });
+            }
             let mut lines = BufReader::new(stdout).lines();
             loop {
                 tokio::select! {
