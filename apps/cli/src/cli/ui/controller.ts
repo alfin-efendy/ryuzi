@@ -2,7 +2,19 @@ import { EventEmitter } from "node:events";
 import { existsSync, readFileSync, openSync, closeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Database } from "bun:sqlite";
-import { openDb, SettingsStore, SETTING_DEFS, GLOBAL_FIELDS, allFields, SessionsStore, catalog as defaultCatalog, missingRequiredSettings, isConfigured as isConfiguredFn, requiredMissingFields, csv } from "@harness/core";
+import {
+  openDb,
+  SettingsStore,
+  SETTING_DEFS,
+  GLOBAL_FIELDS,
+  allFields,
+  SessionsStore,
+  catalog as defaultCatalog,
+  missingRequiredSettings,
+  isConfigured as isConfiguredFn,
+  requiredMissingFields,
+  csv,
+} from "@harness/core";
 import type { detectClaude, detectGit, ToolInfo, ProviderCatalog, GatewayDescriptor, RuntimeDescriptor, ConfigField } from "@harness/core";
 import { readStatus, writeStatus, clearStatus, isAlive, deriveState, type DaemonState } from "../daemon-status";
 import { isCompiledExecutable, daemonRelaunchCmd } from "../daemon-spawn";

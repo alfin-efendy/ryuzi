@@ -1,5 +1,5 @@
 {
-  "name": "@harness/router",
+  "name": "@harness/cli",
   "version": "0.2.0",
   "private": true,
   "type": "module",
@@ -10,14 +10,6 @@
   "dependencies": {
     "@harness/core": "workspace:*",
     "@harness/protocol": "workspace:*",
-    "@opentelemetry/api": "^1.9.1",
-    "@opentelemetry/exporter-metrics-otlp-http": "^0.219.0",
-    "@opentelemetry/exporter-trace-otlp-http": "^0.219.0",
-    "@opentelemetry/resources": "^2.8.0",
-    "@opentelemetry/sdk-metrics": "^2.8.0",
-    "@opentelemetry/sdk-trace-base": "^2.8.0",
-    "@opentelemetry/semantic-conventions": "^1.41.1",
-    "discord.js": "^14.26.4",
     "ink": "^7.1.0",
     "ink-spinner": "^5.0.0",
     "ink-text-input": "^6.0.0",

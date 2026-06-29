@@ -9,7 +9,7 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "hr": "bun run apps/router/src/cli/index.ts",
+    "hr": "bun run apps/cli/src/cli/index.ts",
     "lint": "biome ci .",
     "format": "biome check --write ."
   },
