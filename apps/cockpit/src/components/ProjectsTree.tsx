@@ -1,5 +1,5 @@
 import { useStore } from "@/store";
-import { Button } from "@/components/ui/button";
+import { Button } from "@harness/ui";
 
 const DOT: Record<string, string> = {
   running: "bg-blue-500",

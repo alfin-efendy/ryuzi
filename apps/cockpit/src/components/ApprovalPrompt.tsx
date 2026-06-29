@@ -1,5 +1,5 @@
 import { useStore } from "@/store";
-import { Button } from "@/components/ui/button";
+import { Button } from "@harness/ui";
 
 export function ApprovalPrompt({ sessionPk }: { sessionPk: string }) {
   const { pendingApprovals, resolveApproval } = useStore();

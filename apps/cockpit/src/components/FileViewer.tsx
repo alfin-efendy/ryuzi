@@ -2,7 +2,7 @@ import { useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { EditorView } from "@codemirror/view";
 import { commands } from "@/bindings";
-import { Input } from "@/components/ui/input";
+import { Input } from "@harness/ui";
 
 export function FileViewer() {
   const [path, setPath] = useState("");

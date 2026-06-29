@@ -1,6 +1,5 @@
 import { useState } from "react";
-import { Textarea } from "@/components/ui/textarea";
-import { Button } from "@/components/ui/button";
+import { Button, Textarea } from "@harness/ui";
 
 export function Composer({ onSubmit, disabled }: { onSubmit: (text: string) => void | Promise<void>; disabled?: boolean }) {
   const [text, setText] = useState("");

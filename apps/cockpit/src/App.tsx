@@ -3,8 +3,7 @@ import { useStore } from "./store";
 import { ProjectsTree } from "./components/ProjectsTree";
 import { SessionTranscript } from "./components/SessionTranscript";
 import { FileViewer } from "./components/FileViewer";
-import { Badge } from "./components/ui/badge";
-import { Toaster } from "@/components/ui/sonner";
+import { Badge, Toaster } from "@harness/ui";
 
 export default function App() {
   const init = useStore((s) => s.init);
