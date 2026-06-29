@@ -4,8 +4,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli, type CliDeps, type IO } from "../src/cli/run";
-import { detectClaude, detectGit } from "../src/agents/detect";
-import type { Agent, AgentEvent, AgentRunInput } from "../src/agents/types";
+import { detectClaude, detectGit } from "@harness/core";
+import type { Agent, AgentEvent, AgentRunInput } from "@harness/core";
 
 async function tempRepo(): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), "harness-run-"));

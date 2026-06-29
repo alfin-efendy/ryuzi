@@ -1,20 +1,20 @@
-// apps/router/src/cli/start-command.ts
-import { openDb } from "../store/db";
-import { ProjectsStore } from "../store/projects";
-import { SessionsStore } from "../store/sessions";
-import { SettingsStore } from "../config/store";
-import { ControlPlane } from "../core/control-plane";
-import { Router } from "../core/router";
-import { startApprovalServer } from "../core/approval-server";
-import type { Gateway } from "../gateways/types";
-import type { Telemetry } from "../observability/types";
-import { ConsoleTelemetry } from "../observability/console";
-import { createOtelTelemetry } from "../observability/otel";
+// packages/core/src/daemon.ts
+import { openDb } from "./store/db";
+import { ProjectsStore } from "./store/projects";
+import { SessionsStore } from "./store/sessions";
+import { SettingsStore } from "./config/store";
+import { ControlPlane } from "./core/control-plane";
+import { Router } from "./core/router";
+import { startApprovalServer } from "./core/approval-server";
+import type { Gateway } from "./gateways/types";
+import type { Telemetry } from "./observability/types";
+import { ConsoleTelemetry } from "./observability/console";
+import { createOtelTelemetry } from "./observability/otel";
 import type { Database } from "bun:sqlite";
-import { expandHome } from "../config/paths";
-import { catalog as defaultCatalog } from "../providers/catalog";
-import type { ProviderCatalog } from "../providers/types";
-import { csv } from "../config/required";
+import { expandHome } from "./config/paths";
+import { catalog as defaultCatalog } from "./providers/catalog";
+import type { ProviderCatalog } from "./providers/types";
+import { csv } from "./config/required";
 
 export function buildDaemon(deps: { dbPath: string; db?: Database; telemetry?: Telemetry; catalog?: ProviderCatalog }): {
   gateways: Gateway[];
@@ -58,7 +58,7 @@ export function buildDaemon(deps: { dbPath: string; db?: Database; telemetry?: T
   }
   const ipc = startApprovalServer(cp);
   cp.approvalUrl = ipc.url;
-  cp.hookBinPath = `${import.meta.dir}/../hook/pretooluse-bin.ts`;
+  cp.hookBinPath = `${import.meta.dir}/hook/pretooluse-bin.ts`;
   return {
     gateways,
     cp,

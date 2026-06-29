@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildDaemon } from "../src/cli/start-command";
+import { buildDaemon } from "../src/daemon";
 import { openDb } from "../src/store/db";
 import { SettingsStore } from "../src/config/store";
 import { makeCatalog } from "../src/providers/catalog";

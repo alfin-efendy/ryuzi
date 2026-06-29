@@ -1,5 +1,5 @@
 import { dirname } from "node:path";
-import { buildDaemon } from "./start-command";
+import { buildDaemon } from "@harness/core";
 import { writeStatus, clearStatus } from "./daemon-status";
 
 const CONNECT_TIMEOUT_MS = 30000;

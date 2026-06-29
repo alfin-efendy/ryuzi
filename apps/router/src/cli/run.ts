@@ -1,10 +1,5 @@
-import { openDb } from "../store/db";
-import { SettingsStore } from "../config/store";
-import { SETTING_DEFS } from "../config/schema";
-import { missingRequiredSettings } from "../config/required";
-import { catalog } from "../providers/catalog";
-import type { detectClaude, detectGit } from "../agents/detect";
-import type { Agent } from "../agents/types";
+import { openDb, SettingsStore, SETTING_DEFS, missingRequiredSettings, catalog } from "@harness/core";
+import type { detectClaude, detectGit, Agent } from "@harness/core";
 import { cmdRun } from "./run-command";
 import { launchUi } from "./ui/launch";
 import { helpText, version } from "./meta";

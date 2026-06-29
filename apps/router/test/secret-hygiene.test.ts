@@ -2,8 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, statSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDb } from "../src/store/db";
-import { SettingsStore } from "../src/config/store";
+import { openDb, SettingsStore } from "@harness/core";
 import { runCli, type CliDeps } from "../src/cli/run";
 
 test("openDb tightens the DB parent directory to 0700", () => {

@@ -4,7 +4,7 @@ import type { AppController } from "../controller";
 import { Panel } from "../components/panel";
 import { StatusDot } from "../components/status-dot";
 import { palette, symbols } from "../theme";
-import type { ToolInfo } from "../../../agents/detect";
+import type { ToolInfo } from "@harness/core";
 
 export function StatusTab({ controller }: { controller: AppController }) {
   const [env, setEnv] = useState<{ git: ToolInfo; claude: ToolInfo } | null>(null);

@@ -4,14 +4,7 @@ import { dirname, resolve } from "node:path";
 import type { CoreEvent } from "@harness/protocol";
 import { PERM_MODES, type PermMode } from "@harness/protocol";
 import type { CliDeps } from "./run";
-import { openDb } from "../store/db";
-import { ProjectsStore } from "../store/projects";
-import { SessionsStore } from "../store/sessions";
-import { SettingsStore } from "../config/store";
-import { ControlPlane } from "../core/control-plane";
-import { expandHome } from "../config/paths";
-import { catalog } from "../providers/catalog";
-import { csv } from "../config/required";
+import { openDb, ProjectsStore, SessionsStore, SettingsStore, ControlPlane, expandHome, catalog, csv } from "@harness/core";
 
 export async function cmdRun(args: string[], deps: CliDeps): Promise<number> {
   let dir: string | undefined, prompt: string | undefined, model: string | undefined, effort: string | undefined, mode: string | undefined;

@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { runCli, type CliDeps, type IO } from "../src/cli/run";
-import { detectClaude, detectGit } from "../src/agents/detect";
+import { detectClaude, detectGit } from "@harness/core";
 
 function tmpDb(): string {
   return `/tmp/harness-cli-${Bun.hash(Math.random().toString())}.sqlite`;

@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
 import type { AppController } from "./controller";
-import type { ConfigField } from "../../providers/types";
+import type { ConfigField } from "@harness/core";
 import { MultiSelectList } from "./components/multi-select-list";
 import { Panel } from "./components/panel";
 import { palette, symbols } from "./theme";

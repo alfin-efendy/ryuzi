@@ -2,15 +2,8 @@ import { EventEmitter } from "node:events";
 import { existsSync, readFileSync, openSync, closeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Database } from "bun:sqlite";
-import { openDb } from "../../store/db";
-import { SettingsStore } from "../../config/store";
-import { SETTING_DEFS, GLOBAL_FIELDS, allFields } from "../../config/schema";
-import type { detectClaude, detectGit } from "../../agents/detect";
-import type { ToolInfo } from "../../agents/detect";
-import { SessionsStore } from "../../store/sessions";
-import { catalog as defaultCatalog } from "../../providers/catalog";
-import type { ProviderCatalog, GatewayDescriptor, RuntimeDescriptor, ConfigField } from "../../providers/types";
-import { missingRequiredSettings, isConfigured as isConfiguredFn, requiredMissingFields, csv } from "../../config/required";
+import { openDb, SettingsStore, SETTING_DEFS, GLOBAL_FIELDS, allFields, SessionsStore, catalog as defaultCatalog, missingRequiredSettings, isConfigured as isConfiguredFn, requiredMissingFields, csv } from "@harness/core";
+import type { detectClaude, detectGit, ToolInfo, ProviderCatalog, GatewayDescriptor, RuntimeDescriptor, ConfigField } from "@harness/core";
 import { readStatus, writeStatus, clearStatus, isAlive, deriveState, type DaemonState } from "../daemon-status";
 import { isCompiledExecutable, daemonRelaunchCmd } from "../daemon-spawn";
 

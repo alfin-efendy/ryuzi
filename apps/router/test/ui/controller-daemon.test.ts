@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AppController } from "../../src/cli/ui/controller";
-import { detectClaude, detectGit } from "../../src/agents/detect";
+import { detectClaude, detectGit } from "@harness/core";
 import { writeStatus } from "../../src/cli/daemon-status";
 
 function configured() {
