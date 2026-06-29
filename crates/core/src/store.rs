@@ -1,4 +1,4 @@
-use crate::domain::{PermMode, Project};
+use crate::domain::{PermMode, Project, Session, SessionStatus};
 use deadpool_sqlite::{Config, Pool, Runtime};
 use rusqlite::{params, OptionalExtension, Row};
 use rusqlite_migration::{Migrations, M};
@@ -123,12 +123,128 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
         Ok(rows)
     }
+
+    pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
+                    s.branch, s.title, s.status.as_str(), s.created_at, s.last_active
+                ],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+
+    pub async fn get_session(&self, pk: &str) -> anyhow::Result<Option<Session>> {
+        let pk = pk.to_string();
+        let conn = self.pool.get().await?;
+        let s = conn
+            .interact(move |c| {
+                c.query_row(
+                    &format!("SELECT {SESSION_COLS} FROM sessions WHERE session_pk=?1"),
+                    params![pk],
+                    row_to_session,
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(s)
+    }
+
+    pub async fn list_sessions(&self, project_id: Option<&str>) -> anyhow::Result<Vec<Session>> {
+        let project_id = project_id.map(|s| s.to_string());
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .interact(move |c| {
+                match project_id {
+                    Some(pid) => {
+                        let mut stmt = c.prepare(&format!(
+                            "SELECT {SESSION_COLS} FROM sessions WHERE project_id=?1 ORDER BY created_at"
+                        ))?;
+                        let rows = stmt.query_map(params![pid], row_to_session)?
+                            .collect::<rusqlite::Result<Vec<_>>>();
+                        rows
+                    }
+                    None => {
+                        let mut stmt = c.prepare(&format!(
+                            "SELECT {SESSION_COLS} FROM sessions ORDER BY created_at"
+                        ))?;
+                        let rows = stmt.query_map([], row_to_session)?
+                            .collect::<rusqlite::Result<Vec<_>>>();
+                        rows
+                    }
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(rows)
+    }
+
+    pub async fn update_status(
+        &self,
+        pk: &str,
+        status: SessionStatus,
+        last_active: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "UPDATE sessions SET status=?2, last_active=COALESCE(?3, last_active) WHERE session_pk=?1",
+                params![pk, status.as_str(), last_active],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+
+    pub async fn update_agent_session_id(&self, pk: &str, agent_session_id: &str) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let agent = agent_session_id.to_string();
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "UPDATE sessions SET agent_session_id=?2 WHERE session_pk=?1",
+                params![pk, agent],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+}
+
+const SESSION_COLS: &str =
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active";
+
+fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
+    let status: String = r.get(6)?;
+    Ok(Session {
+        session_pk: r.get(0)?,
+        project_id: r.get(1)?,
+        agent_session_id: r.get(2)?,
+        worktree_path: r.get(3)?,
+        branch: r.get(4)?,
+        title: r.get(5)?,
+        status: SessionStatus::from_db(&status),
+        created_at: r.get(7)?,
+        last_active: r.get(8)?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{PermMode, Project};
+    use crate::domain::{Session, SessionStatus};
 
     fn sample_project() -> Project {
         Project {
@@ -157,5 +273,41 @@ mod tests {
 
         assert!(store.get_project("missing").await.unwrap().is_none());
         assert_eq!(store.list_projects().await.unwrap().len(), 1);
+    }
+
+    fn sample_session() -> Session {
+        Session {
+            session_pk: "s1".into(),
+            project_id: "p1".into(),
+            agent_session_id: None,
+            worktree_path: Some("/tmp/wt".into()),
+            branch: Some("harness/abcdef01".into()),
+            title: Some("hello".into()),
+            status: SessionStatus::Running,
+            created_at: Some(1),
+            last_active: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_insert_get_list_and_updates() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_project(sample_project()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.status, SessionStatus::Running);
+
+        store.update_agent_session_id("s1", "agent-xyz").await.unwrap();
+        store.update_status("s1", SessionStatus::Idle, Some(99)).await.unwrap();
+
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.agent_session_id.as_deref(), Some("agent-xyz"));
+        assert_eq!(got.status, SessionStatus::Idle);
+        assert_eq!(got.last_active, Some(99));
+
+        assert_eq!(store.list_sessions(Some("p1")).await.unwrap().len(), 1);
+        assert_eq!(store.list_sessions(None).await.unwrap().len(), 1);
     }
 }
