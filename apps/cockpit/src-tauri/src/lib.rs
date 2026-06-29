@@ -61,15 +61,19 @@ pub fn run() {
         .setup(move |app| {
             builder.mount_events(app);
             let handle = app.handle().clone();
-            // Build the engine synchronously on the async runtime.
-            let cp = tauri::async_runtime::block_on(async {
+            let hook_path = resolve_hook_path(&handle);
+            // Build the engine AND enable approvals inside the async runtime: enable_approvals
+            // calls tokio::runtime::Handle::current(), which panics ("no reactor running") unless
+            // invoked from within a Tokio runtime context. block_on enters that context.
+            let cp = tauri::async_runtime::block_on(async move {
                 let store = Store::open(&harness_core::paths::db_path())
                     .await
                     .expect("open cockpit db");
-                ControlPlane::new(store, Arc::new(harness_core::runtime::ProcessRunner)).await
+                let cp = ControlPlane::new(store, Arc::new(harness_core::runtime::ProcessRunner)).await;
+                // Enable the approval side-channel; errors are non-fatal (no hook binary in CI).
+                cp.enable_approvals(hook_path).ok();
+                cp
             });
-            // Enable the approval side-channel; errors are non-fatal (no hook binary in CI).
-            cp.enable_approvals(resolve_hook_path(&handle)).ok();
             // Subscribe BEFORE manage() moves the Arc.
             let mut rx = cp.subscribe();
             // Make Arc<ControlPlane> available to all Tauri commands.
