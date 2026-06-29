@@ -46,3 +46,5 @@ docs/superpowers/
 # npm wrapper binaries are copied in at release time, never committed
 npm/platform/*/hr
 npm/platform/*/hr.exe
+
+/target
