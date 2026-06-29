@@ -16,7 +16,6 @@ harness-core = { path = "../../../crates/core" }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
 specta = { version = "2.0.0-rc.22", features = ["derive"] }
 tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }

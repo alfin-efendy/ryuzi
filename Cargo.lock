@@ -360,7 +360,6 @@ dependencies = [
  "anyhow",
  "harness-core",
  "serde",
- "serde_json",
  "specta",
  "specta-typescript",
  "tauri",
