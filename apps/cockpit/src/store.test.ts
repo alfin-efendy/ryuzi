@@ -32,3 +32,11 @@ test("multiple text events accumulate in order", () => {
   s.applyCoreEvent({ kind: "text", session_pk: "s1", text: "b" });
   expect(useStore.getState().transcripts["s1"].map((l) => l.text)).toEqual(["a", "b"]);
 });
+
+test("pending approvals from different sessions both count", () => {
+  useStore.setState({ projects: [], sessions: [], transcripts: {}, pendingApprovals: [], focusedSessionPk: null });
+  const s = useStore.getState();
+  s.applyCoreEvent({ kind: "approvalRequested", session_pk: "s1", request_id: "r1", tool: "Bash", summary: "x" });
+  s.applyCoreEvent({ kind: "approvalRequested", session_pk: "s2", request_id: "r2", tool: "Write", summary: "y" });
+  expect(useStore.getState().pendingApprovals).toHaveLength(2);
+});
