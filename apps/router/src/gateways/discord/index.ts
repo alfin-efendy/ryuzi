@@ -1,6 +1,6 @@
 // apps/router/src/gateways/discord/index.ts
 import type { Gateway, MessageRef } from "../types";
-import type { Surface, ApprovalRequest, ApprovalDecision, PermMode, ProjectSettings } from "@harness/protocol";
+import type { Surface, ApprovalRequest, ApprovalDecision, PermMode, ProjectSettings, AttachmentRef } from "@harness/protocol";
 
 export interface InboundMessage {
   channelId: string;
@@ -9,6 +9,7 @@ export interface InboundMessage {
   authorId: string;
   mentionsBot: boolean;
   content: string;
+  attachments: AttachmentRef[];
 }
 export interface InboundInteraction {
   name: string;
@@ -45,8 +46,8 @@ export interface InboundRouter {
     actor: string,
     opts: { name?: string; gitUrl?: string; settings?: ProjectSettings },
   ): Promise<{ workspaceId: string; project: { name: string } }>;
-  onStart(gatewayId: string, workspaceId: string, actor: string, prompt: string): Promise<void>;
-  onReply(gatewayId: string, conversationId: string, actor: string, prompt: string): Promise<void>;
+  onStart(gatewayId: string, workspaceId: string, actor: string, prompt: string, attachments?: AttachmentRef[]): Promise<void>;
+  onReply(gatewayId: string, conversationId: string, actor: string, prompt: string, attachments?: AttachmentRef[]): Promise<void>;
   onEnd(gatewayId: string, conversationId: string): Promise<void>;
   onStop(gatewayId: string, conversationId: string): Promise<void>;
 }
@@ -106,12 +107,16 @@ export class DiscordGateway implements Gateway {
   async handleMessage(e: InboundMessage): Promise<void> {
     if (e.authorBot) return;
     if (e.isThread) {
-      await this.router.onReply(this.id, e.channelId, e.authorId, e.content);
+      if (e.content || e.attachments.length > 0) {
+        await this.router.onReply(this.id, e.channelId, e.authorId, e.content, e.attachments);
+      }
       return;
     }
     if (e.mentionsBot) {
       const prompt = stripMentions(e.content);
-      if (prompt) await this.router.onStart(this.id, e.channelId, e.authorId, prompt);
+      if (prompt || e.attachments.length > 0) {
+        await this.router.onStart(this.id, e.channelId, e.authorId, prompt, e.attachments);
+      }
     }
   }
 

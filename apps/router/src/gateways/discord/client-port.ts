@@ -50,6 +50,12 @@ export class DiscordClientPort implements DiscordPort {
         authorId: msg.author.id,
         mentionsBot: this.client.user ? msg.mentions.has(this.client.user) : false,
         content: msg.content,
+        attachments: [...msg.attachments.values()].map((a) => ({
+          name: a.name ?? "file",
+          url: a.url,
+          contentType: a.contentType ?? undefined,
+          size: a.size,
+        })),
       });
     });
 

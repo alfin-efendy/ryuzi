@@ -37,16 +37,19 @@ class FakePort implements DiscordPort {
 
 function fakeRouter() {
   const calls: string[] = [];
+  const attachmentsSeen: number[] = [];
   const router: InboundRouter = {
     onConnect: async (_g, _a, o) => {
       calls.push(`onConnect:${o.name ?? o.gitUrl}`);
       return { workspaceId: "ws-1", project: { name: o.name ?? "p" } };
     },
-    onStart: async (_g, w, _a, p) => {
+    onStart: async (_g, w, _a, p, atts) => {
       calls.push(`onStart:${w}:${p}`);
+      attachmentsSeen.push(atts?.length ?? 0);
     },
-    onReply: async (_g, c, _a, p) => {
+    onReply: async (_g, c, _a, p, atts) => {
       calls.push(`onReply:${c}:${p}`);
+      attachmentsSeen.push(atts?.length ?? 0);
     },
     onEnd: async (_g, c) => {
       calls.push(`onEnd:${c}`);
@@ -55,7 +58,7 @@ function fakeRouter() {
       calls.push(`onStop:${c}`);
     },
   };
-  return { router, calls };
+  return { router, calls, attachmentsSeen };
 }
 
 const msg = (over: Partial<InboundMessage>): InboundMessage => ({
@@ -65,6 +68,7 @@ const msg = (over: Partial<InboundMessage>): InboundMessage => ({
   authorId: "u",
   mentionsBot: false,
   content: "",
+  attachments: [],
   ...over,
 });
 
@@ -129,4 +133,16 @@ test("requestApproval forwards to the port and returns its decision", async () =
   expect(dec).toEqual({ decision: "deny", actor: "u9" });
   expect(port.calls).toContain("requestApproval:t1");
   expect((port.lastApproval as { approverRoleIds: string[] }).approverRoleIds).toEqual(["r1"]);
+});
+
+test("attachment-only messages start/reply even with empty text", async () => {
+  const port = new FakePort();
+  const { router, calls, attachmentsSeen } = fakeRouter();
+  const gw = new DiscordGateway(port, router);
+  const att = { name: "a.png", url: "https://cdn/a", contentType: "image/png", size: 10 };
+  await gw.handleMessage(msg({ mentionsBot: true, channelId: "ch1", content: "<@1>", attachments: [att] })); // start, empty prompt
+  await gw.handleMessage(msg({ isThread: true, channelId: "t1", content: "", attachments: [att] })); // reply
+  await gw.handleMessage(msg({ mentionsBot: true, channelId: "ch2", content: "<@1>" })); // ignored: no text, no attachment
+  expect(calls).toEqual(["onStart:ch1:", "onReply:t1:"]);
+  expect(attachmentsSeen).toEqual([1, 1]);
 });
