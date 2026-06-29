@@ -2,12 +2,15 @@ import { useState } from "react";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 
-export function Composer({ onSubmit, disabled }: { onSubmit: (text: string) => void; disabled?: boolean }) {
+export function Composer({ onSubmit, disabled }: { onSubmit: (text: string) => void | Promise<void>; disabled?: boolean }) {
   const [text, setText] = useState("");
-  const submit = () => {
+  const [sending, setSending] = useState(false);
+  const submit = async () => {
     const t = text.trim();
     if (!t) return;
-    onSubmit(t);
+    setSending(true);
+    await onSubmit(t);
+    setSending(false);
     setText("");
   };
   return (
@@ -18,8 +21,9 @@ export function Composer({ onSubmit, disabled }: { onSubmit: (text: string) => v
         onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(); }}
         placeholder="Message Claude…  (⌘/Ctrl+Enter to send)"
         className="min-h-[44px] flex-1 resize-none"
+        disabled={disabled || sending}
       />
-      <Button onClick={submit} disabled={disabled}>Send</Button>
+      <Button onClick={submit} disabled={disabled || sending}>{sending ? "Sending…" : "Send"}</Button>
     </div>
   );
 }

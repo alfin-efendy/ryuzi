@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { toast } from "sonner";
 import { commands, events, type Project, type Session, type CoreEvent } from "./bindings";
 
 export type Line = { kind: "text" | "status" | "error"; text: string };
@@ -81,7 +82,11 @@ export const useStore = create<State>((set, get) => ({
     if (!dir) return;
     const name = dir.split("/").filter(Boolean).pop() ?? "project";
     const res = await commands.connectProject(dir, name);
-    if (res.status === "ok") await get().refresh();
+    if (res.status === "ok") {
+      await get().refresh();
+    } else if (res.status === "error") {
+      toast.error("Couldn't add project: " + res.error.message);
+    }
   },
 
   start: async (projectId, prompt) => {
@@ -89,25 +94,39 @@ export const useStore = create<State>((set, get) => ({
     if (res.status === "ok") {
       set({ focusedSessionPk: res.data.sessionPk });
       await get().refresh();
+    } else if (res.status === "error") {
+      toast.error("Couldn't start session: " + res.error.message);
     }
   },
   send: async (sessionPk, prompt) => {
-    await commands.continueSession(sessionPk, prompt);
+    const res = await commands.continueSession(sessionPk, prompt);
+    if (res.status === "error") {
+      toast.error("Couldn't send message: " + res.error.message);
+    }
     await get().refresh();
   },
   stop: async (sessionPk) => {
-    await commands.stopSession(sessionPk);
+    const res = await commands.stopSession(sessionPk);
+    if (res.status === "error") {
+      toast.error("Couldn't stop session: " + res.error.message);
+    }
     await get().refresh();
   },
   end: async (sessionPk) => {
-    await commands.endSession(sessionPk);
+    const res = await commands.endSession(sessionPk);
+    if (res.status === "error") {
+      toast.error("Couldn't end session: " + res.error.message);
+    }
     await get().refresh();
   },
   resolveApproval: async (requestId, allow) => {
     try {
       await commands.resolveApproval(requestId, allow);
       get().clearApproval(requestId);
-    } catch (e) { console.error("resolveApproval failed", e); }
+    } catch (e) {
+      console.error("resolveApproval failed", e);
+      toast.error("Approval failed: " + String(e));
+    }
   },
 
   init: async () => {

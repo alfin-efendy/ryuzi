@@ -4,6 +4,7 @@ import { ProjectsTree } from "./components/ProjectsTree";
 import { SessionTranscript } from "./components/SessionTranscript";
 import { FileViewer } from "./components/FileViewer";
 import { Badge } from "./components/ui/badge";
+import { Toaster } from "@/components/ui/sonner";
 
 export default function App() {
   const init = useStore((s) => s.init);
@@ -21,6 +22,7 @@ export default function App() {
         <main className="min-w-0"><SessionTranscript /></main>
         <aside className="border-l border-zinc-200 dark:border-zinc-800"><FileViewer /></aside>
       </div>
+      <Toaster richColors position="bottom-right" />
     </div>
   );
 }
