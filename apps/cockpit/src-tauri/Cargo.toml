@@ -1,0 +1,23 @@
+[package]
+name = "cockpit"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "cockpit_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+harness-core = { path = "../../../crates/core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+specta = { version = "2.0.0-rc.22", features = ["derive"] }
+tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }
+specta-typescript = "0.0.9"
