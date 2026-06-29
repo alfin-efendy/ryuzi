@@ -206,6 +206,22 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically demote `Running → Idle` only if the current status is still `Running`.
+    /// A session already marked `Interrupted` or `Ended` is left untouched.
+    pub async fn demote_if_running(&self, pk: &str, last_active: i64) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "UPDATE sessions SET status='idle', last_active=?2 WHERE session_pk=?1 AND status='running'",
+                params![pk, last_active],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+
     pub async fn update_agent_session_id(&self, pk: &str, agent_session_id: &str) -> anyhow::Result<()> {
         let pk = pk.to_string();
         let agent = agent_session_id.to_string();

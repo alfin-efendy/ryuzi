@@ -119,6 +119,9 @@ impl ControlPlane {
             project_id: project.project_id.clone(),
         });
 
+        let cancel = CancellationToken::new();
+        self.running.lock().unwrap().insert(session_pk.clone(), cancel.clone());
+
         // Non-blocking: stream the run in the background and return the in-memory
         // Running session immediately so the cockpit can drive multiple sessions
         // concurrently without waiting for the harness to finish.
@@ -127,7 +130,7 @@ impl ControlPlane {
         let pk = session_pk.clone();
         let prompt_owned = prompt.to_string();
         tokio::spawn(async move {
-            me.run_harness(&project_for_run, &pk, &prompt_owned, None).await;
+            me.run_harness(&project_for_run, &pk, &prompt_owned, None, cancel).await;
         });
         Ok(session)
     }
@@ -151,6 +154,9 @@ impl ControlPlane {
             .update_status(session_pk, SessionStatus::Running, None)
             .await?;
 
+        let cancel = CancellationToken::new();
+        self.running.lock().unwrap().insert(session_pk.to_string(), cancel.clone());
+
         // Non-blocking: resume in the background and return immediately.
         let me = std::sync::Arc::clone(self);
         let project_for_run = project.clone();
@@ -158,7 +164,7 @@ impl ControlPlane {
         let prompt_owned = prompt.to_string();
         let resume = session.agent_session_id.clone();
         tokio::spawn(async move {
-            me.run_harness(&project_for_run, &pk, &prompt_owned, resume).await;
+            me.run_harness(&project_for_run, &pk, &prompt_owned, resume, cancel).await;
         });
         Ok(())
     }
@@ -168,7 +174,7 @@ impl ControlPlane {
             tok.cancel();
         }
         self.store
-            .update_status(session_pk, SessionStatus::Idle, Some(now_ms()))
+            .update_status(session_pk, SessionStatus::Interrupted, Some(now_ms()))
             .await?;
         Ok(())
     }
@@ -213,13 +219,9 @@ impl ControlPlane {
         session_pk: &str,
         prompt: &str,
         resume: Option<String>,
+        cancel: CancellationToken,
     ) {
-        let cancel = CancellationToken::new();
-        self.running
-            .lock()
-            .unwrap()
-            .insert(session_pk.to_string(), cancel.clone());
-
+        // NOTE: the caller has already inserted `cancel` into `self.running`.
         let new_session_id = resume.clone().unwrap_or_else(new_id);
         let approval = if project.perm_mode == PermMode::Default {
             self.approval_wiring(session_pk)
@@ -272,14 +274,8 @@ impl ControlPlane {
         }
 
         self.running.lock().unwrap().remove(session_pk);
-        if let Ok(Some(s)) = self.store.get_session(session_pk).await {
-            if s.status == SessionStatus::Running {
-                let _ = self
-                    .store
-                    .update_status(session_pk, SessionStatus::Idle, Some(now_ms()))
-                    .await;
-            }
-        }
+        // Atomically demote Running → Idle only if not already Interrupted/Ended.
+        let _ = self.store.demote_if_running(session_pk, now_ms()).await;
     }
 
     async fn handle_agent_event(&self, session_pk: &str, ev: AgentEvent) {
@@ -398,6 +394,45 @@ mod tests {
         let tree_id = repo.index().unwrap().write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_immediately_after_start_is_registered() {
+        // A runner that blocks until cancelled, so the session stays "running"
+        struct BlockingRunner;
+        impl ClaudeRunner for BlockingRunner {
+            fn spawn(
+                &self,
+                _args: Vec<String>,
+                _cwd: std::path::PathBuf,
+                _env: Vec<(String, String)>,
+                cancel: CancellationToken,
+            ) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move {
+                    cancel.cancelled().await;
+                    drop(tx); // close only after cancel
+                });
+                rx
+            }
+        }
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(db.path()).await.unwrap();
+        let cp = ControlPlane::new(store, std::sync::Arc::new(BlockingRunner)).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        let session = cp.start_session(&project.project_id, "go").await.unwrap();
+        // The cancellation token must be registered synchronously by start_session,
+        // BEFORE the background run task is scheduled — so an immediate stop cancels it.
+        cp.stop_session(&session.session_pk).await.unwrap();
+
+        // Give the background task a moment to observe cancellation and exit.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+        assert_eq!(stored[0].status, crate::domain::SessionStatus::Interrupted);
     }
 
     #[tokio::test]

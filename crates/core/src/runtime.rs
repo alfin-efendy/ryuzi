@@ -320,6 +320,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hook_settings_has_pretooluse_command() {
+        let s = build_hook_settings("/path/to/harness-hook");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "/path/to/harness-hook");
+        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "*");
+    }
+
     #[tokio::test]
     async fn runner_trait_streams_lines() {
         let runner = FakeRunner { lines: vec!["a".into(), "b".into()] };

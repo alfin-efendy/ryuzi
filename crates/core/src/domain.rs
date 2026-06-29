@@ -118,6 +118,14 @@ mod tests {
     }
 
     #[test]
+    fn session_status_roundtrips_through_db_string() {
+        for s in [SessionStatus::Idle, SessionStatus::Running, SessionStatus::Interrupted, SessionStatus::Ended] {
+            assert_eq!(SessionStatus::from_db(s.as_str()), s);
+        }
+        assert_eq!(SessionStatus::from_db("nonsense"), SessionStatus::Idle);
+    }
+
+    #[test]
     fn core_event_serializes_with_kind_tag_and_camel_case() {
         let e = CoreEvent::SessionCreated { session_pk: "s1".into(), project_id: "p1".into() };
         let j = serde_json::to_value(&e).unwrap();

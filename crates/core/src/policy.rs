@@ -46,6 +46,13 @@ mod tests {
     }
 
     #[test]
+    fn bash_summary_truncates_to_80_chars() {
+        let long = "a".repeat(100);
+        let out = tool_summary("Bash", &json!({ "command": long }));
+        assert_eq!(out, format!("Bash: {}", "a".repeat(80)));
+    }
+
+    #[test]
     fn tool_summary_formats_bash_and_paths() {
         assert_eq!(tool_summary("Bash", &json!({"command": "ls -la"})), "Bash: ls -la");
         assert_eq!(tool_summary("Read", &json!({"file_path": "/a/b.rs"})), "Read: /a/b.rs");
