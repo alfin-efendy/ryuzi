@@ -16,7 +16,7 @@ specta = { version = "2.0.0-rc.22", features = ["derive"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 deadpool-sqlite = { version = "0.8", features = ["rt_tokio_1"] }
 rusqlite_migration = "1.2"
-git2 = "0.19"
+git2 = "0.20"
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 tiny_http = "0.12"
