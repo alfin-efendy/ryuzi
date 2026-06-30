@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { openFileTab, closeTab, type DockTab } from "./store-ui";
+import { openFileTab, closeTab, normalizeActive, type DockTab } from "./store-ui";
 
 const fileTab = (path: string): DockTab => ({ id: path, kind: "file", path, title: path.split("/").pop() ?? path });
 
@@ -40,4 +40,10 @@ test("closeTab on a non-active tab keeps the active focus", () => {
   const start = [fileTab("/a.ts"), fileTab("/b.ts")];
   const r = closeTab(start, "/a.ts", "/b.ts");
   expect(r.activeTabId).toBe("/a.ts");
+});
+
+test("normalizeActive maps empty/null to null, keeps real ids", () => {
+  expect(normalizeActive("")).toBeNull();
+  expect(normalizeActive(null)).toBeNull();
+  expect(normalizeActive("/a.ts")).toBe("/a.ts");
 });
