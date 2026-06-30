@@ -72,6 +72,7 @@ export type CoreEvent =
   | { kind: "result"; sessionPk: string; usage?: unknown }
   | { kind: "approval.requested"; sessionPk: string; requestId: string; tool: string; summary: string }
   | { kind: "error"; sessionPk: string; message: string }
+  | { kind: "session.branch"; sessionPk: string; branch: string }
   | { kind: "session.ended"; sessionPk: string };
 
 export interface StartSessionRequest {

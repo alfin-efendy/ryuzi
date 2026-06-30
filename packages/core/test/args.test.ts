@@ -34,3 +34,9 @@ test("model and effort included only when set", () => {
   expect(a[a.indexOf("--model") + 1]).toBe("haiku");
   expect(a[a.indexOf("--effort") + 1]).toBe("low");
 });
+
+test("includes --append-system-prompt only when systemPromptAppend is set", () => {
+  expect(buildClaudeArgs(input(), "u")).not.toContain("--append-system-prompt");
+  const a = buildClaudeArgs(input({ systemPromptAppend: "rename your branch" }), "u");
+  expect(a[a.indexOf("--append-system-prompt") + 1]).toBe("rename your branch");
+});

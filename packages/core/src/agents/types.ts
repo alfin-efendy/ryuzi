@@ -21,6 +21,7 @@ export interface AgentRunInput {
   signal: AbortSignal;
   approve: ApproveFn;
   approval?: { url: string; sessionPk: string; hookBinPath: string };
+  systemPromptAppend?: string;
 }
 
 export interface Agent {

@@ -1,5 +1,5 @@
 // packages/core/test/control-plane-run.test.ts
-import { test, expect } from "bun:test";
+import { test, expect, afterAll } from "bun:test";
 import type { Agent, AgentEvent, AgentRunInput } from "../src/agents/types";
 import type { CoreEvent } from "@harness/protocol";
 import { openDb } from "../src/store/db";
@@ -7,6 +7,20 @@ import { ProjectsStore } from "../src/store/projects";
 import { SessionsStore } from "../src/store/sessions";
 import { SettingsStore } from "../src/config/store";
 import { ControlPlane } from "../src/core/control-plane";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { worktreePathFor, createWorktree, removeWorktree } from "../src/agents/worktree";
+
+const tmpDirs: string[] = [];
+function mkTmp(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  tmpDirs.push(dir);
+  return dir;
+}
+afterAll(() => {
+  for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+});
 
 class FakeHarness implements Agent {
   readonly id = "claude-code";
@@ -106,4 +120,128 @@ test("continueSession re-persists agentSessionId when result carries a rotated s
   sessions.insert({ sessionPk: "s2", projectId: "p1", agentSessionId: "old", worktreePath: "/wt", status: "idle" });
   await cp.continueSession({ sessionPk: "s2", prompt: "continue" });
   expect(sessions.get("s2")!.agentSessionId).toBe("rotated");
+});
+
+test("startSession resolves a fresh base and passes it to createWorktree", async () => {
+  const db = openDb(":memory:");
+  const projects = new ProjectsStore(db);
+  projects.insert({ projectId: "p1", name: "foo", workdir: "/repo/foo", harness: "claude-code", permMode: "default" });
+  const calls: Array<{ branch: string; baseRef?: string }> = [];
+  const cp = new ControlPlane({
+    projects,
+    sessions: new SessionsStore(db),
+    settings: new SettingsStore(db),
+    workdirRoot: "/root",
+    worktree: {
+      pathFor: (r, p, s) => `${r}/${p}/${s}`,
+      create: async (_repo, _path, branch, baseRef) => {
+        calls.push({ branch, baseRef });
+      },
+      remove: async () => {},
+      resolveBase: async () => "origin/main",
+    },
+  });
+  cp.harnesses.register("claude-code", () => new FakeHarness([{ type: "result", usage: {} }]));
+  await cp.startSession({ projectId: "p1", prompt: "do it", actor: "u1" });
+  expect(calls[0]!.baseRef).toBe("origin/main");
+  expect(calls[0]!.branch).toMatch(/^harness\//);
+});
+
+test("startSession falls back to an undefined base when resolveBase yields undefined", async () => {
+  const db = openDb(":memory:");
+  const projects = new ProjectsStore(db);
+  projects.insert({ projectId: "p1", name: "foo", workdir: "/repo/foo", harness: "claude-code", permMode: "default" });
+  const seen: Array<string | undefined> = [];
+  const cp = new ControlPlane({
+    projects,
+    sessions: new SessionsStore(db),
+    settings: new SettingsStore(db),
+    workdirRoot: "/root",
+    worktree: {
+      pathFor: (r, p, s) => `${r}/${p}/${s}`,
+      create: async (_repo, _path, _branch, baseRef) => {
+        seen.push(baseRef);
+      },
+      remove: async () => {},
+      resolveBase: async () => undefined,
+    },
+  });
+  cp.harnesses.register("claude-code", () => new FakeHarness([{ type: "result", usage: {} }]));
+  await cp.startSession({ projectId: "p1", prompt: "do it", actor: "u1" });
+  expect(seen[0]).toBeUndefined();
+});
+
+// An agent that renames its branch, the way a real agent will when instructed.
+class RenamingHarness implements Agent {
+  readonly id = "claude-code";
+  constructor(private newBranch: string) {}
+  async *run(i: AgentRunInput): AsyncIterable<AgentEvent> {
+    await Bun.$`git -C ${i.workdir} branch -m ${this.newBranch}`.quiet();
+    yield { type: "init", sessionId: "agent-1" };
+    yield { type: "result", usage: {} };
+  }
+}
+
+test("first run: the agent's branch rename is read back into session.branch and emitted", async () => {
+  const repo = mkTmp("harness-cp-");
+  await Bun.$`git -C ${repo} init -q -b main`.quiet();
+  await Bun.$`git -C ${repo} config user.email x@x.x`.quiet();
+  await Bun.$`git -C ${repo} config user.name x`.quiet();
+  await Bun.$`git -C ${repo} commit -q --allow-empty -m init`.quiet();
+
+  const db = openDb(":memory:");
+  const projects = new ProjectsStore(db);
+  projects.insert({ projectId: "p1", name: "foo", workdir: repo, harness: "claude-code", permMode: "default" });
+  const sessions = new SessionsStore(db);
+  const root = mkTmp("harness-root-");
+  const cp = new ControlPlane({
+    projects,
+    sessions,
+    settings: new SettingsStore(db),
+    workdirRoot: root,
+    worktree: { pathFor: worktreePathFor, create: createWorktree, remove: removeWorktree, resolveBase: async () => undefined },
+  });
+  const seen: CoreEvent[] = [];
+  cp.subscribe((e) => seen.push(e));
+  cp.harnesses.register("claude-code", () => new RenamingHarness("harness/my-real-task"));
+
+  const session = await cp.startSession({ projectId: "p1", prompt: "do the thing", actor: "u1" });
+
+  expect(sessions.get(session.sessionPk)!.branch).toBe("harness/my-real-task");
+  expect(seen.some((e) => e.kind === "session.branch" && e.branch === "harness/my-real-task")).toBe(true);
+});
+
+test("first run sets a branch-rename systemPromptAppend; continue does not", async () => {
+  const captured: Array<string | undefined> = [];
+  const db = openDb(":memory:");
+  const projects = new ProjectsStore(db);
+  projects.insert({ projectId: "p1", name: "foo", workdir: "/repo/foo", harness: "claude-code", permMode: "default" });
+  const sessions = new SessionsStore(db);
+  class CapHarness implements Agent {
+    readonly id = "claude-code";
+    async *run(i: AgentRunInput): AsyncIterable<AgentEvent> {
+      captured.push(i.systemPromptAppend);
+      yield { type: "init", sessionId: "agent-1" };
+      yield { type: "result", usage: {} };
+    }
+  }
+  const cp = new ControlPlane({
+    projects,
+    sessions,
+    settings: new SettingsStore(db),
+    workdirRoot: "/root",
+    worktree: {
+      pathFor: (r, p, s) => `${r}/${p}/${s}`,
+      create: async () => {},
+      remove: async () => {},
+      resolveBase: async () => undefined,
+    },
+  });
+  cp.harnesses.register("claude-code", () => new CapHarness());
+
+  await cp.startSession({ projectId: "p1", prompt: "first", actor: "u1" });
+  await cp.continueSession({ sessionPk: cp.listSessions("p1")[0]!.sessionPk, prompt: "again" });
+
+  expect(captured[0]).toContain("git branch -m"); // first run instructs a rename
+  expect(captured[1]).toBeUndefined(); // continue does not
 });
