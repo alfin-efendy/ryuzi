@@ -124,6 +124,8 @@ Settings live in a local SQLite database at `~/.local/share/harness-router/harne
 
 ## Development (from source)
 
+> **First time?** See [docs/development/setup.md](docs/development/setup.md) for the full toolchain setup on macOS, Linux, and Windows (Rust + MSVC + Windows SDK are needed for the Cockpit desktop app).
+
 This is a Bun workspaces monorepo. From the repo root:
 
 ```bash

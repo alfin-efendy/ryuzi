@@ -48,6 +48,7 @@ npm/platform/*/hr
 npm/platform/*/hr.exe
 
 /target
+/.cargo
 
 # Local agent/skill tooling artifacts (session-local, not part of the repo)
 .agents/
