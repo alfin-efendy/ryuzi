@@ -3,7 +3,7 @@ import { useStore } from "./store";
 import { useUi } from "./store-ui";
 import { ProjectsTree } from "./components/ProjectsTree";
 import { SessionTranscript } from "./components/SessionTranscript";
-import { FileViewer } from "./components/FileViewer";
+import { RightDock } from "./components/RightDock";
 import { TitleBar } from "./components/shell/TitleBar";
 import { useDisableContextMenu } from "./lib/contextMenu";
 import { Badge, Toaster } from "@harness/ui";
@@ -33,7 +33,7 @@ export default function App() {
           <SessionTranscript />
         </main>
         <aside className={`overflow-hidden border-l border-border ${rightPanelOpen ? "" : "hidden"}`}>
-          <FileViewer />
+          <RightDock />
         </aside>
       </div>
       <Toaster richColors position="bottom-right" />
