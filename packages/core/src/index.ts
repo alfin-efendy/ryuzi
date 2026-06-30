@@ -10,6 +10,8 @@ export { catalog } from "./providers/catalog";
 export { csv, missingRequiredSettings, isConfigured, requiredMissingFields } from "./config/required";
 export { SETTING_DEFS, GLOBAL_FIELDS, allFields } from "./config/schema";
 export { detectClaude, detectGit } from "./agents/detect";
+export { compareVersions, isNewer, parseVersion } from "./update/version";
+export type { SemVer } from "./update/version";
 
 export type { Agent, AgentEvent, AgentRunInput } from "./agents/types";
 export type { ToolInfo, Runner } from "./agents/detect";
