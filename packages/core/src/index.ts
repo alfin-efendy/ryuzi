@@ -12,6 +12,8 @@ export { SETTING_DEFS, GLOBAL_FIELDS, allFields } from "./config/schema";
 export { detectClaude, detectGit } from "./agents/detect";
 export { compareVersions, isNewer, parseVersion } from "./update/version";
 export type { SemVer } from "./update/version";
+export { checkForUpdate } from "./update/check";
+export type { UpdateCheckResult } from "./update/check";
 export { detectInstallMethod } from "./update/install-method";
 export type { InstallMethod, InstallInfo } from "./update/install-method";
 
