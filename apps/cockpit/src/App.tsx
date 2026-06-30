@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useStore } from "./store";
+import { useUi } from "./store-ui";
 import { ProjectsTree } from "./components/ProjectsTree";
 import { SessionTranscript } from "./components/SessionTranscript";
 import { FileViewer } from "./components/FileViewer";
@@ -10,6 +11,8 @@ import { Badge, Toaster } from "@harness/ui";
 export default function App() {
   const init = useStore((s) => s.init);
   const pending = useStore((s) => s.pendingApprovals.length);
+  const { leftPanelOpen, rightPanelOpen } = useUi();
+  const cols = `${leftPanelOpen ? "260px" : "0px"} 1fr ${rightPanelOpen ? "360px" : "0px"}`;
   useDisableContextMenu();
   useEffect(() => {
     init();
@@ -22,14 +25,14 @@ export default function App() {
           <Badge variant="secondary">{pending}</Badge> session(s) need approval
         </div>
       )}
-      <div className="grid flex-1 grid-cols-[260px_1fr_360px] overflow-hidden">
-        <aside className="overflow-hidden border-r border-border">
+      <div className="grid flex-1 overflow-hidden" style={{ gridTemplateColumns: cols }}>
+        <aside className={`overflow-hidden border-r border-border ${leftPanelOpen ? "" : "hidden"}`}>
           <ProjectsTree />
         </aside>
         <main className="min-w-0">
           <SessionTranscript />
         </main>
-        <aside className="overflow-hidden border-l border-border">
+        <aside className={`overflow-hidden border-l border-border ${rightPanelOpen ? "" : "hidden"}`}>
           <FileViewer />
         </aside>
       </div>
