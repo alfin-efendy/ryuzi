@@ -47,6 +47,10 @@ export interface ControlPlaneDeps {
 
 const allowAll = async () => ({ behavior: "allow" as const });
 
+const RESUME_NUDGE =
+  "Your previous turn was interrupted by a daemon restart or update. Continue the task " +
+  "from where you left off. If it was already complete, briefly summarize what you did.";
+
 function branchRenameInstruction(branch: string): string {
   return [
     `You are running in a fresh harness session. Your git working branch is currently`,
@@ -154,6 +158,40 @@ export class ControlPlane implements ControlPlaneApi {
       const finalPrompt = await this.withAttachments(req.sessionPk, req.prompt, req.attachments);
       return this.runHarness(project, req.sessionPk, finalPrompt, fresh?.agentSessionId);
     });
+  }
+
+  /**
+   * Re-run an interrupted turn after a restart. Uses the persisted agentSessionId to
+   * `claude --resume`, guarded by a resume_attempts cap so a session that reliably
+   * crashes the daemon cannot loop forever. Called by reconcile() on boot.
+   */
+  async resumeSession(sessionPk: string, reason: string): Promise<void> {
+    const session = this.deps.sessions.get(sessionPk);
+    if (!session) return;
+    const project = this.deps.projects.get(session.projectId);
+    if (!project) return;
+    if (!session.agentSessionId) {
+      this.deps.sessions.update(sessionPk, { status: "idle" });
+      this.events.emit({
+        kind: "status",
+        sessionPk,
+        text: "⚠️ Interrupted by a restart and could not be auto-resumed — send a message to continue.",
+      });
+      return;
+    }
+    const attempts = session.resumeAttempts ?? 0;
+    if (attempts >= 3) {
+      this.deps.sessions.update(sessionPk, { status: "idle" });
+      this.events.emit({
+        kind: "status",
+        sessionPk,
+        text: "⚠️ Auto-resume gave up after 3 attempts — send a message to continue.",
+      });
+      return;
+    }
+    this.deps.sessions.update(sessionPk, { status: "running", resumeAttempts: attempts + 1 });
+    this.events.emit({ kind: "status", sessionPk, text: `🔄 Resumed after ${reason}.` });
+    await this.serial(sessionPk, () => this.runHarness(project, sessionPk, RESUME_NUDGE, session.agentSessionId));
   }
 
   private validateProjectName(name: string): void {
@@ -396,7 +434,7 @@ export class ControlPlane implements ControlPlaneApi {
       span.end();
       this.running.delete(sessionPk);
       const cur = this.deps.sessions.get(sessionPk);
-      if (cur?.status === "running") this.deps.sessions.update(sessionPk, { status: "idle", lastActive: Date.now() });
+      if (cur?.status === "running") this.deps.sessions.update(sessionPk, { status: "idle", lastActive: Date.now(), resumeAttempts: 0 });
       if (isFirstRun) await this.syncBranchName(sessionPk, workdir, session?.branch);
     }
   }
