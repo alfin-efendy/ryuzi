@@ -47,6 +47,17 @@ export interface ControlPlaneDeps {
 
 const allowAll = async () => ({ behavior: "allow" as const });
 
+function branchRenameInstruction(branch: string): string {
+  return [
+    `You are running in a fresh harness session. Your git working branch is currently`,
+    `a throwaway placeholder named "${branch}". As your very first action, before anything`,
+    `else, rename it to a short name that summarizes this task:`,
+    `    git branch -m harness/<short-kebab-slug>`,
+    `Keep the "harness/" prefix, use lowercase kebab-case, and at most ~6 words`,
+    `(for example: harness/fix-login-redirect-loop). Then continue with the task.`,
+  ].join("\n");
+}
+
 export class ControlPlane implements ControlPlaneApi {
   readonly harnesses = new Registry<Agent>();
   readonly gateways = new GatewayRegistry();
@@ -320,12 +331,15 @@ export class ControlPlane implements ControlPlaneApi {
     const harness = this.harnesses.create(project.harness);
     const controller = new AbortController();
     this.running.set(sessionPk, controller);
+    const session = this.deps.sessions.get(sessionPk);
+    const workdir = session?.worktreePath ?? project.workdir;
+    const isFirstRun = resume === undefined;
     const approval =
       project.permMode === "default" && this.approvalUrl && this.hookBinPath
         ? { url: this.approvalUrl, sessionPk, hookBinPath: this.hookBinPath }
         : undefined;
     const input: AgentRunInput = {
-      workdir: this.deps.sessions.get(sessionPk)?.worktreePath ?? project.workdir,
+      workdir,
       resume,
       prompt,
       model: project.model,
@@ -334,6 +348,7 @@ export class ControlPlane implements ControlPlaneApi {
       signal: controller.signal,
       approve: allowAll,
       approval,
+      systemPromptAppend: isFirstRun && session?.branch ? branchRenameInstruction(session.branch) : undefined,
     };
     this.telemetry.count("session.run");
     const span = this.telemetry.startSpan("harness.run", {
@@ -360,6 +375,21 @@ export class ControlPlane implements ControlPlaneApi {
       this.running.delete(sessionPk);
       const cur = this.deps.sessions.get(sessionPk);
       if (cur?.status === "running") this.deps.sessions.update(sessionPk, { status: "idle", lastActive: Date.now() });
+      if (isFirstRun) await this.syncBranchName(sessionPk, workdir, session?.branch);
+    }
+  }
+
+  private async syncBranchName(sessionPk: string, workdir: string, priorBranch?: string): Promise<void> {
+    try {
+      const out = await Bun.$`git -C ${workdir} rev-parse --abbrev-ref HEAD`.quiet().nothrow();
+      if (out.exitCode !== 0) return;
+      const actual = out.stdout.toString().trim();
+      if (actual && actual !== "HEAD" && actual !== priorBranch) {
+        this.deps.sessions.update(sessionPk, { branch: actual });
+        this.events.emit({ kind: "session.branch", sessionPk, branch: actual });
+      }
+    } catch {
+      // Best-effort: keep the stored branch on any failure.
     }
   }
 }
