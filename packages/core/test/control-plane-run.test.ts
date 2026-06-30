@@ -220,7 +220,12 @@ test("first run sets a branch-rename systemPromptAppend; continue does not", asy
     sessions,
     settings: new SettingsStore(db),
     workdirRoot: "/root",
-    worktree: { pathFor: (r, p, s) => `${r}/${p}/${s}`, create: async () => {}, remove: async () => {}, resolveBase: async () => undefined },
+    worktree: {
+      pathFor: (r, p, s) => `${r}/${p}/${s}`,
+      create: async () => {},
+      remove: async () => {},
+      resolveBase: async () => undefined,
+    },
   });
   cp.harnesses.register("claude-code", () => new CapHarness());
 
@@ -228,5 +233,5 @@ test("first run sets a branch-rename systemPromptAppend; continue does not", asy
   await cp.continueSession({ sessionPk: cp.listSessions("p1")[0]!.sessionPk, prompt: "again" });
 
   expect(captured[0]).toContain("git branch -m"); // first run instructs a rename
-  expect(captured[1]).toBeUndefined();            // continue does not
+  expect(captured[1]).toBeUndefined(); // continue does not
 });

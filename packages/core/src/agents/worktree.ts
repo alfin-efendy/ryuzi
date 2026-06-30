@@ -30,12 +30,7 @@ async function readOriginHead(repoDir: string, env: Record<string, string | unde
   return out.exitCode === 0 ? out.stdout.toString().trim() : "";
 }
 
-export async function createWorktree(
-  repoDir: string,
-  worktreePath: string,
-  branch: string,
-  baseRef?: string,
-): Promise<void> {
+export async function createWorktree(repoDir: string, worktreePath: string, branch: string, baseRef?: string): Promise<void> {
   // git worktree add does not create leading directories — ensure the parent exists.
   mkdirSync(dirname(worktreePath), { recursive: true });
   if (baseRef) {
