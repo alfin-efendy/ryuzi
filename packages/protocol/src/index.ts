@@ -31,6 +31,7 @@ export interface Session {
   startedBy?: string;
   createdAt?: number;
   lastActive?: number;
+  resumeAttempts?: number;
 }
 
 export interface Surface {

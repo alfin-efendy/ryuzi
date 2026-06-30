@@ -3,6 +3,12 @@ import { chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import { migrateSettings } from "../config/migrate-settings";
 
+function addColumnIfMissing(db: Database, table: string, column: string, decl: string): void {
+  // table/column are internal literals, never user input — safe to interpolate.
+  const cols = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+}
+
 export function migrate(db: Database): void {
   db.run(`CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -36,8 +42,10 @@ export function migrate(db: Database): void {
     status TEXT NOT NULL DEFAULT 'idle',
     started_by TEXT,
     created_at INTEGER,
-    last_active INTEGER
+    last_active INTEGER,
+    resume_attempts INTEGER NOT NULL DEFAULT 0
   )`);
+  addColumnIfMissing(db, "sessions", "resume_attempts", "INTEGER NOT NULL DEFAULT 0");
   db.run(`CREATE TABLE IF NOT EXISTS session_surfaces (
     gateway TEXT NOT NULL,
     conversation_id TEXT NOT NULL,

@@ -37,3 +37,25 @@ test("surfaces: one session, multiple conversations", () => {
       .sort(),
   ).toEqual(["thread-1", "ts-2"]);
 });
+
+test("resumeAttempts defaults to 0, persists, and updates", () => {
+  const s = new SessionsStore(openDb(":memory:"));
+  s.insert(sample());
+  expect(s.get("s1")?.resumeAttempts).toBe(0);
+  s.update("s1", { resumeAttempts: 2 });
+  expect(s.get("s1")?.resumeAttempts).toBe(2);
+});
+
+test("listByStatus returns only sessions with that status", () => {
+  const s = new SessionsStore(openDb(":memory:"));
+  s.insert(sample()); // status: "running"
+  s.insert({ ...sample(), sessionPk: "s2", status: "idle" });
+  s.insert({ ...sample(), sessionPk: "s3", status: "running" });
+  expect(
+    s
+      .listByStatus("running")
+      .map((x) => x.sessionPk)
+      .sort(),
+  ).toEqual(["s1", "s3"]);
+  expect(s.listByStatus("idle").map((x) => x.sessionPk)).toEqual(["s2"]);
+});

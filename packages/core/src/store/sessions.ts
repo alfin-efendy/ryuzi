@@ -12,6 +12,7 @@ interface Row {
   started_by: string | null;
   created_at: number | null;
   last_active: number | null;
+  resume_attempts: number | null;
 }
 
 function toSession(r: Row): Session {
@@ -26,6 +27,7 @@ function toSession(r: Row): Session {
     startedBy: r.started_by ?? undefined,
     createdAt: r.created_at ?? undefined,
     lastActive: r.last_active ?? undefined,
+    resumeAttempts: r.resume_attempts ?? 0,
   };
 }
 
@@ -40,6 +42,7 @@ const COLUMN: Record<keyof Session, string> = {
   startedBy: "started_by",
   createdAt: "created_at",
   lastActive: "last_active",
+  resumeAttempts: "resume_attempts",
 };
 
 export class SessionsStore {
@@ -47,8 +50,8 @@ export class SessionsStore {
 
   insert(s: Session): void {
     this.db.run(
-      `INSERT INTO sessions(session_pk, project_id, agent_session_id, worktree_path, branch, title, status, started_by, created_at, last_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO sessions(session_pk, project_id, agent_session_id, worktree_path, branch, title, status, started_by, created_at, last_active, resume_attempts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         s.sessionPk,
         s.projectId,
@@ -60,6 +63,7 @@ export class SessionsStore {
         s.startedBy ?? null,
         s.createdAt ?? null,
         s.lastActive ?? null,
+        s.resumeAttempts ?? 0,
       ],
     );
   }
@@ -74,6 +78,10 @@ export class SessionsStore {
       ? this.db.query<Row, [string]>("SELECT * FROM sessions WHERE project_id = ? ORDER BY created_at").all(projectId)
       : this.db.query<Row, []>("SELECT * FROM sessions ORDER BY created_at").all();
     return rows.map(toSession);
+  }
+
+  listByStatus(status: SessionStatus): Session[] {
+    return this.db.query<Row, [string]>("SELECT * FROM sessions WHERE status = ? ORDER BY created_at").all(status).map(toSession);
   }
 
   update(sessionPk: string, patch: Partial<Session>): void {
