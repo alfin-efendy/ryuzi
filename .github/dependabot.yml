@@ -1,5 +1,6 @@
 version: 2
 updates:
+  # GitHub Actions — existing grouped weekly version updates.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -9,3 +10,28 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # Cargo — `glib` is a transitive dependency (via tauri/webkit/gtk) and its
+  # security advisory has NO patched version, so Dependabot cannot produce a
+  # fix and the security-update job fails. Ignore it to stop the noise.
+  # open-pull-requests-limit: 0 keeps version-update PRs off (current behavior).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "glib"
+
+  # npm — this repo uses Bun (`bun.lock`), which Dependabot's npm/yarn updater
+  # cannot write, so npm update jobs fail at the lockfile step regardless of the
+  # dependency. Keep version-update PRs off and ignore the dep whose security
+  # job was failing. (vite is already on a patched release, 5.4.21 — the failure
+  # was the Bun lockfile, not an outstanding vulnerability.)
+  - package-ecosystem: npm
+    directory: "/apps/cockpit"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "vite"
