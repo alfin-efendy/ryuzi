@@ -1,6 +1,6 @@
 {
   "name": "ryuzi-darwin-arm64",
-  "version": "0.0.0",
+  "version": "0.2.0",
   "description": "darwin-arm64 binary for ryuzi.",
   "license": "MIT",
   "repository": {

@@ -1,6 +1,6 @@
 {
   "name": "ryuzi",
-  "version": "0.0.0",
+  "version": "0.2.0",
   "description": "ryuzi CLI — gateway-agnostic control plane for agent harnesses.",
   "license": "MIT",
   "repository": {
@@ -17,12 +17,12 @@
     "bin/ryuzi.js"
   ],
   "optionalDependencies": {
-    "ryuzi-linux-x64": "0.0.0",
-    "ryuzi-linux-arm64": "0.0.0",
-    "ryuzi-linux-x64-musl": "0.0.0",
-    "ryuzi-linux-arm64-musl": "0.0.0",
-    "ryuzi-darwin-x64": "0.0.0",
-    "ryuzi-darwin-arm64": "0.0.0",
-    "ryuzi-win32-x64": "0.0.0"
+    "ryuzi-linux-x64": "0.2.0",
+    "ryuzi-linux-arm64": "0.2.0",
+    "ryuzi-linux-x64-musl": "0.2.0",
+    "ryuzi-linux-arm64-musl": "0.2.0",
+    "ryuzi-darwin-x64": "0.2.0",
+    "ryuzi-darwin-arm64": "0.2.0",
+    "ryuzi-win32-x64": "0.2.0"
   }
 }

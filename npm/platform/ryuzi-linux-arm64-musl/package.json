@@ -1,6 +1,6 @@
 {
   "name": "ryuzi-linux-arm64-musl",
-  "version": "0.0.0",
+  "version": "0.2.0",
   "description": "linux-arm64 (musl) binary for ryuzi.",
   "license": "MIT",
   "repository": {
