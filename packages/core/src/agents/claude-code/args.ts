@@ -13,6 +13,7 @@ export function buildClaudeArgs(input: AgentRunInput, newSessionId: string): str
   if (input.model) args.push("--model", input.model);
   if (input.effort) args.push("--effort", input.effort);
   args.push("--permission-mode", input.permissionMode);
+  if (input.systemPromptAppend) args.push("--append-system-prompt", input.systemPromptAppend);
   if (input.permissionMode === "default" && input.approval) {
     args.push("--settings", buildHookSettings(input.approval.hookBinPath));
   }
