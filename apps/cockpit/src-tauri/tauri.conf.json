@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Cockpit",
+  "productName": "ryuzi",
   "version": "0.0.0",
-  "identifier": "id.meditap.cockpit",
+  "identifier": "id.meditap.ryuzi",
   "build": {
     "beforeDevCommand": "bun run dev",
     "beforeBuildCommand": "bun run build",
@@ -11,7 +11,7 @@
   },
   "app": {
     "windows": [
-      { "title": "Cockpit", "width": 1200, "height": 800, "minWidth": 720, "minHeight": 480, "resizable": true, "decorations": false }
+      { "title": "ryuzi", "width": 1200, "height": 800, "minWidth": 720, "minHeight": 480, "resizable": true, "decorations": false }
     ],
     "security": { "csp": null }
   },

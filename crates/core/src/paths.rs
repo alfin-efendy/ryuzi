@@ -3,11 +3,11 @@ use std::path::PathBuf;
 pub fn state_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("harness-cockpit")
+        .join("ryuzi")
 }
 
 pub fn db_path() -> PathBuf {
-    state_dir().join("cockpit.sqlite")
+    state_dir().join("ryuzi.sqlite")
 }
 
 pub fn worktree_path_for(project_id: &str, session_pk: &str) -> PathBuf {
@@ -32,9 +32,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_dir_is_under_harness_cockpit() {
-        assert!(state_dir().ends_with("harness-cockpit"));
-        assert!(db_path().ends_with("cockpit.sqlite"));
+    fn state_dir_is_under_ryuzi() {
+        assert!(state_dir().ends_with("ryuzi"));
+        assert!(db_path().ends_with("ryuzi.sqlite"));
     }
 
     #[test]

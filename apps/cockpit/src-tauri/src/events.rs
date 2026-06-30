@@ -1,4 +1,4 @@
-use harness_core::CoreEvent;
+use ryuzi_core::CoreEvent;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri_specta::Event;

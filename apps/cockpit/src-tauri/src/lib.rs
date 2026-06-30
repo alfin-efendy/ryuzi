@@ -3,24 +3,24 @@ mod error;
 mod events;
 
 use std::sync::Arc;
-use harness_core::{ControlPlane, Store};
+use ryuzi_core::{ControlPlane, Store};
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
 fn resolve_hook_path(app: &tauri::AppHandle) -> String {
-    // In dev, the hook binary is built into target/<profile>/harness-hook.
+    // In dev, the hook binary is built into target/<profile>/ryuzi-hook.
     // In a bundled app it ships alongside the main binary (see Task: packaging, R3).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("harness-hook");
+            let p = dir.join("ryuzi-hook");
             if p.exists() {
                 return p.to_string_lossy().into_owned();
             }
         }
     }
-    // Dev fallback: fall through to PATH resolution in harness-core.
+    // Dev fallback: fall through to PATH resolution in ryuzi-core.
     let _ = app;
-    "harness-hook".to_string()
+    "ryuzi-hook".to_string()
 }
 
 fn make_builder() -> Builder<tauri::Wry> {
@@ -66,10 +66,10 @@ pub fn run() {
             // calls tokio::runtime::Handle::current(), which panics ("no reactor running") unless
             // invoked from within a Tokio runtime context. block_on enters that context.
             let cp = tauri::async_runtime::block_on(async move {
-                let store = Store::open(&harness_core::paths::db_path())
+                let store = Store::open(&ryuzi_core::paths::db_path())
                     .await
-                    .expect("open cockpit db");
-                let cp = ControlPlane::new(store, Arc::new(harness_core::runtime::ProcessRunner)).await;
+                    .expect("open ryuzi db");
+                let cp = ControlPlane::new(store, Arc::new(ryuzi_core::runtime::ProcessRunner)).await;
                 // Enable the approval side-channel; errors are non-fatal (no hook binary in CI).
                 cp.enable_approvals(hook_path).ok();
                 cp
@@ -89,7 +89,7 @@ pub fn run() {
                             let _ = events::CoreEventMsg { event: ev }.emit(&app_handle);
                         }
                         Err(RecvError::Lagged(n)) => {
-                            eprintln!("[cockpit] CoreEvent bridge lagged, skipped {n} event(s)");
+                            eprintln!("[ryuzi] CoreEvent bridge lagged, skipped {n} event(s)");
                             continue;
                         }
                         Err(RecvError::Closed) => break,
@@ -99,7 +99,7 @@ pub fn run() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running cockpit");
+        .expect("error while running ryuzi");
 }
 
 #[cfg(test)]
@@ -107,7 +107,7 @@ mod tests {
     use super::*;
 
     /// Generates `src/bindings.ts` without launching the Tauri GUI.
-    /// Run via: `cargo test -p cockpit export_bindings -- --nocapture`
+    /// Run via: `cargo test -p ryuzi-cockpit export_bindings -- --nocapture`
     #[test]
     fn export_bindings() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");

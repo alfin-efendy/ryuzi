@@ -1,5 +1,5 @@
 use crate::error::CmdError;
-use harness_core::{ControlPlane, Project, Session};
+use ryuzi_core::{ControlPlane, Project, Session};
 use std::sync::Arc;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;

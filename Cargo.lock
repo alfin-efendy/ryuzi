@@ -354,22 +354,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
 
 [[package]]
-name = "cockpit"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "harness-core",
- "serde",
- "specta",
- "specta-typescript",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-specta",
- "tokio",
-]
-
-[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1314,26 +1298,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "harness-core"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "deadpool-sqlite",
- "dirs 5.0.1",
- "git2",
- "rusqlite",
- "rusqlite_migration",
- "serde",
- "serde_json",
- "specta",
- "tempfile",
- "tiny_http",
- "tokio",
- "tokio-util",
- "uuid",
 ]
 
 [[package]]
@@ -2850,6 +2814,42 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "ryuzi-cockpit"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "ryuzi-core",
+ "serde",
+ "specta",
+ "specta-typescript",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-specta",
+ "tokio",
+]
+
+[[package]]
+name = "ryuzi-core"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "deadpool-sqlite",
+ "dirs 5.0.1",
+ "git2",
+ "rusqlite",
+ "rusqlite_migration",
+ "serde",
+ "serde_json",
+ "specta",
+ "tempfile",
+ "tiny_http",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
 
 [[package]]
 name = "same-file"
