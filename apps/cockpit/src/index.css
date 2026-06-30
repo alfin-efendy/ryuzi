@@ -1,2 +1,7 @@
 @import "@harness/ui/styles.css";
 @import "@fontsource-variable/geist";
+
+/* Tauri drag region (touch/pen support on Windows) */
+*[data-tauri-drag-region] {
+  app-region: drag;
+}
