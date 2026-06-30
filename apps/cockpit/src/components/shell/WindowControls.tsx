@@ -25,7 +25,7 @@ export function WindowControls() {
           <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2"><rect x="2" y="2" width="8" height="8" rx="1.2" /></svg>
         )}
       </button>
-      <button type="button" aria-label="Close" className={`${btn} hover:bg-destructive hover:text-white`} onClick={() => win.close()}>
+      <button type="button" aria-label="Close" className={`${btn} hover:bg-destructive hover:text-destructive-foreground`} onClick={() => win.close()}>
         <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"><path d="M3 3l6 6M9 3l-6 6" /></svg>
       </button>
     </div>
