@@ -34,6 +34,7 @@ export class UpdateManager {
 
   start(): void {
     if (this.mode() === "off") return;
+    void this.tick(); // initial check on boot
     const ms = Number(this.deps.settings.get("auto_update_check_interval_ms") ?? "21600000");
     const make =
       this.deps.makeTimer ??
@@ -71,8 +72,8 @@ export class UpdateManager {
     const text = `⬆️ harness-router ${version} is available — ${upgradeHint(install)}`;
     this.deps.log?.(text);
     for (const s of this.deps.cp.listSessions()) {
-      if (s.status === "ended") continue;
-      this.deps.cp.emit({ kind: "status", sessionPk: s.sessionPk, text });
+      if (s.status !== "idle" && s.status !== "running") continue;
+      this.deps.cp.emit({ kind: "notice", sessionPk: s.sessionPk, text });
     }
   }
 }

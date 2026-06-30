@@ -114,6 +114,10 @@ export class Router {
       this.serial(e.sessionPk, () => this.renderStatus(e.sessionPk, e.text));
       return;
     }
+    if (e.kind === "notice") {
+      this.serial(e.sessionPk, () => this.renderNotice(e.sessionPk, e.text));
+      return;
+    }
     if (e.kind === "result") {
       this.serial(e.sessionPk, () => this.renderResult(e.sessionPk));
       return;
@@ -137,6 +141,13 @@ export class Router {
       const ref = st.status.get(key);
       if (ref) await gw.editStatus(ref, text);
       else st.status.set(key, await gw.postStatus(surface, text));
+    }
+  }
+
+  private async renderNotice(sessionPk: string, text: string): Promise<void> {
+    for (const surface of this.sessions.surfaces(sessionPk)) {
+      const gw = this.core.gateways.get(surface.gateway);
+      if (gw) await gw.postResult(surface, [text]);
     }
   }
 
