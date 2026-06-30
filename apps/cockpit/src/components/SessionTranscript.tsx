@@ -55,7 +55,14 @@ export function SessionTranscript() {
         <div className="mx-auto flex max-w-[720px] flex-col gap-4 px-6">
           {lines.length === 0 && <div className="text-sm text-muted-foreground">Waiting for output…</div>}
           {lines.map((l, i) =>
-            l.kind === "status" ? (
+            l.kind === "user" ? (
+              <div
+                key={i}
+                className="max-w-[80%] self-end rounded-2xl rounded-br-sm border border-border bg-muted px-3.5 py-2.5 text-[13.5px] leading-relaxed whitespace-pre-wrap"
+              >
+                {l.text}
+              </div>
+            ) : l.kind === "status" ? (
               <div key={i} className="pl-9 font-mono text-xs text-muted-foreground">{l.text}</div>
             ) : l.kind === "error" ? (
               <div key={i} className="ml-9 rounded-lg bg-destructive/10 p-2.5 text-sm text-destructive">{l.text}</div>

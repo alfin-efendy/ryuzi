@@ -48,3 +48,37 @@ test("pending approvals from different sessions both count", () => {
   s.applyCoreEvent({ kind: "approvalRequested", session_pk: "s2", request_id: "r2", tool: "Write", summary: "y" });
   expect(useStore.getState().pendingApprovals).toHaveLength(2);
 });
+
+const runningSession = (pk: string) => ({
+  sessionPk: pk,
+  projectId: "p1",
+  agentSessionId: null,
+  worktreePath: null,
+  branch: null,
+  title: null,
+  status: "running" as const,
+  createdAt: null,
+  lastActive: null,
+});
+
+test("result event flips the session status back to idle (so the composer leaves Stop mode)", () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
+  expect(useStore.getState().sessions[0].status).toBe("idle");
+});
+
+test("sessionEnded event marks the session ended", () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  useStore.getState().applyCoreEvent({ kind: "sessionEnded", session_pk: "s1" });
+  expect(useStore.getState().sessions[0].status).toBe("ended");
+});
+
+test("result event leaves other sessions' status untouched", () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1"), runningSession("s2")] });
+  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
+  const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
+  expect(byPk).toEqual({ s1: "idle", s2: "running" });
+});

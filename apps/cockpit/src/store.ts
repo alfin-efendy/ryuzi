@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { toast } from "sonner";
 import { commands, events, type Project, type Session, type CoreEvent } from "./bindings";
 
-export type Line = { kind: "text" | "status" | "error"; text: string };
+export type Line = { kind: "user" | "text" | "status" | "error"; text: string };
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
 
 type State = {
@@ -56,6 +56,12 @@ export const useStore = create<State>((set, get) => ({
               { sessionPk: e.session_pk, requestId: e.request_id, tool: e.tool, summary: e.summary },
             ],
           };
+        case "result":
+          // Turn finished — the session is alive but awaiting input. Flip it out of "running"
+          // so the composer leaves Stop mode and the user can reply.
+          return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
+        case "sessionEnded":
+          return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "ended" as const } : s)) };
         default:
           return {};
       }
@@ -89,13 +95,17 @@ export const useStore = create<State>((set, get) => ({
   start: async (projectId, prompt) => {
     const res = await commands.startSession(projectId, prompt);
     if (res.status === "ok") {
-      set({ focusedSessionPk: res.data.sessionPk });
+      const pk = res.data.sessionPk;
+      // Echo the user's first message into the transcript (the engine does not emit it back).
+      set((st) => ({ focusedSessionPk: pk, transcripts: append(st.transcripts, pk, { kind: "user", text: prompt }) }));
       await get().refresh();
     } else if (res.status === "error") {
       toast.error("Couldn't start session: " + res.error.message);
     }
   },
   send: async (sessionPk, prompt) => {
+    // Echo the user's message into the transcript immediately (the engine does not emit it back).
+    set((st) => ({ transcripts: append(st.transcripts, sessionPk, { kind: "user", text: prompt }) }));
     const res = await commands.continueSession(sessionPk, prompt);
     if (res.status === "error") {
       toast.error("Couldn't send message: " + res.error.message);
