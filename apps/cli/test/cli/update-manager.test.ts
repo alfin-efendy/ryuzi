@@ -159,6 +159,48 @@ test("upgradeHint: unknown execPath produces GitHub release hint", async () => {
   expect((t.emitted[0] as { text: string }).text).toMatch(/GitHub release/);
 });
 
+test("auto mode on a self-applicable install triggers applyUpdate, not a notice", async () => {
+  let applied: { tag: string } | undefined;
+  const { um, emitted } = mgr({
+    execPath: "/home/me/.local/bin/hr", // installsh → selfApplicable
+    home: "/home/me",
+    applyUpdate: async (info) => {
+      applied = { tag: info.tag };
+    },
+  });
+  await um.tick();
+  expect(applied?.tag).toBe("v0.3.0");
+  expect(emitted).toHaveLength(0); // applied, not announced
+});
+
+test("auto mode on a non-self-applicable install still notifies (no apply)", async () => {
+  let applied = false;
+  const { um, emitted } = mgr({
+    execPath: "/opt/homebrew/bin/hr", // brew → notify-only
+    applyUpdate: async () => {
+      applied = true;
+    },
+  });
+  await um.tick();
+  expect(applied).toBe(false);
+  expect(emitted).toHaveLength(1);
+});
+
+test("notify mode never applies even on a self-applicable install", async () => {
+  let applied = false;
+  const { um, settings, emitted } = mgr({
+    execPath: "/home/me/.local/bin/hr",
+    home: "/home/me",
+    applyUpdate: async () => {
+      applied = true;
+    },
+  });
+  settings.set("auto_update", "notify");
+  await um.tick();
+  expect(applied).toBe(false);
+  expect(emitted).toHaveLength(1);
+});
+
 test("interrupted sessions are excluded from notice broadcast", async () => {
   const settings = new SettingsStore(openDb(":memory:"));
   const t = target([

@@ -18,6 +18,7 @@ export interface UpdateManagerDeps {
   home?: string;
   log?: (m: string) => void;
   makeTimer?: (fn: () => void, ms: number) => { stop(): void };
+  applyUpdate?: (info: { repo: string; tag: string; version: string }) => Promise<void>;
 }
 
 type Mode = "auto" | "notify" | "off";
@@ -61,8 +62,10 @@ export class UpdateManager {
       home: this.deps.home,
       dockerEnv: this.deps.dockerEnv,
     });
-    // Phase 2a: announce only. Phase 2b adds the self-apply branch for
-    // mode === "auto" && install.selfApplicable.
+    if (this.mode() === "auto" && install.selfApplicable && this.deps.applyUpdate && res.tag) {
+      await this.deps.applyUpdate({ repo, tag: res.tag, version: res.latestVersion });
+      return;
+    }
     this.notify(res.latestVersion, install);
   }
 
