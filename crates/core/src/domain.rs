@@ -105,6 +105,42 @@ pub enum McpTransport {
     },
 }
 
+/// Where a session is driven from (a gateway channel + conversation).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Surface {
+    pub gateway: String,
+    pub conversation_id: String,
+}
+
+/// Who initiated an action, across gateways.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Actor {
+    pub id: String,
+    pub gateway: String,
+}
+
+/// A tool-approval request surfaced to a gateway / UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequest {
+    pub request_id: String,
+    pub tool: String,
+    pub summary: String,
+}
+
+/// The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+    Cancel,
+}
+
 /// A persisted transcript entry. Forward-compatible with ACP session/update blocks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
