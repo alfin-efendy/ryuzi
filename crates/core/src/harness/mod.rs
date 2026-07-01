@@ -3,6 +3,8 @@ use crate::domain::{CoreEvent, McpServerSpec, PermMode};
 use crate::registry::Registry;
 use crate::store::Store;
 use async_trait::async_trait;
+
+pub mod acp;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
