@@ -303,7 +303,9 @@ impl Store {
                             seq: r.get(1)?,
                             role: r.get(2)?,
                             block_type: r.get(3)?,
-                            payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                            payload: serde_json::from_str(&payload).map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                            })?,
                             tool_call_id: r.get(5)?,
                             status: r.get(6)?,
                             tool_kind: r.get(7)?,
@@ -331,11 +333,15 @@ impl Store {
         let payload = serde_json::to_string(payload)?;
         let conn = self.pool.get().await?;
         conn.interact(move |c| {
-            c.execute(
+            let n = c.execute(
                 "UPDATE messages SET payload=?3, status=COALESCE(?4, status) \
                  WHERE session_pk=?1 AND tool_call_id=?2",
                 params![session_pk, tool_call_id, payload, status],
-            )
+            )?;
+            if n == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            Ok(())
         })
         .await
         .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
@@ -364,7 +370,7 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{PermMode, Project};
+    use crate::domain::{NewMessage, PermMode, Project};
     use crate::domain::{Session, SessionStatus};
 
     fn sample_project() -> Project {
@@ -409,8 +415,6 @@ mod tests {
             last_active: Some(1),
         }
     }
-
-    use crate::domain::NewMessage;
 
     #[tokio::test]
     async fn messages_get_monotonic_per_session_seq_and_list_in_order() {
@@ -457,6 +461,16 @@ mod tests {
         assert_eq!(rows.len(), 1, "update must not insert a new row");
         assert_eq!(rows[0].status.as_deref(), Some("completed"));
         assert_eq!(rows[0].payload["output"], "file.txt");
+    }
+
+    #[tokio::test]
+    async fn update_tool_call_errors_when_row_absent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let res = store
+            .update_tool_call("s1", "missing-tc", Some("completed"), &serde_json::json!({}))
+            .await;
+        assert!(res.is_err(), "updating a nonexistent tool_call_id must error");
     }
 
     #[tokio::test]
