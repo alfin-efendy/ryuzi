@@ -16,6 +16,8 @@
 //! Both feed the same [`connect_and_initialize`], which is transport-agnostic
 //! over any `impl ConnectTo<Client>`.
 
+use std::sync::Arc;
+
 use agent_client_protocol::schema::v1::{
     ClientCapabilities, InitializeRequest, InitializeResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SessionNotification,
@@ -79,19 +81,28 @@ fn extract_caps(response: &InitializeResponse) -> Caps {
 /// capabilities we gate on. Proves the full builder + transport + `initialize`
 /// round-trip against the real crate API.
 ///
+/// If `sink` is `Some`, incoming `SessionNotification`s are forwarded to
+/// [`crate::harness::acp::notification::handle`] for persistence + fan-out.
+/// Pass `None` to keep the stub behaviour (Task 1/2 tests).
+///
 /// The two `on_receive_*` handlers are minimal stubs in Task 1 (they exist so
 /// the builder is shaped correctly); the real notification and permission
 /// handlers land in Tasks 3-4. They are written as inline closures so the
 /// responder/notification types are inferred by the marker macros.
 pub async fn connect_and_initialize(
     transport: impl agent_client_protocol::ConnectTo<Client> + 'static,
+    sink: Option<Arc<crate::harness::acp::notification::NotificationSink>>,
 ) -> Result<Caps, agent_client_protocol::Error> {
     Client
         .builder()
         .on_receive_notification(
-            async move |_notification: SessionNotification, _cx| {
-                // Task 1 does not consume session updates yet.
-                Ok(())
+            {
+                async move |notification: SessionNotification, _cx| {
+                    if let Some(ref s) = sink {
+                        crate::harness::acp::notification::handle(notification, s).await;
+                    }
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_notification!(),
         )
@@ -130,7 +141,7 @@ mod tests {
         let (transport, _join) = crate::harness::acp::testkit::connect_mock(
             crate::harness::acp::testkit::MockAgent::new(),
         );
-        let caps = super::connect_and_initialize(transport).await.unwrap();
+        let caps = super::connect_and_initialize(transport, None).await.unwrap();
         assert!(caps.supports_load, "mock advertises loadSession=true");
         assert!(caps.supports_close, "mock advertises a close capability");
     }

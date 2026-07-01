@@ -13,10 +13,12 @@
 //! `LifecycleOutcome` for test assertions.
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, Implementation, InitializeRequest, InitializeResponse,
-    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionMode,
-    SessionModeState, SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
+    AgentCapabilities, ContentBlock, ContentChunk, Implementation, InitializeRequest,
+    InitializeResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, SessionCapabilities, SessionCloseCapabilities, SessionId, SessionMode,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
 use agent_client_protocol::util::MatchDispatchFrom;
 use agent_client_protocol::{
@@ -139,12 +141,46 @@ impl HandleDispatchFrom<Client> for MockAgent {
                 },
             )
             .await
-            // session/prompt — return EndTurn with no updates
-            .if_request(
-                |_req: PromptRequest, responder: Responder<PromptResponse>| async move {
-                    responder.respond(PromptResponse::new(StopReason::EndTurn))
-                },
-            )
+            // session/prompt — send a few streaming notifications then return EndTurn
+            .if_request({
+                let cx_for_prompt = cx.clone();
+                move |req: PromptRequest, responder: Responder<PromptResponse>| {
+                    let cx = cx_for_prompt.clone();
+                    async move {
+                        let session_id = req.session_id.clone();
+
+                        // 1. Agent message text chunk
+                        let _ = cx.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("working")),
+                            )),
+                        ));
+
+                        // 2. Tool call (pending)
+                        let _ = cx.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::ToolCall(
+                                ToolCall::new("tc-1", "Bash")
+                                    .status(ToolCallStatus::Pending),
+                            ),
+                        ));
+
+                        // 3. Tool call update (completed)
+                        let _ = cx.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                "tc-1",
+                                ToolCallUpdateFields::new()
+                                    .status(ToolCallStatus::Completed)
+                                    .raw_output(serde_json::json!("output text")),
+                            )),
+                        ));
+
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    }
+                }
+            })
             .await
             .otherwise(|message: Dispatch| async move {
                 // Reject anything else so the client sees a clean protocol
@@ -200,6 +236,126 @@ pub struct LifecycleOutcome {
     pub session_id: SessionId,
     /// `true` when `session/prompt` returned a `StopReason` (any variant).
     pub completed: bool,
+}
+
+/// Run the full lifecycle, collect notifications into a temp store, and
+/// return `(store, session_pk)` for test assertions.
+///
+/// The `session_pk` is the ACP `session_id` UUID string assigned by the mock
+/// agent during `session/new`. Notifications arrive carrying that same UUID,
+/// so the returned store will have rows keyed by `session_pk`.
+pub async fn run_prompt_and_collect() -> (std::sync::Arc<crate::store::Store>, String) {
+    use std::sync::Arc;
+
+    use agent_client_protocol::schema::v1::{
+        ClientCapabilities, InitializeRequest, InitializeResponse, RequestPermissionOutcome,
+        RequestPermissionRequest, RequestPermissionResponse,
+    };
+    use agent_client_protocol::schema::ProtocolVersion;
+    use agent_client_protocol::Client;
+    use tokio::sync::broadcast;
+
+    use crate::domain::CoreEvent;
+    use crate::harness::acp::notification::NotificationSink;
+    use crate::store::Store;
+
+    // 1. Temp SQLite store.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store: Arc<Store> = Arc::new(Store::open(tmp.path()).await.unwrap());
+
+    // 2. Broadcast channel (we don't subscribe — just need the sender).
+    let (events_tx, _events_rx) = broadcast::channel::<CoreEvent>(64);
+
+    // 3. Shared sink (session_pk filled in below via Arc<Mutex<>>).
+    //    We derive session_pk from the notification's session_id in the
+    //    notification handler, so the sink itself doesn't need it.
+    let sink: Arc<NotificationSink> = Arc::new(NotificationSink {
+        store: store.clone(),
+        events: events_tx,
+    });
+
+    // 4. Shared slot to capture the ACP session_id after session/new.
+    let session_pk_slot: Arc<tokio::sync::Mutex<String>> =
+        Arc::new(tokio::sync::Mutex::new(String::new()));
+    let session_pk_out = session_pk_slot.clone();
+
+    let (transport, _join) = connect_mock(MockAgent::new());
+
+    Client
+        .builder()
+        .on_receive_notification(
+            {
+                let sink = sink.clone();
+                async move |notification: SessionNotification, _cx| {
+                    crate::harness::acp::notification::handle(notification, &sink).await;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |_request: RequestPermissionRequest, responder, _cx| {
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(
+            transport,
+            async move |cx: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>| {
+                // initialize
+                let _init: InitializeResponse = cx
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::LATEST)
+                            .client_capabilities(ClientCapabilities::new()),
+                    )
+                    .block_task()
+                    .await?;
+
+                // session/new — capture the ACP session_id as our session_pk
+                let session_resp = crate::harness::acp::lifecycle::new_session(
+                    &cx,
+                    std::path::PathBuf::from("/tmp"),
+                    vec![],
+                )
+                .await?;
+                let session_id = session_resp.session_id.clone();
+                let pk = session_id.0.to_string();
+                *session_pk_out.lock().await = pk.clone();
+
+                // set_mode
+                let available = session_resp
+                    .modes
+                    .as_ref()
+                    .map(|m| m.available_modes.as_slice())
+                    .unwrap_or(&[]);
+                crate::harness::acp::lifecycle::set_mode(
+                    &cx,
+                    session_id.clone(),
+                    "default",
+                    available,
+                )
+                .await?;
+
+                // prompt — the mock will send 3 notifications before EndTurn
+                let content = vec![ContentBlock::Text(TextContent::new("hi"))];
+                let (_stop, _usage) =
+                    crate::harness::acp::lifecycle::prompt(&cx, session_id, content).await?;
+
+                Ok(())
+            },
+        )
+        .await
+        .expect("run_prompt_and_collect: ACP lifecycle failed");
+
+    // Give the async notification handlers a chance to complete.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let session_pk = session_pk_slot.lock().await.clone();
+    // Keep tmp alive until after we've read the store.
+    drop(tmp);
+    (store, session_pk)
 }
 
 /// Run the full lifecycle sequence — connect → initialize → new_session →

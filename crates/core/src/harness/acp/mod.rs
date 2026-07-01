@@ -6,6 +6,7 @@
 //! session driver) land in later tasks.
 
 pub mod lifecycle;
+pub mod notification;
 pub mod transport;
 
 #[cfg(test)]
