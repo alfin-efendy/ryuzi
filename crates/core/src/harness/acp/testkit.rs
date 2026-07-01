@@ -6,10 +6,17 @@
 //! `HandleDispatchFrom<Client>` dispatch chain), pared down to only what
 //! Task 1's `initialize` needs. Later tasks extend `MockAgent` to answer
 //! `session/new`, `session/prompt`, etc.
+//!
+//! Task 2 extends `MockAgent` to answer `session/new`, `session/set_mode`,
+//! and `session/prompt`. The `drive_lifecycle` helper runs the full
+//! connect→initialize→new→set_mode→prompt sequence and returns a
+//! `LifecycleOutcome` for test assertions.
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, Implementation, InitializeRequest, InitializeResponse, McpCapabilities,
-    SessionCapabilities, SessionCloseCapabilities,
+    AgentCapabilities, ContentBlock, Implementation, InitializeRequest, InitializeResponse,
+    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionMode,
+    SessionModeState, SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
 };
 use agent_client_protocol::util::MatchDispatchFrom;
 use agent_client_protocol::{
@@ -62,6 +69,23 @@ impl MockAgent {
             .agent_info(Implementation::new("ryuzi-mock-agent", env!("CARGO_PKG_VERSION")))
             .agent_capabilities(capabilities)
     }
+
+    /// Build the `SessionModeState` that the mock always advertises: three
+    /// modes matching ryuzi's `PermMode` variants, with `default` active.
+    fn mock_mode_state() -> SessionModeState {
+        SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("acceptEdits", "Accept Edits"),
+                SessionMode::new("bypassPermissions", "Bypass Permissions"),
+            ],
+        )
+    }
+
+    fn new_session_response(session_id: impl Into<SessionId>) -> NewSessionResponse {
+        NewSessionResponse::new(session_id).modes(Self::mock_mode_state())
+    }
 }
 
 impl Default for MockAgent {
@@ -82,6 +106,7 @@ impl HandleDispatchFrom<Client> for MockAgent {
     ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
         let this = self.clone();
         MatchDispatchFrom::new(message, &cx)
+            // initialize
             .if_request(
                 |req: InitializeRequest, responder: Responder<InitializeResponse>| async move {
                     let response = this.initialize_response(&req);
@@ -89,9 +114,41 @@ impl HandleDispatchFrom<Client> for MockAgent {
                 },
             )
             .await
+            // session/new — return a fresh session id + mode list
+            .if_request(
+                |_req: NewSessionRequest, responder: Responder<NewSessionResponse>| async move {
+                    let session_id = uuid::Uuid::new_v4().to_string();
+                    let response = MockAgent::new_session_response(session_id);
+                    responder.respond(response)
+                },
+            )
+            .await
+            // session/set_mode — accept valid modes, reject unknown ones
+            .if_request(
+                |req: SetSessionModeRequest,
+                 responder: Responder<SetSessionModeResponse>| async move {
+                    let valid = ["default", "acceptEdits", "bypassPermissions"];
+                    if valid.contains(&req.mode_id.0.as_ref()) {
+                        responder.respond(SetSessionModeResponse::new())
+                    } else {
+                        responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data(format!("unknown mode: {}", req.mode_id.0)),
+                        )
+                    }
+                },
+            )
+            .await
+            // session/prompt — return EndTurn with no updates
+            .if_request(
+                |_req: PromptRequest, responder: Responder<PromptResponse>| async move {
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                },
+            )
+            .await
             .otherwise(|message: Dispatch| async move {
-                // Task 1 only needs `initialize`; reject anything else so the
-                // client sees a clean protocol error rather than a hang.
+                // Reject anything else so the client sees a clean protocol
+                // error rather than a hang.
                 if let Dispatch::Request(_req, responder) = message {
                     responder
                         .respond_with_error(agent_client_protocol::Error::method_not_found())?;
@@ -135,4 +192,96 @@ pub fn connect_mock(agent: MockAgent) -> (DuplexTransport, tokio::task::JoinHand
     let transport =
         agent_client_protocol::ByteStreams::new(client_write.compat_write(), client_read.compat());
     (transport, join)
+}
+
+/// Outcome returned by [`drive_lifecycle`].
+pub struct LifecycleOutcome {
+    /// The `SessionId` assigned by the mock for the new session.
+    pub session_id: SessionId,
+    /// `true` when `session/prompt` returned a `StopReason` (any variant).
+    pub completed: bool,
+}
+
+/// Run the full lifecycle sequence — connect → initialize → new_session →
+/// set_mode → prompt — against the in-process mock agent and return the
+/// outcome for test assertions.
+///
+/// `mode` is the ACP mode string to request (e.g. `"default"`).
+/// `prompt_text` is the user message to send in the `session/prompt`.
+pub async fn drive_lifecycle(
+    mode: &str,
+    prompt_text: &str,
+) -> Result<LifecycleOutcome, agent_client_protocol::Error> {
+    use agent_client_protocol::schema::ProtocolVersion;
+    use agent_client_protocol::schema::v1::{
+        ClientCapabilities, InitializeRequest, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, SessionNotification,
+    };
+    use agent_client_protocol::Client;
+
+    let mode = mode.to_string();
+    let prompt_text = prompt_text.to_string();
+
+    let (transport, _join) = connect_mock(MockAgent::new());
+
+    Client
+        .builder()
+        .on_receive_notification(
+            async move |_notification: SessionNotification, _cx| Ok(()),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |_request: RequestPermissionRequest, responder, _cx| {
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(
+            transport,
+            async move |cx: ConnectionTo<agent_client_protocol::Agent>| {
+                // 1. initialize
+                let _init: InitializeResponse = cx
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::LATEST)
+                            .client_capabilities(ClientCapabilities::new()),
+                    )
+                    .block_task()
+                    .await?;
+
+                // 2. session/new
+                let session_resp = crate::harness::acp::lifecycle::new_session(
+                    &cx,
+                    std::path::PathBuf::from("/tmp"),
+                    vec![],
+                )
+                .await?;
+                let session_id = session_resp.session_id.clone();
+
+                // 3. set_mode — gather available modes from the response
+                let available = session_resp
+                    .modes
+                    .as_ref()
+                    .map(|m| m.available_modes.as_slice())
+                    .unwrap_or(&[]);
+                crate::harness::acp::lifecycle::set_mode(&cx, session_id.clone(), &mode, available)
+                    .await?;
+
+                // 4. prompt
+                let content = vec![ContentBlock::Text(TextContent::new(prompt_text))];
+                let (stop_reason, _usage) =
+                    crate::harness::acp::lifecycle::prompt(&cx, session_id.clone(), content)
+                        .await?;
+
+                // StopReason is non_exhaustive but we just care that we got one.
+                let _ = stop_reason;
+
+                Ok(LifecycleOutcome {
+                    session_id,
+                    completed: true,
+                })
+            },
+        )
+        .await
 }

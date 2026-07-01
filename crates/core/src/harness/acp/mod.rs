@@ -5,10 +5,11 @@
 //! the external `agent-client-protocol` 1.0 crate; higher layers (control plane,
 //! session driver) land in later tasks.
 
+pub mod lifecycle;
 pub mod transport;
 
 #[cfg(test)]
-mod testkit;
+pub(crate) mod testkit;
 
 /// Static description of how to launch an ACP adapter sidecar (the bundled
 /// Claude Code adapter, in production). Kept here so the transport layer can be
