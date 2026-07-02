@@ -52,6 +52,8 @@ type UiState = {
   activeTabId: string | null;
   toggleLeft: () => void;
   toggleRight: () => void;
+  setLeft: (open: boolean) => void;
+  setRight: (open: boolean) => void;
   openFile: (path: string) => void;
   closeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
@@ -73,6 +75,18 @@ export const useUi = create<UiState>((set, get) => ({
       const v = !s.rightPanelOpen;
       persist(KEY.right, v ? "1" : "0");
       return { rightPanelOpen: v };
+    }),
+  setLeft: (open) =>
+    set((s) => {
+      if (s.leftPanelOpen === open) return s;
+      persist(KEY.left, open ? "1" : "0");
+      return { leftPanelOpen: open };
+    }),
+  setRight: (open) =>
+    set((s) => {
+      if (s.rightPanelOpen === open) return s;
+      persist(KEY.right, open ? "1" : "0");
+      return { rightPanelOpen: open };
     }),
   openFile: (path) => {
     const r = openFileTab(get().tabs, path);

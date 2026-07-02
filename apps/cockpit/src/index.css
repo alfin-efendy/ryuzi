@@ -5,3 +5,9 @@
 *[data-tauri-drag-region] {
   app-region: drag;
 }
+
+/* Programmatic panel toggle animation; applied transiently by useToggleSync so
+   drag-resize stays direct. react-resizable-panels sizes panels via flex-basis. */
+.panels-animating [data-slot="resizable-panel"] {
+  transition: flex-basis 200ms ease;
+}
