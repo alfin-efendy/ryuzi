@@ -12,7 +12,10 @@ const on = "bg-primary/10 text-primary";
 export function TitleBar() {
   const { leftPanelOpen, rightPanelOpen, toggleLeft, toggleRight } = useUi();
   return (
-    <div data-tauri-drag-region className={`flex h-11 shrink-0 select-none items-center border-b border-border bg-surface-window pr-1.5 ${isMac ? "pl-[78px]" : "pl-3"}`}>
+    <div
+      data-tauri-drag-region
+      className={`flex h-11 shrink-0 select-none items-center border-b border-border bg-surface-window pr-1.5 ${isMac ? "pl-[78px]" : "pl-3"}`}
+    >
       <div className="flex items-center gap-2">
         <div className="flex h-[22px] w-[22px] items-center justify-center rounded-[7px] bg-primary text-primary-foreground">
           <svg

@@ -19,13 +19,13 @@ import {
 /**
  * Animate programmatic collapse/expand only — drag must stay direct.
  *
- * `suppressSync` guards against a feedback loop: onResize is
- * ResizeObserver-backed and fires on every intermediate frame of an animated
- * collapse/expand, and isCollapsed() reports false mid-animation — without the
- * flag, those frames would write the opposite of the user's request back into
- * the store. The flag is raised before the imperative call and lowered by the
- * same timeout that removes the animation class, so drag-resize (which never
- * raises it) still syncs normally.
+ * `suppressSync` guards against a feedback loop: onResize fires for every
+ * animation frame via ResizeObserver; the library's layout store already
+ * reflects the target state synchronously, so the flag is defense-in-depth
+ * against epsilon/timing edge cases and keeps sync semantics obvious. The
+ * flag is raised before the imperative call and lowered by the same timeout
+ * that removes the animation class, so drag-resize (which never raises it)
+ * still syncs normally.
  */
 function useToggleSync(
   open: boolean,
@@ -101,7 +101,7 @@ export default function App() {
           defaultSize="260px"
           minSize="200px"
           maxSize="400px"
-          className="min-h-0 overflow-hidden"
+          className="min-h-0"
           onResize={() => {
             if (suppressLeftSync.current) return;
             const p = leftPanel.current;
@@ -111,7 +111,7 @@ export default function App() {
           <ProjectsTree />
         </ResizablePanel>
         <ResizableSeparator />
-        <ResizablePanel id="center" minSize="360px" className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-surface-layer">
+        <ResizablePanel id="center" minSize="360px" className="flex min-h-0 min-w-0 flex-col bg-surface-layer">
           <SessionTranscript />
         </ResizablePanel>
         <ResizableSeparator />
@@ -122,7 +122,7 @@ export default function App() {
           defaultSize="360px"
           minSize="280px"
           maxSize="560px"
-          className="min-h-0 overflow-hidden bg-surface-layer"
+          className="min-h-0 bg-surface-layer"
           onResize={() => {
             if (suppressRightSync.current) return;
             const p = rightPanel.current;

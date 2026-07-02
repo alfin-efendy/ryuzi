@@ -19,7 +19,7 @@ export function Appearance({ triggerClassName }: { triggerClassName?: string } =
       <MenuTrigger
         aria-label="Appearance"
         className={cn(
-          "flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground",
+          "flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-border bg-background text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
           triggerClassName,
         )}
       >
@@ -86,11 +86,9 @@ export function Appearance({ triggerClassName }: { triggerClassName?: string } =
               type="button"
               role="switch"
               aria-checked={transparency}
+              aria-label="Toggle transparency"
               onClick={() => setTransparency(!transparency)}
-              className={cn(
-                "relative h-5 w-9 rounded-full transition-colors",
-                transparency ? "bg-primary" : "bg-muted",
-              )}
+              className={cn("relative h-5 w-9 rounded-full transition-colors", transparency ? "bg-primary" : "bg-muted")}
             >
               <span
                 className={cn(

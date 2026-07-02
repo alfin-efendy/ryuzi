@@ -1,14 +1,6 @@
 // packages/ui/src/components/ui/resizable.tsx
 // Thin shadcn-style wrapper over react-resizable-panels v4 (Group/Panel/Separator API).
-import {
-  Group,
-  Panel,
-  Separator,
-  useDefaultLayout,
-  type GroupProps,
-  type PanelProps,
-  type SeparatorProps,
-} from "react-resizable-panels";
+import { Group, Panel, Separator, useDefaultLayout, type GroupProps, type PanelProps, type SeparatorProps } from "react-resizable-panels";
 
 import { cn } from "../../lib/utils";
 

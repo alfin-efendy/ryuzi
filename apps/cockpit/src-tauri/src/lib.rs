@@ -129,7 +129,7 @@ pub fn run() {
                 .expect("main window exists");
             let cap = backdrop::apply_backdrop(&main_window);
             app.manage(backdrop::BackdropState(cap));
-            accent::spawn_accent_watcher(&app.handle().clone());
+            accent::spawn_accent_watcher(app.handle());
             // Bridge: forward every CoreEvent from the broadcast channel to the webview.
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
