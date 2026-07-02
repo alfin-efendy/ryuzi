@@ -7,7 +7,9 @@
 }
 
 /* Programmatic panel toggle animation; applied transiently by useToggleSync so
-   drag-resize stays direct. react-resizable-panels sizes panels via flex-basis. */
+   drag-resize stays direct. react-resizable-panels v4 hardcodes flex-basis: 0
+   on panel nodes and drives live sizing purely via flex-grow, so that is the
+   property to interpolate. */
 .panels-animating [data-slot="resizable-panel"] {
-  transition: flex-basis 200ms ease;
+  transition: flex-grow 200ms ease;
 }
