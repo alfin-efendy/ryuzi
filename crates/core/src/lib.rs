@@ -8,6 +8,7 @@ pub mod integration;
 pub mod paths;
 pub mod policy;
 pub mod registry;
+pub mod settings;
 pub mod sidecar;
 pub mod store;
 pub mod worktree;
