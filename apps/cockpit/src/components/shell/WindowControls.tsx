@@ -1,12 +1,12 @@
 // apps/cockpit/src/components/shell/WindowControls.tsx
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-const win = getCurrentWindow();
 const btn =
   "flex h-[30px] w-[42px] items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground";
 
 export function WindowControls() {
+  const win = useMemo(() => getCurrentWindow(), []);
   const [max, setMax] = useState(false);
   useEffect(() => {
     win
@@ -22,7 +22,7 @@ export function WindowControls() {
     return () => {
       un.then((f) => f()).catch(() => {});
     };
-  }, []);
+  }, [win]);
   return (
     <div className="flex gap-0.5">
       <button type="button" aria-label="Minimize" className={btn} onClick={() => win.minimize()}>

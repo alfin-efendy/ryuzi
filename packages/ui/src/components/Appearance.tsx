@@ -9,7 +9,7 @@ const MODES: { key: Mode; label: string }[] = [
   { key: "system", label: "System" },
 ];
 
-export function Appearance() {
+export function Appearance({ triggerClassName }: { triggerClassName?: string } = {}) {
   const { mode, accent, setMode, setAccent } = useTheme();
   const activeKey = typeof accent === "object" ? "" : accent;
   const customValue = typeof accent === "object" ? accent.custom : "#4f46e5";
@@ -18,7 +18,10 @@ export function Appearance() {
     <Menu>
       <MenuTrigger
         aria-label="Appearance"
-        className="flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+        className={cn(
+          "flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground",
+          triggerClassName,
+        )}
       >
         <Settings className="h-4 w-4" />
       </MenuTrigger>
