@@ -170,7 +170,7 @@ impl SidecarManager {
         if self.bun_ok() {
             let bundle = self.bundle_path();
             if !bundle.exists() {
-                self.download(&self.cfg.manifest.bundle.clone(), &bundle)?;
+                self.download(&self.cfg.manifest.bundle.clone(), &bundle, false)?;
             }
             return Ok(ResolvedSidecar {
                 command: "bun".to_string(),
@@ -193,12 +193,7 @@ impl SidecarManager {
             .clone();
         let dest = self.standalone_path();
         if !dest.exists() {
-            self.download(&spec, &dest)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
-            }
+            self.download(&spec, &dest, true)?;
         }
         Ok(ResolvedSidecar {
             command: dest.to_string_lossy().into_owned(),
@@ -207,12 +202,19 @@ impl SidecarManager {
         })
     }
 
-    /// Atomic download: fetch to `<dest>.partial`, verify sha256, rename.
-    /// A mismatched artifact is deleted and never lands at `dest`.
-    fn download(&self, spec: &ArtifactSpec, dest: &Path) -> anyhow::Result<()> {
+    /// Atomic download: fetch to a per-process `<dest>.partial.<pid>`, verify
+    /// sha256, rename. A mismatched artifact is deleted and never lands at
+    /// `dest`. The partial path is unique per process so two processes
+    /// (e.g. CLI + cockpit) cold-starting concurrently never interleave
+    /// writes into the same file; the rename remains the atomic commit
+    /// point, so last-writer-wins is safe since both wrote identical,
+    /// verified bytes. When `executable` is set, the exec bit is applied to
+    /// the partial (on unix) before the rename so the file at `dest` is
+    /// never observed in a non-executable state.
+    fn download(&self, spec: &ArtifactSpec, dest: &Path, executable: bool) -> anyhow::Result<()> {
         std::fs::create_dir_all(dest.parent().expect("dest has parent"))?;
         let url = format!("{RELEASE_BASE}/{}/{}", self.cfg.release_tag, spec.asset);
-        let partial = dest.with_extension("partial");
+        let partial = dest.with_extension(format!("partial.{}", std::process::id()));
         self.fetcher.fetch(&url, &partial)?;
         let bytes = std::fs::read(&partial)?;
         let actual = {
@@ -227,7 +229,17 @@ impl SidecarManager {
                 spec.sha256
             );
         }
-        std::fs::rename(&partial, dest)?;
+        #[cfg(unix)]
+        if executable {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+        if let Err(e) = std::fs::rename(&partial, dest) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e).with_context(|| format!("rename partial to {}", dest.display()));
+        }
         Ok(())
     }
 }
@@ -354,6 +366,25 @@ mod tests {
         );
         assert!(mgr.resolve().is_err());
         assert!(!dir.path().join("acp/0.55.0/adapter.js").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_artifact_is_executable_at_final_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"native binary bytes".to_vec();
+        let m = manifest("00", &sha256_hex(&body));
+        let mgr = SidecarManager::new(
+            cfg(dir.path(), m, || Some("1.0.0".into())),
+            Box::new(FakeFetcher(body)),
+        );
+        let r = mgr.resolve().unwrap();
+        assert_eq!(r.mode, SidecarMode::Standalone);
+        let final_path = PathBuf::from(&r.command);
+        let mode = std::fs::metadata(&final_path).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "expected exec bit set on {final_path:?}");
     }
 
     #[test]
