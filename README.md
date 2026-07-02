@@ -4,8 +4,6 @@
   <img src="assets/brand/wordmark-light.svg" alt="ryuzi" width="560">
 </picture>
 
-# ryuzi
-
 [![npm version](https://img.shields.io/npm/v/ryuzi.svg)](https://www.npmjs.com/package/ryuzi)
 [![CI](https://github.com/alfin-efendy/ryuzi/actions/workflows/ci.yml/badge.svg)](https://github.com/alfin-efendy/ryuzi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -148,10 +146,7 @@ apps/
 packages/
   core/              # @ryuzi/core — engine: control plane, store, providers, agents, gateways, observability
   protocol/          # @ryuzi/protocol — shared contracts: domain models, events, ControlPlane API
-docs/superpowers/    # specs & implementation plans
 ```
-
-See `docs/superpowers/specs/` for designs and `docs/superpowers/plans/` for milestone plans.
 
 ## Roadmap
 

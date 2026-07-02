@@ -11,7 +11,7 @@ import type {
 } from "../src/index";
 
 test("protocol runtime enums are exported", () => {
-  expect([...PERM_MODES]).toEqual(["default", "acceptEdits", "bypassPermissions"]);
+  expect([...PERM_MODES]).toEqual(["default", "acceptEdits", "bypassPermissions", "plan"]);
   expect([...SESSION_STATUSES]).toEqual(["idle", "running", "interrupted", "ended"]);
 });
 

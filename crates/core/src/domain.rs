@@ -7,6 +7,7 @@ pub enum PermMode {
     Default,
     AcceptEdits,
     BypassPermissions,
+    Plan,
 }
 
 impl PermMode {
@@ -15,12 +16,14 @@ impl PermMode {
             PermMode::Default => "default",
             PermMode::AcceptEdits => "acceptEdits",
             PermMode::BypassPermissions => "bypassPermissions",
+            PermMode::Plan => "plan",
         }
     }
     pub fn from_db(s: &str) -> PermMode {
         match s {
             "acceptEdits" => PermMode::AcceptEdits,
             "bypassPermissions" => PermMode::BypassPermissions,
+            "plan" => PermMode::Plan,
             _ => PermMode::Default,
         }
     }
@@ -82,31 +85,124 @@ pub struct Session {
     pub last_active: Option<i64>,
 }
 
-/// Internal event emitted by the runtime parser.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentEvent {
-    Init { session_id: String },
-    Status { text: String },
-    Text { text: String },
-    Result { session_id: Option<String> },
-    Error { message: String },
+/// An MCP server the agent can use as tools (attached to an ACP session in Spec 3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerSpec {
+    pub name: String,
+    pub transport: McpTransport,
+}
+
+/// How to reach an MCP server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum McpTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    Http {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+}
+
+/// Where a session is driven from (a gateway channel + conversation).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Surface {
+    pub gateway: String,
+    pub conversation_id: String,
+}
+
+/// Who initiated an action, across gateways.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Actor {
+    pub id: String,
+    pub gateway: String,
+}
+
+/// A tool-approval request surfaced to a gateway / UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequest {
+    pub request_id: String,
+    pub tool: String,
+    pub summary: String,
+}
+
+/// The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+    Cancel,
+}
+
+/// A persisted transcript entry. Forward-compatible with ACP session/update blocks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Message {
+    pub session_pk: String,
+    pub seq: i64,
+    pub role: String,       // user | assistant | system
+    pub block_type: String, // text | thought | tool_call | plan | status | error
+    pub payload: serde_json::Value,
+    pub tool_call_id: Option<String>,
+    pub status: Option<String>,
+    pub tool_kind: Option<String>,
+    pub created_at: i64,
+}
+
+/// Input to `Store::insert_message`; `seq` and `created_at` are assigned by the store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewMessage {
+    pub session_pk: String,
+    pub role: String,
+    pub block_type: String,
+    pub payload: serde_json::Value,
+    pub tool_call_id: Option<String>,
+    pub status: Option<String>,
+    pub tool_kind: Option<String>,
+}
+
+impl NewMessage {
+    /// Convenience for a simple text/status/error block.
+    pub fn block(session_pk: &str, role: &str, block_type: &str, payload: serde_json::Value) -> Self {
+        NewMessage {
+            session_pk: session_pk.to_string(),
+            role: role.to_string(),
+            block_type: block_type.to_string(),
+            payload,
+            tool_call_id: None,
+            status: None,
+            tool_kind: None,
+        }
+    }
 }
 
 /// Public event broadcast to consumers (the Tauri layer re-emits these).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum CoreEvent {
     SessionCreated {
         session_pk: String,
         project_id: String,
     },
-    Status {
+    Message {
         session_pk: String,
-        text: String,
-    },
-    Text {
-        session_pk: String,
-        text: String,
+        seq: i64,
+        role: String,
+        block_type: String,
+        payload: serde_json::Value,
+        tool_call_id: Option<String>,
+        status: Option<String>,
+        tool_kind: Option<String>,
     },
     Result {
         session_pk: String,
@@ -136,6 +232,7 @@ mod tests {
             PermMode::Default,
             PermMode::AcceptEdits,
             PermMode::BypassPermissions,
+            PermMode::Plan,
         ] {
             assert_eq!(PermMode::from_db(m.as_str()), m);
         }
@@ -153,6 +250,21 @@ mod tests {
             assert_eq!(SessionStatus::from_db(s.as_str()), s);
         }
         assert_eq!(SessionStatus::from_db("nonsense"), SessionStatus::Idle);
+    }
+
+    #[test]
+    fn mcp_server_spec_round_trips_through_json() {
+        let spec = McpServerSpec {
+            name: "notion".into(),
+            transport: McpTransport::Stdio {
+                command: "notion-mcp".into(),
+                args: vec!["--stdio".into()],
+                env: vec![("TOKEN".into(), "x".into())],
+            },
+        };
+        let j = serde_json::to_string(&spec).unwrap();
+        let back: McpServerSpec = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, spec);
     }
 
     #[test]

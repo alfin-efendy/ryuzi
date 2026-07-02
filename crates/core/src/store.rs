@@ -1,4 +1,5 @@
-use crate::domain::{PermMode, Project, Session, SessionStatus};
+use crate::domain::{Message, NewMessage, PermMode, Project, Session, SessionStatus};
+use crate::paths::now_ms;
 use deadpool_sqlite::{Config, Pool, Runtime};
 use rusqlite::{params, OptionalExtension, Row};
 use rusqlite_migration::{Migrations, M};
@@ -30,6 +31,31 @@ fn migrations() -> Migrations<'static> {
                 status TEXT NOT NULL DEFAULT 'idle',\
                 created_at INTEGER,\
                 last_active INTEGER\
+            );",
+        ),
+        M::up(
+            "CREATE TABLE messages (\
+                session_pk TEXT NOT NULL,\
+                seq INTEGER NOT NULL,\
+                role TEXT NOT NULL,\
+                block_type TEXT NOT NULL,\
+                payload TEXT NOT NULL,\
+                tool_call_id TEXT,\
+                status TEXT,\
+                tool_kind TEXT,\
+                created_at INTEGER NOT NULL,\
+                PRIMARY KEY (session_pk, seq)\
+            );\
+            CREATE INDEX idx_messages_session ON messages(session_pk, seq);\
+            CREATE UNIQUE INDEX idx_messages_tool_call \
+                ON messages(session_pk, tool_call_id) WHERE tool_call_id IS NOT NULL;",
+        ),
+        M::up(
+            "CREATE TABLE tool_policies (\
+                project_id TEXT NOT NULL,\
+                tool TEXT NOT NULL,\
+                decision TEXT NOT NULL,\
+                PRIMARY KEY (project_id, tool)\
             );",
         ),
     ])
@@ -246,6 +272,136 @@ impl Store {
         .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
         Ok(())
     }
+
+    pub async fn insert_message(&self, m: NewMessage) -> anyhow::Result<i64> {
+        let payload = serde_json::to_string(&m.payload)?;
+        let created = now_ms();
+        let conn = self.pool.get().await?;
+        let seq = conn
+            .interact(move |c| {
+                c.query_row(
+                    "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at) \
+                     SELECT ?1, COALESCE(MAX(seq),0)+1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+                     FROM messages WHERE session_pk=?1 \
+                     RETURNING seq",
+                    params![m.session_pk, m.role, m.block_type, payload,
+                            m.tool_call_id, m.status, m.tool_kind, created],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(seq)
+    }
+
+    pub async fn list_messages(&self, session_pk: &str) -> anyhow::Result<Vec<Message>> {
+        let session_pk = session_pk.to_string();
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .interact(move |c| -> rusqlite::Result<Vec<Message>> {
+                let mut stmt = c.prepare(
+                    "SELECT session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at \
+                     FROM messages WHERE session_pk=?1 ORDER BY seq",
+                )?;
+                let items = stmt
+                    .query_map(params![session_pk], |r| {
+                        let payload: String = r.get(4)?;
+                        Ok(Message {
+                            session_pk: r.get(0)?,
+                            seq: r.get(1)?,
+                            role: r.get(2)?,
+                            block_type: r.get(3)?,
+                            payload: serde_json::from_str(&payload).map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                            })?,
+                            tool_call_id: r.get(5)?,
+                            status: r.get(6)?,
+                            tool_kind: r.get(7)?,
+                            created_at: r.get(8)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(items)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(rows)
+    }
+
+    /// Return the persisted decision for `(project_id, tool)`, or `None` if no
+    /// policy has been set.
+    pub async fn get_tool_policy(
+        &self,
+        project_id: &str,
+        tool: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let project_id = project_id.to_string();
+        let tool = tool.to_string();
+        let conn = self.pool.get().await?;
+        let result = conn
+            .interact(move |c| {
+                c.query_row(
+                    "SELECT decision FROM tool_policies WHERE project_id=?1 AND tool=?2",
+                    params![project_id, tool],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(result)
+    }
+
+    /// Upsert a tool policy: set `decision` for `(project_id, tool)`.
+    /// On conflict (same project+tool already has a policy), update the decision.
+    pub async fn set_tool_policy(
+        &self,
+        project_id: &str,
+        tool: &str,
+        decision: &str,
+    ) -> anyhow::Result<()> {
+        let project_id = project_id.to_string();
+        let tool = tool.to_string();
+        let decision = decision.to_string();
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "INSERT INTO tool_policies(project_id, tool, decision) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(project_id, tool) DO UPDATE SET decision=excluded.decision",
+                params![project_id, tool, decision],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+
+    pub async fn update_tool_call(
+        &self,
+        session_pk: &str,
+        tool_call_id: &str,
+        status: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> anyhow::Result<i64> {
+        let session_pk = session_pk.to_string();
+        let tool_call_id = tool_call_id.to_string();
+        let status = status.map(|s| s.to_string());
+        let payload = serde_json::to_string(payload)?;
+        let conn = self.pool.get().await?;
+        let seq = conn
+            .interact(move |c| {
+                c.query_row(
+                    "UPDATE messages SET payload=?3, status=COALESCE(?4, status) \
+                     WHERE session_pk=?1 AND tool_call_id=?2 RETURNING seq",
+                    params![session_pk, tool_call_id, payload, status],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(seq)
+    }
 }
 
 const SESSION_COLS: &str =
@@ -269,7 +425,7 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{PermMode, Project};
+    use crate::domain::{NewMessage, PermMode, Project};
     use crate::domain::{Session, SessionStatus};
 
     fn sample_project() -> Project {
@@ -313,6 +469,86 @@ mod tests {
             created_at: Some(1),
             last_active: Some(1),
         }
+    }
+
+    #[tokio::test]
+    async fn messages_get_monotonic_per_session_seq_and_list_in_order() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        let a1 = store.insert_message(NewMessage::block("s1", "user", "text",
+            serde_json::json!({"text": "hi"}))).await.unwrap();
+        let a2 = store.insert_message(NewMessage::block("s1", "assistant", "text",
+            serde_json::json!({"text": "hello"}))).await.unwrap();
+        // A different session has an INDEPENDENT seq sequence starting at 1.
+        let b1 = store.insert_message(NewMessage::block("s2", "user", "text",
+            serde_json::json!({"text": "yo"}))).await.unwrap();
+
+        assert_eq!((a1, a2, b1), (1, 2, 1));
+
+        let s1 = store.list_messages("s1").await.unwrap();
+        assert_eq!(s1.len(), 2);
+        assert_eq!(s1[0].seq, 1);
+        assert_eq!(s1[0].role, "user");
+        assert_eq!(s1[0].payload["text"], "hi");
+        assert_eq!(s1[1].seq, 2);
+        assert_eq!(s1[1].payload["text"], "hello");
+        assert!(store.list_messages("missing").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_call_row_can_be_upserted_by_tool_call_id() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store.insert_message(NewMessage {
+            session_pk: "s1".into(), role: "assistant".into(), block_type: "tool_call".into(),
+            payload: serde_json::json!({"name": "Bash", "input": {"command": "ls"}}),
+            tool_call_id: Some("tc-1".into()), status: Some("pending".into()),
+            tool_kind: Some("execute".into()),
+        }).await.unwrap();
+
+        let updated_seq = store.update_tool_call("s1", "tc-1", Some("completed"),
+            &serde_json::json!({"name": "Bash", "input": {"command": "ls"}, "output": "file.txt"}))
+            .await.unwrap();
+        assert_eq!(updated_seq, 1, "update_tool_call must return the row's real seq");
+
+        let rows = store.list_messages("s1").await.unwrap();
+        assert_eq!(rows.len(), 1, "update must not insert a new row");
+        assert_eq!(rows[0].status.as_deref(), Some("completed"));
+        assert_eq!(rows[0].payload["output"], "file.txt");
+    }
+
+    #[tokio::test]
+    async fn update_tool_call_errors_when_row_absent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let res = store
+            .update_tool_call("s1", "missing-tc", Some("completed"), &serde_json::json!({}))
+            .await;
+        assert!(res.is_err(), "updating a nonexistent tool_call_id must error");
+    }
+
+    #[tokio::test]
+    async fn tool_policy_is_per_project_and_upserts() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // initially no policy
+        assert!(store.get_tool_policy("p1", "Bash").await.unwrap().is_none());
+        // set a policy
+        store.set_tool_policy("p1", "Bash", "allowAlways").await.unwrap();
+        assert_eq!(
+            store.get_tool_policy("p1", "Bash").await.unwrap().as_deref(),
+            Some("allowAlways")
+        );
+        // different project is independent
+        assert!(store.get_tool_policy("p2", "Bash").await.unwrap().is_none());
+        // upsert (update) the existing policy
+        store.set_tool_policy("p1", "Bash", "rejectAlways").await.unwrap();
+        assert_eq!(
+            store.get_tool_policy("p1", "Bash").await.unwrap().as_deref(),
+            Some("rejectAlways")
+        );
     }
 
     #[tokio::test]

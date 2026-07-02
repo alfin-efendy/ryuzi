@@ -1,0 +1,4 @@
+# Ignore built sidecar binaries by default; keep this file + the committed linux stub.
+*
+!.gitignore
+!claude-agent-acp-x86_64-unknown-linux-gnu

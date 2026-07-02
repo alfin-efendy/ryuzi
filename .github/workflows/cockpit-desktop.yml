@@ -70,6 +70,13 @@ jobs:
       - name: Install deps
         run: bun install --frozen-lockfile
 
+      - name: Build ACP sidecar
+        # Compiles @agentclientprotocol/claude-agent-acp to a self-contained
+        # binary with the Tauri target-triple suffix so tauri-action picks it up
+        # from src-tauri/binaries/.  The script installs the package and runs
+        # bun build --compile; see apps/cockpit/scripts/build-acp-sidecar.ts.
+        run: bun run --cwd apps/cockpit scripts/build-acp-sidecar.ts
+
       - name: Build Cockpit (tauri build)
         uses: tauri-apps/tauri-action@v1
         env:
@@ -89,5 +96,4 @@ jobs:
             target/release/bundle/dmg/*.dmg
             target/release/bundle/macos/*.app
             target/release/bundle/deb/*.deb
-            target/release/bundle/appimage/*.AppImage
             target/release/bundle/rpm/*.rpm

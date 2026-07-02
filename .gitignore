@@ -54,3 +54,6 @@ npm/platform/*/ryuzi.exe
 .agents/
 .claude/
 skills-lock.json
+
+# Design specs/plans are kept as a local-only artifact (not tracked in origin)
+docs/design/

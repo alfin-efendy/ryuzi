@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, events, type Project, type Session, type CoreEvent } from "./bindings";
+import { commands, events, type Project, type Session, type CoreEvent, type Message } from "./bindings";
 
 export type Line = { kind: "user" | "text" | "status" | "error"; text: string };
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
@@ -12,6 +12,8 @@ type State = {
   pendingApprovals: PendingApproval[];
   focusedSessionPk: string | null;
   selectedProjectId: string | null;
+  lastSeq: Record<string, number>;
+  loaded: Record<string, boolean>;
   applyCoreEvent: (e: CoreEvent) => void;
   clearApproval: (requestId: string) => void;
   setFocused: (pk: string | null) => void;
@@ -23,11 +25,21 @@ type State = {
   stop: (sessionPk: string) => Promise<void>;
   end: (sessionPk: string) => Promise<void>;
   resolveApproval: (requestId: string, allow: boolean) => Promise<void>;
+  hydrateTranscript: (pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
   init: () => Promise<void>;
 };
 
 function append(map: Record<string, Line[]>, pk: string, line: Line): Record<string, Line[]> {
   return { ...map, [pk]: [...(map[pk] ?? []), line] };
+}
+
+// Projects a persisted/streamed message block onto the render Line shape.
+function messageToLine(role: string, blockType: string, payload: unknown): Line {
+  const p = (payload ?? {}) as Record<string, unknown>;
+  if (role === "user") return { kind: "user", text: String(p.text ?? "") };
+  if (blockType === "status" || blockType === "tool_call") return { kind: "status", text: String(p.summary ?? p.name ?? "") };
+  if (blockType === "error") return { kind: "error", text: String(p.message ?? "") };
+  return { kind: "text", text: String(p.text ?? "") };
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -37,17 +49,28 @@ export const useStore = create<State>((set, get) => ({
   pendingApprovals: [],
   focusedSessionPk: null,
   selectedProjectId: null,
+  lastSeq: {},
+  loaded: {},
 
   applyCoreEvent: (e) =>
     set((st) => {
       switch (e.kind) {
         case "sessionCreated":
-          return { transcripts: { ...st.transcripts, [e.session_pk]: st.transcripts[e.session_pk] ?? [] } };
-        case "status":
-          return { transcripts: append(st.transcripts, e.session_pk, { kind: "status", text: e.text }) };
-        case "text":
-          return { transcripts: append(st.transcripts, e.session_pk, { kind: "text", text: e.text }) };
+          return {
+            transcripts: { ...st.transcripts, [e.session_pk]: st.transcripts[e.session_pk] ?? [] },
+            loaded: { ...st.loaded, [e.session_pk]: true },
+          };
+        case "message": {
+          const prev = st.lastSeq[e.session_pk] ?? 0;
+          if (e.seq <= prev) return {}; // stale/duplicate (covers reload/replay races)
+          const line = messageToLine(e.role, e.block_type, e.payload);
+          return {
+            transcripts: append(st.transcripts, e.session_pk, line),
+            lastSeq: { ...st.lastSeq, [e.session_pk]: e.seq },
+          };
+        }
         case "error":
+          // Transient infrastructure error (not a persisted transcript row).
           return { transcripts: append(st.transcripts, e.session_pk, { kind: "error", text: e.message }) };
         case "approvalRequested":
           return {
@@ -69,7 +92,28 @@ export const useStore = create<State>((set, get) => ({
 
   clearApproval: (requestId) => set((st) => ({ pendingApprovals: st.pendingApprovals.filter((a) => a.requestId !== requestId) })),
 
-  setFocused: (pk) => set({ focusedSessionPk: pk }),
+  setFocused: (pk) => {
+    set({ focusedSessionPk: pk });
+    if (pk && !get().loaded[pk]) void get().hydrateTranscript(pk);
+  },
+
+  hydrateTranscript: async (pk, fetcher) => {
+    if (get().loaded[pk]) return;
+    const rows = fetcher
+      ? await fetcher(pk)
+      : await (async () => {
+          const res = await commands.listMessages(pk);
+          return res.status === "ok" ? res.data : [];
+        })();
+    const lines = rows.map((m) => messageToLine(m.role, m.blockType, m.payload));
+    const maxSeq = rows.reduce((mx, m) => Math.max(mx, m.seq), 0);
+    set((st) => ({
+      transcripts: { ...st.transcripts, [pk]: lines },
+      lastSeq: { ...st.lastSeq, [pk]: maxSeq },
+      loaded: { ...st.loaded, [pk]: true },
+    }));
+  },
+
   // Selecting a project clears the focused session so the center shows the "start a new session" composer.
   selectProject: (id) => set({ selectedProjectId: id, focusedSessionPk: null }),
 
@@ -96,16 +140,13 @@ export const useStore = create<State>((set, get) => ({
     const res = await commands.startSession(projectId, prompt);
     if (res.status === "ok") {
       const pk = res.data.sessionPk;
-      // Echo the user's first message into the transcript (the engine does not emit it back).
-      set((st) => ({ focusedSessionPk: pk, transcripts: append(st.transcripts, pk, { kind: "user", text: prompt }) }));
+      set({ focusedSessionPk: pk });
       await get().refresh();
     } else if (res.status === "error") {
       toast.error("Couldn't start session: " + res.error.message);
     }
   },
   send: async (sessionPk, prompt) => {
-    // Echo the user's message into the transcript immediately (the engine does not emit it back).
-    set((st) => ({ transcripts: append(st.transcripts, sessionPk, { kind: "user", text: prompt }) }));
     const res = await commands.continueSession(sessionPk, prompt);
     if (res.status === "error") {
       toast.error("Couldn't send message: " + res.error.message);

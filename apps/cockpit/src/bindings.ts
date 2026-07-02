@@ -21,6 +21,14 @@ async listSessions(projectId: string | null) : Promise<Result<Session[], CmdErro
     else return { status: "error", error: e  as any };
 }
 },
+async listMessages(sessionPk: string) : Promise<Result<Message[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_messages", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async connectProject(workdir: string, name: string) : Promise<Result<Project, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("connect_project", { workdir, name }) };
@@ -96,9 +104,14 @@ export type CmdError = { message: string }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "status"; session_pk: string; text: string } | { kind: "text"; session_pk: string; text: string } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | { kind: "sessionEnded"; session_pk: string }
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | { kind: "sessionEnded"; session_pk: string }
 export type CoreEventMsg = { event: CoreEvent }
-export type PermMode = "default" | "acceptEdits" | "bypassPermissions"
+export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+/**
+ * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
+ */
+export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
+export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"

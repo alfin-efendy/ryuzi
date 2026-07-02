@@ -1,7 +1,7 @@
 // @ryuzi/protocol — runtime-free shared contracts for the ryuzi monorepo.
 // (Only plain const arrays at runtime — no Node/Bun deps — so any client can consume it.)
 
-export const PERM_MODES = ["default", "acceptEdits", "bypassPermissions"] as const;
+export const PERM_MODES = ["default", "acceptEdits", "bypassPermissions", "plan"] as const;
 export type PermMode = (typeof PERM_MODES)[number];
 
 export const SESSION_STATUSES = ["idle", "running", "interrupted", "ended"] as const;

@@ -1,1 +1,3 @@
 /gen
+# Isolated sidecar build dir — created by build-acp-sidecar.ts, never in workspace lockfile
+/.sidecar-build/

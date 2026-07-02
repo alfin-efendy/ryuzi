@@ -2,25 +2,67 @@ mod commands;
 mod error;
 mod events;
 
-use ryuzi_core::{ControlPlane, Store};
-use std::sync::Arc;
+use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
-fn resolve_hook_path(app: &tauri::AppHandle) -> String {
-    // In dev, the hook binary is built into target/<profile>/ryuzi-hook.
-    // In a bundled app it ships alongside the main binary (see Task: packaging, R3).
+/// The base name of the ACP adapter sidecar binary (no target-triple suffix,
+/// no `.exe`).  Must match the `bundle.externalBin` entry in tauri.conf.json
+/// and the filename produced by `apps/cockpit/scripts/build-acp-sidecar.ts`.
+///
+/// Package: @agentclientprotocol/claude-agent-acp
+/// NOTE: the adapter refuses to start inside a nested Claude Code session, so
+/// we unconditionally remove the `CLAUDECODE` env-var before spawning it.
+/// Authentication (claude login) is out-of-band — the host machine's `claude`
+/// session is reused; no credentials are managed here.
+const ADAPTER_BIN: &str = "claude-agent-acp";
+
+/// Resolve the ACP adapter command, preferring the Tauri-bundled sidecar.
+///
+/// Resolution order:
+///   1. Bundled sidecar: `<exe_dir>/claude-agent-acp[.exe]` — present in
+///      production (tauri build) and after running build-acp-sidecar.ts.
+///   2. PATH fallback — for `cargo build` / `tauri dev` when the sidecar
+///      binary has not been compiled yet.  A missing PATH entry produces a
+///      clear runtime error on first session start, not at launch.
+fn resolve_acp_adapter_command() -> String {
+    // Tauri places sidecars next to the main executable at runtime.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("ryuzi-hook");
-            if p.exists() {
-                return p.to_string_lossy().into_owned();
+            // Check platform-specific name: <dir>/claude-agent-acp[.exe]
+            #[cfg(windows)]
+            let candidate = dir.join(format!("{}.exe", ADAPTER_BIN));
+            #[cfg(not(windows))]
+            let candidate = dir.join(ADAPTER_BIN);
+
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
             }
         }
     }
-    // Dev fallback: fall through to PATH resolution in ryuzi-core.
-    let _ = app;
-    "ryuzi-hook".to_string()
+    // Dev / PATH fallback — allows `cargo build` + `tauri dev` to compile and
+    // launch without the sidecar binary present.  Starting a session without
+    // the sidecar installed will fail with a clear spawn error at runtime.
+    ADAPTER_BIN.to_string()
+}
+
+/// Build the extension registries and install the `claude-agent-acp` harness
+/// integration with the resolved adapter path.
+///
+/// `env_remove: ["CLAUDECODE"]` is required: the adapter checks for this
+/// variable to detect a nested Claude Code session and refuses to start.
+fn build_registries() -> Registries {
+    let descriptor = AcpAdapterDescriptor {
+        command: resolve_acp_adapter_command(),
+        args: vec![],
+        env: vec![],
+        // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's running
+        // inside a Claude Code session and refuses to start.
+        env_remove: vec!["CLAUDECODE".to_string()],
+    };
+    let mut registries = Registries::new();
+    registries.install(&ClaudeCodeIntegration::new(descriptor));
+    registries
 }
 
 fn make_builder() -> Builder<tauri::Wry> {
@@ -28,6 +70,7 @@ fn make_builder() -> Builder<tauri::Wry> {
         .commands(collect_commands![
             commands::list_projects,
             commands::list_sessions,
+            commands::list_messages,
             commands::connect_project,
             commands::start_session,
             commands::continue_session,
@@ -60,20 +103,14 @@ pub fn run() {
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             builder.mount_events(app);
-            let handle = app.handle().clone();
-            let hook_path = resolve_hook_path(&handle);
-            // Build the engine AND enable approvals inside the async runtime: enable_approvals
-            // calls tokio::runtime::Handle::current(), which panics ("no reactor running") unless
-            // invoked from within a Tokio runtime context. block_on enters that context.
+            // Build the engine inside the async runtime so Store::open (and any
+            // harness setup) run within a Tokio context.
             let cp = tauri::async_runtime::block_on(async move {
                 let store = Store::open(&ryuzi_core::paths::db_path())
                     .await
                     .expect("open ryuzi db");
-                let cp =
-                    ControlPlane::new(store, Arc::new(ryuzi_core::runtime::ProcessRunner)).await;
-                // Enable the approval side-channel; errors are non-fatal (no hook binary in CI).
-                cp.enable_approvals(hook_path).ok();
-                cp
+                let registries = build_registries();
+                ControlPlane::new(store, registries).await
             });
             // Subscribe BEFORE manage() moves the Arc.
             let mut rx = cp.subscribe();

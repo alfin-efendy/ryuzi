@@ -2,7 +2,16 @@ import { test, expect } from "bun:test";
 import { useStore } from "./store";
 
 function reset() {
-  useStore.setState({ projects: [], sessions: [], transcripts: {}, pendingApprovals: [], focusedSessionPk: null, selectedProjectId: null });
+  useStore.setState({
+    projects: [],
+    sessions: [],
+    transcripts: {},
+    pendingApprovals: [],
+    focusedSessionPk: null,
+    selectedProjectId: null,
+    lastSeq: {},
+    loaded: {},
+  });
 }
 
 test("selectProject sets the selected project and clears the focused session", () => {
@@ -13,15 +22,117 @@ test("selectProject sets the selected project and clears the focused session", (
   expect(useStore.getState().focusedSessionPk).toBeNull();
 });
 
-test("text and status events append lines to the session transcript", () => {
+test("message events project to lines by role/blockType and dedupe by seq", () => {
   reset();
   const s = useStore.getState();
   s.applyCoreEvent({ kind: "sessionCreated", session_pk: "s1", project_id: "p1" });
-  s.applyCoreEvent({ kind: "status", session_pk: "s1", text: "Bash: ls" });
-  s.applyCoreEvent({ kind: "text", session_pk: "s1", text: "hello" });
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 1,
+    role: "user",
+    block_type: "text",
+    payload: { text: "hi" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 2,
+    role: "assistant",
+    block_type: "status",
+    payload: { summary: "Bash: ls" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 3,
+    role: "assistant",
+    block_type: "text",
+    payload: { text: "hello" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+  // A duplicate/stale seq is ignored.
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 2,
+    role: "assistant",
+    block_type: "status",
+    payload: { summary: "dup" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+
   const lines = useStore.getState().transcripts.s1;
-  expect(lines.map((l) => l.kind)).toEqual(["status", "text"]);
-  expect(lines[1].text).toBe("hello");
+  expect(lines.map((l) => l.kind)).toEqual(["user", "status", "text"]);
+  expect(lines.map((l) => l.text)).toEqual(["hi", "Bash: ls", "hello"]);
+});
+
+test("hydrateTranscript replaces the transcript from persisted messages and sets lastSeq", async () => {
+  reset();
+  const rows = [
+    {
+      sessionPk: "s1",
+      seq: 1,
+      role: "user",
+      blockType: "text",
+      payload: { text: "hi" },
+      toolCallId: null,
+      status: null,
+      toolKind: null,
+      createdAt: 1,
+    },
+    {
+      sessionPk: "s1",
+      seq: 2,
+      role: "assistant",
+      blockType: "text",
+      payload: { text: "yo" },
+      toolCallId: null,
+      status: null,
+      toolKind: null,
+      createdAt: 2,
+    },
+  ];
+  await useStore.getState().hydrateTranscript("s1", async () => rows);
+  const st = useStore.getState();
+  expect(st.transcripts.s1.map((l) => l.text)).toEqual(["hi", "yo"]);
+  expect(st.lastSeq.s1).toBe(2);
+  expect(st.loaded.s1).toBe(true);
+
+  // A live event with seq <= lastSeq is ignored; a newer one appends.
+  st.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 2,
+    role: "assistant",
+    block_type: "text",
+    payload: { text: "again" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+  st.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 3,
+    role: "assistant",
+    block_type: "text",
+    payload: { text: "next" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+  expect(useStore.getState().transcripts.s1.map((l) => l.text)).toEqual(["hi", "yo", "next"]);
 });
 
 test("approval.requested adds a pending approval; resolving removes it", () => {
@@ -31,14 +142,6 @@ test("approval.requested adds a pending approval; resolving removes it", () => {
   expect(useStore.getState().pendingApprovals).toHaveLength(1);
   useStore.getState().clearApproval("r1");
   expect(useStore.getState().pendingApprovals).toHaveLength(0);
-});
-
-test("multiple text events accumulate in order", () => {
-  useStore.setState({ projects: [], sessions: [], transcripts: {}, pendingApprovals: [], focusedSessionPk: null });
-  const s = useStore.getState();
-  s.applyCoreEvent({ kind: "text", session_pk: "s1", text: "a" });
-  s.applyCoreEvent({ kind: "text", session_pk: "s1", text: "b" });
-  expect(useStore.getState().transcripts.s1.map((l) => l.text)).toEqual(["a", "b"]);
 });
 
 test("pending approvals from different sessions both count", () => {

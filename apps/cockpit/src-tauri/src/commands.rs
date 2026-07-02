@@ -1,5 +1,5 @@
 use crate::error::CmdError;
-use ryuzi_core::{ControlPlane, Project, Session};
+use ryuzi_core::{ControlPlane, Message, Project, Session};
 use std::sync::Arc;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -94,4 +94,13 @@ pub async fn pick_directory(app: tauri::AppHandle) -> Option<String> {
         .ok()
         .flatten()
         .map(|p| p.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_messages(
+    cp: State<'_, Arc<ControlPlane>>,
+    session_pk: String,
+) -> R<Vec<Message>> {
+    Ok(cp.list_messages(&session_pk).await?)
 }
