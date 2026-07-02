@@ -8,7 +8,7 @@ use tauri_specta::{collect_commands, collect_events, Builder};
 
 /// The base name of the ACP adapter sidecar binary (no target-triple suffix,
 /// no `.exe`).  Must match the `bundle.externalBin` entry in tauri.conf.json
-/// and the filename produced by `apps/cockpit/scripts/build-acp-sidecar.ts`.
+/// and the filename produced by `scripts/build-acp-sidecar.ts`.
 ///
 /// Package: @agentclientprotocol/claude-agent-acp
 /// NOTE: the adapter refuses to start inside a nested Claude Code session, so

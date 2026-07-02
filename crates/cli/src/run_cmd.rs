@@ -19,6 +19,21 @@ fn parse_mode(s: &str) -> Option<PermMode> {
     }
 }
 
+/// A turn is over when the session row is no longer Running. Used only as a
+/// fallback when the broadcast dropped the terminal event: at that point we
+/// cannot distinguish success from error (errors are not persisted), so the
+/// optimistic "✓ done" + exit 0 is the documented trade-off.
+async fn turn_is_over(cp: &ControlPlane, session_pk: &str) -> bool {
+    match cp.list_sessions(None).await {
+        Ok(sessions) => sessions
+            .iter()
+            .find(|s| s.session_pk == session_pk)
+            .map(|s| s.status != ryuzi_core::domain::SessionStatus::Running)
+            .unwrap_or(true),
+        Err(_) => false,
+    }
+}
+
 fn expand_home(dir: &str) -> PathBuf {
     if let Some(rest) = dir.strip_prefix("~") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -159,52 +174,70 @@ async fn run_session(
 
     let mut failed = false;
     loop {
-        match rx.recv().await {
-            Ok(ev) => match ev {
-                CoreEvent::Message {
-                    session_pk,
-                    role,
-                    block_type,
-                    payload,
-                    ..
-                } if session_pk == session.session_pk => match block_type.as_str() {
-                    "status" => {
-                        if let Some(s) = payload.get("summary").and_then(|v| v.as_str()) {
-                            (deps.out)(&format!("· {s}"));
-                        }
-                    }
-                    "text" if role == "assistant" => {
-                        if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
-                            (deps.out)(t);
-                        }
-                    }
-                    _ => {} // thought/tool_call not rendered in 4A
-                },
-                CoreEvent::ApprovalRequested {
-                    session_pk,
-                    request_id,
-                    tool,
-                    summary,
-                } if session_pk == session.session_pk => {
-                    let answer = (deps.prompt)(&format!("approve {tool}? {summary} [y/N] "));
-                    cp.resolve_approval(&request_id, answer.trim().eq_ignore_ascii_case("y"));
-                }
-                CoreEvent::Result { session_pk } if session_pk == session.session_pk => {
+        // Bounded wait: if the terminal Result/Error is ever lost (broadcast
+        // Lagged past capacity 1024), fall back to polling the session row so
+        // a one-shot run can never hang forever.
+        let recv = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        let event = match recv {
+            Err(_elapsed) => {
+                if turn_is_over(&cp, &session.session_pk).await {
                     (deps.out)("✓ done");
                     break;
                 }
-                CoreEvent::Error {
-                    session_pk,
-                    message,
-                } if session_pk == session.session_pk => {
-                    failed = true;
-                    (deps.err)(&format!("✗ {message}"));
+                continue;
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                if turn_is_over(&cp, &session.session_pk).await {
+                    (deps.out)("✓ done");
                     break;
                 }
-                _ => {}
+                continue;
+            }
+            Ok(Err(_closed)) => break,
+            Ok(Ok(ev)) => ev,
+        };
+        match event {
+            CoreEvent::Message {
+                session_pk,
+                role,
+                block_type,
+                payload,
+                ..
+            } if session_pk == session.session_pk => match block_type.as_str() {
+                "status" => {
+                    if let Some(s) = payload.get("summary").and_then(|v| v.as_str()) {
+                        (deps.out)(&format!("· {s}"));
+                    }
+                }
+                "text" if role == "assistant" => {
+                    if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
+                        (deps.out)(t);
+                    }
+                }
+                _ => {} // thought/tool_call not rendered in 4A
             },
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(_) => break,
+            CoreEvent::ApprovalRequested {
+                session_pk,
+                request_id,
+                tool,
+                summary,
+            } if session_pk == session.session_pk => {
+                let answer = (deps.prompt)(&format!("approve {tool}? {summary} [y/N] "));
+                cp.resolve_approval(&request_id, answer.trim().eq_ignore_ascii_case("y"));
+            }
+            CoreEvent::Result { session_pk } if session_pk == session.session_pk => {
+                (deps.out)("✓ done");
+                break;
+            }
+            CoreEvent::Error {
+                session_pk,
+                message,
+            } if session_pk == session.session_pk => {
+                failed = true;
+                (deps.err)(&format!("✗ {message}"));
+                break;
+            }
+            _ => {}
         }
     }
     // Let `cp` drop with the runtime: AcpSession teardown kills the sidecar child.

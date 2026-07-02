@@ -213,6 +213,16 @@ impl SidecarManager {
     /// never observed in a non-executable state.
     fn download(&self, spec: &ArtifactSpec, dest: &Path, executable: bool) -> anyhow::Result<()> {
         std::fs::create_dir_all(dest.parent().expect("dest has parent"))?;
+        // Sweep partials left by crashed processes. Our own partial has this
+        // process's pid suffix and doesn't exist yet, so everything matching
+        // "*.partial.*" is stale and safe to remove (best-effort).
+        if let Ok(entries) = std::fs::read_dir(dest.parent().expect("dest has parent")) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().contains(".partial.") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let url = format!("{RELEASE_BASE}/{}/{}", self.cfg.release_tag, spec.asset);
         let partial = dest.with_extension(format!("partial.{}", std::process::id()));
         self.fetcher.fetch(&url, &partial)?;
@@ -385,6 +395,27 @@ mod tests {
         let final_path = PathBuf::from(&r.command);
         let mode = std::fs::metadata(&final_path).unwrap().permissions().mode();
         assert_ne!(mode & 0o111, 0, "expected exec bit set on {final_path:?}");
+    }
+
+    #[test]
+    fn stale_partials_from_other_processes_are_swept_before_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"js bundle bytes".to_vec();
+        let m = manifest(&sha256_hex(&body), "00");
+        // A crashed process (fake pid 99999999) left a stale partial behind.
+        let vdir = dir.path().join("acp/0.55.0");
+        std::fs::create_dir_all(&vdir).unwrap();
+        let stale = vdir.join("adapter.partial.99999999");
+        std::fs::write(&stale, b"junk").unwrap();
+
+        let mgr = SidecarManager::new(
+            cfg(dir.path(), m, || Some("1.3.14".into())),
+            Box::new(FakeFetcher(body)),
+        );
+        mgr.resolve().unwrap();
+
+        assert!(!stale.exists(), "stale partial must be swept");
+        assert!(vdir.join("adapter.js").exists());
     }
 
     #[test]

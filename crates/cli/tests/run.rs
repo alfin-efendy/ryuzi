@@ -199,3 +199,112 @@ fn run_usage_and_mode_validation() {
         Some("--mode must be one of: default, acceptEdits, bypassPermissions, plan")
     );
 }
+
+// A harness whose turn never completes: send_prompt awaits a future that never
+// resolves, so ControlPlane never emits Result/Error. The run loop must still
+// exit once the session row leaves Running (poll fallback).
+struct BlockingFakeSession;
+
+#[async_trait]
+impl HarnessSession for BlockingFakeSession {
+    async fn send_prompt(&self, _prompt: String) -> anyhow::Result<()> {
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+    async fn cancel(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn end(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn agent_session_id(&self) -> Option<String> {
+        None
+    }
+}
+
+struct BlockingFakeHarness;
+#[async_trait]
+impl Harness for BlockingFakeHarness {
+    async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+        Ok(Box::new(BlockingFakeSession))
+    }
+}
+
+struct BlockingFactory;
+impl HarnessFactory for BlockingFactory {
+    fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+        Ok(Arc::new(BlockingFakeHarness))
+    }
+}
+
+struct BlockingIntegration;
+impl Integration for BlockingIntegration {
+    fn id(&self) -> &str {
+        "claude-code"
+    }
+    fn harness(&self) -> Option<Arc<dyn HarnessFactory>> {
+        Some(Arc::new(BlockingFactory))
+    }
+}
+
+#[test]
+#[serial]
+fn run_exits_when_session_demoted_even_without_terminal_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+
+    let db = tmp.path().join("ryuzi.sqlite");
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut deps = deps_with_fake(&db, out.clone(), errs.clone());
+    deps.build_registries = Box::new(|| {
+        let mut r = Registries::new();
+        r.install(&BlockingIntegration);
+        Ok(r)
+    });
+
+    // External demotion: a second Store handle flips the (only) session to Idle
+    // after 1s, simulating a lost terminal event.
+    let db2 = db.clone();
+    let demoter = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let store = ryuzi_core::Store::open(&db2).await.unwrap();
+            let sessions = store.list_sessions(None).await.unwrap();
+            store
+                .update_status(
+                    &sessions[0].session_pk,
+                    ryuzi_core::domain::SessionStatus::Idle,
+                    None,
+                )
+                .await
+                .unwrap();
+        });
+    });
+
+    let start = std::time::Instant::now();
+    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    demoter.join().unwrap();
+
+    assert_eq!(code, 0);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "run loop must not hang"
+    );
+    assert_eq!(
+        out.lock().unwrap().last().map(String::as_str),
+        Some("✓ done")
+    );
+}
