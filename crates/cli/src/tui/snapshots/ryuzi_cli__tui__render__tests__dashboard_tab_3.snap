@@ -8,20 +8,20 @@ expression: text
 
  ╭CONFIG──────────────────────────────────────────────────────────────────────╮
  │ GENERAL                                                                    │
- │ › Workdir root          (unset)                                            │
+ │ › Workdir root                     (unset)                                 │
  │  Parent directory where project repos live  (e.g. /home/you/repos)         │
- │   Default model         (unset)                                            │
- │   Default effort        medium                                             │
- │   Default permission modedefault                                           │
- │   Admin role IDs        (unset)                                            │
- │   Approver role IDs     (unset)                                            │
- │   OTel endpoint         (unset)                                            │
- │   Max concurrent runs   3                                                  │
- │   Approval timeout (ms) 300000                                             │
- │   Attachment max bytes  26214400                                           │
- │   Attachment max count  10                                                 │
- │   Attachment allowed extensions(unset)                                     │
- │   Attachment allowed hostscdn.discordapp.com,media.discordapp.net          │
+ │   Default model                    (unset)                                 │
+ │   Default effort                   medium                                  │
+ │   Default permission mode          default                                 │
+ │   Admin role IDs                   (unset)                                 │
+ │   Approver role IDs                (unset)                                 │
+ │   OTel endpoint                    (unset)                                 │
+ │   Max concurrent runs              3                                       │
+ │   Approval timeout (ms)            300000                                  │
+ │   Attachment max bytes             26214400                                │
+ │   Attachment max count             10                                      │
+ │   Attachment allowed extensions    (unset)                                 │
+ │   Attachment allowed hosts         cdn.discordapp.com,media.discordapp.net │
  │ ↑↓ select · Enter edit · Space toggle provider · Esc cancel                │
  ╰────────────────────────────────────────────────────────────────────────────╯
  Tab switch  ·  ↑↓ select  ·  Enter edit  ·  ? options  ·  q quit

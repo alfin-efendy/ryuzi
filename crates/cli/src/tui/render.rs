@@ -469,13 +469,32 @@ fn draw_sessions_tab(frame: &mut Frame, area: Rect, state: &DashboardState) {
 }
 
 /// `GENERAL`/provider-group/`PROVIDERS` sections as uppercase header lines,
-/// field rows (`label` padded 22 + value/mask/`(unset)`, dim help when
-/// selected), toggle rows (`[x] {label}`), an error line, and the footer
-/// hint — all inside a single `CONFIG` panel.
+/// field rows (`label` padded to `label_col_width` + value/mask/`(unset)`,
+/// dim help when selected), toggle rows (`[x] {label}`), an error line, and
+/// the footer hint — all inside a single `CONFIG` panel.
 fn draw_config_tab(frame: &mut Frame, area: Rect, state: &DashboardState, ctx: &RenderCtx) {
     let block = widgets::panel("Config", true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // The retired TS `padEnd(22)` assumed every label fit in 22 columns; it
+    // doesn't — "Default permission mode" (23), "Attachment allowed hosts"
+    // (24), "Attachment allowed extensions" (29), and a few `Auto-update
+    // ...` labels all overflow it, which ran the value straight into the
+    // label with no gap (e.g. "Default permission modedefault"). Deviate
+    // from the TS constant deliberately: size the label column to the
+    // longest label actually present this render (+2 for a gap), with 22
+    // as the floor so short label sets keep the original layout.
+    let label_col_width = state
+        .config_rows
+        .iter()
+        .filter_map(|row| match row {
+            ConfigRow::Field(field) => Some(field.label.chars().count()),
+            _ => None,
+        })
+        .max()
+        .map_or(22, |max_len| max_len + 2)
+        .max(22);
     // Pin the footer hint to the panel's last row: the field list (General's
     // ~18 rows alone) routinely outgrows the visible height, and the footer
     // must stay reachable rather than scrolling off with the rest of the
@@ -505,7 +524,7 @@ fn draw_config_tab(frame: &mut Frame, area: Rect, state: &DashboardState, ctx: &
                 } else {
                     "  ".to_string()
                 };
-                let label_col = format!("{prefix}{:<22}", field.label);
+                let label_col = format!("{prefix}{:<label_col_width$}", field.label);
                 let label_style = if is_selected {
                     theme::tone(Tone::Signature)
                 } else {

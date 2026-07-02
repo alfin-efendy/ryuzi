@@ -57,12 +57,22 @@ impl DashboardState {
     /// dashboard's 1s tick) and clamps cursors that outlived a shrunk list.
     pub async fn refresh(&mut self, controller: &AppController) {
         self.sessions = controller.sessions().await;
-        self.config_rows = build_config_rows(controller).await;
+        self.rebuild_config_rows(controller).await;
 
         self.sessions_cursor = clamp_cursor(self.sessions_cursor, self.sessions.len());
         if matches!(self.detail, Some(i) if i >= self.sessions.len()) {
             self.detail = None;
         }
+    }
+
+    /// Re-pulls `config_rows` from `controller` and clamps `config_cursor`
+    /// into the (possibly shrunk) selectable list. Called both from the 1s
+    /// tick (`refresh`) and immediately after any action that can change the
+    /// row list — a provider toggle or a submitted edit — so a just-disabled
+    /// provider's header/field rows disappear in the same `handle` call
+    /// instead of lagging up to a second behind.
+    async fn rebuild_config_rows(&mut self, controller: &AppController) {
+        self.config_rows = build_config_rows(controller).await;
         let selectable_len = self.selectable_indices().len();
         self.config_cursor = clamp_cursor(self.config_cursor, selectable_len);
     }
@@ -155,7 +165,9 @@ impl DashboardState {
 
     /// Validates and persists the current draft against the field under the
     /// cursor. On error the draft and edit mode are kept (TS parity: the
-    /// `TextInput` stays mounted and shows the message).
+    /// `TextInput` stays mounted and shows the message). On success,
+    /// `config_rows` is rebuilt immediately rather than waiting for the next
+    /// tick.
     async fn submit_edit(&mut self, controller: &AppController) {
         let selectable = self.selectable_indices();
         let Some(&row_idx) = selectable.get(self.config_cursor) else {
@@ -169,6 +181,7 @@ impl DashboardState {
             Ok(()) => {
                 self.editing = None;
                 self.config_error = None;
+                self.rebuild_config_rows(controller).await;
             }
             Err(e) => self.config_error = Some(e.to_string()),
         }
@@ -239,7 +252,14 @@ impl DashboardState {
             }
             Key::Space => {
                 let row_idx = selectable[self.config_cursor.min(selectable.len() - 1)];
-                self.toggle_provider_row(row_idx, controller).await;
+                if self.toggle_provider_row(row_idx, controller).await {
+                    // A gateway/runtime toggle can add or remove that
+                    // provider's Header/Field rows (`build_config_rows` only
+                    // includes them while enabled) — rebuild now instead of
+                    // leaving stale rows on screen for up to a second until
+                    // the next tick.
+                    self.rebuild_config_rows(controller).await;
+                }
             }
             _ => {}
         }
@@ -248,29 +268,34 @@ impl DashboardState {
     /// `toggleProvider` (TS): flips `id` in the corresponding enabled-CSV. A
     /// runtime toggle also keeps `default_runtime` valid: empty set -> `""`,
     /// else the first remaining member if the current default fell out.
-    async fn toggle_provider_row(&mut self, row_idx: usize, controller: &AppController) {
+    /// Returns whether the toggle was actually persisted (i.e. the CSV write
+    /// succeeded), so the caller only rebuilds `config_rows` on success.
+    async fn toggle_provider_row(&mut self, row_idx: usize, controller: &AppController) -> bool {
         match &self.config_rows[row_idx] {
             ConfigRow::ToggleGateway { id, .. } => {
                 let id = id.clone();
                 let mut ids = controller.enabled_gateways().await;
                 toggle_id(&mut ids, &id);
-                let _ = controller.set_enabled_gateways(&ids).await;
+                controller.set_enabled_gateways(&ids).await.is_ok()
             }
             ConfigRow::ToggleRuntime { id, .. } => {
                 let id = id.clone();
                 let mut ids = controller.enabled_runtimes().await;
                 toggle_id(&mut ids, &id);
-                let _ = controller.set_enabled_runtimes(&ids).await;
-                if ids.is_empty() {
-                    let _ = controller.set_default_runtime("").await;
-                } else {
-                    let current_default = controller.default_runtime().await;
-                    if !ids.iter().any(|i| i == &current_default) {
-                        let _ = controller.set_default_runtime(&ids[0]).await;
+                let ok = controller.set_enabled_runtimes(&ids).await.is_ok();
+                if ok {
+                    if ids.is_empty() {
+                        let _ = controller.set_default_runtime("").await;
+                    } else {
+                        let current_default = controller.default_runtime().await;
+                        if !ids.iter().any(|i| i == &current_default) {
+                            let _ = controller.set_default_runtime(&ids[0]).await;
+                        }
                     }
                 }
+                ok
             }
-            ConfigRow::Header(_) | ConfigRow::Field(_) => {}
+            ConfigRow::Header(_) | ConfigRow::Field(_) => false,
         }
     }
 
@@ -300,6 +325,15 @@ impl DashboardState {
     pub(crate) fn selectable_index_of_runtime_toggle(&self, id: &str) -> Option<usize> {
         self.selectable_indices().into_iter().position(|idx| {
             matches!(&self.config_rows[idx], ConfigRow::ToggleRuntime { id: rid, .. } if rid == id)
+        })
+    }
+
+    /// Test-only lookup: the selectable-index of the `ToggleGateway` row for
+    /// `id`.
+    #[cfg(test)]
+    pub(crate) fn selectable_index_of_gateway_toggle(&self, id: &str) -> Option<usize> {
+        self.selectable_indices().into_iter().position(|idx| {
+            matches!(&self.config_rows[idx], ConfigRow::ToggleGateway { id: rid, .. } if rid == id)
         })
     }
 }
@@ -453,6 +487,46 @@ mod tests {
         assert_eq!(c.default_runtime().await, "");
         d.handle(Key::Space, &c).await; // toggle back on
         assert_eq!(c.default_runtime().await, "claude-code");
+    }
+
+    #[tokio::test]
+    async fn config_toggle_gateway_rebuilds_rows_in_same_handle_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller_in(dir.path()).await; // seeds: enabled_gateways = discord
+        let mut d = DashboardState::new(&c).await;
+        d.active = 3;
+        let has_discord_rows = |d: &DashboardState| {
+            d.config_rows
+                .iter()
+                .any(|r| matches!(r, ConfigRow::Header(h) if h == "Discord"))
+        };
+        assert!(
+            has_discord_rows(&d),
+            "discord's header/fields should be present while enabled"
+        );
+
+        // move cursor to the discord gateway toggle row and Space it off:
+        let idx = d.selectable_index_of_gateway_toggle("discord").unwrap();
+        d.config_cursor = idx;
+        d.handle(Key::Space, &c).await;
+
+        assert_eq!(c.enabled_gateways().await, Vec::<String>::new());
+        assert!(
+            !has_discord_rows(&d),
+            "discord's header/field rows must disappear from config_rows in the \
+             same handle() call, not up to 1s later on the next tick"
+        );
+
+        // Removing discord's header/field rows shifted every later row (incl.
+        // the toggle rows themselves) up in the selectable list, so re-fetch
+        // the toggle row's new position rather than reusing the stale `idx`.
+        let idx = d.selectable_index_of_gateway_toggle("discord").unwrap();
+        d.config_cursor = idx;
+        d.handle(Key::Space, &c).await; // toggle back on
+        assert!(
+            has_discord_rows(&d),
+            "re-enabling should also rebuild immediately"
+        );
     }
 
     #[tokio::test]
