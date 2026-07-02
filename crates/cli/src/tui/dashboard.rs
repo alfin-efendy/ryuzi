@@ -1,0 +1,504 @@
+//! `DashboardState` — pure, terminal-free state machine for the main app
+//! view: tab navigation, the sessions list/detail, and inline config editing
+//! with provider (gateway/runtime) toggles. Rust port of the retired
+//! TypeScript `apps/router/src/cli/ui/{app,tabs/sessions,tabs/config}.tsx`.
+
+use ryuzi_core::settings::ConfigField;
+
+use crate::tui::controller::{AppController, SessionRow};
+use crate::tui::Key;
+
+pub const TABS: [&str; 4] = ["Status", "Daemon", "Sessions", "Config"];
+
+/// One row of the Config tab's flattened row list. Headers are never
+/// selectable; `config_cursor` walks only the `Field`/`ToggleGateway`/
+/// `ToggleRuntime` rows (TS `buildRows`/`selectable`).
+pub enum ConfigRow {
+    Header(String),
+    Field(&'static ConfigField),
+    ToggleGateway { id: String, label: String },
+    ToggleRuntime { id: String, label: String },
+}
+
+pub struct DashboardState {
+    pub active: usize,
+    pub show_options: bool,
+    pub exit: bool,
+    pub sessions: Vec<SessionRow>,
+    pub sessions_cursor: usize,
+    pub detail: Option<usize>,
+    /// The full row list (headers included); `config_cursor` indexes the
+    /// *selectable* subset, not this vec directly.
+    pub config_rows: Vec<ConfigRow>,
+    pub config_cursor: usize,
+    /// `Some(draft)` while a `Field` row is being edited.
+    pub editing: Option<String>,
+    pub config_error: Option<String>,
+}
+
+impl DashboardState {
+    /// Loads the initial sessions list and config rows from `controller`.
+    pub async fn new(controller: &AppController) -> Self {
+        Self {
+            active: 0,
+            show_options: false,
+            exit: false,
+            sessions: controller.sessions().await,
+            sessions_cursor: 0,
+            detail: None,
+            config_rows: build_config_rows(controller).await,
+            config_cursor: 0,
+            editing: None,
+            config_error: None,
+        }
+    }
+
+    /// Re-pulls sessions and config rows from `controller` (driven by the
+    /// dashboard's 1s tick) and clamps cursors that outlived a shrunk list.
+    pub async fn refresh(&mut self, controller: &AppController) {
+        self.sessions = controller.sessions().await;
+        self.config_rows = build_config_rows(controller).await;
+
+        self.sessions_cursor = clamp_cursor(self.sessions_cursor, self.sessions.len());
+        if matches!(self.detail, Some(i) if i >= self.sessions.len()) {
+            self.detail = None;
+        }
+        let selectable_len = self.selectable_indices().len();
+        self.config_cursor = clamp_cursor(self.config_cursor, selectable_len);
+    }
+
+    pub async fn handle(&mut self, key: Key, controller: &AppController) {
+        if self.editing.is_some() {
+            self.handle_editing_key(key, controller).await;
+            return;
+        }
+        if self.handle_global_key(key, controller).await {
+            return;
+        }
+        match self.active {
+            2 => self.handle_sessions_key(key),
+            3 => self.handle_config_key(key, controller).await,
+            _ => {}
+        }
+    }
+
+    /// Global keybinds, active only while nothing is being edited. Returns
+    /// `true` if `key` was consumed (TS: the single `useInput` in `app.tsx`,
+    /// active only while `!editing`).
+    async fn handle_global_key(&mut self, key: Key, controller: &AppController) -> bool {
+        match key {
+            Key::Char('q') => self.exit = true,
+            Key::Char('?') => self.show_options = !self.show_options,
+            Key::Tab | Key::Right => self.active = (self.active + 1) % TABS.len(),
+            Key::Left => self.active = (self.active + TABS.len() - 1) % TABS.len(),
+            Key::Char(c) if ('1'..='4').contains(&c) => {
+                self.active = c as usize - '1' as usize;
+            }
+            Key::Char('s') if self.active == 1 => {
+                let _ = controller.toggle_daemon().await;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// While `editing.is_some()`, every key is text input for the draft
+    /// except Enter (submit) and Esc (cancel) — TS parity with
+    /// `ink-text-input`'s `useInput` swallowing all input while active, so
+    /// even `q` types into the draft instead of quitting.
+    async fn handle_editing_key(&mut self, key: Key, controller: &AppController) {
+        match key {
+            Key::Char(c) => {
+                if let Some(draft) = self.editing.as_mut() {
+                    draft.push(c);
+                }
+            }
+            Key::Backspace => {
+                if let Some(draft) = self.editing.as_mut() {
+                    draft.pop();
+                }
+            }
+            Key::Enter => self.submit_edit(controller).await,
+            Key::Esc => {
+                self.editing = None;
+                self.config_error = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Validates and persists the current draft against the field under the
+    /// cursor. On error the draft and edit mode are kept (TS parity: the
+    /// `TextInput` stays mounted and shows the message).
+    async fn submit_edit(&mut self, controller: &AppController) {
+        let selectable = self.selectable_indices();
+        let Some(&row_idx) = selectable.get(self.config_cursor) else {
+            return;
+        };
+        let Some(ConfigRow::Field(field)) = self.config_rows.get(row_idx) else {
+            return;
+        };
+        let draft = self.editing.clone().unwrap_or_default();
+        match controller.set(field.key, &draft).await {
+            Ok(()) => {
+                self.editing = None;
+                self.config_error = None;
+            }
+            Err(e) => self.config_error = Some(e.to_string()),
+        }
+    }
+
+    /// Up/Down wrap over `sessions`; Enter opens the detail view; Esc closes
+    /// it. While a detail is open, only Esc is handled (TS: `useInput`
+    /// short-circuits to just the escape check when `open`).
+    fn handle_sessions_key(&mut self, key: Key) {
+        if self.detail.is_some() {
+            if key == Key::Esc {
+                self.detail = None;
+            }
+            return;
+        }
+        match key {
+            Key::Up => {
+                self.sessions_cursor = if self.sessions_cursor > 0 {
+                    self.sessions_cursor - 1
+                } else {
+                    self.sessions.len().saturating_sub(1)
+                };
+            }
+            Key::Down => {
+                self.sessions_cursor = if self.sessions_cursor + 1 < self.sessions.len() {
+                    self.sessions_cursor + 1
+                } else {
+                    0
+                };
+            }
+            Key::Enter if !self.sessions.is_empty() => {
+                self.detail = Some(self.sessions_cursor);
+            }
+            _ => {}
+        }
+    }
+
+    /// Up/Down wrap over the selectable rows; Enter on a `Field` row starts
+    /// editing (draft = current value or empty); Space on a toggle row
+    /// flips provider membership.
+    async fn handle_config_key(&mut self, key: Key, controller: &AppController) {
+        let selectable = self.selectable_indices();
+        if selectable.is_empty() {
+            return;
+        }
+        match key {
+            Key::Up => {
+                self.config_cursor = if self.config_cursor > 0 {
+                    self.config_cursor - 1
+                } else {
+                    selectable.len() - 1
+                };
+            }
+            Key::Down => {
+                self.config_cursor = if self.config_cursor + 1 < selectable.len() {
+                    self.config_cursor + 1
+                } else {
+                    0
+                };
+            }
+            Key::Enter => {
+                let row_idx = selectable[self.config_cursor.min(selectable.len() - 1)];
+                if let ConfigRow::Field(field) = &self.config_rows[row_idx] {
+                    let current = controller.get(field.key).await.unwrap_or_default();
+                    self.editing = Some(current);
+                    self.config_error = None;
+                }
+            }
+            Key::Space => {
+                let row_idx = selectable[self.config_cursor.min(selectable.len() - 1)];
+                self.toggle_provider_row(row_idx, controller).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// `toggleProvider` (TS): flips `id` in the corresponding enabled-CSV. A
+    /// runtime toggle also keeps `default_runtime` valid: empty set -> `""`,
+    /// else the first remaining member if the current default fell out.
+    async fn toggle_provider_row(&mut self, row_idx: usize, controller: &AppController) {
+        match &self.config_rows[row_idx] {
+            ConfigRow::ToggleGateway { id, .. } => {
+                let id = id.clone();
+                let mut ids = controller.enabled_gateways().await;
+                toggle_id(&mut ids, &id);
+                let _ = controller.set_enabled_gateways(&ids).await;
+            }
+            ConfigRow::ToggleRuntime { id, .. } => {
+                let id = id.clone();
+                let mut ids = controller.enabled_runtimes().await;
+                toggle_id(&mut ids, &id);
+                let _ = controller.set_enabled_runtimes(&ids).await;
+                if ids.is_empty() {
+                    let _ = controller.set_default_runtime("").await;
+                } else {
+                    let current_default = controller.default_runtime().await;
+                    if !ids.iter().any(|i| i == &current_default) {
+                        let _ = controller.set_default_runtime(&ids[0]).await;
+                    }
+                }
+            }
+            ConfigRow::Header(_) | ConfigRow::Field(_) => {}
+        }
+    }
+
+    /// Indices into `config_rows` of every selectable (non-`Header`) row, in
+    /// order; `config_cursor` indexes into *this* list, not `config_rows`.
+    fn selectable_indices(&self) -> Vec<usize> {
+        self.config_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !matches!(r, ConfigRow::Header(_)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Test-only lookup: the selectable-index (i.e. a valid `config_cursor`
+    /// value) of the `Field` row for `key`.
+    #[cfg(test)]
+    pub(crate) fn selectable_index_of_field(&self, key: &str) -> Option<usize> {
+        self.selectable_indices()
+            .into_iter()
+            .position(|idx| matches!(&self.config_rows[idx], ConfigRow::Field(f) if f.key == key))
+    }
+
+    /// Test-only lookup: the selectable-index of the `ToggleRuntime` row for
+    /// `id`.
+    #[cfg(test)]
+    pub(crate) fn selectable_index_of_runtime_toggle(&self, id: &str) -> Option<usize> {
+        self.selectable_indices().into_iter().position(|idx| {
+            matches!(&self.config_rows[idx], ConfigRow::ToggleRuntime { id: rid, .. } if rid == id)
+        })
+    }
+}
+
+/// Clamp a cursor into `0..len`, pinning to `0` when the list is empty.
+fn clamp_cursor(cursor: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        cursor.min(len - 1)
+    }
+}
+
+/// Remove `id` from `ids` if present, else append it.
+fn toggle_id(ids: &mut Vec<String>, id: &str) {
+    if let Some(pos) = ids.iter().position(|s| s == id) {
+        ids.remove(pos);
+    } else {
+        ids.push(id.to_string());
+    }
+}
+
+/// TS `buildRows`: `Header("General")` + general fields, then per *enabled*
+/// gateway/runtime that has fields a `Header(label)` + its fields, then
+/// `Header("Providers")` + a toggle row for every catalog gateway/runtime
+/// (enabled or not).
+async fn build_config_rows(controller: &AppController) -> Vec<ConfigRow> {
+    let mut rows = vec![ConfigRow::Header("General".to_string())];
+    for f in controller.general_fields() {
+        rows.push(ConfigRow::Field(f));
+    }
+
+    for id in controller.enabled_gateways().await {
+        if let Some(gw) = controller.gateway_descriptors().iter().find(|g| g.id == id) {
+            if !gw.fields.is_empty() {
+                rows.push(ConfigRow::Header(gw.label.to_string()));
+                rows.extend(gw.fields.iter().map(ConfigRow::Field));
+            }
+        }
+    }
+
+    for id in controller.enabled_runtimes().await {
+        if let Some(rt) = controller.runtime_descriptors().iter().find(|r| r.id == id) {
+            if !rt.fields.is_empty() {
+                rows.push(ConfigRow::Header(rt.label.to_string()));
+                rows.extend(rt.fields.iter().map(ConfigRow::Field));
+            }
+        }
+    }
+
+    rows.push(ConfigRow::Header("Providers".to_string()));
+    rows.extend(
+        controller
+            .gateway_descriptors()
+            .iter()
+            .map(|gw| ConfigRow::ToggleGateway {
+                id: gw.id.to_string(),
+                label: format!("{} (gateway)", gw.label),
+            }),
+    );
+    rows.extend(
+        controller
+            .runtime_descriptors()
+            .iter()
+            .map(|rt| ConfigRow::ToggleRuntime {
+                id: rt.id.to_string(),
+                label: format!("{} (runtime)", rt.label),
+            }),
+    );
+
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::controller::controller_in;
+    use crate::tui::Key;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn keybinds_switch_tabs_and_gate_on_editing() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller_in(dir.path()).await;
+        let mut d = DashboardState::new(&c).await;
+        assert_eq!(d.active, 0);
+        d.handle(Key::Char('2'), &c).await;
+        assert_eq!(d.active, 1);
+        d.handle(Key::Tab, &c).await;
+        assert_eq!(d.active, 2);
+        d.handle(Key::Left, &c).await;
+        assert_eq!(d.active, 1);
+        d.handle(Key::Char('?'), &c).await;
+        assert!(d.show_options);
+        d.handle(Key::Char('q'), &c).await;
+        assert!(d.exit);
+        // editing gates globals:
+        let mut d = DashboardState::new(&c).await;
+        d.active = 3;
+        d.editing = Some(String::new());
+        d.handle(Key::Char('q'), &c).await;
+        assert!(!d.exit);
+        assert_eq!(d.editing.as_deref(), Some("q")); // char went into the draft
+    }
+
+    #[tokio::test]
+    async fn s_toggles_daemon_only_on_daemon_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawns: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let mut c = controller_in(dir.path()).await;
+        let log = spawns.clone();
+        c.deps.spawn_daemon = Some(Box::new(move |cmd, _log_path| {
+            log.lock().unwrap().push(cmd.to_vec());
+            Ok(4242)
+        }));
+        for (k, v) in [
+            ("discord.token", "t"),
+            ("discord.app_id", "a"),
+            ("discord.guild_id", "g"),
+            ("workdir_root", "/repos"),
+        ] {
+            c.set(k, v).await.unwrap();
+        }
+        let mut d = DashboardState::new(&c).await;
+        d.active = 0;
+        d.handle(Key::Char('s'), &c).await;
+        assert!(
+            spawns.lock().unwrap().is_empty(),
+            "s on a non-daemon tab must not spawn"
+        );
+        d.active = 1;
+        d.handle(Key::Char('s'), &c).await;
+        assert_eq!(
+            spawns.lock().unwrap().len(),
+            1,
+            "s on the daemon tab toggles the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_toggle_runtime_keeps_default_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller_in(dir.path()).await; // seeds: enabled_runtimes = claude-code, default = claude-code
+        let mut d = DashboardState::new(&c).await;
+        d.active = 3;
+        // move cursor to the claude-code runtime toggle row and Space it off:
+        let idx = d.selectable_index_of_runtime_toggle("claude-code").unwrap(); // small test helper on DashboardState
+        d.config_cursor = idx;
+        d.handle(Key::Space, &c).await;
+        assert_eq!(c.enabled_runtimes().await, Vec::<String>::new());
+        assert_eq!(c.default_runtime().await, "");
+        d.handle(Key::Space, &c).await; // toggle back on
+        assert_eq!(c.default_runtime().await, "claude-code");
+    }
+
+    #[tokio::test]
+    async fn config_edit_field_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller_in(dir.path()).await;
+        let mut d = DashboardState::new(&c).await;
+        d.active = 3;
+        let idx = d.selectable_index_of_field("workdir_root").unwrap();
+        d.config_cursor = idx;
+        d.handle(Key::Enter, &c).await; // enter edit mode (draft = current value or "")
+        for ch in "/tmp/x".chars() {
+            d.handle(Key::Char(ch), &c).await;
+        }
+        d.handle(Key::Enter, &c).await; // submit
+        assert!(d.editing.is_none());
+        assert_eq!(c.get("workdir_root").await.as_deref(), Some("/tmp/x"));
+        // Esc cancels:
+        d.handle(Key::Enter, &c).await;
+        d.handle(Key::Char('z'), &c).await;
+        d.handle(Key::Esc, &c).await;
+        assert!(d.editing.is_none());
+        assert_eq!(c.get("workdir_root").await.as_deref(), Some("/tmp/x"));
+    }
+
+    #[tokio::test]
+    async fn sessions_cursor_wraps_and_detail_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller_in(dir.path()).await;
+        c.deps
+            .store
+            .insert_session(ryuzi_core::Session {
+                session_pk: "s1".into(),
+                project_id: "p1".into(),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("first".into()),
+                status: ryuzi_core::SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(1),
+                last_active: Some(1),
+                resume_attempts: 0,
+            })
+            .await
+            .unwrap();
+        c.deps
+            .store
+            .insert_session(ryuzi_core::Session {
+                session_pk: "s2".into(),
+                project_id: "p1".into(),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("second".into()),
+                status: ryuzi_core::SessionStatus::Running,
+                started_by: None,
+                created_at: Some(2),
+                last_active: Some(2),
+                resume_attempts: 0,
+            })
+            .await
+            .unwrap();
+        let mut d = DashboardState::new(&c).await;
+        d.active = 2;
+        assert_eq!(d.sessions.len(), 2);
+        assert_eq!(d.sessions_cursor, 0);
+        d.handle(Key::Up, &c).await; // wraps to the last session
+        assert_eq!(d.sessions_cursor, 1);
+        d.handle(Key::Enter, &c).await;
+        assert_eq!(d.detail, Some(1));
+        d.handle(Key::Esc, &c).await;
+        assert_eq!(d.detail, None);
+    }
+}
