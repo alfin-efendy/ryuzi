@@ -35,7 +35,10 @@ pub fn sandbox(work_dir: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     // Canonicalize work_dir so we compare against the real on-disk root and so
     // a symlinked work_dir doesn't cause false rejections on relative paths.
     let canonical_root = work_dir.canonicalize().map_err(|e| {
-        anyhow::anyhow!("sandbox: cannot canonicalize work_dir {}: {e}", work_dir.display())
+        anyhow::anyhow!(
+            "sandbox: cannot canonicalize work_dir {}: {e}",
+            work_dir.display()
+        )
     })?;
 
     // Construct the candidate (absolute) path, resolving `..` lexically.
@@ -79,10 +82,7 @@ pub fn sandbox(work_dir: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     loop {
         if ancestor.exists() {
             let canonical_ancestor = ancestor.canonicalize().map_err(|e| {
-                anyhow::anyhow!(
-                    "sandbox: cannot canonicalize {}: {e}",
-                    ancestor.display()
-                )
+                anyhow::anyhow!("sandbox: cannot canonicalize {}: {e}", ancestor.display())
             })?;
             // Verify the canonicalized ancestor is still under the root.
             if !canonical_ancestor.starts_with(&canonical_root) {
@@ -95,7 +95,9 @@ pub fn sandbox(work_dir: &Path, path: &Path) -> anyhow::Result<PathBuf> {
             // Reconstruct: canonical_ancestor + the suffix that didn't exist.
             // NOTE: PathBuf::join("") appends a trailing slash which causes
             // "Not a directory" on stat, so guard the empty-suffix case.
-            let suffix = normalized.strip_prefix(ancestor).unwrap_or(std::path::Path::new(""));
+            let suffix = normalized
+                .strip_prefix(ancestor)
+                .unwrap_or(std::path::Path::new(""));
             if suffix == std::path::Path::new("") {
                 return Ok(canonical_ancestor);
             }
@@ -226,11 +228,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("output.txt");
 
-        let req = WriteTextFileRequest::new(
-            SessionId::from("test-session"),
-            &target,
-            "hello from agent",
-        );
+        let req =
+            WriteTextFileRequest::new(SessionId::from("test-session"), &target, "hello from agent");
         write_text_file(root.path(), req).unwrap();
 
         let got = std::fs::read_to_string(&target).unwrap();
@@ -242,11 +241,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("deep/nested/dir/file.txt");
 
-        let req = WriteTextFileRequest::new(
-            SessionId::from("test-session"),
-            &target,
-            "content",
-        );
+        let req = WriteTextFileRequest::new(SessionId::from("test-session"), &target, "content");
         write_text_file(root.path(), req).unwrap();
         assert!(target.exists());
     }
@@ -256,8 +251,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bad_path = std::path::PathBuf::from("/etc/passwd");
 
-        let req =
-            WriteTextFileRequest::new(SessionId::from("test-session"), bad_path, "content");
+        let req = WriteTextFileRequest::new(SessionId::from("test-session"), bad_path, "content");
         assert!(write_text_file(root.path(), req).is_err());
     }
 }

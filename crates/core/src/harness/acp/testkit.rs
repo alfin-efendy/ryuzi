@@ -69,7 +69,10 @@ impl MockAgent {
             .mcp_capabilities(McpCapabilities::new().http(self.mcp_http));
 
         InitializeResponse::new(req.protocol_version)
-            .agent_info(Implementation::new("ryuzi-mock-agent", env!("CARGO_PKG_VERSION")))
+            .agent_info(Implementation::new(
+                "ryuzi-mock-agent",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .agent_capabilities(capabilities)
     }
 
@@ -396,11 +399,11 @@ pub async fn drive_lifecycle(
     mode: &str,
     prompt_text: &str,
 ) -> Result<LifecycleOutcome, agent_client_protocol::Error> {
-    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
         ClientCapabilities, InitializeRequest, RequestPermissionOutcome, RequestPermissionRequest,
         RequestPermissionResponse, SessionNotification,
     };
+    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::Client;
 
     let mode = mode.to_string();
@@ -480,8 +483,8 @@ pub async fn drive_lifecycle(
 pub async fn drive_load(resume_session_id: &str) -> (std::sync::Arc<crate::store::Store>, String) {
     use std::sync::Arc;
 
-    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{ClientCapabilities, InitializeResponse};
+    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::Client;
     use tokio::sync::broadcast;
 
@@ -567,9 +570,7 @@ pub async fn drive_load(resume_session_id: &str) -> (std::sync::Arc<crate::store
 /// The test runner spawns a tokio task (not an OS thread + fresh runtime) so
 /// the mock duplex's I/O stays on the test runtime, and drives the shared
 /// `run_client_loop` over the injected transport.
-pub async fn run_via_harness_trait(
-    prompt: &str,
-) -> (std::sync::Arc<crate::store::Store>, String) {
+pub async fn run_via_harness_trait(prompt: &str) -> (std::sync::Arc<crate::store::Store>, String) {
     use std::sync::Arc;
 
     use tokio::sync::broadcast;
@@ -588,9 +589,7 @@ pub async fn run_via_harness_trait(
     // shared client loop over a fresh mock duplex on a tokio task.
     let harness = AcpHarness::with_runner_factory(
         AcpAdapterDescriptor::default(),
-        |_descriptor: &AcpAdapterDescriptor| {
-            crate::harness::acp::mock_runner()
-        },
+        |_descriptor: &AcpAdapterDescriptor| crate::harness::acp::mock_runner(),
     );
 
     // Use a stable ryuzi session_pk; messages will be keyed under this value
@@ -645,8 +644,16 @@ pub fn perm_request_with_kinds() -> RequestPermissionRequest {
         ToolCallUpdateFields::new().title("Bash".to_string()),
     );
     let options = vec![
-        PermissionOption::new(PERM_ALLOW_ONCE_ID, "Allow once", PermissionOptionKind::AllowOnce),
-        PermissionOption::new(PERM_REJECT_ONCE_ID, "Reject once", PermissionOptionKind::RejectOnce),
+        PermissionOption::new(
+            PERM_ALLOW_ONCE_ID,
+            "Allow once",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            PERM_REJECT_ONCE_ID,
+            "Reject once",
+            PermissionOptionKind::RejectOnce,
+        ),
     ];
     RequestPermissionRequest::new(session_id, tool_call, options)
 }
@@ -806,13 +813,16 @@ impl HandleDispatchFrom<Client> for PermMockAgent {
 /// `AllowOnce | AllowAlways` → `true` (allow), everything else → `false` (deny).
 pub async fn run_prompt_with_permission(
     decision: crate::domain::ApprovalDecision,
-) -> (std::sync::Arc<crate::approval::ApprovalHub>, PermissionResult) {
+) -> (
+    std::sync::Arc<crate::approval::ApprovalHub>,
+    PermissionResult,
+) {
     use std::sync::Arc;
 
-    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
         ClientCapabilities, InitializeRequest, InitializeResponse,
     };
+    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::Client;
 
     use crate::approval::ApprovalHub;
@@ -820,8 +830,7 @@ pub async fn run_prompt_with_permission(
 
     let hub: Arc<ApprovalHub> = Arc::new(ApprovalHub::new());
     let (events_tx, _rx) = tokio::sync::broadcast::channel::<CoreEvent>(64);
-    let allowed_slot: Arc<tokio::sync::Mutex<bool>> =
-        Arc::new(tokio::sync::Mutex::new(false));
+    let allowed_slot: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
 
     let perm_agent = PermMockAgent {
         allowed_slot: allowed_slot.clone(),
@@ -849,10 +858,8 @@ pub async fn run_prompt_with_permission(
             .await;
     });
 
-    let transport = agent_client_protocol::ByteStreams::new(
-        client_write.compat_write(),
-        client_read.compat(),
-    );
+    let transport =
+        agent_client_protocol::ByteStreams::new(client_write.compat_write(), client_read.compat());
 
     // The binary allow/deny value derived from the decision.
     let allow = matches!(
@@ -899,7 +906,8 @@ pub async fn run_prompt_with_permission(
                     } else {
                         crate::domain::ApprovalDecision::RejectOnce
                     };
-                    let response = crate::harness::acp::permission::map_response(&request, decision);
+                    let response =
+                        crate::harness::acp::permission::map_response(&request, decision);
                     responder.respond(response)
                 }
             },
@@ -1138,7 +1146,9 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
             Box::new(move |args: crate::harness::acp::ClientLoopArgs| {
                 let (client_read, server_write) = tokio::io::duplex(64 * 1024);
                 let (server_read, client_write) = tokio::io::duplex(64 * 1024);
-                use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+                use tokio_util::compat::{
+                    TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _,
+                };
 
                 tokio::spawn(async move {
                     let _ = SacpAgent
@@ -1404,7 +1414,9 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
             Box::new(move |args: crate::harness::acp::ClientLoopArgs| {
                 let (client_read, server_write) = tokio::io::duplex(64 * 1024);
                 let (server_read, client_write) = tokio::io::duplex(64 * 1024);
-                use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+                use tokio_util::compat::{
+                    TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _,
+                };
 
                 tokio::spawn(async move {
                     let _ = SacpAgent
@@ -1544,15 +1556,17 @@ pub async fn run_perm_mock_via_harness(
 
     // Pre-set a tool policy if requested.
     if let Some((tool, decision)) = tool_policy {
-        store.set_tool_policy(project_id, tool, decision).await.unwrap();
+        store
+            .set_tool_policy(project_id, tool, decision)
+            .await
+            .unwrap();
     }
 
     // Track whether the hub was ever registered.
     let hub: Arc<ApprovalHub> = Arc::new(ApprovalHub::new());
     let hub_registrations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let allowed_slot: Arc<tokio::sync::Mutex<bool>> =
-        Arc::new(tokio::sync::Mutex::new(false));
+    let allowed_slot: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
     let allowed_slot_for_agent = allowed_slot.clone();
 
     let perm_agent = PermMockAgent {
@@ -1569,7 +1583,9 @@ pub async fn run_perm_mock_via_harness(
             Box::new(move |args: crate::harness::acp::ClientLoopArgs| {
                 let (client_read, server_write) = tokio::io::duplex(64 * 1024);
                 let (server_read, client_write) = tokio::io::duplex(64 * 1024);
-                use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+                use tokio_util::compat::{
+                    TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _,
+                };
 
                 tokio::spawn(async move {
                     let _ = SacpAgent

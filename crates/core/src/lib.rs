@@ -11,12 +11,12 @@ pub mod registry;
 pub mod store;
 pub mod worktree;
 
+pub use connector::{Connector, ConnectorCtx, ConnectorFactory, ConnectorRegistry};
 pub use control::ControlPlane;
 pub use domain::{
     Actor, ApprovalDecision, ApprovalRequest, CoreEvent, McpServerSpec, McpTransport, Message,
     PermMode, Project, Session, SessionStatus, Surface,
 };
-pub use connector::{Connector, ConnectorCtx, ConnectorFactory, ConnectorRegistry};
 pub use gateway::{Gateway, GatewayFactory, GatewayHub, GatewayRegistry};
 pub use harness::acp::{AcpAdapterDescriptor, ClaudeCodeIntegration};
 pub use harness::{Harness, HarnessFactory, HarnessRegistry, HarnessSession, SessionCtx};

@@ -56,7 +56,6 @@ pub async fn spawn_adapter(
     cmd.spawn()
 }
 
-
 #[cfg(test)]
 mod tests {
     /// The `client_connects_and_initializes` scenario is covered by the

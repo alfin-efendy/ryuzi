@@ -67,7 +67,10 @@ mod tests {
     async fn connector_yields_mcp_servers_and_default_auth_is_ok() {
         let f = FakeConnectorFactory;
         let c = f.create(&serde_json::json!({})).unwrap();
-        let ctx = ConnectorCtx { project_id: "p1".into(), work_dir: PathBuf::from("/tmp") };
+        let ctx = ConnectorCtx {
+            project_id: "p1".into(),
+            work_dir: PathBuf::from("/tmp"),
+        };
         c.ensure_auth(&ctx).await.unwrap(); // default impl returns Ok
         let servers = c.mcp_servers(&ctx).await.unwrap();
         assert_eq!(servers.len(), 1);

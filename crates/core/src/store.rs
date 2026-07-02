@@ -476,13 +476,34 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
 
-        let a1 = store.insert_message(NewMessage::block("s1", "user", "text",
-            serde_json::json!({"text": "hi"}))).await.unwrap();
-        let a2 = store.insert_message(NewMessage::block("s1", "assistant", "text",
-            serde_json::json!({"text": "hello"}))).await.unwrap();
+        let a1 = store
+            .insert_message(NewMessage::block(
+                "s1",
+                "user",
+                "text",
+                serde_json::json!({"text": "hi"}),
+            ))
+            .await
+            .unwrap();
+        let a2 = store
+            .insert_message(NewMessage::block(
+                "s1",
+                "assistant",
+                "text",
+                serde_json::json!({"text": "hello"}),
+            ))
+            .await
+            .unwrap();
         // A different session has an INDEPENDENT seq sequence starting at 1.
-        let b1 = store.insert_message(NewMessage::block("s2", "user", "text",
-            serde_json::json!({"text": "yo"}))).await.unwrap();
+        let b1 = store
+            .insert_message(NewMessage::block(
+                "s2",
+                "user",
+                "text",
+                serde_json::json!({"text": "yo"}),
+            ))
+            .await
+            .unwrap();
 
         assert_eq!((a1, a2, b1), (1, 2, 1));
 
@@ -501,17 +522,26 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
 
-        store.insert_message(NewMessage {
-            session_pk: "s1".into(), role: "assistant".into(), block_type: "tool_call".into(),
-            payload: serde_json::json!({"name": "Bash", "input": {"command": "ls"}}),
-            tool_call_id: Some("tc-1".into()), status: Some("pending".into()),
-            tool_kind: Some("execute".into()),
-        }).await.unwrap();
+        store
+            .insert_message(NewMessage {
+                session_pk: "s1".into(),
+                role: "assistant".into(),
+                block_type: "tool_call".into(),
+                payload: serde_json::json!({"name": "Bash", "input": {"command": "ls"}}),
+                tool_call_id: Some("tc-1".into()),
+                status: Some("pending".into()),
+                tool_kind: Some("execute".into()),
+            })
+            .await
+            .unwrap();
 
         let updated_seq = store.update_tool_call("s1", "tc-1", Some("completed"),
             &serde_json::json!({"name": "Bash", "input": {"command": "ls"}, "output": "file.txt"}))
             .await.unwrap();
-        assert_eq!(updated_seq, 1, "update_tool_call must return the row's real seq");
+        assert_eq!(
+            updated_seq, 1,
+            "update_tool_call must return the row's real seq"
+        );
 
         let rows = store.list_messages("s1").await.unwrap();
         assert_eq!(rows.len(), 1, "update must not insert a new row");
@@ -524,9 +554,17 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         let res = store
-            .update_tool_call("s1", "missing-tc", Some("completed"), &serde_json::json!({}))
+            .update_tool_call(
+                "s1",
+                "missing-tc",
+                Some("completed"),
+                &serde_json::json!({}),
+            )
             .await;
-        assert!(res.is_err(), "updating a nonexistent tool_call_id must error");
+        assert!(
+            res.is_err(),
+            "updating a nonexistent tool_call_id must error"
+        );
     }
 
     #[tokio::test]
@@ -536,17 +574,31 @@ mod tests {
         // initially no policy
         assert!(store.get_tool_policy("p1", "Bash").await.unwrap().is_none());
         // set a policy
-        store.set_tool_policy("p1", "Bash", "allowAlways").await.unwrap();
+        store
+            .set_tool_policy("p1", "Bash", "allowAlways")
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_tool_policy("p1", "Bash").await.unwrap().as_deref(),
+            store
+                .get_tool_policy("p1", "Bash")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("allowAlways")
         );
         // different project is independent
         assert!(store.get_tool_policy("p2", "Bash").await.unwrap().is_none());
         // upsert (update) the existing policy
-        store.set_tool_policy("p1", "Bash", "rejectAlways").await.unwrap();
+        store
+            .set_tool_policy("p1", "Bash", "rejectAlways")
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_tool_policy("p1", "Bash").await.unwrap().as_deref(),
+            store
+                .get_tool_policy("p1", "Bash")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("rejectAlways")
         );
     }

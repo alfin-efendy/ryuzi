@@ -115,7 +115,10 @@ mod tests {
         reg.register("codex", Arc::new(FakeHarnessFactory));
         assert!(reg.get("claude-code").is_some());
         assert!(reg.get("unknown").is_none());
-        assert_eq!(reg.names(), vec!["claude-code".to_string(), "codex".to_string()]);
+        assert_eq!(
+            reg.names(),
+            vec!["claude-code".to_string(), "codex".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -78,7 +78,10 @@ mod tests {
     async fn factory_produces_a_gateway_that_returns_a_decision() {
         let f = FakeGatewayFactory;
         let gw = f.create(&serde_json::json!({})).unwrap();
-        let surface = Surface { gateway: "discord".into(), conversation_id: "c1".into() };
+        let surface = Surface {
+            gateway: "discord".into(),
+            conversation_id: "c1".into(),
+        };
         let req = ApprovalRequest {
             request_id: "r1".into(),
             tool: "Bash".into(),

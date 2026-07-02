@@ -173,7 +173,12 @@ pub struct NewMessage {
 
 impl NewMessage {
     /// Convenience for a simple text/status/error block.
-    pub fn block(session_pk: &str, role: &str, block_type: &str, payload: serde_json::Value) -> Self {
+    pub fn block(
+        session_pk: &str,
+        role: &str,
+        block_type: &str,
+        payload: serde_json::Value,
+    ) -> Self {
         NewMessage {
             session_pk: session_pk.to_string(),
             role: role.to_string(),

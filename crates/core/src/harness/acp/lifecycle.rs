@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, SetSessionModeRequest, SetSessionModeResponse, SessionId,
+    PromptRequest, PromptResponse, SessionId, SetSessionModeRequest, SetSessionModeResponse,
     StopReason, TextContent,
 };
 use agent_client_protocol::ConnectionTo;
@@ -47,10 +47,7 @@ pub async fn new_session(
         .block_task()
         .await
         .map_err(|err| {
-            let message = format!(
-                "ACP {} failed: {err}",
-                AGENT_METHOD_NAMES.session_new
-            );
+            let message = format!("ACP {} failed: {err}", AGENT_METHOD_NAMES.session_new);
             agent_client_protocol::Error::internal_error().data(message)
         })?;
     Ok(session)
@@ -132,10 +129,7 @@ pub async fn prompt(
         .block_task()
         .await
         .map_err(|err| {
-            let message = format!(
-                "ACP {} failed: {err}",
-                AGENT_METHOD_NAMES.session_prompt
-            );
+            let message = format!("ACP {} failed: {err}", AGENT_METHOD_NAMES.session_prompt);
             agent_client_protocol::Error::internal_error().data(message)
         })?;
     Ok((response.stop_reason, response.usage))
@@ -163,8 +157,7 @@ mod tests {
     async fn load_session_replays_transcript_into_the_store() {
         // drive: connect -> initialize -> session/load; the mock replays a
         // user + agent message chunk during load, which the sink persists.
-        let (store, session_pk) =
-            crate::harness::acp::testkit::drive_load("resume-abc").await;
+        let (store, session_pk) = crate::harness::acp::testkit::drive_load("resume-abc").await;
         let msgs = store.list_messages(&session_pk).await.unwrap();
         assert!(
             msgs.iter().any(|m| m.role == "assistant"

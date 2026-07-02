@@ -161,9 +161,7 @@ impl ControlPlane {
                     .store
                     .get_project(&session.project_id)
                     .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("unknown project: {}", session.project_id)
-                    })?;
+                    .ok_or_else(|| anyhow::anyhow!("unknown project: {}", session.project_id))?;
                 let work_dir = session
                     .worktree_path
                     .clone()
@@ -195,13 +193,17 @@ impl ControlPlane {
         work_dir: &Path,
         resume: Option<String>,
     ) -> anyhow::Result<Arc<dyn HarnessSession>> {
-        let factory = self.registries.harness.get(&project.harness).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown harness '{}' (registered: {:?})",
-                project.harness,
-                self.registries.harness.names()
-            )
-        })?;
+        let factory = self
+            .registries
+            .harness
+            .get(&project.harness)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown harness '{}' (registered: {:?})",
+                    project.harness,
+                    self.registries.harness.names()
+                )
+            })?;
         let harness = factory.create()?;
 
         let ctx = SessionCtx {
@@ -571,7 +573,10 @@ mod tests {
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
         // First turn: creates the live ACP session and drives one prompt.
-        let session = cp.start_session(&project.project_id, "first").await.unwrap();
+        let session = cp
+            .start_session(&project.project_id, "first")
+            .await
+            .unwrap();
         // Let the background prompt task finish its turn.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -628,7 +633,10 @@ mod tests {
         init_repo(repo.path());
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
-        let session = cp.start_session(&project.project_id, "first").await.unwrap();
+        let session = cp
+            .start_session(&project.project_id, "first")
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Simulate an app restart that wiped the in-memory running map.
