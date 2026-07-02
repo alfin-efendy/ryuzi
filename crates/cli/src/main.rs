@@ -15,6 +15,7 @@ fn main() -> ExitCode {
         }),
         detect_git: ryuzi_cli::detect::detect_git,
         detect_claude: ryuzi_cli::detect::detect_claude,
+        sidecar_status: Box::new(|| ryuzi_cli::sidecar_host::manager().status()),
     };
     ExitCode::from(ryuzi_cli::dispatch::run_cli(
         std::env::args().skip(1).collect(),

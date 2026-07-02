@@ -1,0 +1,9 @@
+{
+  "version": "0.55.0",
+  "min_bun": "1.3.14",
+  "bundle": {
+    "asset": "claude-agent-acp-0.55.0.js",
+    "sha256": "dd648e6e423d2c4e7765b520c2c651a887f6a9c024bd6df4979659e47b6f0a0a"
+  },
+  "standalone": {}
+}

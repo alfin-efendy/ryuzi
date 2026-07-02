@@ -74,8 +74,8 @@ jobs:
         # Compiles @agentclientprotocol/claude-agent-acp to a self-contained
         # binary with the Tauri target-triple suffix so tauri-action picks it up
         # from src-tauri/binaries/.  The script installs the package and runs
-        # bun build --compile; see apps/cockpit/scripts/build-acp-sidecar.ts.
-        run: bun run --cwd apps/cockpit scripts/build-acp-sidecar.ts
+        # bun build --compile; see scripts/build-acp-sidecar.ts.
+        run: bun run scripts/build-acp-sidecar.ts
 
       - name: Build Cockpit (tauri build)
         uses: tauri-apps/tauri-action@v1

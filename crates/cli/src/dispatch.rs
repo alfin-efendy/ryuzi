@@ -10,6 +10,7 @@ pub struct Deps {
     pub prompt: Box<dyn FnMut(&str) -> String>,
     pub detect_git: fn() -> Detected,
     pub detect_claude: fn() -> Detected,
+    pub sidecar_status: Box<dyn Fn() -> ryuzi_core::sidecar::SidecarStatus>,
 }
 
 pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {

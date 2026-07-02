@@ -20,7 +20,7 @@ before:
     # this hook but it is harmless — the binaries/ dir is not consumed by
     # goreleaser builds.  The Cockpit CI build (cockpit-desktop.yml) runs this
     # script directly on the matching runner before tauri-action.
-    - bun run apps/cockpit/scripts/build-acp-sidecar.ts
+    - bun run scripts/build-acp-sidecar.ts
 
 builds:
   - id: ryuzi-gnu-other

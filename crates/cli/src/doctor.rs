@@ -1,5 +1,6 @@
 use crate::dispatch::Deps;
 use crate::paint::{paint, Tone};
+use ryuzi_core::sidecar::SidecarStatus;
 
 pub fn cmd_doctor(deps: &mut Deps) -> u8 {
     let git = (deps.detect_git)();
@@ -32,7 +33,25 @@ pub fn cmd_doctor(deps: &mut Deps) -> u8 {
             "n/a"
         }
     ));
-    // settings check arrives with the SettingsStore port (Plan 4B); acp line with Task 6.
+    // settings check arrives with the SettingsStore port (Plan 4B).
+    let sidecar = (deps.sidecar_status)();
+    let acp_line = match sidecar {
+        SidecarStatus::Override => paint("OK (override)", Tone::Ok, false),
+        SidecarStatus::CachedBundle => paint("OK (bun)", Tone::Ok, false),
+        SidecarStatus::CachedStandalone => paint("OK (standalone)", Tone::Ok, false),
+        SidecarStatus::NeedsDownloadBundle => paint(
+            "not cached (bun detected - JS bundle downloads on first run)",
+            Tone::Warn,
+            false,
+        ),
+        SidecarStatus::NeedsDownloadStandalone => paint(
+            "not cached (no bun - standalone binary downloads on first run)",
+            Tone::Warn,
+            false,
+        ),
+    };
+    (deps.out)(&format!("acp:    {acp_line}"));
+    // The acp line never affects the exit code in 4A.
     let ok = git.found && claude.found;
     (deps.out)(&format!(
         "doctor: {}",
@@ -53,10 +72,41 @@ pub fn cmd_doctor(deps: &mut Deps) -> u8 {
 mod tests {
     use super::*;
     use crate::detect::Detected;
+    use ryuzi_core::sidecar::SidecarStatus;
 
     fn fake_deps(
         git: Detected,
         claude: Detected,
+    ) -> (
+        crate::dispatch::Deps,
+        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    ) {
+        fake_deps_with_sidecar_inner(git, claude, SidecarStatus::Override)
+    }
+
+    fn fake_deps_with_sidecar(
+        status: SidecarStatus,
+    ) -> (
+        crate::dispatch::Deps,
+        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    ) {
+        fake_deps_with_sidecar_inner(
+            Detected {
+                found: true,
+                version: None,
+            },
+            Detected {
+                found: true,
+                version: None,
+            },
+            status,
+        )
+    }
+
+    fn fake_deps_with_sidecar_inner(
+        git: Detected,
+        claude: Detected,
+        sidecar: SidecarStatus,
     ) -> (
         crate::dispatch::Deps,
         std::rc::Rc<std::cell::RefCell<Vec<String>>>,
@@ -90,6 +140,7 @@ mod tests {
                     version: None,
                 }
             },
+            sidecar_status: Box::new(move || sidecar.clone()),
         };
         (deps, out)
     }
@@ -111,7 +162,8 @@ mod tests {
         assert_eq!(lines[0], "git:    OK 2.45.0");
         assert_eq!(lines[1], "claude: OK 2.1.89");
         assert_eq!(lines[2], "auth:   unknown (relies on host login)");
-        assert_eq!(lines[3], "doctor: PASS");
+        assert_eq!(lines[3], "acp:    OK (override)");
+        assert_eq!(lines[4], "doctor: PASS");
         assert_eq!(code, 0);
         assert!(lines.iter().all(|l| !l.contains('\u{1b}'))); // no ANSI when not a TTY
     }
@@ -132,7 +184,30 @@ mod tests {
         let lines = out.borrow();
         assert_eq!(lines[1], "claude: NOT FOUND");
         assert_eq!(lines[2], "auth:   n/a");
-        assert_eq!(lines[3], "doctor: FAIL");
+        assert_eq!(lines[3], "acp:    OK (override)");
+        assert_eq!(lines[4], "doctor: FAIL");
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn doctor_reports_acp_mode() {
+        use ryuzi_core::sidecar::SidecarStatus;
+        for (status, line) in [
+            (SidecarStatus::Override, "acp:    OK (override)"),
+            (SidecarStatus::CachedBundle, "acp:    OK (bun)"),
+            (SidecarStatus::CachedStandalone, "acp:    OK (standalone)"),
+            (
+                SidecarStatus::NeedsDownloadBundle,
+                "acp:    not cached (bun detected - JS bundle downloads on first run)",
+            ),
+            (
+                SidecarStatus::NeedsDownloadStandalone,
+                "acp:    not cached (no bun - standalone binary downloads on first run)",
+            ),
+        ] {
+            let (mut deps, out) = fake_deps_with_sidecar(status);
+            cmd_doctor(&mut deps);
+            assert_eq!(out.borrow()[3], line); // between auth: and doctor:
+        }
     }
 }
