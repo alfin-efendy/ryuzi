@@ -473,7 +473,24 @@ mod tests {
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
     use crate::integration::Registries;
     use async_trait::async_trait;
+    use serial_test::serial;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Redirect dirs::data_dir() into a tempdir for the duration of a test so
+    /// worktree creation never touches the real ~/.local/share. Process-global
+    /// env — every test using it must be #[serial].
+    struct StateDirGuard {
+        _dir: tempfile::TempDir,
+    }
+
+    impl StateDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            StateDirGuard { _dir: dir }
+        }
+    }
 
     /// A fake `HarnessSession` that, on `send_prompt`, persists a user turn and a
     /// streamed assistant text row through the `SessionCtx.store`, then records
@@ -643,17 +660,15 @@ mod tests {
             .unwrap();
     }
 
-    /// A fresh sqlite path that survives past the temp-file guard's drop —
-    /// reconcile/resume tests seed session state directly via `cp.store`
-    /// (visible here since `tests` is a child module of `control`) alongside
-    /// driving the `ControlPlane`, so the DB file must outlive the helper
-    /// that creates it.
-    fn temp_db_path() -> std::path::PathBuf {
-        tempfile::NamedTempFile::new()
-            .unwrap()
-            .into_temp_path()
-            .keep()
-            .unwrap()
+    /// A fresh sqlite path backed by a `NamedTempFile` guard. The caller must
+    /// keep the returned guard alive for as long as the path is in use —
+    /// dropping it deletes the file — mirroring the inline
+    /// `let tmp = tempfile::NamedTempFile::new()...` pattern `store.rs`'s
+    /// tests use directly, instead of leaking a `.keep()`ed file into /tmp.
+    fn temp_db_path() -> (tempfile::NamedTempFile, std::path::PathBuf) {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let path = f.path().to_path_buf();
+        (f, path)
     }
 
     /// A `HarnessFactory` whose `create()` always fails — used to exercise
@@ -667,26 +682,35 @@ mod tests {
 
     /// Build a `ControlPlane` wired to the shared-counter fake harness, plus
     /// a clone of its internal `Store` (for seeding/asserting session state
-    /// directly) and the shared prompt log (for asserting exactly what text
-    /// was driven on a resumed session).
-    async fn fake_control_plane() -> (Arc<ControlPlane>, Arc<Store>, Arc<Mutex<Vec<String>>>) {
-        let store = crate::store::Store::open(&temp_db_path()).await.unwrap();
+    /// directly), the shared prompt log (for asserting exactly what text
+    /// was driven on a resumed session), and the sqlite temp-file guard the
+    /// caller must keep alive for the test's duration.
+    async fn fake_control_plane() -> (
+        Arc<ControlPlane>,
+        Arc<Store>,
+        Arc<Mutex<Vec<String>>>,
+        tempfile::NamedTempFile,
+    ) {
+        let (db_guard, db_path) = temp_db_path();
+        let store = crate::store::Store::open(&db_path).await.unwrap();
         let counters = Counters::default();
         let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
         let store_ref = cp.store.clone();
-        (cp, store_ref, counters.prompts)
+        (cp, store_ref, counters.prompts, db_guard)
     }
 
     /// Like `fake_control_plane`, but the registered harness always fails to
     /// start — for testing the cold-resume rollback in `continue_session`.
-    async fn control_plane_with_failing_factory() -> (Arc<ControlPlane>, Arc<Store>) {
-        let store = crate::store::Store::open(&temp_db_path()).await.unwrap();
+    async fn control_plane_with_failing_factory(
+    ) -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
+        let (db_guard, db_path) = temp_db_path();
+        let store = crate::store::Store::open(&db_path).await.unwrap();
         let mut regs = Registries::new();
         regs.harness
             .register("claude-code", Arc::new(FailingHarnessFactory));
         let cp = ControlPlane::new(store, regs).await;
         let store_ref = cp.store.clone();
-        (cp, store_ref)
+        (cp, store_ref, db_guard)
     }
 
     /// Seed a minimal project row (bypassing `connect_project`'s git-repo
@@ -761,7 +785,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn unknown_harness_errors_cleanly() {
+        let _guard = StateDirGuard::new();
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(db.path()).await.unwrap();
         // Empty registry → no harness registered under "claude-code".
@@ -781,7 +807,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn stop_immediately_after_start_is_registered() {
+        let _guard = StateDirGuard::new();
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(db.path()).await.unwrap();
         // A harness whose session blocks until cancelled, so it stays Running.
@@ -821,7 +849,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn continue_reuses_the_live_session() {
+        let _guard = StateDirGuard::new();
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(db.path()).await.unwrap();
         let counters = Counters::default();
@@ -884,7 +914,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn continue_cold_resumes_when_handle_absent() {
+        let _guard = StateDirGuard::new();
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(db.path()).await.unwrap();
         let counters = Counters::default();
@@ -919,7 +951,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn end_session_removes_and_ends_the_handle() {
+        let _guard = StateDirGuard::new();
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(db.path()).await.unwrap();
         let counters = Counters::default();
@@ -950,7 +984,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn start_session_streams_events_and_records_agent_id() {
+        let _guard = StateDirGuard::new();
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(db.path()).await.unwrap();
         let cp = ControlPlane::new(store, registries(false)).await;
@@ -1007,7 +1043,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_resumes_running_session_with_nudge_and_increments_attempts() {
-        let (cp, store, prompt_log) = fake_control_plane().await;
+        let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
         seed_project(&store, "p1").await;
         seed_session(
             &store,
@@ -1037,7 +1073,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_without_agent_session_id_goes_idle_with_warning() {
-        let (cp, store, _prompt_log) = fake_control_plane().await;
+        let (cp, store, _prompt_log, _db_guard) = fake_control_plane().await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", SessionStatus::Running, None, 0).await;
 
@@ -1052,7 +1088,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_gives_up_after_three_attempts() {
-        let (cp, store, _prompt_log) = fake_control_plane().await;
+        let (cp, store, _prompt_log, _db_guard) = fake_control_plane().await;
         seed_project(&store, "p1").await;
         seed_session(
             &store,
@@ -1076,7 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn continue_session_cold_resume_failure_rolls_back_to_idle() {
-        let (cp, store) = control_plane_with_failing_factory().await;
+        let (cp, store, _db_guard) = control_plane_with_failing_factory().await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", SessionStatus::Idle, Some("acp-123"), 0).await;
 
