@@ -3389,11 +3389,13 @@ dependencies = [
  "rusqlite_migration",
  "serde",
  "serde_json",
+ "sha2",
  "specta",
  "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
+ "ureq",
  "uuid",
 ]
 
