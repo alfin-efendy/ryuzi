@@ -113,7 +113,7 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | Partial
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
-export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
+export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 
 /** tauri-specta globals **/

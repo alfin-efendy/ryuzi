@@ -90,6 +90,7 @@ impl ControlPlane {
         self: &Arc<Self>,
         project_id: &str,
         prompt: &str,
+        started_by: &str,
     ) -> anyhow::Result<Session> {
         let project = self
             .store
@@ -113,8 +114,10 @@ impl ControlPlane {
             branch: Some(branch),
             title: Some(title),
             status: SessionStatus::Running,
+            started_by: Some(started_by.to_string()),
             created_at: Some(now),
             last_active: Some(now),
+            resume_attempts: 0,
         };
         self.store.insert_session(session.clone()).await?;
         let _ = self.events.send(CoreEvent::SessionCreated {
@@ -528,7 +531,7 @@ mod tests {
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
         let err = cp
-            .start_session(&project.project_id, "go")
+            .start_session(&project.project_id, "go", "test")
             .await
             .expect_err("start_session should fail without a registered harness");
         assert!(
@@ -547,7 +550,10 @@ mod tests {
         init_repo(repo.path());
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
-        let session = cp.start_session(&project.project_id, "go").await.unwrap();
+        let session = cp
+            .start_session(&project.project_id, "go", "test")
+            .await
+            .unwrap();
         // The harness handle must be registered synchronously by start_session,
         // BEFORE the background prompt task is spawned — so an immediate stop
         // reaches the live session's cancel().
@@ -588,7 +594,7 @@ mod tests {
 
         // First turn: creates the live ACP session and drives one prompt.
         let session = cp
-            .start_session(&project.project_id, "first")
+            .start_session(&project.project_id, "first", "test")
             .await
             .unwrap();
         // Let the background prompt task finish its turn.
@@ -648,7 +654,7 @@ mod tests {
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
         let session = cp
-            .start_session(&project.project_id, "first")
+            .start_session(&project.project_id, "first", "test")
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -682,7 +688,10 @@ mod tests {
         init_repo(repo.path());
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
-        let session = cp.start_session(&project.project_id, "go").await.unwrap();
+        let session = cp
+            .start_session(&project.project_id, "go", "test")
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(cp.running.lock().unwrap().contains_key(&session.session_pk));
 
@@ -712,7 +721,7 @@ mod tests {
 
         let mut rx = cp.subscribe();
         let session = cp
-            .start_session(&project.project_id, "do it")
+            .start_session(&project.project_id, "do it", "test")
             .await
             .unwrap();
 

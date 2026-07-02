@@ -81,8 +81,10 @@ pub struct Session {
     pub branch: Option<String>,
     pub title: Option<String>,
     pub status: SessionStatus,
+    pub started_by: Option<String>,
     pub created_at: Option<i64>,
     pub last_active: Option<i64>,
+    pub resume_attempts: i64,
 }
 
 /// An MCP server the agent can use as tools (attached to an ACP session in Spec 3).

@@ -1,4 +1,4 @@
-use crate::domain::{Message, NewMessage, PermMode, Project, Session, SessionStatus};
+use crate::domain::{Message, NewMessage, PermMode, Project, Session, SessionStatus, Surface};
 use crate::paths::now_ms;
 use deadpool_sqlite::{Config, Pool, Runtime};
 use rusqlite::{params, OptionalExtension, Row};
@@ -58,6 +58,36 @@ fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (project_id, tool)\
             );",
         ),
+        M::up(
+            "CREATE TABLE settings (\
+                key TEXT PRIMARY KEY,\
+                value TEXT\
+            );\
+            CREATE TABLE session_surfaces (\
+                gateway TEXT NOT NULL,\
+                conversation_id TEXT NOT NULL,\
+                session_pk TEXT NOT NULL,\
+                PRIMARY KEY (gateway, conversation_id)\
+            );\
+            CREATE TABLE project_bindings (\
+                gateway TEXT NOT NULL,\
+                workspace_id TEXT NOT NULL,\
+                project_id TEXT NOT NULL,\
+                PRIMARY KEY (gateway, workspace_id)\
+            );\
+            CREATE TABLE audit (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                gateway TEXT,\
+                conversation_id TEXT,\
+                actor TEXT,\
+                action TEXT,\
+                tool TEXT,\
+                decision TEXT,\
+                at INTEGER\
+            );\
+            ALTER TABLE sessions ADD COLUMN started_by TEXT;\
+            ALTER TABLE sessions ADD COLUMN resume_attempts INTEGER NOT NULL DEFAULT 0;",
+        ),
     ])
 }
 
@@ -94,6 +124,15 @@ impl Store {
         conn.interact(|c| {
             let _ = c.pragma_update(None, "journal_mode", "WAL");
             migrations().to_latest(c)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        conn.interact(|c| {
+            c.execute_batch(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_gateways', 'discord');\
+                 INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_runtimes', 'claude-code');\
+                 INSERT OR IGNORE INTO settings(key, value) VALUES ('default_runtime', 'claude-code');",
+            )
         })
         .await
         .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
@@ -155,11 +194,12 @@ impl Store {
         let conn = self.pool.get().await?;
         conn.interact(move |c| {
             c.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
-                    s.branch, s.title, s.status.as_str(), s.created_at, s.last_active
+                    s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
+                    s.started_by, s.resume_attempts
                 ],
             )
         })
@@ -427,10 +467,190 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
         Ok(seq)
     }
+
+    /// Return the raw persisted value for `key`, or `None` if no row exists.
+    /// No defaults are applied here — that's the caller's job.
+    pub async fn get_setting_raw(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let key = key.to_string();
+        let conn = self.pool.get().await?;
+        let result = conn
+            .interact(move |c| {
+                c.query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    params![key],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(result)
+    }
+
+    /// Upsert a raw setting value. No validation is performed.
+    pub async fn set_setting_raw(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let key = key.to_string();
+        let value = value.to_string();
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "INSERT INTO settings(key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+
+    /// List all persisted settings rows.
+    pub async fn list_settings(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .interact(|c| -> rusqlite::Result<Vec<(String, String)>> {
+                let mut stmt = c.prepare("SELECT key, value FROM settings")?;
+                let items = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(items)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(rows)
+    }
+
+    /// Bind a gateway conversation to a session (upsert on the `(gateway,
+    /// conversation_id)` primary key).
+    pub async fn add_surface(
+        &self,
+        gateway: &str,
+        conversation_id: &str,
+        session_pk: &str,
+    ) -> anyhow::Result<()> {
+        let gateway = gateway.to_string();
+        let conversation_id = conversation_id.to_string();
+        let session_pk = session_pk.to_string();
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "INSERT INTO session_surfaces(gateway, conversation_id, session_pk) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(gateway, conversation_id) DO UPDATE SET session_pk = excluded.session_pk",
+                params![gateway, conversation_id, session_pk],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+
+    /// List the gateway surfaces bound to a session.
+    pub async fn surfaces(&self, session_pk: &str) -> anyhow::Result<Vec<Surface>> {
+        let session_pk = session_pk.to_string();
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .interact(move |c| -> rusqlite::Result<Vec<Surface>> {
+                let mut stmt = c.prepare(
+                    "SELECT gateway, conversation_id FROM session_surfaces WHERE session_pk = ?1",
+                )?;
+                let items = stmt
+                    .query_map(params![session_pk], |r| {
+                        Ok(Surface {
+                            gateway: r.get(0)?,
+                            conversation_id: r.get(1)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(items)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(rows)
+    }
+
+    /// Resolve the session bound to a `(gateway, conversation_id)` surface, if any.
+    pub async fn resolve_by_conversation(
+        &self,
+        gateway: &str,
+        conversation_id: &str,
+    ) -> anyhow::Result<Option<Session>> {
+        let gateway = gateway.to_string();
+        let conversation_id = conversation_id.to_string();
+        let conn = self.pool.get().await?;
+        let s = conn
+            .interact(move |c| {
+                c.query_row(
+                    &format!(
+                        "SELECT s.{SESSION_COLS} FROM sessions s \
+                         JOIN session_surfaces sf ON sf.session_pk = s.session_pk \
+                         WHERE sf.gateway = ?1 AND sf.conversation_id = ?2"
+                    ),
+                    params![gateway, conversation_id],
+                    row_to_session,
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(s)
+    }
+
+    /// Bind a gateway workspace to a project (upsert on the `(gateway,
+    /// workspace_id)` primary key).
+    pub async fn bind_project(
+        &self,
+        gateway: &str,
+        workspace_id: &str,
+        project_id: &str,
+    ) -> anyhow::Result<()> {
+        let gateway = gateway.to_string();
+        let workspace_id = workspace_id.to_string();
+        let project_id = project_id.to_string();
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "INSERT INTO project_bindings(gateway, workspace_id, project_id) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(gateway, workspace_id) DO UPDATE SET project_id = excluded.project_id",
+                params![gateway, workspace_id, project_id],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+
+    /// Resolve the project bound to a `(gateway, workspace_id)` binding, if any.
+    pub async fn resolve_project_by_workspace(
+        &self,
+        gateway: &str,
+        workspace_id: &str,
+    ) -> anyhow::Result<Option<Project>> {
+        let gateway = gateway.to_string();
+        let workspace_id = workspace_id.to_string();
+        let conn = self.pool.get().await?;
+        let p = conn
+            .interact(move |c| {
+                c.query_row(
+                    &format!(
+                        "SELECT p.{PROJECT_COLS} FROM projects p \
+                         JOIN project_bindings b ON b.project_id = p.project_id \
+                         WHERE b.gateway = ?1 AND b.workspace_id = ?2"
+                    ),
+                    params![gateway, workspace_id],
+                    row_to_project,
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(p)
+    }
 }
 
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     let status: String = r.get(6)?;
@@ -444,6 +664,8 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
         status: SessionStatus::from_db(&status),
         created_at: r.get(7)?,
         last_active: r.get(8)?,
+        started_by: r.get(9)?,
+        resume_attempts: r.get(10)?,
     })
 }
 
@@ -524,8 +746,10 @@ mod tests {
             branch: Some("harness/abcdef01".into()),
             title: Some("hello".into()),
             status: SessionStatus::Running,
+            started_by: None,
             created_at: Some(1),
             last_active: Some(1),
+            resume_attempts: 0,
         }
     }
 
@@ -740,5 +964,123 @@ mod tests {
         drop(conn);
         assert_eq!(quarantine_legacy_db(&db).unwrap(), None);
         assert!(db.exists());
+    }
+
+    #[tokio::test]
+    async fn settings_raw_roundtrip_and_seeds() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // Seeds applied on open:
+        assert_eq!(
+            store
+                .get_setting_raw("enabled_gateways")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("discord")
+        );
+        assert_eq!(
+            store
+                .get_setting_raw("enabled_runtimes")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            store
+                .get_setting_raw("default_runtime")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("claude-code")
+        );
+        // Upsert + empty string is a real value:
+        store
+            .set_setting_raw("workdir_root", "/repos")
+            .await
+            .unwrap();
+        store.set_setting_raw("workdir_root", "").await.unwrap();
+        assert_eq!(
+            store
+                .get_setting_raw("workdir_root")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+        let listed = store.list_settings().await.unwrap();
+        assert!(listed
+            .iter()
+            .any(|(k, v)| k == "workdir_root" && v.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn surfaces_and_bindings_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_project(sample_project()).await.unwrap();
+        let mut s = sample_session();
+        s.started_by = Some("u42".into());
+        store.insert_session(s).await.unwrap();
+
+        store.add_surface("discord", "chan1", "s1").await.unwrap();
+        store.add_surface("discord", "chan1", "s1").await.unwrap(); // upsert, no error
+        let surfaces = store.surfaces("s1").await.unwrap();
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].gateway, "discord");
+        assert_eq!(surfaces[0].conversation_id, "chan1");
+        let resolved = store
+            .resolve_by_conversation("discord", "chan1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.session_pk, "s1");
+        assert_eq!(resolved.started_by.as_deref(), Some("u42"));
+        assert_eq!(resolved.resume_attempts, 0);
+
+        store.bind_project("discord", "guild1", "p1").await.unwrap();
+        let proj = store
+            .resolve_project_by_workspace("discord", "guild1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(proj.project_id, "p1");
+        assert!(store
+            .resolve_project_by_workspace("discord", "nope")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn migration_5_upgrades_a_v4_database() {
+        // A DB created before this task (user_version 4) must upgrade in place.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            // Minimal v4 shape: the 4 old tables + user_version 4.
+            conn.execute_batch(
+                "CREATE TABLE projects (project_id TEXT PRIMARY KEY, name TEXT, workdir TEXT NOT NULL, source TEXT, harness TEXT NOT NULL DEFAULT 'claude-code', model TEXT, effort TEXT, perm_mode TEXT NOT NULL DEFAULT 'default', created_at INTEGER);
+                 CREATE TABLE sessions (session_pk TEXT PRIMARY KEY, project_id TEXT NOT NULL, agent_session_id TEXT, worktree_path TEXT, branch TEXT, title TEXT, status TEXT NOT NULL DEFAULT 'idle', created_at INTEGER, last_active INTEGER);
+                 CREATE TABLE messages (session_pk TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL, block_type TEXT NOT NULL, payload TEXT NOT NULL, tool_call_id TEXT, status TEXT, tool_kind TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (session_pk, seq));
+                 CREATE TABLE tool_policies (project_id TEXT NOT NULL, tool TEXT NOT NULL, decision TEXT NOT NULL, PRIMARY KEY (project_id, tool));
+                 INSERT INTO sessions(session_pk, project_id) VALUES ('old1', 'p1');
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        let store = Store::open(tmp.path()).await.unwrap();
+        let s = store.get_session("old1").await.unwrap().unwrap();
+        assert_eq!(s.resume_attempts, 0); // ALTER default applied
+        assert_eq!(s.started_by, None);
+        assert_eq!(
+            store
+                .get_setting_raw("enabled_gateways")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("discord")
+        );
     }
 }

@@ -164,7 +164,7 @@ async fn run_session(
         }
     };
 
-    let session = match cp.start_session(&project.project_id, prompt).await {
+    let session = match cp.start_session(&project.project_id, prompt, "cli").await {
         Ok(s) => s,
         Err(e) => {
             (deps.err)(&format!("✗ {e}"));

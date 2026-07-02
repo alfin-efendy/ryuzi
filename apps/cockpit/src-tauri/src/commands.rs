@@ -41,7 +41,10 @@ pub async fn start_session(
     prompt: String,
 ) -> R<Session> {
     // `.inner()` -> &Arc<ControlPlane>: start/continue_session take `self: &Arc<Self>`.
-    Ok(cp.inner().start_session(&project_id, &prompt).await?)
+    Ok(cp
+        .inner()
+        .start_session(&project_id, &prompt, "cockpit")
+        .await?)
 }
 
 #[tauri::command]
