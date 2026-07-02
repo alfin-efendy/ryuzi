@@ -10,7 +10,7 @@ const MODES: { key: Mode; label: string }[] = [
 ];
 
 export function Appearance({ triggerClassName }: { triggerClassName?: string } = {}) {
-  const { mode, accent, setMode, setAccent } = useTheme();
+  const { mode, accent, setMode, setAccent, capability, transparency, setTransparency, systemAccentHex } = useTheme();
   const activeKey = typeof accent === "object" ? "" : accent;
   const customValue = typeof accent === "object" ? accent.custom : "#4f46e5";
 
@@ -65,7 +65,42 @@ export function Appearance({ triggerClassName }: { triggerClassName?: string } =
             onChange={(e) => setAccent({ custom: e.target.value })}
             className="h-5 w-5 cursor-pointer rounded-full border border-border bg-transparent p-0"
           />
+          {systemAccentHex && (
+            <button
+              type="button"
+              aria-label="System accent"
+              title="Follow Windows accent"
+              onClick={() => setAccent("system")}
+              className={cn(
+                "h-5 w-5 rounded-full border border-border",
+                accent === "system" ? "ring-2 ring-ring ring-offset-1 ring-offset-popover" : "",
+              )}
+              style={{ background: systemAccentHex }}
+            />
+          )}
         </div>
+        {capability !== "none" && (
+          <>
+            <div className="mt-3 mb-1 text-xs font-medium text-muted-foreground">Transparency</div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={transparency}
+              onClick={() => setTransparency(!transparency)}
+              className={cn(
+                "relative h-5 w-9 rounded-full transition-colors",
+                transparency ? "bg-primary" : "bg-muted",
+              )}
+            >
+              <span
+                className={cn(
+                  "absolute top-0.5 h-4 w-4 rounded-full bg-background shadow transition-[left]",
+                  transparency ? "left-[18px]" : "left-0.5",
+                )}
+              />
+            </button>
+          </>
+        )}
       </MenuContent>
     </Menu>
   );
