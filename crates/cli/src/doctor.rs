@@ -141,6 +141,7 @@ mod tests {
                 }
             },
             sidecar_status: Box::new(move || sidecar.clone()),
+            build_registries: Box::new(|| Ok(ryuzi_core::Registries::new())),
         };
         (deps, out)
     }

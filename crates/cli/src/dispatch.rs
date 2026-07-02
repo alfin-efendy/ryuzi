@@ -11,6 +11,7 @@ pub struct Deps {
     pub detect_git: fn() -> Detected,
     pub detect_claude: fn() -> Detected,
     pub sidecar_status: Box<dyn Fn() -> ryuzi_core::sidecar::SidecarStatus>,
+    pub build_registries: Box<dyn Fn() -> anyhow::Result<ryuzi_core::Registries>>,
 }
 
 pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {
@@ -25,6 +26,7 @@ pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {
             0
         }
         Some("doctor") => crate::doctor::cmd_doctor(deps),
+        Some("run") => crate::run_cmd::cmd_run(&args[1..], deps),
         Some(other) => {
             (deps.err)(&format!("unknown command: {other} - run `ryuzi --help`"));
             1
