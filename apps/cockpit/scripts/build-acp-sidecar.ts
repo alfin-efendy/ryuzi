@@ -34,7 +34,7 @@
  * Idempotent: re-running overwrites an existing binary of the same name.
  */
 
-import { execSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -71,14 +71,25 @@ const BIN_NAME = "claude-agent-acp";
 // Helpers
 // ---------------------------------------------------------------------------
 
-function run(cmd: string, opts?: { cwd?: string }): string {
-  console.log(`$ ${cmd}`);
-  const result = execSync(cmd, {
+/**
+ * Run a command WITHOUT a shell — arguments are passed as a discrete argv
+ * array, so absolute paths (which may contain spaces or shell metacharacters)
+ * are never interpreted by a shell. This avoids shell-command-injection from
+ * environment-derived paths (CodeQL js/shell-command-injection-from-environment).
+ */
+function run(file: string, args: string[], opts?: { cwd?: string }): string {
+  console.log(`$ ${file} ${args.join(" ")}`);
+  const result = spawnSync(file, args, {
     cwd: opts?.cwd ?? cockpitDir,
     stdio: ["inherit", "pipe", "inherit"],
     encoding: "utf8",
+    shell: false,
   });
-  return result.trim();
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`Command failed (exit ${result.status}): ${file} ${args.join(" ")}`);
+  }
+  return (result.stdout ?? "").trim();
 }
 
 /** Derive the Rust/Tauri target triple for the host (or for a Bun target). */
@@ -144,7 +155,7 @@ function ensureIsolatedInstall(): void {
   // Install into the isolated dir.  bun install here creates/updates
   // sidecarBuildDir/bun.lock and sidecarBuildDir/node_modules, leaving the
   // workspace root bun.lock completely untouched.
-  run(`bun install`, { cwd: sidecarBuildDir });
+  run("bun", ["install"], { cwd: sidecarBuildDir });
 }
 
 /** Resolve the main entry-point of the installed ACP package. */
@@ -218,8 +229,7 @@ const buildFlags = ["build", "--compile", "--minify", `--outfile=${tmpBin}`];
 if (bunTarget) buildFlags.push(`--target=${bunTarget}`);
 buildFlags.push(entryPoint);
 
-const buildCmd = `bun ${buildFlags.join(" ")}`;
-run(buildCmd, { cwd: cockpitDir });
+run("bun", buildFlags, { cwd: cockpitDir });
 
 // 5. Rename to include target triple (Tauri convention)
 if (existsSync(finalBin)) rmSync(finalBin);
