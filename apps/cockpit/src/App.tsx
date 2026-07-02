@@ -18,7 +18,7 @@ export default function App() {
     init();
   }, [init]);
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
+    <div className="flex h-screen flex-col overflow-hidden bg-surface-window text-foreground">
       <TitleBar />
       {pending > 0 && (
         <div className="flex shrink-0 items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-700 dark:text-amber-300">
