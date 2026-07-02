@@ -1,7 +1,8 @@
 @import "@ryuzi/ui/styles.css";
 @import "@fontsource-variable/geist";
 
-/* Tauri drag region (touch/pen support on Windows) */
+/* Tauri drag region (touch/pen support on Windows). app-region is Chromium/WebView2-only;
+   Linux (WebKitGTK) drag relies on Tauri's drag script via data-tauri-drag-region="deep" on the titlebar root. */
 *[data-tauri-drag-region] {
   app-region: drag;
 }

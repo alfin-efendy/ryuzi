@@ -150,7 +150,7 @@ export function initTheme(): void {
     listening = true;
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
       const s = useTheme.getState();
-      if (s.mode === "system") applyTheme("system", s.accent);
+      if (s.mode === "system") applyTheme("system", s.accent, s.systemAccentHex);
     });
   }
 }
