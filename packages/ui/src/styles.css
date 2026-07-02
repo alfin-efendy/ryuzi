@@ -101,6 +101,22 @@ html.dark[data-backdrop] {
   --popover: oklch(0.205 0 0 / 0.78);
   --surface-acrylic: oklch(0.205 0 0 / 0.55);
 }
+/* Theme-mismatch guard: mica follows the OS theme, not the app theme. When the
+   app theme differs from the OS theme, fully transparent chrome would put dark
+   text on dark mica (or light on light) — give the window base and sidebar a
+   translucent wash of the app theme instead. Matching themes keep full mica. */
+@media (prefers-color-scheme: dark) {
+  html[data-backdrop]:not(.dark) {
+    --surface-window: oklch(1 0 0 / 0.75);
+    --sidebar: oklch(1 0 0 / 0.55);
+  }
+}
+@media (prefers-color-scheme: light) {
+  html.dark[data-backdrop] {
+    --surface-window: oklch(0.145 0 0 / 0.75);
+    --sidebar: oklch(0.205 0 0 / 0.55);
+  }
+}
 @utility surface-acrylic {
   background: var(--surface-acrylic);
   -webkit-backdrop-filter: blur(16px) saturate(140%);
