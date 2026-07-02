@@ -3,7 +3,7 @@ use crate::paths::now_ms;
 use deadpool_sqlite::{Config, Pool, Runtime};
 use rusqlite::{params, OptionalExtension, Row};
 use rusqlite_migration::{Migrations, M};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -422,6 +422,39 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     })
 }
 
+/// Spec 4 §6 clean break: a database written by the retired TypeScript stack
+/// (marker: `settings` table present, `messages` absent) is moved aside to
+/// `<name>.pre-rust.bak` so `Store::open` starts fresh. No migration.
+pub fn quarantine_legacy_db(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_table = |name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+    };
+    let legacy = has_table("settings")? && !has_table("messages")?;
+    drop(conn);
+    if !legacy {
+        return Ok(None);
+    }
+    let backup = db_path.with_extension("sqlite.pre-rust.bak");
+    std::fs::rename(db_path, &backup)?;
+    for suffix in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        if side.exists() {
+            let _ = std::fs::rename(&side, format!("{}{suffix}", backup.display()));
+        }
+    }
+    Ok(Some(backup))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +662,40 @@ mod tests {
 
         assert_eq!(store.list_sessions(Some("p1")).await.unwrap().len(), 1);
         assert_eq!(store.list_sessions(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quarantine_moves_ts_schema_db_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ryuzi.sqlite");
+        // TS schema marker: `settings` table exists, `messages` does not.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        drop(conn);
+
+        let moved = quarantine_legacy_db(&db).unwrap();
+        let backup = dir.path().join("ryuzi.sqlite.pre-rust.bak");
+        assert_eq!(moved, Some(backup.clone()));
+        assert!(!db.exists());
+        assert!(backup.exists());
+    }
+
+    #[tokio::test]
+    async fn quarantine_leaves_rust_schema_and_missing_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ryuzi.sqlite");
+        assert_eq!(quarantine_legacy_db(&db).unwrap(), None); // missing file
+
+        // Rust schema (has `messages`): untouched even if `settings` appears later (4B superset).
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE messages (session_pk TEXT, seq INTEGER);",
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(quarantine_legacy_db(&db).unwrap(), None);
+        assert!(db.exists());
     }
 }
