@@ -13,6 +13,8 @@ fn main() -> ExitCode {
             let _ = std::io::stdin().read_line(&mut line);
             line
         }),
+        detect_git: ryuzi_cli::detect::detect_git,
+        detect_claude: ryuzi_cli::detect::detect_claude,
     };
     ExitCode::from(ryuzi_cli::dispatch::run_cli(
         std::env::args().skip(1).collect(),

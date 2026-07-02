@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::detect::Detected;
 use crate::meta;
 
 pub struct Deps {
@@ -7,6 +8,8 @@ pub struct Deps {
     pub out: Box<dyn FnMut(&str)>,
     pub err: Box<dyn FnMut(&str)>,
     pub prompt: Box<dyn FnMut(&str) -> String>,
+    pub detect_git: fn() -> Detected,
+    pub detect_claude: fn() -> Detected,
 }
 
 pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {
@@ -20,6 +23,7 @@ pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {
             (deps.out)(&meta::help_text());
             0
         }
+        Some("doctor") => crate::doctor::cmd_doctor(deps),
         Some(other) => {
             (deps.err)(&format!("unknown command: {other} - run `ryuzi --help`"));
             1
