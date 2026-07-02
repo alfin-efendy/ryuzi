@@ -16,8 +16,9 @@
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    SetSessionModeRequest, SetSessionModeResponse, SessionId, StopReason, TextContent,
+    ContentBlock, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PromptRequest, PromptResponse, SetSessionModeRequest, SetSessionModeResponse, SessionId,
+    StopReason, TextContent,
 };
 use agent_client_protocol::ConnectionTo;
 use agent_client_protocol_schema::v1::{McpServer, Usage, AGENT_METHOD_NAMES};
@@ -54,6 +55,37 @@ pub async fn new_session(
             agent_client_protocol::Error::internal_error().data(message)
         })?;
     Ok(session)
+}
+
+/// Resume an existing session via `session/load` (cookbook §6). **Gated on
+/// `supports_load`** — the caller passes the top-level `agent_capabilities.load_session`
+/// bool read from the `initialize` response; if the agent does not advertise the
+/// capability this returns an error rather than sending an unsupported request.
+///
+/// During load the agent replays the session's history as a stream of
+/// `session/update` notifications (which the wired [`crate::harness::acp::notification`]
+/// sink persists), then responds with a `LoadSessionResponse`.
+pub async fn load_session(
+    cx: &ConnectionTo<agent_client_protocol::Agent>,
+    supports_load: bool,
+    session_id: SessionId,
+    cwd: PathBuf,
+    mcp_servers: Vec<McpServer>,
+) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
+    if !supports_load {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("agent does not advertise session/load (loadSession=false)"));
+    }
+
+    let response: LoadSessionResponse = cx
+        .send_request(LoadSessionRequest::new(session_id, cwd).mcp_servers(mcp_servers))
+        .block_task()
+        .await
+        .map_err(|err| {
+            let message = format!("ACP {} failed: {err}", AGENT_METHOD_NAMES.session_load);
+            agent_client_protocol::Error::internal_error().data(message)
+        })?;
+    Ok(response)
 }
 
 /// Send `session/set_mode` **only if** `mode_id` is listed in the session's
@@ -126,5 +158,20 @@ mod tests {
             .unwrap();
         assert!(!outcome.session_id.0.is_empty());
         assert!(outcome.completed, "prompt returned a StopReason");
+    }
+
+    #[tokio::test]
+    async fn load_session_replays_transcript_into_the_store() {
+        // drive: connect -> initialize -> session/load; the mock replays a
+        // user + agent message chunk during load, which the sink persists.
+        let (store, session_pk) =
+            crate::harness::acp::testkit::drive_load("resume-abc").await;
+        let msgs = store.list_messages(&session_pk).await.unwrap();
+        assert!(
+            msgs.iter().any(|m| m.role == "assistant"
+                && m.block_type == "text"
+                && m.payload["text"] == "previous answer"),
+            "expected replayed assistant text row from session/load, got: {msgs:?}"
+        );
     }
 }

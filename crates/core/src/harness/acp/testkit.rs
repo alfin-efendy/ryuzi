@@ -14,12 +14,12 @@
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentBlock, ContentChunk, Implementation, InitializeRequest,
-    InitializeResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SessionCapabilities,
-    SessionCloseCapabilities, SessionId, SessionMode, SessionModeState, SessionNotification,
-    SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
-    ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionMode, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::util::MatchDispatchFrom;
 use agent_client_protocol::{
@@ -141,6 +141,37 @@ impl HandleDispatchFrom<Client> for MockAgent {
                     }
                 },
             )
+            .await
+            // session/load — replay a user + agent message chunk as session/update
+            // notifications (the resume transcript), then respond with an empty
+            // LoadSessionResponse.
+            .if_request({
+                let cx_for_load = cx.clone();
+                move |req: LoadSessionRequest, responder: Responder<LoadSessionResponse>| {
+                    let cx = cx_for_load.clone();
+                    async move {
+                        let session_id = req.session_id.clone();
+
+                        // Replay: the earlier user turn.
+                        let _ = cx.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::UserMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("previous question")),
+                            )),
+                        ));
+
+                        // Replay: the earlier agent reply.
+                        let _ = cx.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("previous answer")),
+                            )),
+                        ));
+
+                        responder.respond(LoadSessionResponse::new())
+                    }
+                }
+            })
             .await
             // session/prompt — send a few streaming notifications then return EndTurn
             .if_request({
@@ -441,6 +472,164 @@ pub async fn drive_lifecycle(
             },
         )
         .await
+}
+
+/// Drive a resume: connect → initialize → `session/load` against the in-process
+/// mock agent, wiring the notification sink so the replayed transcript is
+/// persisted. Returns `(store, session_pk)` for assertions.
+///
+/// The mock replays a user + agent message chunk as `session/update`
+/// notifications during load; the sink persists the agent chunk as an
+/// assistant text row (user chunks are currently skipped by the sink).
+pub async fn drive_load(resume_session_id: &str) -> (std::sync::Arc<crate::store::Store>, String) {
+    use std::sync::Arc;
+
+    use agent_client_protocol::schema::ProtocolVersion;
+    use agent_client_protocol::schema::v1::{ClientCapabilities, InitializeResponse};
+    use agent_client_protocol::Client;
+    use tokio::sync::broadcast;
+
+    use crate::domain::CoreEvent;
+    use crate::harness::acp::notification::NotificationSink;
+    use crate::store::Store;
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store: Arc<Store> = Arc::new(Store::open(tmp.path()).await.unwrap());
+    let (events_tx, _events_rx) = broadcast::channel::<CoreEvent>(64);
+    let sink: Arc<NotificationSink> = Arc::new(NotificationSink {
+        store: store.clone(),
+        events: events_tx,
+    });
+
+    let session_pk = resume_session_id.to_string();
+    let (transport, _join) = connect_mock(MockAgent::new());
+
+    Client
+        .builder()
+        .on_receive_notification(
+            {
+                let sink = sink.clone();
+                async move |notification: SessionNotification, _cx| {
+                    crate::harness::acp::notification::handle(notification, &sink).await;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |_request: RequestPermissionRequest, responder, _cx| {
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(
+            transport,
+            async move |cx: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>| {
+                // initialize (read supports_load off the response)
+                let init: InitializeResponse = cx
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::LATEST)
+                            .client_capabilities(ClientCapabilities::new()),
+                    )
+                    .block_task()
+                    .await?;
+                let supports_load = init.agent_capabilities.load_session;
+
+                // session/load — the mock replays the transcript as notifications.
+                crate::harness::acp::lifecycle::load_session(
+                    &cx,
+                    supports_load,
+                    SessionId::from(session_pk.clone()),
+                    std::path::PathBuf::from("/tmp"),
+                    vec![],
+                )
+                .await?;
+
+                Ok(())
+            },
+        )
+        .await
+        .expect("drive_load: ACP session/load failed");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(tmp);
+    (store, resume_session_id.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: end-to-end Harness-trait test helper
+// ---------------------------------------------------------------------------
+
+/// Build an [`AcpHarness`](crate::harness::acp::AcpHarness) wired to the
+/// in-process mock agent (via the test runner seam), start a session through
+/// the Spec 2 `Harness` trait, send `prompt`, then return `(store, session_pk)`
+/// for assertions. `session_pk` is the ACP `SessionId` the mock assigned.
+///
+/// The test runner spawns a tokio task (not an OS thread + fresh runtime) so
+/// the mock duplex's I/O stays on the test runtime, and drives the shared
+/// `run_client_loop` over the injected transport.
+pub async fn run_via_harness_trait(
+    prompt: &str,
+) -> (std::sync::Arc<crate::store::Store>, String) {
+    use std::sync::Arc;
+
+    use tokio::sync::broadcast;
+
+    use crate::approval::ApprovalHub;
+    use crate::domain::{CoreEvent, PermMode};
+    use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
+    use crate::harness::{Harness, SessionCtx};
+    use crate::store::Store;
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store: Arc<Store> = Arc::new(Store::open(tmp.path()).await.unwrap());
+    let (events_tx, _events_rx) = broadcast::channel::<CoreEvent>(64);
+
+    // Test runner factory: for each session, produce a runner that drives the
+    // shared client loop over a fresh mock duplex on a tokio task.
+    let harness = AcpHarness::with_runner_factory(
+        AcpAdapterDescriptor::default(),
+        |_descriptor: &AcpAdapterDescriptor| {
+            crate::harness::acp::mock_runner()
+        },
+    );
+
+    let ctx = SessionCtx {
+        session_pk: "unused-in-3a".into(),
+        work_dir: std::path::PathBuf::from("/tmp"),
+        perm_mode: PermMode::Default,
+        model: None,
+        effort: None,
+        resume: None,
+        mcp_servers: vec![],
+        events: events_tx,
+        approvals: Arc::new(ApprovalHub::new()),
+        store: store.clone(),
+    };
+
+    let session = harness
+        .start_session(ctx)
+        .await
+        .expect("start_session via Harness trait failed");
+
+    session
+        .send_prompt(prompt.to_string())
+        .await
+        .expect("send_prompt failed");
+
+    // The agent session id is the ACP SessionId assigned during session/new.
+    let session_pk = session
+        .agent_session_id()
+        .expect("agent_session_id should be present after start_session");
+
+    // Let the async notification handlers drain.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    session.end().await.expect("end failed");
+    drop(tmp);
+    (store, session_pk)
 }
 
 // ---------------------------------------------------------------------------
