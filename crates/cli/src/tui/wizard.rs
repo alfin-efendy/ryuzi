@@ -185,6 +185,7 @@ impl WizardState {
     async fn handle_fields(&mut self, key: Key, controller: &AppController) {
         match key {
             Key::Char(c) => self.draft.push(c),
+            Key::Space => self.draft.push(' '),
             Key::Backspace => {
                 self.draft.pop();
             }
@@ -337,5 +338,29 @@ mod tests {
         w.handle(Key::Enter, &c).await; // gateways confirmed (discord pre-checked)
         w.handle(Key::Enter, &c).await; // runtimes confirmed → no missing → done
         assert!(w.done);
+    }
+
+    #[tokio::test]
+    async fn wizard_fields_space_key_types_into_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller_in(dir.path()).await;
+        c.set_enabled_gateways(&[]).await.unwrap();
+        c.set_enabled_runtimes(&[]).await.unwrap();
+        let mut w = WizardState::new(&c).await;
+        // Force into Fields phase at workdir_root field
+        w.phase = WizardPhase::Fields;
+        w.fields = vec![ryuzi_core::settings::find_field("workdir_root").unwrap()];
+        w.field_idx = 0;
+
+        // Type "a b" using Key::Char and Key::Space
+        w.handle(Key::Char('a'), &c).await;
+        w.handle(Key::Space, &c).await;
+        w.handle(Key::Char('b'), &c).await;
+        assert_eq!(w.draft, "a b");
+
+        // Submit the value
+        w.handle(Key::Enter, &c).await;
+        assert!(w.done);
+        assert_eq!(c.get("workdir_root").await.as_deref(), Some("a b"));
     }
 }

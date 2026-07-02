@@ -149,6 +149,11 @@ impl DashboardState {
                     draft.push(c);
                 }
             }
+            Key::Space => {
+                if let Some(draft) = self.editing.as_mut() {
+                    draft.push(' ');
+                }
+            }
             Key::Backspace => {
                 if let Some(draft) = self.editing.as_mut() {
                     draft.pop();
@@ -722,5 +727,24 @@ mod tests {
                 .contains("must be one of"),
             "error message should mention valid enum values"
         );
+    }
+
+    #[tokio::test]
+    async fn config_edit_field_space_key_types_into_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller_in(dir.path()).await;
+        let mut d = DashboardState::new(&c).await;
+        d.active = 3; // Config tab
+        let idx = d.selectable_index_of_field("workdir_root").unwrap();
+        d.config_cursor = idx;
+        d.handle(Key::Enter, &c).await; // enter edit mode
+                                        // Type "x y" using Key::Char and Key::Space
+        d.handle(Key::Char('x'), &c).await;
+        d.handle(Key::Space, &c).await;
+        d.handle(Key::Char('y'), &c).await;
+        assert_eq!(d.editing.as_deref(), Some("x y"));
+        d.handle(Key::Enter, &c).await; // submit
+        assert!(d.editing.is_none());
+        assert_eq!(c.get("workdir_root").await.as_deref(), Some("x y"));
     }
 }

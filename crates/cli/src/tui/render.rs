@@ -723,6 +723,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn snapshot_wizard_gateways_phase() {
         let dir = tempfile::tempdir().unwrap();
         let c = controller_in(dir.path()).await;
@@ -740,6 +741,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn snapshot_dashboard_all_tabs() {
         let dir = tempfile::tempdir().unwrap();
         let c = controller_in(dir.path()).await;
