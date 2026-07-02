@@ -225,6 +225,29 @@ impl Store {
         Ok(s)
     }
 
+    /// List sessions in a given status, oldest-first — used by `reconcile` on
+    /// daemon boot to find sessions a dead process left in `Running`.
+    pub async fn list_sessions_by_status(
+        &self,
+        status: SessionStatus,
+    ) -> anyhow::Result<Vec<Session>> {
+        let status = status.as_str().to_string();
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .interact(move |c| -> rusqlite::Result<Vec<Session>> {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {SESSION_COLS} FROM sessions WHERE status=?1 ORDER BY created_at"
+                ))?;
+                let items = stmt
+                    .query_map(params![status], row_to_session)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(items)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(rows)
+    }
+
     pub async fn list_sessions(&self, project_id: Option<&str>) -> anyhow::Result<Vec<Session>> {
         let project_id = project_id.map(|s| s.to_string());
         let conn = self.pool.get().await?;
@@ -300,18 +323,42 @@ impl Store {
 
     /// Atomically demote `Running → Idle` only if the current status is still `Running`.
     /// A session already marked `Interrupted` or `Ended` is left untouched.
+    /// Also resets `resume_attempts` to 0 — a turn that reaches a normal (or
+    /// errored-but-demoted) end clears the auto-resume cap (TS `runHarness`
+    /// finally parity).
     pub async fn demote_if_running(&self, pk: &str, last_active: i64) -> anyhow::Result<()> {
         let pk = pk.to_string();
         let conn = self.pool.get().await?;
         conn.interact(move |c| {
             c.execute(
-                "UPDATE sessions SET status=?2, last_active=?3 WHERE session_pk=?1 AND status=?4",
+                "UPDATE sessions SET status=?2, last_active=?3, resume_attempts = 0 WHERE session_pk=?1 AND status=?4",
                 params![
                     pk,
                     SessionStatus::Idle.as_str(),
                     last_active,
                     SessionStatus::Running.as_str()
                 ],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+
+    /// Set `status` and `resume_attempts` together — used by `resume_session`
+    /// to atomically bump the attempt counter as it re-drives a turn.
+    pub async fn update_resume(
+        &self,
+        pk: &str,
+        status: SessionStatus,
+        resume_attempts: i64,
+    ) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "UPDATE sessions SET status=?2, resume_attempts=?3 WHERE session_pk=?1",
+                params![pk, status.as_str(), resume_attempts],
             )
         })
         .await

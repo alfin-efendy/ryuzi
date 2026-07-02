@@ -10,6 +10,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
+/// Nudge prompt used when re-driving a turn interrupted by a restart (TS parity).
+pub const RESUME_NUDGE: &str = "Your previous turn was interrupted by a daemon restart or update. \
+    Continue the task from where you left off. If it was already complete, briefly summarize what you did.";
+
 pub struct ControlPlane {
     store: Arc<Store>,
     /// Extension registries (harness/gateway/connector). `Project.harness` is
@@ -184,19 +188,131 @@ impl ControlPlane {
                     .clone()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::path::PathBuf::from(&project.workdir));
-                self.start_harness_session(
-                    &project,
-                    session_pk,
-                    &work_dir,
-                    session.agent_session_id.clone(),
-                )
-                .await?
+                match self
+                    .start_harness_session(
+                        &project,
+                        session_pk,
+                        &work_dir,
+                        session.agent_session_id.clone(),
+                    )
+                    .await
+                {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        // Roll back the eager Running transition — don't leave the row stuck.
+                        let _ = self
+                            .store
+                            .update_status(session_pk, SessionStatus::Idle, None)
+                            .await;
+                        return Err(e);
+                    }
+                }
                 // `start_harness_session` already persists any resolved
                 // agent_session_id, and `spawn_prompt` persists it post-turn,
                 // so no redundant `update_agent_session_id` is needed here.
             }
         };
         self.spawn_prompt(handle, session_pk.to_string(), prompt.to_string());
+        Ok(())
+    }
+
+    /// Persist a user-visible status row (role=system, block_type=status) and
+    /// broadcast it — the Rust equivalent of TS's ephemeral status events.
+    async fn emit_status(&self, session_pk: &str, text: &str) {
+        let payload = serde_json::json!({ "summary": text });
+        let msg = crate::domain::NewMessage::block(session_pk, "system", "status", payload.clone());
+        if let Ok(seq) = self.store.insert_message(msg).await {
+            let _ = self.events.send(CoreEvent::Message {
+                session_pk: session_pk.to_string(),
+                seq,
+                role: "system".to_string(),
+                block_type: "status".to_string(),
+                payload,
+                tool_call_id: None,
+                status: None,
+                tool_kind: None,
+            });
+        }
+    }
+
+    /// Re-drive an interrupted turn after a restart, guarded by the attempts
+    /// cap so a session that reliably crashes the daemon cannot loop forever.
+    pub async fn resume_session(
+        self: &Arc<Self>,
+        session_pk: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let Some(session) = self.store.get_session(session_pk).await? else {
+            return Ok(());
+        };
+        let Some(project) = self.store.get_project(&session.project_id).await? else {
+            return Ok(());
+        };
+        if session.agent_session_id.is_none() {
+            self.store
+                .update_status(session_pk, SessionStatus::Idle, None)
+                .await?;
+            self.emit_status(session_pk, "⚠️ Interrupted by a restart and could not be auto-resumed — send a message to continue.").await;
+            return Ok(());
+        }
+        if session.resume_attempts >= 3 {
+            self.store
+                .update_status(session_pk, SessionStatus::Idle, None)
+                .await?;
+            self.emit_status(
+                session_pk,
+                "⚠️ Auto-resume gave up after 3 attempts — send a message to continue.",
+            )
+            .await;
+            return Ok(());
+        }
+        self.store
+            .update_resume(
+                session_pk,
+                SessionStatus::Running,
+                session.resume_attempts + 1,
+            )
+            .await?;
+        self.emit_status(session_pk, &format!("🔄 Resumed after {reason}."))
+            .await;
+        let work_dir = session
+            .worktree_path
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(&project.workdir));
+        match self
+            .start_harness_session(
+                &project,
+                session_pk,
+                &work_dir,
+                session.agent_session_id.clone(),
+            )
+            .await
+        {
+            Ok(handle) => {
+                self.spawn_prompt(handle, session_pk.to_string(), RESUME_NUDGE.to_string());
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self
+                    .store
+                    .update_status(session_pk, SessionStatus::Idle, None)
+                    .await;
+                Err(e)
+            }
+        }
+    }
+
+    /// On boot: resume every session a dead process left in Running. Each
+    /// resume is isolated so one bad session can't block the rest.
+    pub async fn reconcile(self: &Arc<Self>) -> anyhow::Result<()> {
+        for s in self
+            .store
+            .list_sessions_by_status(SessionStatus::Running)
+            .await?
+        {
+            let _ = self.resume_session(&s.session_pk, "restart").await;
+        }
         Ok(())
     }
 
@@ -376,12 +492,16 @@ mod tests {
         cancelled: Arc<AtomicBool>,
         send_count: Arc<AtomicUsize>,
         ended: Arc<AtomicBool>,
+        /// Every prompt text driven on this (or a sibling) fake session, in
+        /// order — lets resume tests assert the exact nudge text sent.
+        prompts: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
     impl HarnessSession for FakeSession {
         async fn send_prompt(&self, prompt: String) -> anyhow::Result<()> {
             self.send_count.fetch_add(1, Ordering::SeqCst);
+            self.prompts.lock().unwrap().push(prompt.clone());
             // Persist the user turn (as the ACP session does in send_prompt).
             let _ = self
                 .store
@@ -454,6 +574,8 @@ mod tests {
         sends: Arc<AtomicUsize>,
         /// Set once `end()` is called on a produced session.
         ended: Arc<AtomicBool>,
+        /// Prompts observed by `send_prompt` across every produced session, in order.
+        prompts: Arc<Mutex<Vec<String>>>,
     }
 
     struct FakeHarness {
@@ -473,6 +595,7 @@ mod tests {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 send_count: self.counters.sends.clone(),
                 ended: self.counters.ended.clone(),
+                prompts: self.counters.prompts.clone(),
             }))
         }
     }
@@ -518,6 +641,123 @@ mod tests {
         let tree = repo.find_tree(tree_id).unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
+    }
+
+    /// A fresh sqlite path that survives past the temp-file guard's drop —
+    /// reconcile/resume tests seed session state directly via `cp.store`
+    /// (visible here since `tests` is a child module of `control`) alongside
+    /// driving the `ControlPlane`, so the DB file must outlive the helper
+    /// that creates it.
+    fn temp_db_path() -> std::path::PathBuf {
+        tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap()
+    }
+
+    /// A `HarnessFactory` whose `create()` always fails — used to exercise
+    /// the cold-resume rollback path in `continue_session`.
+    struct FailingHarnessFactory;
+    impl HarnessFactory for FailingHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Err(anyhow::anyhow!("boom: harness factory intentionally fails"))
+        }
+    }
+
+    /// Build a `ControlPlane` wired to the shared-counter fake harness, plus
+    /// a clone of its internal `Store` (for seeding/asserting session state
+    /// directly) and the shared prompt log (for asserting exactly what text
+    /// was driven on a resumed session).
+    async fn fake_control_plane() -> (Arc<ControlPlane>, Arc<Store>, Arc<Mutex<Vec<String>>>) {
+        let store = crate::store::Store::open(&temp_db_path()).await.unwrap();
+        let counters = Counters::default();
+        let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+        let store_ref = cp.store.clone();
+        (cp, store_ref, counters.prompts)
+    }
+
+    /// Like `fake_control_plane`, but the registered harness always fails to
+    /// start — for testing the cold-resume rollback in `continue_session`.
+    async fn control_plane_with_failing_factory() -> (Arc<ControlPlane>, Arc<Store>) {
+        let store = crate::store::Store::open(&temp_db_path()).await.unwrap();
+        let mut regs = Registries::new();
+        regs.harness
+            .register("claude-code", Arc::new(FailingHarnessFactory));
+        let cp = ControlPlane::new(store, regs).await;
+        let store_ref = cp.store.clone();
+        (cp, store_ref)
+    }
+
+    /// Seed a minimal project row (bypassing `connect_project`'s git-repo
+    /// requirement, which reconcile/resume tests don't need).
+    async fn seed_project(store: &Store, project_id: &str) {
+        store
+            .insert_project(Project {
+                project_id: project_id.to_string(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                harness: "claude-code".into(),
+                model: None,
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: Some(now_ms()),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Seed a session directly at a given status/agent_session_id/resume_attempts.
+    async fn seed_session(
+        store: &Store,
+        session_pk: &str,
+        project_id: &str,
+        status: SessionStatus,
+        agent_session_id: Option<&str>,
+        resume_attempts: i64,
+    ) {
+        let now = now_ms();
+        store
+            .insert_session(Session {
+                session_pk: session_pk.to_string(),
+                project_id: project_id.to_string(),
+                agent_session_id: agent_session_id.map(|s| s.to_string()),
+                worktree_path: None,
+                branch: None,
+                title: Some("seed".into()),
+                status,
+                started_by: Some("test".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+            })
+            .await
+            .unwrap();
+        store
+            .update_resume(session_pk, status, resume_attempts)
+            .await
+            .unwrap();
+    }
+
+    /// Poll the shared prompt log until it has at least `n` entries (or panic
+    /// after a timeout), then give the fire-and-forget background prompt task
+    /// (spawned by `resume_session` via `spawn_prompt`, which isn't joinable)
+    /// a brief grace period to finish its trailing store writes — persisting
+    /// the turn's messages and `demote_if_running` — before the caller
+    /// asserts on session/store state.
+    async fn wait_for_prompts(log: &Arc<Mutex<Vec<String>>>, n: usize) {
+        for _ in 0..400 {
+            if log.lock().unwrap().len() >= n {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "timed out waiting for {n} prompt(s); got {}",
+            log.lock().unwrap().len()
+        );
     }
 
     #[tokio::test]
@@ -763,5 +1003,90 @@ mod tests {
             && m.payload["text"] == "working"));
         // seq is monotonic and matches insertion order.
         assert!(msgs.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
+    #[tokio::test]
+    async fn reconcile_resumes_running_session_with_nudge_and_increments_attempts() {
+        let (cp, store, prompt_log) = fake_control_plane().await;
+        seed_project(&store, "p1").await;
+        seed_session(
+            &store,
+            "s1",
+            "p1",
+            SessionStatus::Running,
+            Some("acp-123"),
+            0,
+        )
+        .await;
+
+        cp.reconcile().await.unwrap();
+        wait_for_prompts(&prompt_log, 1).await;
+
+        assert_eq!(prompt_log.lock().unwrap()[0], RESUME_NUDGE);
+
+        let s = store.get_session("s1").await.unwrap().unwrap();
+        // the resumed turn completed via the fake → demote reset attempts to 0
+        assert_eq!(s.resume_attempts, 0);
+        assert_eq!(s.status, SessionStatus::Idle);
+        // the 🔄 status row was persisted
+        let msgs = store.list_messages("s1").await.unwrap();
+        assert!(msgs.iter().any(
+            |m| m.block_type == "status" && m.payload["summary"] == "🔄 Resumed after restart."
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_without_agent_session_id_goes_idle_with_warning() {
+        let (cp, store, _prompt_log) = fake_control_plane().await;
+        seed_project(&store, "p1").await;
+        seed_session(&store, "s1", "p1", SessionStatus::Running, None, 0).await;
+
+        cp.resume_session("s1", "restart").await.unwrap();
+
+        let s = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Idle);
+        let msgs = store.list_messages("s1").await.unwrap();
+        assert!(msgs.iter().any(|m| m.payload["summary"]
+            == "⚠️ Interrupted by a restart and could not be auto-resumed — send a message to continue."));
+    }
+
+    #[tokio::test]
+    async fn resume_gives_up_after_three_attempts() {
+        let (cp, store, _prompt_log) = fake_control_plane().await;
+        seed_project(&store, "p1").await;
+        seed_session(
+            &store,
+            "s1",
+            "p1",
+            SessionStatus::Running,
+            Some("acp-123"),
+            3,
+        )
+        .await;
+
+        cp.resume_session("s1", "restart").await.unwrap();
+
+        let s = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Idle);
+        assert_eq!(s.resume_attempts, 3); // untouched
+        let msgs = store.list_messages("s1").await.unwrap();
+        assert!(msgs.iter().any(|m| m.payload["summary"]
+            == "⚠️ Auto-resume gave up after 3 attempts — send a message to continue."));
+    }
+
+    #[tokio::test]
+    async fn continue_session_cold_resume_failure_rolls_back_to_idle() {
+        let (cp, store) = control_plane_with_failing_factory().await;
+        seed_project(&store, "p1").await;
+        seed_session(&store, "s1", "p1", SessionStatus::Idle, Some("acp-123"), 0).await;
+
+        assert!(cp.continue_session("s1", "hi").await.is_err());
+
+        let s = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(
+            s.status,
+            SessionStatus::Idle,
+            "must not be left stuck in Running"
+        );
     }
 }
