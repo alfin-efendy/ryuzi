@@ -30,6 +30,10 @@ fn unknown_command_exits_1_with_hint() {
 }
 
 #[test]
+// No-args here always sees help, never the TUI: `assert_cmd::Command`
+// captures stdout to a pipe, so `dispatch::run_cli`'s TTY gate on `None`
+// (crates/cli/src/dispatch.rs) takes the non-interactive branch. Only a real
+// terminal's stdout launches `tui::launch_ui`.
 fn help_flag_and_bare_help_and_no_args_print_usage() {
     for args in [vec!["--help"], vec!["-h"], vec!["help"], vec![]] {
         Command::cargo_bin("ryuzi")

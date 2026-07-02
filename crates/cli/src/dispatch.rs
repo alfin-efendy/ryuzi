@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::detect::Detected;
@@ -21,9 +22,23 @@ pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {
             (deps.out)(meta::version());
             0
         }
-        Some("-h") | Some("--help") | Some("help") | None => {
+        Some("-h") | Some("--help") | Some("help") => {
             (deps.out)(&meta::help_text());
             0
+        }
+        // TTY gate (deliberate delta from the retired TS CLI, which never
+        // gated): a bare `ryuzi` on a real terminal launches the TUI
+        // (wizard first-run, else dashboard); piped/non-interactive stdout
+        // (scripts, CI, the `cli.rs` no-args test which runs through
+        // `assert_cmd`'s captured pipe) keeps printing help and exits 0, so
+        // script-safe automation is unaffected.
+        None => {
+            if std::io::stdout().is_terminal() {
+                crate::tui::launch_ui(deps)
+            } else {
+                (deps.out)(&meta::help_text());
+                0
+            }
         }
         Some("doctor") => crate::doctor::cmd_doctor(deps),
         Some("run") => crate::run_cmd::cmd_run(&args[1..], deps),
