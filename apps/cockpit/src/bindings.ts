@@ -85,6 +85,9 @@ async pickDirectory() : Promise<string | null> {
 },
 async backdropCapability() : Promise<BackdropCapability> {
     return await TAURI_INVOKE("backdrop_capability");
+},
+async systemAccentColor() : Promise<string | null> {
+    return await TAURI_INVOKE("system_accent_color");
 }
 }
 
@@ -92,8 +95,10 @@ async backdropCapability() : Promise<BackdropCapability> {
 
 
 export const events = __makeEvents__<{
+accentChangedMsg: AccentChangedMsg,
 coreEventMsg: CoreEventMsg
 }>({
+accentChangedMsg: "accent-changed-msg",
 coreEventMsg: "core-event-msg"
 })
 
@@ -103,6 +108,7 @@ coreEventMsg: "core-event-msg"
 
 /** user-defined types **/
 
+export type AccentChangedMsg = { hex: string }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CmdError = { message: string }
 /**

@@ -1,3 +1,4 @@
+mod accent;
 mod backdrop;
 mod commands;
 mod error;
@@ -81,8 +82,9 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::read_file,
             commands::pick_directory,
             commands::backdrop_capability,
+            accent::system_accent_color,
         ])
-        .events(collect_events![events::CoreEventMsg])
+        .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])
 }
 
 pub fn run() {
@@ -127,6 +129,7 @@ pub fn run() {
                 .expect("main window exists");
             let cap = backdrop::apply_backdrop(&main_window);
             app.manage(backdrop::BackdropState(cap));
+            accent::spawn_accent_watcher(&app.handle().clone());
             // Bridge: forward every CoreEvent from the broadcast channel to the webview.
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
