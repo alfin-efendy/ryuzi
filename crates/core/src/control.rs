@@ -53,6 +53,20 @@ impl ControlPlane {
         self.store.list_sessions(project_id).await
     }
 
+    /// Persist per-project preferences (host-supplied model/effort/perm overrides).
+    /// `None` leaves the corresponding column untouched.
+    pub async fn set_project_prefs(
+        &self,
+        project_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        perm_mode: Option<PermMode>,
+    ) -> anyhow::Result<()> {
+        self.store
+            .update_project_prefs(project_id, model, effort, perm_mode)
+            .await
+    }
+
     pub async fn connect_project(&self, workdir: &Path, name: &str) -> anyhow::Result<Project> {
         // Must be an existing git repo (worktrees need a HEAD commit).
         git2::Repository::open(workdir)

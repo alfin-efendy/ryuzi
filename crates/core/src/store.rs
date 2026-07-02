@@ -233,6 +233,31 @@ impl Store {
         Ok(())
     }
 
+    /// Update per-project preferences; `None` leaves the column untouched.
+    pub async fn update_project_prefs(
+        &self,
+        project_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        perm_mode: Option<PermMode>,
+    ) -> anyhow::Result<()> {
+        let project_id = project_id.to_string();
+        let model = model.map(|s| s.to_string());
+        let effort = effort.map(|s| s.to_string());
+        let perm = perm_mode.map(|m| m.as_str().to_string());
+        let conn = self.pool.get().await?;
+        conn.interact(move |c| {
+            c.execute(
+                "UPDATE projects SET model=COALESCE(?2, model), effort=COALESCE(?3, effort), \
+                 perm_mode=COALESCE(?4, perm_mode) WHERE project_id=?1",
+                params![project_id, model, effort, perm],
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(())
+    }
+
     /// Atomically demote `Running → Idle` only if the current status is still `Running`.
     /// A session already marked `Interrupted` or `Ended` is left untouched.
     pub async fn demote_if_running(&self, pk: &str, last_active: i64) -> anyhow::Result<()> {
@@ -679,6 +704,24 @@ mod tests {
         assert_eq!(moved, Some(backup.clone()));
         assert!(!db.exists());
         assert!(backup.exists());
+    }
+
+    #[tokio::test]
+    async fn update_project_prefs_coalesces_none_fields() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let mut p = sample_project();
+        p.model = Some("opus".into());
+        store.insert_project(p).await.unwrap();
+
+        store
+            .update_project_prefs("p1", None, Some("high"), Some(PermMode::BypassPermissions))
+            .await
+            .unwrap();
+        let got = store.get_project("p1").await.unwrap().unwrap();
+        assert_eq!(got.model.as_deref(), Some("opus")); // None left it untouched
+        assert_eq!(got.effort.as_deref(), Some("high"));
+        assert_eq!(got.perm_mode, PermMode::BypassPermissions);
     }
 
     #[tokio::test]
