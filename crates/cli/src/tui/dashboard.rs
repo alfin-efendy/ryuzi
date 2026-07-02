@@ -67,6 +67,16 @@ impl DashboardState {
         self.config_cursor = clamp_cursor(self.config_cursor, selectable_len);
     }
 
+    /// Reset per-tab view state when switching tabs (TS remount parity).
+    /// Clears sessions_cursor, detail, config_cursor, and config_error.
+    /// Leaves `editing` alone (it's guaranteed None since global keys are gated).
+    fn reset_tab_state(&mut self) {
+        self.sessions_cursor = 0;
+        self.detail = None;
+        self.config_cursor = 0;
+        self.config_error = None;
+    }
+
     pub async fn handle(&mut self, key: Key, controller: &AppController) {
         if self.editing.is_some() {
             self.handle_editing_key(key, controller).await;
@@ -89,10 +99,26 @@ impl DashboardState {
         match key {
             Key::Char('q') => self.exit = true,
             Key::Char('?') => self.show_options = !self.show_options,
-            Key::Tab | Key::Right => self.active = (self.active + 1) % TABS.len(),
-            Key::Left => self.active = (self.active + TABS.len() - 1) % TABS.len(),
+            Key::Tab | Key::Right => {
+                let new_active = (self.active + 1) % TABS.len();
+                if new_active != self.active {
+                    self.active = new_active;
+                    self.reset_tab_state();
+                }
+            }
+            Key::Left => {
+                let new_active = (self.active + TABS.len() - 1) % TABS.len();
+                if new_active != self.active {
+                    self.active = new_active;
+                    self.reset_tab_state();
+                }
+            }
             Key::Char(c) if ('1'..='4').contains(&c) => {
-                self.active = c as usize - '1' as usize;
+                let new_active = c as usize - '1' as usize;
+                if new_active != self.active {
+                    self.active = new_active;
+                    self.reset_tab_state();
+                }
             }
             Key::Char('s') if self.active == 1 => {
                 let _ = controller.toggle_daemon().await;
@@ -500,5 +526,127 @@ mod tests {
         assert_eq!(d.detail, Some(1));
         d.handle(Key::Esc, &c).await;
         assert_eq!(d.detail, None);
+    }
+
+    #[tokio::test]
+    async fn tab_switch_resets_per_tab_view_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller_in(dir.path()).await;
+        // Seed 2 sessions
+        c.deps
+            .store
+            .insert_session(ryuzi_core::Session {
+                session_pk: "s1".into(),
+                project_id: "p1".into(),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("first".into()),
+                status: ryuzi_core::SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(1),
+                last_active: Some(1),
+                resume_attempts: 0,
+            })
+            .await
+            .unwrap();
+        c.deps
+            .store
+            .insert_session(ryuzi_core::Session {
+                session_pk: "s2".into(),
+                project_id: "p1".into(),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("second".into()),
+                status: ryuzi_core::SessionStatus::Running,
+                started_by: None,
+                created_at: Some(2),
+                last_active: Some(2),
+                resume_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        let mut d = DashboardState::new(&c).await;
+        d.active = 2; // Sessions tab
+        assert_eq!(d.sessions.len(), 2);
+
+        // Open detail on the second session
+        d.sessions_cursor = 1;
+        d.detail = Some(1);
+        assert_eq!(d.sessions_cursor, 1);
+        assert_eq!(d.detail, Some(1));
+
+        // Switch to Config tab (key '4')
+        d.handle(Key::Char('4'), &c).await;
+        assert_eq!(d.active, 3);
+        assert_eq!(d.sessions_cursor, 0, "sessions_cursor should reset");
+        assert_eq!(d.detail, None, "detail should reset");
+
+        // Switch back to Sessions tab (key '3')
+        d.handle(Key::Char('3'), &c).await;
+        assert_eq!(d.active, 2);
+        assert_eq!(d.sessions_cursor, 0, "sessions_cursor should still be 0");
+        assert_eq!(d.detail, None, "detail should still be None");
+
+        // Set sessions_cursor to 1 and press '3' (same tab) - should NOT reset
+        d.sessions_cursor = 1;
+        d.handle(Key::Char('3'), &c).await;
+        assert_eq!(d.active, 2);
+        assert_eq!(
+            d.sessions_cursor, 1,
+            "pressing same tab digit should NOT reset state"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_submit_error_keeps_editing() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller_in(dir.path()).await;
+        let mut d = DashboardState::new(&c).await;
+        d.active = 3; // Config tab
+
+        // Find the default_perm_mode field and navigate to it
+        let idx = d
+            .selectable_index_of_field("default_perm_mode")
+            .expect("default_perm_mode field must exist");
+        d.config_cursor = idx;
+
+        // Enter edit mode (draft = current value, which is "default")
+        d.handle(Key::Enter, &c).await;
+        assert!(d.editing.is_some(), "should enter edit mode");
+
+        // Clear the draft by backspacing 7 times (len("default") = 7)
+        for _ in 0..7 {
+            d.handle(Key::Backspace, &c).await;
+        }
+
+        // Type "bogus" (invalid enum value)
+        for ch in "bogus".chars() {
+            d.handle(Key::Char(ch), &c).await;
+        }
+        assert_eq!(d.editing.as_deref(), Some("bogus"));
+
+        // Submit (should fail validation)
+        d.handle(Key::Enter, &c).await;
+
+        // After failed submit, editing and error should persist
+        assert!(
+            d.editing.is_some(),
+            "editing should persist after validation error"
+        );
+        assert!(
+            d.config_error.is_some(),
+            "config_error should be set after validation error"
+        );
+        assert!(
+            d.config_error
+                .as_ref()
+                .unwrap()
+                .to_lowercase()
+                .contains("must be one of"),
+            "error message should mention valid enum values"
+        );
     }
 }
