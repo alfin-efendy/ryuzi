@@ -82,6 +82,9 @@ async readFile(path: string) : Promise<Result<string, CmdError>> {
 },
 async pickDirectory() : Promise<string | null> {
     return await TAURI_INVOKE("pick_directory");
+},
+async backdropCapability() : Promise<BackdropCapability> {
+    return await TAURI_INVOKE("backdrop_capability");
 }
 }
 
@@ -100,6 +103,7 @@ coreEventMsg: "core-event-msg"
 
 /** user-defined types **/
 
+export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CmdError = { message: string }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).

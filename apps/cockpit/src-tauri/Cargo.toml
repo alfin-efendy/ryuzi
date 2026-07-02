@@ -13,7 +13,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 ryuzi-core = { path = "../../../crates/core" }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
 serde.workspace = true
 tokio.workspace = true
@@ -21,3 +21,6 @@ specta = { version = "2.0.0-rc.22", features = ["derive"] }
 tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }
 specta-typescript = "0.0.9"
 anyhow = "1"
+
+[target."cfg(windows)".dependencies]
+windows-version = "0.1.7"

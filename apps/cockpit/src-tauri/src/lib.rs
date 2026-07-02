@@ -1,3 +1,4 @@
+mod backdrop;
 mod commands;
 mod error;
 mod events;
@@ -79,6 +80,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::resolve_approval,
             commands::read_file,
             commands::pick_directory,
+            commands::backdrop_capability,
         ])
         .events(collect_events![events::CoreEventMsg])
 }
@@ -116,6 +118,15 @@ pub fn run() {
             let mut rx = cp.subscribe();
             // Make Arc<ControlPlane> available to all Tauri commands.
             app.manage(cp);
+            // Apply the OS backdrop (mica/vibrancy) at runtime and record what
+            // actually applied. Static windowEffects config is forbidden: Tauri
+            // picks effects by platform family and swallows failures, which on
+            // Win10 would yield a transparent window with no backdrop.
+            let main_window = app
+                .get_webview_window("main")
+                .expect("main window exists");
+            let cap = backdrop::apply_backdrop(&main_window);
+            app.manage(backdrop::BackdropState(cap));
             // Bridge: forward every CoreEvent from the broadcast channel to the webview.
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
