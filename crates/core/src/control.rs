@@ -119,6 +119,19 @@ impl ControlPlane {
         Ok(session)
     }
 
+    /// Send a follow-up prompt on an existing session.
+    ///
+    /// The ACP session built by `start_harness_session` is long-lived: its
+    /// handle holds an mpsc `ClientRequest` channel whose client loop stays
+    /// connected to serve many prompts on ONE session. So the fast (normal)
+    /// path here REUSES the live handle from the `running` map — no new adapter
+    /// process, no `session/load` replay, because the live adapter already holds
+    /// the full conversation context.
+    ///
+    /// Only when the handle is ABSENT — e.g. the in-memory `running` map was
+    /// wiped by an app restart — do we start a FRESH session that resumes via
+    /// `session/load` (passing `session.agent_session_id` as `resume`). That
+    /// cold-resume path is the single place `session/load` is needed.
     pub async fn continue_session(
         self: &Arc<Self>,
         session_pk: &str,
@@ -129,34 +142,45 @@ impl ControlPlane {
             .get_session(session_pk)
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown session: {session_pk}"))?;
-        let project = self
-            .store
-            .get_project(&session.project_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("unknown project: {}", session.project_id))?;
-
-        let work_dir = session
-            .worktree_path
-            .clone()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(&project.workdir));
 
         self.store
             .update_status(session_pk, SessionStatus::Running, None)
             .await?;
 
-        let handle = self
-            .start_harness_session(
-                &project,
-                session_pk,
-                &work_dir,
-                session.agent_session_id.clone(),
-            )
-            .await?;
-        // Persist any resumed agent session id the harness resolved.
-        if let Some(sid) = handle.agent_session_id() {
-            let _ = self.store.update_agent_session_id(session_pk, &sid).await;
-        }
+        // Fast path: reuse the live ACP session if its handle is still in the
+        // `running` map. The live adapter already holds context, so no new
+        // adapter is spawned and no `session/load` replay happens.
+        let existing = self.running.lock().unwrap().get(session_pk).cloned();
+        let handle = match existing {
+            Some(handle) => handle,
+            None => {
+                // Cold-resume path: the in-memory handle is gone (e.g. after an
+                // app restart). Start a FRESH session that resumes the prior
+                // conversation via `session/load` using the persisted agent id.
+                let project = self
+                    .store
+                    .get_project(&session.project_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unknown project: {}", session.project_id)
+                    })?;
+                let work_dir = session
+                    .worktree_path
+                    .clone()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from(&project.workdir));
+                self.start_harness_session(
+                    &project,
+                    session_pk,
+                    &work_dir,
+                    session.agent_session_id.clone(),
+                )
+                .await?
+                // `start_harness_session` already persists any resolved
+                // agent_session_id, and `spawn_prompt` persists it post-turn,
+                // so no redundant `update_agent_session_id` is needed here.
+            }
+        };
         self.spawn_prompt(handle, session_pk.to_string(), prompt.to_string());
         Ok(())
     }
@@ -211,6 +235,12 @@ impl ControlPlane {
     /// the turn completes (ACP `EndTurn`); on completion we atomically demote
     /// `Running → Idle` (unless the session was already Interrupted/Ended) and
     /// broadcast a `Result`. Errors surface as `CoreEvent::Error`.
+    ///
+    /// The `handle` is the PERSISTENT live session — the same handle inserted
+    /// into `running` by `start_harness_session` and reused across
+    /// `continue_session` turns. This method therefore does NOT remove it from
+    /// `running` on turn completion: the session stays alive to serve the next
+    /// prompt. It is removed and `end()`ed only by `end_session`.
     fn spawn_prompt(
         self: &Arc<Self>,
         handle: Arc<dyn HarnessSession>,
@@ -252,6 +282,9 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Tear down a session. This is the ONLY place the persistent live-session
+    /// handle is removed from `running` and `end()`ed (graceful ACP teardown),
+    /// after which the worktree is cleaned up and the session marked `Ended`.
     pub async fn end_session(&self, session_pk: &str) -> anyhow::Result<()> {
         let handle = self.running.lock().unwrap().remove(session_pk);
         if let Some(handle) = handle {
@@ -305,24 +338,31 @@ mod tests {
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
     use crate::integration::Registries;
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A fake `HarnessSession` that, on `send_prompt`, persists a user turn and a
     /// streamed assistant text row through the `SessionCtx.store`, then records
     /// the agent session id — mirroring what the real ACP sink/session does. It
     /// blocks until `cancel()` fires if `block_until_cancel` is set, so tests can
     /// exercise the "stop while running" transition.
+    ///
+    /// `send_count`/`ended` are shared counters (via the factory) so tests can
+    /// assert how many prompts a live session served and whether `end()` was
+    /// called on it.
     struct FakeSession {
         store: Arc<Store>,
         events: broadcast::Sender<CoreEvent>,
         session_pk: String,
         block_until_cancel: bool,
         cancelled: Arc<AtomicBool>,
+        send_count: Arc<AtomicUsize>,
+        ended: Arc<AtomicBool>,
     }
 
     #[async_trait]
     impl HarnessSession for FakeSession {
         async fn send_prompt(&self, prompt: String) -> anyhow::Result<()> {
+            self.send_count.fetch_add(1, Ordering::SeqCst);
             // Persist the user turn (as the ACP session does in send_prompt).
             let _ = self
                 .store
@@ -376,6 +416,7 @@ mod tests {
 
         async fn end(&self) -> anyhow::Result<()> {
             self.cancelled.store(true, Ordering::SeqCst);
+            self.ended.store(true, Ordering::SeqCst);
             Ok(())
         }
 
@@ -384,40 +425,69 @@ mod tests {
         }
     }
 
+    /// Shared counters so tests can observe the harness/session lifecycle across
+    /// `start_session` / `continue_session` calls.
+    #[derive(Clone, Default)]
+    struct Counters {
+        /// Times `Harness::start_session` was invoked (new ACP session created).
+        starts: Arc<AtomicUsize>,
+        /// Times `send_prompt` was driven on any produced session.
+        sends: Arc<AtomicUsize>,
+        /// Set once `end()` is called on a produced session.
+        ended: Arc<AtomicBool>,
+    }
+
     struct FakeHarness {
         block_until_cancel: bool,
+        counters: Counters,
     }
 
     #[async_trait]
     impl Harness for FakeHarness {
         async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            self.counters.starts.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(FakeSession {
                 store: ctx.store.clone(),
                 events: ctx.events.clone(),
                 session_pk: ctx.session_pk.clone(),
                 block_until_cancel: self.block_until_cancel,
                 cancelled: Arc::new(AtomicBool::new(false)),
+                send_count: self.counters.sends.clone(),
+                ended: self.counters.ended.clone(),
             }))
         }
     }
 
     struct FakeHarnessFactory {
         block_until_cancel: bool,
+        counters: Counters,
     }
 
     impl HarnessFactory for FakeHarnessFactory {
         fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
             Ok(Arc::new(FakeHarness {
                 block_until_cancel: self.block_until_cancel,
+                counters: self.counters.clone(),
             }))
         }
     }
 
     /// Build a `Registries` with a `claude-code` harness backed by the fake.
     fn registries(block_until_cancel: bool) -> Registries {
+        registries_with(block_until_cancel, Counters::default())
+    }
+
+    /// Like `registries`, but sharing `counters` so a test can inspect how many
+    /// times the harness started a session / drove a prompt / ended.
+    fn registries_with(block_until_cancel: bool, counters: Counters) -> Registries {
         let mut regs = Registries::new();
-        regs.harness
-            .register("claude-code", Arc::new(FakeHarnessFactory { block_until_cancel }));
+        regs.harness.register(
+            "claude-code",
+            Arc::new(FakeHarnessFactory {
+                block_until_cancel,
+                counters,
+            }),
+        );
         regs
     }
 
@@ -471,6 +541,141 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
         assert_eq!(stored[0].status, crate::domain::SessionStatus::Interrupted);
+
+        // Under the long-lived-session model the handle intentionally PERSISTS
+        // after stop — it is the live session, kept to serve future prompts and
+        // torn down only by `end_session`.
+        assert!(
+            cp.running.lock().unwrap().contains_key(&session.session_pk),
+            "stop must NOT drop the live-session handle"
+        );
+
+        // end_session is the one place that removes + ends the handle.
+        cp.end_session(&session.session_pk).await.unwrap();
+        assert!(
+            !cp.running.lock().unwrap().contains_key(&session.session_pk),
+            "end_session must remove the handle from the running map"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_reuses_the_live_session() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(db.path()).await.unwrap();
+        let counters = Counters::default();
+        // Non-blocking session so each prompt turn completes and the handle
+        // stays parked in `running` for reuse on the next turn.
+        let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        // First turn: creates the live ACP session and drives one prompt.
+        let session = cp.start_session(&project.project_id, "first").await.unwrap();
+        // Let the background prompt task finish its turn.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Snapshot the live handle so we can prove the SAME one is reused.
+        let handle_before = cp
+            .running
+            .lock()
+            .unwrap()
+            .get(&session.session_pk)
+            .cloned()
+            .expect("start_session must register a live handle");
+
+        // Second turn: MUST reuse the live handle — no new ACP session.
+        cp.continue_session(&session.session_pk, "second")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let handle_after = cp
+            .running
+            .lock()
+            .unwrap()
+            .get(&session.session_pk)
+            .cloned()
+            .expect("continue_session must keep the live handle registered");
+
+        // Same Arc → the live session was reused, not replaced.
+        assert!(
+            Arc::ptr_eq(&handle_before, &handle_after),
+            "continue_session must reuse the live handle, not create a new one"
+        );
+        // A NEW session was started exactly ONCE (only on start_session); the
+        // follow-up turn did NOT spawn a fresh adapter / session/load.
+        assert_eq!(
+            counters.starts.load(Ordering::SeqCst),
+            1,
+            "only start_session should create an ACP session"
+        );
+        // send_prompt was driven twice on that one live session.
+        assert_eq!(
+            counters.sends.load(Ordering::SeqCst),
+            2,
+            "both turns must run on the same live session"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_cold_resumes_when_handle_absent() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(db.path()).await.unwrap();
+        let counters = Counters::default();
+        let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        let session = cp.start_session(&project.project_id, "first").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Simulate an app restart that wiped the in-memory running map.
+        cp.running.lock().unwrap().remove(&session.session_pk);
+
+        // Continue must fall back to the cold-resume path: start a FRESH session
+        // (via session/load) and register a new live handle.
+        cp.continue_session(&session.session_pk, "second")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            cp.running.lock().unwrap().contains_key(&session.session_pk),
+            "cold resume must re-register a live handle"
+        );
+        // Two ACP sessions created total: the initial start + the cold resume.
+        assert_eq!(counters.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(counters.sends.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn end_session_removes_and_ends_the_handle() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(db.path()).await.unwrap();
+        let counters = Counters::default();
+        let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        let session = cp.start_session(&project.project_id, "go").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(cp.running.lock().unwrap().contains_key(&session.session_pk));
+
+        cp.end_session(&session.session_pk).await.unwrap();
+
+        assert!(
+            !cp.running.lock().unwrap().contains_key(&session.session_pk),
+            "end_session must remove the handle"
+        );
+        assert!(
+            counters.ended.load(Ordering::SeqCst),
+            "end_session must call end() on the live handle"
+        );
+        let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+        assert_eq!(stored[0].status, crate::domain::SessionStatus::Ended);
     }
 
     #[tokio::test]
