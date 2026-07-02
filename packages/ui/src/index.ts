@@ -1,6 +1,6 @@
 export { cn } from "./lib/utils";
-export { useTheme, initTheme, applyTheme, resolveDark, accentVars, ACCENTS } from "./theme";
-export type { Mode, Accent, AccentKey } from "./theme";
+export { useTheme, initTheme, applyTheme, applyBackdrop, resolveBackdropAttr, resolveDark, accentVars, parseAccent, ACCENTS } from "./theme";
+export type { Mode, Accent, AccentKey, BackdropCapability } from "./theme";
 export * from "./components/ui/badge";
 export * from "./components/ui/button";
 export * from "./components/ui/card";
