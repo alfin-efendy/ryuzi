@@ -1,9 +1,10 @@
 import { create } from "zustand";
+import { basename } from "./lib/paths";
 
 export type DockTab = { id: string; kind: "file"; path: string; title: string };
 
 function titleOf(path: string): string {
-  return path.split("/").filter(Boolean).pop() ?? path;
+  return basename(path) || path;
 }
 
 export function openFileTab(tabs: DockTab[], path: string): { tabs: DockTab[]; activeTabId: string } {
