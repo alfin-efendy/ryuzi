@@ -5,8 +5,6 @@
 //! [`super::run_client_loop`] in `mod.rs`. This module only owns:
 //!
 //! - [`spawn_adapter`]: spawns the ACP adapter sidecar process (production).
-//! - [`extract_caps`]: extracts the subset of `InitializeResponse` the higher
-//!   layers care about.
 //! - [`PermissionContext`]: the shared state bundle for the permission handler.
 //!
 //! The previous `connect_and_initialize` helper that duplicated the builder
@@ -15,11 +13,9 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{InitializeResponse};
-
 use crate::domain::CoreEvent;
 
-use super::{AcpAdapterDescriptor, Caps};
+use super::AcpAdapterDescriptor;
 
 /// Bundle of shared state threaded into the ACP client for the permission
 /// handler. Defined here so callers can name the type concisely.
@@ -54,21 +50,6 @@ pub async fn spawn_adapter(
     cmd.spawn()
 }
 
-/// Read the capabilities that the harness cares about out of an `initialize`
-/// response.
-pub fn extract_caps(response: &InitializeResponse) -> Caps {
-    Caps {
-        // Top-level bool on AgentCapabilities (wire `loadSession`), NOT a field
-        // on SessionCapabilities.
-        supports_load: response.agent_capabilities.load_session,
-        // Presence of an optional `close` capability on SessionCapabilities.
-        supports_close: response
-            .agent_capabilities
-            .session_capabilities
-            .close
-            .is_some(),
-    }
-}
 
 #[cfg(test)]
 mod tests {

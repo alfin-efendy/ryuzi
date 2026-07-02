@@ -967,6 +967,13 @@ pub struct FsOutcome {
     /// `true` when the file written by `fs/write_text_file` actually exists
     /// inside the (temp) worktree.
     pub wrote_inside_worktree: bool,
+    /// The store, for asserting on persisted status rows.
+    pub store: std::sync::Arc<crate::store::Store>,
+    /// The ryuzi session_pk used during the test (all rows are keyed under it).
+    pub session_pk: String,
+    /// Keep the temp store file alive for the lifetime of this outcome.
+    #[allow(dead_code)]
+    _tmp_store: tempfile::NamedTempFile,
 }
 
 /// A mock agent that, during the `session/prompt` handler, sends a
@@ -1181,20 +1188,21 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
         .await
         .expect("run_prompt_with_fs_calls: send_prompt failed");
 
-    // Give async handlers a moment to complete.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
+    // send_prompt.await already blocks until the PromptResponse returns,
+    // so no sleep is needed here.
     session.end().await.expect("end failed");
 
     let read_back = read_result.lock().await.clone();
     let wrote_inside_worktree = expected_file.exists();
 
-    // Keep temp resources alive until assertions are done.
-    drop(tmp_store);
+    // Keep work_dir_tmp alive until after the worktree check above.
     drop(work_dir_tmp);
 
     FsOutcome {
         read_back,
         wrote_inside_worktree,
+        store,
+        session_pk,
+        _tmp_store: tmp_store,
     }
 }

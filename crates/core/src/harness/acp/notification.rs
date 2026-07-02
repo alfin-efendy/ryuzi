@@ -157,6 +157,43 @@ fn decode(notification: SessionNotification, session_pk: &str) -> AcpUpdate {
     }
 }
 
+impl NotificationSink {
+    /// Persist a `(role="system", block_type="status")` row and emit a real
+    /// [`CoreEvent::Message`] with the returned DB seq.
+    ///
+    /// Used to record observable fs-write events (and any other client-side
+    /// status events) through the same persist-then-emit path that ACP
+    /// notifications use, so the frontend sees a real seq ≥ 1 (never −1).
+    ///
+    /// On store error → `tracing::warn!` + skip (same as the sink's rule).
+    pub async fn record_status(&self, summary: String) {
+        let payload = serde_json::json!({ "summary": summary });
+        let msg = NewMessage::block(
+            &self.session_pk,
+            "system",
+            "status",
+            payload.clone(),
+        );
+        match self.store.insert_message(msg).await {
+            Ok(seq) => {
+                let _ = self.events.send(CoreEvent::Message {
+                    session_pk: self.session_pk.clone(),
+                    seq,
+                    role: "system".into(),
+                    block_type: "status".into(),
+                    payload,
+                    tool_call_id: None,
+                    status: None,
+                    tool_kind: None,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("notification: failed to insert status message: {e}");
+            }
+        }
+    }
+}
+
 /// Process one [`SessionNotification`], persisting to the store and emitting
 /// a [`CoreEvent::Message`] on success.
 ///

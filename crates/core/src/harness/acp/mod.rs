@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-    InitializeRequest, InitializeResponse, ReadTextFileRequest, ReadTextFileResponse,
+    InitializeRequest, InitializeResponse, ReadTextFileRequest,
     SessionId, TextContent, WriteTextFileRequest,
 };
 use agent_client_protocol::schema::ProtocolVersion;
@@ -113,6 +113,7 @@ async fn run_client_loop(
     } = args;
 
     let sink_for_handler = sink.clone();
+    let sink_for_write = sink.clone();
     let perm = (perm.hub, perm.events);
     // Clone work_dir for the fs handler closures (they must be 'static + Send).
     let work_dir_for_read = work_dir.clone();
@@ -182,9 +183,10 @@ async fn run_client_loop(
                         Ok(response) => responder.respond(response),
                         Err(err) => {
                             tracing::warn!("fs/read_text_file failed: {err}");
-                            responder.respond(ReadTextFileResponse::new(
-                                format!("error: {err}"),
-                            ))
+                            responder.respond_with_error(
+                                agent_client_protocol::Error::internal_error()
+                                    .data(format!("fs/read_text_file: {err}")),
+                            )
                         }
                     }
                 }
@@ -195,10 +197,19 @@ async fn run_client_loop(
         .on_receive_request(
             {
                 async move |request: WriteTextFileRequest, responder, _cx| {
+                    // Capture a display path for the status event before the
+                    // request is consumed by write_text_file.
+                    let display_path = request.path.display().to_string();
                     let result =
                         crate::harness::acp::fs::write_text_file(&work_dir_for_write, request);
                     match result {
-                        Ok(response) => responder.respond(response),
+                        Ok(response) => {
+                            // Persist a real-seq status row and emit CoreEvent.
+                            sink_for_write
+                                .record_status(format!("wrote {display_path}"))
+                                .await;
+                            responder.respond(response)
+                        }
                         Err(err) => {
                             tracing::warn!("fs/write_text_file failed: {err}");
                             responder.respond_with_error(
@@ -633,6 +644,31 @@ mod tests {
         assert!(
             outcome.wrote_inside_worktree,
             "file should exist inside the worktree after write"
+        );
+
+        // A (system, status) message row with a REAL seq (≥ 1) must have been
+        // persisted after the successful fs/write_text_file (FIX 1).
+        let msgs = outcome
+            .store
+            .list_messages(&outcome.session_pk)
+            .await
+            .expect("list_messages should not fail");
+        let status_row = msgs
+            .iter()
+            .find(|m| m.role == "system" && m.block_type == "status")
+            .expect("expected a (system, status) row for the fs write event");
+        assert!(
+            status_row.seq >= 1,
+            "status row seq must be a real DB seq (≥ 1), got {}",
+            status_row.seq
+        );
+        assert!(
+            status_row.payload["summary"]
+                .as_str()
+                .unwrap_or("")
+                .contains("wrote"),
+            "status payload summary should mention 'wrote', got: {:?}",
+            status_row.payload
         );
     }
 }

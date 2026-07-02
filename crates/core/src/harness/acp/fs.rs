@@ -32,16 +32,19 @@ pub const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 /// Returns the resolved absolute path on success, or an error if the path
 /// escapes the worktree.
 pub fn sandbox(work_dir: &Path, path: &Path) -> anyhow::Result<PathBuf> {
-    // Canonicalize work_dir so we compare against the real on-disk root.
+    // Canonicalize work_dir so we compare against the real on-disk root and so
+    // a symlinked work_dir doesn't cause false rejections on relative paths.
     let canonical_root = work_dir.canonicalize().map_err(|e| {
         anyhow::anyhow!("sandbox: cannot canonicalize work_dir {}: {e}", work_dir.display())
     })?;
 
     // Construct the candidate (absolute) path, resolving `..` lexically.
+    // Use the *canonicalized* root as the base for relative joins so that any
+    // symlink in work_dir is resolved before we concatenate the user path.
     let raw = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        work_dir.join(path)
+        canonical_root.join(path)
     };
 
     // Lexically normalize: walk components and collapse `..` without I/O.
