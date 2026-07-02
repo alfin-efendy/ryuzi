@@ -1,0 +1,8 @@
+# Compiled sidecar binaries — built by apps/cockpit/scripts/build-acp-sidecar.ts
+# Large real binaries are NOT committed; the stub placeholder IS committed
+# (it is required for `cargo build` Tauri validation without network access).
+#
+# To replace the stub with the real binary, run:
+#   bun run apps/cockpit/scripts/build-acp-sidecar.ts
+# The real binary is NOT gitignored by name so CI can cache/upload it as an
+# artifact; only uncommitted large binaries are excluded here if needed.

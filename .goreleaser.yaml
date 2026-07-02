@@ -1,6 +1,24 @@
 version: 2
 project_name: ryuzi
 
+# ---------------------------------------------------------------------------
+# Pre-build hooks
+# ---------------------------------------------------------------------------
+# Note: GoReleaser manages the ryuzi CLI builds (bun --compile).
+# The Cockpit desktop app (Tauri) is NOT built by GoReleaser — it is built by
+# the cockpit-desktop GitHub Actions workflow (.github/workflows/cockpit-desktop.yml).
+# That workflow already runs build-acp-sidecar.ts before tauri-action.
+#
+# The hook below ensures the ACP sidecar binary is compiled for the host
+# platform when running `goreleaser release --snapshot` or similar local runs
+# that also exercise the cockpit build path.
+before:
+  hooks:
+    # Build the claude-agent-acp sidecar for the host target.
+    # Required before any tauri build step; safe to run even when only building
+    # the CLI (the binaries/ directory is ignored by goreleaser builds).
+    - bun run apps/cockpit/scripts/build-acp-sidecar.ts
+
 builds:
   - id: ryuzi-gnu-other
     builder: bun

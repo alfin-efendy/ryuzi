@@ -6,34 +6,59 @@ use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Regi
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
-/// Resolve the ACP adapter command for the bundled Claude Code sidecar.
+/// The base name of the ACP adapter sidecar binary (no target-triple suffix,
+/// no `.exe`).  Must match the `bundle.externalBin` entry in tauri.conf.json
+/// and the filename produced by `apps/cockpit/scripts/build-acp-sidecar.ts`.
 ///
-/// PLACEHOLDER (Spec 3B Task 5 wires the real bundled sidecar path): for now we
-/// resolve `claude-code-acp` off the app dir / PATH. Starting a session without
-/// a real adapter present will fail at runtime, but the app still compiles and
-/// launches — which is all this task requires.
+/// Package: @agentclientprotocol/claude-agent-acp
+/// NOTE: the adapter refuses to start inside a nested Claude Code session, so
+/// we unconditionally remove the `CLAUDECODE` env-var before spawning it.
+/// Authentication (claude login) is out-of-band — the host machine's `claude`
+/// session is reused; no credentials are managed here.
+const ADAPTER_BIN: &str = "claude-agent-acp";
+
+/// Resolve the ACP adapter command, preferring the Tauri-bundled sidecar.
+///
+/// Resolution order:
+///   1. Bundled sidecar: `<exe_dir>/claude-agent-acp[.exe]` — present in
+///      production (tauri build) and after running build-acp-sidecar.ts.
+///   2. PATH fallback — for `cargo build` / `tauri dev` when the sidecar
+///      binary has not been compiled yet.  A missing PATH entry produces a
+///      clear runtime error on first session start, not at launch.
 fn resolve_acp_adapter_command() -> String {
-    const ADAPTER_BIN: &str = "claude-code-acp";
+    // Tauri places sidecars next to the main executable at runtime.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join(ADAPTER_BIN);
-            if p.exists() {
-                return p.to_string_lossy().into_owned();
+            // Check platform-specific name: <dir>/claude-agent-acp[.exe]
+            #[cfg(windows)]
+            let candidate = dir.join(format!("{}.exe", ADAPTER_BIN));
+            #[cfg(not(windows))]
+            let candidate = dir.join(ADAPTER_BIN);
+
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
             }
         }
     }
-    // Dev/fallback: rely on PATH resolution when the sidecar is not co-located.
+    // Dev / PATH fallback — allows `cargo build` + `tauri dev` to compile and
+    // launch without the sidecar binary present.  Starting a session without
+    // the sidecar installed will fail with a clear spawn error at runtime.
     ADAPTER_BIN.to_string()
 }
 
-/// Build the extension registries and install the `claude-code` harness
-/// integration over the (placeholder) ACP adapter descriptor.
+/// Build the extension registries and install the `claude-agent-acp` harness
+/// integration with the resolved adapter path.
+///
+/// `env_remove: ["CLAUDECODE"]` is required: the adapter checks for this
+/// variable to detect a nested Claude Code session and refuses to start.
 fn build_registries() -> Registries {
     let descriptor = AcpAdapterDescriptor {
         command: resolve_acp_adapter_command(),
         args: vec![],
         env: vec![],
-        env_remove: vec![],
+        // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's running
+        // inside a Claude Code session and refuses to start.
+        env_remove: vec!["CLAUDECODE".to_string()],
     };
     let mut registries = Registries::new();
     registries.install(&ClaudeCodeIntegration::new(descriptor));
