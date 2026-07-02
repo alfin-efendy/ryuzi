@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use ryuzi_core::domain::PermMode;
-use ryuzi_core::{ControlPlane, CoreEvent, Store};
+use ryuzi_core::{ControlPlane, CoreEvent};
 
 use crate::dispatch::Deps;
 
@@ -99,28 +99,16 @@ async fn run_session(
         }
     };
 
-    // Spec 4 §6 clean break: move a TS-schema db aside before Store::open.
-    match ryuzi_core::store::quarantine_legacy_db(&deps.db_path) {
-        Ok(Some(bak)) => (deps.err)(&format!(
-            "note: existing database used the retired schema; moved to {}",
-            bak.display()
-        )),
-        Ok(None) => {}
-        Err(e) => {
-            (deps.err)(&format!("✗ {e}"));
-            return 1;
-        }
-    }
-
-    let registries = match (deps.build_registries)() {
-        Ok(r) => r,
+    let store = match crate::db::open_store(deps).await {
+        Ok(s) => s,
         Err(e) => {
             (deps.err)(&format!("✗ {e}"));
             return 1;
         }
     };
-    let store = match Store::open(&deps.db_path).await {
-        Ok(s) => s,
+
+    let registries = match (deps.build_registries)() {
+        Ok(r) => r,
         Err(e) => {
             (deps.err)(&format!("✗ {e}"));
             return 1;

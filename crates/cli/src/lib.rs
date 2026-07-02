@@ -1,3 +1,5 @@
+pub mod config_cmd;
+pub(crate) mod db;
 pub mod detect;
 pub mod dispatch;
 pub mod doctor;

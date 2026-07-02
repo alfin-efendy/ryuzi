@@ -27,6 +27,7 @@ pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {
         }
         Some("doctor") => crate::doctor::cmd_doctor(deps),
         Some("run") => crate::run_cmd::cmd_run(&args[1..], deps),
+        Some("config") => crate::config_cmd::cmd_config(&args[1..], deps), // hidden: kept for headless automation
         Some(other) => {
             (deps.err)(&format!("unknown command: {other} - run `ryuzi --help`"));
             1
