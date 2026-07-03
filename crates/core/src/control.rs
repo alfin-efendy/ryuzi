@@ -35,20 +35,26 @@ pub struct ControlPlane {
 
 impl ControlPlane {
     pub async fn new(store: Store, registries: Registries) -> Arc<ControlPlane> {
-        Self::new_with_telemetry(store, registries, Arc::new(NoopTelemetry)).await
+        Self::new_with_telemetry(Arc::new(store), registries, Arc::new(NoopTelemetry)).await
     }
 
     /// Like `new`, but with an explicit telemetry backend — used by the
     /// daemon (Console/OTLP selection) and by tests asserting on emitted
     /// spans/counts.
+    ///
+    /// Takes an already-shared `Arc<Store>` (rather than an owned `Store`)
+    /// so callers that must read settings through a `Store` handle BEFORE
+    /// `ControlPlane` exists (e.g. `build_daemon`'s telemetry/harness
+    /// selection) can hold and clone the same `Arc` throughout, instead of
+    /// juggling ownership back and forth with `Arc::try_unwrap`.
     pub async fn new_with_telemetry(
-        store: Store,
+        store: Arc<Store>,
         registries: Registries,
         telemetry: Arc<dyn Telemetry>,
     ) -> Arc<ControlPlane> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(ControlPlane {
-            store: Arc::new(store),
+            store,
             registries,
             events,
             approvals: Arc::new(ApprovalHub::new()),
@@ -753,7 +759,7 @@ mod tests {
         let store = crate::store::Store::open(&db_path).await.unwrap();
         let counters = Counters::default();
         let cp = ControlPlane::new_with_telemetry(
-            store,
+            Arc::new(store),
             registries_with(false, counters.clone()),
             telemetry,
         )

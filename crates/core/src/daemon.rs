@@ -13,6 +13,7 @@ use crate::control::ControlPlane;
 use crate::domain::{ApprovalDecision, ApprovalRequest, CoreEvent, Surface};
 use crate::gateway::{Gateway, GatewayFactory};
 use crate::harness::acp::{AcpAdapterDescriptor, ClaudeCodeIntegration};
+use crate::harness::HarnessFactory;
 use crate::integration::Registries;
 use crate::policy;
 use crate::router::Router;
@@ -26,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::task::{JoinHandle, JoinSet};
 
 /// Inputs to [`build_daemon`].
 pub struct BuildDaemonOpts {
@@ -46,6 +48,17 @@ pub struct BuildDaemonOpts {
     /// `enabled_gateways` setting names (e.g. `"discord"`). 4D-b registers
     /// its gateway(s) here (directly or via an `Integration`).
     pub extra_gateway_factories: Vec<(String, Arc<dyn GatewayFactory>)>,
+    /// Harness factories to register directly (keyed by `Project.harness`),
+    /// alongside whatever `ClaudeCodeIntegration` installs under
+    /// `"claude-code"` when `enabled_runtimes` calls for it. Registered
+    /// unconditionally (registration is cheap — a `HarnessFactory` isn't
+    /// instantiated until a session actually starts), and installed AFTER
+    /// the `ClaudeCodeIntegration` step so an entry here can override it.
+    /// Empty in production today; exists so tests can wire a fake harness
+    /// through the real `build_daemon` composition (e.g. to exercise the
+    /// real spawned approval fan-out end-to-end) without spinning up an
+    /// actual ACP sidecar.
+    pub extra_harness_factories: Vec<(String, Arc<dyn HarnessFactory>)>,
 }
 
 /// A fully wired daemon: control plane, shared store handle, and the
@@ -58,12 +71,31 @@ pub struct Daemon {
     pub gateways: Vec<Arc<dyn Gateway>>,
     telemetry: Arc<dyn Telemetry>,
     stopped: AtomicBool,
+    /// The outbound `Router`'s broadcast-consumer task, tracked so `stop()`
+    /// can abort it. Otherwise it (and the `Arc<ControlPlane>` clone its
+    /// closure holds) would keep running — and keep the control plane
+    /// alive — past `stop()`.
+    router_handle: JoinHandle<()>,
+    /// The approval fan-out's broadcast-consumer task, tracked for the same
+    /// reason. Aborting it also drops its owned `JoinSet` of in-flight
+    /// per-approval `handle_approval` races (see `spawn_approval_fanout`),
+    /// so no race started before `stop()` survives it either.
+    fanout_handle: JoinHandle<()>,
 }
 
 impl Daemon {
     /// Start every gateway, then fire-and-forget `cp.reconcile()` (resumes
     /// any session a dead process left `Running`). Reconcile runs in the
     /// background so a slow/hanging resume can't block daemon startup.
+    ///
+    /// This task is deliberately left UNTRACKED (unlike `router_handle` /
+    /// `fanout_handle`): it mirrors the retired TS daemon's boot sequence,
+    /// which does not await or hold onto its reconcile call either. A
+    /// resume it kicks off is its own independent `spawn_prompt` background
+    /// turn (tracked/owned by `ControlPlane`, not by `Daemon`), so there is
+    /// nothing here for `stop()` to meaningfully cancel — this handle only
+    /// covers the `reconcile()` scan itself, which is expected to finish
+    /// quickly regardless of `Daemon`'s lifecycle.
     pub async fn start(&self) -> anyhow::Result<()> {
         for gw in &self.gateways {
             gw.start().await?;
@@ -75,8 +107,11 @@ impl Daemon {
         Ok(())
     }
 
-    /// Idempotent teardown: stop every gateway (errors swallowed — TS parity)
-    /// and flush telemetry. A second call is a no-op.
+    /// Idempotent teardown: stop every gateway (errors swallowed — TS parity),
+    /// abort the router and approval fan-out broadcast-consumer loops (which
+    /// also aborts any in-flight per-approval races the fan-out spawned —
+    /// see `spawn_approval_fanout`), then flush telemetry. A second call is
+    /// a no-op.
     pub async fn stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
@@ -84,24 +119,42 @@ impl Daemon {
         for gw in &self.gateways {
             let _ = gw.stop().await;
         }
+        self.router_handle.abort();
+        self.fanout_handle.abort();
         self.telemetry.shutdown();
+    }
+}
+
+/// Given the persisted `otel_endpoint` setting, choose the telemetry backend.
+/// A pure/unit-testable split of `build_daemon`'s telemetry-selection branch:
+/// an empty/unset endpoint selects `ConsoleTelemetry` silently (the second
+/// tuple element — "warned" — is `false`); a non-empty endpoint is meant to
+/// select an OTLP exporter behind `#[cfg(feature = "otel")]` (Task 6; the
+/// feature doesn't exist yet), so today it ALSO selects `ConsoleTelemetry`
+/// but reports `warned = true` so the caller can print the
+/// `[telemetry] OTel init failed — falling back to console` warning. The
+/// print itself is kept out of this function (rather than done here) so the
+/// selection logic is testable without capturing stderr.
+pub(crate) fn select_telemetry(otel_endpoint: &str) -> (Arc<dyn Telemetry>, bool) {
+    if otel_endpoint.trim().is_empty() {
+        (Arc::new(ConsoleTelemetry::new()), false)
+    } else {
+        (Arc::new(ConsoleTelemetry::new()), true)
     }
 }
 
 /// Build order (TS daemon parity):
 /// `Store::open` → settings → telemetry select → `Registries` (installs
-/// `ClaudeCodeIntegration` iff `enabled_runtimes` contains `"claude-code"`) →
-/// `ControlPlane::new_with_telemetry` → gateways (from `enabled_gateways` +
-/// `extra_gateway_factories` + the provider catalog) → the outbound `Router`
-/// spawned on one `cp.subscribe()` → the approval fan-out spawned on
-/// another.
+/// `ClaudeCodeIntegration` iff `enabled_runtimes` contains `"claude-code"`,
+/// then `opts.extra_harness_factories`) → `ControlPlane::new_with_telemetry`
+/// → gateways (from `enabled_gateways` + `extra_gateway_factories` + the
+/// provider catalog) → the outbound `Router` spawned on one `cp.subscribe()`
+/// → the approval fan-out spawned on another. One `Arc<Store>` is opened
+/// once and cloned throughout — no `Arc::try_unwrap` reclaiming.
 ///
 /// Telemetry selection: an explicit `opts.telemetry` override always wins;
-/// otherwise an empty/unset `otel_endpoint` setting selects `ConsoleTelemetry`.
-/// A non-empty `otel_endpoint` is meant to select an OTLP exporter behind
-/// `#[cfg(feature = "otel")]` (Task 6; the feature doesn't exist yet), so
-/// today it prints the `[telemetry] OTel init failed — falling back to
-/// console` warning and falls back to `ConsoleTelemetry` too.
+/// otherwise selection is delegated to [`select_telemetry`] (see its doc for
+/// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
 
@@ -110,16 +163,15 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         None => {
             let settings = SettingsStore::new(Arc::clone(&store));
             let endpoint = settings.get("otel_endpoint").await?.unwrap_or_default();
-            if endpoint.trim().is_empty() {
-                Arc::new(ConsoleTelemetry::new())
-            } else {
+            let (telemetry, warned) = select_telemetry(&endpoint);
+            if warned {
                 // Task 6 slots the real OTLP exporter here, behind
                 // `#[cfg(feature = "otel")]` (the feature doesn't exist yet).
                 // Until then, every configured endpoint falls back to
                 // console with this warning.
                 eprintln!("[telemetry] OTel init failed — falling back to console");
-                Arc::new(ConsoleTelemetry::new())
             }
+            telemetry
         }
     };
 
@@ -132,15 +184,13 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
             registries.install(&ClaudeCodeIntegration::new(descriptor));
         }
     }
+    for (id, factory) in opts.extra_harness_factories {
+        registries.harness.register(id, factory);
+    }
 
-    // Reclaim exclusive ownership of the store: the two `SettingsStore`
-    // clones above are already dropped (block-scoped), so this Arc has
-    // exactly one strong reference — ours.
-    let store = Arc::try_unwrap(store)
-        .map_err(|_| anyhow::anyhow!("build_daemon: store Arc has outstanding references"))?;
-
-    let cp = ControlPlane::new_with_telemetry(store, registries, Arc::clone(&telemetry)).await;
-    let store = cp.store();
+    let cp =
+        ControlPlane::new_with_telemetry(Arc::clone(&store), registries, Arc::clone(&telemetry))
+            .await;
     let settings = SettingsStore::new(Arc::clone(&store));
 
     let factories: HashMap<String, Arc<dyn GatewayFactory>> =
@@ -163,9 +213,10 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     }
 
     let router = Router::new(Arc::clone(&store), gateways.clone());
-    tokio::spawn(router.run(cp.subscribe()));
+    let router_handle = tokio::spawn(router.run(cp.subscribe()));
 
-    spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), gateways.clone());
+    let fanout_handle =
+        spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), gateways.clone());
 
     Ok(Daemon {
         cp,
@@ -173,18 +224,28 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         gateways,
         telemetry,
         stopped: AtomicBool::new(false),
+        router_handle,
+        fanout_handle,
     })
 }
 
 /// Subscribe to `cp`'s event bus and spawn one [`handle_approval`] task per
-/// `ApprovalRequested` event. Runs until the broadcast channel closes.
+/// `ApprovalRequested` event, into a `JoinSet` owned by this loop. Runs until
+/// the broadcast channel closes. Returns the loop's own `JoinHandle` so the
+/// caller (`build_daemon`/`Daemon`) can `abort()` it — which drops the loop's
+/// future, which drops its `JoinSet`, which (per `JoinSet`'s `Drop` impl)
+/// aborts every still-running `handle_approval` race spawned into it. So
+/// aborting this one handle tears down both the loop AND any in-flight
+/// per-approval work, instead of leaving orphaned untracked tasks racing
+/// against a control plane the caller believes is stopped.
 fn spawn_approval_fanout(
     cp: Arc<ControlPlane>,
     store: Arc<Store>,
     gateways: Vec<Arc<dyn Gateway>>,
-) {
+) -> JoinHandle<()> {
     let mut rx = cp.subscribe();
     tokio::spawn(async move {
+        let mut inflight: JoinSet<()> = JoinSet::new();
         loop {
             match rx.recv().await {
                 Ok(CoreEvent::ApprovalRequested {
@@ -196,7 +257,7 @@ fn spawn_approval_fanout(
                     let cp = Arc::clone(&cp);
                     let store = Arc::clone(&store);
                     let gateways = gateways.clone();
-                    tokio::spawn(async move {
+                    inflight.spawn(async move {
                         handle_approval(
                             &cp,
                             &store,
@@ -214,7 +275,7 @@ fn spawn_approval_fanout(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    })
 }
 
 /// Core approval fan-out decision, callable directly (no broadcast loop
@@ -364,7 +425,8 @@ mod tests {
     ) -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
         let (guard, path) = temp_db_path();
         let store = Store::open(&path).await.unwrap();
-        let cp = ControlPlane::new_with_telemetry(store, Registries::new(), telemetry).await;
+        let cp =
+            ControlPlane::new_with_telemetry(Arc::new(store), Registries::new(), telemetry).await;
         let store = cp.store();
         (cp, store, guard)
     }
@@ -548,6 +610,7 @@ mod tests {
             adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
+            extra_harness_factories: vec![],
         })
         .await
         .unwrap();
@@ -747,7 +810,8 @@ mod tests {
         let mut regs = Registries::new();
         regs.harness
             .register("claude-code", Arc::new(PermFakeHarnessFactory));
-        let cp = ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry)).await;
+        let cp =
+            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store();
 
         let repo = tempfile::tempdir().unwrap();
@@ -879,7 +943,8 @@ mod tests {
                 prompts: prompts.clone(),
             }),
         );
-        let cp = ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry)).await;
+        let cp =
+            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store();
         seed_project(&store, "p1").await;
         let now = crate::paths::now_ms();
@@ -906,6 +971,8 @@ mod tests {
             gateways: vec![],
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
         };
 
         daemon.start().await.unwrap();
@@ -929,14 +996,30 @@ mod tests {
     async fn daemon_stop_is_idempotent_and_stops_each_gateway_once() {
         let (_db_guard, db_path) = temp_db_path();
         let store = Store::open(&db_path).await.unwrap();
-        let cp =
-            ControlPlane::new_with_telemetry(store, Registries::new(), Arc::new(NoopTelemetry))
-                .await;
+        let cp = ControlPlane::new_with_telemetry(
+            Arc::new(store),
+            Registries::new(),
+            Arc::new(NoopTelemetry),
+        )
+        .await;
         let store = cp.store();
 
         let gw = FakeGateway::new("discord", GwBehavior::Allow);
         let stops = gw.stops.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
+
+        // Long-running "loops" standing in for the real router/fan-out
+        // tasks, so this test can assert `stop()` actually aborts them.
+        let router_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        let fanout_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
 
         let daemon = Daemon {
             cp,
@@ -944,6 +1027,8 @@ mod tests {
             gateways,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
+            router_handle,
+            fanout_handle,
         };
 
         daemon.stop().await;
@@ -953,6 +1038,248 @@ mod tests {
             stops.load(Ordering::SeqCst),
             1,
             "a second stop() must not re-invoke gateway.stop()"
+        );
+        // Give the abort a moment to actually land, then assert both
+        // tracked loops are gone — stop() must not leave them running.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            daemon.router_handle.is_finished(),
+            "stop() must abort the router loop"
+        );
+        assert!(
+            daemon.fanout_handle.is_finished(),
+            "stop() must abort the approval fan-out loop"
+        );
+    }
+
+    // ---------- (g) build_daemon: telemetry selection (Finding 4) ----------
+
+    #[test]
+    fn select_telemetry_empty_endpoint_selects_console_without_warning() {
+        let (_telemetry, warned) = select_telemetry("");
+        assert!(
+            !warned,
+            "an unset otel_endpoint must select Console without a warning"
+        );
+    }
+
+    #[test]
+    fn select_telemetry_blank_endpoint_selects_console_without_warning() {
+        let (_telemetry, warned) = select_telemetry("   ");
+        assert!(
+            !warned,
+            "a blank (whitespace-only) otel_endpoint must be treated as unset"
+        );
+    }
+
+    #[test]
+    fn select_telemetry_nonempty_endpoint_warns_and_still_falls_back_to_console() {
+        let (_telemetry, warned) = select_telemetry("http://localhost:4317");
+        assert!(
+            warned,
+            "a configured otel_endpoint must signal the fallback warning until Task 6 lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_daemon_selects_console_telemetry_when_otel_endpoint_is_unset() {
+        let (_guard, db_path) = temp_db_path();
+        // No otel_endpoint set at all — build_daemon must fall back to
+        // Console silently and still build successfully end-to-end.
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path: db_path.clone(),
+            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
+            telemetry: None,
+            extra_gateway_factories: vec![],
+            extra_harness_factories: vec![],
+        })
+        .await
+        .unwrap();
+        assert!(daemon.gateways.is_empty());
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn build_daemon_falls_back_to_console_when_otel_endpoint_is_set_without_override() {
+        let (_guard, db_path) = temp_db_path();
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            let settings = SettingsStore::new(Arc::new(store));
+            settings
+                .set("otel_endpoint", "http://localhost:4317")
+                .await
+                .unwrap();
+        }
+
+        // With no `opts.telemetry` override and a non-empty otel_endpoint,
+        // build_daemon must still build successfully (the "OTel init failed"
+        // stderr warning path, exercised end-to-end here; the warning bool
+        // itself is unit-tested directly above via `select_telemetry` since
+        // capturing stderr here would be awkward/flaky).
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path: db_path.clone(),
+            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
+            telemetry: None,
+            extra_gateway_factories: vec![],
+            extra_harness_factories: vec![],
+        })
+        .await
+        .unwrap();
+        assert!(daemon.gateways.is_empty());
+        daemon.stop().await;
+    }
+
+    // ---------- (h) the REAL spawned fan-out (Finding 1) ----------
+
+    #[tokio::test]
+    #[serial]
+    async fn build_daemon_real_fanout_lets_a_blocked_turn_complete_end_to_end() {
+        let _guard = StateDirGuard::new();
+        let (_db_guard, db_path) = temp_db_path();
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            let settings = SettingsStore::new(Arc::new(store));
+            settings.set("enabled_gateways", "discord").await.unwrap();
+            settings.set("discord.token", "tok-xyz").await.unwrap();
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let factory: Arc<dyn GatewayFactory> = Arc::new(CapturingGatewayFactory {
+            captured: captured.clone(),
+        });
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path: db_path.clone(),
+            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            extra_harness_factories: vec![(
+                "claude-code".to_string(),
+                Arc::new(PermFakeHarnessFactory) as Arc<dyn HarnessFactory>,
+            )],
+        })
+        .await
+        .unwrap();
+
+        daemon.start().await.unwrap();
+
+        // Seed a project/session/surface directly (bypassing `start_session`'s
+        // git-repo + fresh-random-session_pk machinery, which isn't needed
+        // here) so the surface is bound BEFORE the turn starts — no race with
+        // the real fan-out's `store.surfaces(session_pk)` lookup.
+        seed_project(&daemon.store, "p1").await;
+        seed_session(&daemon.store, "s1", "p1", Some("starter-1")).await;
+        daemon
+            .store
+            .add_surface("discord", "chan1", "s1")
+            .await
+            .unwrap();
+
+        let mut rx = daemon.cp.subscribe();
+        // `continue_session` drives the (registered-but-never-started) "s1"
+        // session through the SAME `PermFakeHarnessFactory` cold-resume path
+        // `handle_approval`'s unit tests already exercise directly — except
+        // here nothing in the test calls `handle_approval` itself: the
+        // `ApprovalRequested` event this emits must be picked up by the REAL
+        // `spawn_approval_fanout` task `build_daemon` wired above.
+        daemon.cp.continue_session("s1", "go").await.unwrap();
+
+        let mut saw_result = false;
+        for _ in 0..200 {
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(CoreEvent::Result { .. })) => {
+                    saw_result = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_result,
+            "the REAL spawned fan-out must pick up ApprovalRequested, get an allow decision \
+             from the FakeGateway, and let the blocked turn complete"
+        );
+
+        let msgs = daemon.store.list_messages("s1").await.unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == "assistant" && m.payload["text"] == "done"),
+            "expected the post-approval assistant row, got: {msgs:?}"
+        );
+
+        daemon.stop().await;
+    }
+
+    // ---------- (i) Daemon::stop aborts the fan-out loop (Finding 2) ----------
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_stop_aborts_fanout_so_a_later_approval_is_never_resolved() {
+        let _guard = StateDirGuard::new();
+        let (_db_guard, db_path) = temp_db_path();
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path: db_path.clone(),
+            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            extra_harness_factories: vec![(
+                "claude-code".to_string(),
+                Arc::new(PermFakeHarnessFactory) as Arc<dyn HarnessFactory>,
+            )],
+        })
+        .await
+        .unwrap();
+
+        daemon.start().await.unwrap();
+        // Stop BEFORE the session/approval even exists: this must abort the
+        // real router + fan-out loops so nothing is left listening.
+        daemon.stop().await;
+
+        seed_project(&daemon.store, "p1").await;
+        seed_session(&daemon.store, "s1", "p1", Some("starter-1")).await;
+        daemon
+            .store
+            .add_surface("discord", "chan1", "s1")
+            .await
+            .unwrap();
+
+        let mut rx = daemon.cp.subscribe();
+        // The session/harness machinery is independent of `Daemon` (it lives
+        // on `ControlPlane`), so this still runs and still emits
+        // `ApprovalRequested` — proving the request really happened. What
+        // must NOT happen is anyone resolving it, since `stop()` already
+        // killed the only listener that would have.
+        daemon.cp.continue_session("s1", "go").await.unwrap();
+
+        let mut saw_approval_requested = false;
+        let mut saw_result = false;
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(CoreEvent::ApprovalRequested { .. })) => saw_approval_requested = true,
+                Ok(Ok(CoreEvent::Result { .. })) => saw_result = true,
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_approval_requested,
+            "the blocked turn must still emit ApprovalRequested regardless of Daemon::stop()"
+        );
+        assert!(
+            !saw_result,
+            "with the fan-out loop aborted by stop(), nothing must resolve the approval, so \
+             the turn must never complete"
+        );
+
+        let msgs = daemon.store.list_messages("s1").await.unwrap();
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.role == "assistant" && m.payload["text"] == "done"),
+            "the post-approval assistant row must never appear since nothing resolved the \
+             approval: got {msgs:?}"
         );
     }
 }
