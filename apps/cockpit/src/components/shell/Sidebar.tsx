@@ -40,6 +40,33 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
 const iconBtn =
   "flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground";
 
+const guideColor = "color-mix(in srgb, var(--sidebar-foreground) 20%, var(--sidebar))";
+
+// Tree connector in front of session rows: a rounded elbow into the row, plus
+// a vertical rail continuing to the next sibling. `reach` extends the lines
+// past the row edges to bridge the 1px gaps between rows.
+function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
+  return (
+    <span aria-hidden className="relative w-6 shrink-0 self-stretch">
+      <span
+        className="absolute left-3.5 box-border w-[9px] rounded-bl-[7px]"
+        style={{
+          top: -reach,
+          height: `calc(50% + ${reach}px)`,
+          borderLeft: `1.5px solid ${guideColor}`,
+          borderBottom: `1.5px solid ${guideColor}`,
+        }}
+      />
+      {tail && (
+        <span
+          className="absolute left-3.5 box-border w-[9px]"
+          style={{ top: -reach, bottom: -reach, borderLeft: `1.5px solid ${guideColor}` }}
+        />
+      )}
+    </span>
+  );
+}
+
 export function Sidebar() {
   const { projects, sessions, setFocused, focusedSessionPk, selectProject, addProject } = useStore();
   const { pinned, archived, togglePin, toggleArchive } = useUi();
@@ -204,49 +231,57 @@ export function Sidebar() {
               </div>
               {open && (
                 <>
-                  {sess.map((s) => {
+                  {sess.map((s, i) => {
                     const m = statusMeta(s.status);
                     const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
                     const isPinned = !!pinned[s.sessionPk];
+                    const showArchivedLabel = archCount > 0 && !archivedGlobal;
+                    const hasTail = i < sess.length - 1 || showArchivedLabel;
                     return (
                       <div
                         key={s.sessionPk}
-                        className={`group flex min-h-7 items-center gap-2 rounded-md py-[5px] pl-[26px] pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""} ${archived[s.sessionPk] ? "opacity-55" : ""}`}
+                        className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[s.sessionPk] ? "opacity-55" : ""}`}
                       >
-                        <button
-                          type="button"
-                          onClick={() => openSession(s.sessionPk)}
-                          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 border-none bg-transparent p-0 text-left text-sidebar-foreground"
+                        <TreeGuide tail={hasTail} reach={3} />
+                        <span
+                          className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-[7px] pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
                         >
-                          <StatusDot color={m.color} pulse={m.pulse} />
-                          <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium">{sessionTitle(s)}</span>
-                        </button>
-                        <button
-                          type="button"
-                          title={isPinned ? "Unpin" : "Pin"}
-                          className={`h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent hover:bg-accent hover:text-accent-foreground ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
-                          onClick={() => togglePin(s.sessionPk)}
-                        >
-                          <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
-                        </button>
-                        <button
-                          type="button"
-                          title={archived[s.sessionPk] ? "Restore" : "Archive"}
-                          className="hidden h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground group-hover:flex"
-                          onClick={() => toggleArchive(s.sessionPk)}
-                        >
-                          <Archive aria-hidden size={12} strokeWidth={2} />
-                        </button>
+                          <button
+                            type="button"
+                            onClick={() => openSession(s.sessionPk)}
+                            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 border-none bg-transparent p-0 text-left text-sidebar-foreground"
+                          >
+                            <StatusDot color={m.color} pulse={m.pulse} />
+                            <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium">{sessionTitle(s)}</span>
+                          </button>
+                          <button
+                            type="button"
+                            title={isPinned ? "Unpin" : "Pin"}
+                            className={`h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent hover:bg-accent hover:text-accent-foreground ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
+                            onClick={() => togglePin(s.sessionPk)}
+                          >
+                            <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
+                          </button>
+                          <button
+                            type="button"
+                            title={archived[s.sessionPk] ? "Restore" : "Archive"}
+                            className="hidden h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground group-hover:flex"
+                            onClick={() => toggleArchive(s.sessionPk)}
+                          >
+                            <Archive aria-hidden size={12} strokeWidth={2} />
+                          </button>
+                        </span>
                       </div>
                     );
                   })}
                   {archCount > 0 && !archivedGlobal && (
                     <button
                       type="button"
-                      className="cursor-pointer rounded-sm border-none bg-transparent px-2 pb-1.5 pl-[26px] pt-1 text-left text-[11.5px] text-muted-foreground hover:text-foreground"
+                      className="flex min-h-6 cursor-pointer items-stretch rounded-sm border-none bg-transparent pr-2 text-left text-[11.5px] text-muted-foreground hover:text-foreground"
                       onClick={() => setShowArchived((m) => ({ ...m, [p.projectId]: !m[p.projectId] }))}
                     >
-                      {showArchived[p.projectId] ? "Hide archived" : `${archCount} archived`}
+                      <TreeGuide tail={false} reach={1} />
+                      <span className="self-center pl-[7px]">{showArchived[p.projectId] ? "Hide archived" : `${archCount} archived`}</span>
                     </button>
                   )}
                 </>
