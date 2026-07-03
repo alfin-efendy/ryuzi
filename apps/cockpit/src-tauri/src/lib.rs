@@ -273,8 +273,9 @@ pub fn run() {
             });
             // Subscribe BEFORE manage() moves the Arc.
             let mut rx = cp.subscribe();
-            // The scheduler loop fires enabled jobs for real (30s tick).
-            ryuzi_core::scheduler::spawn_runner(cp.clone());
+            // The scheduler loop fires enabled jobs for real (30s tick). Runs
+            // on the tauri async runtime — setup() has no ambient tokio context.
+            tauri::async_runtime::spawn(ryuzi_core::scheduler::run_loop(cp.clone()));
             // Make Arc<ControlPlane> available to all Tauri commands.
             app.manage(cp);
             // UI terminal registry (session shells over portable-pty).

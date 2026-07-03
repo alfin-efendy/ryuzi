@@ -180,6 +180,11 @@ export const useStore = create<State>((set, get) => ({
 
   init: async () => {
     await get().refresh();
-    await events.coreEventMsg.listen((e) => get().applyCoreEvent(e.payload.event));
+    await events.coreEventMsg.listen((e) => {
+      get().applyCoreEvent(e.payload.event);
+      // Sessions can be created outside UI actions (e.g. scheduler runs) —
+      // refresh the list so they appear in the sidebar immediately.
+      if (e.payload.event.kind === "sessionCreated") void get().refresh();
+    });
   },
 }));

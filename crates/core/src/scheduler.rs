@@ -467,9 +467,16 @@ async fn finalize_partial_session(store: &Store, run_id: &str, session_pk: &str)
 /// Background loop: every 30s, fire enabled jobs whose next occurrence (after
 /// the last fire) has passed. `last fired` persists in settings KV so app
 /// restarts don't re-fire missed-by-restart schedules more than once.
+///
+/// Returned as a future (not self-spawned) so hosts can run it on their own
+/// runtime — Tauri's setup hook has no ambient tokio context.
 pub fn spawn_runner(cp: Arc<ControlPlane>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
+    tokio::spawn(run_loop(cp))
+}
+
+pub async fn run_loop(cp: Arc<ControlPlane>) {
+    loop {
+        {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let store = cp.store().clone();
             let jobs = match list_jobs(&store).await {
@@ -504,7 +511,7 @@ pub fn spawn_runner(cp: Arc<ControlPlane>) -> tokio::task::JoinHandle<()> {
                 let _ = execute_job(&cp, &job).await;
             }
         }
-    })
+    }
 }
 
 #[cfg(test)]

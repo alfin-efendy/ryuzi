@@ -3,6 +3,8 @@ name = "ryuzi-cockpit"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
+# `cargo run` (tauri dev) must pick the app, not the gen-bindings helper bin.
+default-run = "ryuzi-cockpit"
 
 [lib]
 name = "ryuzi_cockpit_lib"
