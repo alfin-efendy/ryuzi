@@ -103,7 +103,11 @@ fn resolve_claude_code_executable() -> Option<String> {
     // sidecar build dir (see scripts/build-acp-sidecar.ts).
     #[cfg(debug_assertions)]
     {
-        let bin_name = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let bin_name = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
         let scope_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".sidecar-build")
             .join("node_modules")
@@ -173,7 +177,10 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::backdrop_capability,
             accent::system_accent_color,
         ])
-        .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])
+        .events(collect_events![
+            events::CoreEventMsg,
+            accent::AccentChangedMsg
+        ])
 }
 
 pub fn run() {
@@ -213,9 +220,7 @@ pub fn run() {
             // actually applied. Static windowEffects config is forbidden: Tauri
             // picks effects by platform family and swallows failures, which on
             // Win10 would yield a transparent window with no backdrop.
-            let main_window = app
-                .get_webview_window("main")
-                .expect("main window exists");
+            let main_window = app.get_webview_window("main").expect("main window exists");
             let cap = backdrop::apply_backdrop(&main_window);
             app.manage(backdrop::BackdropState(cap));
             accent::spawn_accent_watcher(app.handle());
@@ -263,16 +268,25 @@ mod tests {
 
     #[test]
     fn sdk_platform_package_maps_windows_x86_64() {
-        assert_eq!(sdk_platform_package("windows", "x86_64"), "claude-agent-sdk-win32-x64");
+        assert_eq!(
+            sdk_platform_package("windows", "x86_64"),
+            "claude-agent-sdk-win32-x64"
+        );
     }
 
     #[test]
     fn sdk_platform_package_maps_macos_aarch64() {
-        assert_eq!(sdk_platform_package("macos", "aarch64"), "claude-agent-sdk-darwin-arm64");
+        assert_eq!(
+            sdk_platform_package("macos", "aarch64"),
+            "claude-agent-sdk-darwin-arm64"
+        );
     }
 
     #[test]
     fn sdk_platform_package_maps_linux_x86_64() {
-        assert_eq!(sdk_platform_package("linux", "x86_64"), "claude-agent-sdk-linux-x64");
+        assert_eq!(
+            sdk_platform_package("linux", "x86_64"),
+            "claude-agent-sdk-linux-x64"
+        );
     }
 }

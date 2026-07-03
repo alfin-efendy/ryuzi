@@ -44,7 +44,9 @@ pub fn spawn_accent_watcher(app: &tauri::AppHandle) {
     use windows::Foundation::TypedEventHandler;
     use windows::UI::ViewManagement::UISettings;
 
-    let Ok(settings) = UISettings::new() else { return };
+    let Ok(settings) = UISettings::new() else {
+        return;
+    };
     let handle = app.clone();
     let handler = TypedEventHandler::new(move |_, _| {
         if let Some(hex) = read_accent_hex() {
