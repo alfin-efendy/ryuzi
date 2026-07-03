@@ -1,29 +1,36 @@
 import { create } from "zustand";
 import {
+  AGENT_TIERS,
   AGENTS,
   APPS,
   PROVIDERS,
   SCHEDULE_JOBS,
+  WORKSPACES,
   type AgentId,
   type AppFixture,
   type JobFixture,
+  type ModelTier,
   type PermMode,
   type ProviderFixture,
+  type RotationStrategy,
+  type WorkspaceFixture,
 } from "./fixtures";
 
 // Interactive state over the design-preview fixtures. Everything here is
 // session-local: it makes the new screens behave like the design prototype
 // until real provider/agent/scheduler/app backends land.
 
-export type AgentState = { enabled: boolean; model: string; permMode: PermMode; flags: string; version: string };
+export type AgentState = { enabled: boolean; model: string; permMode: PermMode; flags: string; version: string; tiers: ModelTier[] };
 export type ProviderState = {
   on: boolean;
   failAuto: boolean;
+  strategy: RotationStrategy;
   threshold: number;
   returnToPrimary: boolean;
   activeAccount: string;
   accountOrder: string[];
 };
+export type GatewayState = { fsMode: WorkspaceFixture["fsMode"]; daemon: string };
 
 type FixtureState = {
   defaultAgent: AgentId;
@@ -33,6 +40,7 @@ type FixtureState = {
   apps: AppFixture[];
   registryState: Record<string, "installing" | "installed">;
   activeWorkspace: string;
+  gatewayState: Record<string, GatewayState>;
 
   setDefaultAgent: (id: AgentId) => void;
   toggleAgent: (id: AgentId) => void;
@@ -41,9 +49,11 @@ type FixtureState = {
   setAgentFlags: (id: AgentId, flags: string) => void;
   applyAgentUpdate: (id: AgentId) => void;
   setAgentAppAccess: (agentId: AgentId, appId: string, on: boolean) => void;
+  setAgentTier: (id: AgentId, tierId: string, value: string | null, combo?: boolean) => void;
 
   toggleProvider: (id: string) => void;
   setFailAuto: (id: string, on: boolean) => void;
+  setStrategy: (id: string, strategy: RotationStrategy) => void;
   setThreshold: (id: string, pct: number) => void;
   setReturnToPrimary: (id: string, on: boolean) => void;
   setActiveAccount: (id: string, accountId: string) => void;
@@ -60,12 +70,21 @@ type FixtureState = {
   uninstallApp: (id: string) => void;
   installRegistry: (id: string) => void;
   setActiveWorkspace: (id: string) => void;
+  setGatewayFsMode: (id: string, mode: WorkspaceFixture["fsMode"]) => void;
+  applyGatewayUpdate: (id: string) => void;
 };
 
 function initialAgentState(): Record<AgentId, AgentState> {
   const out = {} as Record<AgentId, AgentState>;
   for (const a of Object.values(AGENTS)) {
-    out[a.id] = { enabled: a.id !== "local", model: a.model, permMode: a.permMode, flags: a.flags, version: a.version };
+    out[a.id] = {
+      enabled: a.id !== "local",
+      model: a.model,
+      permMode: a.permMode,
+      flags: a.flags,
+      version: a.version,
+      tiers: AGENT_TIERS[a.id].map((t) => ({ ...t })),
+    };
   }
   return out;
 }
@@ -76,11 +95,20 @@ function initialProviderState(): Record<string, ProviderState> {
     out[p.id] = {
       on: p.id !== "local",
       failAuto: p.failover.auto,
+      strategy: "priority",
       threshold: p.failover.threshold,
       returnToPrimary: p.failover.returnToPrimary,
       activeAccount: p.accounts[0]?.id ?? "",
       accountOrder: p.accounts.map((a) => a.id),
     };
+  }
+  return out;
+}
+
+function initialGatewayState(): Record<string, GatewayState> {
+  const out: Record<string, GatewayState> = {};
+  for (const w of WORKSPACES) {
+    out[w.id] = { fsMode: w.fsMode, daemon: w.daemon };
   }
   return out;
 }
@@ -105,6 +133,7 @@ export const useFixtures = create<FixtureState>((set) => ({
   apps: APPS,
   registryState: {},
   activeWorkspace: "local",
+  gatewayState: initialGatewayState(),
 
   setDefaultAgent: (id) => set({ defaultAgent: id }),
   toggleAgent: (id) => set((st) => mapAgents(st, id, { enabled: !st.agentState[id].enabled })),
@@ -116,9 +145,16 @@ export const useFixtures = create<FixtureState>((set) => ({
     set((st) => ({
       apps: st.apps.map((a) => (a.id === appId ? { ...a, agentAccess: { ...a.agentAccess, [agentId]: on } } : a)),
     })),
+  setAgentTier: (id, tierId, value, combo) =>
+    set((st) =>
+      mapAgents(st, id, {
+        tiers: st.agentState[id].tiers.map((t) => (t.id === tierId ? { ...t, value, combo: combo ?? false } : t)),
+      }),
+    ),
 
   toggleProvider: (id) => set((st) => mapProvider(st, id, { on: !st.providerState[id].on })),
   setFailAuto: (id, on) => set((st) => mapProvider(st, id, { failAuto: on })),
+  setStrategy: (id, strategy) => set((st) => mapProvider(st, id, { strategy })),
   setThreshold: (id, pct) => set((st) => mapProvider(st, id, { threshold: pct })),
   setReturnToPrimary: (id, on) => set((st) => mapProvider(st, id, { returnToPrimary: on })),
   setActiveAccount: (id, accountId) => set((st) => mapProvider(st, id, { activeAccount: accountId })),
@@ -150,4 +186,11 @@ export const useFixtures = create<FixtureState>((set) => ({
     }, 1400);
   },
   setActiveWorkspace: (id) => set({ activeWorkspace: id }),
+  setGatewayFsMode: (id, mode) => set((st) => ({ gatewayState: { ...st.gatewayState, [id]: { ...st.gatewayState[id], fsMode: mode } } })),
+  applyGatewayUpdate: (id) =>
+    set((st) => {
+      const latest = WORKSPACES.find((w) => w.id === id)?.daemonLatest;
+      if (!latest) return {};
+      return { gatewayState: { ...st.gatewayState, [id]: { ...st.gatewayState[id], daemon: latest } } };
+    }),
 }));

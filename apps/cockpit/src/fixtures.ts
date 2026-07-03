@@ -267,15 +267,203 @@ export const PROVIDER_CATALOG = [
 
 const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);
 
-export type WorkspaceFixture = { id: string; name: string; badge: string; detail: string; status: "connected" | "offline" };
+export type GatewayResource = { label: string; sub: string; pct: number };
+export type WorkspaceFixture = {
+  id: string;
+  name: string;
+  badge: string;
+  detail: string;
+  status: "connected" | "offline";
+  lat: string;
+  metaLine: string;
+  daemon: string;
+  daemonLatest: string;
+  uptime: string;
+  lastSeen: string;
+  resources: GatewayResource[];
+  fingerprint: string | null;
+  fsMode: "full" | "projects" | "read";
+  paths: string[];
+  log: { t: string; c: string }[];
+};
 
 export const WORKSPACES: WorkspaceFixture[] = [
-  isMac
-    ? { id: "local", name: "This Mac", badge: "MAC", detail: "macOS · Apple Silicon", status: "connected" }
-    : { id: "local", name: "This PC", badge: "WIN", detail: "Windows 11 · x64", status: "connected" },
-  { id: "wsl", name: "wsl · ubuntu", badge: "WSL", detail: "Ubuntu 22.04 · localhost", status: "connected" },
-  { id: "vps", name: "prod-sg1", badge: "VPS", detail: "Hetzner · 128.140.42.7", status: "connected" },
-  { id: "devbox", name: "devbox", badge: "SSH", detail: "ssh · 10.0.0.4:22", status: "offline" },
+  {
+    id: "local",
+    name: isMac ? "This Mac" : "This PC",
+    badge: isMac ? "MAC" : "WIN",
+    detail: isMac ? "macOS · Apple Silicon" : "Windows 11 · x64",
+    status: "connected",
+    lat: "0ms",
+    metaLine: isMac ? "macOS · Apple Silicon · 10 cores · 32 GB" : "Windows 11 · x64 · 16 cores · 32 GB",
+    daemon: "v0.3.0",
+    daemonLatest: "v0.3.0",
+    uptime: "4d 6h",
+    lastSeen: "now",
+    resources: [
+      { label: "CPU", sub: "3.1/16 cores", pct: 19 },
+      { label: "Memory", sub: "11.4/32 GB", pct: 36 },
+      { label: "Disk", sub: "410/956 GB", pct: 43 },
+    ],
+    fingerprint: null,
+    fsMode: "projects",
+    paths: ["~/Documents/repo/project", "~/dev"],
+    log: [
+      { t: "[09:12:04] session s-4821 started (claude · sentinel)", c: "var(--code-foreground)" },
+      { t: "[09:12:11] mcp github connected (oauth ok)", c: "var(--code-foreground)" },
+      { t: "[11:40:52] scheduler tick — nothing due", c: "var(--muted-foreground)" },
+      { t: "[12:00:00] job j2 run r89 finished — +6 −6 (1m 44s)", c: "#22C55E" },
+      { t: "[13:26:19] session s-4821 idle — awaiting input", c: "var(--muted-foreground)" },
+    ],
+  },
+  {
+    id: "wsl",
+    name: "wsl · ubuntu",
+    badge: "WSL",
+    detail: "Ubuntu 22.04 · localhost",
+    status: "connected",
+    lat: "1ms",
+    metaLine: "Ubuntu 22.04 · x64 · 8 cores · 16 GB",
+    daemon: "v0.3.0",
+    daemonLatest: "v0.3.0",
+    uptime: "18h 12m",
+    lastSeen: "now",
+    resources: [
+      { label: "CPU", sub: "0.8/8 cores", pct: 10 },
+      { label: "Memory", sub: "4.9/16 GB", pct: 31 },
+      { label: "Disk", sub: "88/256 GB", pct: 34 },
+    ],
+    fingerprint: null,
+    fsMode: "projects",
+    paths: ["~/repo"],
+    log: [
+      { t: "[08:02:11] daemon started (v0.3.0)", c: "var(--code-foreground)" },
+      { t: "[09:00:00] job j3 skipped — schedule disabled", c: "var(--muted-foreground)" },
+      { t: "[14:31:47] fs watcher rebuilt (2 roots)", c: "var(--muted-foreground)" },
+    ],
+  },
+  {
+    id: "vps",
+    name: "prod-sg1",
+    badge: "VPS",
+    detail: "Hetzner · 128.140.42.7",
+    status: "connected",
+    lat: "38ms",
+    metaLine: "Debian 12 · x64 · 8 cores · 16 GB · Hetzner",
+    daemon: "v0.2.9",
+    daemonLatest: "v0.3.0",
+    uptime: "31d 2h",
+    lastSeen: "now",
+    resources: [
+      { label: "CPU", sub: "5.6/8 cores", pct: 70 },
+      { label: "Memory", sub: "12.9/16 GB", pct: 81 },
+      { label: "Disk", sub: "154/160 GB", pct: 96 },
+    ],
+    fingerprint: "SHA256:Zk3mN9tYqB2wV8xR4cJ7dL1pS6aH0uE5fGkTnQoWvXs",
+    fsMode: "projects",
+    paths: ["/srv/sentinel", "/srv/web"],
+    log: [
+      { t: "[02:00:00] job j1 run r128 started", c: "var(--code-foreground)" },
+      { t: "[02:04:12] job j1 run r128 finished — +12 −4 (4m 12s)", c: "#22C55E" },
+      { t: "[06:11:38] disk usage 96% — consider pruning worktrees", c: "#F59E0B" },
+      { t: "[12:44:09] session srun1 opened from run r128", c: "var(--code-foreground)" },
+    ],
+  },
+  {
+    id: "devbox",
+    name: "devbox",
+    badge: "SSH",
+    detail: "ssh · 10.0.0.4:22",
+    status: "offline",
+    lat: "—",
+    metaLine: "ssh · 10.0.0.4:22",
+    daemon: "v0.2.7",
+    daemonLatest: "v0.3.0",
+    uptime: "—",
+    lastSeen: "2h 14m ago",
+    resources: [],
+    fingerprint: "SHA256:Ub7cP2eK9rM4xT1qW6yA8dF3jH5sL0vN2gZoRiCnEmB",
+    fsMode: "full",
+    paths: [],
+    log: [
+      { t: "[10:02:51] connection lost (ssh timeout)", c: "#EF4444" },
+      { t: "[10:03:21] retry 1 failed — host unreachable", c: "var(--muted-foreground)" },
+      { t: "[10:08:21] retry 2 failed — host unreachable", c: "var(--muted-foreground)" },
+      { t: "[12:08:21] retrying every 5m", c: "var(--muted-foreground)" },
+    ],
+  },
+];
+
+export const GW_FS_MODES: { id: WorkspaceFixture["fsMode"]; label: string; desc: string }[] = [
+  { id: "full", label: "Full", desc: "Agents may read and write anywhere the daemon user can." },
+  { id: "projects", label: "Projects only", desc: "Agents are sandboxed to the connected project folders." },
+  { id: "read", label: "Read-only", desc: "Agents can inspect files but never write outside a worktree." },
+];
+
+export type RotationStrategy = "priority" | "roundrobin" | "sticky";
+
+export const ROTATION_STRATEGIES: { id: RotationStrategy; label: string; desc: string; pill: string }[] = [
+  {
+    id: "priority",
+    label: "Priority order",
+    desc: "The top account serves requests; rotate down the list when a quota runs out.",
+    pill: "Priority rotation",
+  },
+  {
+    id: "roundrobin",
+    label: "Round-robin",
+    desc: "Spread requests evenly across every enabled account.",
+    pill: "Round-robin",
+  },
+  {
+    id: "sticky",
+    label: "Sticky sessions",
+    desc: "Each session keeps its account for cache reuse; new sessions pick the freest one.",
+    pill: "Sticky sessions",
+  },
+];
+
+// Per-tier model routing shown on the agent detail screen. "combo" tiers route
+// across models instead of pinning one.
+export type ModelTier = { id: string; label: string; value: string | null; combo?: boolean };
+
+export const AGENT_TIERS: Record<AgentId, ModelTier[]> = {
+  claude: [
+    { id: "default", label: "Default", value: "claude-opus-4-5" },
+    { id: "plan", label: "Plan", value: "claude-opus-4-5 + gpt-5.2 review", combo: true },
+    { id: "fast", label: "Fast", value: "claude-haiku-4-5" },
+  ],
+  codex: [
+    { id: "default", label: "Default", value: "gpt-5.2-codex" },
+    { id: "plan", label: "Plan", value: "gpt-5.2" },
+    { id: "fast", label: "Fast", value: null },
+  ],
+  gemini: [
+    { id: "default", label: "Default", value: "gemini-3.0-pro" },
+    { id: "plan", label: "Plan", value: null },
+    { id: "fast", label: "Fast", value: "gemini-3.0-flash" },
+  ],
+  openclaw: [
+    { id: "default", label: "Default", value: "route by task", combo: true },
+    { id: "plan", label: "Plan", value: "claude-opus-4-5" },
+    { id: "fast", label: "Fast", value: "gpt-5.2-mini" },
+  ],
+  local: [
+    { id: "default", label: "Default", value: "qwen3-coder-72b" },
+    { id: "plan", label: "Plan", value: null },
+    { id: "fast", label: "Fast", value: "deepseek-v4-lite" },
+  ],
+};
+
+// Command entries surfaced by the ⌘K palette.
+export const SEARCH_COMMANDS: { id: string; label: string; keywords: string }[] = [
+  { id: "new-session", label: "New session", keywords: "new session start compose" },
+  { id: "toggle-terminal", label: "Toggle terminal panel", keywords: "terminal bottom panel shell" },
+  { id: "toggle-right", label: "Toggle right panel", keywords: "review files right panel" },
+  { id: "gateways", label: "Manage gateways", keywords: "gateway workspace ssh daemon connect" },
+  { id: "providers", label: "Open providers", keywords: "provider quota account claude openai" },
+  { id: "scheduler", label: "New scheduled job", keywords: "schedule cron job recurring" },
+  { id: "settings", label: "Open settings", keywords: "settings appearance theme transparency" },
 ];
 
 export type JobRun = {

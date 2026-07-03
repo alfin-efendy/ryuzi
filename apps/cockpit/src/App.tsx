@@ -17,6 +17,8 @@ import { JobNewView } from "./views/JobNewView";
 import { AppsView } from "./views/AppsView";
 import { AppDetailView } from "./views/AppDetailView";
 import { RegistryView } from "./views/RegistryView";
+import { GatewaysView } from "./views/GatewaysView";
+import { GatewayDetailView } from "./views/GatewayDetailView";
 import { SettingsView } from "./views/SettingsView";
 import { Badge, Toaster } from "@ryuzi/ui";
 
@@ -47,6 +49,10 @@ function MainView() {
       return <AppDetailView id={view.id} />;
     case "registry":
       return <RegistryView />;
+    case "gateways":
+      return <GatewaysView />;
+    case "gatewayDetail":
+      return <GatewayDetailView id={view.id} />;
     case "settings":
       return <SettingsView />;
   }
@@ -61,8 +67,10 @@ export default function App() {
   }, [init]);
   return (
     <div className="relative flex h-screen flex-col overflow-hidden text-sm text-foreground antialiased">
-      {/* Wallpaper behind the acrylic chrome; collapses to transparent when an OS backdrop is active. */}
+      {/* Wallpaper behind the glass chrome; collapses to transparent when an OS backdrop is active. */}
       <div aria-hidden className="absolute inset-0 z-0" style={{ background: "var(--wallpaper)" }} />
+      {/* Full-window glass layer — one blur pass for the whole chrome. */}
+      <div aria-hidden className="acrylic-chrome absolute inset-0 z-0" />
       <TitleBar />
       {pending > 0 && (
         <div className="relative z-10 flex shrink-0 items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-700 dark:text-amber-300">
@@ -71,7 +79,7 @@ export default function App() {
       )}
       <div className="relative z-10 flex min-h-0 flex-1">
         <Sidebar />
-        <main className="acrylic-main flex min-h-0 min-w-0 flex-1 flex-col">
+        <main className="acrylic-main mx-2.5 mb-2.5 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-border shadow-sm">
           <MainView />
         </main>
       </div>

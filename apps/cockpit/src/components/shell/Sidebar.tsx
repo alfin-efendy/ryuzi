@@ -17,7 +17,6 @@ import {
   Plus,
   Server,
   Settings,
-  SquareTerminal,
 } from "lucide-react";
 import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
@@ -67,7 +66,7 @@ export function Sidebar() {
 
   return (
     <div
-      className="acrylic-chrome flex min-h-0 shrink-0 flex-col overflow-hidden border-r border-sidebar-border text-sidebar-foreground transition-[width] duration-200"
+      className="flex min-h-0 shrink-0 flex-col overflow-hidden bg-transparent text-sidebar-foreground transition-[width] duration-200"
       style={{ width: nav.sidebarOpen ? 260 : 0 }}
     >
       {/* Primary navigation */}
@@ -258,7 +257,7 @@ export function Sidebar() {
       </div>
 
       {/* Workspace / gateway switcher */}
-      <div className="relative box-border w-[260px] shrink-0 border-t border-sidebar-border px-2.5 py-2">
+      <div className="relative box-border w-[260px] shrink-0 px-2.5 py-2">
         <button
           type="button"
           onClick={() => setWorkspaceMenuOpen((v) => !v)}
@@ -298,23 +297,28 @@ export function Sidebar() {
                   <span className="block truncate text-[13px] font-semibold">{w.name}</span>
                   <span className="block truncate text-[11px] text-muted-foreground">{w.detail}</span>
                 </span>
+                <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{w.lat}</span>
                 <StatusDot color={w.status === "connected" ? "#22C55E" : "#9CA3AF"} />
               </MenuItem>
             ))}
             <MenuSeparator />
-            <MenuItem className="font-medium">
+            <MenuItem
+              className="font-medium"
+              onClick={() => {
+                setWorkspaceMenuOpen(false);
+                nav.navigate({ kind: "gateways" });
+              }}
+            >
               <Server aria-hidden size={14} strokeWidth={2} className="text-muted-foreground" />
               Connect gateway
             </MenuItem>
-            <MenuItem className="font-medium">
-              <SquareTerminal aria-hidden size={14} strokeWidth={2} className="text-muted-foreground" />
-              Connect SSH
-            </MenuItem>
-            <MenuItem className="font-medium">
-              <SquareTerminal aria-hidden size={14} strokeWidth={2} className="text-muted-foreground" />
-              Connect WSL
-            </MenuItem>
-            <MenuItem className="font-medium text-muted-foreground hover:text-accent-foreground">
+            <MenuItem
+              className="font-medium text-muted-foreground hover:text-accent-foreground"
+              onClick={() => {
+                setWorkspaceMenuOpen(false);
+                nav.navigate({ kind: "gateways" });
+              }}
+            >
               <Settings aria-hidden size={14} strokeWidth={2} />
               Manage gateways
             </MenuItem>

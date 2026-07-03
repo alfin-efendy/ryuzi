@@ -109,7 +109,7 @@ export function SessionView() {
     <div className="flex min-h-0 flex-1">
       {/* Chat column */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div className="flex shrink-0 items-center gap-3 border-b border-border px-5 py-3">
+        <div className="box-border flex h-[55px] shrink-0 items-center gap-3 border-b border-border px-5">
           <StatusDot color={meta.color} pulse={meta.pulse} size={9} />
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
@@ -301,7 +301,7 @@ export function SessionView() {
       {nav.rightOpen && (
         <div className="acrylic-panel flex w-[46%] max-w-[660px] shrink-0 flex-col border-l border-border">
           {/* Tab bar */}
-          <div className="flex shrink-0 items-center gap-1 border-b border-border px-2.5 py-2">
+          <div className="box-border flex h-[55px] shrink-0 items-center gap-1 border-b border-border px-2.5">
             {rightTabs.map((t) => {
               const sel = nav.rightTab === t.id;
               const Icon = t.icon;

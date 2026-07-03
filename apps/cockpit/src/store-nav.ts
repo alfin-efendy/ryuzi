@@ -16,6 +16,8 @@ export type View =
   | { kind: "apps" }
   | { kind: "appDetail"; id: string }
   | { kind: "registry" }
+  | { kind: "gateways" }
+  | { kind: "gatewayDetail"; id: string }
   | { kind: "settings" };
 
 export type RightTab = "review" | "term" | "file";
