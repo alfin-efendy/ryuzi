@@ -64,6 +64,52 @@ pub async fn session_workdir(cp: State<'_, Arc<ControlPlane>>, session_pk: Strin
     Ok(session_root(&cp, &session_pk).await?.to_string_lossy().into_owned())
 }
 
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeState {
+    /// Uncommitted work (staged, unstaged, or untracked).
+    pub dirty: bool,
+    /// Commits reachable only from the session branch — deleting the branch
+    /// would strand them.
+    pub unmerged_commits: u32,
+}
+
+/// What the session's OWN worktree would lose on teardown — the archive flow
+/// asks before discarding either kind of work. Sessions whose worktree is
+/// gone (or isn't a repo, e.g. an emptied leftover dir) report clean —
+/// deliberately NOT the project-workdir fallback: the main checkout's state
+/// is the user's business, not the session's.
+#[tauri::command]
+#[specta::specta]
+pub async fn worktree_dirty(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -> R<WorktreeState> {
+    let session = cp
+        .store()
+        .get_session(&session_pk)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown session: {session_pk}"),
+        })?;
+    let clean = WorktreeState {
+        dirty: false,
+        unmerged_commits: 0,
+    };
+    let Some(wt) = session.worktree_path.as_deref() else {
+        return Ok(clean);
+    };
+    if !std::path::Path::new(wt).join(".git").exists() {
+        return Ok(clean);
+    }
+    let dirty = fsview::is_dirty(wt).await?;
+    let unmerged_commits = match session.branch.as_deref() {
+        Some(branch) => fsview::unmerged_commit_count(wt, branch).await.unwrap_or(0),
+        None => 0,
+    };
+    Ok(WorktreeState {
+        dirty,
+        unmerged_commits,
+    })
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn git_diff(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -> R<String> {

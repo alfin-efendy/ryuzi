@@ -30,8 +30,12 @@ pub struct TermExitMsg {
 }
 
 struct TermHandle {
+    session_pk: String,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
+    /// Kills the shell on close — EOF alone can leave it orphaned (holding its
+    /// cwd, e.g. a session worktree pending deletion).
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
 
 #[derive(Default)]
@@ -93,6 +97,7 @@ pub async fn term_open(
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| CmdError {
         message: format!("shell spawn failed: {e}"),
     })?;
+    let killer = child.clone_killer();
     drop(pair.slave);
 
     let id = format!("t-{}", &ryuzi_core::paths::new_id()[..8]);
@@ -106,8 +111,10 @@ pub async fn term_open(
     terms.0.lock().unwrap().insert(
         id.clone(),
         TermHandle {
+            session_pk: session_pk.clone(),
             master: pair.master,
             writer,
+            killer,
         },
     );
 
@@ -177,7 +184,30 @@ pub fn term_resize(terms: State<'_, Arc<UiTerms>>, id: String, cols: u16, rows: 
 #[tauri::command]
 #[specta::specta]
 pub fn term_close(terms: State<'_, Arc<UiTerms>>, id: String) -> R<()> {
-    // Dropping the handle closes the PTY; the shell exits on EOF.
-    terms.0.lock().unwrap().remove(&id);
+    // Kill the shell explicitly, then drop the handle to close the PTY —
+    // relying on EOF alone can leave the shell orphaned with its cwd held.
+    if let Some(mut handle) = terms.0.lock().unwrap().remove(&id) {
+        let _ = handle.killer.kill();
+    }
+    Ok(())
+}
+
+/// Kill every shell opened for a session — the archive/end flow runs this
+/// BEFORE worktree teardown, or the shells' cwd handles block the directory
+/// removal on Windows.
+#[tauri::command]
+#[specta::specta]
+pub fn term_close_session(terms: State<'_, Arc<UiTerms>>, session_pk: String) -> R<()> {
+    let mut map = terms.0.lock().unwrap();
+    let ids: Vec<String> = map
+        .iter()
+        .filter(|(_, h)| h.session_pk == session_pk)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        if let Some(mut handle) = map.remove(&id) {
+            let _ = handle.killer.kill();
+        }
+    }
     Ok(())
 }

@@ -406,6 +406,21 @@ async sessionWorkdir(sessionPk: string) : Promise<Result<string, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * What the session's OWN worktree would lose on teardown — the archive flow
+ * asks before discarding either kind of work. Sessions whose worktree is
+ * gone (or isn't a repo, e.g. an emptied leftover dir) report clean —
+ * deliberately NOT the project-workdir fallback: the main checkout's state
+ * is the user's business, not the session's.
+ */
+async worktreeDirty(sessionPk: string) : Promise<Result<WorktreeState, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("worktree_dirty", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async gitDiff(sessionPk: string) : Promise<Result<string, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("git_diff", { sessionPk }) };
@@ -452,6 +467,19 @@ async termResize(id: string, cols: number, rows: number) : Promise<Result<null, 
 async termClose(id: string) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("term_close", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Kill every shell opened for a session — the archive/end flow runs this
+ * BEFORE worktree teardown, or the shells' cwd handles block the directory
+ * removal on Windows.
+ */
+async termCloseSession(sessionPk: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_close_session", { sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -570,6 +598,16 @@ export type UsagePoint = { day: string;
  * Estimated tokens that day (chars/4 over persisted transcripts).
  */
 tok: number }
+export type WorktreeState = { 
+/**
+ * Uncommitted work (staged, unstaged, or untracked).
+ */
+dirty: boolean; 
+/**
+ * Commits reachable only from the session branch — deleting the branch
+ * would strand them.
+ */
+unmergedCommits: number }
 
 /** tauri-specta globals **/
 

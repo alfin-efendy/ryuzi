@@ -24,7 +24,8 @@ type State = {
   start: (projectId: string, prompt: string) => Promise<void>;
   send: (sessionPk: string, prompt: string) => Promise<void>;
   stop: (sessionPk: string) => Promise<void>;
-  end: (sessionPk: string) => Promise<void>;
+  /** Resolves true only when the backend teardown actually succeeded. */
+  end: (sessionPk: string) => Promise<boolean>;
   resolveApproval: (requestId: string, allow: boolean) => Promise<void>;
   hydrateTranscript: (pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
   init: () => Promise<void>;
@@ -167,6 +168,7 @@ export const useStore = create<State>((set, get) => ({
       toast.error("Couldn't end session: " + res.error.message);
     }
     await get().refresh();
+    return res.status === "ok";
   },
   resolveApproval: async (requestId, allow) => {
     try {

@@ -218,12 +218,14 @@ fn make_builder() -> Builder<tauri::Wry> {
             registry_cmd::registry_search,
             fsview_cmd::list_dir,
             fsview_cmd::session_workdir,
+            fsview_cmd::worktree_dirty,
             fsview_cmd::git_diff,
             fsview_cmd::search_files,
             term::term_open,
             term::term_input,
             term::term_resize,
             term::term_close,
+            term::term_close_session,
             accent::system_accent_color,
         ])
         .events(collect_events![

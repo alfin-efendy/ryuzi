@@ -22,6 +22,8 @@ import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
+import { commands, type Session } from "@/bindings";
+import { Modal } from "@/components/modals/Modal";
 import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
 import { MenuItem, MenuPanel, MenuSectionLabel, MenuSeparator } from "@/components/common/MenuPanel";
@@ -67,8 +69,58 @@ function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
 }
 
 export function Sidebar() {
-  const { projects, sessions, setFocused, focusedSessionPk, selectProject, addProject } = useStore();
-  const { pinned, archived, togglePin, toggleArchive } = useUi();
+  const { projects, sessions, setFocused, focusedSessionPk, selectProject, addProject, end } = useStore();
+  const { pinned, archived, togglePin, setArchived } = useUi();
+  const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
+  const [archivingPk, setArchivingPk] = useState<string | null>(null);
+
+  // Archive = real teardown: end the session (interrupt + stop the agent,
+  // kill its terminals, remove the worktree and its harness/* branch), then
+  // hide the row. Work that teardown would destroy — uncommitted changes OR
+  // commits that exist only on the session branch — gets a confirmation.
+  // The row is archived ONLY when the backend teardown succeeded.
+  const finishArchive = async (s: Session) => {
+    setArchivingPk(s.sessionPk);
+    try {
+      // Shells opened for this session hold their cwd inside the worktree;
+      // kill them first or the directory removal fails on Windows.
+      await commands.termCloseSession(s.sessionPk);
+      const ok = await end(s.sessionPk);
+      if (!ok) return; // end() already toasted; leave the row visible
+      setArchived(s.sessionPk, true);
+      if (focusedSessionPk === s.sessionPk) setFocused(null);
+    } finally {
+      setArchivingPk(null);
+      setConfirmArchive(null);
+    }
+  };
+
+  const archiveSession = async (s: Session) => {
+    if (archivingPk !== null) return;
+    setArchivingPk(s.sessionPk);
+    try {
+      const res = await commands.worktreeDirty(s.sessionPk);
+      // Can't prove it's clean → treat as at-risk and ask.
+      if (res.status !== "ok") {
+        setConfirmArchive({ session: s, reason: "Cockpit couldn't inspect this session's worktree." });
+        return;
+      }
+      if (res.data.dirty || res.data.unmergedCommits > 0) {
+        const parts: string[] = [];
+        if (res.data.dirty) parts.push("uncommitted changes");
+        if (res.data.unmergedCommits > 0)
+          parts.push(
+            `${res.data.unmergedCommits} commit${res.data.unmergedCommits === 1 ? "" : "s"} that exist only on its branch`,
+          );
+        setConfirmArchive({ session: s, reason: `This session's worktree still has ${parts.join(" and ")}.` });
+        return;
+      }
+    } finally {
+      // finishArchive re-acquires the guard; release it for the modal path.
+      setArchivingPk(null);
+    }
+    await finishArchive(s);
+  };
   const nav = useNav();
   const view = nav.history.current;
   const { gateways, activeGateway, setActive: setActiveGateway, loaded: gatewaysLoaded, hydrate: hydrateGateways } = useGateways();
@@ -266,9 +318,12 @@ export function Sidebar() {
                           </button>
                           <button
                             type="button"
-                            title={archived[s.sessionPk] ? "Restore" : "Archive"}
-                            className="hidden h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground group-hover:flex"
-                            onClick={() => toggleArchive(s.sessionPk)}
+                            title={archived[s.sessionPk] ? "Restore" : "Archive — ends the session and removes its worktree"}
+                            disabled={archivingPk === s.sessionPk}
+                            className="hidden h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-40 group-hover:flex"
+                            onClick={() =>
+                              archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s)
+                            }
                           >
                             <Archive aria-hidden size={12} strokeWidth={2} />
                           </button>
@@ -362,6 +417,40 @@ export function Sidebar() {
           </MenuPanel>
         )}
       </div>
+
+      {confirmArchive && (
+        <Modal onClose={() => setConfirmArchive(null)} width={440}>
+          <div className="mb-1 flex items-center gap-2.5">
+            <Archive aria-hidden size={16} strokeWidth={2} className="text-muted-foreground" />
+            <span className="text-[15px] font-semibold tracking-[-0.01em]">Archive session?</span>
+          </div>
+          <p className="mb-1 mt-2 text-[13px] leading-[1.55] text-foreground">
+            “{sessionTitle(confirmArchive.session)}”
+          </p>
+          <p className="mb-[18px] mt-1 text-[12.5px] leading-[1.55] text-muted-foreground">
+            {confirmArchive.reason} Archiving ends the session and deletes the worktree and its{" "}
+            <span className="font-mono text-xs">{confirmArchive.session.branch ?? "harness"}</span> branch — that work is discarded and
+            unrecoverable. The transcript stays available.
+          </p>
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setConfirmArchive(null)}
+              className="h-8 cursor-pointer rounded-md border border-border bg-transparent px-3.5 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={archivingPk !== null}
+              onClick={() => void finishArchive(confirmArchive.session)}
+              className="h-8 cursor-pointer rounded-md border-none bg-destructive px-3.5 font-sans text-[12.5px] font-medium text-white hover:opacity-85 disabled:opacity-50"
+            >
+              {archivingPk !== null ? "Archiving…" : "Archive & discard work"}
+            </button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

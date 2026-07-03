@@ -40,6 +40,47 @@ pub fn list_dir(root: &Path, rel: &str) -> anyhow::Result<Vec<DirEntry>> {
     Ok(out)
 }
 
+/// Whether the working tree has uncommitted work (staged, unstaged, or
+/// untracked) — the guard before destructive worktree teardown.
+pub async fn is_dirty(workdir: &str) -> anyhow::Result<bool> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C", workdir, "status", "--porcelain"])
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(!out.stdout.is_empty())
+}
+
+/// Commits reachable from the worktree's HEAD but from no other ref — work
+/// that would become unreachable if the session branch were deleted. Guards
+/// teardown of worktrees where the agent committed instead of leaving edits.
+pub async fn unmerged_commit_count(workdir: &str, branch: &str) -> anyhow::Result<u32> {
+    // NOT --all: it includes HEAD, which would negate the very commits we're
+    // counting. Enumerate every OTHER branch/tag/remote instead (--exclude
+    // applies to the next enumerator only, and patterns for --branches are
+    // matched without the refs/heads/ prefix).
+    let exclude = format!("--exclude={branch}");
+    let out = tokio::process::Command::new("git")
+        .args([
+            "-C", workdir, "rev-list", "--count", "HEAD", "--not",
+            &exclude, "--branches", "--tags", "--remotes",
+        ])
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0))
+}
+
 /// The working tree's diff against HEAD (staged + unstaged), unified format.
 pub async fn git_diff(workdir: &str) -> anyhow::Result<String> {
     let out = tokio::process::Command::new("git")
@@ -123,6 +164,44 @@ mod tests {
         assert!(list_dir(tmp.path(), "../..").is_err());
         assert!(jail(tmp.path(), "C:\\Windows").is_err() || cfg!(not(windows)));
         assert!(jail(tmp.path(), "src/../..").is_err());
+    }
+
+    #[tokio::test]
+    async fn dirty_and_unmerged_detection_on_a_real_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+
+        // Clean checkout on a session branch that matches main → nothing at risk.
+        git(&["checkout", "-b", "harness/abc123"]);
+        assert!(!is_dirty(&dir).await.unwrap());
+        assert_eq!(unmerged_commit_count(&dir, "harness/abc123").await.unwrap(), 0);
+
+        // Uncommitted (untracked) work → dirty.
+        std::fs::write(tmp.path().join("b.txt"), "b").unwrap();
+        assert!(is_dirty(&dir).await.unwrap());
+
+        // Committed work that exists ONLY on the session branch → unmerged.
+        git(&["add", "."]);
+        git(&["commit", "-m", "session work"]);
+        assert!(!is_dirty(&dir).await.unwrap());
+        assert_eq!(unmerged_commit_count(&dir, "harness/abc123").await.unwrap(), 1);
     }
 
     #[test]

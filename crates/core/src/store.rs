@@ -446,6 +446,20 @@ impl Store {
         Ok(())
     }
 
+    /// Forget a torn-down worktree: the path and branch are gone from disk, so
+    /// later cold-resumes must fall back to the project workdir.
+    pub async fn clear_session_worktree(&self, pk: &str) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET worktree_path=NULL, branch=NULL WHERE session_pk=?1",
+                params![pk],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
     pub async fn update_agent_session_id(
         &self,
         pk: &str,
@@ -785,6 +799,19 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_session_worktree_forgets_path_and_branch() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_project(sample_project()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+
+        store.clear_session_worktree("s1").await.unwrap();
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.worktree_path, None);
+        assert_eq!(got.branch, None);
     }
 
     #[tokio::test]

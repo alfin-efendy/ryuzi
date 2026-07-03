@@ -190,28 +190,42 @@ impl ControlPlane {
                 // Cold-resume path: the in-memory handle is gone (e.g. after an
                 // app restart). Start a FRESH session that resumes the prior
                 // conversation via `session/load` using the persisted agent id.
-                let project = self
-                    .store
-                    .get_project(&session.project_id)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("unknown project: {}", session.project_id)
-                    })?;
-                let work_dir = session
-                    .worktree_path
-                    .clone()
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| std::path::PathBuf::from(&project.workdir));
-                self.start_harness_session(
-                    &project,
-                    session_pk,
-                    &work_dir,
-                    session.agent_session_id.clone(),
-                )
-                .await?
-                // `start_harness_session` already persists any resolved
-                // agent_session_id, and `spawn_prompt` persists it post-turn,
-                // so no redundant `update_agent_session_id` is needed here.
+                let resume = async {
+                    let project = self
+                        .store
+                        .get_project(&session.project_id)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("unknown project: {}", session.project_id)
+                        })?;
+                    let work_dir = session
+                        .worktree_path
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                        .filter(|p| p.exists())
+                        .unwrap_or_else(|| std::path::PathBuf::from(&project.workdir));
+                    self.start_harness_session(
+                        &project,
+                        session_pk,
+                        &work_dir,
+                        session.agent_session_id.clone(),
+                    )
+                    .await
+                    // `start_harness_session` already persists any resolved
+                    // agent_session_id, and `spawn_prompt` persists it post-turn,
+                    // so no redundant `update_agent_session_id` is needed here.
+                }
+                .await;
+                match resume {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        // Roll back the optimistic Running write above —
+                        // otherwise a failed resume wedges the session in a
+                        // false "running" state with no live handle.
+                        let _ = self.store.demote_if_running(session_pk, now_ms()).await;
+                        return Err(e);
+                    }
+                }
             }
         };
         self.spawn_prompt(handle, session_pk.to_string(), prompt.to_string());
@@ -325,13 +339,24 @@ impl ControlPlane {
     pub async fn end_session(&self, session_pk: &str) -> anyhow::Result<()> {
         let handle = self.running.lock().unwrap().remove(session_pk);
         if let Some(handle) = handle {
+            // Interrupt any in-flight turn first so teardown doesn't race a
+            // still-working agent inside the worktree we're about to delete.
+            let _ = handle.cancel().await;
             let _ = handle.end().await;
         }
         if let Some(session) = self.store.get_session(session_pk).await? {
             if let Some(project) = self.store.get_project(&session.project_id).await? {
                 if let Some(wt) = &session.worktree_path {
                     let short: String = session_pk.chars().take(8).collect();
-                    let _ = worktree::remove(Path::new(&project.workdir), &short, Path::new(wt));
+                    let _ = worktree::remove(
+                        Path::new(&project.workdir),
+                        &short,
+                        session.branch.as_deref(),
+                        Path::new(wt),
+                    );
+                    // Forget the deleted path so a later continue cold-resumes
+                    // into the project workdir instead of a dead directory.
+                    let _ = self.store.clear_session_worktree(session_pk).await;
                 }
             }
         }
@@ -687,6 +712,79 @@ mod tests {
         // Two ACP sessions created total: the initial start + the cold resume.
         assert_eq!(counters.starts.load(Ordering::SeqCst), 2);
         assert_eq!(counters.sends.load(Ordering::SeqCst), 2);
+    }
+
+    /// Factory that works for the first session but fails every later create —
+    /// models "the adapter can't come back up" for cold-resume paths.
+    struct FailingResumeFactory {
+        counters: Counters,
+    }
+
+    impl HarnessFactory for FailingResumeFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            if self.counters.starts.load(Ordering::SeqCst) >= 1 {
+                anyhow::bail!("adapter unavailable");
+            }
+            Ok(Arc::new(FakeHarness {
+                block_until_cancel: false,
+                counters: self.counters.clone(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_cold_resume_rolls_back_the_running_status() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(db.path()).await.unwrap();
+        let counters = Counters::default();
+        let mut regs = Registries::new();
+        regs.harness.register(
+            "claude-code",
+            Arc::new(FailingResumeFactory {
+                counters: counters.clone(),
+            }),
+        );
+        let cp = ControlPlane::new(store, regs).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        let session = cp.start_session(&project.project_id, "first").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Simulate a restart, then a resume whose harness can't start.
+        cp.running.lock().unwrap().remove(&session.session_pk);
+        let err = cp
+            .continue_session(&session.session_pk, "second")
+            .await
+            .expect_err("resume must fail when the harness can't start");
+        assert!(err.to_string().contains("adapter unavailable"));
+
+        // The optimistic Running write must be rolled back — a wedged
+        // "running" session with no live handle is unrecoverable in the UI.
+        let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+        assert_ne!(stored[0].status, crate::domain::SessionStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn end_session_clears_the_stale_worktree_path() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(db.path()).await.unwrap();
+        let cp = ControlPlane::new(store, registries(false)).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        let session = cp.start_session(&project.project_id, "go").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(session.worktree_path.is_some());
+
+        cp.end_session(&session.session_pk).await.unwrap();
+        let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+        // The path is forgotten, so a later continue cold-resumes into the
+        // project workdir instead of the deleted directory.
+        assert_eq!(stored[0].worktree_path, None);
+        assert_eq!(stored[0].branch, None);
     }
 
     #[tokio::test]

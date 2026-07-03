@@ -84,6 +84,8 @@ type UiState = {
   setActiveTab: (id: string) => void;
   togglePin: (sessionPk: string) => void;
   toggleArchive: (sessionPk: string) => void;
+  /** Idempotent write — archive flows must not race a pure toggle. */
+  setArchived: (sessionPk: string, on: boolean) => void;
 };
 
 export const useUi = create<UiState>((set, get) => ({
@@ -144,6 +146,13 @@ export const useUi = create<UiState>((set, get) => ({
   },
   toggleArchive: (sessionPk) => {
     const archived = toggleKey(get().archived, sessionPk);
+    persist(KEY.archived, JSON.stringify(archived));
+    set({ archived });
+  },
+  setArchived: (sessionPk, on) => {
+    const archived = { ...get().archived };
+    if (on) archived[sessionPk] = true;
+    else delete archived[sessionPk];
     persist(KEY.archived, JSON.stringify(archived));
     set({ archived });
   },
