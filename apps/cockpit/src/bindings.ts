@@ -110,6 +110,50 @@ async updateProject(projectId: string, model: string | null, permMode: PermMode,
     else return { status: "error", error: e  as any };
 }
 },
+async listAgents() : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_agents") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Re-probe every catalog agent (PATH + --version + npm latest + local model
+ * list for ollama), persist the snapshot, and return the fresh assembly.
+ */
+async refreshAgents() : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_agents") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateAgent(id: string, enabled: boolean, model: string | null, permMode: string, flags: string) : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_agent", { id, enabled, model, permMode, flags }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setAgentTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_agent_tier", { id, tierId, value, combo }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setDefaultAgent(id: string) : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_default_agent", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 }
@@ -133,6 +177,11 @@ coreEventMsg: "core-event-msg"
 /** user-defined types **/
 
 export type AccentChangedMsg = { hex: string }
+export type AgentInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
+/**
+ * Whether Cockpit has a session harness for this agent today.
+ */
+runnable: boolean }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CmdError = { message: string }
 /**
@@ -149,6 +198,7 @@ export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
+export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 
 /** tauri-specta globals **/
 

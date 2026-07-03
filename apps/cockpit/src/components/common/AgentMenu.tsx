@@ -1,41 +1,50 @@
-import { AGENT_IDS, AGENTS, type AgentId } from "@/fixtures";
+import { useAgents } from "@/store-agents";
 import { MenuItem, MenuPanel, MenuSectionLabel } from "./MenuPanel";
 import { StatusDot } from "./bits";
 
-// "Run with" agent picker shared by the home and session composers.
+// "Run with" agent picker shared by the home and session composers. Lists
+// enabled agents from the real catalog; agents without a session harness yet
+// are shown disabled so the picker never promises what can't run.
 export function AgentMenu({
   value,
   onPick,
   onClose,
   className,
 }: {
-  value: AgentId;
-  onPick: (id: AgentId) => void;
+  value: string;
+  onPick: (id: string) => void;
   onClose: () => void;
   className?: string;
 }) {
+  const agents = useAgents((s) => s.agents);
+  const visible = agents.filter((a) => a.enabled && a.binaryPath);
   return (
     <MenuPanel onClose={onClose} className={className ?? "bottom-11 right-[78px] z-40 w-[280px]"}>
       <MenuSectionLabel>Run with</MenuSectionLabel>
-      {AGENT_IDS.map((id) => {
-        const a = AGENTS[id];
-        return (
-          <MenuItem
-            key={id}
-            selected={value === id}
-            onClick={() => {
-              onPick(id);
-              onClose();
-            }}
-          >
-            <StatusDot color={a.color} size={9} />
-            <span className="min-w-0 flex-1">
-              <span className="block text-[13px] font-medium">{a.name}</span>
-              <span className="block text-[11.5px] text-muted-foreground">{a.model}</span>
+      {visible.length === 0 && (
+        <div className="px-3 py-2 text-[12px] text-muted-foreground">
+          No agents detected — install a CLI agent (e.g. Claude Code) and refresh in Agents.
+        </div>
+      )}
+      {visible.map((a) => (
+        <MenuItem
+          key={a.id}
+          selected={value === a.id}
+          onClick={() => {
+            if (!a.runnable) return;
+            onPick(a.id);
+            onClose();
+          }}
+        >
+          <StatusDot color={a.color} size={9} />
+          <span className={`min-w-0 flex-1 ${a.runnable ? "" : "opacity-50"}`}>
+            <span className="block text-[13px] font-medium">{a.name}</span>
+            <span className="block text-[11.5px] text-muted-foreground">
+              {a.runnable ? a.model || a.connection : "Session harness coming soon"}
             </span>
-          </MenuItem>
-        );
-      })}
+          </span>
+        </MenuItem>
+      ))}
     </MenuPanel>
   );
 }

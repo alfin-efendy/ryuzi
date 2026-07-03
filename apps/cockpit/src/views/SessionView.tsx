@@ -19,7 +19,8 @@ import {
 import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type RightTab } from "@/store-nav";
-import { AGENTS, CODE_LINES, REVIEW_FILES, TERM_LINES, TREE_ITEMS, type DiffLine } from "@/fixtures";
+import { CODE_LINES, REVIEW_FILES, TERM_LINES, TREE_ITEMS, type DiffLine } from "@/fixtures";
+import { agentById, defaultAgentOf, useAgents } from "@/store-agents";
 import { statusMeta } from "@/lib/status";
 import { basename } from "@/lib/paths";
 import { projectLabel } from "@/lib/sidebar";
@@ -68,7 +69,8 @@ export function SessionView() {
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
   // Persisted transcripts can carry empty text blocks (e.g. tool-only turns); skip them.
   const lines = ((focusedSessionPk && transcripts[focusedSessionPk]) || []).filter((l) => l.kind !== "text" || l.text.trim().length > 0);
-  const agent = AGENTS[nav.composerAgent];
+  const agents = useAgents((s) => s.agents);
+  const agent = agentById(agents, nav.composerAgent) ?? defaultAgentOf(agents);
   const project = projects.find((p) => p.projectId === session?.projectId);
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
 
@@ -114,9 +116,7 @@ export function SessionView() {
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
             <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-              <span>
-                {agent.name} · {agent.model}
-              </span>
+              <span>{agent ? `${agent.name} · ${agent.model || agent.connection}` : "No agent detected"}</span>
               {session.branch && (
                 <span className="inline-flex items-center gap-1">
                   <GitBranch aria-hidden size={11} strokeWidth={2} />
@@ -177,8 +177,8 @@ export function SessionView() {
             return (
               <div key={key} className="flex max-w-[82%] flex-col text-[13.5px] leading-relaxed text-foreground">
                 <div className="mb-1 flex items-center gap-1.5 text-[11.5px] font-semibold text-muted-foreground">
-                  <StatusDot color={agent.color} />
-                  {agent.name}
+                  <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
+                  {agent?.name ?? "Agent"}
                 </div>
                 <div className="whitespace-pre-wrap">{line.text}</div>
               </div>
@@ -188,7 +188,7 @@ export function SessionView() {
             <div className="flex items-center gap-2 text-[12.5px] text-muted-foreground">
               <span
                 className="h-2 w-2 rounded-full"
-                style={{ background: agent.color, animation: "relay-pulse 1.2s ease-in-out infinite" }}
+                style={{ background: agent?.color ?? "var(--muted-foreground)", animation: "relay-pulse 1.2s ease-in-out infinite" }}
               />
               Working…
             </div>
@@ -235,8 +235,8 @@ export function SessionView() {
                 onClick={() => setAgentMenuOpen((v) => !v)}
                 className="flex h-7 cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2 font-sans text-xs font-semibold text-foreground hover:bg-accent"
               >
-                <StatusDot color={agent.color} />
-                {agent.model}
+                <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
+                {agent?.model || agent?.name || "No agent"}
                 <ChevronDown aria-hidden size={11} strokeWidth={2} />
               </button>
               <button

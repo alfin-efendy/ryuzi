@@ -82,11 +82,26 @@ impl ControlPlane {
         project_id: &str,
         prompt: &str,
     ) -> anyhow::Result<Session> {
-        let project = self
+        let mut project = self
             .store
             .get_project(project_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
+
+        // Projects without pinned settings inherit the default agent's
+        // configured model / permission mode (Agents screen → real effect).
+        if project.model.is_none() || project.perm_mode == PermMode::Default {
+            if let Ok(defaults) = crate::agents::session_defaults(&self.store).await {
+                if project.model.is_none() {
+                    project.model = defaults.model;
+                }
+                if project.perm_mode == PermMode::Default {
+                    if let Some(pm) = defaults.perm_mode {
+                        project.perm_mode = pm;
+                    }
+                }
+            }
+        }
 
         let session_pk = new_id();
         let short: String = session_pk.chars().take(8).collect();

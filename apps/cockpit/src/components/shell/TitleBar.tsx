@@ -4,7 +4,8 @@ import { ArrowLeft, ArrowRight, CornerDownLeft, FileText, PanelLeft, Search, Squ
 import { useStore, type Line } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
-import { AGENTS, SEARCH_COMMANDS } from "@/fixtures";
+import { SEARCH_COMMANDS } from "@/constants";
+import { agentById, defaultAgentOf, useAgents } from "@/store-agents";
 import { projectLabel, sessionTitle } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
 import { useClickOutside } from "@/components/common/MenuPanel";
@@ -43,6 +44,8 @@ export function TitleBar() {
   const nav = useNav();
   const { goBack, goForward, toggleSidebar, searchQuery, setSearchQuery } = nav;
   const { projects, sessions, transcripts, setFocused } = useStore();
+  const agents = useAgents((s) => s.agents);
+  const sessionAgent = agentById(agents, nav.composerAgent) ?? defaultAgentOf(agents);
   const ui = useUi();
   const searchRef = useRef<HTMLInputElement>(null);
   const [searchFocused, setSearchFocused] = useState(false);
@@ -192,7 +195,8 @@ export function TitleBar() {
                           )}
                         </span>
                         <span className="shrink-0 text-[11px] text-muted-foreground">
-                          {project ? projectLabel(project) : s.projectId} · {AGENTS[nav.composerAgent].name}
+                          {project ? projectLabel(project) : s.projectId}
+                          {sessionAgent ? ` · ${sessionAgent.name}` : ""}
                         </span>
                       </button>
                     );

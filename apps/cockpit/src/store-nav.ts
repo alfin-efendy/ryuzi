@@ -1,5 +1,7 @@
 import { create } from "zustand";
-import type { AgentId } from "./fixtures";
+
+// Agent ids come from the engine's agent catalog (see store-agents).
+export type AgentId = string;
 
 // View router for the Relay v3 shell. Session focus itself stays in the main
 // store (focusedSessionPk); this store only decides which screen is showing.

@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod approval;
 pub mod connector;
 pub mod control;

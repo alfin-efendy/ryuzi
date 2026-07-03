@@ -1,51 +1,43 @@
-import { Layers, MonitorUp, X } from "lucide-react";
+import { Copy, Layers, MonitorUp, X } from "lucide-react";
 import { useState } from "react";
+import { toast } from "sonner";
 import { Chip, Pill } from "@/components/common/bits";
 import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { MenuItem, MenuPanel, MenuSeparator } from "@/components/common/MenuPanel";
 import { Segmented } from "@/components/common/Segmented";
 import { Switch } from "@/components/common/Switch";
-import { type AgentId, AGENTS, PERM_MODES } from "@/fixtures";
-import { useFixtures } from "@/store-fixtures";
+import { PERM_MODES } from "@/constants";
+import { agentById, useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
 
 const WARN = "#F59E0B";
 
-function ChangelogNote({ note }: { note: string }) {
-  return (
-    <div className="flex items-baseline gap-2 text-[12.5px] text-muted-foreground">
-      <span className="h-1 w-1 shrink-0 -translate-y-[2px] rounded-full bg-muted-foreground" />
-      {note}
-    </div>
-  );
-}
-
-// Agent detail: update banner, model/permission/flags configuration, per-app
-// access toggles, and the installed version with its changelog.
+// Agent detail: real detection state, update banner with the actual install
+// command, model/permission/flags configuration, and per-tier model routing.
 export function AgentDetailView({ id }: { id: string }) {
-  const agentId = id as AgentId;
-  const agent = AGENTS[agentId];
-  const {
-    defaultAgent,
-    agentState,
-    apps,
-    setDefaultAgent,
-    toggleAgent,
-    setAgentPerm,
-    setAgentFlags,
-    applyAgentUpdate,
-    setAgentAppAccess,
-    setAgentTier,
-  } = useFixtures();
+  const { agents, refreshing, refresh, update, setTier, setDefault } = useAgents();
   const navigate = useNav((s) => s.navigate);
   const [openTierMenu, setOpenTierMenu] = useState<string | null>(null);
 
-  const st = agentState[agentId];
-  const isDefault = defaultAgent === agentId;
-  const hasUpdate = st.version !== agent.latest;
-  const updateNotes = agent.changelog.find((c) => c.v === agent.latest)?.notes ?? [];
-  const permDesc = PERM_MODES.find((m) => m.id === st.permMode)?.desc ?? "";
+  const agent = agentById(agents, id);
+  if (!agent) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center text-[13px] text-muted-foreground">
+        Unknown agent.
+      </div>
+    );
+  }
+
+  const installed = agent.binaryPath !== null;
+  const isDefault = agent.isDefault;
+  const hasUpdate =
+    installed &&
+    agent.latestVersion !== null &&
+    agent.installedVersion !== null &&
+    agent.latestVersion !== agent.installedVersion;
+  const updateCmd = agent.npmPackage ? `npm install -g ${agent.npmPackage}` : null;
+  const permDesc = PERM_MODES.find((m) => m.id === agent.permMode)?.desc ?? "";
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
@@ -56,37 +48,43 @@ export function AgentDetailView({ id }: { id: string }) {
           chip={<Chip initial={agent.initial} color={agent.color} size={44} />}
           title={agent.name}
           titleExtra={isDefault ? <Pill variant="primary">Default</Pill> : undefined}
-          sub={`${agent.connection} · ${agent.binary}`}
+          sub={installed ? `${agent.connection} · ${agent.binaryPath}` : `${agent.connection} · not installed`}
         >
-          {!isDefault && st.enabled && (
+          {!isDefault && agent.enabled && installed && (
             <button
               type="button"
-              onClick={() => setDefaultAgent(agentId)}
+              onClick={() => void setDefault(agent.id)}
               className="h-8 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
             >
               Make default
             </button>
           )}
-          <Switch on={st.enabled} onToggle={() => toggleAgent(agentId)} label="Enabled" />
+          <Switch
+            on={agent.enabled && installed}
+            onToggle={() => installed && void update(agent.id, { enabled: !agent.enabled })}
+            label="Enabled"
+          />
         </DetailHeader>
 
-        {hasUpdate && (
+        {hasUpdate && updateCmd && (
           <Card className="mb-3 flex items-start gap-3 px-[18px] py-3.5">
             <MonitorUp aria-hidden size={16} strokeWidth={2} className="mt-px shrink-0" style={{ color: WARN }} />
             <div className="min-w-0 flex-1">
-              <div className="text-[13.5px] font-semibold">Update available — {agent.latest}</div>
-              <div className="mt-1.5 flex flex-col gap-[2px]">
-                {updateNotes.map((n) => (
-                  <ChangelogNote key={n} note={n} />
-                ))}
+              <div className="text-[13.5px] font-semibold">
+                Update available — {agent.latestVersion} (installed {agent.installedVersion})
               </div>
+              <div className="mt-1.5 font-mono text-xs text-muted-foreground">{updateCmd}</div>
             </div>
             <button
               type="button"
-              onClick={() => applyAgentUpdate(agentId)}
-              className="h-[30px] shrink-0 cursor-pointer rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85"
+              onClick={() => {
+                void navigator.clipboard.writeText(updateCmd);
+                toast.success("Update command copied");
+              }}
+              className="flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85"
             >
-              Update now
+              <Copy aria-hidden size={12} strokeWidth={2} />
+              Copy command
             </button>
           </Card>
         )}
@@ -99,7 +97,7 @@ export function AgentDetailView({ id }: { id: string }) {
             <span className="text-[13px] font-medium">Model mapping</span>
             <span className="text-[11.5px] text-muted-foreground">Route each tier to any model or combo</span>
           </div>
-          {st.tiers.map((tier) => (
+          {agent.tiers.map((tier) => (
             <div key={tier.id} className="relative flex items-center gap-2.5 px-[18px] py-[7px]">
               <span className="w-[100px] shrink-0 text-[12.5px] font-medium text-muted-foreground">{tier.label}</span>
               <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-input bg-background pl-3 pr-1">
@@ -116,7 +114,7 @@ export function AgentDetailView({ id }: { id: string }) {
                       type="button"
                       title="Clear"
                       aria-label={`Clear ${tier.label} model`}
-                      onClick={() => setAgentTier(agentId, tier.id, null)}
+                      onClick={() => void setTier(agent.id, tier.id, null)}
                       className="flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent p-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                     >
                       <X aria-hidden size={12} strokeWidth={2} />
@@ -135,12 +133,17 @@ export function AgentDetailView({ id }: { id: string }) {
               </button>
               {openTierMenu === tier.id && (
                 <MenuPanel onClose={() => setOpenTierMenu(null)} className="right-[18px] top-[42px] w-[240px]">
+                  {agent.models.length === 0 && (
+                    <div className="px-3 py-2 text-[12px] text-muted-foreground">
+                      No models detected{agent.id === "ollama" ? " — pull one with `ollama pull`" : ""}.
+                    </div>
+                  )}
                   {agent.models.map((m) => (
                     <MenuItem
                       key={m}
                       selected={!tier.combo && tier.value === m}
                       onClick={() => {
-                        setAgentTier(agentId, tier.id, m);
+                        void setTier(agent.id, tier.id, m);
                         setOpenTierMenu(null);
                       }}
                     >
@@ -151,7 +154,7 @@ export function AgentDetailView({ id }: { id: string }) {
                   <MenuItem
                     selected={tier.combo === true}
                     onClick={() => {
-                      setAgentTier(agentId, tier.id, "route by task", true);
+                      void setTier(agent.id, tier.id, "route by task", true);
                       setOpenTierMenu(null);
                     }}
                   >
@@ -167,79 +170,63 @@ export function AgentDetailView({ id }: { id: string }) {
               <span className="flex-1 text-[13px] font-medium">Permission mode</span>
               <Segmented
                 options={PERM_MODES.map((m) => ({ id: m.id, label: m.label }))}
-                value={st.permMode}
-                onChange={(mode) => setAgentPerm(agentId, mode)}
+                value={agent.permMode as (typeof PERM_MODES)[number]["id"]}
+                onChange={(mode) => void update(agent.id, { permMode: mode })}
               />
             </div>
             <div className="text-right text-[11.5px] text-muted-foreground">{permDesc}</div>
           </div>
           <CardRow>
+            <span className="w-[110px] shrink-0 text-[13px] font-medium">Default model</span>
+            <span className="flex-1 truncate font-mono text-xs text-muted-foreground">{agent.model || "engine default"}</span>
+          </CardRow>
+          <CardRow>
             <span className="w-[110px] shrink-0 text-[13px] font-medium">CLI flags</span>
             <input
-              value={st.flags}
-              onChange={(e) => setAgentFlags(agentId, e.target.value)}
+              defaultValue={agent.flags}
+              onBlur={(e) => {
+                if (e.target.value !== agent.flags) void update(agent.id, { flags: e.target.value });
+              }}
               placeholder="No extra flags"
               className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-xs text-foreground"
             />
           </CardRow>
           <CardRow>
             <span className="w-[110px] shrink-0 text-[13px] font-medium">Binary</span>
-            <span className="flex-1 truncate font-mono text-xs text-muted-foreground">{agent.binary}</span>
-            <button
-              type="button"
-              className="h-[27px] shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-[11px] font-sans text-xs font-medium text-foreground hover:bg-accent"
-            >
-              Reveal
-            </button>
+            <span className="flex-1 truncate font-mono text-xs text-muted-foreground">
+              {agent.binaryPath ?? "not found on PATH"}
+            </span>
           </CardRow>
-        </Card>
-
-        <Card className="mb-3">
-          <CardHeader>
-            <CardTitle>App access</CardTitle>
-            <CardHint>Which installed apps this agent may call</CardHint>
-          </CardHeader>
-          {apps.map((app) => (
-            <CardRow key={app.id} className="py-[11px]">
-              <Chip initial={app.initial} color={app.color} size={28} mono />
-              <span className="min-w-0 flex-1">
-                <span className="block text-[13px] font-medium">{app.name}</span>
-                <span className="block text-[11px] text-muted-foreground">{app.kind}</span>
-              </span>
-              <Switch
-                on={app.agentAccess[agentId]}
-                onToggle={() => setAgentAppAccess(agentId, app.id, !app.agentAccess[agentId])}
-                label={`${app.name} access`}
-              />
-            </CardRow>
-          ))}
         </Card>
 
         <Card>
           <CardHeader>
             <CardTitle>Version</CardTitle>
-            <span className="font-mono text-[11.5px] text-muted-foreground">{st.version} installed</span>
+            <span className="font-mono text-[11.5px] text-muted-foreground">
+              {installed
+                ? `${agent.installedVersion ?? "unknown"} installed${agent.latestVersion ? ` · ${agent.latestVersion} latest` : ""}`
+                : "not installed"}
+            </span>
             <span className="flex-1" />
             <button
               type="button"
-              className="h-[27px] shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-[11px] font-sans text-xs font-medium text-foreground hover:bg-accent"
+              onClick={() => void refresh()}
+              disabled={refreshing}
+              className="h-[27px] shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-[11px] font-sans text-xs font-medium text-foreground hover:bg-accent disabled:opacity-50"
             >
-              Check for updates
+              {refreshing ? "Checking…" : "Check for updates"}
             </button>
           </CardHeader>
-          {agent.changelog.map((cl) => (
-            <div key={cl.v} className="border-b border-border px-[18px] py-3 last:border-b-0">
-              <div className="flex items-baseline gap-2.5">
-                <span className="font-mono text-[12.5px] font-semibold">{cl.v}</span>
-                <span className="text-[11.5px] text-muted-foreground">{cl.date}</span>
-              </div>
-              <div className="mt-[5px] flex flex-col gap-[2px]">
-                {cl.notes.map((n) => (
-                  <ChangelogNote key={n} note={n} />
-                ))}
-              </div>
-            </div>
-          ))}
+          <div className="px-[18px] py-3 text-[12.5px] text-muted-foreground">
+            {agent.npmPackage ? (
+              <>
+                Published as <span className="font-mono text-xs">{agent.npmPackage}</span> on npm.
+                {!hasUpdate && installed && agent.latestVersion ? " You're up to date." : ""}
+              </>
+            ) : (
+              "Version updates are managed by the agent's own installer."
+            )}
+          </div>
         </Card>
       </div>
     </div>

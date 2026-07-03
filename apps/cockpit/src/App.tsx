@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useStore } from "./store";
+import { useAgents } from "./store-agents";
 import { useNav } from "./store-nav";
 import { useDisableContextMenu } from "./lib/contextMenu";
 import { TitleBar } from "./components/shell/TitleBar";
@@ -60,11 +61,13 @@ function MainView() {
 
 export default function App() {
   const init = useStore((s) => s.init);
+  const hydrateAgents = useAgents((s) => s.hydrate);
   const pending = useStore((s) => s.pendingApprovals.length);
   useDisableContextMenu();
   useEffect(() => {
     init();
-  }, [init]);
+    void hydrateAgents();
+  }, [init, hydrateAgents]);
   return (
     <div className="relative flex h-screen flex-col overflow-hidden text-sm text-foreground antialiased">
       {/* Wallpaper behind the glass chrome; collapses to transparent when an OS backdrop is active. */}

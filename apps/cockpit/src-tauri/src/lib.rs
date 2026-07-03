@@ -1,4 +1,5 @@
 mod accent;
+mod agents_cmd;
 mod backdrop;
 mod commands;
 mod error;
@@ -174,6 +175,11 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::get_setting,
             commands::set_setting,
             commands::update_project,
+            agents_cmd::list_agents,
+            agents_cmd::refresh_agents,
+            agents_cmd::update_agent,
+            agents_cmd::set_agent_tier,
+            agents_cmd::set_default_agent,
             accent::system_accent_color,
         ])
         .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])

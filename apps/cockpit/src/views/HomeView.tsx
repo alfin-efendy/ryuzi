@@ -2,7 +2,8 @@ import { useMemo, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FolderOpen, GitBranch, Mic, Plus } from "lucide-react";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
-import { AGENTS, HOME_SUGGESTIONS } from "@/fixtures";
+import { HOME_SUGGESTIONS } from "@/constants";
+import { agentById, defaultAgentOf, useAgents } from "@/store-agents";
 import { projectLabel } from "@/lib/sidebar";
 import { AgentMenu } from "@/components/common/AgentMenu";
 import { MenuItem, MenuPanel, MenuSectionLabel, MenuSeparator } from "@/components/common/MenuPanel";
@@ -22,7 +23,8 @@ export function HomeView() {
   const [branchMenuOpen, setBranchMenuOpen] = useState(false);
 
   const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
-  const agent = AGENTS[nav.composerAgent];
+  const agents = useAgents((s) => s.agents);
+  const agent = agentById(agents, nav.composerAgent) ?? defaultAgentOf(agents);
 
   const branches = useMemo(() => {
     const fromSessions = sessions.filter((s) => s.projectId === project?.projectId && s.branch).map((s) => s.branch as string);
@@ -76,9 +78,9 @@ export function HomeView() {
               onClick={() => setAgentMenuOpen((v) => !v)}
               className="flex h-[30px] cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2 font-sans text-[12.5px] font-semibold text-foreground hover:bg-accent"
             >
-              <StatusDot color={agent.color} />
-              {agent.model}
-              <span className="font-normal text-muted-foreground">{agent.name}</span>
+              <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
+              {agent?.model || agent?.name || "No agent"}
+              <span className="font-normal text-muted-foreground">{agent?.name ?? "install one"}</span>
               <ChevronDown aria-hidden size={12} strokeWidth={2} />
             </button>
             <button type="button" title="Voice" className={roundBtn}>
