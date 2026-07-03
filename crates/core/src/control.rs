@@ -117,6 +117,14 @@ pub struct ControlPlane {
     /// `with_attachments`. Real network I/O (`UreqFetcher`) unless a test
     /// injects a fake via `new_full`.
     attachment_fetcher: Arc<dyn AttachmentFetcher>,
+    /// One-way latch set by `drain` — once true, `start_session`/
+    /// `continue_session` reject new turns. TS parity: `control-plane.ts`'s
+    /// `draining` field.
+    draining: std::sync::atomic::AtomicBool,
+    /// Count of in-flight turns (incremented synchronously in `spawn_prompt`
+    /// before the task is spawned, decremented by `TurnGuard`'s `Drop` inside
+    /// the task) — polled by `drain` to know when it's safe to stop waiting.
+    active_turns: std::sync::atomic::AtomicUsize,
 }
 
 impl ControlPlane {
@@ -159,6 +167,8 @@ impl ControlPlane {
             running: Mutex::new(HashMap::new()),
             telemetry,
             attachment_fetcher,
+            draining: std::sync::atomic::AtomicBool::new(false),
+            active_turns: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -171,6 +181,31 @@ impl ControlPlane {
 
     pub fn subscribe(&self) -> broadcast::Receiver<CoreEvent> {
         self.events.subscribe()
+    }
+
+    /// Number of turns currently in flight (see `spawn_prompt`'s `TurnGuard`).
+    pub fn running_count(&self) -> usize {
+        self.active_turns.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// One-way latch: stop accepting new turns, wait (100ms polls) for
+    /// in-flight turns up to `timeout_ms`; turns still running at the
+    /// deadline are left alone (killed by the daemon exit, resumed by
+    /// `reconcile`). TS parity: `control-plane.ts`'s `drain`.
+    pub async fn drain(&self, timeout_ms: u64) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while self.running_count() > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Public event injection — TS parity: `control-plane.ts`'s `cp.emit`,
+    /// used by `UpdateManager`'s notify path to broadcast update-lifecycle
+    /// events through the same channel as session events.
+    pub fn emit(&self, e: CoreEvent) {
+        let _ = self.events.send(e);
     }
 
     pub fn resolve_approval(&self, request_id: &str, allow: bool) -> bool {
@@ -340,6 +375,9 @@ impl ControlPlane {
         started_by: &str,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<Session> {
+        if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("daemon is draining for an update; try again shortly");
+        }
         let project = self
             .store
             .get_project(project_id)
@@ -414,6 +452,9 @@ impl ControlPlane {
         prompt: &str,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<()> {
+        if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("daemon is draining for an update; try again shortly");
+        }
         let session = self
             .store
             .get_session(session_pk)
@@ -653,8 +694,24 @@ impl ControlPlane {
         session_pk: String,
         prompt: TurnPrompt,
     ) {
+        // Panic-safe in-flight turn counter: incremented synchronously here
+        // (before the task is spawned, so `drain`/`running_count` never race
+        // a not-yet-counted turn) and decremented by `TurnGuard`'s `Drop` as
+        // the task's first statement, covering both the Ok/Err result arms
+        // below AND a panic mid-turn.
+        struct TurnGuard(Arc<ControlPlane>);
+        impl Drop for TurnGuard {
+            fn drop(&mut self) {
+                self.0
+                    .active_turns
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.active_turns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let me = Arc::clone(self);
         tokio::spawn(async move {
+            let _turn = TurnGuard(Arc::clone(&me));
             let mut span = me
                 .telemetry
                 .start_span("harness.run", vec![("session_pk", session_pk.clone())]);
@@ -2357,5 +2414,82 @@ mod tests {
         assert_eq!(project.harness, "other-harness");
         assert_eq!(project.model.as_deref(), Some("sonnet"));
         assert_eq!(project.effort.as_deref(), Some("low"));
+    }
+
+    #[tokio::test]
+    async fn drain_resolves_immediately_when_nothing_is_running() {
+        let (_db, path) = temp_db_path();
+        let store = Store::open(&path).await.unwrap();
+        let cp = ControlPlane::new(store, registries(false)).await;
+        let t0 = std::time::Instant::now();
+        cp.drain(1000).await;
+        assert!(t0.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(cp.running_count(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn start_and_continue_reject_once_draining() {
+        let _guard = StateDirGuard::new();
+        let (_db, path) = temp_db_path();
+        let store = Store::open(&path).await.unwrap();
+        let cp = ControlPlane::new(store, registries(false)).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        cp.drain(10).await; // sets the latch; nothing running so returns fast
+
+        let err = cp
+            .start_session(&project.project_id, "x", "test", &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("draining"), "{err}");
+        // Gate fires BEFORE the unknown-session lookup (first line, TS parity).
+        let err = cp.continue_session("nope", "x", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("draining"), "{err}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn drain_waits_for_an_in_flight_turn_up_to_the_timeout() {
+        let _guard = StateDirGuard::new();
+        let (_db, path) = temp_db_path();
+        let store = Store::open(&path).await.unwrap();
+        let cp = ControlPlane::new(store, registries(true)).await; // send_prompt blocks until cancel
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+        let session = cp
+            .start_session(&project.project_id, "go", "test", &[])
+            .await
+            .unwrap();
+
+        for _ in 0..400 {
+            if cp.running_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(cp.running_count(), 1, "the blocked turn must be in flight");
+
+        let t0 = std::time::Instant::now();
+        cp.drain(200).await;
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(200));
+        assert_eq!(
+            cp.running_count(),
+            1,
+            "drain timed out — it must never kill the turn"
+        );
+
+        // cleanup: cancel the blocked turn and wait for the guard to release
+        cp.stop_session(&session.session_pk).await.unwrap();
+        for _ in 0..400 {
+            if cp.running_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(cp.running_count(), 0);
     }
 }
