@@ -1,45 +1,44 @@
-import { ChevronRight, Plus } from "lucide-react";
-import { quotaColor, WORKSPACES, type WorkspaceFixture } from "@/fixtures";
-import { useFixtures } from "@/store-fixtures";
+import { ChevronRight, Plus, RefreshCw } from "lucide-react";
+import { useEffect, useState } from "react";
+import { quotaColor } from "@/constants";
+import { formatLastSeen, useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
+import type { GatewayInfo } from "@/bindings";
+import { AddGatewayModal } from "@/components/modals/AddGatewayModal";
 import { Card } from "@/components/common/Card";
-import { Pill, QuotaTrack, StatusDot } from "@/components/common/bits";
+import { QuotaTrack, StatusDot } from "@/components/common/bits";
 
 function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-function GatewayCard({ w }: { w: WorkspaceFixture }) {
+function GatewayCard({ g }: { g: GatewayInfo }) {
   const nav = useNav();
-  const daemon = useFixtures((s) => s.gatewayState[w.id]?.daemon ?? w.daemon);
-  const jobCount = useFixtures((s) => s.jobs.filter((j) => j.workspace === w.id).length);
-  const appCount = useFixtures((s) => s.apps.filter((a) => a.scope === "global" || a.scopeWs[w.id]).length);
-  // Real sessions all run on the local daemon today; remote gateways host none yet.
-  const sessionCount = useStore((s) => (w.id === "local" ? s.sessions.length : 0));
+  // Real sessions all run on the local gateway until the remote daemon ships.
+  const sessionCount = useStore((s) => (g.id === "local" ? s.sessions.length : 0));
 
-  const online = w.status === "connected";
-  const hasUpdate = daemon !== w.daemonLatest;
+  const online = g.status === "connected";
   const statusColor = online ? "#22C55E" : "var(--muted-foreground)";
-  const counts = `${plural(sessionCount, "session")} · ${plural(jobCount, "job")} · ${plural(appCount, "app")}`;
 
   return (
     <Card>
       <button
         type="button"
-        onClick={() => nav.navigate({ kind: "gatewayDetail", id: w.id })}
+        onClick={() => nav.navigate({ kind: "gatewayDetail", id: g.id })}
         className="flex w-full cursor-pointer items-center gap-3 border-none bg-transparent px-[18px] py-3.5 text-left font-sans"
       >
         <span className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-md bg-muted font-mono text-[10.5px] font-semibold text-muted-foreground">
-          {w.badge}
+          {g.badge}
         </span>
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-2">
-            <span className="text-sm font-semibold text-foreground">{w.name}</span>
-            {hasUpdate && <Pill variant="warn">Update {w.daemonLatest}</Pill>}
+            <span className="text-sm font-semibold text-foreground">{g.name}</span>
           </span>
-          <span className="mt-0.5 block text-xs text-muted-foreground">{w.metaLine}</span>
-          <span className="mt-0.5 block text-[11.5px] text-muted-foreground">{counts}</span>
+          <span className="mt-0.5 block text-xs text-muted-foreground">{g.metaLine}</span>
+          <span className="mt-0.5 block text-[11.5px] text-muted-foreground">
+            {g.id === "local" ? plural(sessionCount, "session") : `daemon ${g.daemonVersion}`}
+          </span>
         </span>
         <span className="flex shrink-0 items-center gap-1.5 text-xs" style={{ color: statusColor }}>
           <StatusDot color={statusColor} size={7} />
@@ -47,9 +46,9 @@ function GatewayCard({ w }: { w: WorkspaceFixture }) {
         </span>
         <ChevronRight aria-hidden size={14} strokeWidth={2} className="shrink-0 text-muted-foreground" />
       </button>
-      {online ? (
+      {online && g.resources.length > 0 && (
         <div className="grid grid-cols-3 gap-[18px] px-[18px] pb-3.5">
-          {w.resources.map((r) => (
+          {g.resources.map((r) => (
             <div key={r.label} className="flex flex-col gap-1">
               <div className="flex items-baseline gap-2">
                 <span className="text-[11px] font-medium text-muted-foreground">{r.label}</span>
@@ -60,9 +59,10 @@ function GatewayCard({ w }: { w: WorkspaceFixture }) {
             </div>
           ))}
         </div>
-      ) : (
+      )}
+      {!online && (
         <div className="px-[18px] pb-3.5 text-xs text-muted-foreground">
-          Offline — last seen {w.lastSeen}. Scheduled jobs are queued and run on reconnect.
+          Offline — last seen {formatLastSeen(g.lastSeenMs)}.
         </div>
       )}
     </Card>
@@ -70,6 +70,13 @@ function GatewayCard({ w }: { w: WorkspaceFixture }) {
 }
 
 export function GatewaysView() {
+  const { gateways, loaded, probing, hydrate, probe } = useGateways();
+  const [addOpen, setAddOpen] = useState(false);
+
+  useEffect(() => {
+    if (!loaded) void hydrate();
+  }, [loaded, hydrate]);
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
       <div className="mx-auto max-w-[860px]">
@@ -82,6 +89,16 @@ export function GatewaysView() {
           </div>
           <button
             type="button"
+            onClick={() => void probe()}
+            disabled={probing}
+            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent disabled:opacity-50"
+          >
+            <RefreshCw aria-hidden size={13} strokeWidth={2} className={probing ? "animate-spin" : ""} />
+            {probing ? "Probing…" : "Probe"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setAddOpen(true)}
             className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-primary px-3 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-90"
           >
             <Plus aria-hidden size={14} strokeWidth={2} />
@@ -90,11 +107,15 @@ export function GatewaysView() {
         </div>
 
         <div className="flex flex-col gap-3">
-          {WORKSPACES.map((w) => (
-            <GatewayCard key={w.id} w={w} />
+          {gateways.map((g) => (
+            <GatewayCard key={g.id} g={g} />
           ))}
+          {loaded && gateways.length === 0 && (
+            <div className="py-8 text-center text-[13px] text-muted-foreground">Detecting gateways…</div>
+          )}
         </div>
       </div>
+      {addOpen && <AddGatewayModal onClose={() => setAddOpen(false)} />}
     </div>
   );
 }

@@ -4,6 +4,7 @@ pub mod connector;
 pub mod control;
 pub mod domain;
 pub mod gateway;
+pub mod gateways;
 pub mod harness;
 pub mod integration;
 pub mod paths;

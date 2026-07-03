@@ -1,5 +1,5 @@
 // apps/cockpit/src/components/shell/Sidebar.tsx
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Archive,
   Bot,
@@ -21,8 +21,7 @@ import {
 import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
-import { useFixtures } from "@/store-fixtures";
-import { WORKSPACES } from "@/fixtures";
+import { useGateways } from "@/store-gateways";
 import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
 import { MenuItem, MenuPanel, MenuSectionLabel, MenuSeparator } from "@/components/common/MenuPanel";
@@ -72,7 +71,10 @@ export function Sidebar() {
   const { pinned, archived, togglePin, toggleArchive } = useUi();
   const nav = useNav();
   const view = nav.history.current;
-  const { activeWorkspace, setActiveWorkspace } = useFixtures();
+  const { gateways, activeGateway, setActive: setActiveGateway, loaded: gatewaysLoaded, hydrate: hydrateGateways } = useGateways();
+  useEffect(() => {
+    if (!gatewaysLoaded) void hydrateGateways();
+  }, [gatewaysLoaded, hydrateGateways]);
 
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [showArchived, setShowArchived] = useState<Record<string, boolean>>({});
@@ -83,7 +85,7 @@ export function Sidebar() {
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
 
   const q = nav.searchQuery;
-  const ws = WORKSPACES.find((w) => w.id === activeWorkspace) ?? WORKSPACES[0];
+  const ws = gateways.find((w) => w.id === activeGateway) ?? gateways[0];
   const projList = orderProjects(projects, ordering);
 
   const openSession = (pk: string) => {
@@ -302,12 +304,12 @@ export function Sidebar() {
             <Server aria-hidden size={15} strokeWidth={2} />
             <span
               className="absolute -bottom-0.5 -right-0.5 h-[9px] w-[9px] rounded-full border-2 border-sidebar"
-              style={{ background: ws.status === "connected" ? "#22C55E" : "#9CA3AF" }}
+              style={{ background: ws?.status === "connected" ? "#22C55E" : "#9CA3AF" }}
             />
           </span>
           <span className="min-w-0 flex-1">
             <span className="block text-[10px] font-semibold uppercase tracking-[0.05em] text-muted-foreground">Workspace</span>
-            <span className="block truncate text-[13px] font-semibold">{ws.name}</span>
+            <span className="block truncate text-[13px] font-semibold">{ws?.name ?? "This PC"}</span>
           </span>
           <ChevronsUpDown aria-hidden size={14} strokeWidth={2} className="shrink-0 text-muted-foreground" />
         </button>
@@ -315,15 +317,15 @@ export function Sidebar() {
         {workspaceMenuOpen && (
           <MenuPanel onClose={() => setWorkspaceMenuOpen(false)} className="bottom-14 left-2.5 right-2.5 z-[70]">
             <MenuSectionLabel>Gateways</MenuSectionLabel>
-            {WORKSPACES.map((w) => (
+            {gateways.map((w) => (
               <MenuItem
                 key={w.id}
-                selected={w.id === activeWorkspace}
+                selected={w.id === activeGateway}
                 onClick={() => {
-                  setActiveWorkspace(w.id);
+                  setActiveGateway(w.id);
                   setWorkspaceMenuOpen(false);
                 }}
-                className={w.id === activeWorkspace ? "bg-accent" : ""}
+                className={w.id === activeGateway ? "bg-accent" : ""}
               >
                 <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md bg-muted">
                   <span className="font-mono text-[9.5px] font-semibold tracking-[0.02em] text-muted-foreground">{w.badge}</span>
@@ -332,7 +334,7 @@ export function Sidebar() {
                   <span className="block truncate text-[13px] font-semibold">{w.name}</span>
                   <span className="block truncate text-[11px] text-muted-foreground">{w.detail}</span>
                 </span>
-                <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{w.lat}</span>
+                <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{w.latency ?? "—"}</span>
                 <StatusDot color={w.status === "connected" ? "#22C55E" : "#9CA3AF"} />
               </MenuItem>
             ))}

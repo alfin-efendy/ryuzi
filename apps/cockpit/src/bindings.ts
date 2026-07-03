@@ -154,6 +154,57 @@ async setDefaultAgent(id: string) : Promise<Result<AgentInfo[], CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+async listGateways() : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_gateways") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Live probe: local telemetry, WSL detection, and SSH TCP reachability.
+ */
+async probeGateways() : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("probe_gateways") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addGateway(name: string, host: string, port: number, username: string) : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_gateway", { name, host, port, username }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeGateway(id: string) : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_gateway", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateGateway(id: string, fsMode: string, paths: string[]) : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_gateway", { id, fsMode, paths }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async gatewayEvents(id: string) : Promise<Result<GatewayEventInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("gateway_events", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 }
@@ -189,6 +240,17 @@ export type CmdError = { message: string }
  */
 export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | { kind: "sessionEnded"; session_pk: string }
 export type CoreEventMsg = { event: CoreEvent }
+export type GatewayEventInfo = { at: number; level: string; text: string }
+export type GatewayInfo = { id: string; name: string; badge: string; 
+/**
+ * local | wsl | ssh
+ */
+kind: string; detail: string; metaLine: string; 
+/**
+ * connected | offline
+ */
+status: string; latency: string | null; daemonVersion: string; uptime: string | null; lastSeenMs: number | null; resources: GatewayResourceInfo[]; fingerprint: string | null; fsMode: string; paths: string[] }
+export type GatewayResourceInfo = { label: string; sub: string; pct: number }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.

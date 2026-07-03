@@ -127,6 +127,14 @@ impl ControlPlane {
             session_pk: session_pk.clone(),
             project_id: project.project_id.clone(),
         });
+        // Sessions run on the local gateway today; its log is the real record.
+        let _ = crate::gateways::add_event(
+            &self.store,
+            "local",
+            "info",
+            &format!("session {short} started ({} · {})", project.harness, project.name),
+        )
+        .await;
 
         // Resolve + start the harness session synchronously so an immediate
         // `stop_session` finds a live handle. The prompt is then driven in the
@@ -324,6 +332,8 @@ impl ControlPlane {
         let _ = self.events.send(CoreEvent::SessionEnded {
             session_pk: session_pk.to_string(),
         });
+        let short: String = session_pk.chars().take(8).collect();
+        let _ = crate::gateways::add_event(&self.store, "local", "info", &format!("session {short} ended")).await;
         Ok(())
     }
 

@@ -4,6 +4,7 @@ mod backdrop;
 mod commands;
 mod error;
 mod events;
+mod gateways_cmd;
 
 use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
 use tauri::Manager;
@@ -180,6 +181,12 @@ fn make_builder() -> Builder<tauri::Wry> {
             agents_cmd::update_agent,
             agents_cmd::set_agent_tier,
             agents_cmd::set_default_agent,
+            gateways_cmd::list_gateways,
+            gateways_cmd::probe_gateways,
+            gateways_cmd::add_gateway,
+            gateways_cmd::remove_gateway,
+            gateways_cmd::update_gateway,
+            gateways_cmd::gateway_events,
             accent::system_accent_color,
         ])
         .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])
