@@ -17,7 +17,7 @@ ryuzi-core = { path = "../core" }
 anyhow = "1"
 clap = { version = "4", features = ["string"] }
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
