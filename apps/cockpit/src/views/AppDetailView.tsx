@@ -1,29 +1,38 @@
-import { CircleAlert } from "lucide-react";
+import { RefreshCw } from "lucide-react";
+import { useEffect } from "react";
 import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { Segmented } from "@/components/common/Segmented";
 import { Switch } from "@/components/common/Switch";
 import { Chip, StatusDot } from "@/components/common/bits";
-import { AGENT_IDS, AGENTS, WORKSPACES } from "@/fixtures";
-import { useFixtures } from "@/store-fixtures";
+import { agentAllowed, appById, useApps } from "@/store-apps";
+import { useAgents } from "@/store-agents";
+import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 
-const smallOutlineBtn =
-  "h-[27px] shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-[11px] font-sans text-xs font-medium text-foreground hover:bg-accent";
 const rowLabel = "w-[120px] shrink-0 text-[13px] font-medium";
 
 export function AppDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { apps, setAppScope, toggleAppWs, setToolPerm, toggleAppAgent, uninstallApp } = useFixtures();
-  const app = apps.find((a) => a.id === id);
+  const { apps, loaded, hydrate, probing, probe, remove, setScope, setToolPerm, toggleAgent } = useApps();
+  const agents = useAgents((s) => s.agents);
+  const gateways = useGateways((s) => s.gateways);
   const goApps = () => nav.navigate({ kind: "apps" });
 
-  // Uninstalled (or unknown) apps have no detail to show — the uninstall action
-  // navigates back explicitly, so this only covers stale/deep-linked ids.
+  useEffect(() => {
+    if (!loaded) void hydrate();
+  }, [loaded, hydrate]);
+
+  const app = appById(apps, id);
   if (!app) return null;
 
-  const auth = app.auth;
-  const status = app.status === "error" ? { color: "#EF4444", label: "Error" } : { color: "#22C55E", label: "Connected" };
+  const status =
+    app.status === "connected"
+      ? { color: "#22C55E", label: "Connected" }
+      : app.status === "error"
+        ? { color: "#EF4444", label: "Error" }
+        : { color: "var(--muted-foreground)", label: "Unchecked" };
+  const isProbing = probing === app.id;
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
@@ -33,7 +42,7 @@ export function AppDetailView({ id }: { id: string }) {
         <DetailHeader
           chip={<Chip initial={app.initial} color={app.color} size={44} mono />}
           title={app.name}
-          sub={`${app.kind} · v${app.version} · ${app.publisher}`}
+          sub={[app.kind, app.version ? `v${app.version}` : null, app.publisher].filter(Boolean).join(" · ")}
         >
           <span className="flex shrink-0 items-center gap-1.5 text-xs" style={{ color: status.color }}>
             <StatusDot color={status.color} />
@@ -41,8 +50,17 @@ export function AppDetailView({ id }: { id: string }) {
           </span>
           <button
             type="button"
+            onClick={() => void probe(app.id)}
+            disabled={isProbing}
+            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent disabled:opacity-50"
+          >
+            <RefreshCw aria-hidden size={13} strokeWidth={2} className={isProbing ? "animate-spin" : ""} />
+            {isProbing ? "Connecting…" : "Reconnect"}
+          </button>
+          <button
+            type="button"
             onClick={() => {
-              uninstallApp(app.id);
+              void remove(app.id);
               goApps();
             }}
             className="h-8 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-destructive hover:bg-accent"
@@ -51,63 +69,30 @@ export function AppDetailView({ id }: { id: string }) {
           </button>
         </DetailHeader>
 
+        {app.status === "error" && app.statusDetail && (
+          <Card className="mb-3 px-[18px] py-3 text-[12.5px]">
+            <span style={{ color: "#EF4444" }}>{app.statusDetail}</span>
+          </Card>
+        )}
+
         <Card className="mb-3">
           <CardHeader>
             <CardTitle>Connection</CardTitle>
           </CardHeader>
-          {auth.type === "oauth" && (
-            <>
-              {auth.status === "expired" && (
-                <CardRow>
-                  <CircleAlert aria-hidden size={16} strokeWidth={2} className="shrink-0" style={{ color: "#F59E0B" }} />
-                  <span className="flex-1 text-[12.5px]">
-                    The OAuth token expired on {auth.expires}. Agents can’t call this app until you sign in again.
-                  </span>
-                  <button
-                    type="button"
-                    className="h-[30px] shrink-0 cursor-pointer rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85"
-                  >
-                    Re-authenticate
-                  </button>
-                </CardRow>
-              )}
-              <CardRow>
-                <span className={rowLabel}>Account</span>
-                <span className="flex-1 font-mono text-xs text-muted-foreground">{auth.account}</span>
-              </CardRow>
-              <CardRow>
-                <span className={rowLabel}>Token expires</span>
-                <span className="flex-1 text-[12.5px] text-muted-foreground">{auth.expires}</span>
-              </CardRow>
-              <CardRow>
-                <span className={rowLabel}>Last refreshed</span>
-                <span className="flex-1 text-[12.5px] text-muted-foreground">{auth.lastRefresh}</span>
-                {auth.status === "connected" && (
-                  <button type="button" className={smallOutlineBtn}>
-                    Refresh now
-                  </button>
-                )}
-              </CardRow>
-            </>
-          )}
-          {auth.type === "env" && (
-            <>
-              <CardRow>
-                <span className={rowLabel}>Environment</span>
-                <span className="flex-1 font-mono text-xs text-muted-foreground">{auth.env}</span>
-                <button type="button" className={smallOutlineBtn}>
-                  Edit
-                </button>
-              </CardRow>
-              <CardRow>
-                <span className={rowLabel}>Connects as</span>
-                <span className="flex-1 font-mono text-xs text-muted-foreground">{auth.account}</span>
-              </CardRow>
-            </>
-          )}
-          {auth.type === "none" && (
+          <CardRow>
+            <span className={rowLabel}>{app.transport === "http" ? "URL" : "Command"}</span>
+            <span className="flex-1 truncate font-mono text-xs text-muted-foreground">
+              {app.transport === "http" ? (app.url ?? "—") : [app.command, ...app.args].filter(Boolean).join(" ")}
+            </span>
+          </CardRow>
+          {app.authKind === "env" ? (
+            <CardRow>
+              <span className={rowLabel}>Environment</span>
+              <span className="flex-1 font-mono text-xs text-muted-foreground">{app.authDetail ?? "—"}</span>
+            </CardRow>
+          ) : (
             <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
-              No authentication required — runs locally on the gateway.
+              No authentication configured — runs with the environment it inherits.
             </div>
           )}
         </Card>
@@ -115,7 +100,7 @@ export function AppDetailView({ id }: { id: string }) {
         <Card className="mb-3">
           <CardHeader>
             <CardTitle>Scope</CardTitle>
-            <CardHint>Where this app is installed</CardHint>
+            <CardHint>Where this app is attached</CardHint>
             <span className="flex-1" />
             <Segmented
               options={[
@@ -123,18 +108,24 @@ export function AppDetailView({ id }: { id: string }) {
                 { id: "select", label: "Select" },
               ]}
               value={app.scope}
-              onChange={(scope) => setAppScope(app.id, scope)}
+              onChange={(scope) => void setScope(app.id, scope, app.scopeGateways)}
             />
           </CardHeader>
           {app.scope === "select" && (
             <div className="flex flex-wrap gap-1.5 px-[18px] py-3">
-              {WORKSPACES.map((w) => {
-                const sel = !!app.scopeWs[w.id];
+              {gateways.map((w) => {
+                const sel = app.scopeGateways.includes(w.id);
                 return (
                   <button
                     key={w.id}
                     type="button"
-                    onClick={() => toggleAppWs(app.id, w.id)}
+                    onClick={() =>
+                      void setScope(
+                        app.id,
+                        app.scope,
+                        sel ? app.scopeGateways.filter((x) => x !== w.id) : [...app.scopeGateways, w.id],
+                      )
+                    }
                     className={`flex h-7 cursor-pointer items-center gap-[7px] rounded-full border px-[11px] font-sans text-xs font-medium ${
                       sel ? "border-transparent bg-primary text-primary-foreground" : "border-border bg-transparent text-muted-foreground"
                     }`}
@@ -151,8 +142,17 @@ export function AppDetailView({ id }: { id: string }) {
         <Card className="mb-3">
           <CardHeader>
             <CardTitle>Tools</CardTitle>
-            <CardHint>{app.tools.length} tools · per-tool permission for every agent</CardHint>
+            <CardHint>
+              {app.tools.length > 0
+                ? `${app.tools.length} tools · per-tool permission for every agent`
+                : "Discovered on connect"}
+            </CardHint>
           </CardHeader>
+          {app.tools.length === 0 && (
+            <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+              No tools discovered yet — reconnect to run the handshake.
+            </div>
+          )}
           {app.tools.map((t) => (
             <div key={t.name} className="flex items-center gap-3 border-b border-border px-[18px] py-[11px] last:border-b-0">
               <div className="min-w-0 flex-1">
@@ -167,7 +167,7 @@ export function AppDetailView({ id }: { id: string }) {
                   { id: "deny", label: "Deny" },
                 ]}
                 value={t.perm}
-                onChange={(perm) => setToolPerm(app.id, t.name, perm)}
+                onChange={(perm) => void setToolPerm(app.id, t.name, perm)}
               />
             </div>
           ))}
@@ -178,19 +178,20 @@ export function AppDetailView({ id }: { id: string }) {
             <CardTitle>Agent access</CardTitle>
             <CardHint>Which agents may call this app</CardHint>
           </CardHeader>
-          {AGENT_IDS.map((aid) => {
-            const agent = AGENTS[aid];
-            return (
-              <div key={aid} className="flex items-center gap-3 border-b border-border px-[18px] py-[11px] last:border-b-0">
-                <StatusDot color={agent.color} size={8} />
-                <span className="min-w-0 flex-1">
-                  <span className="block text-[13px] font-medium">{agent.name}</span>
-                  <span className="block text-[11px] text-muted-foreground">{agent.model}</span>
-                </span>
-                <Switch on={!!app.agentAccess[aid]} onToggle={() => toggleAppAgent(app.id, aid)} label={`${agent.name} access`} />
-              </div>
-            );
-          })}
+          {agents.map((agent) => (
+            <div key={agent.id} className="flex items-center gap-3 border-b border-border px-[18px] py-[11px] last:border-b-0">
+              <StatusDot color={agent.color} size={8} />
+              <span className="min-w-0 flex-1">
+                <span className="block text-[13px] font-medium">{agent.name}</span>
+                <span className="block text-[11px] text-muted-foreground">{agent.model || agent.connection}</span>
+              </span>
+              <Switch
+                on={agentAllowed(app, agent.id)}
+                onToggle={() => void toggleAgent(app.id, agent.id, !agentAllowed(app, agent.id))}
+                label={`${agent.name} access`}
+              />
+            </div>
+          ))}
         </Card>
       </div>
     </div>

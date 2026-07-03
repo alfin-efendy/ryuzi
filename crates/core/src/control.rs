@@ -237,6 +237,10 @@ impl ControlPlane {
         })?;
         let harness = factory.create()?;
 
+        // Attach the Apps screen's enabled MCP servers to the session for real.
+        let mcp_servers = crate::mcp::servers_for_session(&self.store, "claude")
+            .await
+            .unwrap_or_default();
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
             work_dir: work_dir.to_path_buf(),
@@ -244,7 +248,7 @@ impl ControlPlane {
             model: project.model.clone(),
             effort: project.effort.clone(),
             resume,
-            mcp_servers: vec![],
+            mcp_servers,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             store: self.store.clone(),

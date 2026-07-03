@@ -323,6 +323,62 @@ async runJobNow(id: string) : Promise<Result<JobInfo[], CmdError>> {
 async parseNaturalSchedule(text: string) : Promise<string | null> {
     return await TAURI_INVOKE("parse_natural_schedule", { text });
 },
+async listApps() : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_apps") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addApp(input: AddAppInput) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_app", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeApp(id: string) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_app", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async probeApp(id: string) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("probe_app", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateAppScope(id: string, scope: string, scopeGateways: string[]) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_app_scope", { id, scope, scopeGateways }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setAppToolPerm(id: string, tool: string, perm: string) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_app_tool_perm", { id, tool, perm }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async toggleAppAgent(id: string, agentId: string, allowed: boolean) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("toggle_app_agent", { id, agentId, allowed }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 }
@@ -347,11 +403,22 @@ coreEventMsg: "core-event-msg"
 
 export type AccentChangedMsg = { hex: string }
 export type AccountInfo = { id: string; label: string; email: string; plan: string; active: boolean; sessionLimitTokens: number | null; weeklyLimitTokens: number | null; quotas: QuotaInfo[] }
+export type AddAppInput = { id: string | null; name: string; description: string; kind: string | null; 
+/**
+ * stdio | http
+ */
+transport: string; command: string | null; args: string[]; 
+/**
+ * KEY=VALUE pairs.
+ */
+env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
+export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
 /**
  * Whether Cockpit has a session harness for this agent today.
  */
 runnable: boolean }
+export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CmdError = { message: string }
 /**
@@ -394,6 +461,7 @@ export type RunInfo = { id: string; status: string; startedAtMs: number; duratio
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
+export type ToolInfo = { name: string; desc: string; perm: string }
 export type UsagePoint = { day: string; 
 /**
  * Estimated tokens that day (chars/4 over persisted transcripts).

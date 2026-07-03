@@ -1,5 +1,5 @@
 import { Copy, Layers, MonitorUp, X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Chip, Pill } from "@/components/common/bits";
 import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
@@ -9,6 +9,7 @@ import { Segmented } from "@/components/common/Segmented";
 import { Switch } from "@/components/common/Switch";
 import { PERM_MODES } from "@/constants";
 import { agentById, useAgents } from "@/store-agents";
+import { agentAllowed, useApps } from "@/store-apps";
 import { useNav } from "@/store-nav";
 
 const WARN = "#F59E0B";
@@ -17,8 +18,13 @@ const WARN = "#F59E0B";
 // command, model/permission/flags configuration, and per-tier model routing.
 export function AgentDetailView({ id }: { id: string }) {
   const { agents, refreshing, refresh, update, setTier, setDefault } = useAgents();
+  const { apps, loaded: appsLoaded, hydrate: hydrateApps, toggleAgent: toggleAppAgent } = useApps();
   const navigate = useNav((s) => s.navigate);
   const [openTierMenu, setOpenTierMenu] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!appsLoaded) void hydrateApps();
+  }, [appsLoaded, hydrateApps]);
 
   const agent = agentById(agents, id);
   if (!agent) {
@@ -197,6 +203,32 @@ export function AgentDetailView({ id }: { id: string }) {
               {agent.binaryPath ?? "not found on PATH"}
             </span>
           </CardRow>
+        </Card>
+
+        <Card className="mb-3">
+          <CardHeader>
+            <CardTitle>App access</CardTitle>
+            <CardHint>Which installed apps this agent may call</CardHint>
+          </CardHeader>
+          {apps.length === 0 && (
+            <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+              No apps installed yet — add MCP servers from the Apps screen.
+            </div>
+          )}
+          {apps.map((app) => (
+            <CardRow key={app.id} className="py-[11px]">
+              <Chip initial={app.initial} color={app.color} size={28} mono />
+              <span className="min-w-0 flex-1">
+                <span className="block text-[13px] font-medium">{app.name}</span>
+                <span className="block text-[11px] text-muted-foreground">{app.kind}</span>
+              </span>
+              <Switch
+                on={agentAllowed(app, agent.id)}
+                onToggle={() => void toggleAppAgent(app.id, agent.id, !agentAllowed(app, agent.id))}
+                label={`${app.name} access`}
+              />
+            </CardRow>
+          ))}
         </Card>
 
         <Card>

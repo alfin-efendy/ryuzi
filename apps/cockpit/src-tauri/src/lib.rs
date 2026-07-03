@@ -1,5 +1,6 @@
 mod accent;
 mod agents_cmd;
+mod apps_cmd;
 mod backdrop;
 mod commands;
 mod error;
@@ -204,6 +205,13 @@ fn make_builder() -> Builder<tauri::Wry> {
             scheduler_cmd::delete_job,
             scheduler_cmd::run_job_now,
             scheduler_cmd::parse_natural_schedule,
+            apps_cmd::list_apps,
+            apps_cmd::add_app,
+            apps_cmd::remove_app,
+            apps_cmd::probe_app,
+            apps_cmd::update_app_scope,
+            apps_cmd::set_app_tool_perm,
+            apps_cmd::toggle_app_agent,
             accent::system_accent_color,
         ])
         .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])

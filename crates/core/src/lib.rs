@@ -7,6 +7,7 @@ pub mod gateway;
 pub mod gateways;
 pub mod harness;
 pub mod integration;
+pub mod mcp;
 pub mod paths;
 pub mod policy;
 pub mod providers;
