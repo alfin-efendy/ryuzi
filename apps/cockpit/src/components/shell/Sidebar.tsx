@@ -24,7 +24,7 @@ import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useFixtures } from "@/store-fixtures";
 import { WORKSPACES } from "@/fixtures";
-import { archivedCount, orderProjects, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
+import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
 import { MenuItem, MenuPanel, MenuSectionLabel, MenuSeparator } from "@/components/common/MenuPanel";
 import { StatusDot } from "@/components/common/bits";
@@ -180,7 +180,7 @@ export function Sidebar() {
                   ) : (
                     <Folder aria-hidden size={14} strokeWidth={2} className="shrink-0 text-muted-foreground" />
                   )}
-                  <span className="min-w-0 flex-1 truncate text-[13px] font-semibold">{p.name}</span>
+                  <span className="min-w-0 flex-1 truncate text-[13px] font-semibold">{projectLabel(p)}</span>
                 </button>
                 <button
                   type="button"

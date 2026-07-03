@@ -3,6 +3,7 @@ import { ArrowUp, ChevronDown, CircleAlert, FolderOpen, GitBranch, Mic, Plus } f
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { AGENTS, HOME_SUGGESTIONS } from "@/fixtures";
+import { projectLabel } from "@/lib/sidebar";
 import { AgentMenu } from "@/components/common/AgentMenu";
 import { MenuItem, MenuPanel, MenuSectionLabel, MenuSeparator } from "@/components/common/MenuPanel";
 import { StatusDot } from "@/components/common/bits";
@@ -39,7 +40,7 @@ export function HomeView() {
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-7 p-10">
       <h1 className="m-0 text-center text-[30px] font-semibold tracking-[-0.02em]">
-        What should we build{project ? ` in ${project.name}` : ""}?
+        What should we build{project ? ` in ${projectLabel(project)}` : ""}?
       </h1>
       <div className="w-full max-w-[720px]">
         <div className="acrylic-card relative rounded-2xl border border-border shadow-sm">
@@ -99,7 +100,7 @@ export function HomeView() {
           <div className="relative flex items-center gap-1.5 border-t border-border px-3 py-2">
             <button type="button" onClick={() => setProjectMenuOpen((v) => !v)} className={`${chipBtn} font-semibold text-foreground`}>
               <FolderOpen aria-hidden size={13} strokeWidth={2} />
-              {project?.name ?? "No project"}
+              {project ? projectLabel(project) : "No project"}
               <ChevronDown aria-hidden size={11} strokeWidth={2} />
             </button>
             <button
@@ -126,7 +127,7 @@ export function HomeView() {
                     className="font-medium"
                   >
                     <FolderOpen aria-hidden size={13} strokeWidth={2} className="text-muted-foreground" />
-                    <span className="flex-1">{p.name}</span>
+                    <span className="flex-1">{projectLabel(p)}</span>
                   </MenuItem>
                 ))}
                 <MenuSeparator />

@@ -1,6 +1,13 @@
 import type { Project, Session } from "../bindings";
+import { basename } from "./paths";
 
 export type Ordering = "updated" | "name";
+
+// Some existing projects carry their full path as the display name; show the
+// final segment either way.
+export function projectLabel(p: Pick<Project, "name">): string {
+  return basename(p.name) || p.name;
+}
 
 export function orderProjects(projects: Project[], ordering: Ordering): Project[] {
   if (ordering === "name") return [...projects].sort((a, b) => a.name.localeCompare(b.name));

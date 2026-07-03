@@ -22,6 +22,7 @@ import { useNav, type RightTab } from "@/store-nav";
 import { AGENTS, CODE_LINES, REVIEW_FILES, TERM_LINES, TREE_ITEMS, type DiffLine } from "@/fixtures";
 import { statusMeta } from "@/lib/status";
 import { basename } from "@/lib/paths";
+import { projectLabel } from "@/lib/sidebar";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalPrompt } from "@/components/ApprovalPrompt";
 import { FileViewer } from "@/components/FileViewer";
@@ -55,7 +56,7 @@ function Terminal({ className }: { className?: string }) {
 }
 
 export function SessionView() {
-  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals } = useStore();
+  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects } = useStore();
   const nav = useNav();
   const ui = useUi();
   const [draft, setDraft] = useState("");
@@ -65,8 +66,11 @@ export function SessionView() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
-  const lines = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
+  // Persisted transcripts can carry empty text blocks (e.g. tool-only turns); skip them.
+  const lines = ((focusedSessionPk && transcripts[focusedSessionPk]) || []).filter((l) => l.kind !== "text" || l.text.trim().length > 0);
   const agent = AGENTS[nav.composerAgent];
+  const project = projects.find((p) => p.projectId === session?.projectId);
+  const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
 
   // biome-ignore lint/correctness/useExhaustiveDependencies(lines.length): re-run to pin the scroll to the bottom whenever the transcript grows
   useEffect(() => {
@@ -93,7 +97,7 @@ export function SessionView() {
 
   const rightTabs: { id: RightTab; label: string; icon: typeof SquareCheck }[] = [
     { id: "review", label: "Review", icon: SquareCheck },
-    { id: "term", label: `pwsh in ${session.projectId}`, icon: SquareTerminal },
+    { id: "term", label: `pwsh in ${projectName}`, icon: SquareTerminal },
     { id: "file", label: activeFileTab ? activeFileTab.title : "Files", icon: FileText },
   ];
 
@@ -279,7 +283,7 @@ export function SessionView() {
             <div className="flex shrink-0 items-center gap-2 border-b border-border px-3.5 py-2">
               <SquareTerminal aria-hidden size={14} strokeWidth={2} className="text-muted-foreground" />
               <span className="text-[12.5px] font-semibold">Terminal</span>
-              <span className="font-mono text-[11px] text-muted-foreground">{session.projectId}</span>
+              <span className="font-mono text-[11px] text-muted-foreground">{projectName}</span>
               <div className="flex-1" />
               <button type="button" title="New terminal" className={`${toolBtn} h-[26px] w-[26px]`}>
                 <Plus aria-hidden size={13} strokeWidth={2} />
