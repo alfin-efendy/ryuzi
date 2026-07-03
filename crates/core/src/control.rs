@@ -6,6 +6,7 @@ use crate::domain::{AttachmentRef, CoreEvent, Message, PermMode, Project, Sessio
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::integration::Registries;
 use crate::paths::{new_id, now_ms, worktree_path_for};
+use crate::policy::{gate_perm_mode, is_admin, parse_role_ids};
 use crate::settings::{expand_home, SettingsStore};
 use crate::store::Store;
 use crate::telemetry::{NoopTelemetry, Telemetry};
@@ -18,6 +19,83 @@ use tokio::sync::broadcast;
 /// Nudge prompt used when re-driving a turn interrupted by a restart (TS parity).
 pub const RESUME_NUDGE: &str = "Your previous turn was interrupted by a daemon restart or update. \
     Continue the task from where you left off. If it was already complete, briefly summarize what you did.";
+
+/// Per-request overrides for a provisioned project — `None` means "fall back
+/// to the admin-configured default setting" (see `provision_project`). TS
+/// parity: `ConnectProjectRequest.settings` (`ProjectSettings`).
+#[derive(Debug, Clone, Default)]
+pub struct ProvisionSettings {
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub perm_mode: Option<PermMode>,
+}
+
+/// Request to provision (create-from-name or clone-from-`git_url`) a project
+/// and bind it to the gateway workspace that triggered it (the Discord
+/// `/connect` flow). TS parity: `ConnectProjectRequest`.
+#[derive(Debug, Clone)]
+pub struct ProvisionProjectRequest {
+    pub gateway: String,
+    pub workspace_id: String,
+    pub actor: String,
+    pub actor_role_ids: Vec<String>,
+    pub name: Option<String>,
+    pub git_url: Option<String>,
+    pub settings: ProvisionSettings,
+}
+
+/// TS parity: `connectProject`'s inline `validateProjectName` — rejects `.`,
+/// `..`, any leading-dot name, and anything outside `[A-Za-z0-9._-]+`.
+fn validate_project_name(name: &str) -> anyhow::Result<()> {
+    let ok = name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !ok {
+        anyhow::bail!("invalid project name: {name}");
+    }
+    Ok(())
+}
+
+/// `node:path`'s `basename` semantics (posix-style, trailing-slash
+/// insensitive) applied to a `/`-separated string — used on git URLs, which
+/// aren't OS paths, so this deliberately doesn't go through `std::path`.
+/// `pub(crate)` so `router.rs`'s `on_connect` can derive the same display
+/// name from a bare `git_url`.
+pub(crate) fn basename_of(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(i) => trimmed[i + 1..].to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+/// TS parity: `urlPath.replace(/\/$/, "")` — strips AT MOST one trailing
+/// `/`, unlike `str::trim_end_matches` which would strip all of them.
+fn strip_one_trailing_slash(s: &str) -> &str {
+    s.strip_suffix('/').unwrap_or(s)
+}
+
+/// Run `git` with `args`, failing with the captured stderr on a non-zero
+/// exit. TS parity: `connectProject`'s literal `Bun.$\`git ...\`` invocations.
+async fn run_git(args: &[&str]) -> anyhow::Result<()> {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
 
 pub struct ControlPlane {
     store: Arc<Store>,
@@ -144,6 +222,109 @@ impl ControlPlane {
             created_at: Some(now_ms()),
         };
         self.store.insert_project(project.clone()).await?;
+        Ok(project)
+    }
+
+    /// Discord-driven (or any gateway's) project provisioning: create a
+    /// brand-new git repo under `workdir_root`, or clone an existing one,
+    /// then bind it to the gateway workspace that triggered it. TS parity:
+    /// `control-plane.ts`'s `connectProject` (~207-276), verbatim.
+    ///
+    /// Rust delta (documented, not a bug): the Rust `projects` table has no
+    /// `created_by` column (TS's did) — `Session.started_by` already covers
+    /// per-turn auditability, so nothing is recorded here for who
+    /// provisioned the project.
+    pub async fn provision_project(&self, req: ProvisionProjectRequest) -> anyhow::Result<Project> {
+        let settings = SettingsStore::new(Arc::clone(&self.store));
+        let raw_root = settings
+            .get("workdir_root")
+            .await?
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("workdir_root is not set"))?;
+        let root = expand_home(&raw_root);
+
+        let name: String;
+        let mut source: Option<String> = None;
+        let workdir: PathBuf;
+
+        if let Some(n) = &req.name {
+            validate_project_name(n)?;
+            name = n.clone();
+            workdir = root.join(&name);
+            tokio::fs::create_dir_all(&workdir).await?;
+            let wd = workdir.to_string_lossy().into_owned();
+            let result: anyhow::Result<()> = async {
+                run_git(&["-C", &wd, "init", "-q"]).await?;
+                run_git(&["-C", &wd, "commit", "-q", "--allow-empty", "-m", "init"]).await?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                let _ = tokio::fs::remove_dir_all(&workdir).await;
+                return Err(e);
+            }
+        } else if let Some(url) = &req.git_url {
+            // Strip a trailing `.git` and extract the directory name.
+            let url_path = url.strip_suffix(".git").unwrap_or(url);
+            let mut n = basename_of(url_path);
+            if n.is_empty() {
+                // Fallback: if basename is empty, use the parent directory name.
+                n = basename_of(strip_one_trailing_slash(url_path));
+            }
+            validate_project_name(&n)?;
+            name = n;
+            workdir = root.join(&name);
+            let wd = workdir.to_string_lossy().into_owned();
+            if let Err(e) = run_git(&["clone", "--quiet", url, &wd]).await {
+                let _ = tokio::fs::remove_dir_all(&workdir).await;
+                return Err(e);
+            }
+            source = Some(url.clone());
+        } else {
+            anyhow::bail!("connectProject requires name or gitUrl");
+        }
+
+        let s = &req.settings;
+        let default_perm_raw = settings
+            .get("default_perm_mode")
+            .await?
+            .unwrap_or_else(|| "default".to_string());
+        let requested_mode = s
+            .perm_mode
+            .unwrap_or_else(|| PermMode::from_db(&default_perm_raw));
+        let admin_role_ids = parse_role_ids(settings.get("admin_role_ids").await?.as_deref());
+        let admin = is_admin(&req.actor_role_ids, &admin_role_ids);
+        let (perm_mode, _downgraded) = gate_perm_mode(requested_mode, admin);
+
+        let default_runtime = settings
+            .get("default_runtime")
+            .await?
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "claude-code".to_string());
+        let default_model = settings
+            .get("default_model")
+            .await?
+            .filter(|v| !v.is_empty());
+        let default_effort = settings
+            .get("default_effort")
+            .await?
+            .filter(|v| !v.is_empty());
+
+        let project = Project {
+            project_id: new_id(),
+            name,
+            workdir: workdir.to_string_lossy().into_owned(),
+            source,
+            harness: s.harness.clone().unwrap_or(default_runtime),
+            model: s.model.clone().or(default_model),
+            effort: s.effort.clone().or(default_effort),
+            perm_mode,
+            created_at: Some(now_ms()),
+        };
+        self.store.insert_project(project.clone()).await?;
+        self.store
+            .bind_project(&req.gateway, &req.workspace_id, &project.project_id)
+            .await?;
         Ok(project)
     }
 
@@ -674,7 +855,12 @@ mod tests {
 
     /// Redirect dirs::data_dir() into a tempdir for the duration of a test so
     /// worktree creation never touches the real ~/.local/share. Process-global
-    /// env — every test using it must be #[serial].
+    /// env — every test using it must be #[serial]. Also drops a `.gitconfig`
+    /// under the redirected `HOME` with a throwaway identity, so real `git
+    /// commit` subprocesses spawned by `provision_project`'s name-flow (which
+    /// shells to literal `git ... commit`, needing a resolvable
+    /// user.name/user.email) succeed without touching the developer's real
+    /// global git config.
     struct StateDirGuard {
         _dir: tempfile::TempDir,
     }
@@ -684,6 +870,11 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
             std::env::set_var("HOME", dir.path());
+            std::fs::write(
+                dir.path().join(".gitconfig"),
+                "[user]\n\tname = Test\n\temail = test@example.com\n",
+            )
+            .expect("write .gitconfig");
             StateDirGuard { _dir: dir }
         }
     }
@@ -1764,5 +1955,264 @@ mod tests {
             !dest_dir.exists(),
             "end_session must remove the attachments dest dir"
         );
+    }
+
+    // ---------- Task 4: provision_project ----------
+
+    /// A minimal `ControlPlane` for provisioning tests: no harness needed
+    /// (provisioning never starts a session). Returns the sqlite temp-file
+    /// guard the caller must keep alive.
+    async fn provisioning_control_plane() -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile)
+    {
+        let (db_guard, db_path) = temp_db_path();
+        let store = crate::store::Store::open(&db_path).await.unwrap();
+        let cp = ControlPlane::new(store, Registries::new()).await;
+        let store_ref = cp.store();
+        (cp, store_ref, db_guard)
+    }
+
+    /// Build a bare-bones `ProvisionProjectRequest` — `name`/`git_url` left
+    /// `None` so each test fills in exactly what it needs.
+    fn provision_req(gateway: &str, workspace_id: &str, actor: &str) -> ProvisionProjectRequest {
+        ProvisionProjectRequest {
+            gateway: gateway.to_string(),
+            workspace_id: workspace_id.to_string(),
+            actor: actor.to_string(),
+            actor_role_ids: vec![],
+            name: None,
+            git_url: None,
+            settings: ProvisionSettings::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provision_project_errors_when_workdir_root_is_not_set() {
+        let (cp, _store, _db_guard) = provisioning_control_plane().await;
+        let req = provision_req("fake", "ws1", "u1");
+        let err = cp.provision_project(req).await.unwrap_err();
+        assert_eq!(err.to_string(), "workdir_root is not set");
+    }
+
+    #[tokio::test]
+    async fn provision_project_requires_name_or_git_url() {
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let req = provision_req("fake", "ws1", "u1");
+        let err = cp.provision_project(req).await.unwrap_err();
+        assert_eq!(err.to_string(), "connectProject requires name or gitUrl");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_rejects_invalid_names() {
+        let _guard = StateDirGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        for bad in ["..", ".hidden", "a b", "."] {
+            let mut req = provision_req("fake", "ws1", "u1");
+            req.name = Some(bad.to_string());
+            let err = cp
+                .provision_project(req)
+                .await
+                .expect_err(&format!("{bad:?} should be rejected"));
+            assert_eq!(err.to_string(), format!("invalid project name: {bad}"));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_name_flow_creates_a_real_repo_with_head_and_binds_it() {
+        let _guard = StateDirGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let mut req = provision_req("fake", "ws1", "u1");
+        req.name = Some("demo".to_string());
+        let project = cp.provision_project(req).await.unwrap();
+
+        assert_eq!(project.name, "demo");
+        assert_eq!(project.workdir, root.path().join("demo").to_string_lossy());
+        assert_eq!(project.harness, "claude-code");
+        assert_eq!(project.perm_mode, crate::domain::PermMode::Default);
+
+        // A real repo with a HEAD commit (worktrees need one).
+        let repo = git2::Repository::open(&project.workdir).unwrap();
+        assert!(repo.head().is_ok());
+
+        // Inserted + bound to the gateway workspace.
+        assert!(store
+            .get_project(&project.project_id)
+            .await
+            .unwrap()
+            .is_some());
+        let bound = store
+            .resolve_project_by_workspace("fake", "ws1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.project_id, project.project_id);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_git_url_flow_derives_name_and_records_source() {
+        let _guard = StateDirGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        // A local bare-ish repo to clone from (a real HEAD commit). Named
+        // explicitly (not the raw tempdir path) since `tempfile` defaults to
+        // a dot-prefixed name, which `validate_project_name` would reject.
+        let upstream_root = tempfile::tempdir().unwrap();
+        let upstream_dir = upstream_root.path().join("upstream-repo");
+        std::fs::create_dir_all(&upstream_dir).unwrap();
+        init_repo(&upstream_dir);
+
+        let git_url = format!("{}/.git", upstream_dir.display());
+        let mut req = provision_req("fake", "ws1", "u1");
+        req.git_url = Some(git_url.clone());
+        // A trailing "/.git" strips to the parent dir name ("upstream-repo") via basename.
+        let project = cp.provision_project(req).await.unwrap();
+
+        assert_eq!(project.name, "upstream-repo");
+        assert_eq!(project.source.as_deref(), Some(git_url.as_str()));
+        let repo = git2::Repository::open(&project.workdir).unwrap();
+        assert!(repo.head().is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_git_clone_failure_rolls_back_the_dir() {
+        let _guard = StateDirGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let mut req = provision_req("fake", "ws1", "u1");
+        req.git_url = Some("/no/such/upstream/repo.git".to_string());
+        let err = cp.provision_project(req).await.unwrap_err();
+        assert!(err.to_string().contains("git"), "got: {err}");
+        assert!(
+            !root.path().join("repo").exists(),
+            "a failed clone must not leave a partial dir behind"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_gates_bypass_permissions_for_non_admin() {
+        let _guard = StateDirGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        let settings = SettingsStore::new(store.clone());
+        settings
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        settings.set("admin_role_ids", "admin-role").await.unwrap();
+
+        let mut req = provision_req("fake", "ws1", "u1");
+        req.name = Some("gated".to_string());
+        req.actor_role_ids = vec![]; // not an admin
+        req.settings.perm_mode = Some(crate::domain::PermMode::BypassPermissions);
+        let project = cp.provision_project(req).await.unwrap();
+
+        assert_eq!(
+            project.perm_mode,
+            crate::domain::PermMode::Default,
+            "non-admin bypassPermissions request must be gated down"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_admin_keeps_bypass_permissions() {
+        let _guard = StateDirGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        let settings = SettingsStore::new(store.clone());
+        settings
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        settings.set("admin_role_ids", "admin-role").await.unwrap();
+
+        let mut req = provision_req("fake", "ws1", "u1");
+        req.name = Some("admin-project".to_string());
+        req.actor_role_ids = vec!["admin-role".to_string()];
+        req.settings.perm_mode = Some(crate::domain::PermMode::BypassPermissions);
+        let project = cp.provision_project(req).await.unwrap();
+
+        assert_eq!(
+            project.perm_mode,
+            crate::domain::PermMode::BypassPermissions
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_uses_settings_defaults_when_none_given() {
+        let _guard = StateDirGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        let settings = SettingsStore::new(store.clone());
+        settings
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        settings.set("default_model", "opus").await.unwrap();
+        settings.set("default_effort", "high").await.unwrap();
+
+        let mut req = provision_req("fake", "ws1", "u1");
+        req.name = Some("defaulted".to_string());
+        let project = cp.provision_project(req).await.unwrap();
+
+        assert_eq!(project.harness, "claude-code");
+        assert_eq!(project.model.as_deref(), Some("opus"));
+        assert_eq!(project.effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_explicit_settings_override_defaults() {
+        let _guard = StateDirGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        let settings = SettingsStore::new(store.clone());
+        settings
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let mut req = provision_req("fake", "ws1", "u1");
+        req.name = Some("overridden".to_string());
+        req.settings.harness = Some("other-harness".to_string());
+        req.settings.model = Some("sonnet".to_string());
+        req.settings.effort = Some("low".to_string());
+        let project = cp.provision_project(req).await.unwrap();
+
+        assert_eq!(project.harness, "other-harness");
+        assert_eq!(project.model.as_deref(), Some("sonnet"));
+        assert_eq!(project.effort.as_deref(), Some("low"));
     }
 }

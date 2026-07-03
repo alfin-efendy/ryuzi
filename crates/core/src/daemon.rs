@@ -256,7 +256,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         gateways.push(gw);
     }
 
-    let router = Router::new(Arc::clone(&store), gateways.clone());
+    let router = Router::new(Arc::clone(&cp), gateways.clone());
     let router_handle = tokio::spawn(router.run(cp.subscribe()));
 
     let fanout_handle =
