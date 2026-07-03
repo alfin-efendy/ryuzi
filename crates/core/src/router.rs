@@ -307,6 +307,7 @@ impl Router {
                 session_pk,
                 message,
             } => self.render_error(&session_pk, &message).await,
+            CoreEvent::Notice { session_pk, text } => self.render_notice(&session_pk, &text).await,
             CoreEvent::SessionEnded { session_pk } => {
                 self.state.remove(&session_pk);
             }
@@ -362,6 +363,16 @@ impl Router {
         }
         self.state.remove(session_pk);
     }
+
+    /// TS `renderNotice`: post the text as a result chunk to every surface.
+    async fn render_notice(&mut self, session_pk: &str, text: &str) {
+        let surfaces = self.store.surfaces(session_pk).await.unwrap_or_default();
+        for surface in surfaces {
+            if let Some(gw) = self.gateways.get(&surface.gateway) {
+                let _ = gw.post_result(&surface, &[text.to_string()]).await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -409,6 +420,7 @@ mod tests {
         gid: String,
         calls: Mutex<Vec<String>>,
         n: AtomicU64,
+        chunks_log: Mutex<Vec<Vec<String>>>,
     }
 
     impl FakeGateway {
@@ -417,6 +429,7 @@ mod tests {
                 gid: gid.to_string(),
                 calls: Mutex::new(Vec::new()),
                 n: AtomicU64::new(0),
+                chunks_log: Mutex::new(Vec::new()),
             }
         }
 
@@ -479,6 +492,7 @@ mod tests {
                 surface.conversation_id,
                 chunks.len()
             ));
+            self.chunks_log.lock().unwrap().push(chunks.to_vec());
             Ok(())
         }
         async fn post_error(&self, surface: &Surface, message: &str) -> anyhow::Result<()> {
@@ -650,6 +664,55 @@ mod tests {
                 "post_error:c1:boom".to_string(),
                 "post_result:c1:1".to_string(), // chunk("") => ["(done)"]
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_posts_the_text_to_every_surface_without_touching_the_buffer() {
+        let (cp, store) = test_control_plane().await;
+        store.add_surface("fake", "c1", "s1").await.unwrap();
+        store.add_surface("fake", "c2", "s1").await.unwrap();
+        let gw = Arc::new(FakeGateway::new("fake"));
+        let (tx, rx) = broadcast::channel(16);
+        let router = Router::new(Arc::clone(&cp), vec![gw.clone() as Arc<dyn Gateway>]);
+        let handle = tokio::spawn(router.run(rx));
+
+        tx.send(text_event("s1", 1, "buffered")).unwrap();
+        tx.send(CoreEvent::Notice {
+            session_pk: "s1".into(),
+            text: "⬆️ ryuzi 0.3.0 is available - hint".into(),
+        })
+        .unwrap();
+        tx.send(CoreEvent::Result {
+            session_pk: "s1".into(),
+        })
+        .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let calls = gw.calls();
+        assert_eq!(
+            calls.len(),
+            4,
+            "notice → 2 surfaces, then result flush → 2 surfaces: {calls:?}"
+        );
+        let mut notice_posts = calls[..2].to_vec();
+        notice_posts.sort();
+        assert_eq!(notice_posts, vec!["post_result:c1:1", "post_result:c2:1"]);
+
+        let chunks = gw.chunks_log.lock().unwrap().clone();
+        assert_eq!(
+            chunks[0],
+            vec!["⬆️ ryuzi 0.3.0 is available - hint".to_string()]
+        );
+        assert_eq!(
+            chunks[1],
+            vec!["⬆️ ryuzi 0.3.0 is available - hint".to_string()]
+        );
+        assert_eq!(
+            chunks[2],
+            vec!["buffered".to_string()],
+            "notice must not consume the text buffer"
         );
     }
 
