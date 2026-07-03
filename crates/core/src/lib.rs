@@ -11,6 +11,7 @@ pub mod paths;
 pub mod policy;
 pub mod providers;
 pub mod registry;
+pub mod scheduler;
 pub mod store;
 pub mod worktree;
 

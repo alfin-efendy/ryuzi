@@ -6,6 +6,7 @@ mod error;
 mod events;
 mod gateways_cmd;
 mod providers_cmd;
+mod scheduler_cmd;
 
 use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
 use tauri::Manager;
@@ -196,6 +197,13 @@ fn make_builder() -> Builder<tauri::Wry> {
             providers_cmd::remove_provider_account,
             providers_cmd::set_active_account,
             providers_cmd::move_provider_account,
+            scheduler_cmd::list_jobs,
+            scheduler_cmd::create_job,
+            scheduler_cmd::update_job,
+            scheduler_cmd::toggle_job,
+            scheduler_cmd::delete_job,
+            scheduler_cmd::run_job_now,
+            scheduler_cmd::parse_natural_schedule,
             accent::system_accent_color,
         ])
         .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])
@@ -240,6 +248,8 @@ pub fn run() {
             });
             // Subscribe BEFORE manage() moves the Arc.
             let mut rx = cp.subscribe();
+            // The scheduler loop fires enabled jobs for real (30s tick).
+            ryuzi_core::scheduler::spawn_runner(cp.clone());
             // Make Arc<ControlPlane> available to all Tauri commands.
             app.manage(cp);
             // Apply the OS backdrop (mica/vibrancy) at runtime and record what

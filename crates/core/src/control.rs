@@ -46,6 +46,11 @@ impl ControlPlane {
         &self.store
     }
 
+    /// Broadcast a core event (used by domain modules like the scheduler).
+    pub fn send_event(&self, e: CoreEvent) -> bool {
+        self.events.send(e).is_ok()
+    }
+
     pub fn resolve_approval(&self, request_id: &str, allow: bool) -> bool {
         self.approvals.resolve(request_id, allow)
     }

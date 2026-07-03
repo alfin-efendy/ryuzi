@@ -269,6 +269,60 @@ async moveProviderAccount(providerId: string, accountId: string, dir: number) : 
     else return { status: "error", error: e  as any };
 }
 },
+async listJobs() : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_jobs") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createJob(input: JobInput) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_job", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateJob(id: string, input: JobInput) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_job", { id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async toggleJob(id: string, enabled: boolean) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("toggle_job", { id, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteJob(id: string) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_job", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async runJobNow(id: string) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("run_job_now", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Preview helper for the natural-language schedule editor.
+ */
+async parseNaturalSchedule(text: string) : Promise<string | null> {
+    return await TAURI_INVOKE("parse_natural_schedule", { text });
+},
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 }
@@ -303,7 +357,11 @@ export type CmdError = { message: string }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | { kind: "sessionEnded"; session_pk: string }
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | { kind: "sessionEnded"; session_pk: string } | 
+/**
+ * A scheduled job run started or finished (status: running|success|failed).
+ */
+{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string }
 export type CoreEventMsg = { event: CoreEvent }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string; 
@@ -316,6 +374,8 @@ kind: string; detail: string; metaLine: string;
  */
 status: string; latency: string | null; daemonVersion: string; uptime: string | null; lastSeenMs: number | null; resources: GatewayResourceInfo[]; fingerprint: string | null; fsMode: string; paths: string[] }
 export type GatewayResourceInfo = { label: string; sub: string; pct: number }
+export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
+export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
@@ -330,6 +390,7 @@ export type ProviderInfo = { id: string; name: string; color: string; initial: s
  */
 tracksUsage: boolean }
 export type QuotaInfo = { label: string; pct: number; used: string; max: string; resets: string }
+export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
