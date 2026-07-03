@@ -53,7 +53,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::domain::{CoreEvent, NewMessage};
 use crate::harness::acp::notification::NotificationSink;
 use crate::harness::acp::transport::PermissionContext;
-use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
+use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use crate::store::Store;
 
 /// One request the [`AcpSession`] hands to the client loop. Each carries a
@@ -719,7 +719,7 @@ pub struct AcpSession {
 
 #[async_trait]
 impl HarnessSession for AcpSession {
-    async fn send_prompt(&self, prompt: String) -> anyhow::Result<()> {
+    async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
         let tx = {
             let guard = self.tx.lock().await;
             guard
@@ -728,20 +728,23 @@ impl HarnessSession for AcpSession {
                 .ok_or_else(|| anyhow::anyhow!("ACP session already ended"))?
         };
 
-        // Persist the user turn (Spec 1) before driving the prompt.
+        // Persist the user turn (Spec 1) before driving the prompt. Persist
+        // `prompt.display` — the raw text the user typed — not the (possibly
+        // attachment-manifest-decorated) `prompt.agent` text, so durable
+        // history shows what the user actually typed.
         // Use ryuzi's own session_pk (not the ACP session id) so the frontend
         // can find the row via list_messages(session_pk).
         let user_msg = NewMessage::block(
             &self.session_pk,
             "user",
             "text",
-            serde_json::json!({ "text": prompt }),
+            serde_json::json!({ "text": prompt.display }),
         );
         if let Err(e) = self.store.insert_message(user_msg).await {
             tracing::warn!("send_prompt: failed to persist user turn: {e}");
         }
 
-        let content = vec![ContentBlock::Text(TextContent::new(prompt))];
+        let content = vec![ContentBlock::Text(TextContent::new(prompt.agent))];
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(ClientRequest::Prompt {
             content,

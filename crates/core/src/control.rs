@@ -3,7 +3,7 @@ use crate::attachments::{
     build_manifest, materialize_attachments, AttachmentFetcher, MaterializeOpts, UreqFetcher,
 };
 use crate::domain::{AttachmentRef, CoreEvent, Message, PermMode, Project, Session, SessionStatus};
-use crate::harness::{HarnessSession, SessionCtx};
+use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::integration::Registries;
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::settings::{expand_home, SettingsStore};
@@ -197,7 +197,14 @@ impl ControlPlane {
         let final_prompt = self
             .with_attachments(&session_pk, prompt, attachments)
             .await;
-        self.spawn_prompt(handle, session_pk.clone(), final_prompt);
+        self.spawn_prompt(
+            handle,
+            session_pk.clone(),
+            TurnPrompt {
+                agent: final_prompt,
+                display: prompt.to_string(),
+            },
+        );
 
         Ok(session)
     }
@@ -276,7 +283,14 @@ impl ControlPlane {
             }
         };
         let final_prompt = self.with_attachments(session_pk, prompt, attachments).await;
-        self.spawn_prompt(handle, session_pk.to_string(), final_prompt);
+        self.spawn_prompt(
+            handle,
+            session_pk.to_string(),
+            TurnPrompt {
+                agent: final_prompt,
+                display: prompt.to_string(),
+            },
+        );
         Ok(())
     }
 
@@ -354,7 +368,14 @@ impl ControlPlane {
             .await
         {
             Ok(handle) => {
-                self.spawn_prompt(handle, session_pk.to_string(), RESUME_NUDGE.to_string());
+                self.spawn_prompt(
+                    handle,
+                    session_pk.to_string(),
+                    TurnPrompt {
+                        agent: RESUME_NUDGE.to_string(),
+                        display: RESUME_NUDGE.to_string(),
+                    },
+                );
                 Ok(())
             }
             Err(e) => {
@@ -444,7 +465,7 @@ impl ControlPlane {
         self: &Arc<Self>,
         handle: Arc<dyn HarnessSession>,
         session_pk: String,
-        prompt: String,
+        prompt: TurnPrompt,
     ) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
@@ -691,17 +712,21 @@ mod tests {
 
     #[async_trait]
     impl HarnessSession for FakeSession {
-        async fn send_prompt(&self, prompt: String) -> anyhow::Result<()> {
+        async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
             self.send_count.fetch_add(1, Ordering::SeqCst);
-            self.prompts.lock().unwrap().push(prompt.clone());
-            // Persist the user turn (as the ACP session does in send_prompt).
+            // Record the agent-visible (possibly manifest-decorated) text —
+            // tests assert on exactly what the harness/agent was driven with.
+            self.prompts.lock().unwrap().push(prompt.agent.clone());
+            // Persist the user turn (as the ACP session does in send_prompt),
+            // using the RAW display text — not the agent-decorated one — so
+            // durable history mirrors what the real ACP session persists.
             let _ = self
                 .store
                 .insert_message(NewMessage::block(
                     &self.session_pk,
                     "user",
                     "text",
-                    serde_json::json!({ "text": prompt }),
+                    serde_json::json!({ "text": prompt.display }),
                 ))
                 .await;
 
@@ -1513,9 +1538,22 @@ mod tests {
         );
         assert_eq!(
             prompts.lock().unwrap()[0],
-            format!("please review\n\n{expected_manifest}")
+            format!("please review\n\n{expected_manifest}"),
+            "the harness/agent must see the prompt decorated with the attachment manifest"
         );
         assert!(dest.exists(), "attachment must be written to disk");
+
+        // Durable history (the cockpit UI) must show the RAW prompt the user
+        // typed — NOT the manifest-decorated text sent to the agent above.
+        let msgs = store.list_messages(&session.session_pk).await.unwrap();
+        let user_row = msgs
+            .iter()
+            .find(|m| m.role == "user" && m.block_type == "text")
+            .expect("expected a persisted user turn");
+        assert_eq!(
+            user_row.payload["text"], "please review",
+            "the persisted user row must be the raw prompt only, not manifest-decorated"
+        );
     }
 
     #[tokio::test]

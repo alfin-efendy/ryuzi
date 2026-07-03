@@ -443,7 +443,7 @@ mod tests {
     use super::*;
     use crate::domain::{NewMessage, PermMode, Project, Session, SessionStatus};
     use crate::gateway::MessageRef;
-    use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
+    use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::telemetry::NoopTelemetry;
     use async_trait::async_trait;
     use serial_test::serial;
@@ -944,14 +944,14 @@ mod tests {
 
     #[async_trait]
     impl HarnessSession for PermFakeSession {
-        async fn send_prompt(&self, prompt: String) -> anyhow::Result<()> {
+        async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
             let _ = self
                 .store
                 .insert_message(NewMessage::block(
                     &self.session_pk,
                     "user",
                     "text",
-                    serde_json::json!({ "text": prompt }),
+                    serde_json::json!({ "text": prompt.display }),
                 ))
                 .await;
 
@@ -1090,15 +1090,15 @@ mod tests {
     }
     #[async_trait]
     impl HarnessSession for ResumeFakeSession {
-        async fn send_prompt(&self, prompt: String) -> anyhow::Result<()> {
-            self.prompts.lock().unwrap().push(prompt.clone());
+        async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+            self.prompts.lock().unwrap().push(prompt.agent.clone());
             let _ = self
                 .store
                 .insert_message(NewMessage::block(
                     &self.session_pk,
                     "user",
                     "text",
-                    serde_json::json!({ "text": prompt }),
+                    serde_json::json!({ "text": prompt.display }),
                 ))
                 .await;
             Ok(())

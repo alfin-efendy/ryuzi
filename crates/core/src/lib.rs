@@ -26,7 +26,9 @@ pub use domain::{
 };
 pub use gateway::{Gateway, GatewayFactory, GatewayRegistry, MessageRef};
 pub use harness::acp::{AcpAdapterDescriptor, ClaudeCodeIntegration};
-pub use harness::{Harness, HarnessFactory, HarnessRegistry, HarnessSession, SessionCtx};
+pub use harness::{
+    Harness, HarnessFactory, HarnessRegistry, HarnessSession, SessionCtx, TurnPrompt,
+};
 pub use integration::{Integration, Registries};
 pub use registry::Registry;
 pub use router::{chunk, Router};

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ryuzi_core::domain::NewMessage;
-use ryuzi_core::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
+use ryuzi_core::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use ryuzi_core::integration::Integration;
 use ryuzi_core::{CoreEvent, Registries};
 use serial_test::serial;
@@ -20,7 +20,7 @@ struct FakeSession {
 
 #[async_trait]
 impl HarnessSession for FakeSession {
-    async fn send_prompt(&self, _prompt: String) -> anyhow::Result<()> {
+    async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
         let seq = self
             .store
             .insert_message(NewMessage::block(
@@ -207,7 +207,7 @@ struct BlockingFakeSession;
 
 #[async_trait]
 impl HarnessSession for BlockingFakeSession {
-    async fn send_prompt(&self, _prompt: String) -> anyhow::Result<()> {
+    async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
         std::future::pending::<()>().await;
         unreachable!()
     }

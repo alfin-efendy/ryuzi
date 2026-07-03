@@ -578,7 +578,7 @@ pub async fn run_via_harness_trait(prompt: &str) -> (std::sync::Arc<crate::store
     use crate::approval::ApprovalHub;
     use crate::domain::{CoreEvent, PermMode};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
-    use crate::harness::{Harness, SessionCtx};
+    use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -615,7 +615,10 @@ pub async fn run_via_harness_trait(prompt: &str) -> (std::sync::Arc<crate::store
         .expect("start_session via Harness trait failed");
 
     session
-        .send_prompt(prompt.to_string())
+        .send_prompt(TurnPrompt {
+            agent: prompt.to_string(),
+            display: prompt.to_string(),
+        })
         .await
         .expect("send_prompt failed");
 
@@ -1115,7 +1118,7 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
     use crate::approval::ApprovalHub;
     use crate::domain::{CoreEvent, PermMode};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
-    use crate::harness::{Harness, SessionCtx};
+    use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
 
     let tmp_store = tempfile::NamedTempFile::new().unwrap();
@@ -1194,7 +1197,10 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
         .expect("run_prompt_with_fs_calls: start_session failed");
 
     session
-        .send_prompt("write and read".to_string())
+        .send_prompt(TurnPrompt {
+            agent: "write and read".to_string(),
+            display: "write and read".to_string(),
+        })
         .await
         .expect("run_prompt_with_fs_calls: send_prompt failed");
 
@@ -1385,7 +1391,7 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
     use crate::approval::ApprovalHub;
     use crate::domain::{CoreEvent, PermMode};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
-    use crate::harness::{Harness, SessionCtx};
+    use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
 
     let tmp_store = tempfile::NamedTempFile::new().unwrap();
@@ -1462,7 +1468,10 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
         .expect("run_prompt_with_terminal_calls: start_session failed");
 
     session
-        .send_prompt("run terminal".to_string())
+        .send_prompt(TurnPrompt {
+            agent: "run terminal".to_string(),
+            display: "run terminal".to_string(),
+        })
         .await
         .expect("run_prompt_with_terminal_calls: send_prompt failed");
 
@@ -1526,7 +1535,7 @@ pub async fn run_perm_mock_via_harness(
     use crate::approval::ApprovalHub;
     use crate::domain::{CoreEvent, PermMode, Project, Session, SessionStatus};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
-    use crate::harness::{Harness, SessionCtx};
+    use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
 
     let tmp_store = tempfile::NamedTempFile::new().unwrap();
@@ -1679,7 +1688,10 @@ pub async fn run_perm_mock_via_harness(
         .expect("run_perm_mock_via_harness: start_session failed");
 
     session
-        .send_prompt("trigger permission".to_string())
+        .send_prompt(TurnPrompt {
+            agent: "trigger permission".to_string(),
+            display: "trigger permission".to_string(),
+        })
         .await
         .expect("run_perm_mock_via_harness: send_prompt failed");
 
