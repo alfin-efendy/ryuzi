@@ -193,8 +193,11 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// then `opts.extra_harness_factories`) → `ControlPlane::new_with_telemetry`
 /// → gateways (from `enabled_gateways` + `extra_gateway_factories` + the
 /// provider catalog) → the outbound `Router` spawned on one `cp.subscribe()`
-/// → the approval fan-out spawned on another. One `Arc<Store>` is opened
-/// once and cloned throughout — no `Arc::try_unwrap` reclaiming.
+/// → a second, inbound-only `Router` handed to every gateway via
+/// `Gateway::set_router` (Task 6 — see `router.rs`'s module doc for why two
+/// instances) → the approval fan-out spawned on another `cp.subscribe()`.
+/// One `Arc<Store>` is opened once and cloned throughout — no
+/// `Arc::try_unwrap` reclaiming.
 ///
 /// Telemetry selection: an explicit `opts.telemetry` override always wins;
 /// otherwise selection is delegated to [`select_telemetry`] (see its doc for
@@ -256,8 +259,22 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         gateways.push(gw);
     }
 
-    let router = Router::new(Arc::clone(&cp), gateways.clone());
-    let router_handle = tokio::spawn(router.run(cp.subscribe()));
+    // Two `Router` instances sharing the same `cp`/`store` — see `router.rs`'s
+    // module doc. `router_out` drives the outbound render loop (`run`
+    // consumes `self`); `router_in` is handed to every gateway via
+    // `set_router` (Task 6: `DiscordGateway`'s `new(port)` + `set_router`
+    // inversion — see `gateway::discord::mod`'s doc — needs a `Router` to
+    // exist, but a `Router` needs the already-built gateway list, so
+    // gateways are built first and given a `Router` handle right after one
+    // exists; most gateways ignore it via `Gateway::set_router`'s default
+    // no-op).
+    let router_out = Router::new(Arc::clone(&cp), gateways.clone());
+    let router_handle = tokio::spawn(router_out.run(cp.subscribe()));
+
+    let router_in = Arc::new(Router::new(Arc::clone(&cp), gateways.clone()));
+    for gw in &gateways {
+        gw.set_router(Arc::clone(&router_in));
+    }
 
     let fanout_handle =
         spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), gateways.clone());

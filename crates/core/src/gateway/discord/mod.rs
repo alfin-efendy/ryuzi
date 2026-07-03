@@ -1,10 +1,13 @@
-//! The Discord gateway's pure logic: a hexagonal `DiscordPort` trait (no
-//! `serenity`, no feature gate — that's Task 6), slash-command JSON defs, and
-//! message/interaction routing. Ports `packages/core/src/gateways/discord/index.ts`
-//! and `commands.ts` byte-for-byte where TS has a concrete counterpart (reply
-//! strings, stripMentions, command shapes); everything else (the port trait
-//! shape, the reply-callback plumbing) is a Rust-native design translating
-//! the same behavior.
+//! The Discord gateway's pure logic (this module — no `serenity`, no feature
+//! gate, unconditionally compiled): a hexagonal `DiscordPort` trait,
+//! slash-command JSON defs, and message/interaction routing. Ports
+//! `packages/core/src/gateways/discord/index.ts` and `commands.ts`
+//! byte-for-byte where TS has a concrete counterpart (reply strings,
+//! stripMentions, command shapes); everything else (the port trait shape,
+//! the reply-callback plumbing) is a Rust-native design translating the
+//! same behavior. The real `serenity`-backed `DiscordPort` lives in
+//! [`serenity_port`] (Task 6), behind the `discord` feature — see that
+//! module's doc for the Step 0 API-validation gate findings.
 //!
 //! **Delegated decision — reply callback shape:** the brief allowed swapping
 //! the `dyn Fn(String) -> BoxFuture<'static, ()>` reply closure for an
@@ -14,28 +17,89 @@
 //! crate is already a `ryuzi-core` dependency), matching the brief's primary
 //! sketch and the TS `(text: string) => Promise<void>` shape closely.
 //!
-//! **Delegated decision — constructor shape:** `DiscordGateway::new(port:
-//! Arc<dyn DiscordPort>, router: Arc<Router>) -> Arc<Self>`, exactly as the
-//! brief specifies. Internally, the router + gateway id are held by a small
-//! `InboundRouting` struct (`Arc`-wrapped, implementing `InboundHandlers`)
-//! rather than directly on `DiscordGateway` — `Gateway::start` needs to hand
+//! **Delegated decision — constructor shape (Task 5, superseded by Task 6):**
+//! Task 5 landed `DiscordGateway::new(port, router: Arc<Router>) ->
+//! Arc<Self>`. Task 6 needs a real `serenity`-backed `DiscordPort`
+//! (`serenity_port::SerenityDiscordPort`, behind the `discord` feature) built
+//! by a `GatewayFactory` — but `build_daemon` builds every gateway via its
+//! factory BEFORE the outbound `Router` exists (the `Router` itself takes
+//! the already-built gateway list), so a two-argument constructor requiring
+//! an `Arc<Router>` up front can't be satisfied at that point. The brief
+//! offered two ways to break the cycle: an `OnceCell`/`ArcSwapOption` handed
+//! to the factory, or inverting the constructor. Chose the simpler one:
+//! **`DiscordGateway::new(port) -> Arc<Self>`, plus `set_router(&self,
+//! Arc<Router>)`** (also added as a default no-op on the `Gateway` trait
+//! itself — see `gateway::mod`'s doc), called by `build_daemon` right after
+//! constructing the inbound `Router` instance. Inbound events
+//! (`handle_message`/`handle_interaction`) arriving before `set_router` runs
+//! are dropped with an `eprintln!` warning rather than panicking or
+//! blocking — a real Discord connector only fires events after its own
+//! `connect()` resolves, and `build_daemon` calls `set_router` before
+//! `gw.start()`, so this is expected to be unreachable in production; it's
+//! there for robustness (and is exercised directly in this module's tests).
+//!
+//! Internally, the router (now `RwLock<Option<Arc<Router>>>`, populated by
+//! `set_router`) + gateway id are still held by a small `InboundRouting`
+//! struct (`Arc`-wrapped, implementing `InboundHandlers`) rather than
+//! directly on `DiscordGateway` — `Gateway::start` needs to hand
 //! `DiscordPort::connect` an `Arc<dyn InboundHandlers>`, but `start(&self)`
 //! only has `&self`, not `Arc<Self>`. Since routing logic never touches
 //! `self.port` (only `self.router`/the gateway id — verified against the TS
 //! source, which never references `this.port` in `handleMessage`/
 //! `handleInteraction` either), splitting it into its own cheaply-`Arc`-cloneable
 //! struct sidesteps the "no `Arc<Self>` from `&self`" problem entirely,
-//! without a self-referential `Weak<Self>` field. Task 6's `set_router`
-//! inversion will presumably restructure this further; this shape is
-//! sufficient for Task 5.
+//! without a self-referential `Weak<Self>` field.
+//!
+//! **Delegated decision — where the `discord` feature gate lives:** the
+//! brief's daemon-wiring sketch reads `#[cfg(feature = "discord")]` in
+//! `daemon_cmd.rs` (the `ryuzi-cli` crate). `#[cfg(feature = "...")]` always
+//! checks the COMPILING crate's own declared features, never a dependency's
+//! — and `ryuzi-cli`'s `Cargo.toml` change for this task is a hardcoded
+//! feature request on its `ryuzi-core` path dependency (`features = ["otel",
+//! "discord"]`), not a new `[features]` toggle on `ryuzi-cli` itself (`cli`
+//! has none today; `otel` isn't cli-toggleable either — see `daemon.rs`'s
+//! `#[cfg(feature = "otel")]` gates, all of which live in `ryuzi-core`). So a
+//! literal `#[cfg(feature = "discord")]` inside `daemon_cmd.rs` would just
+//! always be `false` (unknown feature on that crate), silently registering
+//! nothing. Instead, [`factory_entries`] below lives HERE, in
+//! `ryuzi-core`, gated on `ryuzi-core`'s own real `discord` feature; `cli`
+//! calls it unconditionally. This keeps the "empty vec under `not(feature)`"
+//! behavior meaningful and testable from `ryuzi-core`'s own two-feature-state
+//! test suite, while `ryuzi-cli`'s build (which always requests
+//! `ryuzi-core/discord`) always gets a populated one.
 
 use crate::domain::{ApprovalDecision, ApprovalRequest, AttachmentRef, PermMode, Surface};
-use crate::gateway::{Gateway, MessageRef};
+use crate::gateway::{Gateway, GatewayFactory, MessageRef};
 use crate::router::{ConnectOpts, Router};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+#[cfg(feature = "discord")]
+pub mod serenity_port;
+
+#[cfg(feature = "discord")]
+pub use serenity_port::{DiscordGatewayFactory, SerenityDiscordPort};
+
+/// [`crate::daemon::BuildDaemonOpts::extra_gateway_factories`] entry for
+/// Discord, gated on the `discord` feature — see the module doc's "where the
+/// feature gate lives" decision. Empty under `not(feature = "discord")`, so
+/// `ryuzi-core`'s default test build (and anything else that doesn't ask for
+/// `discord`) never touches `serenity`.
+#[cfg(feature = "discord")]
+pub fn factory_entries() -> Vec<(String, Arc<dyn GatewayFactory>)> {
+    vec![(
+        GATEWAY_ID.to_string(),
+        Arc::new(DiscordGatewayFactory::new()) as Arc<dyn GatewayFactory>,
+    )]
+}
+
+/// See [`factory_entries`] above (the `discord`-feature-gated version).
+#[cfg(not(feature = "discord"))]
+pub fn factory_entries() -> Vec<(String, Arc<dyn GatewayFactory>)> {
+    Vec::new()
+}
 
 /// This gateway's stable id — matches `Surface.gateway` and the key it's
 /// registered under in a `Router`'s gateway map.
@@ -156,20 +220,33 @@ fn strip_mentions(content: &str) -> String {
 /// impl handed to `DiscordPort::connect` — see the module doc for why this
 /// is a separate `Arc`-held struct rather than living directly on
 /// `DiscordGateway`.
+///
+/// `router` starts `None` (Task 6's `set_router` inversion — see the module
+/// doc): a `DiscordGateway` can exist before `build_daemon` has a `Router` to
+/// give it. `RwLock` (not `Mutex`) since reads (every inbound event) vastly
+/// outnumber the single `set_router` write.
 struct InboundRouting {
-    router: Arc<Router>,
+    router: RwLock<Option<Arc<Router>>>,
 }
 
 impl InboundRouting {
-    /// TS parity: `DiscordGateway.handleMessage`.
+    fn router(&self) -> Option<Arc<Router>> {
+        self.router.read().unwrap().clone()
+    }
+
+    /// TS parity: `DiscordGateway.handleMessage` — plus the Task 6 "router
+    /// not set yet" guard (dropped with a warning; see the module doc).
     async fn handle_message(&self, e: InboundMessage) {
+        let Some(router) = self.router() else {
+            eprintln!("[discord] dropping inbound message: router not set yet");
+            return;
+        };
         if e.author_bot {
             return;
         }
         if e.is_thread {
             if !e.content.is_empty() || !e.attachments.is_empty() {
-                if let Err(err) = self
-                    .router
+                if let Err(err) = router
                     .on_reply(
                         GATEWAY_ID,
                         &e.channel_id,
@@ -187,8 +264,7 @@ impl InboundRouting {
         if e.mentions_bot {
             let prompt = strip_mentions(&e.content);
             if !prompt.is_empty() || !e.attachments.is_empty() {
-                if let Err(err) = self
-                    .router
+                if let Err(err) = router
                     .on_start(
                         GATEWAY_ID,
                         &e.channel_id,
@@ -205,12 +281,17 @@ impl InboundRouting {
     }
 
     /// TS parity: `DiscordGateway.handleInteraction`, including the
-    /// try/catch-as-error-reply wrapper.
+    /// try/catch-as-error-reply wrapper — plus the Task 6 "router not set
+    /// yet" guard (dropped with a warning; see the module doc).
     async fn handle_interaction(
         &self,
         e: InboundInteraction,
         reply: &(dyn Fn(String) -> BoxFuture<'static, ()> + Sync),
     ) {
+        let Some(router) = self.router() else {
+            eprintln!("[discord] dropping inbound interaction: router not set yet");
+            return;
+        };
         let result: anyhow::Result<()> = async {
             match e.name.as_str() {
                 "connect" => {
@@ -225,7 +306,7 @@ impl InboundRouting {
                         },
                         actor_role_ids: e.role_ids.clone(),
                     };
-                    let outcome = self.router.on_connect(GATEWAY_ID, &e.user_id, opts).await?;
+                    let outcome = router.on_connect(GATEWAY_ID, &e.user_id, opts).await?;
                     let mut msg = format!("✅ connected → <#{}>", outcome.workspace_id);
                     if outcome.perm_mode_downgraded {
                         msg.push_str(
@@ -235,11 +316,11 @@ impl InboundRouting {
                     reply(msg).await;
                 }
                 "end" => {
-                    self.router.on_end(GATEWAY_ID, &e.channel_id).await?;
+                    router.on_end(GATEWAY_ID, &e.channel_id).await?;
                     reply("🟥 session ended".to_string()).await;
                 }
                 "stop" => {
-                    self.router.on_stop(GATEWAY_ID, &e.channel_id).await?;
+                    router.on_stop(GATEWAY_ID, &e.channel_id).await?;
                     reply("⏹️ stopping the current turn".to_string()).await;
                 }
                 "status" => {
@@ -279,10 +360,15 @@ pub struct DiscordGateway {
 }
 
 impl DiscordGateway {
-    pub fn new(port: Arc<dyn DiscordPort>, router: Arc<Router>) -> Arc<Self> {
+    /// No `Router` yet (Task 6's `set_router` inversion — see the module
+    /// doc): inbound events are dropped-with-a-warning until [`Self::set_router`]
+    /// (also reachable via the `Gateway` trait) is called.
+    pub fn new(port: Arc<dyn DiscordPort>) -> Arc<Self> {
         Arc::new(DiscordGateway {
             port,
-            inbound: Arc::new(InboundRouting { router }),
+            inbound: Arc::new(InboundRouting {
+                router: RwLock::new(None),
+            }),
         })
     }
 
@@ -315,6 +401,10 @@ impl Gateway for DiscordGateway {
 
     async fn stop(&self) -> anyhow::Result<()> {
         self.port.disconnect().await
+    }
+
+    fn set_router(&self, router: Arc<Router>) {
+        *self.inbound.router.write().unwrap() = Some(router);
     }
 
     async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
@@ -616,7 +706,8 @@ mod tests {
     async fn output_methods_delegate_to_the_port() {
         let port = Arc::new(FakePort::new());
         let router = Arc::new(Router::new(minimal_cp().await, vec![]));
-        let gw = DiscordGateway::new(port.clone(), router);
+        let gw = DiscordGateway::new(port.clone());
+        gw.set_router(router);
 
         let ws = gw.create_workspace("foo").await.unwrap();
         let conv = gw.create_conversation(&ws, "title").await.unwrap();
@@ -649,7 +740,8 @@ mod tests {
     async fn start_connects_the_port() {
         let port = Arc::new(FakePort::new());
         let router = Arc::new(Router::new(minimal_cp().await, vec![]));
-        let gw = DiscordGateway::new(port.clone(), router);
+        let gw = DiscordGateway::new(port.clone());
+        gw.set_router(router);
         Gateway::start(&*gw).await.unwrap();
         assert!(port.connected());
     }
@@ -660,7 +752,8 @@ mod tests {
     async fn request_approval_forwards_to_the_port_and_returns_its_decision() {
         let port = Arc::new(FakePort::new());
         let router = Arc::new(Router::new(minimal_cp().await, vec![]));
-        let gw = DiscordGateway::new(port.clone(), router);
+        let gw = DiscordGateway::new(port.clone());
+        gw.set_router(router);
 
         let dec = gw
             .request_approval(
@@ -897,7 +990,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (router, fake_gw, store, _db_guard) = wired_router(root.path()).await;
         let port = Arc::new(FakePort::new());
-        let gw = DiscordGateway::new(port, router.clone());
+        let gw = DiscordGateway::new(port);
+        gw.set_router(router.clone());
 
         let outcome = router
             .on_connect(
@@ -1004,7 +1098,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (router, fake_gw, _store, _db_guard) = wired_router(root.path()).await;
         let port = Arc::new(FakePort::new());
-        let gw = DiscordGateway::new(port, router);
+        let gw = DiscordGateway::new(port);
+        gw.set_router(router);
 
         let mut options = HashMap::new();
         options.insert("name".to_string(), "foo".to_string());
@@ -1048,7 +1143,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (router, fake_gw, store, _db_guard) = wired_router(root.path()).await;
         let port = Arc::new(FakePort::new());
-        let gw = DiscordGateway::new(port, router.clone());
+        let gw = DiscordGateway::new(port);
+        gw.set_router(router.clone());
 
         let outcome = router
             .on_connect(
@@ -1121,5 +1217,77 @@ mod tests {
         })
         .await;
         assert_eq!(store.list_sessions(None).await.unwrap().len(), 1);
+    }
+
+    // ---------- Test 7 (Task 6): set_router reconciliation ----------
+
+    /// Task 6's `new(port)` + `set_router` inversion: inbound routing on a
+    /// gateway that hasn't had `set_router` called yet must be dropped, not
+    /// routed — then, after `set_router`, the identical event must reach the
+    /// router normally. Targets an ALREADY-CONNECTED workspace for both
+    /// halves (not an unmapped id `on_start` would no-op on regardless of
+    /// the `set_router` guard — see the Task 5 fix report above on why a
+    /// vacuous target defeats this kind of test) so the "before" assertion
+    /// is only true because of the guard, not an unrelated no-op.
+    #[tokio::test]
+    #[serial]
+    async fn inbound_events_before_set_router_are_dropped_then_routed_after() {
+        let _guard = StateDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let (router, fake_gw, _store, _db_guard) = wired_router(root.path()).await;
+
+        // Connect a real workspace up front via a separate, already-wired
+        // gateway instance, so it's a genuine bound target below.
+        let setup_gw = DiscordGateway::new(Arc::new(FakePort::new()));
+        setup_gw.set_router(router.clone());
+        let outcome = router
+            .on_connect(
+                "discord",
+                "u1",
+                ConnectOpts {
+                    name: Some("proj3".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let ws_id = outcome.workspace_id;
+
+        // A FRESH gateway instance, deliberately never `set_router`'d.
+        let gw = DiscordGateway::new(Arc::new(FakePort::new()));
+        gw.handle_message(InboundMessage {
+            channel_id: ws_id.clone(),
+            author_id: "u".to_string(),
+            mentions_bot: true,
+            content: "<@1> do it".to_string(),
+            ..base_msg()
+        })
+        .await;
+        assert!(
+            !fake_gw
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("create_conversation:")),
+            "inbound routing before set_router must be dropped, not routed: {:?}",
+            fake_gw.calls()
+        );
+
+        gw.set_router(router.clone());
+        gw.handle_message(InboundMessage {
+            channel_id: ws_id.clone(),
+            author_id: "u".to_string(),
+            mentions_bot: true,
+            content: "<@1> do it".to_string(),
+            ..base_msg()
+        })
+        .await;
+        assert!(
+            fake_gw
+                .calls()
+                .iter()
+                .any(|c| c.starts_with(&format!("create_conversation:{ws_id}:"))),
+            "inbound routing after set_router must reach the router: {:?}",
+            fake_gw.calls()
+        );
     }
 }

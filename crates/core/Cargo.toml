@@ -32,6 +32,7 @@ url = "2"
 opentelemetry = { version = "0.32.0", features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.32.0", features = ["trace", "metrics", "http-proto", "reqwest-blocking-client"], optional = true }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "http", "builder", "collector"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -42,3 +43,4 @@ serial_test = "3"
 
 [features]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+discord = ["dep:serenity"]

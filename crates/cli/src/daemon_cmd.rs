@@ -101,7 +101,15 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
             })
         }),
         telemetry: None,
-        extra_gateway_factories: vec![],
+        // `factory_entries()` is gated INSIDE `ryuzi-core` on ITS OWN
+        // `discord` feature (see `gateway::discord::mod`'s doc on why the
+        // gate can't live here: `#[cfg(feature = "discord")]` in THIS crate
+        // would check a feature `ryuzi-cli` doesn't declare, since its
+        // `Cargo.toml` requests `ryuzi-core`'s `discord` feature directly
+        // rather than exposing its own toggle). Empty under
+        // `not(feature = "discord")`; populated for every real `ryuzi-cli`
+        // build (its `Cargo.toml` always requests `ryuzi-core/discord`).
+        extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
         extra_harness_factories: vec![],
     };
 

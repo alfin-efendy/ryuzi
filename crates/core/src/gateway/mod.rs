@@ -1,5 +1,6 @@
 use crate::domain::{ApprovalDecision, ApprovalRequest, Surface};
 use crate::registry::Registry;
+use crate::router::Router;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -47,6 +48,23 @@ pub trait Gateway: Send + Sync {
         surface: &Surface,
         req: &ApprovalRequest,
     ) -> anyhow::Result<ApprovalDecision>;
+
+    /// Give this gateway a handle to the outbound [`Router`], once one
+    /// exists. Default no-op: most gateways are pure output sinks and never
+    /// need it.
+    ///
+    /// Exists to break a construction-order cycle (Task 6, recorded choice):
+    /// `build_daemon` builds every `Gateway` via its `GatewayFactory` BEFORE
+    /// the `Router` (the `Router` itself needs the already-built gateway
+    /// list — see `router.rs`'s module doc on why a second, inbound-only
+    /// `Router` instance is built for this). A gateway whose INBOUND
+    /// routing needs a `Router` (Discord's `DiscordGateway`) can't receive
+    /// one at construction time, so `build_daemon` calls `set_router` on
+    /// every gateway right after building that inbound `Router` instead.
+    /// Inbound events arriving at a gateway before its `set_router` is
+    /// called are dropped with a warning — see
+    /// `gateway::discord::DiscordGateway`.
+    fn set_router(&self, _router: Arc<Router>) {}
 }
 
 pub trait GatewayFactory: Send + Sync {
