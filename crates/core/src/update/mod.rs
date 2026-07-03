@@ -4,6 +4,7 @@
 //! Logic lives here behind injectable traits; `crates/cli/src/daemon_cmd.rs`
 //! provides the production impls (real HTTP, real tar, real spawn/renames).
 pub mod asset;
+pub mod canary;
 pub mod check;
 pub mod handoff;
 pub mod install_method;
@@ -14,6 +15,10 @@ pub mod version;
 pub use asset::{
     asset_name, asset_url, checksums_url, detect_platform, sha256_hex, target_triple,
     verify_checksum, Platform,
+};
+pub use canary::{
+    canary_target_version, canary_timeout_ms, probe, run_canary_with, CanaryCfg, CanaryHost,
+    CanaryOutcome, ProbeResult,
 };
 pub use check::{check_for_update, HttpResponse, UpdateCheckResult, UpdateHttp, UreqHttp};
 pub use handoff::{
