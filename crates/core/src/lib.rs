@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod connector;
 pub mod control;
+pub mod daemon;
 pub mod daemon_status;
 pub mod domain;
 pub mod gateway;
