@@ -12,6 +12,7 @@ pub mod registry;
 pub mod settings;
 pub mod sidecar;
 pub mod store;
+pub mod telemetry;
 pub mod worktree;
 
 pub use connector::{Connector, ConnectorCtx, ConnectorFactory, ConnectorRegistry};

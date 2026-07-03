@@ -4,6 +4,7 @@ use crate::harness::{HarnessSession, SessionCtx};
 use crate::integration::Registries;
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::store::Store;
+use crate::telemetry::{NoopTelemetry, Telemetry};
 use crate::worktree;
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,10 +28,24 @@ pub struct ControlPlane {
     /// handle returned by `Harness::start_session`, used to drive prompts and to
     /// `cancel`/`end` the session.
     running: Mutex<HashMap<String, Arc<dyn HarnessSession>>>,
+    /// Telemetry seam (see `crate::telemetry`) — `Noop` unless a daemon wires
+    /// up `Console`/OTLP via `new_with_telemetry`.
+    telemetry: Arc<dyn Telemetry>,
 }
 
 impl ControlPlane {
     pub async fn new(store: Store, registries: Registries) -> Arc<ControlPlane> {
+        Self::new_with_telemetry(store, registries, Arc::new(NoopTelemetry)).await
+    }
+
+    /// Like `new`, but with an explicit telemetry backend — used by the
+    /// daemon (Console/OTLP selection) and by tests asserting on emitted
+    /// spans/counts.
+    pub async fn new_with_telemetry(
+        store: Store,
+        registries: Registries,
+        telemetry: Arc<dyn Telemetry>,
+    ) -> Arc<ControlPlane> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(ControlPlane {
             store: Arc::new(store),
@@ -38,7 +53,15 @@ impl ControlPlane {
             events,
             approvals: Arc::new(ApprovalHub::new()),
             running: Mutex::new(HashMap::new()),
+            telemetry,
         })
+    }
+
+    /// Shared handle to the persistence layer — used by daemon wiring that
+    /// needs direct store access alongside the `ControlPlane` (e.g. HTTP
+    /// read endpoints).
+    pub fn store(&self) -> Arc<Store> {
+        Arc::clone(&self.store)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CoreEvent> {
@@ -46,7 +69,14 @@ impl ControlPlane {
     }
 
     pub fn resolve_approval(&self, request_id: &str, allow: bool) -> bool {
-        self.approvals.resolve(request_id, allow)
+        let resolved = self.approvals.resolve(request_id, allow);
+        let name = if allow {
+            "approval.allow"
+        } else {
+            "approval.deny"
+        };
+        self.telemetry.count(name, vec![]);
+        resolved
     }
 
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {
@@ -128,6 +158,7 @@ impl ControlPlane {
             session_pk: session_pk.clone(),
             project_id: project.project_id.clone(),
         });
+        self.telemetry.count("session.run", vec![]);
 
         // Resolve + start the harness session synchronously so an immediate
         // `stop_session` finds a live handle. The prompt is then driven in the
@@ -384,7 +415,16 @@ impl ControlPlane {
     ) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            match handle.send_prompt(prompt).await {
+            let mut span = me
+                .telemetry
+                .start_span("harness.run", vec![("session_pk", session_pk.clone())]);
+            let result = handle.send_prompt(prompt).await;
+            if let Err(e) = &result {
+                span.set_error(&e.to_string());
+                me.telemetry.count("harness.error", vec![]);
+            }
+            span.end();
+            match result {
                 Ok(()) => {
                     // Persist any agent session id resolved during the turn.
                     if let Some(sid) = handle.agent_session_id() {
@@ -697,6 +737,109 @@ mod tests {
         let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
         let store_ref = cp.store.clone();
         (cp, store_ref, counters.prompts, db_guard)
+    }
+
+    /// Like `fake_control_plane`, but wired via `new_with_telemetry` with an
+    /// injected telemetry backend — for tests asserting on emitted spans/counts.
+    async fn fake_control_plane_with_telemetry(
+        telemetry: Arc<dyn crate::telemetry::Telemetry>,
+    ) -> (
+        Arc<ControlPlane>,
+        Arc<Store>,
+        Arc<Mutex<Vec<String>>>,
+        tempfile::NamedTempFile,
+    ) {
+        let (db_guard, db_path) = temp_db_path();
+        let store = crate::store::Store::open(&db_path).await.unwrap();
+        let counters = Counters::default();
+        let cp = ControlPlane::new_with_telemetry(
+            store,
+            registries_with(false, counters.clone()),
+            telemetry,
+        )
+        .await;
+        let store_ref = cp.store();
+        (cp, store_ref, counters.prompts, db_guard)
+    }
+
+    /// A `Console` sink that captures every emitted JSON line, for telemetry
+    /// assertions below.
+    fn capturing_console_telemetry() -> (
+        Arc<Mutex<Vec<String>>>,
+        Arc<dyn crate::telemetry::Telemetry>,
+    ) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        let telemetry = crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line: &str| captured.lock().unwrap().push(line.to_string()),
+            || 1_000,
+        );
+        (lines, Arc::new(telemetry))
+    }
+
+    fn parse_telemetry_lines(lines: &Arc<Mutex<Vec<String>>>) -> Vec<serde_json::Value> {
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("telemetry line must be valid JSON"))
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn start_session_emits_session_run_count_and_harness_run_span() {
+        let _guard = StateDirGuard::new();
+        let (lines, telemetry) = capturing_console_telemetry();
+        let (cp, _store, _prompts, _db_guard) = fake_control_plane_with_telemetry(telemetry).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        let session = cp
+            .start_session(&project.project_id, "go", "test")
+            .await
+            .unwrap();
+        // Let the background prompt task (spawn_prompt) finish the turn.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let parsed = parse_telemetry_lines(&lines);
+        assert!(
+            parsed
+                .iter()
+                .any(|v| v["kind"] == "count" && v["name"] == "session.run"),
+            "expected a session.run count line, got: {parsed:?}"
+        );
+        let span = parsed
+            .iter()
+            .find(|v| v["kind"] == "span" && v["name"] == "harness.run")
+            .unwrap_or_else(|| panic!("expected a harness.run span line, got: {parsed:?}"));
+        assert_eq!(span["attrs"]["session_pk"], session.session_pk);
+        assert!(span["durationMs"].is_number());
+        assert!(span.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_counts_allow_and_deny() {
+        let (lines, telemetry) = capturing_console_telemetry();
+        let (cp, _store, _prompts, _db_guard) = fake_control_plane_with_telemetry(telemetry).await;
+
+        cp.resolve_approval("req-allow", true);
+        cp.resolve_approval("req-deny", false);
+
+        let parsed = parse_telemetry_lines(&lines);
+        assert!(
+            parsed
+                .iter()
+                .any(|v| v["kind"] == "count" && v["name"] == "approval.allow"),
+            "expected an approval.allow count line, got: {parsed:?}"
+        );
+        assert!(
+            parsed
+                .iter()
+                .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
+            "expected an approval.deny count line, got: {parsed:?}"
+        );
     }
 
     /// Like `fake_control_plane`, but the registered harness always fails to
