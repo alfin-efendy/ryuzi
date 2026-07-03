@@ -133,6 +133,16 @@ pub struct ApprovalRequest {
     pub request_id: String,
     pub tool: String,
     pub summary: String,
+    /// Role ids allowed to approve, beyond the session starter. Empty means
+    /// "starter only" (see `policy::can_approve`).
+    #[serde(default)]
+    pub approver_role_ids: Vec<String>,
+    /// Actor id that started the session, for starter-always approval.
+    #[serde(default)]
+    pub started_by: Option<String>,
+    /// Optional approval timeout, in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// The user's decision on a tool-approval request. Mirrors ACP permission kinds.

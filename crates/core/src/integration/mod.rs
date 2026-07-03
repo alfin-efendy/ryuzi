@@ -51,7 +51,7 @@ mod tests {
     use super::*;
     use crate::connector::Connector;
     use crate::domain::McpServerSpec;
-    use crate::gateway::{Gateway, GatewayHub};
+    use crate::gateway::Gateway;
     use crate::harness::{Harness, HarnessSession, SessionCtx};
     use async_trait::async_trait;
 
@@ -74,13 +74,53 @@ mod tests {
     struct FakeGateway;
     #[async_trait]
     impl Gateway for FakeGateway {
-        async fn start(&self, _hub: Arc<dyn GatewayHub>) -> anyhow::Result<()> {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        async fn start(&self) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn deliver(
+        async fn stop(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
+            Ok(format!("ws-{name}"))
+        }
+        async fn create_conversation(
             &self,
-            _s: &crate::domain::Surface,
-            _e: &crate::domain::CoreEvent,
+            _workspace_id: &str,
+            _title: &str,
+        ) -> anyhow::Result<String> {
+            Ok("conv".to_string())
+        }
+        async fn post_status(
+            &self,
+            surface: &crate::domain::Surface,
+            _text: &str,
+        ) -> anyhow::Result<crate::gateway::MessageRef> {
+            Ok(crate::gateway::MessageRef {
+                surface: surface.clone(),
+                message_id: "m1".to_string(),
+            })
+        }
+        async fn edit_status(
+            &self,
+            _msg: &crate::gateway::MessageRef,
+            _text: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_result(
+            &self,
+            _surface: &crate::domain::Surface,
+            _chunks: &[String],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_error(
+            &self,
+            _surface: &crate::domain::Surface,
+            _message: &str,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -90,9 +130,6 @@ mod tests {
             _r: &crate::domain::ApprovalRequest,
         ) -> anyhow::Result<crate::domain::ApprovalDecision> {
             Ok(crate::domain::ApprovalDecision::Cancel)
-        }
-        async fn shutdown(&self) -> anyhow::Result<()> {
-            Ok(())
         }
     }
     struct FakeGatewayFactory;
