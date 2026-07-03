@@ -7,6 +7,7 @@ mod error;
 mod events;
 mod gateways_cmd;
 mod providers_cmd;
+mod registry_cmd;
 mod scheduler_cmd;
 
 use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
@@ -212,6 +213,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             apps_cmd::update_app_scope,
             apps_cmd::set_app_tool_perm,
             apps_cmd::toggle_app_agent,
+            registry_cmd::registry_search,
             accent::system_accent_color,
         ])
         .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])

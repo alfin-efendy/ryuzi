@@ -379,6 +379,14 @@ async toggleAppAgent(id: string, agentId: string, allowed: boolean) : Promise<Re
     else return { status: "error", error: e  as any };
 }
 },
+async registrySearch(query: string | null, cursor: string | null) : Promise<Result<RegistryPage, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("registry_search", { query, cursor }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 }
@@ -457,6 +465,20 @@ export type ProviderInfo = { id: string; name: string; color: string; initial: s
  */
 tracksUsage: boolean }
 export type QuotaInfo = { label: string; pct: number; used: string; max: string; resets: string }
+export type RegistryEntry = { 
+/**
+ * Registry name, e.g. `io.github.owner/server`.
+ */
+id: string; name: string; desc: string; version: string | null; publisher: string; 
+/**
+ * stdio (npm package) | http (remote)
+ */
+kind: string; 
+/**
+ * npm identifier for stdio entries; URL for remotes.
+ */
+installTarget: string | null; website: string | null }
+export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
