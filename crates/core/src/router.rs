@@ -62,7 +62,10 @@ impl Router {
         loop {
             match rx.recv().await {
                 Ok(event) => self.handle_event(event).await,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("[router] lagged: dropped {n} events");
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -350,6 +353,47 @@ mod tests {
             gw.calls(),
             vec![
                 "post_status:c1:working".to_string(),
+                "edit_status:m0:still working".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_posts_once_per_surface_across_gateways_with_independent_refs() {
+        // Two surfaces on TWO DIFFERENT gateways bound to the same session:
+        // each surface must get its own post-then-edit ref, independent of
+        // the other surface's.
+        let store = test_store().await;
+        store.add_surface("fake1", "c1", "s1").await.unwrap();
+        store.add_surface("fake2", "c2", "s1").await.unwrap();
+        let gw1 = Arc::new(FakeGateway::new("fake1"));
+        let gw2 = Arc::new(FakeGateway::new("fake2"));
+        let (tx, rx) = broadcast::channel(16);
+        let router = Router::new(
+            store.clone(),
+            vec![
+                gw1.clone() as Arc<dyn Gateway>,
+                gw2.clone() as Arc<dyn Gateway>,
+            ],
+        );
+        let handle = tokio::spawn(router.run(rx));
+
+        tx.send(status_event("s1", "working")).unwrap();
+        tx.send(status_event("s1", "still working")).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        assert_eq!(
+            gw1.calls(),
+            vec![
+                "post_status:c1:working".to_string(),
+                "edit_status:m0:still working".to_string(),
+            ]
+        );
+        assert_eq!(
+            gw2.calls(),
+            vec![
+                "post_status:c2:working".to_string(),
                 "edit_status:m0:still working".to_string(),
             ]
         );

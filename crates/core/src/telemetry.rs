@@ -186,6 +186,12 @@ impl Telemetry for ConsoleTelemetry {
 /// OTLP/HTTP signal URLs. opentelemetry-otlp uses a programmatic endpoint
 /// verbatim (no auto signal path), so we append the paths ourselves —
 /// same concatenation the retired TS otel.ts used.
+///
+/// Only called from `OtelTelemetry::new` (behind `#[cfg(feature = "otel")]`),
+/// so without the feature this is otherwise-dead code — its own unit tests
+/// below stay un-gated (they exercise pure string formatting with no
+/// dependency on the `otel` feature at all).
+#[cfg_attr(not(feature = "otel"), allow(dead_code))]
 pub(crate) fn otlp_signal_urls(endpoint: &str) -> (String, String) {
     let base = endpoint.trim_end_matches('/');
     (format!("{base}/v1/traces"), format!("{base}/v1/metrics"))

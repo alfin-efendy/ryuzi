@@ -88,6 +88,15 @@ impl Daemon {
     /// any session a dead process left `Running`). Reconcile runs in the
     /// background so a slow/hanging resume can't block daemon startup.
     ///
+    /// Partial-failure rollback: if gateway N fails to start, every gateway
+    /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
+    /// same as `stop()`), the router/fan-out handles are aborted, and the
+    /// daemon is marked stopped (reusing the same idempotency flag `stop()`
+    /// checks) before the error is returned. Marking it stopped here means a
+    /// caller's own best-effort `stop()` on a `start()` error (e.g.
+    /// `daemon_cmd::build_and_start`) is a safe no-op instead of re-stopping
+    /// gateway 0..N-1 a second time.
+    ///
     /// This task is deliberately left UNTRACKED (unlike `router_handle` /
     /// `fanout_handle`): it mirrors the retired TS daemon's boot sequence,
     /// which does not await or hold onto its reconcile call either. A
@@ -97,8 +106,17 @@ impl Daemon {
     /// covers the `reconcile()` scan itself, which is expected to finish
     /// quickly regardless of `Daemon`'s lifecycle.
     pub async fn start(&self) -> anyhow::Result<()> {
-        for gw in &self.gateways {
-            gw.start().await?;
+        for (idx, gw) in self.gateways.iter().enumerate() {
+            if let Err(e) = gw.start().await {
+                if !self.stopped.swap(true, Ordering::SeqCst) {
+                    for started in &self.gateways[..idx] {
+                        let _ = started.stop().await;
+                    }
+                    self.router_handle.abort();
+                    self.fanout_handle.abort();
+                }
+                return Err(e);
+            }
         }
         let cp = Arc::clone(&self.cp);
         tokio::spawn(async move {
@@ -311,10 +329,13 @@ fn spawn_approval_fanout(
 ///
 /// - No surfaces bound to the session (after filtering to gateways we know
 ///   about) → immediate deny.
-/// - Otherwise races `gw.request_approval` across every known surface via
-///   `futures::future::select_all`; a per-gateway `Err` counts as an instant
-///   `RejectOnce` vote. The whole race is wrapped in `tokio::time::timeout`;
-///   elapsing denies.
+/// - Otherwise races `gw.request_approval` across every known surface via a
+///   loop over `futures::future::select_all`: a per-gateway `Err` REMOVES
+///   that future from the race (so one erroring gateway can never out-race a
+///   slower legitimate human approval on another surface) and the remaining
+///   futures keep racing; only once every future has errored does the race
+///   resolve to a deny. The whole race is wrapped in `tokio::time::timeout`;
+///   elapsing also denies.
 pub(crate) async fn handle_approval(
     cp: &Arc<ControlPlane>,
     store: &Arc<Store>,
@@ -378,24 +399,34 @@ pub(crate) async fn handle_approval(
         timeout_ms: Some(timeout_ms),
     };
 
-    let futs = known_surfaces.into_iter().map(|(surface, gw)| {
-        let req = req.clone();
-        async move {
-            gw.request_approval(&surface, &req)
-                .await
-                .unwrap_or(ApprovalDecision::RejectOnce)
-        }
-        .boxed()
-    });
+    let futs: Vec<_> = known_surfaces
+        .into_iter()
+        .map(|(surface, gw)| {
+            let req = req.clone();
+            async move { gw.request_approval(&surface, &req).await }.boxed()
+        })
+        .collect();
 
-    let decision = match tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        futures::future::select_all(futs),
-    )
-    .await
-    {
-        Ok((decision, _idx, _rest)) => decision,
-        Err(_elapsed) => ApprovalDecision::RejectOnce,
+    // Loop over `select_all`, dropping any future that resolves `Err` from
+    // the race instead of treating it as an instant deny vote — only once
+    // every future has errored (the pool is empty) do we fall back to deny.
+    let race = async move {
+        let mut futs = futs;
+        loop {
+            if futs.is_empty() {
+                return None;
+            }
+            let (result, _idx, rest) = futures::future::select_all(futs).await;
+            futs = rest;
+            if let Ok(decision) = result {
+                return Some(decision);
+            }
+        }
+    };
+
+    let decision = match tokio::time::timeout(Duration::from_millis(timeout_ms), race).await {
+        Ok(Some(decision)) => decision,
+        Ok(None) | Err(_) => ApprovalDecision::RejectOnce,
     };
 
     cp.resolve_approval(
@@ -529,6 +560,11 @@ mod tests {
     enum GwBehavior {
         Allow,
         SleepThenAllow(u64),
+        /// Returns `Err` the instant it's called — used to prove a
+        /// per-gateway error no longer wins the race outright (it must be
+        /// removed from the race instead), and that all-erroring surfaces
+        /// still deny.
+        ErrImmediately,
     }
 
     struct FakeGateway {
@@ -537,6 +573,9 @@ mod tests {
         calls: Arc<AtomicUsize>,
         stops: Arc<AtomicUsize>,
         last_req: Arc<Mutex<Option<ApprovalRequest>>>,
+        /// When true, `start()` always fails — used to exercise
+        /// `Daemon::start`'s partial-failure rollback.
+        fail_start: bool,
     }
 
     impl FakeGateway {
@@ -547,6 +586,14 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 stops: Arc::new(AtomicUsize::new(0)),
                 last_req: Arc::new(Mutex::new(None)),
+                fail_start: false,
+            }
+        }
+
+        fn new_failing_start(gid: &str) -> Self {
+            FakeGateway {
+                fail_start: true,
+                ..FakeGateway::new(gid, GwBehavior::Allow)
             }
         }
     }
@@ -557,6 +604,9 @@ mod tests {
             &self.gid
         }
         async fn start(&self) -> anyhow::Result<()> {
+            if self.fail_start {
+                anyhow::bail!("start failed for gateway {}", self.gid);
+            }
             Ok(())
         }
         async fn stop(&self) -> anyhow::Result<()> {
@@ -596,6 +646,9 @@ mod tests {
                 GwBehavior::SleepThenAllow(ms) => {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                     Ok(ApprovalDecision::AllowOnce)
+                }
+                GwBehavior::ErrImmediately => {
+                    anyhow::bail!("approval request failed for gateway {}", self.gid)
                 }
             }
         }
@@ -750,6 +803,133 @@ mod tests {
                 .iter()
                 .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
             "no surfaces must deny immediately, got: {parsed:?}"
+        );
+    }
+
+    // ---------- fan-out error tolerance (MUST-FIX 1) ----------
+
+    #[tokio::test]
+    async fn handle_approval_an_erroring_gateway_does_not_out_race_a_slower_legitimate_allow() {
+        let (lines, telemetry) = capturing_console_telemetry();
+        let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
+        seed_project(&store, "p1").await;
+        seed_session(&store, "s1", "p1", None).await;
+        // Two surfaces on two DIFFERENT gateways bound to the same session,
+        // so both are raced.
+        store.add_surface("err-gw", "c1", "s1").await.unwrap();
+        store.add_surface("allow-gw", "c2", "s1").await.unwrap();
+
+        let err_gw = FakeGateway::new("err-gw", GwBehavior::ErrImmediately);
+        let allow_gw = FakeGateway::new("allow-gw", GwBehavior::SleepThenAllow(50));
+        let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(err_gw), Arc::new(allow_gw)];
+
+        handle_approval(&cp, &store, &gateways, "s1", "req-race-1", "Bash", "ls").await;
+
+        let parsed = parse_telemetry_lines(&lines);
+        assert!(
+            parsed
+                .iter()
+                .any(|v| v["kind"] == "count" && v["name"] == "approval.allow"),
+            "an instantly-erroring gateway must be removed from the race, not win it — \
+             the slower legitimate allow must still resolve the approval, got: {parsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_approval_denies_only_once_every_gateway_has_errored() {
+        let (lines, telemetry) = capturing_console_telemetry();
+        let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
+        seed_project(&store, "p1").await;
+        seed_session(&store, "s1", "p1", None).await;
+        store.add_surface("err-gw-1", "c1", "s1").await.unwrap();
+        store.add_surface("err-gw-2", "c2", "s1").await.unwrap();
+
+        let gw1 = FakeGateway::new("err-gw-1", GwBehavior::ErrImmediately);
+        let gw2 = FakeGateway::new("err-gw-2", GwBehavior::ErrImmediately);
+        let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw1), Arc::new(gw2)];
+
+        handle_approval(&cp, &store, &gateways, "s1", "req-race-2", "Bash", "ls").await;
+
+        let parsed = parse_telemetry_lines(&lines);
+        assert!(
+            parsed
+                .iter()
+                .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
+            "once every gateway in the race has errored, the approval must deny, got: {parsed:?}"
+        );
+    }
+
+    // ---------- Daemon::start partial-failure rollback (MUST-FIX 2) ----------
+
+    #[tokio::test]
+    async fn daemon_start_rolls_back_started_gateways_and_aborts_handles_on_later_failure() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Store::open(&db_path).await.unwrap();
+        let cp = ControlPlane::new_with_telemetry(
+            Arc::new(store),
+            Registries::new(),
+            Arc::new(NoopTelemetry),
+        )
+        .await;
+        let store = cp.store();
+
+        let gw_a = FakeGateway::new("gw-a", GwBehavior::Allow);
+        let stops_a = gw_a.stops.clone();
+        let gw_b = FakeGateway::new_failing_start("gw-b");
+        let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw_a), Arc::new(gw_b)];
+
+        // Long-running "loops" standing in for the real router/fan-out tasks,
+        // so this test can assert that a failed `start()` aborts them too.
+        let router_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        let fanout_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let daemon = Daemon {
+            cp,
+            store,
+            gateways,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            router_handle,
+            fanout_handle,
+        };
+
+        let err = daemon.start().await.unwrap_err();
+        assert!(
+            err.to_string().contains("gw-b"),
+            "the propagated error must be the failing gateway's, got: {err}"
+        );
+
+        assert_eq!(
+            stops_a.load(Ordering::SeqCst),
+            1,
+            "gateway A (already started) must be stopped exactly once during rollback"
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            daemon.router_handle.is_finished(),
+            "start()'s rollback must abort the router loop"
+        );
+        assert!(
+            daemon.fanout_handle.is_finished(),
+            "start()'s rollback must abort the fan-out loop"
+        );
+
+        // A later explicit stop() (as `build_and_start` performs on a start
+        // failure) must be a no-op — rollback already tore everything down.
+        daemon.stop().await;
+        assert_eq!(
+            stops_a.load(Ordering::SeqCst),
+            1,
+            "a later stop() after rollback must not re-invoke gateway A's stop()"
         );
     }
 
@@ -1163,7 +1343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_daemon_falls_back_to_console_when_otel_endpoint_is_set_without_override() {
+    async fn build_daemon_selects_endpoint_backend_without_override() {
         let (_guard, db_path) = temp_db_path();
         {
             let store = Store::open(&db_path).await.unwrap();
@@ -1175,10 +1355,15 @@ mod tests {
         }
 
         // With no `opts.telemetry` override and a non-empty otel_endpoint,
-        // build_daemon must still build successfully (the "OTel init failed"
-        // stderr warning path, exercised end-to-end here; the warning bool
-        // itself is unit-tested directly above via `select_telemetry` since
-        // capturing stderr here would be awkward/flaky).
+        // build_daemon must still build successfully end-to-end regardless
+        // of which backend `select_telemetry` picks for it: without the
+        // `otel` feature it falls back to Console + the "OTel init failed"
+        // stderr warning; with the feature on and a valid endpoint it
+        // selects the real Otel backend instead (no warning). Either way
+        // this test's assertions are backend-agnostic — the exact
+        // per-feature-state backend/warning behavior is unit-tested
+        // directly above via `select_telemetry`, since capturing stderr
+        // here would be awkward/flaky.
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
             adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),

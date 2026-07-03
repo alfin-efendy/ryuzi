@@ -151,9 +151,19 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
 /// `startWithTimeout(daemon, ms)` wraps. Unlike TS's synchronous
 /// `buildDaemon`, both steps are async in Rust, so both are raced against
 /// the single 30s deadline together.
+///
+/// Review note: `Daemon::start` already rolls back any gateway it managed to
+/// start before hitting the one that failed, and aborts the router/fan-out
+/// handles (see its doc). The `daemon.stop()` below is belt-and-braces on
+/// top of that: it's a safe no-op in the rollback case (which already marks
+/// the daemon stopped) and still flushes telemetry / covers any future
+/// failure path that reaches here without having rolled back itself.
 async fn build_and_start(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let daemon = build_daemon(opts).await?;
-    daemon.start().await?;
+    if let Err(e) = daemon.start().await {
+        daemon.stop().await;
+        return Err(e);
+    }
     Ok(daemon)
 }
 
