@@ -109,16 +109,30 @@ impl Router {
             .get(gateway_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown gateway: {gateway_id}"))?;
-        let display = match &opts.name {
-            Some(n) => Some(n.clone()),
-            None => opts.git_url.as_deref().map(|url| {
-                let b = crate::control::basename_of(url);
-                b.strip_suffix(".git").map(str::to_string).unwrap_or(b)
-            }),
+        // TS parity note (deliberate divergence, documented): TS's
+        // `opts.name ?? (...)` only falls through to `gitUrl` when `name` is
+        // `null`/`undefined`, so a bare `Some("")` there throws immediately
+        // without even trying `gitUrl`. Here we additionally treat an empty
+        // (or whitespace-only) `name` as absent and fall through to
+        // `gitUrl`'s derived basename — either way, an empty/whitespace
+        // result below is rejected BEFORE `create_workspace` is ever called,
+        // so no gateway workspace is orphaned trying to bind to a project
+        // that will fail to provision.
+        let name_display = opts.name.as_deref().filter(|n| !n.trim().is_empty());
+        let display = match name_display {
+            Some(n) => n.to_string(),
+            None => opts
+                .git_url
+                .as_deref()
+                .map(|url| {
+                    let b = crate::control::basename_of(url);
+                    b.strip_suffix(".git").map(str::to_string).unwrap_or(b)
+                })
+                .unwrap_or_default(),
         };
-        let Some(display) = display else {
+        if display.trim().is_empty() {
             anyhow::bail!("connect requires name or gitUrl");
-        };
+        }
         let workspace_id = gw.create_workspace(&display).await?;
         let requested_bypass = opts.settings.perm_mode == Some(PermMode::BypassPermissions);
         let project = self
@@ -893,6 +907,37 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "connect requires name or gitUrl");
+    }
+
+    /// Regression for the parity gap where an empty `name` (`Some("")`)
+    /// passed the old `Option::is_none()` check and reached
+    /// `gw.create_workspace("")` before failing later inside
+    /// `provision_project` — leaving an orphaned gateway workspace bound to
+    /// nothing. `on_connect` must now bail with the same "requires name or
+    /// gitUrl" error BEFORE ever calling `create_workspace`.
+    #[tokio::test]
+    #[serial]
+    async fn on_connect_with_empty_name_and_no_git_url_bails_before_creating_a_workspace() {
+        let (cp, _store) = test_control_plane().await;
+        let gw = Arc::new(FakeGateway::new("fake"));
+        let router = Router::new(Arc::clone(&cp), vec![gw.clone() as Arc<dyn Gateway>]);
+        let err = router
+            .on_connect(
+                "fake",
+                "u1",
+                ConnectOpts {
+                    name: Some("".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "connect requires name or gitUrl");
+        assert!(
+            gw.calls().is_empty(),
+            "create_workspace must not be called when the display name is empty; calls: {:?}",
+            gw.calls()
+        );
     }
 
     #[tokio::test]

@@ -275,7 +275,12 @@ impl ControlPlane {
             name = n;
             workdir = root.join(&name);
             let wd = workdir.to_string_lossy().into_owned();
-            if let Err(e) = run_git(&["clone", "--quiet", url, &wd]).await {
+            // `--` separates options from positionals so an untrusted
+            // `url` (e.g. one starting with `-`, like `--upload-pack=evil`)
+            // can never be parsed by git as a flag. Not shell injection —
+            // `run_git` uses `tokio::process::Command` directly, no shell —
+            // but a git-CLI option-injection hardening measure.
+            if let Err(e) = run_git(&["clone", "--quiet", "--", url, &wd]).await {
                 let _ = tokio::fs::remove_dir_all(&workdir).await;
                 return Err(e);
             }
@@ -2028,6 +2033,62 @@ mod tests {
         }
     }
 
+    /// Like `StateDirGuard`, but deliberately does NOT drop a `.gitconfig`
+    /// (or any git identity) under the redirected `HOME` — and scrubs the
+    /// `GIT_AUTHOR_*`/`GIT_COMMITTER_*`/`GIT_CONFIG_*` env vars a caller's
+    /// shell might otherwise export — so `git commit` (invoked by
+    /// `provision_project`'s NAME-flow) fails deterministically with "Author
+    /// identity unknown". Used to exercise the NAME-flow's rollback
+    /// (`remove_dir_all` on a git failure) without a fake/mocked `run_git`.
+    /// Process-global env — every test using it must be `#[serial]`.
+    struct NoGitIdentityGuard {
+        _dir: tempfile::TempDir,
+    }
+
+    impl NoGitIdentityGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            for var in [
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_SYSTEM",
+            ] {
+                std::env::remove_var(var);
+            }
+            NoGitIdentityGuard { _dir: dir }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_name_flow_rolls_back_the_dir_on_git_commit_failure() {
+        let _guard = NoGitIdentityGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let mut req = provision_req("fake", "ws1", "u1");
+        req.name = Some("rollback-me".to_string());
+        let err = cp.provision_project(req).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("commit") && err.to_string().contains("identity"),
+            "expected a git commit identity failure, got: {err}"
+        );
+        assert!(
+            !root.path().join("rollback-me").exists(),
+            "a failed git init/commit must roll back (remove) the created dir"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn provision_project_name_flow_creates_a_real_repo_with_head_and_binds_it() {
@@ -2114,6 +2175,56 @@ mod tests {
         assert!(err.to_string().contains("git"), "got: {err}");
         assert!(
             !root.path().join("repo").exists(),
+            "a failed clone must not leave a partial dir behind"
+        );
+    }
+
+    /// Regression for git-CLI option-injection hardening: the clone argv
+    /// now inserts `--` before the untrusted `git_url` (and workdir), so a
+    /// URL beginning with `-` can never be parsed by `git` as an option.
+    ///
+    /// `"--upload-pack"` (rather than the more illustrative
+    /// `"--upload-pack=evil"`) is used deliberately: it both (a) starts with
+    /// `-`, exercising exactly the option-injection shape this hardens
+    /// against, and (b) is accepted by `validate_project_name` (ASCII
+    /// alphanumeric + `-` only) so the test actually reaches `run_git`'s
+    /// clone call instead of failing earlier on name validation (an `=`
+    /// character, as in `"--upload-pack=evil"`, is rejected by
+    /// `validate_project_name` before `run_git` is ever invoked).
+    ///
+    /// Without the `--` separator, git would instead parse `--upload-pack`
+    /// as the option requiring a value, consume the destination workdir as
+    /// that value, and fail with a "You must specify a repository to
+    /// clone." usage dump — this test's second assertion fails if that
+    /// regresses.
+    #[tokio::test]
+    #[serial]
+    async fn provision_project_git_clone_treats_option_like_url_as_a_literal_repo_path() {
+        let _guard = StateDirGuard::new();
+        let (cp, store, _db_guard) = provisioning_control_plane().await;
+        let root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let mut req = provision_req("fake", "ws1", "u1");
+        req.git_url = Some("--upload-pack".to_string());
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            cp.provision_project(req),
+        )
+        .await
+        .expect("provision_project must not hang on an option-like git_url")
+        .unwrap_err();
+
+        assert!(
+            !err.to_string().contains("You must specify a repository"),
+            "git must not have parsed the url as the --upload-pack option; got: {err}"
+        );
+        assert!(
+            !root.path().join("--upload-pack").exists(),
             "a failed clone must not leave a partial dir behind"
         );
     }
