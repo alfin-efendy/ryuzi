@@ -3,6 +3,8 @@ use crate::registry::Registry;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+pub mod discord;
+
 /// A reference to a previously-posted message a gateway can edit later (e.g.
 /// a status line updated in place). Mirrors the TS `MessageRef`
 /// (`packages/core/src/gateways/types.ts`), which keeps the originating
