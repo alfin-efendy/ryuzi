@@ -142,7 +142,14 @@ impl Router {
                 workspace_id: workspace_id.clone(),
                 actor: actor.to_string(),
                 actor_role_ids: opts.actor_role_ids,
-                name: opts.name,
+                // Forward the SAME filtered name used to compute `display`
+                // above, not the raw `opts.name` — otherwise `display`
+                // (and thus `create_workspace`) can take the `gitUrl`
+                // branch while `provision_project` still sees
+                // `Some("")`/`Some("  ")` and takes the name branch,
+                // failing `validate_project_name` against an empty string
+                // and orphaning the just-created gateway workspace.
+                name: name_display.map(str::to_string),
                 git_url: opts.git_url,
                 settings: opts.settings,
             })
@@ -937,6 +944,57 @@ mod tests {
             gw.calls().is_empty(),
             "create_workspace must not be called when the display name is empty; calls: {:?}",
             gw.calls()
+        );
+    }
+
+    /// Regression for the raw-`opts.name`-forwarding bug: `display` (and
+    /// thus `create_workspace`) already treats `Some("")` as absent and
+    /// falls through to the `gitUrl`-derived basename, so
+    /// `provision_project` must be handed that SAME filtered name — not
+    /// the raw `Some("")` — otherwise it takes the name branch and fails
+    /// `validate_project_name("")` instead of trying the `gitUrl` clone,
+    /// orphaning the just-created gateway workspace and surfacing the
+    /// wrong error.
+    #[tokio::test]
+    #[serial]
+    async fn on_connect_with_empty_name_and_git_url_takes_the_git_url_branch() {
+        let _guard = StateDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let (cp, _store, _db_guard) = wired_control_plane(root.path()).await;
+        let gw = Arc::new(FakeGateway::new("fake"));
+        let router = Router::new(Arc::clone(&cp), vec![gw.clone() as Arc<dyn Gateway>]);
+
+        let err = router
+            .on_connect(
+                "fake",
+                "u1",
+                ConnectOpts {
+                    name: Some("".to_string()),
+                    git_url: Some("/no/such/upstream/myrepo.git".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        // `display` fell through to gitUrl's derived basename ("myrepo"),
+        // so the gateway workspace was created under that name...
+        assert!(
+            gw.calls().contains(&"create_workspace:myrepo".to_string()),
+            "expected create_workspace:myrepo, got: {:?}",
+            gw.calls()
+        );
+        // ...and `provision_project` must have taken the SAME (gitUrl)
+        // branch: a clone-failure error, never the name-validation error
+        // that `Some("")` would trigger if forwarded raw.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("invalid project name"),
+            "provision_project must not take the name branch for an empty name; got: {msg}"
+        );
+        assert!(
+            msg.contains("git"),
+            "expected a git-clone failure message, got: {msg}"
         );
     }
 
