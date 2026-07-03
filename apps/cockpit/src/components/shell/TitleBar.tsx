@@ -1,57 +1,81 @@
 // apps/cockpit/src/components/shell/TitleBar.tsx
-import { useUi } from "@/store-ui";
-import { Appearance } from "@ryuzi/ui";
+import { useEffect, useRef } from "react";
+import { ArrowLeft, ArrowRight, PanelLeft, Search } from "lucide-react";
+import { useNav } from "@/store-nav";
 import { WindowControls } from "./WindowControls";
 
 const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);
 
 const tool =
-  "flex h-[30px] w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground";
-const on = "bg-primary/10 text-primary";
+  "flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground";
 
 export function TitleBar() {
-  const { leftPanelOpen, rightPanelOpen, toggleLeft, toggleRight } = useUi();
+  const history = useNav((s) => s.history);
+  const { goBack, goForward, toggleSidebar, searchQuery, setSearchQuery } = useNav();
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const canBack = history.back.length > 0;
+  const canForward = history.forward.length > 0;
+
   return (
     <div
       data-tauri-drag-region="deep"
-      className={`flex h-11 shrink-0 select-none items-center border-b border-border bg-surface-window pr-1.5 ${isMac ? "pl-[78px]" : "pl-3"}`}
+      className={`acrylic-chrome relative z-20 flex h-11 shrink-0 select-none items-center gap-2.5 border-b border-border ${isMac ? "pl-[78px]" : "pl-3.5"} pr-3.5`}
     >
-      <div className="flex items-center gap-2">
-        <div className="flex h-[22px] w-[22px] items-center justify-center rounded-[7px] bg-primary text-primary-foreground">
-          <svg
-            aria-hidden="true"
-            width="13"
-            height="13"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.4"
-            strokeLinecap="round"
-          >
-            <path d="M12 3a9 9 0 1 0 9 9" />
-            <path d="M12 3v9l6 3" />
-          </svg>
+      <div className="flex items-center gap-0.5">
+        <button type="button" title="Toggle sidebar" aria-label="Toggle sidebar" className={tool} onClick={toggleSidebar}>
+          <PanelLeft aria-hidden size={15} strokeWidth={2} />
+        </button>
+        <button
+          type="button"
+          title="Back"
+          aria-label="Back"
+          className={`${tool} ${canBack ? "text-foreground" : "cursor-default opacity-50 hover:bg-transparent"}`}
+          onClick={goBack}
+          disabled={!canBack}
+        >
+          <ArrowLeft aria-hidden size={15} strokeWidth={2} />
+        </button>
+        <button
+          type="button"
+          title="Forward"
+          aria-label="Forward"
+          className={`${tool} ${canForward ? "text-foreground" : "cursor-default opacity-50 hover:bg-transparent"}`}
+          onClick={goForward}
+          disabled={!canForward}
+        >
+          <ArrowRight aria-hidden size={15} strokeWidth={2} />
+        </button>
+      </div>
+
+      <div className="flex flex-1 justify-center">
+        <div className="flex h-[30px] w-full max-w-[420px] items-center gap-2 rounded-md border border-border px-3 text-muted-foreground [background:color-mix(in_oklab,var(--background)_45%,transparent)]">
+          <Search aria-hidden size={13} strokeWidth={2} />
+          <input
+            ref={searchRef}
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search sessions, files, commands"
+            className="flex-1 border-none bg-transparent font-sans text-[12.5px] text-foreground"
+          />
+          <kbd className="rounded-sm border border-border px-[5px] py-px font-mono text-[10.5px] text-muted-foreground">
+            {isMac ? "⌘K" : "Ctrl K"}
+          </kbd>
         </div>
-        <span className="text-[13px] font-semibold tracking-tight">Cockpit</span>
       </div>
-      <div className="h-full flex-1" />
-      <div className="mr-1.5 flex items-center gap-0.5">
-        <button type="button" aria-label="Toggle left panel" className={`${tool} ${leftPanelOpen ? on : ""}`} onClick={toggleLeft}>
-          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-            <rect x="3" y="4" width="18" height="16" rx="2" />
-            <path d="M9 4v16" strokeWidth="2.2" />
-          </svg>
-        </button>
-        <button type="button" aria-label="Toggle right panel" className={`${tool} ${rightPanelOpen ? on : ""}`} onClick={toggleRight}>
-          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-            <rect x="3" y="4" width="18" height="16" rx="2" />
-            <path d="M15 4v16" strokeWidth="2.2" />
-          </svg>
-        </button>
-        <Appearance triggerClassName="h-[30px] w-8 rounded-md border-0 bg-transparent" />
-      </div>
-      {!isMac && <div className="mr-1 h-[18px] w-px bg-border" />}
-      {!isMac && <WindowControls />}
+
+      <div className="flex w-[92px] shrink-0 items-center justify-end">{!isMac && <WindowControls />}</div>
     </div>
   );
 }

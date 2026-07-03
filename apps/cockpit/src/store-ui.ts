@@ -23,7 +23,14 @@ export function closeTab(tabs: DockTab[], activeTabId: string | null, id: string
   return { tabs: next, activeTabId: neighbor.id };
 }
 
-const KEY = { left: "cockpit.ui.leftOpen", right: "cockpit.ui.rightOpen", tabs: "cockpit.ui.tabs", active: "cockpit.ui.activeTab" };
+const KEY = {
+  left: "cockpit.ui.leftOpen",
+  right: "cockpit.ui.rightOpen",
+  tabs: "cockpit.ui.tabs",
+  active: "cockpit.ui.activeTab",
+  pinned: "cockpit.ui.pinned",
+  archived: "cockpit.ui.archived",
+};
 
 function readBool(key: string, fallback: boolean): boolean {
   if (typeof localStorage === "undefined") return fallback;
@@ -39,6 +46,21 @@ function readTabs(): DockTab[] {
     return [];
   }
 }
+function readSet(key: string): Record<string, true> {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as Record<string, true>) : {};
+  } catch {
+    return {};
+  }
+}
+export function toggleKey(map: Record<string, true>, key: string): Record<string, true> {
+  const next = { ...map };
+  if (next[key]) delete next[key];
+  else next[key] = true;
+  return next;
+}
 function persist(key: string, value: string): void {
   if (typeof localStorage !== "undefined") localStorage.setItem(key, value);
 }
@@ -51,6 +73,8 @@ type UiState = {
   rightPanelOpen: boolean;
   tabs: DockTab[];
   activeTabId: string | null;
+  pinned: Record<string, true>;
+  archived: Record<string, true>;
   toggleLeft: () => void;
   toggleRight: () => void;
   setLeft: (open: boolean) => void;
@@ -58,6 +82,8 @@ type UiState = {
   openFile: (path: string) => void;
   closeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
+  togglePin: (sessionPk: string) => void;
+  toggleArchive: (sessionPk: string) => void;
 };
 
 export const useUi = create<UiState>((set, get) => ({
@@ -65,6 +91,8 @@ export const useUi = create<UiState>((set, get) => ({
   rightPanelOpen: readBool(KEY.right, true),
   tabs: readTabs(),
   activeTabId: normalizeActive(typeof localStorage !== "undefined" ? localStorage.getItem(KEY.active) : null),
+  pinned: readSet(KEY.pinned),
+  archived: readSet(KEY.archived),
   toggleLeft: () =>
     set((s) => {
       const v = !s.leftPanelOpen;
@@ -108,5 +136,15 @@ export const useUi = create<UiState>((set, get) => ({
   setActiveTab: (id) => {
     persist(KEY.active, id);
     set({ activeTabId: id });
+  },
+  togglePin: (sessionPk) => {
+    const pinned = toggleKey(get().pinned, sessionPk);
+    persist(KEY.pinned, JSON.stringify(pinned));
+    set({ pinned });
+  },
+  toggleArchive: (sessionPk) => {
+    const archived = toggleKey(get().archived, sessionPk);
+    persist(KEY.archived, JSON.stringify(archived));
+    set({ archived });
   },
 }));

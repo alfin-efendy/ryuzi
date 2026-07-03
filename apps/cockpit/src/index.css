@@ -1,5 +1,6 @@
 @import "@ryuzi/ui/styles.css";
 @import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
 
 /* Tauri drag region (touch/pen support on Windows). app-region is Chromium/WebView2-only;
    Linux (WebKitGTK) drag relies on Tauri's drag script via data-tauri-drag-region="deep" on the titlebar root. */
@@ -7,16 +8,83 @@
   app-region: drag;
 }
 
-/* Programmatic panel toggle animation; applied transiently by useToggleSync so
-   drag-resize stays direct. react-resizable-panels v4 hardcodes flex-basis: 0
-   on panel nodes and drives live sizing purely via flex-grow, so that is the
-   property to interpolate. */
-.panels-animating [data-slot="resizable-panel"] {
-  transition: flex-grow 200ms ease;
-}
-
 [data-tauri-drag-region] button,
 [data-tauri-drag-region] input,
 [data-tauri-drag-region] [role="button"] {
   app-region: no-drag;
+}
+
+/* Decorative wallpaper behind the acrylic panels (Relay v3). When an OS
+   backdrop (mica/vibrancy) is active the real desktop plays this role, so the
+   wallpaper collapses to transparent and the translucent surface tokens from
+   @ryuzi/ui take over. */
+:root {
+  --wallpaper: radial-gradient(1100px 750px at 82% -8%, oklch(0.9 0.06 155 / 0.7), transparent 62%),
+    radial-gradient(950px 700px at -8% 108%, oklch(0.88 0.05 230 / 0.65), transparent 60%),
+    radial-gradient(750px 550px at 48% 55%, oklch(0.92 0.04 185 / 0.5), transparent 70%),
+    oklch(0.96 0.01 170);
+}
+.dark {
+  --wallpaper: radial-gradient(1100px 750px at 82% -8%, oklch(0.42 0.09 155 / 0.6), transparent 62%),
+    radial-gradient(950px 700px at -8% 108%, oklch(0.34 0.07 230 / 0.55), transparent 60%),
+    radial-gradient(750px 550px at 48% 55%, oklch(0.3 0.05 185 / 0.4), transparent 70%),
+    oklch(0.16 0.02 170);
+}
+html[data-backdrop] {
+  --wallpaper: transparent;
+}
+
+/* Acrylic surface recipes from the design: chrome (title bar + sidebar), main
+   (center content), panel (bottom drawer + right panel), card (composer +
+   content cards). */
+@utility acrylic-chrome {
+  background: color-mix(in oklab, var(--sidebar) 55%, transparent);
+  -webkit-backdrop-filter: blur(32px) saturate(160%);
+  backdrop-filter: blur(32px) saturate(160%);
+}
+@utility acrylic-main {
+  background: color-mix(in oklab, var(--background) 62%, transparent);
+  -webkit-backdrop-filter: blur(40px) saturate(150%);
+  backdrop-filter: blur(40px) saturate(150%);
+}
+@utility acrylic-panel {
+  background: color-mix(in oklab, var(--surface) 70%, transparent);
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
+  backdrop-filter: blur(28px) saturate(150%);
+}
+@utility acrylic-card {
+  background: color-mix(in oklab, var(--card) 82%, transparent);
+  -webkit-backdrop-filter: blur(24px);
+  backdrop-filter: blur(24px);
+}
+
+@keyframes relay-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.8);
+  }
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: oklch(0.5 0 0 / 35%);
+  border-radius: 5px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+textarea:focus,
+input:focus {
+  outline: none;
 }
