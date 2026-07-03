@@ -5,6 +5,7 @@
 //! provides the production impls (real HTTP, real tar, real spawn/renames).
 pub mod asset;
 pub mod check;
+pub mod install_method;
 pub mod version;
 
 pub use asset::{
@@ -12,4 +13,5 @@ pub use asset::{
     verify_checksum, Platform,
 };
 pub use check::{check_for_update, HttpResponse, UpdateCheckResult, UpdateHttp, UreqHttp};
+pub use install_method::{detect_install_method, InstallInfo, InstallMethod};
 pub use version::{compare_versions, is_newer, parse_version, SemVer};
