@@ -10,7 +10,9 @@ export function Modal({ onClose, width, children }: { onClose: () => void; width
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: scrim click-to-dismiss; Escape is handled globally above
     <div onClick={onClose} className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50" role="presentation">
+      {/* biome-ignore lint/a11y/useKeyWithClickEvents: click handler only swallows bubbling so the scrim doesn't dismiss */}
       <div
         onClick={(e) => e.stopPropagation()}
         className="rounded-xl border border-border bg-popover p-[22px] text-popover-foreground shadow-2xl"
