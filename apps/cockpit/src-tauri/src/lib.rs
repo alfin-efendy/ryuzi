@@ -5,6 +5,7 @@ mod commands;
 mod error;
 mod events;
 mod gateways_cmd;
+mod providers_cmd;
 
 use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
 use tauri::Manager;
@@ -187,6 +188,14 @@ fn make_builder() -> Builder<tauri::Wry> {
             gateways_cmd::remove_gateway,
             gateways_cmd::update_gateway,
             gateways_cmd::gateway_events,
+            providers_cmd::list_providers,
+            providers_cmd::add_provider,
+            providers_cmd::remove_provider,
+            providers_cmd::update_provider,
+            providers_cmd::add_provider_account,
+            providers_cmd::remove_provider_account,
+            providers_cmd::set_active_account,
+            providers_cmd::move_provider_account,
             accent::system_accent_color,
         ])
         .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])

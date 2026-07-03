@@ -41,6 +41,17 @@ export const GW_FS_MODES: { id: GatewayFsMode; label: string; desc: string }[] =
   { id: "read", label: "Read-only", desc: "Agents can inspect files but never write outside a worktree." },
 ];
 
+// Known provider catalog for the add-provider flow (identity/copy only —
+// added providers persist through the engine).
+export const PROVIDER_CATALOG = [
+  { id: "anthropic", name: "Claude", kind: "Subscription · CLI login", color: "#D97757", initial: "C" },
+  { id: "openai", name: "OpenAI", kind: "ChatGPT or platform API", color: "#0FA47F", initial: "O" },
+  { id: "google", name: "Google", kind: "Gemini · AI Studio", color: "#4285F4", initial: "G" },
+  { id: "xai", name: "xAI", kind: "Grok API", color: "#9CA3AF", initial: "X" },
+  { id: "mistral", name: "Mistral", kind: "La Plateforme API", color: "#FA5111", initial: "M" },
+  { id: "openrouter", name: "OpenRouter", kind: "Multi-provider router", color: "#6E56CF", initial: "R" },
+];
+
 // Command entries surfaced by the ⌘K palette.
 export const SEARCH_COMMANDS: { id: string; label: string; keywords: string }[] = [
   { id: "new-session", label: "New session", keywords: "new session start compose" },

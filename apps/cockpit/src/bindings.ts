@@ -205,6 +205,70 @@ async gatewayEvents(id: string) : Promise<Result<GatewayEventInfo[], CmdError>> 
     else return { status: "error", error: e  as any };
 }
 },
+async listProviders() : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_providers") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addProvider(id: string, name: string, kind: string, color: string) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_provider", { id, name, kind, color }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeProvider(id: string) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_provider", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProvider(id: string, enabled: boolean, strategy: string, failAuto: boolean, threshold: number, returnToPrimary: boolean) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_provider", { id, enabled, strategy, failAuto, threshold, returnToPrimary }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addProviderAccount(providerId: string, label: string, email: string, plan: string, sessionLimitTokens: number | null, weeklyLimitTokens: number | null) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_provider_account", { providerId, label, email, plan, sessionLimitTokens, weeklyLimitTokens }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeProviderAccount(accountId: string) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_provider_account", { accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setActiveAccount(providerId: string, accountId: string) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_active_account", { providerId, accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async moveProviderAccount(providerId: string, accountId: string, dir: number) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("move_provider_account", { providerId, accountId, dir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 }
@@ -228,6 +292,7 @@ coreEventMsg: "core-event-msg"
 /** user-defined types **/
 
 export type AccentChangedMsg = { hex: string }
+export type AccountInfo = { id: string; label: string; email: string; plan: string; active: boolean; sessionLimitTokens: number | null; weeklyLimitTokens: number | null; quotas: QuotaInfo[] }
 export type AgentInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
 /**
  * Whether Cockpit has a session harness for this agent today.
@@ -258,9 +323,21 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | Partial
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
+export type ProviderInfo = { id: string; name: string; color: string; initial: string; kind: string; enabled: boolean; strategy: string; failAuto: boolean; threshold: number; returnToPrimary: boolean; accounts: AccountInfo[]; usage: UsagePoint[]; 
+/**
+ * Whether local usage data is attributable to this provider (the engine
+ * runs Claude today, so only `anthropic` gets the local usage series).
+ */
+tracksUsage: boolean }
+export type QuotaInfo = { label: string; pct: number; used: string; max: string; resets: string }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
+export type UsagePoint = { day: string; 
+/**
+ * Estimated tokens that day (chars/4 over persisted transcripts).
+ */
+tok: number }
 
 /** tauri-specta globals **/
 

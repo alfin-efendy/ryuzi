@@ -9,6 +9,7 @@ pub mod harness;
 pub mod integration;
 pub mod paths;
 pub mod policy;
+pub mod providers;
 pub mod registry;
 pub mod store;
 pub mod worktree;
