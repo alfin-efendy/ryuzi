@@ -168,7 +168,7 @@ impl InboundRouting {
         }
         if e.is_thread {
             if !e.content.is_empty() || !e.attachments.is_empty() {
-                let _ = self
+                if let Err(err) = self
                     .router
                     .on_reply(
                         GATEWAY_ID,
@@ -177,14 +177,17 @@ impl InboundRouting {
                         &e.content,
                         &e.attachments,
                     )
-                    .await;
+                    .await
+                {
+                    eprintln!("[discord] on_reply failed: {err}");
+                }
             }
             return;
         }
         if e.mentions_bot {
             let prompt = strip_mentions(&e.content);
             if !prompt.is_empty() || !e.attachments.is_empty() {
-                let _ = self
+                if let Err(err) = self
                     .router
                     .on_start(
                         GATEWAY_ID,
@@ -193,7 +196,10 @@ impl InboundRouting {
                         &prompt,
                         &e.attachments,
                     )
-                    .await;
+                    .await
+                {
+                    eprintln!("[discord] on_start failed: {err}");
+                }
             }
         }
     }
@@ -906,24 +912,6 @@ mod tests {
             .unwrap();
         let ws_id = outcome.workspace_id.clone();
 
-        // Bot messages are dropped outright, even in a thread with content.
-        gw.handle_message(InboundMessage {
-            channel_id: ws_id.clone(),
-            is_thread: true,
-            author_bot: true,
-            content: "x".to_string(),
-            ..base_msg()
-        })
-        .await;
-        assert!(
-            fake_gw
-                .calls()
-                .iter()
-                .all(|c| !c.starts_with("create_conversation:")),
-            "authorBot message must not start a session: {:?}",
-            fake_gw.calls()
-        );
-
         // A non-thread mention starts a session; the mention is stripped from the prompt.
         gw.handle_message(InboundMessage {
             channel_id: ws_id.clone(),
@@ -948,7 +936,44 @@ mod tests {
             .conversation_id
             .clone();
 
-        // A thread message continues that same session.
+        // Bot messages are dropped outright, even in a thread with content —
+        // and even when targeting THIS ALREADY-REGISTERED conversation, where
+        // (unlike an unmapped id) `on_reply` would actually resolve a session
+        // and drive a second turn if the `author_bot` guard were deleted.
+        // `fake_gw.calls()` can't observe that (`on_reply` never touches the
+        // gateway), so the proxy is `last_active`: it's only ever bumped by
+        // `demote_if_running`, which only runs once a real turn completes.
+        let baseline = store.get_session(&session_pk).await.unwrap().unwrap();
+        assert_eq!(baseline.status, SessionStatus::Idle);
+        let last_active_before = baseline.last_active;
+        gw.handle_message(InboundMessage {
+            channel_id: conv_id.clone(),
+            is_thread: true,
+            author_bot: true,
+            author_id: "u".to_string(),
+            content: "x".to_string(),
+            ..base_msg()
+        })
+        .await;
+        // Grace period: give a wrongly-fired turn's background completion
+        // (were the guard deleted) a chance to land before asserting nothing
+        // moved. The fake harness's turn is an immediate no-op, so this
+        // window is ample even under a loaded CI runner.
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let after_bot_msg = store.get_session(&session_pk).await.unwrap().unwrap();
+        assert_eq!(
+            after_bot_msg.status,
+            SessionStatus::Idle,
+            "authorBot message must not leave the session Running"
+        );
+        assert_eq!(
+            after_bot_msg.last_active, last_active_before,
+            "authorBot message must not continue the session (last_active moved, implying a second turn ran)"
+        );
+
+        // A (non-bot) thread message continues that same session.
         gw.handle_message(InboundMessage {
             channel_id: conv_id,
             is_thread: true,
@@ -1081,9 +1106,14 @@ mod tests {
         .await;
         wait_for_status(&store, &session_pk, SessionStatus::Idle).await;
 
-        // Empty content AND no attachments: ignored.
+        // Empty content AND no attachments: ignored — targeting the SAME
+        // already-connected workspace (not an unmapped one), so `on_start`
+        // WOULD run (a project is bound to `ws_id`) if the
+        // `!prompt.is_empty() || !attachments.is_empty()` guard were removed.
+        // The session count staying unchanged is what proves the guard, not
+        // an unrelated "workspace never connected" no-op.
         gw.handle_message(InboundMessage {
-            channel_id: "ch2".to_string(),
+            channel_id: ws_id.clone(),
             author_id: "u".to_string(),
             mentions_bot: true,
             content: "<@1>".to_string(),
