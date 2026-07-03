@@ -171,9 +171,26 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::read_file,
             commands::pick_directory,
             commands::backdrop_capability,
+            commands::get_setting,
+            commands::set_setting,
+            commands::update_project,
             accent::system_accent_color,
         ])
         .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])
+}
+
+/// Write `src/bindings.ts` for the current command/event surface. Used by the
+/// dev-run export, the `export_bindings` test, and the `gen-bindings` bin
+/// (which exists because the Windows lib-test harness crashes at startup —
+/// tauri-apps/tauri#13419 — while bin artifacts get the app manifest linked).
+pub fn export_bindings(out: &std::path::Path) {
+    make_builder()
+        .export(
+            specta_typescript::Typescript::default()
+                .bigint(specta_typescript::BigIntExportBehavior::Number),
+            out,
+        )
+        .expect("export bindings");
 }
 
 pub fn run() {
@@ -182,13 +199,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
-        builder
-            .export(
-                specta_typescript::Typescript::default()
-                    .bigint(specta_typescript::BigIntExportBehavior::Number),
-                &out,
-            )
-            .expect("export bindings");
+        export_bindings(&out);
     }
 
     tauri::Builder::default()
@@ -249,16 +260,12 @@ mod tests {
 
     /// Generates `src/bindings.ts` without launching the Tauri GUI.
     /// Run via: `cargo test -p ryuzi-cockpit export_bindings -- --nocapture`
+    /// (On Windows prefer `cargo run -p ryuzi-cockpit --bin gen-bindings` —
+    /// the lib-test harness crashes at startup, tauri-apps/tauri#13419.)
     #[test]
-    fn export_bindings() {
+    fn export_bindings_test() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
-        make_builder()
-            .export(
-                specta_typescript::Typescript::default()
-                    .bigint(specta_typescript::BigIntExportBehavior::Number),
-                &out,
-            )
-            .expect("export bindings");
+        export_bindings(&out);
     }
 
     #[test]

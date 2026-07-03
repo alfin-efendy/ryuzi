@@ -41,6 +41,11 @@ impl ControlPlane {
         self.events.subscribe()
     }
 
+    /// Direct store access for domain modules and the Tauri command layer.
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
     pub fn resolve_approval(&self, request_id: &str, allow: bool) -> bool {
         self.approvals.resolve(request_id, allow)
     }

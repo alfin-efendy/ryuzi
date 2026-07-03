@@ -86,6 +86,30 @@ async pickDirectory() : Promise<string | null> {
 async backdropCapability() : Promise<BackdropCapability> {
     return await TAURI_INVOKE("backdrop_capability");
 },
+async getSetting(key: string) : Promise<Result<string | null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_setting", { key }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setSetting(key: string, value: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_setting", { key, value }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProject(projectId: string, model: string | null, permMode: PermMode, harness: string) : Promise<Result<Project, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project", { projectId, model, permMode, harness }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 }
