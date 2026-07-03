@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { ChevronDown, ChevronRight, Hourglass, Plus, RefreshCw } from "lucide-react";
-import { PROVIDERS, quotaColor, type ProviderFixture } from "@/fixtures";
+import { PROVIDERS, ROTATION_STRATEGIES, quotaColor, type ProviderFixture } from "@/fixtures";
 import { useFixtures } from "@/store-fixtures";
 import { useNav } from "@/store-nav";
 import { Card } from "@/components/common/Card";
@@ -30,7 +30,7 @@ function ProviderCard({ provider }: { provider: ProviderFixture }) {
         <button type="button" onClick={open} className="min-w-0 flex-1 cursor-pointer border-none bg-transparent p-0 text-left font-sans">
           <span className="flex items-center gap-2 text-sm font-semibold text-foreground">
             {provider.name}
-            {state.failAuto && <Pill>Auto-failover</Pill>}
+            {state.failAuto && <Pill>{ROTATION_STRATEGIES.find((s) => s.id === state.strategy)?.pill ?? "Auto-failover"}</Pill>}
           </span>
           <span className="block text-xs text-muted-foreground">{subtitle}</span>
         </button>

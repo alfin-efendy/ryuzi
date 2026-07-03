@@ -1,9 +1,9 @@
-import { ChevronDown, MonitorUp } from "lucide-react";
+import { Layers, MonitorUp, X } from "lucide-react";
 import { useState } from "react";
 import { Chip, Pill } from "@/components/common/bits";
 import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { MenuItem, MenuPanel } from "@/components/common/MenuPanel";
+import { MenuItem, MenuPanel, MenuSeparator } from "@/components/common/MenuPanel";
 import { Segmented } from "@/components/common/Segmented";
 import { Switch } from "@/components/common/Switch";
 import { type AgentId, AGENTS, PERM_MODES } from "@/fixtures";
@@ -32,14 +32,14 @@ export function AgentDetailView({ id }: { id: string }) {
     apps,
     setDefaultAgent,
     toggleAgent,
-    setAgentModel,
     setAgentPerm,
     setAgentFlags,
     applyAgentUpdate,
     setAgentAppAccess,
+    setAgentTier,
   } = useFixtures();
   const navigate = useNav((s) => s.navigate);
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [openTierMenu, setOpenTierMenu] = useState<string | null>(null);
 
   const st = agentState[agentId];
   const isDefault = defaultAgent === agentId;
@@ -95,33 +95,73 @@ export function AgentDetailView({ id }: { id: string }) {
           <CardHeader>
             <CardTitle>Configuration</CardTitle>
           </CardHeader>
-          <CardRow className="relative">
-            <span className="flex-1 text-[13px] font-medium">Model</span>
-            <button
-              type="button"
-              onClick={() => setModelMenuOpen((v) => !v)}
-              className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
-            >
-              {st.model}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="text-muted-foreground" />
-            </button>
-            {modelMenuOpen && (
-              <MenuPanel onClose={() => setModelMenuOpen(false)} className="right-[18px] top-12 w-[220px]">
-                {agent.models.map((m) => (
+          <div className="flex items-center gap-2.5 px-[18px] pb-1 pt-[11px]">
+            <span className="text-[13px] font-medium">Model mapping</span>
+            <span className="text-[11.5px] text-muted-foreground">Route each tier to any model or combo</span>
+          </div>
+          {st.tiers.map((tier) => (
+            <div key={tier.id} className="relative flex items-center gap-2.5 px-[18px] py-[7px]">
+              <span className="w-[100px] shrink-0 text-[12.5px] font-medium text-muted-foreground">{tier.label}</span>
+              <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-input bg-background pl-3 pr-1">
+                {tier.combo && (
+                  <span className="flex shrink-0 items-center gap-1 rounded-full bg-secondary px-1.5 py-[2px] text-[9.5px] font-semibold uppercase tracking-[0.03em] text-secondary-foreground">
+                    <Layers aria-hidden size={9} strokeWidth={2} />
+                    combo
+                  </span>
+                )}
+                {tier.value !== null ? (
+                  <>
+                    <span className="min-w-0 flex-1 truncate font-mono text-xs">{tier.value}</span>
+                    <button
+                      type="button"
+                      title="Clear"
+                      aria-label={`Clear ${tier.label} model`}
+                      onClick={() => setAgentTier(agentId, tier.id, null)}
+                      className="flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent p-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                    >
+                      <X aria-hidden size={12} strokeWidth={2} />
+                    </button>
+                  </>
+                ) : (
+                  <span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">Not set</span>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setOpenTierMenu((v) => (v === tier.id ? null : tier.id))}
+                className="h-8 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3 font-sans text-xs font-medium text-foreground hover:bg-accent"
+              >
+                Select model
+              </button>
+              {openTierMenu === tier.id && (
+                <MenuPanel onClose={() => setOpenTierMenu(null)} className="right-[18px] top-[42px] w-[240px]">
+                  {agent.models.map((m) => (
+                    <MenuItem
+                      key={m}
+                      selected={!tier.combo && tier.value === m}
+                      onClick={() => {
+                        setAgentTier(agentId, tier.id, m);
+                        setOpenTierMenu(null);
+                      }}
+                    >
+                      <span className="flex-1">{m}</span>
+                    </MenuItem>
+                  ))}
+                  <MenuSeparator />
                   <MenuItem
-                    key={m}
-                    selected={st.model === m}
+                    selected={tier.combo === true}
                     onClick={() => {
-                      setAgentModel(agentId, m);
-                      setModelMenuOpen(false);
+                      setAgentTier(agentId, tier.id, "route by task", true);
+                      setOpenTierMenu(null);
                     }}
                   >
-                    <span className="flex-1">{m}</span>
+                    <span className="flex-1">Route by task (combo)</span>
                   </MenuItem>
-                ))}
-              </MenuPanel>
-            )}
-          </CardRow>
+                </MenuPanel>
+              )}
+            </div>
+          ))}
+          <div className="h-2 border-b border-border" />
           <div className="flex flex-col gap-2 border-b border-border px-[18px] py-3">
             <div className="flex items-center gap-3">
               <span className="flex-1 text-[13px] font-medium">Permission mode</span>

@@ -200,6 +200,7 @@ function ThemeEditorCard({ spec }: { spec: EditorSpec }) {
   const transparency = useTheme((s) => s.transparency);
   const setTransparency = useTheme((s) => s.setTransparency);
   const [contrast, setContrast] = useState(spec.initialContrast);
+  const [windowTransparency, setWindowTransparency] = useState(55);
 
   return (
     <Card className="mb-3">
@@ -269,6 +270,25 @@ function ThemeEditorCard({ spec }: { spec: EditorSpec }) {
           style={{ accentColor: "var(--primary)" }}
         />
         <span className="w-7 shrink-0 text-right font-mono text-[12.5px] font-semibold">{contrast}</span>
+      </CardRow>
+
+      <CardRow className="gap-4">
+        <span className="shrink-0 text-[13px] font-medium">Window transparency</span>
+        <input
+          type="range"
+          min={0}
+          max={80}
+          value={windowTransparency}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            setWindowTransparency(v);
+            setTransparency(v > 0);
+          }}
+          aria-label={`${spec.title} window transparency`}
+          className="flex-1 cursor-pointer"
+          style={{ accentColor: "var(--primary)" }}
+        />
+        <span className="w-7 shrink-0 text-right font-mono text-[12.5px] font-semibold">{windowTransparency}</span>
       </CardRow>
     </Card>
   );

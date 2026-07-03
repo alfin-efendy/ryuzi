@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { ChevronDown, ChevronUp, Plus } from "lucide-react";
-import { PROVIDERS, quotaColor, type ProviderAccount } from "@/fixtures";
+import { PROVIDERS, ROTATION_STRATEGIES, quotaColor, type ProviderAccount } from "@/fixtures";
 import { useFixtures } from "@/store-fixtures";
 import { useNav } from "@/store-nav";
 import { BarChart } from "@/components/common/BarChart";
@@ -166,21 +166,54 @@ export function ProviderDetailView({ id }: { id: string }) {
                       </div>
                       <Switch on={state.failAuto} onToggle={() => fx.setFailAuto(id, !state.failAuto)} label="Auto-switch accounts" />
                     </CardRow>
-                    <CardRow>
-                      <span className="flex-1 text-[13px] font-medium">Switch when quota hits</span>
-                      <Segmented options={THRESHOLDS} value={String(state.threshold)} onChange={(v) => fx.setThreshold(id, Number(v))} />
-                    </CardRow>
-                    <CardRow>
-                      <div className="min-w-0 flex-1">
-                        <div className="text-[13px] font-medium">Return to primary</div>
-                        <div className="mt-px text-[11.5px] text-muted-foreground">Switch back once the primary quota resets.</div>
-                      </div>
-                      <Switch
-                        on={state.returnToPrimary}
-                        onToggle={() => fx.setReturnToPrimary(id, !state.returnToPrimary)}
-                        label="Return to primary"
-                      />
-                    </CardRow>
+                    <div className="flex flex-col border-b border-border px-[18px] pb-3 pt-2.5 last:border-b-0">
+                      <span className="pb-1.5 pt-0.5 text-[13px] font-medium">Rotation strategy</span>
+                      {ROTATION_STRATEGIES.map((stg) => {
+                        const selected = state.strategy === stg.id;
+                        return (
+                          <button
+                            key={stg.id}
+                            type="button"
+                            onClick={() => fx.setStrategy(id, stg.id)}
+                            className="-mx-2.5 flex cursor-pointer items-start gap-2.5 rounded-md border-none bg-transparent px-2.5 py-[7px] text-left font-sans hover:bg-accent"
+                          >
+                            <span
+                              className="mt-px flex h-[15px] w-[15px] flex-none items-center justify-center rounded-full border-[1.5px]"
+                              style={{ borderColor: selected ? "var(--primary)" : "var(--border)" }}
+                            >
+                              <span className={`h-[7px] w-[7px] rounded-full bg-primary ${selected ? "opacity-100" : "opacity-0"}`} />
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block text-[12.5px] font-medium text-foreground">{stg.label}</span>
+                              <span className="mt-px block text-[11.5px] text-muted-foreground">{stg.desc}</span>
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {state.strategy === "priority" && (
+                      <>
+                        <CardRow>
+                          <span className="flex-1 text-[13px] font-medium">Switch when quota hits</span>
+                          <Segmented
+                            options={THRESHOLDS}
+                            value={String(state.threshold)}
+                            onChange={(v) => fx.setThreshold(id, Number(v))}
+                          />
+                        </CardRow>
+                        <CardRow>
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[13px] font-medium">Return to primary</div>
+                            <div className="mt-px text-[11.5px] text-muted-foreground">Switch back once the primary quota resets.</div>
+                          </div>
+                          <Switch
+                            on={state.returnToPrimary}
+                            onToggle={() => fx.setReturnToPrimary(id, !state.returnToPrimary)}
+                            label="Return to primary"
+                          />
+                        </CardRow>
+                      </>
+                    )}
                   </>
                 ) : (
                   <div className="px-[18px] py-4 text-[12.5px] text-muted-foreground">

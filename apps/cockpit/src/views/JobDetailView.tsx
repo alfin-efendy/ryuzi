@@ -1,5 +1,17 @@
 import { useState } from "react";
-import { ArrowUpRight, Check, ChevronDown, ChevronRight, CircleAlert, Clock, Folder, GitBranch, Play, Server } from "lucide-react";
+import {
+  ArrowUpRight,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleAlert,
+  Clock,
+  Folder,
+  GitBranch,
+  Play,
+  Server,
+  TriangleAlert,
+} from "lucide-react";
 import { AGENT_IDS, AGENTS, WORKSPACES, type JobFixture, type JobRun } from "@/fixtures";
 import { useFixtures } from "@/store-fixtures";
 import { useNav } from "@/store-nav";
@@ -183,7 +195,7 @@ const RUN_META: Record<JobRun["status"], { color: string; label: string }> = {
 };
 
 export function JobDetailView({ id }: { id: string }) {
-  const { jobs, toggleJob, updateJob } = useFixtures();
+  const { jobs, toggleJob, updateJob, gatewayState } = useFixtures();
   const nav = useNav();
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   const [expandedRun, setExpandedRun] = useState<string | null>(null);
@@ -194,7 +206,8 @@ export function JobDetailView({ id }: { id: string }) {
   }
 
   const agent = AGENTS[j.agent];
-  const wsName = WORKSPACES.find((w) => w.id === j.workspace)?.name ?? j.workspace;
+  const ws = WORKSPACES.find((w) => w.id === j.workspace);
+  const wsName = ws?.name ?? j.workspace;
   const failedRuns = j.history.filter((r) => r.status === "failed").length;
 
   return (
@@ -225,6 +238,26 @@ export function JobDetailView({ id }: { id: string }) {
           </button>
           <Switch on={j.on} onToggle={() => toggleJob(j.id)} label="Enabled" />
         </DetailHeader>
+
+        {ws && ws.status === "offline" && (
+          <Card className="mb-3 flex items-center gap-3 px-[18px] py-3.5">
+            <TriangleAlert aria-hidden size={16} strokeWidth={2} className="shrink-0" style={{ color: "#F59E0B" }} />
+            <div className="min-w-0 flex-1">
+              <div className="text-[13.5px] font-semibold">{ws.name} is offline — runs are queued</div>
+              <div className="mt-px text-xs text-muted-foreground">
+                The schedule is stored on the gateway daemon ({gatewayState[ws.id]?.daemon ?? ws.daemon}); missed runs execute in order when
+                it reconnects.
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => nav.navigate({ kind: "gatewayDetail", id: ws.id })}
+              className="h-7 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-[11px] font-sans text-xs font-medium text-foreground hover:bg-accent"
+            >
+              View gateway
+            </button>
+          </Card>
+        )}
 
         <Card className="mb-3">
           <CardHeader>
