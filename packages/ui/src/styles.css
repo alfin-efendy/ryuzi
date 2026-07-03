@@ -38,12 +38,15 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  --surface-window: var(--background);
+  --surface-layer: transparent;
+  --surface-acrylic: var(--popover);
 }
 body {
   margin: 0;
 }
 
-@theme inline { --font-heading: var(--font-sans); --font-sans: 'Geist Variable', sans-serif; --color-sidebar-ring: var(--sidebar-ring); --color-sidebar-border: var(--sidebar-border); --color-sidebar-accent-foreground: var(--sidebar-accent-foreground); --color-sidebar-accent: var(--sidebar-accent); --color-sidebar-primary-foreground: var(--sidebar-primary-foreground); --color-sidebar-primary: var(--sidebar-primary); --color-sidebar-foreground: var(--sidebar-foreground); --color-sidebar: var(--sidebar); --color-chart-5: var(--chart-5); --color-chart-4: var(--chart-4); --color-chart-3: var(--chart-3); --color-chart-2: var(--chart-2); --color-chart-1: var(--chart-1); --color-ring: var(--ring); --color-input: var(--input); --color-border: var(--border); --color-destructive: var(--destructive); --color-accent-foreground: var(--accent-foreground); --color-accent: var(--accent); --color-muted-foreground: var(--muted-foreground); --color-muted: var(--muted); --color-secondary-foreground: var(--secondary-foreground); --color-secondary: var(--secondary); --color-primary-foreground: var(--primary-foreground); --color-primary: var(--primary); --color-popover-foreground: var(--popover-foreground); --color-popover: var(--popover); --color-card-foreground: var(--card-foreground); --color-card: var(--card); --color-foreground: var(--foreground); --color-background: var(--background); --radius-sm: calc(var(--radius) * 0.6); --radius-md: calc(var(--radius) * 0.8); --radius-lg: var(--radius); --radius-xl: calc(var(--radius) * 1.4); --radius-2xl: calc(var(--radius) * 1.8); --radius-3xl: calc(var(--radius) * 2.2); --radius-4xl: calc(var(--radius) * 2.6); }
+@theme inline { --font-heading: var(--font-sans); --font-sans: 'Geist Variable', sans-serif; --color-sidebar-ring: var(--sidebar-ring); --color-sidebar-border: var(--sidebar-border); --color-sidebar-accent-foreground: var(--sidebar-accent-foreground); --color-sidebar-accent: var(--sidebar-accent); --color-sidebar-primary-foreground: var(--sidebar-primary-foreground); --color-sidebar-primary: var(--sidebar-primary); --color-sidebar-foreground: var(--sidebar-foreground); --color-sidebar: var(--sidebar); --color-chart-5: var(--chart-5); --color-chart-4: var(--chart-4); --color-chart-3: var(--chart-3); --color-chart-2: var(--chart-2); --color-chart-1: var(--chart-1); --color-ring: var(--ring); --color-input: var(--input); --color-border: var(--border); --color-destructive: var(--destructive); --color-accent-foreground: var(--accent-foreground); --color-accent: var(--accent); --color-muted-foreground: var(--muted-foreground); --color-muted: var(--muted); --color-secondary-foreground: var(--secondary-foreground); --color-secondary: var(--secondary); --color-primary-foreground: var(--primary-foreground); --color-primary: var(--primary); --color-popover-foreground: var(--popover-foreground); --color-popover: var(--popover); --color-card-foreground: var(--card-foreground); --color-card: var(--card); --color-foreground: var(--foreground); --color-background: var(--background); --color-surface-window: var(--surface-window); --color-surface-layer: var(--surface-layer); --radius-sm: calc(var(--radius) * 0.6); --radius-md: calc(var(--radius) * 0.8); --radius-lg: var(--radius); --radius-xl: calc(var(--radius) * 1.4); --radius-2xl: calc(var(--radius) * 1.8); --radius-3xl: calc(var(--radius) * 2.2); --radius-4xl: calc(var(--radius) * 2.6); }
 
 .dark {
   --background: oklch(0.145 0 0);
@@ -79,12 +82,53 @@ body {
   --sidebar-ring: oklch(0.556 0 0);
 }
 
+/* Translucent surfaces over an OS backdrop (mica on Windows 11, vibrancy on
+   macOS). Activated by data-backdrop on <html>; absent attribute = every token
+   keeps its :root/.dark value and rendering is pixel-identical to opaque mode.
+   --background itself is NEVER made transparent (it doubles as a raised/inverse
+   surface in Composer, button outline variant, hover states). */
+html[data-backdrop] {
+  --surface-window: transparent;
+  --sidebar: transparent;
+  --surface-layer: oklch(1 0 0 / 0.78);
+  --card: oklch(1 0 0 / 0.82);
+  --popover: oklch(1 0 0 / 0.88);
+  --surface-acrylic: oklch(1 0 0 / 0.7);
+}
+html.dark[data-backdrop] {
+  --surface-layer: oklch(0.205 0 0 / 0.6);
+  --card: oklch(0.205 0 0 / 0.68);
+  --popover: oklch(0.205 0 0 / 0.78);
+  --surface-acrylic: oklch(0.205 0 0 / 0.55);
+}
+/* Theme-mismatch guard: mica follows the OS theme, not the app theme. When the
+   app theme differs from the OS theme, fully transparent chrome would put dark
+   text on dark mica (or light on light) — give the window base and sidebar a
+   translucent wash of the app theme instead. Matching themes keep full mica. */
+@media (prefers-color-scheme: dark) {
+  html[data-backdrop]:not(.dark) {
+    --surface-window: oklch(1 0 0 / 0.75);
+    --sidebar: oklch(1 0 0 / 0.55);
+  }
+}
+@media (prefers-color-scheme: light) {
+  html.dark[data-backdrop] {
+    --surface-window: oklch(0.145 0 0 / 0.75);
+    --sidebar: oklch(0.205 0 0 / 0.55);
+  }
+}
+@utility surface-acrylic {
+  background: var(--surface-acrylic);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  backdrop-filter: blur(16px) saturate(140%);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply bg-surface-window text-foreground;
   }
   html {
     @apply font-sans;

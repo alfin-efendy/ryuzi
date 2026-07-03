@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { toast } from "sonner";
 import { commands, events, type Project, type Session, type CoreEvent, type Message } from "./bindings";
+import { basename } from "./lib/paths";
 
 export type Line = { kind: "user" | "text" | "status" | "error"; text: string };
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
@@ -127,7 +128,7 @@ export const useStore = create<State>((set, get) => ({
   addProject: async () => {
     const dir = await commands.pickDirectory();
     if (!dir) return;
-    const name = dir.split("/").filter(Boolean).pop() ?? "project";
+    const name = basename(dir) || "project";
     const res = await commands.connectProject(dir, name);
     if (res.status === "ok") {
       await get().refresh();

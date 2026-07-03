@@ -11,9 +11,20 @@
   },
   "app": {
     "windows": [
-      { "title": "ryuzi", "width": 1200, "height": 800, "minWidth": 720, "minHeight": 480, "resizable": true, "decorations": false }
+      {
+        "title": "Ryuzi Cockpit",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 480,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "visible": false
+      }
     ],
-    "security": { "csp": null }
+    "security": { "csp": null },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,

@@ -31,7 +31,7 @@ export function Composer({
 
   return (
     <div className="p-3 pt-2">
-      <div className="mx-auto max-w-[720px] rounded-2xl border border-border bg-background p-3 shadow-sm">
+      <div className="mx-auto max-w-[720px] rounded-2xl border border-border bg-card p-3 shadow-sm">
         <Textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
