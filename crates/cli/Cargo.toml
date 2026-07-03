@@ -13,7 +13,7 @@ name = "ryuzi"
 path = "src/main.rs"
 
 [dependencies]
-ryuzi-core = { path = "../core" }
+ryuzi-core = { path = "../core", features = ["otel"] }
 anyhow = "1"
 clap = { version = "4", features = ["string"] }
 serde_json.workspace = true

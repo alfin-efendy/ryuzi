@@ -128,19 +128,45 @@ impl Daemon {
 /// Given the persisted `otel_endpoint` setting, choose the telemetry backend.
 /// A pure/unit-testable split of `build_daemon`'s telemetry-selection branch:
 /// an empty/unset endpoint selects `ConsoleTelemetry` silently (the second
-/// tuple element — "warned" — is `false`); a non-empty endpoint is meant to
-/// select an OTLP exporter behind `#[cfg(feature = "otel")]` (Task 6; the
-/// feature doesn't exist yet), so today it ALSO selects `ConsoleTelemetry`
-/// but reports `warned = true` so the caller can print the
+/// tuple element — "warned" — is `false`).
+///
+/// A non-empty endpoint tries the real OTLP exporter behind
+/// `#[cfg(feature = "otel")]` ([`crate::telemetry::OtelTelemetry`]):
+/// - feature ON + construction succeeds → the `OtelTelemetry` backend,
+///   `warned = false` (no fallback happened).
+/// - feature ON + construction fails (e.g. an unparseable endpoint) →
+///   `ConsoleTelemetry`, `warned = true`.
+/// - feature OFF → always `ConsoleTelemetry`, `warned = true` (unchanged
+///   pre-Task-6 behavior — the feature doesn't exist in the build).
+///
+/// Either way, `warned = true` means the caller should print the
 /// `[telemetry] OTel init failed — falling back to console` warning. The
 /// print itself is kept out of this function (rather than done here) so the
 /// selection logic is testable without capturing stderr.
 pub(crate) fn select_telemetry(otel_endpoint: &str) -> (Arc<dyn Telemetry>, bool) {
     if otel_endpoint.trim().is_empty() {
-        (Arc::new(ConsoleTelemetry::new()), false)
-    } else {
-        (Arc::new(ConsoleTelemetry::new()), true)
+        return (Arc::new(ConsoleTelemetry::new()), false);
     }
+    match try_otel_telemetry(otel_endpoint) {
+        Some(telemetry) => (telemetry, false),
+        None => (Arc::new(ConsoleTelemetry::new()), true),
+    }
+}
+
+/// Attempt to construct the real OTLP backend for `otel_endpoint`. Returns
+/// `None` (never panics) when the `otel` feature is off, or when
+/// construction fails — either way `select_telemetry` falls back to
+/// `ConsoleTelemetry` with a warning.
+#[cfg(feature = "otel")]
+fn try_otel_telemetry(otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
+    crate::telemetry::OtelTelemetry::new(otel_endpoint)
+        .ok()
+        .map(|telemetry| Arc::new(telemetry) as Arc<dyn Telemetry>)
+}
+
+#[cfg(not(feature = "otel"))]
+fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
+    None
 }
 
 /// Build order (TS daemon parity):
@@ -1072,13 +1098,50 @@ mod tests {
         );
     }
 
+    // Without the `otel` feature there's no real backend to try, so every
+    // configured endpoint still falls back to Console with a warning (the
+    // pre-Task-6 behavior). With the feature on, a syntactically valid
+    // endpoint now selects the real Otel backend instead — see the
+    // `#[cfg(feature = "otel")]` tests below.
+    #[cfg(not(feature = "otel"))]
     #[test]
     fn select_telemetry_nonempty_endpoint_warns_and_still_falls_back_to_console() {
-        let (_telemetry, warned) = select_telemetry("http://localhost:4317");
+        let (telemetry, warned) = select_telemetry("http://localhost:4317");
         assert!(
             warned,
-            "a configured otel_endpoint must signal the fallback warning until Task 6 lands"
+            "a configured otel_endpoint must signal the fallback warning when the `otel` feature is off"
         );
+        assert_eq!(telemetry.backend_name(), "console");
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn select_telemetry_nonempty_endpoint_selects_otel_without_warning() {
+        let (telemetry, warned) = select_telemetry("http://localhost:4317");
+        assert!(
+            !warned,
+            "a configured otel_endpoint that constructs successfully must not warn"
+        );
+        assert_eq!(
+            telemetry.backend_name(),
+            "otel",
+            "select_telemetry must choose the real Otel backend when the feature is on \
+             and construction succeeds"
+        );
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn select_telemetry_unparseable_endpoint_falls_back_to_console_with_warning() {
+        // Not a valid URI at all — OtelTelemetry::new must return Err, and
+        // select_telemetry must still fall back to Console + warn, exactly
+        // as it does when the `otel` feature is off.
+        let (telemetry, warned) = select_telemetry("not a url");
+        assert!(
+            warned,
+            "a configured otel_endpoint that fails to construct must still warn"
+        );
+        assert_eq!(telemetry.backend_name(), "console");
     }
 
     #[tokio::test]
