@@ -35,6 +35,10 @@ pub fn csv(s: Option<&str>) -> Vec<String> {
 /// Validated facade over `Store`'s raw settings rows: applies schema
 /// defaults on read, validates on write, and computes required/configured
 /// status from the enabled gateway/runtime provider lists.
+///
+/// Cheaply `Clone` (an `Arc<Store>` wrapper) so it can be handed to
+/// long-lived owners like `UpdateManager` alongside other `Arc`-held deps.
+#[derive(Clone)]
 pub struct SettingsStore {
     store: Arc<Store>,
 }

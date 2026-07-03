@@ -7,6 +7,7 @@ pub mod asset;
 pub mod check;
 pub mod handoff;
 pub mod install_method;
+pub mod manager;
 pub mod version;
 
 pub use asset::{
@@ -18,4 +19,8 @@ pub use handoff::{
     clear_handoff, handoff_path, read_handoff, write_handoff, Handoff, HandoffPhase,
 };
 pub use install_method::{detect_install_method, InstallInfo, InstallMethod};
+pub use manager::{
+    upgrade_hint, ApplyHook, ApplyInfo, NotifyTarget, UpdateManager, UpdateManagerDeps, UpdateMode,
+    DEFAULT_CHECK_INTERVAL_MS, DEFAULT_REPO,
+};
 pub use version::{compare_versions, is_newer, parse_version, SemVer};

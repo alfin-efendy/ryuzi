@@ -905,6 +905,22 @@ impl ControlPlane {
     }
 }
 
+/// `ControlPlane` satisfies `UpdateManager`'s `NotifyTarget` seam — TS
+/// parity: `update-manager.ts`'s `NotifyTarget` interface, which the TS
+/// `ControlPlane` implements structurally.
+#[async_trait::async_trait]
+impl crate::update::manager::NotifyTarget for ControlPlane {
+    async fn list_sessions(&self) -> Vec<Session> {
+        ControlPlane::list_sessions(self, None)
+            .await
+            .unwrap_or_default()
+    }
+
+    fn emit(&self, e: CoreEvent) {
+        self.emit(e);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
