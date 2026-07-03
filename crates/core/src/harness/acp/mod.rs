@@ -120,6 +120,7 @@ async fn run_client_loop(
     let perm = (
         perm.hub,
         perm.events,
+        perm.session_pk,
         perm.project_id,
         perm.perm_mode,
         perm.store,
@@ -156,12 +157,23 @@ async fn run_client_loop(
         )
         .on_receive_request(
             {
-                let (hub, events, project_id, perm_mode_for_perm, store_for_perm) = perm;
+                let (
+                    hub,
+                    events,
+                    session_pk_for_perm,
+                    project_id,
+                    perm_mode_for_perm,
+                    store_for_perm,
+                ) = perm;
                 async move |request: agent_client_protocol::schema::v1::RequestPermissionRequest,
                             responder,
                             _cx| {
                     let request_id = request.tool_call.tool_call_id.0.to_string();
-                    let session_pk = request.session_id.0.to_string();
+                    // Ryuzi's own session_pk (NOT `request.session_id`, which is the
+                    // ACP-assigned id) — consumers route ApprovalRequested by ryuzi
+                    // pk (see e.g. `run_cmd.rs`'s `session_pk == session.session_pk`
+                    // guard and the daemon fan-out), mirroring the notification sink.
+                    let session_pk = session_pk_for_perm.clone();
                     let tool = request
                         .tool_call
                         .fields
@@ -657,6 +669,7 @@ impl Harness for AcpHarness {
         let perm = PermissionContext {
             hub: ctx.approvals.clone(),
             events: ctx.events.clone(),
+            session_pk: ctx.session_pk.clone(),
             project_id,
             perm_mode: ctx.perm_mode,
             store: ctx.store.clone(),
@@ -907,6 +920,26 @@ mod tests {
         assert!(
             outcome.hub_was_never_registered,
             "hub should NOT have been registered when policy is allowAlways"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_requested_carries_the_ryuzi_session_pk_not_the_acp_session_id() {
+        // No per-project tool policy is set, so "Bash" in PermMode::Default
+        // falls through to the hub-prompt path (not AutoAllow), which emits
+        // CoreEvent::ApprovalRequested. The mock agent's session/new always
+        // assigns a fresh random ACP session id (a UUID), which necessarily
+        // differs from ryuzi's own session_pk ("perm-bridge-session-pk") —
+        // the emitted event must carry the ryuzi pk, not the ACP-assigned id.
+        let outcome =
+            crate::harness::acp::testkit::run_perm_mock_via_harness("p-approval-pk", None).await;
+
+        assert_eq!(
+            outcome.captured_session_pk.as_deref(),
+            Some(outcome.session_pk.as_str()),
+            "ApprovalRequested.session_pk should be ryuzi's own session_pk ({:?}), \
+             not the ACP-assigned session id",
+            outcome.session_pk
         );
     }
 

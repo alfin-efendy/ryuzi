@@ -1495,6 +1495,13 @@ pub struct PermBridgeOutcome {
     /// `true` when the `ApprovalHub` was never registered during the request
     /// (i.e. the bridge short-circuited before hitting the hub).
     pub hub_was_never_registered: bool,
+    /// The ryuzi `session_pk` this test wired into `SessionCtx` (all rows and
+    /// events for the session should be keyed under this value).
+    pub session_pk: String,
+    /// The `session_pk` captured off the broadcast `CoreEvent::ApprovalRequested`
+    /// (`None` if the request never reached the hub-prompt path, e.g. AutoAllow).
+    /// Should equal `session_pk` above, NOT the ACP-assigned session id.
+    pub captured_session_pk: Option<String>,
     /// The store, for further assertions.
     #[allow(dead_code)]
     pub store: std::sync::Arc<crate::store::Store>,
@@ -1567,6 +1574,38 @@ pub async fn run_perm_mock_via_harness(
     // Track whether the hub was ever registered.
     let hub: Arc<ApprovalHub> = Arc::new(ApprovalHub::new());
     let hub_registrations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Capture the session_pk carried by a broadcast CoreEvent::ApprovalRequested
+    // (if the request reaches the hub-prompt path) and drive the hub
+    // resolution — standing in for a real consumer (e.g. the CLI) that
+    // watches the event stream and resolves the approval once the user
+    // answers. Subscribing here (before `events_tx` is moved into `ctx`)
+    // ensures we see the event even though it fires inside `send_prompt`.
+    let captured_session_pk: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    {
+        let mut approval_rx = events_tx.subscribe();
+        let captured = captured_session_pk.clone();
+        let hub_for_resolver = hub.clone();
+        tokio::spawn(async move {
+            if let Ok(CoreEvent::ApprovalRequested {
+                session_pk,
+                request_id,
+                ..
+            }) = approval_rx.recv().await
+            {
+                *captured.lock().await = Some(session_pk);
+                // The bridge calls hub.register(..) right after emitting the
+                // event; retry briefly so we don't race ahead of it.
+                for _ in 0..200 {
+                    if hub_for_resolver.resolve(&request_id, true) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        });
+    }
 
     let allowed_slot: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
     let allowed_slot_for_agent = allowed_slot.clone();
@@ -1649,10 +1688,13 @@ pub async fn run_perm_mock_via_harness(
     let allowed = *allowed_slot.lock().await;
     // The hub has no pending registrations if nothing called hub.register().
     let hub_was_never_registered = !hub.has_pending();
+    let captured_session_pk = captured_session_pk.lock().await.clone();
 
     PermBridgeOutcome {
         allowed,
         hub_was_never_registered,
+        session_pk,
+        captured_session_pk,
         store,
         _tmp_store: tmp_store,
     }
