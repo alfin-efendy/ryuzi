@@ -28,6 +28,7 @@ tracing = "0.1"
 portable-pty = "0.8"
 ureq = "2"
 sha2 = "0.10"
+url = "2"
 opentelemetry = { version = "0.32.0", features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.32.0", features = ["trace", "metrics", "http-proto", "reqwest-blocking-client"], optional = true }

@@ -126,6 +126,19 @@ pub struct Actor {
     pub gateway: String,
 }
 
+/// A file a user attached to a message, before it has been downloaded.
+/// Mirrors `packages/protocol/src/index.ts`'s `AttachmentRef` (not part of
+/// the specta/Tauri type export surface — this crosses gateway boundaries,
+/// not the cockpit IPC boundary).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRef {
+    pub name: String,
+    pub url: String,
+    pub content_type: Option<String>,
+    pub size: u64,
+}
+
 /// A tool-approval request surfaced to a gateway / UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
