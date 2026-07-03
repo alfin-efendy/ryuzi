@@ -5,6 +5,7 @@
 //! provides the production impls (real HTTP, real tar, real spawn/renames).
 pub mod asset;
 pub mod check;
+pub mod handoff;
 pub mod install_method;
 pub mod version;
 
@@ -13,5 +14,8 @@ pub use asset::{
     verify_checksum, Platform,
 };
 pub use check::{check_for_update, HttpResponse, UpdateCheckResult, UpdateHttp, UreqHttp};
+pub use handoff::{
+    clear_handoff, handoff_path, read_handoff, write_handoff, Handoff, HandoffPhase,
+};
 pub use install_method::{detect_install_method, InstallInfo, InstallMethod};
 pub use version::{compare_versions, is_newer, parse_version, SemVer};
