@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/alfin-efendy/ryuzi/compare/v0.2.0...v0.3.0) (2026-07-02)
+
+
+### Features
+
+* auto-update daemon (canary) + auto-resume running sessions ([#19](https://github.com/alfin-efendy/ryuzi/issues/19)) ([1ac0ad2](https://github.com/alfin-efendy/ryuzi/commit/1ac0ad23f41d63c50ee6a06c418662aa28e0878f))
+
 ## [0.2.0](https://github.com/alfin-efendy/harness-router/compare/v0.1.0...v0.2.0) (2026-06-29)
 
 

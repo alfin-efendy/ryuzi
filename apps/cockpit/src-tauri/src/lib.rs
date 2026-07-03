@@ -1,3 +1,5 @@
+mod accent;
+mod backdrop;
 mod commands;
 mod error;
 mod events;
@@ -46,16 +48,105 @@ fn resolve_acp_adapter_command() -> String {
     ADAPTER_BIN.to_string()
 }
 
+/// Map Rust's `std::env::consts::{OS, ARCH}` to the npm platform-package
+/// naming used by `@anthropic-ai/claude-agent-sdk`'s optional-dependency
+/// binaries (e.g. `claude-agent-sdk-win32-x64`). Pure and testable in
+/// isolation from the filesystem lookups in
+/// [`resolve_claude_code_executable`].
+fn sdk_platform_package(os: &str, arch: &str) -> String {
+    let os = match os {
+        "windows" => "win32",
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match arch {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("claude-agent-sdk-{os}-{arch}")
+}
+
+/// Resolve a Claude Code CLI for the ACP adapter's `CLAUDE_CODE_EXECUTABLE`
+/// override. The bun-compiled adapter cannot resolve
+/// `@anthropic-ai/claude-agent-sdk` from its virtual filesystem (bunfs), so
+/// the engine locates the CLI on its behalf:
+///   1. Respect an operator-provided CLAUDE_CODE_EXECUTABLE (inherited env).
+///   2. A bundled `claude-code[.exe]` next to the app executable (reserved
+///      for future packaged builds; nothing bundles it yet).
+///   3. Dev builds only: the SDK platform package inside the sidecar
+///      isolated build dir produced by scripts/build-acp-sidecar.ts.
+/// Returns None when nothing is found — the adapter then falls back to its
+/// own resolution, which works when it runs un-compiled under bun/node.
+fn resolve_claude_code_executable() -> Option<String> {
+    // 1. Operator-provided override — the child inherits it either way, so
+    // don't shadow it with our own resolution.
+    if std::env::var_os("CLAUDE_CODE_EXECUTABLE").is_some() {
+        return None;
+    }
+
+    // 2. Bundled `claude-code[.exe]` next to the app executable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            #[cfg(windows)]
+            let candidate = dir.join("claude-code.exe");
+            #[cfg(not(windows))]
+            let candidate = dir.join("claude-code");
+
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    // 3. Dev builds only: the SDK platform package inside the isolated
+    // sidecar build dir (see scripts/build-acp-sidecar.ts).
+    #[cfg(debug_assertions)]
+    {
+        let bin_name = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let scope_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".sidecar-build")
+            .join("node_modules")
+            .join("@anthropic-ai");
+
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        // On Linux, both glibc and musl platform packages may be installed;
+        // prefer glibc, mirroring the adapter's own resolution order.
+        let candidates = if os == "linux" {
+            vec![
+                sdk_platform_package(os, arch),
+                format!("{}-musl", sdk_platform_package(os, arch)),
+            ]
+        } else {
+            vec![sdk_platform_package(os, arch)]
+        };
+
+        for pkg in candidates {
+            let candidate = scope_dir.join(&pkg).join(bin_name);
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    None
+}
+
 /// Build the extension registries and install the `claude-agent-acp` harness
 /// integration with the resolved adapter path.
 ///
 /// `env_remove: ["CLAUDECODE"]` is required: the adapter checks for this
 /// variable to detect a nested Claude Code session and refuses to start.
 fn build_registries() -> Registries {
+    let mut env = Vec::new();
+    if let Some(cli) = resolve_claude_code_executable() {
+        env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
+    }
     let descriptor = AcpAdapterDescriptor {
         command: resolve_acp_adapter_command(),
         args: vec![],
-        env: vec![],
+        env,
         // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's running
         // inside a Claude Code session and refuses to start.
         env_remove: vec!["CLAUDECODE".to_string()],
@@ -79,8 +170,10 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::resolve_approval,
             commands::read_file,
             commands::pick_directory,
+            commands::backdrop_capability,
+            accent::system_accent_color,
         ])
-        .events(collect_events![events::CoreEventMsg])
+        .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])
 }
 
 pub fn run() {
@@ -116,6 +209,16 @@ pub fn run() {
             let mut rx = cp.subscribe();
             // Make Arc<ControlPlane> available to all Tauri commands.
             app.manage(cp);
+            // Apply the OS backdrop (mica/vibrancy) at runtime and record what
+            // actually applied. Static windowEffects config is forbidden: Tauri
+            // picks effects by platform family and swallows failures, which on
+            // Win10 would yield a transparent window with no backdrop.
+            let main_window = app
+                .get_webview_window("main")
+                .expect("main window exists");
+            let cap = backdrop::apply_backdrop(&main_window);
+            app.manage(backdrop::BackdropState(cap));
+            accent::spawn_accent_watcher(app.handle());
             // Bridge: forward every CoreEvent from the broadcast channel to the webview.
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -156,5 +259,20 @@ mod tests {
                 &out,
             )
             .expect("export bindings");
+    }
+
+    #[test]
+    fn sdk_platform_package_maps_windows_x86_64() {
+        assert_eq!(sdk_platform_package("windows", "x86_64"), "claude-agent-sdk-win32-x64");
+    }
+
+    #[test]
+    fn sdk_platform_package_maps_macos_aarch64() {
+        assert_eq!(sdk_platform_package("macos", "aarch64"), "claude-agent-sdk-darwin-arm64");
+    }
+
+    #[test]
+    fn sdk_platform_package_maps_linux_x86_64() {
+        assert_eq!(sdk_platform_package("linux", "x86_64"), "claude-agent-sdk-linux-x64");
     }
 }

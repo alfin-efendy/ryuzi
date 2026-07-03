@@ -111,3 +111,11 @@ pub async fn list_messages(
 ) -> R<Vec<Message>> {
     Ok(cp.list_messages(&session_pk).await?)
 }
+
+#[tauri::command]
+#[specta::specta]
+pub fn backdrop_capability(
+    state: State<'_, crate::backdrop::BackdropState>,
+) -> crate::backdrop::BackdropCapability {
+    state.0
+}

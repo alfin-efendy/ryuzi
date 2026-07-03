@@ -1,7 +1,8 @@
 // apps/cockpit/src/components/RightDock.tsx
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { useUi } from "@/store-ui";
 import { FileViewer } from "./FileViewer";
+import { fileBadge } from "@/lib/paths";
 import { Tabs, TabsList, TabsTab, Menu, MenuTrigger, MenuContent, MenuItem, MenuSeparator, Input } from "@ryuzi/ui";
 
 const SOON = [
@@ -13,6 +14,7 @@ const SOON = [
 export function RightDock() {
   const { tabs, activeTabId, openFile, closeTab, setActiveTab } = useUi();
   const [path, setPath] = useState("");
+  const pathInputRef = useRef<HTMLInputElement>(null);
   const active = tabs.find((t) => t.id === activeTabId) ?? null;
 
   const open = () => {
@@ -31,7 +33,7 @@ export function RightDock() {
           <TabsList className="overflow-x-auto">
             {tabs.map((t) => (
               <TabsTab key={t.id} value={t.id}>
-                <span className="rounded-[3px] bg-blue-500 px-1 py-px text-[8.5px] font-bold text-white">TS</span>
+                <span className="rounded-[3px] bg-muted px-1 py-px text-[8.5px] font-bold text-muted-foreground">{fileBadge(t.path)}</span>
                 <span className="truncate">{t.title}</span>
                 {/* biome-ignore lint/a11y/useSemanticElements: must stay a <span> — it lives inside the Tab <button>, and a nested <button> is invalid HTML */}
                 <span
@@ -87,7 +89,7 @@ export function RightDock() {
             </svg>
           </MenuTrigger>
           <MenuContent align="end" className="min-w-[200px]">
-            <MenuItem onClick={() => document.getElementById("dock-path-input")?.focus()}>Files</MenuItem>
+            <MenuItem onClick={() => pathInputRef.current?.focus()}>Files</MenuItem>
             <MenuSeparator />
             {SOON.map((s) => (
               <MenuItem key={s.key} disabled className="justify-between">
@@ -104,7 +106,7 @@ export function RightDock() {
       {/* open-by-path input */}
       <div className="shrink-0 border-b border-border p-2">
         <Input
-          id="dock-path-input"
+          ref={pathInputRef}
           value={path}
           onChange={(e) => setPath(e.target.value)}
           onKeyDown={(e) => {

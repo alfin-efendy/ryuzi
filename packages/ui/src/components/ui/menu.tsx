@@ -24,7 +24,7 @@ function MenuContent({
         <MenuPrimitive.Popup
           data-slot="menu-content"
           className={cn(
-            "min-w-44 origin-(--transform-origin) rounded-xl border border-border bg-popover p-1.5 text-popover-foreground shadow-lg outline-none",
+            "min-w-44 origin-(--transform-origin) rounded-xl border border-border surface-acrylic p-1.5 text-popover-foreground shadow-lg outline-none",
             "data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
             className,
           )}
