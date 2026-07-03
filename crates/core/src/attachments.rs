@@ -6,6 +6,7 @@
 //! ControlPlane wiring (dest dir under the session's attachment root, config
 //! from settings) is a separate task — this module is the pure primitive.
 
+use anyhow::Context;
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
@@ -295,7 +296,7 @@ pub async fn materialize_attachments(
     refs: &[AttachmentRef],
     opts: &MaterializeOpts,
     fetcher: Arc<dyn AttachmentFetcher>,
-) -> MaterializeResult {
+) -> anyhow::Result<MaterializeResult> {
     let mut saved = Vec::new();
     let mut skipped = Vec::new();
     let mut used: HashSet<String> = HashSet::new();
@@ -397,10 +398,12 @@ pub async fn materialize_attachments(
             continue;
         }
 
-        std::fs::create_dir_all(&opts.dest_dir).expect("create attachment dest dir");
+        std::fs::create_dir_all(&opts.dest_dir)
+            .with_context(|| format!("create attachment dest dir {}", opts.dest_dir.display()))?;
         let file_name = dedupe(sanitize_name(&r.name), &mut used);
         let path = opts.dest_dir.join(&file_name);
-        std::fs::write(&path, &bytes).expect("write attachment to disk");
+        std::fs::write(&path, &bytes)
+            .with_context(|| format!("write attachment to disk at {}", path.display()))?;
         saved.push(SavedAttachment {
             path,
             name: r.name.clone(),
@@ -410,7 +413,7 @@ pub async fn materialize_attachments(
         accepted += 1;
     }
 
-    MaterializeResult { saved, skipped }
+    Ok(MaterializeResult { saved, skipped })
 }
 
 /// Renders the manifest text appended to the agent prompt: a header + one
@@ -534,7 +537,9 @@ mod tests {
     async fn saves_a_valid_file_and_reports_it() {
         let dir = tempfile::tempdir().unwrap();
         let fetcher = Arc::new(FakeFetcher::new([("https://cdn/a", PNG)]));
-        let res = materialize_attachments(&[base_ref()], &base_opts(dir.path()), fetcher).await;
+        let res = materialize_attachments(&[base_ref()], &base_opts(dir.path()), fetcher)
+            .await
+            .unwrap();
         assert_eq!(res.saved.len(), 1);
         assert_eq!(res.skipped.len(), 0);
         assert!(res.saved[0].path.exists());
@@ -554,7 +559,7 @@ mod tests {
             max_bytes: 10,
             ..base_opts(dir.path())
         };
-        let res = materialize_attachments(&[r], &opts, fetcher).await;
+        let res = materialize_attachments(&[r], &opts, fetcher).await.unwrap();
         assert_eq!(res.saved.len(), 0);
         assert!(res.skipped[0].reason.contains("exceeds"));
         assert_eq!(calls.load(Ordering::SeqCst), 0, "never fetched");
@@ -582,7 +587,9 @@ mod tests {
             max_count: 2,
             ..base_opts(dir.path())
         };
-        let res = materialize_attachments(&refs, &opts, fetcher).await;
+        let res = materialize_attachments(&refs, &opts, fetcher)
+            .await
+            .unwrap();
         assert_eq!(res.saved.len(), 2);
         assert_eq!(
             res.skipped
@@ -613,7 +620,9 @@ mod tests {
             allowed_ext: vec!["png".into()],
             ..base_opts(dir.path())
         };
-        let res = materialize_attachments(&refs, &opts, fetcher).await;
+        let res = materialize_attachments(&refs, &opts, fetcher)
+            .await
+            .unwrap();
         assert_eq!(
             res.saved.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
             vec!["img.png".to_string()]
@@ -630,7 +639,9 @@ mod tests {
             url: "u1".into(),
             ..base_ref()
         };
-        let res = materialize_attachments(&[r], &base_opts(dir.path()), fetcher).await;
+        let res = materialize_attachments(&[r], &base_opts(dir.path()), fetcher)
+            .await
+            .unwrap();
         assert_eq!(res.saved.len(), 0);
         assert!(res.skipped[0].reason.contains("does not match extension"));
     }
@@ -645,7 +656,9 @@ mod tests {
             content_type: Some("text/plain".into()),
             ..base_ref()
         };
-        let res = materialize_attachments(&[r], &base_opts(dir.path()), fetcher).await;
+        let res = materialize_attachments(&[r], &base_opts(dir.path()), fetcher)
+            .await
+            .unwrap();
         assert_eq!(res.saved.len(), 1);
     }
 
@@ -665,7 +678,9 @@ mod tests {
                 ..base_ref()
             },
         ];
-        let res = materialize_attachments(&refs, &base_opts(dir.path()), fetcher).await;
+        let res = materialize_attachments(&refs, &base_opts(dir.path()), fetcher)
+            .await
+            .unwrap();
         assert_eq!(
             res.saved.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
             vec!["ok.png".to_string()]
@@ -695,7 +710,9 @@ mod tests {
                 ..base_ref()
             },
         ];
-        let res = materialize_attachments(&refs, &base_opts(dir.path()), fetcher).await;
+        let res = materialize_attachments(&refs, &base_opts(dir.path()), fetcher)
+            .await
+            .unwrap();
         let bases: Vec<String> = res
             .saved
             .iter()
@@ -755,7 +772,7 @@ mod tests {
             max_bytes: 100,
             ..base_opts(dir.path())
         };
-        let res = materialize_attachments(&[r], &opts, fetcher).await;
+        let res = materialize_attachments(&[r], &opts, fetcher).await.unwrap();
         assert_eq!(res.saved.len(), 0);
         assert!(res.skipped[0].reason.contains("exceeds"));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "fetch happened");
@@ -810,7 +827,9 @@ mod tests {
             allowed_hosts: vec!["cdn.discordapp.com".into()],
             ..base_opts(dir.path())
         };
-        let res = materialize_attachments(&refs, &opts, fetcher).await;
+        let res = materialize_attachments(&refs, &opts, fetcher)
+            .await
+            .unwrap();
         assert_eq!(res.saved.len(), 1);
         assert_eq!(res.saved[0].name, "a.png");
         assert_eq!(res.skipped.len(), 2);
@@ -848,7 +867,7 @@ mod tests {
             max_bytes: 100,
             ..base_opts(dir.path())
         };
-        let res = materialize_attachments(&[r], &opts, fetcher).await;
+        let res = materialize_attachments(&[r], &opts, fetcher).await.unwrap();
         assert_eq!(res.saved.len(), 0);
         assert!(res.skipped[0].reason.contains("exceeds"));
     }

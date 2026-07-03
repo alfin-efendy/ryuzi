@@ -1,13 +1,17 @@
 use crate::approval::ApprovalHub;
-use crate::domain::{CoreEvent, Message, PermMode, Project, Session, SessionStatus};
+use crate::attachments::{
+    build_manifest, materialize_attachments, AttachmentFetcher, MaterializeOpts, UreqFetcher,
+};
+use crate::domain::{AttachmentRef, CoreEvent, Message, PermMode, Project, Session, SessionStatus};
 use crate::harness::{HarnessSession, SessionCtx};
 use crate::integration::Registries;
 use crate::paths::{new_id, now_ms, worktree_path_for};
+use crate::settings::{expand_home, SettingsStore};
 use crate::store::Store;
 use crate::telemetry::{NoopTelemetry, Telemetry};
 use crate::worktree;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -31,6 +35,10 @@ pub struct ControlPlane {
     /// Telemetry seam (see `crate::telemetry`) — `Noop` unless a daemon wires
     /// up `Console`/OTLP via `new_with_telemetry`.
     telemetry: Arc<dyn Telemetry>,
+    /// Downloads Discord (or other gateway) message attachments for
+    /// `with_attachments`. Real network I/O (`UreqFetcher`) unless a test
+    /// injects a fake via `new_full`.
+    attachment_fetcher: Arc<dyn AttachmentFetcher>,
 }
 
 impl ControlPlane {
@@ -52,6 +60,18 @@ impl ControlPlane {
         registries: Registries,
         telemetry: Arc<dyn Telemetry>,
     ) -> Arc<ControlPlane> {
+        Self::new_full(store, registries, telemetry, Arc::new(UreqFetcher)).await
+    }
+
+    /// Like `new_with_telemetry`, but with an explicit attachment fetcher —
+    /// used by tests that inject a fake fetcher instead of hitting the
+    /// network (`new`/`new_with_telemetry` delegate here with `UreqFetcher`).
+    pub async fn new_full(
+        store: Arc<Store>,
+        registries: Registries,
+        telemetry: Arc<dyn Telemetry>,
+        attachment_fetcher: Arc<dyn AttachmentFetcher>,
+    ) -> Arc<ControlPlane> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(ControlPlane {
             store,
@@ -60,6 +80,7 @@ impl ControlPlane {
             approvals: Arc::new(ApprovalHub::new()),
             running: Mutex::new(HashMap::new()),
             telemetry,
+            attachment_fetcher,
         })
     }
 
@@ -131,6 +152,7 @@ impl ControlPlane {
         project_id: &str,
         prompt: &str,
         started_by: &str,
+        attachments: &[AttachmentRef],
     ) -> anyhow::Result<Session> {
         let project = self
             .store
@@ -172,7 +194,10 @@ impl ControlPlane {
         let handle = self
             .start_harness_session(&project, &session_pk, &worktree_path, None)
             .await?;
-        self.spawn_prompt(handle, session_pk.clone(), prompt.to_string());
+        let final_prompt = self
+            .with_attachments(&session_pk, prompt, attachments)
+            .await;
+        self.spawn_prompt(handle, session_pk.clone(), final_prompt);
 
         Ok(session)
     }
@@ -194,6 +219,7 @@ impl ControlPlane {
         self: &Arc<Self>,
         session_pk: &str,
         prompt: &str,
+        attachments: &[AttachmentRef],
     ) -> anyhow::Result<()> {
         let session = self
             .store
@@ -249,7 +275,8 @@ impl ControlPlane {
                 // so no redundant `update_agent_session_id` is needed here.
             }
         };
-        self.spawn_prompt(handle, session_pk.to_string(), prompt.to_string());
+        let final_prompt = self.with_attachments(session_pk, prompt, attachments).await;
+        self.spawn_prompt(handle, session_pk.to_string(), final_prompt);
         Ok(())
     }
 
@@ -479,6 +506,9 @@ impl ControlPlane {
                 }
             }
         }
+        // Best-effort cleanup of any downloaded attachments for this session
+        // (TS parity: control-plane.ts's `endSession` `rmSync`s the same dir).
+        let _ = tokio::fs::remove_dir_all(self.attachment_dest_dir(session_pk).await).await;
         self.store
             .update_status(session_pk, SessionStatus::Ended, Some(now_ms()))
             .await?;
@@ -486,6 +516,105 @@ impl ControlPlane {
             session_pk: session_pk.to_string(),
         });
         Ok(())
+    }
+
+    /// `{expand_home(workdir_root)}/.harness-attachments/{session_pk}` — the
+    /// dest dir attachments are downloaded into (`with_attachments`) and torn
+    /// down from (`end_session`). Reads `workdir_root` fresh each call: it's
+    /// a rarely-changed setting, and this avoids caching it on `ControlPlane`.
+    async fn attachment_dest_dir(&self, session_pk: &str) -> PathBuf {
+        let settings = SettingsStore::new(Arc::clone(&self.store));
+        let root_raw = settings
+            .get("workdir_root")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        expand_home(&root_raw)
+            .join(".harness-attachments")
+            .join(session_pk)
+    }
+
+    /// Materializes any Discord-supplied attachments into
+    /// `.harness-attachments/{session_pk}` and folds the resulting manifest
+    /// into the prompt. TS parity: `control-plane.ts`'s `withAttachments`
+    /// (~368-398) — settings reads/defaults, short-circuits, and fallback
+    /// strings are all verbatim.
+    async fn with_attachments(
+        &self,
+        session_pk: &str,
+        prompt: &str,
+        attachments: &[AttachmentRef],
+    ) -> String {
+        if attachments.is_empty() {
+            return prompt.to_string();
+        }
+        let settings = SettingsStore::new(Arc::clone(&self.store));
+        let max_count: i64 = settings
+            .get("attachment_max_count")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        if max_count <= 0 {
+            // feature disabled
+            return if prompt.is_empty() {
+                "User sent attachments, but attachment support is disabled.".to_string()
+            } else {
+                prompt.to_string()
+            };
+        }
+
+        let dest_dir = self.attachment_dest_dir(session_pk).await;
+        let max_bytes: u64 = settings
+            .get("attachment_max_bytes")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(26_214_400);
+        let allowed_ext_raw = settings.get("attachment_allowed_ext").await.ok().flatten();
+        let allowed_hosts_raw = settings
+            .get("attachment_allowed_hosts")
+            .await
+            .ok()
+            .flatten();
+
+        let opts = MaterializeOpts {
+            dest_dir,
+            max_bytes,
+            max_count: max_count as u32,
+            allowed_ext: crate::attachments::parse_allowed_ext(allowed_ext_raw.as_deref()),
+            allowed_hosts: crate::attachments::parse_allowed_hosts(allowed_hosts_raw.as_deref()),
+        };
+
+        let result =
+            match materialize_attachments(attachments, &opts, Arc::clone(&self.attachment_fetcher))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return if !prompt.is_empty() {
+                        format!("{prompt}\n\n⚠️ Could not process attachments: {e}")
+                    } else {
+                        format!("User sent attachments, but they could not be processed: {e}")
+                    };
+                }
+            };
+
+        let manifest = build_manifest(&result);
+        if manifest.is_empty() {
+            return prompt.to_string();
+        }
+        if prompt.is_empty() {
+            return if !result.saved.is_empty() {
+                format!("User sent attachments with no message text.\n\n{manifest}")
+            } else {
+                format!("User sent attachments but none could be processed:\n{manifest}")
+            };
+        }
+        format!("{prompt}\n\n{manifest}")
     }
 
     pub async fn list_messages(&self, session_pk: &str) -> anyhow::Result<Vec<Message>> {
@@ -768,6 +897,62 @@ mod tests {
         (cp, store_ref, counters.prompts, db_guard)
     }
 
+    /// A fake `AttachmentFetcher`: returns the configured bytes for a known
+    /// URL, or a 404 for anything else — no real network I/O, for
+    /// `with_attachments` tests.
+    struct FakeAttachmentFetcher {
+        bodies: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    impl FakeAttachmentFetcher {
+        fn new(bodies: impl IntoIterator<Item = (&'static str, &'static [u8])>) -> Self {
+            Self {
+                bodies: bodies
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_vec()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl crate::attachments::AttachmentFetcher for FakeAttachmentFetcher {
+        fn fetch_capped(
+            &self,
+            url: &str,
+            _max_bytes: u64,
+        ) -> anyhow::Result<crate::attachments::FetchOutcome> {
+            match self.bodies.get(url) {
+                Some(bytes) => Ok(crate::attachments::FetchOutcome::Ok(bytes.clone())),
+                None => Ok(crate::attachments::FetchOutcome::HttpError(404)),
+            }
+        }
+    }
+
+    /// Like `fake_control_plane`, but wired via `new_full` with an injected
+    /// attachment fetcher — for `with_attachments` tests that must not hit
+    /// the real network.
+    async fn fake_control_plane_with_fetcher(
+        fetcher: Arc<dyn crate::attachments::AttachmentFetcher>,
+    ) -> (
+        Arc<ControlPlane>,
+        Arc<Store>,
+        Arc<Mutex<Vec<String>>>,
+        tempfile::NamedTempFile,
+    ) {
+        let (db_guard, db_path) = temp_db_path();
+        let store = crate::store::Store::open(&db_path).await.unwrap();
+        let counters = Counters::default();
+        let cp = ControlPlane::new_full(
+            Arc::new(store),
+            registries_with(false, counters.clone()),
+            Arc::new(NoopTelemetry),
+            fetcher,
+        )
+        .await;
+        let store_ref = cp.store();
+        (cp, store_ref, counters.prompts, db_guard)
+    }
+
     /// A `Console` sink that captures every emitted JSON line, for telemetry
     /// assertions below.
     fn capturing_console_telemetry() -> (
@@ -803,7 +988,7 @@ mod tests {
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
         let session = cp
-            .start_session(&project.project_id, "go", "test")
+            .start_session(&project.project_id, "go", "test", &[])
             .await
             .unwrap();
         // Let the background prompt task (spawn_prompt) finish the turn.
@@ -946,7 +1131,7 @@ mod tests {
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
         let err = cp
-            .start_session(&project.project_id, "go", "test")
+            .start_session(&project.project_id, "go", "test", &[])
             .await
             .expect_err("start_session should fail without a registered harness");
         assert!(
@@ -968,7 +1153,7 @@ mod tests {
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
         let session = cp
-            .start_session(&project.project_id, "go", "test")
+            .start_session(&project.project_id, "go", "test", &[])
             .await
             .unwrap();
         // The harness handle must be registered synchronously by start_session,
@@ -1013,7 +1198,7 @@ mod tests {
 
         // First turn: creates the live ACP session and drives one prompt.
         let session = cp
-            .start_session(&project.project_id, "first", "test")
+            .start_session(&project.project_id, "first", "test", &[])
             .await
             .unwrap();
         // Let the background prompt task finish its turn.
@@ -1029,7 +1214,7 @@ mod tests {
             .expect("start_session must register a live handle");
 
         // Second turn: MUST reuse the live handle — no new ACP session.
-        cp.continue_session(&session.session_pk, "second")
+        cp.continue_session(&session.session_pk, "second", &[])
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1075,7 +1260,7 @@ mod tests {
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
         let session = cp
-            .start_session(&project.project_id, "first", "test")
+            .start_session(&project.project_id, "first", "test", &[])
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1085,7 +1270,7 @@ mod tests {
 
         // Continue must fall back to the cold-resume path: start a FRESH session
         // (via session/load) and register a new live handle.
-        cp.continue_session(&session.session_pk, "second")
+        cp.continue_session(&session.session_pk, "second", &[])
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1112,7 +1297,7 @@ mod tests {
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
         let session = cp
-            .start_session(&project.project_id, "go", "test")
+            .start_session(&project.project_id, "go", "test", &[])
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1146,7 +1331,7 @@ mod tests {
 
         let mut rx = cp.subscribe();
         let session = cp
-            .start_session(&project.project_id, "do it", "test")
+            .start_session(&project.project_id, "do it", "test", &[])
             .await
             .unwrap();
 
@@ -1265,13 +1450,281 @@ mod tests {
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", SessionStatus::Idle, Some("acp-123"), 0).await;
 
-        assert!(cp.continue_session("s1", "hi").await.is_err());
+        assert!(cp.continue_session("s1", "hi", &[]).await.is_err());
 
         let s = store.get_session("s1").await.unwrap().unwrap();
         assert_eq!(
             s.status,
             SessionStatus::Idle,
             "must not be left stuck in Running"
+        );
+    }
+
+    // ---------- Task 3: attachments wired into start/continue_session ----------
+
+    fn text_attachment(url: &str) -> AttachmentRef {
+        AttachmentRef {
+            name: "notes.txt".into(),
+            url: url.into(),
+            content_type: Some("text/plain".into()),
+            size: 5,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn attachments_manifest_is_appended_to_the_prompt_the_harness_receives() {
+        let _guard = StateDirGuard::new();
+        let fetcher = Arc::new(FakeAttachmentFetcher::new([(
+            "https://cdn.discordapp.com/a",
+            &b"hello"[..],
+        )]));
+        let (cp, store, prompts, _db_guard) = fake_control_plane_with_fetcher(fetcher).await;
+
+        let workdir_root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", workdir_root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        let session = cp
+            .start_session(
+                &project.project_id,
+                "please review",
+                "test",
+                &[text_attachment("https://cdn.discordapp.com/a")],
+            )
+            .await
+            .unwrap();
+        wait_for_prompts(&prompts, 1).await;
+
+        let dest = workdir_root
+            .path()
+            .join(".harness-attachments")
+            .join(&session.session_pk)
+            .join("notes.txt");
+        let expected_manifest = format!(
+            "[User attached 1 file — saved to disk, use the Read tool to open them:]\n- {} (text/plain, 5 B)",
+            dest.display()
+        );
+        assert_eq!(
+            prompts.lock().unwrap()[0],
+            format!("please review\n\n{expected_manifest}")
+        );
+        assert!(dest.exists(), "attachment must be written to disk");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn attachment_max_count_zero_disables_attachments() {
+        let _guard = StateDirGuard::new();
+        let fetcher = Arc::new(FakeAttachmentFetcher::new([(
+            "https://cdn.discordapp.com/a",
+            &b"hello"[..],
+        )]));
+        let (cp, store, prompts, _db_guard) = fake_control_plane_with_fetcher(fetcher).await;
+        SettingsStore::new(store.clone())
+            .set("attachment_max_count", "0")
+            .await
+            .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        // Non-empty prompt: passed through unchanged.
+        cp.start_session(
+            &project.project_id,
+            "hi",
+            "test",
+            &[text_attachment("https://cdn.discordapp.com/a")],
+        )
+        .await
+        .unwrap();
+        wait_for_prompts(&prompts, 1).await;
+        assert_eq!(prompts.lock().unwrap()[0], "hi");
+
+        // Empty prompt: the disabled-feature text.
+        cp.start_session(
+            &project.project_id,
+            "",
+            "test",
+            &[text_attachment("https://cdn.discordapp.com/a")],
+        )
+        .await
+        .unwrap();
+        wait_for_prompts(&prompts, 2).await;
+        assert_eq!(
+            prompts.lock().unwrap()[1],
+            "User sent attachments, but attachment support is disabled."
+        );
+    }
+
+    /// Forces `materialize_attachments` to return `Err` (contract resolution
+    /// from the Task 2 review) by putting a plain FILE where the per-session
+    /// dest dir's parent needs to be created, so `create_dir_all` fails.
+    #[tokio::test]
+    #[serial]
+    async fn materialize_error_produces_the_could_not_process_fallback() {
+        let _guard = StateDirGuard::new();
+        let fetcher = Arc::new(FakeAttachmentFetcher::new([(
+            "https://cdn.discordapp.com/a",
+            &b"hello"[..],
+        )]));
+        let (cp, store, prompts, _db_guard) = fake_control_plane_with_fetcher(fetcher).await;
+
+        let workdir_root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workdir_root.path().join(".harness-attachments"),
+            b"not a dir",
+        )
+        .unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", workdir_root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        cp.start_session(
+            &project.project_id,
+            "hello",
+            "test",
+            &[text_attachment("https://cdn.discordapp.com/a")],
+        )
+        .await
+        .unwrap();
+        wait_for_prompts(&prompts, 1).await;
+
+        let got = prompts.lock().unwrap()[0].clone();
+        assert!(
+            got.starts_with("hello\n\n⚠️ Could not process attachments: "),
+            "got: {got}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_prompt_with_saved_attachment_gets_the_no_message_text_variant() {
+        let _guard = StateDirGuard::new();
+        let fetcher = Arc::new(FakeAttachmentFetcher::new([(
+            "https://cdn.discordapp.com/a",
+            &b"hello"[..],
+        )]));
+        let (cp, store, prompts, _db_guard) = fake_control_plane_with_fetcher(fetcher).await;
+
+        let workdir_root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", workdir_root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        cp.start_session(
+            &project.project_id,
+            "",
+            "test",
+            &[text_attachment("https://cdn.discordapp.com/a")],
+        )
+        .await
+        .unwrap();
+        wait_for_prompts(&prompts, 1).await;
+
+        let got = prompts.lock().unwrap()[0].clone();
+        assert!(
+            got.starts_with("User sent attachments with no message text.\n\n"),
+            "got: {got}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_prompt_with_nothing_saved_gets_the_none_processed_variant() {
+        let _guard = StateDirGuard::new();
+        // No bodies registered — the fetch 404s, so nothing is saved.
+        let fetcher = Arc::new(FakeAttachmentFetcher::new([]));
+        let (cp, store, prompts, _db_guard) = fake_control_plane_with_fetcher(fetcher).await;
+
+        let workdir_root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", workdir_root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        cp.start_session(
+            &project.project_id,
+            "",
+            "test",
+            &[text_attachment("https://cdn.discordapp.com/missing")],
+        )
+        .await
+        .unwrap();
+        wait_for_prompts(&prompts, 1).await;
+
+        let got = prompts.lock().unwrap()[0].clone();
+        assert!(
+            got.starts_with("User sent attachments but none could be processed:\n"),
+            "got: {got}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn end_session_removes_the_attachments_dest_dir() {
+        let _guard = StateDirGuard::new();
+        let fetcher = Arc::new(FakeAttachmentFetcher::new([(
+            "https://cdn.discordapp.com/a",
+            &b"hello"[..],
+        )]));
+        let (cp, store, prompts, _db_guard) = fake_control_plane_with_fetcher(fetcher).await;
+
+        let workdir_root = tempfile::tempdir().unwrap();
+        SettingsStore::new(store.clone())
+            .set("workdir_root", workdir_root.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        let session = cp
+            .start_session(
+                &project.project_id,
+                "hi",
+                "test",
+                &[text_attachment("https://cdn.discordapp.com/a")],
+            )
+            .await
+            .unwrap();
+        wait_for_prompts(&prompts, 1).await;
+
+        let dest_dir = workdir_root
+            .path()
+            .join(".harness-attachments")
+            .join(&session.session_pk);
+        assert!(
+            dest_dir.exists(),
+            "attachment dir should exist before end_session"
+        );
+
+        cp.end_session(&session.session_pk).await.unwrap();
+        assert!(
+            !dest_dir.exists(),
+            "end_session must remove the attachments dest dir"
         );
     }
 }

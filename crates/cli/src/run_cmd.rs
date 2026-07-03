@@ -1,6 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ryuzi_core::domain::PermMode;
+use ryuzi_core::settings::expand_home;
 use ryuzi_core::{ControlPlane, CoreEvent};
 
 use crate::dispatch::Deps;
@@ -32,15 +33,6 @@ async fn turn_is_over(cp: &ControlPlane, session_pk: &str) -> bool {
             .unwrap_or(true),
         Err(_) => false,
     }
-}
-
-fn expand_home(dir: &str) -> PathBuf {
-    if let Some(rest) = dir.strip_prefix("~") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest.trim_start_matches('/'));
-        }
-    }
-    PathBuf::from(dir)
 }
 
 pub fn cmd_run(args: &[String], deps: &mut Deps) -> u8 {
@@ -152,7 +144,10 @@ async fn run_session(
         }
     };
 
-    let session = match cp.start_session(&project.project_id, prompt, "cli").await {
+    let session = match cp
+        .start_session(&project.project_id, prompt, "cli", &[])
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             (deps.err)(&format!("✗ {e}"));

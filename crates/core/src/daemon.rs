@@ -1029,7 +1029,7 @@ mod tests {
 
         let mut rx = cp.subscribe();
         let session = cp
-            .start_session(&project.project_id, "go", "test")
+            .start_session(&project.project_id, "go", "test", &[])
             .await
             .unwrap();
 
@@ -1430,7 +1430,7 @@ mod tests {
         // here nothing in the test calls `handle_approval` itself: the
         // `ApprovalRequested` event this emits must be picked up by the REAL
         // `spawn_approval_fanout` task `build_daemon` wired above.
-        daemon.cp.continue_session("s1", "go").await.unwrap();
+        daemon.cp.continue_session("s1", "go", &[]).await.unwrap();
 
         let mut saw_result = false;
         for _ in 0..200 {
@@ -1499,7 +1499,7 @@ mod tests {
         // `ApprovalRequested` — proving the request really happened. What
         // must NOT happen is anyone resolving it, since `stop()` already
         // killed the only listener that would have.
-        daemon.cp.continue_session("s1", "go").await.unwrap();
+        daemon.cp.continue_session("s1", "go", &[]).await.unwrap();
 
         let mut saw_approval_requested = false;
         let mut saw_result = false;
