@@ -8,6 +8,7 @@ pub mod check;
 pub mod handoff;
 pub mod install_method;
 pub mod manager;
+pub mod stage;
 pub mod version;
 
 pub use asset::{
@@ -23,4 +24,5 @@ pub use manager::{
     upgrade_hint, ApplyHook, ApplyInfo, NotifyTarget, UpdateManager, UpdateManagerDeps, UpdateMode,
     DEFAULT_CHECK_INTERVAL_MS, DEFAULT_REPO,
 };
+pub use stage::{stage_canary, StageHost, StageOpts, StageResult, TarStageHost};
 pub use version::{compare_versions, is_newer, parse_version, SemVer};
