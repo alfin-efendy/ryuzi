@@ -3,6 +3,7 @@ pub mod approval;
 pub mod connector;
 pub mod control;
 pub mod domain;
+pub mod fsview;
 pub mod gateway;
 pub mod gateways;
 pub mod harness;

@@ -387,6 +387,76 @@ async registrySearch(query: string | null, cursor: string | null) : Promise<Resu
     else return { status: "error", error: e  as any };
 }
 },
+async listDir(sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_dir", { sessionPk, rel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Absolute root path of the session's working tree (for opening files).
+ */
+async sessionWorkdir(sessionPk: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("session_workdir", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async gitDiff(sessionPk: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("git_diff", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async searchFiles(projectId: string, query: string) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("search_files", { projectId, query }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open a shell in the session's worktree (or the project workdir).
+ */
+async termOpen(sessionPk: string, cols: number, rows: number) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_open", { sessionPk, cols, rows }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async termInput(id: string, data: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_input", { id, data }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async termResize(id: string, cols: number, rows: number) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_resize", { id, cols, rows }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async termClose(id: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_close", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 }
@@ -397,10 +467,14 @@ async systemAccentColor() : Promise<string | null> {
 
 export const events = __makeEvents__<{
 accentChangedMsg: AccentChangedMsg,
-coreEventMsg: CoreEventMsg
+coreEventMsg: CoreEventMsg,
+termExitMsg: TermExitMsg,
+termOutputMsg: TermOutputMsg
 }>({
 accentChangedMsg: "accent-changed-msg",
-coreEventMsg: "core-event-msg"
+coreEventMsg: "core-event-msg",
+termExitMsg: "term-exit-msg",
+termOutputMsg: "term-output-msg"
 })
 
 /** user-defined constants **/
@@ -438,6 +512,7 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  */
 { kind: "jobRunChanged"; job_id: string; run_id: string; status: string }
 export type CoreEventMsg = { event: CoreEvent }
+export type DirEntryInfo = { name: string; dir: boolean }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string; 
 /**
@@ -482,6 +557,12 @@ export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
+export type TermExitMsg = { id: string }
+export type TermOutputMsg = { id: string; 
+/**
+ * UTF-8 chunk (lossy) of PTY output.
+ */
+data: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type ToolInfo = { name: string; desc: string; perm: string }
 export type UsagePoint = { day: string; 

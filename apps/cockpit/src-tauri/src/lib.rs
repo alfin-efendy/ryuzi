@@ -5,10 +5,12 @@ mod backdrop;
 mod commands;
 mod error;
 mod events;
+mod fsview_cmd;
 mod gateways_cmd;
 mod providers_cmd;
 mod registry_cmd;
 mod scheduler_cmd;
+mod term;
 
 use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
 use tauri::Manager;
@@ -214,9 +216,22 @@ fn make_builder() -> Builder<tauri::Wry> {
             apps_cmd::set_app_tool_perm,
             apps_cmd::toggle_app_agent,
             registry_cmd::registry_search,
+            fsview_cmd::list_dir,
+            fsview_cmd::session_workdir,
+            fsview_cmd::git_diff,
+            fsview_cmd::search_files,
+            term::term_open,
+            term::term_input,
+            term::term_resize,
+            term::term_close,
             accent::system_accent_color,
         ])
-        .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])
+        .events(collect_events![
+            events::CoreEventMsg,
+            accent::AccentChangedMsg,
+            term::TermOutputMsg,
+            term::TermExitMsg
+        ])
 }
 
 /// Write `src/bindings.ts` for the current command/event surface. Used by the
@@ -262,6 +277,8 @@ pub fn run() {
             ryuzi_core::scheduler::spawn_runner(cp.clone());
             // Make Arc<ControlPlane> available to all Tauri commands.
             app.manage(cp);
+            // UI terminal registry (session shells over portable-pty).
+            app.manage(std::sync::Arc::new(term::UiTerms::default()));
             // Apply the OS backdrop (mica/vibrancy) at runtime and record what
             // actually applied. Static windowEffects config is forbidden: Tauri
             // picks effects by platform family and swallows failures, which on

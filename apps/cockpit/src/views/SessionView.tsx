@@ -19,7 +19,8 @@ import {
 import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type RightTab } from "@/store-nav";
-import { CODE_LINES, REVIEW_FILES, TERM_LINES, TREE_ITEMS, type DiffLine } from "@/fixtures";
+import { commands } from "@/bindings";
+import { parseUnifiedDiff, type DiffLine, type ReviewFile } from "@/lib/diff";
 import { agentById, defaultAgentOf, useAgents } from "@/store-agents";
 import { statusMeta } from "@/lib/status";
 import { basename } from "@/lib/paths";
@@ -27,6 +28,8 @@ import { projectLabel } from "@/lib/sidebar";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalPrompt } from "@/components/ApprovalPrompt";
 import { FileViewer } from "@/components/FileViewer";
+import { FileTreePane } from "@/components/FileTreePane";
+import { TerminalPane } from "@/components/TerminalPane";
 import { AgentMenu } from "@/components/common/AgentMenu";
 import { DiffStat, StatusDot } from "@/components/common/bits";
 
@@ -44,17 +47,6 @@ function diffLineStyle(l: DiffLine): { bg: string; numBg: string; sign: string; 
   return { bg: "transparent", numBg: "transparent", sign: "", signColor: "transparent", color: "var(--code-foreground)" };
 }
 
-function Terminal({ className }: { className?: string }) {
-  return (
-    <div className={`flex min-h-0 flex-col overflow-auto px-4 py-3 font-mono text-xs leading-[1.75] ${className ?? ""}`}>
-      {TERM_LINES.map((l, i) => (
-        <div key={`${i}-${l.text}`} style={{ color: l.color }} className="whitespace-pre-wrap">
-          {l.text || " "}
-        </div>
-      ))}
-    </div>
-  );
-}
 
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects } = useStore();
@@ -64,6 +56,10 @@ export function SessionView() {
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   const [reviewFile, setReviewFile] = useState(0);
   const [pathDraft, setPathDraft] = useState("");
+  const [treeFilter, setTreeFilter] = useState("");
+  const [reviewFiles, setReviewFiles] = useState<ReviewFile[]>([]);
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
@@ -78,6 +74,30 @@ export function SessionView() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [lines.length]);
+
+  // Real diff of the session worktree; refreshed when the Review tab opens
+  // and whenever the running turn finishes (the agent may have edited files).
+  const sessionPk = session?.sessionPk;
+  const running0 = session?.status === "running";
+  useEffect(() => {
+    if (!sessionPk || !nav.rightOpen || nav.rightTab !== "review" || running0) return;
+    let cancelled = false;
+    setReviewLoading(true);
+    void commands.gitDiff(sessionPk).then((res) => {
+      if (cancelled) return;
+      setReviewLoading(false);
+      if (res.status === "ok") {
+        setReviewFiles(parseUnifiedDiff(res.data));
+        setReviewError(null);
+        setReviewFile(0);
+      } else {
+        setReviewError(res.error.message);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionPk, nav.rightOpen, nav.rightTab, running0]);
 
   if (!session) {
     return (
@@ -99,13 +119,13 @@ export function SessionView() {
 
   const rightTabs: { id: RightTab; label: string; icon: typeof SquareCheck }[] = [
     { id: "review", label: "Review", icon: SquareCheck },
-    { id: "term", label: `pwsh in ${projectName}`, icon: SquareTerminal },
+    { id: "term", label: `Terminal · ${projectName}`, icon: SquareTerminal },
     { id: "file", label: activeFileTab ? activeFileTab.title : "Files", icon: FileText },
   ];
 
-  const review = REVIEW_FILES[Math.min(reviewFile, REVIEW_FILES.length - 1)];
-  const reviewAdd = REVIEW_FILES.reduce((n, f) => n + f.add, 0);
-  const reviewDel = REVIEW_FILES.reduce((n, f) => n + f.del, 0);
+  const review = reviewFiles.length > 0 ? reviewFiles[Math.min(reviewFile, reviewFiles.length - 1)] : null;
+  const reviewAdd = reviewFiles.reduce((n, f) => n + f.add, 0);
+  const reviewDel = reviewFiles.reduce((n, f) => n + f.del, 0);
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -277,7 +297,7 @@ export function SessionView() {
           </div>
         </div>
 
-        {/* Bottom terminal drawer (design preview — no terminal backend yet) */}
+        {/* Bottom terminal drawer — a real shell in the session worktree */}
         {nav.bottomOpen && (
           <div className="acrylic-panel flex h-60 shrink-0 flex-col border-t border-border">
             <div className="flex shrink-0 items-center gap-2 border-b border-border px-3.5 py-2">
@@ -285,14 +305,11 @@ export function SessionView() {
               <span className="text-[12.5px] font-semibold">Terminal</span>
               <span className="font-mono text-[11px] text-muted-foreground">{projectName}</span>
               <div className="flex-1" />
-              <button type="button" title="New terminal" className={`${toolBtn} h-[26px] w-[26px]`}>
-                <Plus aria-hidden size={13} strokeWidth={2} />
-              </button>
               <button type="button" title="Close" onClick={nav.toggleBottom} className={`${toolBtn} h-[26px] w-[26px]`}>
                 <X aria-hidden size={13} strokeWidth={2} />
               </button>
             </div>
-            <Terminal className="flex-1" />
+            <TerminalPane sessionPk={session.sessionPk} className="flex-1" />
           </div>
         )}
       </div>
@@ -328,30 +345,38 @@ export function SessionView() {
             </button>
           </div>
 
-          {/* Review tab (design preview — diff backend lands with specs 2–4) */}
+          {/* Review tab — the worktree's real git diff */}
           {nav.rightTab === "review" && (
             <>
               <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-4 py-2.5">
                 <span className="font-mono text-xs text-muted-foreground">main → {session.branch ?? "worktree"}</span>
                 <DiffStat add={reviewAdd} del={reviewDel} className="ml-auto" />
               </div>
-              <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-border px-3 py-2">
-                {REVIEW_FILES.map((f, i) => (
-                  <button
-                    key={f.name}
-                    type="button"
-                    onClick={() => setReviewFile(i)}
-                    className={`flex h-7 cursor-pointer items-center gap-[7px] whitespace-nowrap rounded-md border px-2.5 font-mono text-[11.5px] text-foreground hover:bg-accent ${
-                      i === reviewFile ? "border-border bg-background" : "border-transparent bg-transparent"
-                    }`}
-                  >
-                    {f.name}
-                    <DiffStat add={f.add} del={f.del} className="text-[11.5px]" />
-                  </button>
-                ))}
-              </div>
+              {reviewFiles.length > 0 && (
+                <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-border px-3 py-2">
+                  {reviewFiles.map((f, i) => (
+                    <button
+                      key={`${f.dir}${f.name}`}
+                      type="button"
+                      onClick={() => setReviewFile(i)}
+                      className={`flex h-7 cursor-pointer items-center gap-[7px] whitespace-nowrap rounded-md border px-2.5 font-mono text-[11.5px] text-foreground hover:bg-accent ${
+                        i === reviewFile ? "border-border bg-background" : "border-transparent bg-transparent"
+                      }`}
+                    >
+                      {f.name}
+                      <DiffStat add={f.add} del={f.del} className="text-[11.5px]" />
+                    </button>
+                  ))}
+                </div>
+              )}
               <div className="min-h-0 flex-1 overflow-auto py-2 font-mono text-xs leading-[1.7]">
-                {review.lines.map((l, i) => {
+                {reviewError && <div className="px-4 py-3 text-[12.5px] text-destructive">{reviewError}</div>}
+                {!reviewError && !review && (
+                  <div className="px-4 py-3 font-sans text-[12.5px] text-muted-foreground">
+                    {reviewLoading ? "Reading diff…" : "No changes in the worktree yet."}
+                  </div>
+                )}
+                {review?.lines.map((l, i) => {
                   const s = diffLineStyle(l);
                   return (
                     <div key={`${i}-${l[2]}`} className="flex" style={{ background: s.bg, color: s.color }}>
@@ -369,32 +394,11 @@ export function SessionView() {
                   );
                 })}
               </div>
-              <div className="flex shrink-0 gap-2 border-t border-border px-4 py-3">
-                <button
-                  type="button"
-                  className="h-8 cursor-pointer rounded-md border-none bg-primary px-4 font-sans text-[13px] font-medium text-primary-foreground hover:opacity-85"
-                >
-                  Accept all
-                </button>
-                <button
-                  type="button"
-                  className="h-8 cursor-pointer rounded-md border border-border bg-transparent px-4 font-sans text-[13px] font-medium text-foreground hover:bg-accent"
-                >
-                  Request changes
-                </button>
-                <div className="flex-1" />
-                <button
-                  type="button"
-                  className="h-8 cursor-pointer rounded-md border border-border bg-transparent px-4 font-sans text-[13px] font-medium text-destructive hover:bg-accent"
-                >
-                  Discard
-                </button>
-              </div>
             </>
           )}
 
-          {/* Terminal tab (design preview) */}
-          {nav.rightTab === "term" && <Terminal className="flex-1 px-4 py-3.5" />}
+          {/* Terminal tab — real shell in the session worktree */}
+          {nav.rightTab === "term" && <TerminalPane sessionPk={session.sessionPk} className="flex-1" />}
 
           {/* File tab — wired to the real readFile IPC via dock tabs */}
           {nav.rightTab === "file" && (
@@ -446,45 +450,22 @@ export function SessionView() {
                   {activeFileTab ? (
                     <FileViewer path={activeFileTab.path} />
                   ) : (
-                    <div className="flex flex-col py-2.5 font-mono leading-[1.75]">
-                      {CODE_LINES.map(([text, color], i) => (
-                        <div key={`${i}-${text}`} className="flex">
-                          <span className="w-10 shrink-0 select-none pr-3.5 text-right text-[11px] text-code-number">{i + 1}</span>
-                          <span className="whitespace-pre pr-4" style={{ color }}>
-                            {text || " "}
-                          </span>
-                        </div>
-                      ))}
+                    <div className="flex flex-1 items-center justify-center font-sans text-[12.5px] text-muted-foreground">
+                      Select a file from the tree.
                     </div>
                   )}
                 </div>
                 <div className="flex w-[200px] shrink-0 flex-col gap-2 overflow-y-auto border-l border-border p-2.5">
                   <div className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs text-muted-foreground [background:color-mix(in_oklab,var(--background)_45%,transparent)]">
                     <Search aria-hidden size={12} strokeWidth={2} />
-                    Filter files
+                    <input
+                      value={treeFilter}
+                      onChange={(e) => setTreeFilter(e.target.value)}
+                      placeholder="Filter files"
+                      className="min-w-0 flex-1 border-none bg-transparent font-sans text-xs text-foreground outline-none"
+                    />
                   </div>
-                  <div className="flex flex-col">
-                    {TREE_ITEMS.map((t) => (
-                      <div
-                        key={`${t.depth}-${t.name}`}
-                        className={`flex cursor-pointer items-center gap-1.5 rounded-sm py-[5px] pr-2 text-[12.5px] text-foreground hover:bg-accent ${t.sel ? "bg-accent" : ""}`}
-                        style={{ paddingLeft: 8 + t.depth * 14 }}
-                      >
-                        {t.dir ? (
-                          <ChevronRight
-                            aria-hidden
-                            size={11}
-                            strokeWidth={2}
-                            className="text-muted-foreground"
-                            style={{ transform: t.open ? "rotate(90deg)" : undefined }}
-                          />
-                        ) : (
-                          <FileText aria-hidden size={12} strokeWidth={2} className="text-muted-foreground" />
-                        )}
-                        {t.name}
-                      </div>
-                    ))}
-                  </div>
+                  <FileTreePane sessionPk={session.sessionPk} filter={treeFilter} />
                 </div>
               </div>
             </>

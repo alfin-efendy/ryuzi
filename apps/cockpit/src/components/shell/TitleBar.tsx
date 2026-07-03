@@ -4,6 +4,7 @@ import { ArrowLeft, ArrowRight, CornerDownLeft, FileText, PanelLeft, Search, Squ
 import { useStore, type Line } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
+import { commands } from "@/bindings";
 import { SEARCH_COMMANDS } from "@/constants";
 import { agentById, defaultAgentOf, useAgents } from "@/store-agents";
 import { projectLabel, sessionTitle } from "@/lib/sidebar";
@@ -84,6 +85,29 @@ export function TitleBar() {
     const lower = q.toLowerCase();
     return ui.tabs.filter((t) => t.path.toLowerCase().includes(lower)).slice(0, 4);
   }, [q, ui.tabs]);
+
+  // Live filename search over the active project's workdir.
+  const searchProject = useMemo(() => {
+    const focused = sessions.find((s) => s.sessionPk === useStore.getState().focusedSessionPk);
+    return projects.find((p) => p.projectId === focused?.projectId) ?? projects[0];
+  }, [sessions, projects]);
+  const [projectFileHits, setProjectFileHits] = useState<string[]>([]);
+  useEffect(() => {
+    if (!q || !searchProject) {
+      setProjectFileHits([]);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void commands.searchFiles(searchProject.projectId, q).then((res) => {
+        if (!cancelled && res.status === "ok") setProjectFileHits(res.data.slice(0, 6));
+      });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [q, searchProject]);
 
   const cmdHits = useMemo(() => {
     if (!q) return [];
@@ -203,7 +227,7 @@ export function TitleBar() {
                   })}
                 </>
               )}
-              {fileHits.length > 0 && (
+              {(fileHits.length > 0 || projectFileHits.length > 0) && (
                 <>
                   <div className={sectionLabel}>Files</div>
                   {fileHits.map((t) => (
@@ -224,6 +248,30 @@ export function TitleBar() {
                       <span className="max-w-[180px] shrink-0 truncate text-[11px] text-muted-foreground">open tab</span>
                     </button>
                   ))}
+                  {projectFileHits
+                    .filter((rel) => !fileHits.some((t) => t.path.endsWith(rel)))
+                    .map((rel) => (
+                      <button
+                        key={rel}
+                        type="button"
+                        className={`${resultBtn} items-center`}
+                        onClick={() => {
+                          if (!searchProject) return;
+                          const sep = searchProject.workdir.includes("\\") ? "\\" : "/";
+                          ui.openFile(`${searchProject.workdir}${sep}${rel.split("/").join(sep)}`);
+                          nav.setRightOpen(true);
+                          nav.setRightTab("file");
+                          nav.navigate({ kind: "session" });
+                          closePalette();
+                        }}
+                      >
+                        <FileText aria-hidden size={13} strokeWidth={2} className="shrink-0 text-muted-foreground" />
+                        <span className="min-w-0 flex-1 truncate font-mono text-xs">{rel}</span>
+                        <span className="max-w-[180px] shrink-0 truncate text-[11px] text-muted-foreground">
+                          {searchProject ? projectLabel(searchProject) : ""}
+                        </span>
+                      </button>
+                    ))}
                 </>
               )}
               {cmdHits.length > 0 && (
