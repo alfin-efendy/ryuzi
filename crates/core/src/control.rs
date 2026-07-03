@@ -2041,26 +2041,58 @@ mod tests {
     /// identity unknown". Used to exercise the NAME-flow's rollback
     /// (`remove_dir_all` on a git failure) without a fake/mocked `run_git`.
     /// Process-global env — every test using it must be `#[serial]`.
+    /// The env vars `NoGitIdentityGuard` mutates; saved and restored so the
+    /// guard's effect is confined to its own scope (it sets values pointing at
+    /// an ephemeral tempdir, so leaking them poisons later git-using tests).
+    const GIT_ENV_VARS: [&str; 6] = [
+        "XDG_DATA_HOME",
+        "HOME",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+    ];
+
     struct NoGitIdentityGuard {
         _dir: tempfile::TempDir,
+        saved: Vec<(&'static str, Option<String>)>,
     }
 
     impl NoGitIdentityGuard {
         fn new() -> Self {
+            let saved = GIT_ENV_VARS
+                .iter()
+                .map(|&k| (k, std::env::var(k).ok()))
+                .collect();
             let dir = tempfile::tempdir().expect("tempdir");
             std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
             std::env::set_var("HOME", dir.path());
-            for var in [
-                "GIT_AUTHOR_NAME",
-                "GIT_AUTHOR_EMAIL",
-                "GIT_COMMITTER_NAME",
-                "GIT_COMMITTER_EMAIL",
-                "GIT_CONFIG_GLOBAL",
-                "GIT_CONFIG_SYSTEM",
-            ] {
-                std::env::remove_var(var);
+            std::env::remove_var("GIT_AUTHOR_NAME");
+            std::env::remove_var("GIT_AUTHOR_EMAIL");
+            // Force `git commit` to hard-fail regardless of any ambient identity.
+            // Clearing HOME/env isn't enough: with no configured identity git
+            // auto-derives one from getpwuid()+hostname, so a commit would
+            // *succeed* on CI runners (observed on macOS). Point GIT_CONFIG_GLOBAL
+            // at a config that sets `user.useConfigOnly = true`, which disables
+            // that auto-detection and makes the commit fail deterministically;
+            // null out the system config so it can't supply an identity either.
+            let config_path = dir.path().join("gitconfig");
+            std::fs::write(&config_path, "[user]\n    useConfigOnly = true\n")
+                .expect("write gitconfig");
+            std::env::set_var("GIT_CONFIG_GLOBAL", &config_path);
+            std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+            NoGitIdentityGuard { _dir: dir, saved }
+        }
+    }
+
+    impl Drop for NoGitIdentityGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
             }
-            NoGitIdentityGuard { _dir: dir }
         }
     }
 

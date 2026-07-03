@@ -184,16 +184,20 @@ mod tests {
     #[test]
     fn sandbox_confines_to_work_dir_and_rejects_escapes() {
         let root = tempfile::tempdir().unwrap();
+        // Canonicalize the root: on macOS tempdir() lives under /var -> /private/var,
+        // and sandbox() canonicalizes work_dir, so the raw root.path() prefix wouldn't
+        // match the returned canonicalized path.
+        let root_path = root.path().canonicalize().unwrap();
         // an in-root relative path resolves under root:
-        let ok = sandbox(root.path(), std::path::Path::new("sub/file.txt")).unwrap();
-        assert!(ok.starts_with(root.path()));
+        let ok = sandbox(&root_path, std::path::Path::new("sub/file.txt")).unwrap();
+        assert!(ok.starts_with(&root_path));
         // escapes are rejected:
         assert!(
-            sandbox(root.path(), std::path::Path::new("../../etc/passwd")).is_err(),
+            sandbox(&root_path, std::path::Path::new("../../etc/passwd")).is_err(),
             "expected .. escape to be rejected"
         );
         assert!(
-            sandbox(root.path(), std::path::Path::new("/etc/passwd")).is_err(),
+            sandbox(&root_path, std::path::Path::new("/etc/passwd")).is_err(),
             "expected absolute path outside root to be rejected"
         );
     }
@@ -201,24 +205,26 @@ mod tests {
     #[test]
     fn read_text_file_returns_content_within_sandbox() {
         let root = tempfile::tempdir().unwrap();
-        let file_path = root.path().join("hello.txt");
+        let root_path = root.path().canonicalize().unwrap();
+        let file_path = root_path.join("hello.txt");
         std::fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
 
         let req = ReadTextFileRequest::new(SessionId::from("test-session"), &file_path);
-        let resp = read_text_file(root.path(), req).unwrap();
+        let resp = read_text_file(&root_path, req).unwrap();
         assert_eq!(resp.content, "line1\nline2\nline3\n");
     }
 
     #[test]
     fn read_text_file_honours_line_and_limit() {
         let root = tempfile::tempdir().unwrap();
-        let file_path = root.path().join("data.txt");
+        let root_path = root.path().canonicalize().unwrap();
+        let file_path = root_path.join("data.txt");
         std::fs::write(&file_path, "a\nb\nc\nd\ne\n").unwrap();
 
         let req = ReadTextFileRequest::new(SessionId::from("test-session"), &file_path)
             .line(2u32)
             .limit(3u32);
-        let resp = read_text_file(root.path(), req).unwrap();
+        let resp = read_text_file(&root_path, req).unwrap();
         // Lines 2-4: b, c, d
         assert_eq!(resp.content, "b\nc\nd");
     }
@@ -226,11 +232,12 @@ mod tests {
     #[test]
     fn write_text_file_creates_file_in_sandbox() {
         let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("output.txt");
+        let root_path = root.path().canonicalize().unwrap();
+        let target = root_path.join("output.txt");
 
         let req =
             WriteTextFileRequest::new(SessionId::from("test-session"), &target, "hello from agent");
-        write_text_file(root.path(), req).unwrap();
+        write_text_file(&root_path, req).unwrap();
 
         let got = std::fs::read_to_string(&target).unwrap();
         assert_eq!(got, "hello from agent");
@@ -239,10 +246,11 @@ mod tests {
     #[test]
     fn write_text_file_creates_parent_dirs() {
         let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("deep/nested/dir/file.txt");
+        let root_path = root.path().canonicalize().unwrap();
+        let target = root_path.join("deep/nested/dir/file.txt");
 
         let req = WriteTextFileRequest::new(SessionId::from("test-session"), &target, "content");
-        write_text_file(root.path(), req).unwrap();
+        write_text_file(&root_path, req).unwrap();
         assert!(target.exists());
     }
 
