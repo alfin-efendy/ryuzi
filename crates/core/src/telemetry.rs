@@ -183,6 +183,14 @@ impl Telemetry for ConsoleTelemetry {
     }
 }
 
+/// OTLP/HTTP signal URLs. opentelemetry-otlp uses a programmatic endpoint
+/// verbatim (no auto signal path), so we append the paths ourselves —
+/// same concatenation the retired TS otel.ts used.
+pub(crate) fn otlp_signal_urls(endpoint: &str) -> (String, String) {
+    let base = endpoint.trim_end_matches('/');
+    (format!("{base}/v1/traces"), format!("{base}/v1/metrics"))
+}
+
 /// OTLP/HTTP telemetry backend, ported from the retired TS
 /// `observability/otel.ts` adapter: batched span export to
 /// `{endpoint}/v1/traces`, periodic metric export to `{endpoint}/v1/metrics`,
@@ -234,20 +242,19 @@ fn attrs_to_kvs(attrs: &Attrs) -> Vec<opentelemetry::KeyValue> {
 impl OtelTelemetry {
     /// Build the OTLP/HTTP exporters + providers against `endpoint`. Spans
     /// are exported to `{endpoint}/v1/traces`, metrics to
-    /// `{endpoint}/v1/metrics` — the otlp-http exporter appends the
-    /// signal-specific path to `endpoint` automatically. Service name is
-    /// fixed at `ryuzi` (TS parity).
+    /// `{endpoint}/v1/metrics`. Service name is fixed at `ryuzi` (TS parity).
     pub fn new(endpoint: &str) -> anyhow::Result<Self> {
         use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_otlp::WithExportConfig;
 
+        let (traces_url, metrics_url) = otlp_signal_urls(endpoint);
         let resource = opentelemetry_sdk::Resource::builder()
             .with_service_name("ryuzi")
             .build();
 
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(&traces_url)
             .build()?;
         let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_resource(resource.clone())
@@ -256,7 +263,7 @@ impl OtelTelemetry {
 
         let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(&metrics_url)
             .build()?;
         let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
         let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
@@ -534,5 +541,26 @@ mod tests {
     async fn otel_telemetry_constructs_inside_a_tokio_runtime_without_panicking() {
         let telemetry = OtelTelemetry::new("http://localhost:9").expect("construction");
         telemetry.shutdown();
+    }
+
+    #[test]
+    fn otlp_signal_urls_formats_without_trailing_slash() {
+        let (traces, metrics) = otlp_signal_urls("http://localhost:4318");
+        assert_eq!(traces, "http://localhost:4318/v1/traces");
+        assert_eq!(metrics, "http://localhost:4318/v1/metrics");
+    }
+
+    #[test]
+    fn otlp_signal_urls_formats_with_trailing_slash() {
+        let (traces, metrics) = otlp_signal_urls("http://localhost:4318/");
+        assert_eq!(traces, "http://localhost:4318/v1/traces");
+        assert_eq!(metrics, "http://localhost:4318/v1/metrics");
+    }
+
+    #[test]
+    fn otlp_signal_urls_handles_multiple_trailing_slashes() {
+        let (traces, metrics) = otlp_signal_urls("http://localhost:4318///");
+        assert_eq!(traces, "http://localhost:4318/v1/traces");
+        assert_eq!(metrics, "http://localhost:4318/v1/metrics");
     }
 }
