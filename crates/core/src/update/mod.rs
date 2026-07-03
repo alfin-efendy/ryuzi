@@ -4,10 +4,12 @@
 //! Logic lives here behind injectable traits; `crates/cli/src/daemon_cmd.rs`
 //! provides the production impls (real HTTP, real tar, real spawn/renames).
 pub mod asset;
+pub mod check;
 pub mod version;
 
 pub use asset::{
     asset_name, asset_url, checksums_url, detect_platform, sha256_hex, target_triple,
     verify_checksum, Platform,
 };
+pub use check::{check_for_update, HttpResponse, UpdateCheckResult, UpdateHttp, UreqHttp};
 pub use version::{compare_versions, is_newer, parse_version, SemVer};
