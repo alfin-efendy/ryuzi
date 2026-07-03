@@ -135,6 +135,9 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
     );
     (deps.out)("daemon: running");
 
+    // Deliberate delta from TS runDaemon (which registered handlers before connect): a signal during
+    // the connect window falls back to default kill; the stale "connecting" file is benign — derive_state
+    // treats a dead pid as stopped.
     install_signal_handlers(dir, daemon);
 
     // Block until a signal handler calls `std::process::exit` from within

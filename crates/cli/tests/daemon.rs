@@ -86,8 +86,13 @@ fn daemon_process_reaches_running_then_exits_cleanly_on_sigterm() {
         );
     });
 
-    assert_eq!(status.pid, child.id() as i32);
-    assert_eq!(status.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    let pid_ok = status.pid == child.id() as i32;
+    let ver_ok = status.version.as_deref() == Some(env!("CARGO_PKG_VERSION"));
+    if !pid_ok || !ver_ok {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("daemon status mismatch: pid_ok={pid_ok} ver_ok={ver_ok} status={status:?}");
+    }
 
     send_sigterm(child.id() as i32);
 
