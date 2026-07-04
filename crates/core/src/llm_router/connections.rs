@@ -6,11 +6,18 @@ use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct ConnectionData {
     pub api_key: Option<String>,
     pub base_url_override: Option<String>,
     pub models_override: Option<Vec<String>>,
+    // OAuth (auth_type == "oauth"): tokens stored plaintext (F3 = keychain).
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<i64>,
+    pub last_refresh_at: Option<i64>,
+    pub provider_specific: Option<serde_json::Value>,
+    pub needs_relogin: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,6 +165,10 @@ pub async fn move_connection(store: &Store, id: &str, dir: i32) -> anyhow::Resul
         .await
 }
 
+pub fn is_oauth(row: &ConnectionRow) -> bool {
+    row.auth_type == "oauth"
+}
+
 pub fn effective_base_url(desc: &ProviderDescriptor, row: &ConnectionRow) -> Option<String> {
     row.data
         .base_url_override
@@ -197,6 +208,7 @@ mod tests {
                 api_key: Some("sk-test".into()),
                 base_url_override: None,
                 models_override: None,
+                ..Default::default()
             },
             created_at: 1,
             updated_at: 1,
@@ -251,5 +263,22 @@ mod tests {
             Some("http://localhost:9/v1")
         );
         assert_eq!(effective_models(desc, &r), vec!["custom-model".to_string()]);
+    }
+
+    #[test]
+    fn legacy_apikey_data_deserializes_with_new_oauth_fields_absent() {
+        let legacy = r#"{"apiKey":"sk-x","baseUrlOverride":null,"modelsOverride":null}"#;
+        let d: ConnectionData = serde_json::from_str(legacy).unwrap();
+        assert_eq!(d.api_key.as_deref(), Some("sk-x"));
+        assert!(d.access_token.is_none() && d.expires_at.is_none());
+    }
+
+    #[test]
+    fn is_oauth_reads_auth_type() {
+        let mut r = row("c1", "anthropic-oauth", 0);
+        r.auth_type = "oauth".into();
+        assert!(is_oauth(&r));
+        r.auth_type = "api_key".into();
+        assert!(!is_oauth(&r));
     }
 }

@@ -109,6 +109,7 @@ async fn setup() -> (Arc<Store>, String, u16) {
                 api_key: Some("sk-up".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
+                ..Default::default()
             },
             created_at: 1,
             updated_at: 1,
@@ -147,6 +148,7 @@ async fn setup_with_anthropic() -> (Arc<Store>, String, u16) {
                 api_key: Some("sk-up".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
+                ..Default::default()
             },
             created_at: 1,
             updated_at: 1,
@@ -167,6 +169,7 @@ async fn setup_with_anthropic() -> (Arc<Store>, String, u16) {
                 api_key: Some("sk-up2".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{anthropic_port}/v1")),
                 models_override: Some(vec!["mock-claude".into()]),
+                ..Default::default()
             },
             created_at: 1,
             updated_at: 1,
@@ -492,6 +495,7 @@ async fn anthropic_client_gets_error_frame_when_upstream_truncates() {
                 api_key: Some("k".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
+                ..Default::default()
             },
             created_at: 0,
             updated_at: 0,
@@ -580,6 +584,7 @@ async fn anthropic_client_gets_error_frame_on_clean_eof_before_terminal() {
                 api_key: Some("k".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
+                ..Default::default()
             },
             created_at: 0,
             updated_at: 0,
