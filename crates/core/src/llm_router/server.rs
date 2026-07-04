@@ -632,8 +632,19 @@ fn spawn_openai_to_anthropic_pump(
             }
         }
         if !errored {
-            for (name, data) in tr.finish() {
-                let _ = tx.send(Ok(format_sse(&name, &data))).await;
+            if tr.saw_terminal() {
+                for (name, data) in tr.finish() {
+                    let _ = tx.send(Ok(format_sse(&name, &data))).await;
+                }
+            } else {
+                // Upstream closed cleanly but never sent a terminal chunk —
+                // that's a truncated stream, not a completed one. Don't fake
+                // a clean finish.
+                for (name, data) in tr.error_frame("upstream stream ended without a terminal event")
+                {
+                    let _ = tx.send(Ok(format_sse(&name, &data))).await;
+                }
+                errored = true;
             }
         }
         let (input, output) = tr.usage();
@@ -832,7 +843,7 @@ fn spawn_responses_pump(
         let mut rs = crate::llm_router::responses::ResponsesStreamState::new();
         let mut stream = resp.bytes_stream();
         let mut errored = false;
-        while let Some(item) = stream.next().await {
+        'pump: while let Some(item) = stream.next().await {
             let chunk = match item {
                 Ok(c) => c,
                 Err(e) => {
@@ -861,27 +872,49 @@ fn spawn_responses_pump(
                 for oai in oai_chunks {
                     for (name, data) in rs.feed(&oai) {
                         if tx.send(Ok(format_sse(&name, &data))).await.is_err() {
-                            return;
+                            // Client disconnected; stop pumping but still
+                            // record what we saw so far.
+                            break 'pump;
                         }
                     }
                 }
             }
         }
         if !errored {
-            for (name, data) in rs.finish() {
+            if rs.saw_terminal() {
+                for (name, data) in rs.finish() {
+                    let _ = tx.send(Ok(format_sse(&name, &data))).await;
+                }
+            } else {
+                // Upstream closed cleanly but never sent a terminal chunk —
+                // that's a truncated stream, not a completed one. Don't fake
+                // a clean finish.
+                let (name, data) = rs.error_frame("upstream stream ended without a terminal event");
                 let _ = tx.send(Ok(format_sse(&name, &data))).await;
+                errored = true;
             }
         }
-        // usage: for openai upstream we didn't accumulate; record zero-token row
-        // with status (F2a keeps Responses usage best-effort — the completed
-        // event's usage plumbing is a follow-up).
+        // usage: for an Anthropic upstream, tokens come from the translated
+        // AnthropicToOpenAiStream; for a native OpenAI upstream, from the
+        // Responses encoder's own accumulation of each chunk's `usage` field
+        // (present when the upstream provider sends a final usage frame —
+        // best-effort, since the Responses request doesn't yet ask for
+        // `stream_options.include_usage` the way the Anthropic-client path
+        // does in `anthropic_to_openai_request`).
+        let usage = if anthropic_upstream {
+            let (input, output) = anth.usage();
+            crate::llm_router::usage::Usage { input, output }
+        } else {
+            let (input, output) = rs.usage();
+            crate::llm_router::usage::Usage { input, output }
+        };
         crate::llm_router::usage::record(
             &store,
             &ctx.conn_id,
             &ctx.provider,
             &ctx.model,
             &ctx.client_format,
-            crate::llm_router::usage::Usage::default(),
+            usage,
             if errored { 502 } else { 200 },
             ctx.started,
             errored.then(|| "stream interrupted".to_string()),

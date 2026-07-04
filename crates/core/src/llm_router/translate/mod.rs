@@ -62,6 +62,11 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
     if let Some(v) = body.get("stop_sequences") {
         out.insert("stop".into(), v.clone());
     }
+    // Streamed requests ask the OpenAI-format upstream for a final usage
+    // frame so the router can capture real token counts (spec follow-up).
+    if out.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        out.insert("stream_options".into(), json!({"include_usage": true}));
+    }
 
     let mut messages: Vec<Value> = Vec::new();
     // system: string or [{type:text}] blocks → one system message.
@@ -532,6 +537,14 @@ impl OpenAiToAnthropicStream {
     pub fn usage(&self) -> (i64, i64) {
         (self.input_tokens, self.output_tokens)
     }
+
+    /// True once a `finish_reason` chunk was observed. When the upstream
+    /// stream ends cleanly WITHOUT ever seeing one, the caller must emit
+    /// `error_frame` instead of `finish` — a clean EOF with no terminal event
+    /// is a truncated stream, not a completed one.
+    pub fn saw_terminal(&self) -> bool {
+        self.finish_reason.is_some()
+    }
 }
 
 /// Upstream Anthropic SSE events → OpenAI chunks (client called
@@ -714,6 +727,16 @@ mod tests {
         assert_eq!(out["tool_choice"], "auto");
         assert!(out.get("system").is_none());
         assert!(out.get("stop_sequences").is_none());
+    }
+
+    #[test]
+    fn anthropic_stream_true_adds_openai_stream_options() {
+        let req = json!({
+            "model": "m", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = anthropic_to_openai_request(&req).unwrap();
+        assert_eq!(out["stream_options"], json!({"include_usage": true}));
     }
 
     #[test]
@@ -972,6 +995,16 @@ mod tests {
         assert_eq!(evs[6].1["delta"]["partial_json"], "{\"a\"");
         assert_eq!(evs[9].1["delta"]["stop_reason"], "tool_use");
         assert_eq!(evs[9].1["usage"]["output_tokens"], 3);
+    }
+
+    #[test]
+    fn openai_to_anthropic_stream_saw_terminal_tracks_finish_reason() {
+        let mut s = OpenAiToAnthropicStream::new("m");
+        assert!(!s.saw_terminal());
+        s.feed(&json!({"id": "c1", "choices": [{"index": 0, "delta": {"content": "hi"}}]}));
+        assert!(!s.saw_terminal(), "content deltas alone aren't terminal");
+        s.feed(&json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
+        assert!(s.saw_terminal());
     }
 
     #[test]

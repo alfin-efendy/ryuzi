@@ -182,17 +182,22 @@ pub struct ResponsesStreamState {
     // single assistant message item
     msg_open: bool,
     msg_index: i64,
+    // accumulated assistant message text, cleared once the item closes
+    text: String,
     // function-call items keyed by upstream tool_call index
     tools: std::collections::HashMap<i64, ToolItem>,
     tool_order: Vec<i64>,
     finish_reason: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
 }
 
+/// call_id is clamped to 64 chars per spec §3.3 before it's stored here.
 struct ToolItem {
     output_index: i64,
-    #[allow(dead_code)]
     call_id: String,
-    #[allow(dead_code)]
+    name: String,
+    arguments: String,
     started: bool,
 }
 
@@ -212,9 +217,12 @@ impl ResponsesStreamState {
             completed: false,
             msg_open: false,
             msg_index: 0,
+            text: String::new(),
             tools: std::collections::HashMap::new(),
             tool_order: Vec::new(),
             finish_reason: None,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 
@@ -271,28 +279,41 @@ impl ResponsesStreamState {
         }
         self.msg_open = false;
         let idx = self.msg_index;
+        let text = std::mem::take(&mut self.text);
         out.push(self.ev(
             "response.output_text.done",
-            json!({"type": "response.output_text.done", "output_index": idx, "content_index": 0}),
+            json!({"type": "response.output_text.done", "output_index": idx,
+                   "content_index": 0, "text": text}),
         ));
         out.push(self.ev(
             "response.content_part.done",
             json!({"type": "response.content_part.done", "output_index": idx, "content_index": 0}),
         ));
+        let item_id = format!("msg_{}_{}", self.response_id, idx);
         out.push(self.ev(
             "response.output_item.done",
-            json!({"type": "response.output_item.done", "output_index": idx}),
+            json!({"type": "response.output_item.done", "output_index": idx,
+                   "item": {"id": item_id, "type": "message", "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": text, "annotations": []}]}}),
         ));
     }
 
     pub fn feed(&mut self, chunk: &Value) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         self.ensure_started(chunk, &mut out);
+        if let Some(u) = chunk.get("usage") {
+            self.input_tokens = u["prompt_tokens"].as_i64().unwrap_or(self.input_tokens);
+            self.output_tokens = u["completion_tokens"]
+                .as_i64()
+                .unwrap_or(self.output_tokens);
+        }
         let delta = &chunk["choices"][0]["delta"];
 
         if let Some(text) = delta["content"].as_str() {
             if !text.is_empty() {
                 self.open_message(&mut out);
+                self.text.push_str(text);
                 let idx = self.msg_index;
                 out.push(self.ev(
                     "response.output_text.delta",
@@ -305,18 +326,24 @@ impl ResponsesStreamState {
 
         for tc in delta["tool_calls"].as_array().cloned().unwrap_or_default() {
             let tidx = tc["index"].as_i64().unwrap_or(0);
-            let starting = tc["id"].is_string() || tc["function"]["name"].is_string();
+            let already_started = self.tools.get(&tidx).is_some_and(|t| t.started);
+            let starting =
+                !already_started && (tc["id"].is_string() || tc["function"]["name"].is_string());
             if starting {
                 // close the message before opening a tool item
                 self.close_message(&mut out);
                 let oidx = self.output_index;
                 self.output_index += 1;
-                let call_id = tc["id"].as_str().unwrap_or("").to_string();
+                // spec §3.3: call_id is clamped to 64 chars.
+                let call_id: String = tc["id"].as_str().unwrap_or("").chars().take(64).collect();
+                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                 self.tools.insert(
                     tidx,
                     ToolItem {
                         output_index: oidx,
                         call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: String::new(),
                         started: true,
                     },
                 );
@@ -327,12 +354,13 @@ impl ResponsesStreamState {
                     json!({
                         "type": "response.output_item.added", "output_index": oidx,
                         "item": {"id": item_id, "type": "function_call",
-                                 "call_id": call_id, "name": tc["function"]["name"], "arguments": ""}}),
+                                 "call_id": call_id, "name": name, "arguments": ""}}),
                 ));
             }
             if let Some(frag) = tc["function"]["arguments"].as_str() {
                 if !frag.is_empty() {
-                    if let Some(item) = self.tools.get(&tidx) {
+                    if let Some(item) = self.tools.get_mut(&tidx) {
+                        item.arguments.push_str(frag);
                         let oidx = item.output_index;
                         out.push(self.ev(
                             "response.function_call_arguments.delta",
@@ -361,17 +389,28 @@ impl ResponsesStreamState {
         // close each tool item
         let order = self.tool_order.clone();
         for tidx in order {
-            if let Some(item) = self.tools.get(&tidx) {
-                let oidx = item.output_index;
-                out.push(self.ev(
-                    "response.function_call_arguments.done",
-                    json!({"type": "response.function_call_arguments.done", "output_index": oidx}),
-                ));
-                out.push(self.ev(
-                    "response.output_item.done",
-                    json!({"type": "response.output_item.done", "output_index": oidx}),
-                ));
-            }
+            let Some((oidx, call_id, name, arguments)) = self.tools.get(&tidx).map(|item| {
+                (
+                    item.output_index,
+                    item.call_id.clone(),
+                    item.name.clone(),
+                    item.arguments.clone(),
+                )
+            }) else {
+                continue;
+            };
+            out.push(self.ev(
+                "response.function_call_arguments.done",
+                json!({"type": "response.function_call_arguments.done",
+                       "output_index": oidx, "arguments": arguments}),
+            ));
+            let item_id = format!("fc_{call_id}");
+            out.push(self.ev(
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": oidx,
+                       "item": {"id": item_id, "type": "function_call", "call_id": call_id,
+                                "name": name, "arguments": arguments, "status": "completed"}}),
+            ));
         }
         let rid = self.response_id.clone();
         out.push(self.ev(
@@ -386,6 +425,20 @@ impl ResponsesStreamState {
             "error".to_string(),
             json!({"type": "error", "message": message, "code": null}),
         )
+    }
+
+    /// True once a `finish_reason` chunk was observed. When the upstream
+    /// stream ends cleanly WITHOUT ever seeing one, the caller must emit
+    /// `error_frame` instead of `finish` — a clean EOF with no terminal event
+    /// is a truncated stream, not a completed one.
+    pub fn saw_terminal(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
+    /// Accumulated (input, output) token counts seen so far, from the
+    /// upstream `usage` field carried on OpenAI chunks.
+    pub fn usage(&self) -> (i64, i64) {
+        (self.input_tokens, self.output_tokens)
     }
 }
 
@@ -519,6 +572,22 @@ mod tests {
             .map(|(_, d)| d["sequence_number"].as_i64().unwrap())
             .collect();
         assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1));
+
+        // Codex (codex-rs) only dispatches from output_item.done events that
+        // carry a full `item` — an event with no `item` is silently dropped.
+        let text_done = evs
+            .iter()
+            .find(|(n, _)| n == "response.output_text.done")
+            .unwrap();
+        assert_eq!(text_done.1["text"], "Hello");
+        let item_done = evs
+            .iter()
+            .find(|(n, d)| n == "response.output_item.done" && d["item"]["type"] == "message")
+            .unwrap();
+        assert_eq!(item_done.1["item"]["role"], "assistant");
+        assert_eq!(item_done.1["item"]["status"], "completed");
+        assert_eq!(item_done.1["item"]["content"][0]["type"], "output_text");
+        assert_eq!(item_done.1["item"]["content"][0]["text"], "Hello");
     }
 
     #[test]
@@ -548,6 +617,48 @@ mod tests {
             })
             .unwrap();
         assert_eq!(added.1["item"]["name"], "f");
+
+        // Codex (codex-rs) only dispatches tool calls from output_item.done
+        // events that carry a full `item` — an event with no `item` is
+        // silently dropped, so the accumulated call_id/name/arguments must
+        // all be present on the terminal event, not just `added`.
+        let done = evs
+            .iter()
+            .find(|(n, d)| n == "response.output_item.done" && d["item"]["type"] == "function_call")
+            .unwrap();
+        assert_eq!(done.1["item"]["call_id"], "call_1");
+        assert_eq!(done.1["item"]["name"], "f");
+        assert_eq!(done.1["item"]["arguments"], "{\"a\":1}");
+        assert_eq!(done.1["item"]["status"], "completed");
+    }
+
+    #[test]
+    fn stream_tool_call_id_is_clamped_to_64_chars() {
+        let long_id = "x".repeat(100);
+        let mut s = ResponsesStreamState::new();
+        let mut evs = Vec::new();
+        evs.extend(s.feed(
+            &json!({"id": "c1", "choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": long_id, "function": {"name": "f", "arguments": "{}"}}]}}]}),
+        ));
+        evs.extend(
+            s.feed(&json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})),
+        );
+        evs.extend(s.finish());
+        let added = evs
+            .iter()
+            .find(|(n, d)| {
+                n == "response.output_item.added" && d["item"]["type"] == "function_call"
+            })
+            .unwrap();
+        let call_id = added.1["item"]["call_id"].as_str().unwrap();
+        assert_eq!(call_id.len(), 64);
+        assert_eq!(added.1["item"]["id"], format!("fc_{call_id}"));
+        let done = evs
+            .iter()
+            .find(|(n, d)| n == "response.output_item.done" && d["item"]["type"] == "function_call")
+            .unwrap();
+        assert_eq!(done.1["item"]["call_id"], call_id);
     }
 
     #[test]
@@ -556,5 +667,29 @@ mod tests {
         let (name, data) = s.error_frame("boom");
         assert_eq!(name, "error");
         assert_eq!(data["message"], "boom");
+    }
+
+    #[test]
+    fn responses_stream_saw_terminal_tracks_finish_reason() {
+        let mut s = ResponsesStreamState::new();
+        assert!(!s.saw_terminal());
+        s.feed(&json!({"id": "c1",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}}]}));
+        assert!(!s.saw_terminal(), "content deltas alone aren't terminal");
+        s.feed(&json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
+        assert!(s.saw_terminal());
+    }
+
+    #[test]
+    fn responses_stream_usage_accumulates_from_chunks() {
+        let mut s = ResponsesStreamState::new();
+        s.feed(&json!({"id": "c1",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}}]}));
+        assert_eq!(s.usage(), (0, 0));
+        s.feed(
+            &json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3}}),
+        );
+        assert_eq!(s.usage(), (7, 3));
     }
 }

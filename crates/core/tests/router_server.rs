@@ -531,6 +531,95 @@ async fn anthropic_client_gets_error_frame_when_upstream_truncates() {
     srv.stop().await;
 }
 
+/// OpenAI-format upstream that sends one COMPLETE SSE chunk (a content
+/// delta) and then closes the connection cleanly — a normal, well-framed
+/// HTTP response (unlike `mock_truncating_openai_upstream`, there's no
+/// mid-chunk decode error here). This is the "upstream just stopped talking"
+/// case: no finish_reason chunk, no `[DONE]`, but a clean EOF.
+async fn mock_clean_eof_no_terminal_openai_upstream() -> (u16, tokio::task::JoinHandle<()>) {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::Response;
+    use axum::{routing::post, Router};
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|_body: axum::extract::Json<serde_json::Value>| async move {
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"He\"}}]}\n\n",
+            );
+            Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, h)
+}
+
+/// I2b: a clean EOF that never carried a terminal event (no finish_reason
+/// chunk, no `[DONE]`) must surface as an error to the Anthropic client, not
+/// a fake clean `message_stop`.
+#[tokio::test]
+async fn anthropic_client_gets_error_frame_on_clean_eof_before_terminal() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+    let (up_port, _h) = mock_clean_eof_no_terminal_openai_upstream().await;
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "c1".into(),
+            provider: "custom-openai".into(),
+            auth_type: "api_key".into(),
+            label: "mock".into(),
+            priority: 0,
+            enabled: true,
+            data: connections::ConnectionData {
+                api_key: Some("k".into()),
+                base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
+                models_override: Some(vec!["mock-model".into()]),
+            },
+            created_at: 0,
+            updated_at: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let key = keys::create_key(&store, "t").await.unwrap();
+    let srv = RouterServer::new(store.clone());
+    let port = srv.start(0).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", &key.key)
+        .json(
+            &json!({"model": "custom-openai/mock-model", "max_tokens": 16, "stream": true,
+                      "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    // saw the partial content...
+    assert!(body.contains("content_block_delta"), "body: {body}");
+    // ...and a terminal ERROR event, NOT a clean message_stop
+    assert!(
+        body.contains("event: error"),
+        "expected error frame on clean EOF before terminal, got: {body}"
+    );
+    assert!(
+        !body.contains("event: message_stop"),
+        "must not fake a clean finish on truncated stream: {body}"
+    );
+
+    srv.stop().await;
+}
+
 #[tokio::test]
 async fn passthrough_streaming_preserves_sse() {
     let (_store, key, port) = setup().await;
