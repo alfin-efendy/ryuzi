@@ -56,7 +56,14 @@ fn mask(key: &str) -> String {
     if key.chars().count() < 7 {
         return "••••".to_string();
     }
-    let tail: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    let tail: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("{}…{tail}", key.chars().take(3).collect::<String>())
 }
 
@@ -65,21 +72,33 @@ fn to_info(row: &ConnectionRow) -> ConnectionInfo {
     ConnectionInfo {
         id: row.id.clone(),
         provider: row.provider.clone(),
-        provider_name: desc.map(|d| d.name.to_string()).unwrap_or_else(|| row.provider.clone()),
-        color: desc.map(|d| d.color.to_string()).unwrap_or_else(|| "#8B8B8B".into()),
-        initial: desc.map(|d| d.initial.to_string()).unwrap_or_else(|| "?".into()),
+        provider_name: desc
+            .map(|d| d.name.to_string())
+            .unwrap_or_else(|| row.provider.clone()),
+        color: desc
+            .map(|d| d.color.to_string())
+            .unwrap_or_else(|| "#8B8B8B".into()),
+        initial: desc
+            .map(|d| d.initial.to_string())
+            .unwrap_or_else(|| "?".into()),
         auth_type: row.auth_type.clone(),
         label: row.label.clone(),
         priority: row.priority as i32,
         enabled: row.enabled,
         base_url: desc.and_then(|d| connections::effective_base_url(d, row)),
-        models: desc.map(|d| connections::effective_models(d, row)).unwrap_or_default(),
+        models: desc
+            .map(|d| connections::effective_models(d, row))
+            .unwrap_or_default(),
         key_masked: row.data.api_key.as_deref().map(mask),
     }
 }
 
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<ConnectionInfo>> {
-    Ok(connections::list_connections(cp.store()).await?.iter().map(to_info).collect())
+    Ok(connections::list_connections(cp.store())
+        .await?
+        .iter()
+        .map(to_info)
+        .collect())
 }
 
 #[tauri::command]
@@ -126,10 +145,14 @@ pub async fn add_connection(
         message: format!("unknown provider: {provider}"),
     })?;
     if desc.category != ProviderCategory::ApiKey {
-        return Err(CmdError { message: format!("{} is coming in a later phase.", desc.name) });
+        return Err(CmdError {
+            message: format!("{} is coming in a later phase.", desc.name),
+        });
     }
     if desc.requires_base_url && base_url.as_deref().map(str::is_empty).unwrap_or(true) {
-        return Err(CmdError { message: format!("{} requires a base URL", desc.name) });
+        return Err(CmdError {
+            message: format!("{} requires a base URL", desc.name),
+        });
     }
     let now = ryuzi_core::paths::now_ms();
     connections::add_connection(
@@ -142,7 +165,11 @@ pub async fn add_connection(
             priority: 0, // add_connection assigns MAX+1
             enabled: true,
             data: ConnectionData {
-                api_key: if api_key.is_empty() { None } else { Some(api_key) },
+                api_key: if api_key.is_empty() {
+                    None
+                } else {
+                    Some(api_key)
+                },
                 base_url_override: base_url.filter(|s| !s.is_empty()),
                 models_override: None,
             },
@@ -167,7 +194,9 @@ pub async fn update_connection(
 ) -> R<Vec<ConnectionInfo>> {
     let mut row = connections::get_connection(cp.store(), &id)
         .await?
-        .ok_or_else(|| CmdError { message: format!("unknown connection: {id}") })?;
+        .ok_or_else(|| CmdError {
+            message: format!("unknown connection: {id}"),
+        })?;
     row.label = label;
     row.enabled = enabled;
     if let Some(k) = api_key {
@@ -177,7 +206,11 @@ pub async fn update_connection(
         }
     }
     row.data.base_url_override = base_url.filter(|s| !s.is_empty());
-    row.data.models_override = if models.is_empty() { None } else { Some(models) };
+    row.data.models_override = if models.is_empty() {
+        None
+    } else {
+        Some(models)
+    };
     row.updated_at = ryuzi_core::paths::now_ms();
     connections::update_connection(cp.store(), row).await?;
     Ok(assemble(&cp).await?)
@@ -185,7 +218,10 @@ pub async fn update_connection(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn remove_connection(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<ConnectionInfo>> {
+pub async fn remove_connection(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+) -> R<Vec<ConnectionInfo>> {
     connections::remove_connection(cp.store(), &id).await?;
     Ok(assemble(&cp).await?)
 }
@@ -208,18 +244,25 @@ pub async fn move_connection(
 pub async fn test_connection(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<TestResult> {
     let row = connections::get_connection(cp.store(), &id)
         .await?
-        .ok_or_else(|| CmdError { message: format!("unknown connection: {id}") })?;
+        .ok_or_else(|| CmdError {
+            message: format!("unknown connection: {id}"),
+        })?;
     let desc = registry::descriptor(&row.provider).ok_or_else(|| CmdError {
         message: format!("unknown provider: {}", row.provider),
     })?;
     let Some(base) = connections::effective_base_url(desc, &row) else {
-        return Ok(TestResult { ok: false, message: "no base URL configured".into() });
+        return Ok(TestResult {
+            ok: false,
+            message: "no base URL configured".into(),
+        });
     };
     let key = row.data.api_key.clone().unwrap_or_default();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| CmdError { message: e.to_string() })?;
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
     let resp = match desc.format {
         ApiFormat::OpenAi => {
             let mut r = client.get(format!("{base}/models"));
@@ -239,12 +282,21 @@ pub async fn test_connection(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<
             .await,
     };
     Ok(match resp {
-        Ok(r) if r.status().is_success() => TestResult { ok: true, message: "Connection OK".into() },
+        Ok(r) if r.status().is_success() => TestResult {
+            ok: true,
+            message: "Connection OK".into(),
+        },
         Ok(r) if r.status().as_u16() == 401 || r.status().as_u16() == 403 => TestResult {
             ok: false,
             message: "Rejected: the API key looks invalid for this provider.".into(),
         },
-        Ok(r) => TestResult { ok: false, message: format!("Upstream returned HTTP {}", r.status()) },
-        Err(e) => TestResult { ok: false, message: format!("Network error: {e}") },
+        Ok(r) => TestResult {
+            ok: false,
+            message: format!("Upstream returned HTTP {}", r.status()),
+        },
+        Err(e) => TestResult {
+            ok: false,
+            message: format!("Network error: {e}"),
+        },
     })
 }

@@ -307,9 +307,7 @@ export function RuntimeDetailView({ id }: { id: string }) {
             <CardTitle>Endpoint config</CardTitle>
             <Pill variant={cfg?.configured ? "primary" : "secondary"}>{cfg?.configured ? "Configured" : "Not configured"}</Pill>
           </CardHeader>
-          {cfg?.configPath && (
-            <div className="px-[18px] pb-1 pt-3 font-mono text-[11px] text-muted-foreground">{cfg.configPath}</div>
-          )}
+          {cfg?.configPath && <div className="px-[18px] pb-1 pt-3 font-mono text-[11px] text-muted-foreground">{cfg.configPath}</div>}
           {cfg && !cfg.supported ? (
             <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
               Config apply for this runtime is coming in a later phase.
@@ -317,13 +315,19 @@ export function RuntimeDetailView({ id }: { id: string }) {
           ) : (
             <>
               {endpointBlocked && (
-                <div className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]" style={{ borderColor: WARN, color: WARN }}>
+                <div
+                  className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]"
+                  style={{ borderColor: WARN, color: WARN }}
+                >
                   <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
                   <span>Start the endpoint server and create an API key in Models → Endpoint before applying.</span>
                 </div>
               )}
               {noModels && (
-                <div className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]" style={{ borderColor: WARN, color: WARN }}>
+                <div
+                  className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]"
+                  style={{ borderColor: WARN, color: WARN }}
+                >
                   <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
                   <span>Add an enabled provider connection in Models → Providers to pick models.</span>
                 </div>

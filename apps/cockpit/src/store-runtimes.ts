@@ -66,11 +66,7 @@ export const useRuntimes = create<RuntimesState>((set, get) => ({
     const next = { ...current, ...patch };
     // Optimistic paint; the command returns the authoritative list.
     set({ runtimes: get().runtimes.map((a) => (a.id === id ? next : a)) });
-    applyResult(
-      set,
-      await commands.updateRuntimeConfig(id, next.enabled, next.model || null, next.permMode, next.flags),
-      "Runtime update",
-    );
+    applyResult(set, await commands.updateRuntimeConfig(id, next.enabled, next.model || null, next.permMode, next.flags), "Runtime update");
   },
 
   setTier: async (id, tierId, value, combo = false) => {

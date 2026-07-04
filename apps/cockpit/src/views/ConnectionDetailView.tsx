@@ -148,7 +148,12 @@ export function ConnectionDetailView({ id }: { id: string }) {
             <CardTitle>Base URL</CardTitle>
           </CardHeader>
           <CardRow>
-            <input className={`${field} flex-1`} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://host/v1" />
+            <input
+              className={`${field} flex-1`}
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder="https://host/v1"
+            />
           </CardRow>
           <div className="px-[18px] pb-3 text-[11.5px] text-muted-foreground">Leave empty for the provider default.</div>
         </Card>
@@ -158,7 +163,12 @@ export function ConnectionDetailView({ id }: { id: string }) {
             <CardTitle>Models</CardTitle>
           </CardHeader>
           <div className="px-[18px] py-3">
-            <textarea className={modelsField} value={modelsText} onChange={(e) => setModelsText(e.target.value)} placeholder="one model per line" />
+            <textarea
+              className={modelsField}
+              value={modelsText}
+              onChange={(e) => setModelsText(e.target.value)}
+              placeholder="one model per line"
+            />
             <div className="mt-1.5 text-[11.5px] text-muted-foreground">Leave empty for the provider's default list.</div>
           </div>
         </Card>

@@ -49,7 +49,9 @@ pub async fn list_connections(store: &Store) -> anyhow::Result<Vec<ConnectionRow
             let mut stmt = c.prepare(&format!(
                 "SELECT {COLS} FROM provider_connections ORDER BY priority ASC, created_at ASC"
             ))?;
-            let items = stmt.query_map([], row_to_conn)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let items = stmt
+                .query_map([], row_to_conn)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })
         .await
@@ -109,7 +111,8 @@ pub async fn remove_connection(store: &Store, id: &str) -> anyhow::Result<()> {
     let id = id.to_string();
     store
         .with_conn(move |c| {
-            c.execute("DELETE FROM provider_connections WHERE id=?1", params![id]).map(|_| ())
+            c.execute("DELETE FROM provider_connections WHERE id=?1", params![id])
+                .map(|_| ())
         })
         .await
 }
@@ -184,22 +187,31 @@ mod tests {
 
     fn row(id: &str, provider: &str, prio: i64) -> ConnectionRow {
         ConnectionRow {
-            id: id.into(), provider: provider.into(), auth_type: "api_key".into(),
-            label: format!("{id} label"), priority: prio, enabled: true,
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: "api_key".into(),
+            label: format!("{id} label"),
+            priority: prio,
+            enabled: true,
             data: ConnectionData {
                 api_key: Some("sk-test".into()),
                 base_url_override: None,
                 models_override: None,
             },
-            created_at: 1, updated_at: 1,
+            created_at: 1,
+            updated_at: 1,
         }
     }
 
     #[tokio::test]
     async fn crud_and_priority_ordering() {
         let store = mem_store().await;
-        add_connection(&store, row("c1", "openai", 0)).await.unwrap();
-        add_connection(&store, row("c2", "anthropic", 1)).await.unwrap();
+        add_connection(&store, row("c1", "openai", 0))
+            .await
+            .unwrap();
+        add_connection(&store, row("c2", "anthropic", 1))
+            .await
+            .unwrap();
         let list = list_connections(&store).await.unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].id, "c1"); // ordered by priority ASC
@@ -214,7 +226,10 @@ mod tests {
         c1.label = "renamed".into();
         c1.data.models_override = Some(vec!["m1".into()]);
         update_connection(&store, c1).await.unwrap();
-        assert_eq!(get_connection(&store, "c1").await.unwrap().unwrap().label, "renamed");
+        assert_eq!(
+            get_connection(&store, "c1").await.unwrap().unwrap().label,
+            "renamed"
+        );
 
         remove_connection(&store, "c1").await.unwrap();
         assert_eq!(list_connections(&store).await.unwrap().len(), 1);
@@ -224,11 +239,17 @@ mod tests {
     async fn effective_helpers_prefer_overrides() {
         let desc = crate::llm_router::registry::descriptor("openai").unwrap();
         let mut r = row("c1", "openai", 0);
-        assert_eq!(effective_base_url(desc, &r).as_deref(), Some("https://api.openai.com/v1"));
+        assert_eq!(
+            effective_base_url(desc, &r).as_deref(),
+            Some("https://api.openai.com/v1")
+        );
         assert!(effective_models(desc, &r).contains(&"gpt-5.2".to_string()));
         r.data.base_url_override = Some("http://localhost:9/v1".into());
         r.data.models_override = Some(vec!["custom-model".into()]);
-        assert_eq!(effective_base_url(desc, &r).as_deref(), Some("http://localhost:9/v1"));
+        assert_eq!(
+            effective_base_url(desc, &r).as_deref(),
+            Some("http://localhost:9/v1")
+        );
         assert_eq!(effective_models(desc, &r), vec!["custom-model".to_string()]);
     }
 }

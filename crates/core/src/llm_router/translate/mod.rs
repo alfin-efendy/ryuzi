@@ -315,7 +315,9 @@ pub fn openai_to_anthropic_response(resp: &Value) -> Value {
             "name": tc["function"]["name"], "input": input,
         }));
     }
-    let finish = resp["choices"][0]["finish_reason"].as_str().unwrap_or("stop");
+    let finish = resp["choices"][0]["finish_reason"]
+        .as_str()
+        .unwrap_or("stop");
     json!({
         "id": resp["id"], "type": "message", "role": "assistant",
         "model": resp["model"], "content": content,
@@ -330,7 +332,12 @@ pub fn openai_to_anthropic_response(resp: &Value) -> Value {
 pub fn anthropic_to_openai_response(resp: &Value) -> Value {
     let mut text = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
-    for b in resp["content"].as_array().cloned().unwrap_or_default().iter() {
+    for b in resp["content"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+    {
         match b["type"].as_str().unwrap_or("") {
             "text" => text.push_str(b["text"].as_str().unwrap_or("")),
             "tool_use" => {
@@ -433,7 +440,9 @@ impl OpenAiToAnthropicStream {
         self.ensure_start(chunk, &mut out);
         if let Some(u) = chunk.get("usage") {
             self.input_tokens = u["prompt_tokens"].as_i64().unwrap_or(self.input_tokens);
-            self.output_tokens = u["completion_tokens"].as_i64().unwrap_or(self.output_tokens);
+            self.output_tokens = u["completion_tokens"]
+                .as_i64()
+                .unwrap_or(self.output_tokens);
         }
         let choice = &chunk["choices"][0];
         let delta = &choice["delta"];
@@ -601,7 +610,9 @@ impl AnthropicToOpenAiStream {
                 if let Some(sr) = data["delta"]["stop_reason"].as_str() {
                     self.finish = Some(anthropic_stop_to_oai(sr).to_string());
                 }
-                self.usage_out = data["usage"]["output_tokens"].as_i64().unwrap_or(self.usage_out);
+                self.usage_out = data["usage"]["output_tokens"]
+                    .as_i64()
+                    .unwrap_or(self.usage_out);
             }
             "message_stop" => {
                 self.done = true;
@@ -652,13 +663,21 @@ mod tests {
         assert_eq!(msgs[2]["tool_calls"][0]["id"], "tu_1");
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "get_weather");
         assert_eq!(
-            msgs[2]["tool_calls"][0]["function"]["arguments"].as_str().unwrap(),
+            msgs[2]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
             r#"{"city":"Jakarta"}"#
         );
-        assert_eq!(msgs[3], json!({"role": "tool", "tool_call_id": "tu_1", "content": "sunny"}));
+        assert_eq!(
+            msgs[3],
+            json!({"role": "tool", "tool_call_id": "tu_1", "content": "sunny"})
+        );
         assert_eq!(out["max_tokens"], 1024);
         assert_eq!(out["stop"], json!(["END"]));
-        assert_eq!(out["tools"][0]["function"]["parameters"], json!({"type": "object"}));
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"],
+            json!({"type": "object"})
+        );
         assert_eq!(out["tool_choice"], "auto");
         assert!(out.get("system").is_none());
         assert!(out.get("stop_sequences").is_none());
@@ -712,11 +731,17 @@ mod tests {
         let out = openai_to_anthropic_response(&resp);
         assert_eq!(out["type"], "message");
         assert_eq!(out["role"], "assistant");
-        assert_eq!(out["content"][0], json!({"type": "text", "text": "checking"}));
+        assert_eq!(
+            out["content"][0],
+            json!({"type": "text", "text": "checking"})
+        );
         assert_eq!(out["content"][1]["type"], "tool_use");
         assert_eq!(out["content"][1]["input"], json!({"city": "Jakarta"}));
         assert_eq!(out["stop_reason"], "tool_use");
-        assert_eq!(out["usage"], json!({"input_tokens": 10, "output_tokens": 5}));
+        assert_eq!(
+            out["usage"],
+            json!({"input_tokens": 10, "output_tokens": 5})
+        );
     }
 
     #[test]
@@ -736,7 +761,10 @@ mod tests {
         assert_eq!(msg["content"], "checking");
         assert_eq!(msg["tool_calls"][0]["function"]["name"], "get_weather");
         assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(out["usage"], json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}));
+        assert_eq!(
+            out["usage"],
+            json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+        );
     }
 
     #[test]
@@ -784,13 +812,19 @@ mod tests {
         let out = anthropic_to_openai_request(&req).unwrap();
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 4);
-        assert_eq!(msgs[0], json!({"role": "user", "content": "what's the weather"}));
+        assert_eq!(
+            msgs[0],
+            json!({"role": "user", "content": "what's the weather"})
+        );
         assert_eq!(msgs[1]["role"], "assistant");
         assert_eq!(msgs[1]["tool_calls"][0]["id"], "tu_1");
         // The tool result must come immediately after the assistant tool_calls
         // turn, before the accompanying user text — OpenAI-compat providers
         // 400 on a `role: tool` message that doesn't directly follow it.
-        assert_eq!(msgs[2], json!({"role": "tool", "tool_call_id": "tu_1", "content": "sunny"}));
+        assert_eq!(
+            msgs[2],
+            json!({"role": "tool", "tool_call_id": "tu_1", "content": "sunny"})
+        );
         assert_eq!(msgs[3], json!({"role": "user", "content": "also note X"}));
     }
 
@@ -818,7 +852,9 @@ mod tests {
             "usage": {"input_tokens": 1, "output_tokens": 1}
         });
         let out = anthropic_to_openai_response(&resp);
-        let calls = out["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        let calls = out["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0]["index"], 0);
         assert_eq!(calls[1]["index"], 1);
@@ -866,20 +902,36 @@ mod tests {
         let mut evs = Vec::new();
         evs.extend(s.feed(&json!({"id": "c1", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "He"}}]})));
         evs.extend(s.feed(&json!({"choices": [{"index": 0, "delta": {"content": "llo"}}]})));
-        evs.extend(s.feed(&json!({"choices": [{"index": 0, "delta": {"tool_calls": [
-            {"index": 0, "id": "call_1", "function": {"name": "f", "arguments": "{\"a\""}}]}}]})));
-        evs.extend(s.feed(&json!({"choices": [{"index": 0, "delta": {"tool_calls": [
-            {"index": 0, "function": {"arguments": ":1}"}}]}}]})));
-        evs.extend(s.feed(&json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-                                  "usage": {"prompt_tokens": 7, "completion_tokens": 3}})));
+        evs.extend(
+            s.feed(&json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "call_1", "function": {"name": "f", "arguments": "{\"a\""}}]}}]})),
+        );
+        evs.extend(
+            s.feed(&json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": ":1}"}}]}}]})),
+        );
+        evs.extend(s.feed(
+            &json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                                  "usage": {"prompt_tokens": 7, "completion_tokens": 3}}),
+        ));
         evs.extend(s.finish());
         let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec![
-            "message_start",
-            "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop",
-            "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop",
-            "message_delta", "message_stop",
-        ]);
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
         assert_eq!(evs[1].1["content_block"]["type"], "text");
         assert_eq!(evs[2].1["delta"]["text"], "He");
         assert_eq!(evs[5].1["content_block"]["type"], "tool_use");
@@ -893,22 +945,46 @@ mod tests {
     fn anthropic_events_translate_to_openai_chunks() {
         let mut s = AnthropicToOpenAiStream::new();
         let mut chunks = Vec::new();
-        chunks.extend(s.feed("message_start", &json!({"message": {"id": "msg_1", "model": "m"}})));
-        chunks.extend(s.feed("content_block_start", &json!({"index": 0, "content_block": {"type": "text", "text": ""}})));
-        chunks.extend(s.feed("content_block_delta", &json!({"index": 0, "delta": {"type": "text_delta", "text": "Hi"}})));
+        chunks.extend(s.feed(
+            "message_start",
+            &json!({"message": {"id": "msg_1", "model": "m"}}),
+        ));
+        chunks.extend(s.feed(
+            "content_block_start",
+            &json!({"index": 0, "content_block": {"type": "text", "text": ""}}),
+        ));
+        chunks.extend(s.feed(
+            "content_block_delta",
+            &json!({"index": 0, "delta": {"type": "text_delta", "text": "Hi"}}),
+        ));
         chunks.extend(s.feed("content_block_stop", &json!({"index": 0})));
-        chunks.extend(s.feed("content_block_start", &json!({"index": 1, "content_block": {"type": "tool_use", "id": "tu_1", "name": "f"}})));
-        chunks.extend(s.feed("content_block_delta", &json!({"index": 1, "delta": {"type": "input_json_delta", "partial_json": "{}"}})));
-        chunks.extend(s.feed("message_delta", &json!({"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}})));
+        chunks.extend(s.feed(
+            "content_block_start",
+            &json!({"index": 1, "content_block": {"type": "tool_use", "id": "tu_1", "name": "f"}}),
+        ));
+        chunks.extend(s.feed(
+            "content_block_delta",
+            &json!({"index": 1, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+        ));
+        chunks.extend(s.feed(
+            "message_delta",
+            &json!({"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
+        ));
         chunks.extend(s.feed("message_stop", &json!({})));
         assert!(s.finish());
         // role announcement
         assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
         // text delta
-        assert!(chunks.iter().any(|c| c["choices"][0]["delta"]["content"] == "Hi"));
+        assert!(chunks
+            .iter()
+            .any(|c| c["choices"][0]["delta"]["content"] == "Hi"));
         // tool call start carries id+name, later fragment carries arguments
-        assert!(chunks.iter().any(|c| c["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "f"));
-        assert!(chunks.iter().any(|c| c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == "{}"));
+        assert!(chunks
+            .iter()
+            .any(|c| c["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "f"));
+        assert!(chunks
+            .iter()
+            .any(|c| c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == "{}"));
         // finish chunk
         let last = chunks.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");

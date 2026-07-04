@@ -295,7 +295,12 @@ pub fn run() {
             app.manage(router_srv.clone());
             let cp3 = cp2.clone();
             tauri::async_runtime::spawn(async move {
-                let auto = cp3.store().get_setting("endpoint_autostart").await.ok().flatten();
+                let auto = cp3
+                    .store()
+                    .get_setting("endpoint_autostart")
+                    .await
+                    .ok()
+                    .flatten();
                 if auto.as_deref() == Some("1") {
                     let port = endpoint_cmd::configured_port(&cp3).await;
                     if let Err(e) = router_srv.start(port).await {

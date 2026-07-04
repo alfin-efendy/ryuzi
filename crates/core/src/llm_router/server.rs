@@ -41,13 +41,19 @@ impl RouterServer {
     pub fn new(store: Arc<Store>) -> Self {
         Self {
             store,
-            inner: Mutex::new(Inner { shutdown: None, port: 0 }),
+            inner: Mutex::new(Inner {
+                shutdown: None,
+                port: 0,
+            }),
         }
     }
 
     pub fn status(&self) -> RouterStatus {
         let g = self.inner.lock().unwrap();
-        RouterStatus { running: g.shutdown.is_some(), port: g.port }
+        RouterStatus {
+            running: g.shutdown.is_some(),
+            port: g.port,
+        }
     }
 
     /// Bind 127.0.0.1:`port` (0 = ephemeral) and serve. Returns bound port.
@@ -107,11 +113,14 @@ fn presented_key(headers: &HeaderMap) -> Option<String> {
 }
 
 fn anthropic_error(status: StatusCode, msg: &str) -> Response {
-    (status, Json(json!({"type": "error", "error": {
+    (
+        status,
+        Json(json!({"type": "error", "error": {
         "type": if status == StatusCode::UNAUTHORIZED { "authentication_error" }
                 else if status == StatusCode::NOT_FOUND { "not_found_error" }
                 else { "api_error" },
-        "message": msg }})))
+        "message": msg }})),
+    )
         .into_response()
 }
 
@@ -129,7 +138,10 @@ async fn check_auth(
     err: fn(StatusCode, &str) -> Response,
 ) -> Result<(), Response> {
     let Some(k) = presented_key(headers) else {
-        return Err(err(StatusCode::UNAUTHORIZED, "missing API key (x-api-key or Authorization: Bearer)"));
+        return Err(err(
+            StatusCode::UNAUTHORIZED,
+            "missing API key (x-api-key or Authorization: Bearer)",
+        ));
     };
     match keys::verify_key(&state.store, &k).await {
         Ok(true) => Ok(()),
@@ -155,7 +167,11 @@ pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Optio
         for conn in enabled {
             if conn.provider == prov {
                 if let Some(desc) = registry::descriptor(&conn.provider) {
-                    return Ok(Some(RouteTarget { conn, desc, upstream_model: model.to_string() }));
+                    return Ok(Some(RouteTarget {
+                        conn,
+                        desc,
+                        upstream_model: model.to_string(),
+                    }));
                 }
             }
         }
@@ -163,9 +179,18 @@ pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Optio
     }
     // Bare model: first (highest-priority) connection listing it.
     for conn in enabled {
-        let Some(desc) = registry::descriptor(&conn.provider) else { continue };
-        if connections::effective_models(desc, &conn).iter().any(|m| m == requested) {
-            return Ok(Some(RouteTarget { conn, desc, upstream_model: requested.to_string() }));
+        let Some(desc) = registry::descriptor(&conn.provider) else {
+            continue;
+        };
+        if connections::effective_models(desc, &conn)
+            .iter()
+            .any(|m| m == requested)
+        {
+            return Ok(Some(RouteTarget {
+                conn,
+                desc,
+                upstream_model: requested.to_string(),
+            }));
         }
     }
     Ok(None)
@@ -214,7 +239,9 @@ async fn handle_messages(
         Ok(None) => {
             return anthropic_error(
                 StatusCode::NOT_FOUND,
-                &format!("no enabled connection serves model '{requested}' — add one in Models → Providers"),
+                &format!(
+                "no enabled connection serves model '{requested}' — add one in Models → Providers"
+            ),
             )
         }
         Err(e) => return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -294,7 +321,9 @@ async fn handle_models(State(state): State<AppState>, headers: HeaderMap) -> Res
     let mut data: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for conn in conns.iter().filter(|c| c.enabled) {
-        let Some(desc) = registry::descriptor(&conn.provider) else { continue };
+        let Some(desc) = registry::descriptor(&conn.provider) else {
+            continue;
+        };
         for m in connections::effective_models(desc, conn) {
             let id = format!("{}/{}", conn.provider, m);
             if seen.insert(id.clone()) {
@@ -315,8 +344,12 @@ async fn handle_count_tokens(
     if let Err(r) = check_auth(&state, &headers, anthropic_error).await {
         return r;
     }
-    let chars = serde_json::to_string(&body["messages"]).map(|s| s.len()).unwrap_or(0)
-        + serde_json::to_string(&body["system"]).map(|s| s.len()).unwrap_or(0);
+    let chars = serde_json::to_string(&body["messages"])
+        .map(|s| s.len())
+        .unwrap_or(0)
+        + serde_json::to_string(&body["system"])
+            .map(|s| s.len())
+            .unwrap_or(0);
     Json(json!({"input_tokens": (chars / 4).max(1)})).into_response()
 }
 
@@ -330,8 +363,14 @@ async fn send_json(
     body: &Value,
     err: fn(StatusCode, &str) -> Response,
 ) -> Result<Value, Response> {
-    let req = upstream_request(state, target, body).map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
-    let resp = req.send().await.map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("upstream {}: {e}", target.conn.provider)))?;
+    let req = upstream_request(state, target, body)
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
+    let resp = req.send().await.map_err(|e| {
+        err(
+            StatusCode::BAD_GATEWAY,
+            &format!("upstream {}: {e}", target.conn.provider),
+        )
+    })?;
     let status = resp.status();
     let v: Value = resp.json().await.unwrap_or(json!({}));
     if !status.is_success() {
@@ -366,7 +405,12 @@ async fn proxy_passthrough(
     };
     let resp = match req.send().await {
         Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, &format!("upstream {}: {e}", target.conn.provider)),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream {}: {e}", target.conn.provider),
+            )
+        }
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ct = resp
@@ -460,9 +504,13 @@ async fn stream_openai_upstream_to_anthropic(
         Err(e) => return anthropic_error(StatusCode::BAD_GATEWAY, &e.to_string()),
     };
     if !resp.status().is_success() {
-        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let v: Value = resp.json().await.unwrap_or(json!({}));
-        let msg = v["error"]["message"].as_str().unwrap_or("upstream error").to_string();
+        let msg = v["error"]["message"]
+            .as_str()
+            .unwrap_or("upstream error")
+            .to_string();
         return anthropic_error(status, &format!("[{}] {msg}", target.conn.provider));
     }
     sse_response(spawn_openai_to_anthropic_pump(resp, model))
@@ -483,9 +531,13 @@ async fn stream_anthropic_upstream_to_openai(
         Err(e) => return openai_error(StatusCode::BAD_GATEWAY, &e.to_string()),
     };
     if !resp.status().is_success() {
-        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let v: Value = resp.json().await.unwrap_or(json!({}));
-        let msg = v["error"]["message"].as_str().unwrap_or("upstream error").to_string();
+        let msg = v["error"]["message"]
+            .as_str()
+            .unwrap_or("upstream error")
+            .to_string();
         return openai_error(status, &format!("[{}] {msg}", target.conn.provider));
     }
     sse_response(spawn_anthropic_to_openai_pump(resp))

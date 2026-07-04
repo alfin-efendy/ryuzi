@@ -99,14 +99,19 @@ async fn setup() -> (Arc<Store>, String, u16) {
     connections::add_connection(
         &store,
         connections::ConnectionRow {
-            id: "c1".into(), provider: "custom-openai".into(), auth_type: "api_key".into(),
-            label: "mock".into(), priority: 0, enabled: true,
+            id: "c1".into(),
+            provider: "custom-openai".into(),
+            auth_type: "api_key".into(),
+            label: "mock".into(),
+            priority: 0,
+            enabled: true,
             data: connections::ConnectionData {
                 api_key: Some("sk-up".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
             },
-            created_at: 1, updated_at: 1,
+            created_at: 1,
+            updated_at: 1,
         },
     )
     .await
@@ -114,7 +119,7 @@ async fn setup() -> (Arc<Store>, String, u16) {
     let key = keys::create_key(&store, "test").await.unwrap();
     let srv = RouterServer::new(store.clone());
     let port = srv.start(0).await.unwrap(); // 0 → ephemeral
-    // Keep the server alive for the test duration by leaking it.
+                                            // Keep the server alive for the test duration by leaking it.
     std::mem::forget(srv);
     (store, key.key, port)
 }
@@ -132,14 +137,19 @@ async fn setup_with_anthropic() -> (Arc<Store>, String, u16) {
     connections::add_connection(
         &store,
         connections::ConnectionRow {
-            id: "c1".into(), provider: "custom-openai".into(), auth_type: "api_key".into(),
-            label: "mock".into(), priority: 0, enabled: true,
+            id: "c1".into(),
+            provider: "custom-openai".into(),
+            auth_type: "api_key".into(),
+            label: "mock".into(),
+            priority: 0,
+            enabled: true,
             data: connections::ConnectionData {
                 api_key: Some("sk-up".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
             },
-            created_at: 1, updated_at: 1,
+            created_at: 1,
+            updated_at: 1,
         },
     )
     .await
@@ -147,14 +157,19 @@ async fn setup_with_anthropic() -> (Arc<Store>, String, u16) {
     connections::add_connection(
         &store,
         connections::ConnectionRow {
-            id: "c2".into(), provider: "custom-anthropic".into(), auth_type: "api_key".into(),
-            label: "mock-anthropic".into(), priority: 1, enabled: true,
+            id: "c2".into(),
+            provider: "custom-anthropic".into(),
+            auth_type: "api_key".into(),
+            label: "mock-anthropic".into(),
+            priority: 1,
+            enabled: true,
             data: connections::ConnectionData {
                 api_key: Some("sk-up2".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{anthropic_port}/v1")),
                 models_override: Some(vec!["mock-claude".into()]),
             },
-            created_at: 1, updated_at: 1,
+            created_at: 1,
+            updated_at: 1,
         },
     )
     .await
@@ -173,8 +188,10 @@ async fn anthropic_client_routes_to_openai_upstream() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("x-api-key", &key)
-        .json(&json!({"model": "custom-openai/mock-model", "max_tokens": 64,
-                      "messages": [{"role": "user", "content": "hi"}]}))
+        .json(
+            &json!({"model": "custom-openai/mock-model", "max_tokens": 64,
+                      "messages": [{"role": "user", "content": "hi"}]}),
+        )
         .send()
         .await
         .unwrap();
@@ -209,7 +226,9 @@ async fn missing_or_bad_key_is_rejected_in_client_format() {
     let r1 = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .json(&json!({"model": "x", "max_tokens": 1, "messages": []}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r1.status(), 401);
     let b1: serde_json::Value = r1.json().await.unwrap();
     assert_eq!(b1["type"], "error");
@@ -217,7 +236,9 @@ async fn missing_or_bad_key_is_rejected_in_client_format() {
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .header("authorization", "Bearer ryz-wrong")
         .json(&json!({"model": "x", "messages": []}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r2.status(), 401);
     let b2: serde_json::Value = r2.json().await.unwrap();
     assert!(b2.get("error").is_some());
@@ -232,12 +253,19 @@ async fn unknown_model_is_404_and_models_lists_connections() {
         .header("x-api-key", &key)
         .json(&json!({"model": "nope/nope", "max_tokens": 1,
                       "messages": [{"role": "user", "content": "hi"}]}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 404);
     let m: serde_json::Value = client
         .get(format!("http://127.0.0.1:{port}/v1/models"))
         .header("x-api-key", &key)
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(m["data"][0]["id"], "custom-openai/mock-model");
 }
 
@@ -250,7 +278,12 @@ async fn count_tokens_estimates_locally() {
         .header("x-api-key", &key)
         .json(&json!({"model": "custom-openai/mock-model",
                       "messages": [{"role": "user", "content": "abcdefgh"}]}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert!(r["input_tokens"].as_i64().unwrap() >= 2);
 }
 
@@ -261,8 +294,10 @@ async fn anthropic_client_streams_from_openai_upstream() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("x-api-key", &key)
-        .json(&json!({"model": "custom-openai/mock-model", "max_tokens": 64, "stream": true,
-                      "messages": [{"role": "user", "content": "hi"}]}))
+        .json(
+            &json!({"model": "custom-openai/mock-model", "max_tokens": 64, "stream": true,
+                      "messages": [{"role": "user", "content": "hi"}]}),
+        )
         .send()
         .await
         .unwrap();
@@ -273,28 +308,63 @@ async fn anthropic_client_streams_from_openai_upstream() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    assert!(ct.starts_with("text/event-stream"), "unexpected content-type: {ct}");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "unexpected content-type: {ct}"
+    );
     // The mock upstream sends the whole SSE fixture as one chunk, and the
     // pump task finishes writing before the client-side stream ends — so a
     // plain `.text()` read is enough to observe the full translated body.
     let body = resp.text().await.unwrap();
 
-    let idx_start = body.find("event: message_start").expect("message_start missing");
-    let idx_cb_start = body.find("event: content_block_start").expect("content_block_start missing");
-    let idx_he = body.find("\"text\":\"He\"").expect("\"He\" text_delta missing");
-    let idx_llo = body.find("\"text\":\"llo\"").expect("\"llo\" text_delta missing");
-    let idx_cb_stop = body.find("event: content_block_stop").expect("content_block_stop missing");
-    let idx_msg_delta = body.find("event: message_delta").expect("message_delta missing");
-    assert!(body.contains("\"stop_reason\":\"end_turn\""), "body: {body}");
+    let idx_start = body
+        .find("event: message_start")
+        .expect("message_start missing");
+    let idx_cb_start = body
+        .find("event: content_block_start")
+        .expect("content_block_start missing");
+    let idx_he = body
+        .find("\"text\":\"He\"")
+        .expect("\"He\" text_delta missing");
+    let idx_llo = body
+        .find("\"text\":\"llo\"")
+        .expect("\"llo\" text_delta missing");
+    let idx_cb_stop = body
+        .find("event: content_block_stop")
+        .expect("content_block_stop missing");
+    let idx_msg_delta = body
+        .find("event: message_delta")
+        .expect("message_delta missing");
+    assert!(
+        body.contains("\"stop_reason\":\"end_turn\""),
+        "body: {body}"
+    );
     assert!(body.contains("\"output_tokens\":3"), "body: {body}");
-    let idx_msg_stop = body.find("event: message_stop").expect("message_stop missing");
+    let idx_msg_stop = body
+        .find("event: message_stop")
+        .expect("message_stop missing");
 
-    assert!(idx_start < idx_cb_start, "message_start must precede content_block_start");
-    assert!(idx_cb_start < idx_he, "content_block_start must precede first text_delta");
+    assert!(
+        idx_start < idx_cb_start,
+        "message_start must precede content_block_start"
+    );
+    assert!(
+        idx_cb_start < idx_he,
+        "content_block_start must precede first text_delta"
+    );
     assert!(idx_he < idx_llo, "\"He\" delta must precede \"llo\" delta");
-    assert!(idx_llo < idx_cb_stop, "text deltas must precede content_block_stop");
-    assert!(idx_cb_stop < idx_msg_delta, "content_block_stop must precede message_delta");
-    assert!(idx_msg_delta < idx_msg_stop, "message_delta must precede message_stop");
+    assert!(
+        idx_llo < idx_cb_stop,
+        "text deltas must precede content_block_stop"
+    );
+    assert!(
+        idx_cb_stop < idx_msg_delta,
+        "content_block_stop must precede message_delta"
+    );
+    assert!(
+        idx_msg_delta < idx_msg_stop,
+        "message_delta must precede message_stop"
+    );
 }
 
 #[tokio::test]
@@ -304,8 +374,10 @@ async fn openai_client_streams_from_anthropic_upstream() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .header("authorization", format!("Bearer {key}"))
-        .json(&json!({"model": "custom-anthropic/mock-claude", "stream": true,
-                      "messages": [{"role": "user", "content": "hi"}]}))
+        .json(
+            &json!({"model": "custom-anthropic/mock-claude", "stream": true,
+                      "messages": [{"role": "user", "content": "hi"}]}),
+        )
         .send()
         .await
         .unwrap();
@@ -316,17 +388,35 @@ async fn openai_client_streams_from_anthropic_upstream() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    assert!(ct.starts_with("text/event-stream"), "unexpected content-type: {ct}");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "unexpected content-type: {ct}"
+    );
     let body = resp.text().await.unwrap();
 
-    let idx_role = body.find("\"role\":\"assistant\"").expect("role chunk missing");
-    let idx_content = body.find("\"content\":\"Hi\"").expect("content chunk missing");
-    let idx_finish = body.find("\"finish_reason\":\"stop\"").expect("finish_reason chunk missing");
+    let idx_role = body
+        .find("\"role\":\"assistant\"")
+        .expect("role chunk missing");
+    let idx_content = body
+        .find("\"content\":\"Hi\"")
+        .expect("content chunk missing");
+    let idx_finish = body
+        .find("\"finish_reason\":\"stop\"")
+        .expect("finish_reason chunk missing");
     let idx_done = body.find("data: [DONE]").expect("[DONE] missing");
 
-    assert!(idx_role < idx_content, "role chunk must precede content chunk");
-    assert!(idx_content < idx_finish, "content chunk must precede finish_reason chunk");
-    assert!(idx_finish < idx_done, "finish_reason chunk must precede [DONE]");
+    assert!(
+        idx_role < idx_content,
+        "role chunk must precede content chunk"
+    );
+    assert!(
+        idx_content < idx_finish,
+        "content chunk must precede finish_reason chunk"
+    );
+    assert!(
+        idx_finish < idx_done,
+        "finish_reason chunk must precede [DONE]"
+    );
 }
 
 /// Claude Code posts multi-MB conversations (base64 images) to /v1/messages;
@@ -339,8 +429,10 @@ async fn large_bodies_are_accepted() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("x-api-key", &key)
-        .json(&json!({"model": "custom-openai/mock-model", "max_tokens": 8,
-                      "messages": [{"role": "user", "content": big_content}]}))
+        .json(
+            &json!({"model": "custom-openai/mock-model", "max_tokens": 8,
+                      "messages": [{"role": "user", "content": big_content}]}),
+        )
         .send()
         .await
         .unwrap();
@@ -366,7 +458,10 @@ async fn passthrough_streaming_preserves_sse() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    assert!(ct.starts_with("text/event-stream"), "unexpected content-type: {ct}");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "unexpected content-type: {ct}"
+    );
     let body = resp.text().await.unwrap();
     assert!(body.contains("He"), "body: {body}");
     assert!(body.contains("llo"), "body: {body}");

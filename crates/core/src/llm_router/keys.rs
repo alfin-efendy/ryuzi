@@ -33,9 +33,12 @@ fn row_to_key(r: &Row) -> rusqlite::Result<EndpointKey> {
 pub async fn list_keys(store: &Store) -> anyhow::Result<Vec<EndpointKey>> {
     store
         .with_conn(|c| -> rusqlite::Result<Vec<EndpointKey>> {
-            let mut stmt =
-                c.prepare(&format!("SELECT {COLS} FROM endpoint_keys ORDER BY created_at ASC"))?;
-            let items = stmt.query_map([], row_to_key)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT {COLS} FROM endpoint_keys ORDER BY created_at ASC"
+            ))?;
+            let items = stmt
+                .query_map([], row_to_key)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })
         .await
@@ -66,7 +69,8 @@ pub async fn revoke_key(store: &Store, id: &str) -> anyhow::Result<()> {
     let id = id.to_string();
     store
         .with_conn(move |c| {
-            c.execute("DELETE FROM endpoint_keys WHERE id=?1", params![id]).map(|_| ())
+            c.execute("DELETE FROM endpoint_keys WHERE id=?1", params![id])
+                .map(|_| ())
         })
         .await
 }

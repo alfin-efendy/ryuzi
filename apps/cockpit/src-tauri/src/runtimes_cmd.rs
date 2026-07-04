@@ -66,7 +66,8 @@ struct Snapshot {
 
 async fn read_snapshots(cp: &ControlPlane) -> std::collections::HashMap<String, Snapshot> {
     let raw = cp.store().get_setting(SNAPSHOT_KEY).await.ok().flatten();
-    raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
@@ -115,7 +116,9 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
             // Zero-config default: detected agents start enabled.
             enabled: cfg.map(|c| c.enabled).unwrap_or(detected),
             model,
-            perm_mode: cfg.map(|c| c.perm_mode.clone()).unwrap_or_else(|| "ask".into()),
+            perm_mode: cfg
+                .map(|c| c.perm_mode.clone())
+                .unwrap_or_else(|| "ask".into()),
             flags: cfg.map(|c| c.flags.clone()).unwrap_or_default(),
             tiers,
             is_default: default_agent == desc.id,
@@ -218,7 +221,10 @@ pub async fn set_runtime_tier(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn set_default_runtime(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<RuntimeInfo>> {
+pub async fn set_default_runtime(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+) -> R<Vec<RuntimeInfo>> {
     cp.store().set_setting("default_agent", &id).await?;
     Ok(assemble(&cp).await?)
 }
@@ -281,7 +287,9 @@ pub struct RuntimeMappingArg {
 }
 
 fn home() -> Result<std::path::PathBuf, CmdError> {
-    dirs::home_dir().ok_or_else(|| CmdError { message: "cannot resolve home directory".into() })
+    dirs::home_dir().ok_or_else(|| CmdError {
+        message: "cannot resolve home directory".into(),
+    })
 }
 
 fn status_of(id: &str, home: &std::path::Path) -> Result<RuntimeConfigStatusInfo, CmdError> {
@@ -293,16 +301,24 @@ fn status_of(id: &str, home: &std::path::Path) -> Result<RuntimeConfigStatusInfo
     };
     Ok(match st {
         Some(s) => RuntimeConfigStatusInfo {
-            config_path: s.config_path, exists: s.exists, configured: s.configured, supported: true,
+            config_path: s.config_path,
+            exists: s.exists,
+            configured: s.configured,
+            supported: true,
         },
         None => RuntimeConfigStatusInfo {
-            config_path: String::new(), exists: false, configured: false, supported: false,
+            config_path: String::new(),
+            exists: false,
+            configured: false,
+            supported: false,
         },
     })
 }
 
 fn err(e: anyhow::Error) -> CmdError {
-    CmdError { message: e.to_string() }
+    CmdError {
+        message: e.to_string(),
+    }
 }
 
 #[tauri::command]
@@ -324,7 +340,8 @@ pub async fn apply_runtime_config(
     let st = srv.status();
     if !st.running {
         return Err(CmdError {
-            message: "The endpoint server is not running. Start it in Models → Endpoint first.".into(),
+            message: "The endpoint server is not running. Start it in Models → Endpoint first."
+                .into(),
         });
     }
     let key = keys::first_key(cp.store())
@@ -335,7 +352,9 @@ pub async fn apply_runtime_config(
         })?;
     if mapping.model.trim().is_empty() {
         return Err(CmdError {
-            message: "No model selected. Add an enabled provider connection in Models → Providers first.".into(),
+            message:
+                "No model selected. Add an enabled provider connection in Models → Providers first."
+                    .into(),
         });
     }
     let ep = EndpointInfo {
@@ -355,7 +374,9 @@ pub async fn apply_runtime_config(
         "codex" => runtime_config::codex_apply(&home, &ep, &m).map_err(err)?,
         "opencode" => runtime_config::opencode_apply(&home, &ep, &m).map_err(err)?,
         other => {
-            return Err(CmdError { message: format!("config apply is not supported for '{other}' yet") })
+            return Err(CmdError {
+                message: format!("config apply is not supported for '{other}' yet"),
+            })
         }
     }
     status_of(&id, &home)
@@ -370,7 +391,9 @@ pub async fn reset_runtime_config(id: String) -> Result<RuntimeConfigStatusInfo,
         "codex" => runtime_config::codex_reset(&home).map_err(err)?,
         "opencode" => runtime_config::opencode_reset(&home).map_err(err)?,
         other => {
-            return Err(CmdError { message: format!("config apply is not supported for '{other}' yet") })
+            return Err(CmdError {
+                message: format!("config apply is not supported for '{other}' yet"),
+            })
         }
     }
     status_of(&id, &home)

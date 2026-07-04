@@ -41,7 +41,11 @@ pub async fn configured_port(cp: &ControlPlane) -> u16 {
 
 async fn status_info(cp: &ControlPlane, srv: &RouterServer) -> EndpointStatusInfo {
     let st = srv.status();
-    let port = if st.running { st.port } else { configured_port(cp).await };
+    let port = if st.running {
+        st.port
+    } else {
+        configured_port(cp).await
+    };
     let autostart = cp
         .store()
         .get_setting("endpoint_autostart")
@@ -74,7 +78,9 @@ pub async fn start_endpoint(
     srv: State<'_, Arc<RouterServer>>,
 ) -> R<EndpointStatusInfo> {
     let port = configured_port(&cp).await;
-    srv.start(port).await.map_err(|e| CmdError { message: e.to_string() })?;
+    srv.start(port).await.map_err(|e| CmdError {
+        message: e.to_string(),
+    })?;
     Ok(status_info(&cp, &srv).await)
 }
 
@@ -97,12 +103,16 @@ pub async fn set_endpoint_config(
     port: u16,
     autostart: bool,
 ) -> R<EndpointStatusInfo> {
-    cp.store().set_setting("endpoint_port", &port.to_string()).await?;
+    cp.store()
+        .set_setting("endpoint_port", &port.to_string())
+        .await?;
     cp.store()
         .set_setting("endpoint_autostart", if autostart { "1" } else { "0" })
         .await?;
     if srv.status().running {
-        srv.start(port).await.map_err(|e| CmdError { message: e.to_string() })?;
+        srv.start(port).await.map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
     }
     Ok(status_info(&cp, &srv).await)
 }
@@ -120,7 +130,11 @@ fn to_key_info(k: keys::EndpointKey) -> EndpointKeyInfo {
 #[tauri::command]
 #[specta::specta]
 pub async fn list_endpoint_keys(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<EndpointKeyInfo>> {
-    Ok(keys::list_keys(cp.store()).await?.into_iter().map(to_key_info).collect())
+    Ok(keys::list_keys(cp.store())
+        .await?
+        .into_iter()
+        .map(to_key_info)
+        .collect())
 }
 
 #[tauri::command]
@@ -130,7 +144,11 @@ pub async fn create_endpoint_key(
     name: String,
 ) -> R<Vec<EndpointKeyInfo>> {
     keys::create_key(cp.store(), &name).await?;
-    Ok(keys::list_keys(cp.store()).await?.into_iter().map(to_key_info).collect())
+    Ok(keys::list_keys(cp.store())
+        .await?
+        .into_iter()
+        .map(to_key_info)
+        .collect())
 }
 
 #[tauri::command]
@@ -140,5 +158,9 @@ pub async fn revoke_endpoint_key(
     id: String,
 ) -> R<Vec<EndpointKeyInfo>> {
     keys::revoke_key(cp.store(), &id).await?;
-    Ok(keys::list_keys(cp.store()).await?.into_iter().map(to_key_info).collect())
+    Ok(keys::list_keys(cp.store())
+        .await?
+        .into_iter()
+        .map(to_key_info)
+        .collect())
 }

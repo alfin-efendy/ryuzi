@@ -70,8 +70,12 @@ fn read_json(path: &Path) -> anyhow::Result<Value> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(&strip_trailing_commas(&raw))
-        .map_err(|e| anyhow::anyhow!("refusing to modify unparseable config {}: {e}", path.display()))
+    serde_json::from_str(&strip_trailing_commas(&raw)).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to modify unparseable config {}: {e}",
+            path.display()
+        )
+    })
 }
 
 fn write_json(path: &Path, v: &Value) -> anyhow::Result<()> {
@@ -89,7 +93,10 @@ fn write_json(path: &Path, v: &Value) -> anyhow::Result<()> {
 /// is safer and simpler to reason about than silently replacing it.
 fn root_object<'a>(v: &'a mut Value, path: &Path) -> anyhow::Result<&'a mut Map<String, Value>> {
     v.as_object_mut().ok_or_else(|| {
-        anyhow::anyhow!("refusing to modify {}: top-level JSON is not an object", path.display())
+        anyhow::anyhow!(
+            "refusing to modify {}: top-level JSON is not an object",
+            path.display()
+        )
     })
 }
 
@@ -132,7 +139,11 @@ pub fn claude_status(home: &Path) -> anyhow::Result<ConfigStatus> {
     } else {
         false
     };
-    Ok(ConfigStatus { config_path: path.display().to_string(), exists, configured })
+    Ok(ConfigStatus {
+        config_path: path.display().to_string(),
+        exists,
+        configured,
+    })
 }
 
 pub fn claude_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> anyhow::Result<()> {
@@ -195,15 +206,19 @@ pub fn codex_status(home: &Path) -> anyhow::Result<ConfigStatus> {
     } else {
         false
     };
-    Ok(ConfigStatus { config_path: path.display().to_string(), exists, configured })
+    Ok(ConfigStatus {
+        config_path: path.display().to_string(),
+        exists,
+        configured,
+    })
 }
 
 pub fn codex_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> anyhow::Result<()> {
     let path = codex_cfg_path(home);
     let mut doc: toml_edit::DocumentMut = if path.exists() {
-        std::fs::read_to_string(&path)?
-            .parse()
-            .map_err(|e| anyhow::anyhow!("refusing to modify unparseable {}: {e}", path.display()))?
+        std::fs::read_to_string(&path)?.parse().map_err(|e| {
+            anyhow::anyhow!("refusing to modify unparseable {}: {e}", path.display())
+        })?
     } else {
         toml_edit::DocumentMut::new()
     };
@@ -211,7 +226,10 @@ pub fn codex_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> anyhow
     // `doc["model_providers"]["ryuzi"] = ..` below panics if model_providers
     // exists but isn't a table, so refuse up front — before any write, same
     // as the unparseable-doc / corrupt-auth.json guards.
-    if doc.get("model_providers").is_some_and(|item| item.as_table().is_none()) {
+    if doc
+        .get("model_providers")
+        .is_some_and(|item| item.as_table().is_none())
+    {
         return Err(anyhow::anyhow!(
             "refusing to modify {}: model_providers is not a table",
             path.display()
@@ -250,7 +268,10 @@ pub fn codex_reset(home: &Path) -> anyhow::Result<()> {
     let mut auth_pending: Option<Value> = None;
     if auth_path.exists() {
         let mut auth = read_json(&auth_path)?;
-        let is_ours = auth["OPENAI_API_KEY"].as_str().map(|k| k.starts_with("ryz-")).unwrap_or(false);
+        let is_ours = auth["OPENAI_API_KEY"]
+            .as_str()
+            .map(|k| k.starts_with("ryz-"))
+            .unwrap_or(false);
         if is_ours {
             root_object(&mut auth, &auth_path)?.remove("OPENAI_API_KEY");
             auth_pending = Some(auth);
@@ -265,7 +286,10 @@ pub fn codex_reset(home: &Path) -> anyhow::Result<()> {
             doc.remove("model_provider");
             doc.remove("model");
         }
-        if let Some(mp) = doc.get_mut("model_providers").and_then(|i| i.as_table_mut()) {
+        if let Some(mp) = doc
+            .get_mut("model_providers")
+            .and_then(|i| i.as_table_mut())
+        {
             mp.remove("ryuzi");
             if mp.is_empty() {
                 doc.remove("model_providers");
@@ -295,7 +319,11 @@ pub fn opencode_status(home: &Path) -> anyhow::Result<ConfigStatus> {
     } else {
         false
     };
-    Ok(ConfigStatus { config_path: path.display().to_string(), exists, configured })
+    Ok(ConfigStatus {
+        config_path: path.display().to_string(),
+        exists,
+        configured,
+    })
 }
 
 pub fn opencode_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> anyhow::Result<()> {
@@ -336,7 +364,11 @@ pub fn opencode_reset(home: &Path) -> anyhow::Result<()> {
             changed = true;
         }
     }
-    let ours = root.get("model").and_then(Value::as_str).map(|s| s.starts_with("ryuzi/")).unwrap_or(false);
+    let ours = root
+        .get("model")
+        .and_then(Value::as_str)
+        .map(|s| s.starts_with("ryuzi/"))
+        .unwrap_or(false);
     if ours {
         root.remove("model");
         changed = true;
@@ -353,7 +385,10 @@ mod tests {
     use serde_json::json;
 
     fn ep() -> EndpointInfo {
-        EndpointInfo { base_url: "http://127.0.0.1:21128".into(), api_key: "ryz-abc".into() }
+        EndpointInfo {
+            base_url: "http://127.0.0.1:21128".into(),
+            api_key: "ryz-abc".into(),
+        }
     }
 
     fn mapping() -> RuntimeMapping {
@@ -369,7 +404,10 @@ mod tests {
     #[test]
     fn strip_trailing_commas_respects_strings() {
         assert_eq!(strip_trailing_commas(r#"{"a": 1,}"#), r#"{"a": 1}"#);
-        assert_eq!(strip_trailing_commas(r#"{"a": [1, 2,],}"#), r#"{"a": [1, 2]}"#);
+        assert_eq!(
+            strip_trailing_commas(r#"{"a": [1, 2,],}"#),
+            r#"{"a": [1, 2]}"#
+        );
         // commas inside strings survive
         assert_eq!(strip_trailing_commas(r#"{"a": "x,}"}"#), r#"{"a": "x,}"}"#);
     }
@@ -389,9 +427,12 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:21128");
         assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], "ryz-abc");
-        assert_eq!(v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "anthropic/claude-opus-4-5");
-        assert_eq!(v["env"]["KEEP"], "1");       // user's env preserved
-        assert_eq!(v["theme"], "dark");           // user's settings preserved
+        assert_eq!(
+            v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            "anthropic/claude-opus-4-5"
+        );
+        assert_eq!(v["env"]["KEEP"], "1"); // user's env preserved
+        assert_eq!(v["theme"], "dark"); // user's settings preserved
         assert!(claude_status(home.path()).unwrap().configured);
 
         claude_reset(home.path()).unwrap();
@@ -430,7 +471,10 @@ mod tests {
 
         codex_apply(home.path(), &ep(), &mapping()).unwrap();
         let text = std::fs::read_to_string(&cfg).unwrap();
-        assert!(text.contains("# user comment"), "toml_edit must preserve comments");
+        assert!(
+            text.contains("# user comment"),
+            "toml_edit must preserve comments"
+        );
         assert!(text.contains("model_provider = \"ryuzi\""));
         assert!(text.contains("base_url = \"http://127.0.0.1:21128/v1\""));
         assert!(text.contains("wire_api = \"chat\""));
@@ -460,7 +504,10 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["provider"]["ryuzi"]["npm"], "@ai-sdk/openai-compatible");
-        assert_eq!(v["provider"]["ryuzi"]["options"]["baseURL"], "http://127.0.0.1:21128/v1");
+        assert_eq!(
+            v["provider"]["ryuzi"]["options"]["baseURL"],
+            "http://127.0.0.1:21128/v1"
+        );
         assert_eq!(v["provider"]["ryuzi"]["options"]["apiKey"], "ryz-abc");
         assert_eq!(v["model"], "ryuzi/anthropic/claude-sonnet-4-5");
         assert!(v["provider"]["ryuzi"]["models"]["anthropic/claude-sonnet-4-5"].is_object());

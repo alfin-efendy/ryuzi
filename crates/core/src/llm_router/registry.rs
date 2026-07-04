@@ -49,91 +49,174 @@ use ProviderCategory::*;
 
 pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
-        id: "anthropic", name: "Anthropic", color: "#D97757", initial: "A",
-        category: ApiKey, format: ApiFormat::Anthropic,
-        base_url: Some("https://api.anthropic.com/v1"), auth: AuthScheme::XApiKey,
+        id: "anthropic",
+        name: "Anthropic",
+        color: "#D97757",
+        initial: "A",
+        category: ApiKey,
+        format: ApiFormat::Anthropic,
+        base_url: Some("https://api.anthropic.com/v1"),
+        auth: AuthScheme::XApiKey,
         models: &["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"],
         requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "openai", name: "OpenAI", color: "#0FA47F", initial: "O",
-        category: ApiKey, format: ApiFormat::OpenAi,
-        base_url: Some("https://api.openai.com/v1"), auth: AuthScheme::Bearer,
+        id: "openai",
+        name: "OpenAI",
+        color: "#0FA47F",
+        initial: "O",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://api.openai.com/v1"),
+        auth: AuthScheme::Bearer,
         models: &["gpt-5.2", "gpt-5.2-codex", "o5-mini"],
         requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "openrouter", name: "OpenRouter", color: "#6E56CF", initial: "R",
-        category: ApiKey, format: ApiFormat::OpenAi,
-        base_url: Some("https://openrouter.ai/api/v1"), auth: AuthScheme::Bearer,
-        models: &[], requires_base_url: false,
+        id: "openrouter",
+        name: "OpenRouter",
+        color: "#6E56CF",
+        initial: "R",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://openrouter.ai/api/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "groq", name: "Groq", color: "#F55036", initial: "G",
-        category: ApiKey, format: ApiFormat::OpenAi,
-        base_url: Some("https://api.groq.com/openai/v1"), auth: AuthScheme::Bearer,
-        models: &[], requires_base_url: false,
+        id: "groq",
+        name: "Groq",
+        color: "#F55036",
+        initial: "G",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://api.groq.com/openai/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "deepseek", name: "DeepSeek", color: "#4D6BFE", initial: "D",
-        category: ApiKey, format: ApiFormat::OpenAi,
-        base_url: Some("https://api.deepseek.com/v1"), auth: AuthScheme::Bearer,
-        models: &["deepseek-chat", "deepseek-reasoner"], requires_base_url: false,
+        id: "deepseek",
+        name: "DeepSeek",
+        color: "#4D6BFE",
+        initial: "D",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://api.deepseek.com/v1"),
+        auth: AuthScheme::Bearer,
+        models: &["deepseek-chat", "deepseek-reasoner"],
+        requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "mistral", name: "Mistral", color: "#FA5111", initial: "M",
-        category: ApiKey, format: ApiFormat::OpenAi,
-        base_url: Some("https://api.mistral.ai/v1"), auth: AuthScheme::Bearer,
-        models: &[], requires_base_url: false,
+        id: "mistral",
+        name: "Mistral",
+        color: "#FA5111",
+        initial: "M",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://api.mistral.ai/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "xai", name: "xAI", color: "#9CA3AF", initial: "X",
-        category: ApiKey, format: ApiFormat::OpenAi,
-        base_url: Some("https://api.x.ai/v1"), auth: AuthScheme::Bearer,
-        models: &[], requires_base_url: false,
+        id: "xai",
+        name: "xAI",
+        color: "#9CA3AF",
+        initial: "X",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://api.x.ai/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "google", name: "Google (Gemini)", color: "#4285F4", initial: "G",
-        category: ApiKey, format: ApiFormat::OpenAi,
+        id: "google",
+        name: "Google (Gemini)",
+        color: "#4285F4",
+        initial: "G",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
         base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
         auth: AuthScheme::Bearer,
-        models: &["gemini-3.0-pro", "gemini-3.0-flash"], requires_base_url: false,
+        models: &["gemini-3.0-pro", "gemini-3.0-flash"],
+        requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "ollama", name: "Ollama (local)", color: "#8B8B8B", initial: "L",
-        category: ApiKey, format: ApiFormat::OpenAi,
-        base_url: Some("http://127.0.0.1:11434/v1"), auth: AuthScheme::None,
-        models: &[], requires_base_url: false,
+        id: "ollama",
+        name: "Ollama (local)",
+        color: "#8B8B8B",
+        initial: "L",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("http://127.0.0.1:11434/v1"),
+        auth: AuthScheme::None,
+        models: &[],
+        requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "custom-openai", name: "Custom (OpenAI-compatible)", color: "#8B8B8B",
-        initial: "C", category: ApiKey, format: ApiFormat::OpenAi,
-        base_url: None, auth: AuthScheme::Bearer, models: &[], requires_base_url: true,
+        id: "custom-openai",
+        name: "Custom (OpenAI-compatible)",
+        color: "#8B8B8B",
+        initial: "C",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: None,
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: true,
     },
     ProviderDescriptor {
-        id: "custom-anthropic", name: "Custom (Anthropic-compatible)", color: "#8B8B8B",
-        initial: "C", category: ApiKey, format: ApiFormat::Anthropic,
-        base_url: None, auth: AuthScheme::XApiKey, models: &[], requires_base_url: true,
+        id: "custom-anthropic",
+        name: "Custom (Anthropic-compatible)",
+        color: "#8B8B8B",
+        initial: "C",
+        category: ApiKey,
+        format: ApiFormat::Anthropic,
+        base_url: None,
+        auth: AuthScheme::XApiKey,
+        models: &[],
+        requires_base_url: true,
     },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
     // Not connectable in F1 (add_connection refuses non-ApiKey categories).
     ProviderDescriptor {
-        id: "anthropic-oauth", name: "Anthropic (Claude subscription)", color: "#D97757",
-        initial: "A", category: OAuth, format: ApiFormat::Anthropic,
-        base_url: Some("https://api.anthropic.com/v1"), auth: AuthScheme::Bearer,
-        models: &[], requires_base_url: false,
+        id: "anthropic-oauth",
+        name: "Anthropic (Claude subscription)",
+        color: "#D97757",
+        initial: "A",
+        category: OAuth,
+        format: ApiFormat::Anthropic,
+        base_url: Some("https://api.anthropic.com/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "openai-oauth", name: "OpenAI (ChatGPT)", color: "#0FA47F",
-        initial: "O", category: OAuth, format: ApiFormat::OpenAi,
-        base_url: Some("https://api.openai.com/v1"), auth: AuthScheme::Bearer,
-        models: &[], requires_base_url: false,
+        id: "openai-oauth",
+        name: "OpenAI (ChatGPT)",
+        color: "#0FA47F",
+        initial: "O",
+        category: OAuth,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://api.openai.com/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
     },
     ProviderDescriptor {
-        id: "kiro", name: "Kiro (free tier)", color: "#7C3AED",
-        initial: "K", category: Free, format: ApiFormat::OpenAi,
-        base_url: None, auth: AuthScheme::Bearer,
-        models: &[], requires_base_url: true,
+        id: "kiro",
+        name: "Kiro (free tier)",
+        color: "#7C3AED",
+        initial: "K",
+        category: Free,
+        format: ApiFormat::OpenAi,
+        base_url: None,
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: true,
     },
 ];
 
@@ -161,7 +244,10 @@ mod tests {
 
     #[test]
     fn descriptor_lookup_works() {
-        assert_eq!(descriptor("anthropic").unwrap().format, ApiFormat::Anthropic);
+        assert_eq!(
+            descriptor("anthropic").unwrap().format,
+            ApiFormat::Anthropic
+        );
         assert_eq!(descriptor("openai").unwrap().format, ApiFormat::OpenAi);
         assert!(descriptor("nope").is_none());
     }
@@ -170,7 +256,10 @@ mod tests {
     fn f1_catalog_is_api_key_only_active() {
         // OAuth/free entries may exist but must be marked by category so the
         // UI can grey them out; every ApiKey entry must be usable.
-        for d in CATALOG.iter().filter(|d| d.category == ProviderCategory::ApiKey) {
+        for d in CATALOG
+            .iter()
+            .filter(|d| d.category == ProviderCategory::ApiKey)
+        {
             assert!(d.requires_base_url || d.base_url.is_some());
         }
     }
@@ -179,7 +268,9 @@ mod tests {
     fn catalog_has_oauth_and_free_teasers() {
         // Phase 1 shows OAuth/Free entries in the catalog, greyed "Coming
         // soon" in the UI; add_connection refuses to activate them.
-        assert!(CATALOG.iter().any(|d| d.category == ProviderCategory::OAuth));
+        assert!(CATALOG
+            .iter()
+            .any(|d| d.category == ProviderCategory::OAuth));
         assert!(CATALOG.iter().any(|d| d.category == ProviderCategory::Free));
     }
 }
