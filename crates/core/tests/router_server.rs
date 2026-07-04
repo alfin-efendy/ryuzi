@@ -544,9 +544,8 @@ async fn mock_clean_eof_no_terminal_openai_upstream() -> (u16, tokio::task::Join
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|_body: axum::extract::Json<serde_json::Value>| async move {
-            let sse = concat!(
-                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"He\"}}]}\n\n",
-            );
+            let sse =
+                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"He\"}}]}\n\n";
             Response::builder()
                 .status(200)
                 .header(header::CONTENT_TYPE, "text/event-stream")
