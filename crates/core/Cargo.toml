@@ -22,7 +22,7 @@ rusqlite_migration = "1.2"
 # Local worktree/init/commit only — clones go through the git CLI
 # (provision_project), so the https/ssh default features (openssl-sys) are
 # dead weight and the main obstacle to zigbuild cross-compilation.
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 anyhow = "1"
