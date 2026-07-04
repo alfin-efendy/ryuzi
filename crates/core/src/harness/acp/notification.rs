@@ -393,4 +393,27 @@ mod tests {
         assert_eq!(tc.payload["output"], "output text");
         assert_eq!(tc.tool_kind.as_deref(), Some("execute"));
     }
+
+    #[tokio::test]
+    async fn user_turn_is_broadcast_live() {
+        use crate::domain::CoreEvent;
+
+        let (_store, _session_pk, events) =
+            crate::harness::acp::testkit::run_via_harness_trait_collecting_events("hello there")
+                .await;
+
+        let user = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::Message { role, block_type, payload, seq, .. }
+                    if role == "user" && block_type == "text" =>
+                {
+                    Some((payload.clone(), *seq))
+                }
+                _ => None,
+            })
+            .expect("expected a live user-turn Message event");
+        assert_eq!(user.0["text"], "hello there");
+        assert!(user.1 >= 1, "user turn must carry a real DB seq");
+    }
 }
