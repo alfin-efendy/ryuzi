@@ -516,6 +516,16 @@ impl OpenAiToAnthropicStream {
         out.push(("message_stop".into(), json!({"type": "message_stop"})));
         out
     }
+
+    /// Terminal error event in Anthropic SSE shape. Emit this INSTEAD of
+    /// `finish()` when the upstream stream errored mid-flight; do not follow
+    /// it with `message_stop`.
+    pub fn error_frame(&self, message: &str) -> Vec<(String, Value)> {
+        vec![(
+            "error".into(),
+            json!({"type": "error", "error": {"type": "api_error", "message": message}}),
+        )]
+    }
 }
 
 /// Upstream Anthropic SSE events → OpenAI chunks (client called
@@ -627,6 +637,12 @@ impl AnthropicToOpenAiStream {
     /// True once message_stop arrived — caller then emits `data: [DONE]`.
     pub fn finish(&self) -> bool {
         self.done
+    }
+
+    /// Terminal error chunk in OpenAI shape. Emit this INSTEAD of the normal
+    /// finish chunk + `[DONE]` when the upstream stream errored mid-flight.
+    pub fn error_frame(&self, message: &str) -> Value {
+        json!({"error": {"message": message, "type": "api_error"}})
     }
 }
 
@@ -988,5 +1004,24 @@ mod tests {
         // finish chunk
         let last = chunks.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn openai_to_anthropic_error_frame_is_anthropic_shaped() {
+        let s = OpenAiToAnthropicStream::new("m");
+        let ev = s.error_frame("upstream stream interrupted: boom");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].0, "error");
+        assert_eq!(ev[0].1["type"], "error");
+        assert_eq!(ev[0].1["error"]["type"], "api_error");
+        assert_eq!(ev[0].1["error"]["message"], "upstream stream interrupted: boom");
+    }
+
+    #[test]
+    fn anthropic_to_openai_error_frame_is_openai_shaped() {
+        let s = AnthropicToOpenAiStream::new();
+        let chunk = s.error_frame("upstream stream interrupted: boom");
+        assert_eq!(chunk["error"]["message"], "upstream stream interrupted: boom");
+        assert_eq!(chunk["error"]["type"], "api_error");
     }
 }
