@@ -403,6 +403,65 @@ pub struct SessionDefaults {
     pub perm_mode: Option<PermMode>,
 }
 
+/// Build the npm argv for updating `pkg` (separated for testability).
+pub fn npm_update_argv(pkg: &str) -> Vec<String> {
+    vec!["install".into(), "-g".into(), format!("{pkg}@latest")]
+}
+
+/// Run `npm install -g <pkg>@latest`, streaming each output line as a
+/// RuntimeUpdateLog event. Returns Ok(exit_success).
+pub async fn run_npm_update(
+    events: tokio::sync::broadcast::Sender<crate::domain::CoreEvent>,
+    id: &str,
+    pkg: &str,
+) -> anyhow::Result<bool> {
+    use tokio::io::AsyncBufReadExt;
+    let args = npm_update_argv(pkg);
+    // npm is a .cmd shim on Windows — run through cmd.exe like the version probe.
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg("npm").args(&args);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("npm");
+        c.args(&args);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn()?;
+    let mut out = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut errl = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let (id_a, id_b) = (id.to_string(), id.to_string());
+    let (ev_a, ev_b) = (events.clone(), events.clone());
+    let a = tokio::spawn(async move {
+        while let Ok(Some(line)) = out.next_line().await {
+            let _ = ev_a.send(crate::domain::CoreEvent::RuntimeUpdateLog {
+                runtime_id: id_a.clone(),
+                line,
+            });
+        }
+    });
+    let b = tokio::spawn(async move {
+        while let Ok(Some(line)) = errl.next_line().await {
+            let _ = ev_b.send(crate::domain::CoreEvent::RuntimeUpdateLog {
+                runtime_id: id_b.clone(),
+                line,
+            });
+        }
+    });
+    let status = child.wait().await?;
+    let _ = a.await;
+    let _ = b.await;
+    Ok(status.success())
+}
+
 pub async fn session_defaults(store: &Store) -> anyhow::Result<SessionDefaults> {
     let default_id = store
         .get_setting("default_agent")
@@ -522,5 +581,16 @@ mod tests {
         let d = session_defaults(&store).await.unwrap();
         assert_eq!(d.model.as_deref(), Some("claude-haiku-4-5"));
         assert_eq!(d.perm_mode, Some(PermMode::BypassPermissions));
+    }
+}
+
+#[cfg(test)]
+mod npm_tests {
+    #[test]
+    fn npm_argv_targets_latest() {
+        assert_eq!(
+            super::npm_update_argv("@anthropic-ai/claude-code"),
+            vec!["install", "-g", "@anthropic-ai/claude-code@latest"]
+        );
     }
 }

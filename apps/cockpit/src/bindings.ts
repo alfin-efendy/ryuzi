@@ -138,6 +138,19 @@ async updateRuntimeConfig(id: string, enabled: boolean, model: string | null, pe
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Fire-and-forget npm update; progress streams via CoreEvent
+ * RuntimeUpdateLog / RuntimeUpdateDone, then a refreshed snapshot matters —
+ * the UI calls refreshRuntimes() on Done.
+ */
+async updateRuntime(id: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_runtime", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async setRuntimeTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_runtime_tier", { id, tierId, value, combo }) };
@@ -621,7 +634,15 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 /**
  * A scheduled job run started or finished (status: running|success|failed).
  */
-{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string }
+{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string } | 
+/**
+ * A runtime npm install/update produced an output line.
+ */
+{ kind: "runtimeUpdateLog"; runtime_id: string; line: string } | 
+/**
+ * A runtime npm install/update finished (ok=false → message has detail).
+ */
+{ kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null }
 export type CoreEventMsg = { event: CoreEvent }
 export type DirEntryInfo = { name: string; dir: boolean }
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }

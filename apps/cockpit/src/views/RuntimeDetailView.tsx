@@ -1,4 +1,4 @@
-import { AlertTriangle, Copy, Layers, MonitorUp, X } from "lucide-react";
+import { AlertTriangle, Copy, Layers, Loader2, MonitorUp, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { commands, type RuntimeConfigStatusInfo } from "@/bindings";
@@ -52,7 +52,7 @@ function ModelSelectRow({
 // Runtime detail: real detection state, update banner with the actual install
 // command, model/permission/flags configuration, and per-tier model routing.
 export function RuntimeDetailView({ id }: { id: string }) {
-  const { runtimes, refreshing, refresh, update, setTier, setDefault } = useRuntimes();
+  const { runtimes, refreshing, refresh, update, setTier, setDefault, updating, updateLog, beginUpdate } = useRuntimes();
   const { apps, loaded: appsLoaded, hydrate: hydrateApps, toggleAgent: toggleAppAgent } = useApps();
   const navigate = useNav((s) => s.navigate);
   const [openTierMenu, setOpenTierMenu] = useState<string | null>(null);
@@ -91,6 +91,7 @@ export function RuntimeDetailView({ id }: { id: string }) {
   const hasUpdate =
     installed && agent.latestVersion !== null && agent.installedVersion !== null && agent.latestVersion !== agent.installedVersion;
   const updateCmd = agent.npmPackage ? `npm install -g ${agent.npmPackage}` : null;
+  const isUpdating = updating[agent.id] === true;
   const permDesc = PERM_MODES.find((m) => m.id === agent.permMode)?.desc ?? "";
 
   const endpointBlocked = !epStatus?.running || epKeys.length === 0;
@@ -158,18 +159,38 @@ export function RuntimeDetailView({ id }: { id: string }) {
                 Update available — {agent.latestVersion} (installed {agent.installedVersion})
               </div>
               <div className="mt-1.5 font-mono text-xs text-muted-foreground">{updateCmd}</div>
+              {isUpdating && (
+                <pre className="mt-2 max-h-40 overflow-auto rounded-md bg-muted px-2 py-1.5 text-[11px] leading-[1.5] text-muted-foreground">
+                  {(updateLog[agent.id] ?? []).slice(-12).join("\n") || "Starting…"}
+                </pre>
+              )}
             </div>
-            <button
-              type="button"
-              onClick={() => {
-                void navigator.clipboard.writeText(updateCmd);
-                toast.success("Update command copied");
-              }}
-              className="flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85"
-            >
-              <Copy aria-hidden size={12} strokeWidth={2} />
-              Copy command
-            </button>
+            <div className="flex shrink-0 flex-col items-stretch gap-1.5">
+              <button
+                type="button"
+                disabled={isUpdating}
+                onClick={() => void beginUpdate(agent.id)}
+                className="flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isUpdating ? (
+                  <Loader2 aria-hidden size={12} strokeWidth={2} className="animate-spin" />
+                ) : (
+                  <MonitorUp aria-hidden size={12} strokeWidth={2} />
+                )}
+                {isUpdating ? "Updating…" : "Update now"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard.writeText(updateCmd);
+                  toast.success("Update command copied");
+                }}
+                className="flex h-[26px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md border border-border bg-transparent px-3 font-sans text-[11.5px] font-medium text-foreground hover:bg-accent"
+              >
+                <Copy aria-hidden size={11} strokeWidth={2} />
+                Copy command
+              </button>
+            </div>
           </Card>
         )}
 

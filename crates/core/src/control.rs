@@ -51,6 +51,11 @@ impl ControlPlane {
         self.events.send(e).is_ok()
     }
 
+    /// Clone of the broadcast sender for long-running domain tasks.
+    pub fn events_sender(&self) -> broadcast::Sender<CoreEvent> {
+        self.events.clone()
+    }
+
     pub fn resolve_approval(&self, request_id: &str, allow: bool) -> bool {
         self.approvals.resolve(request_id, allow)
     }

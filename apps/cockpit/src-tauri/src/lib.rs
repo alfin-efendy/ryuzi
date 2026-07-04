@@ -186,6 +186,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             runtimes_cmd::list_runtimes,
             runtimes_cmd::refresh_runtimes,
             runtimes_cmd::update_runtime_config,
+            runtimes_cmd::update_runtime,
             runtimes_cmd::set_runtime_tier,
             runtimes_cmd::set_default_runtime,
             runtimes_cmd::runtime_config_status,

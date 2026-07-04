@@ -223,6 +223,38 @@ pub async fn set_default_runtime(cp: State<'_, Arc<ControlPlane>>, id: String) -
     Ok(assemble(&cp).await?)
 }
 
+/// Fire-and-forget npm update; progress streams via CoreEvent
+/// RuntimeUpdateLog / RuntimeUpdateDone, then a refreshed snapshot matters —
+/// the UI calls refreshRuntimes() on Done.
+#[tauri::command]
+#[specta::specta]
+pub async fn update_runtime(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<()> {
+    let desc = runtimes::descriptor(&id).ok_or_else(|| CmdError {
+        message: format!("unknown runtime: {id}"),
+    })?;
+    let Some(pkg) = desc.npm_package else {
+        return Err(CmdError {
+            message: format!("{} is not npm-managed", desc.name),
+        });
+    };
+    let events = cp.events_sender();
+    let pkg = pkg.to_string();
+    tauri::async_runtime::spawn(async move {
+        let res = ryuzi_core::runtimes::run_npm_update(events.clone(), &id, &pkg).await;
+        let (ok, message) = match res {
+            Ok(true) => (true, None),
+            Ok(false) => (false, Some("npm exited with a non-zero status".to_string())),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        let _ = events.send(ryuzi_core::CoreEvent::RuntimeUpdateDone {
+            runtime_id: id,
+            ok,
+            message,
+        });
+    });
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Endpoint config apply/reset (spec §5) — write/remove the local router's
 // base URL + key into native CLI-tool configs (claude/codex/opencode only).
