@@ -75,8 +75,20 @@ export function diffLineStyle(l: DiffLine): DiffLineStyle {
   if (type === "hunk")
     return { bg: "var(--muted)", numBg: "transparent", sign: "⇅", signColor: "var(--muted-foreground)", color: "var(--muted-foreground)" };
   if (type === "add")
-    return { bg: "var(--diff-add-bg)", numBg: "var(--diff-add-bg)", sign: "+", signColor: "var(--diff-add-fg)", color: "var(--foreground)" };
+    return {
+      bg: "var(--diff-add-bg)",
+      numBg: "var(--diff-add-bg)",
+      sign: "+",
+      signColor: "var(--diff-add-fg)",
+      color: "var(--foreground)",
+    };
   if (type === "del")
-    return { bg: "var(--diff-del-bg)", numBg: "var(--diff-del-bg)", sign: "−", signColor: "var(--diff-del-fg)", color: "var(--foreground)" };
+    return {
+      bg: "var(--diff-del-bg)",
+      numBg: "var(--diff-del-bg)",
+      sign: "−",
+      signColor: "var(--diff-del-fg)",
+      color: "var(--foreground)",
+    };
   return { bg: "transparent", numBg: "transparent", sign: "", signColor: "transparent", color: "var(--code-foreground)" };
 }
