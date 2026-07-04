@@ -38,6 +38,8 @@ const FIXTURES: Record<string, unknown> = {
   list_agents: [],
   refresh_agents: [],
   list_providers: [],
+  list_runtimes: [],
+  refresh_runtimes: [],
   list_gateways: [],
   probe_gateways: [],
   list_jobs: [],
@@ -77,6 +79,9 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           if (cmd.startsWith("plugin:")) return Promise.resolve(null);
           if (cmd in fixtures) return Promise.resolve(fixtures[cmd]);
           console.warn("[mock-ipc] unmocked command:", cmd);
+          if (cmd.startsWith("list_") || cmd.startsWith("refresh_") || cmd.startsWith("probe_")) {
+            return Promise.resolve([]);
+          }
           return Promise.resolve(null);
         },
       };
