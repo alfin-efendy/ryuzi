@@ -357,4 +357,40 @@ mod tests {
         assert_eq!(tc.status.as_deref(), Some("completed"));
         assert_eq!(tc.tool_call_id.as_deref(), Some("tc-1"));
     }
+
+    #[tokio::test]
+    async fn tool_completion_reemits_merged_payload_and_kind() {
+        use crate::domain::CoreEvent;
+
+        let (store, session_pk, events) =
+            crate::harness::acp::testkit::run_via_harness_trait_collecting_events("hi").await;
+
+        // The live completion event carries the MERGED payload and the
+        // persisted kind (not just {output} / None as before).
+        let done = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::Message {
+                    block_type,
+                    status: Some(s),
+                    payload,
+                    tool_kind,
+                    ..
+                } if block_type == "tool_call" && s == "completed" => {
+                    Some((payload.clone(), tool_kind.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected a completed tool_call Message event");
+        assert_eq!(done.0["name"], "Bash");
+        assert_eq!(done.0["output"], "output text");
+        assert_eq!(done.1.as_deref(), Some("execute"));
+
+        // And the persisted row kept name + input alongside the output.
+        let msgs = store.list_messages(&session_pk).await.unwrap();
+        let tc = msgs.iter().find(|m| m.block_type == "tool_call").expect("tool_call row");
+        assert_eq!(tc.payload["name"], "Bash");
+        assert_eq!(tc.payload["output"], "output text");
+        assert_eq!(tc.tool_kind.as_deref(), Some("execute"));
+    }
 }

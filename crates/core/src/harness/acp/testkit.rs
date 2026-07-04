@@ -194,6 +194,7 @@ impl HandleDispatchFrom<Client> for MockAgent {
                             session_id.clone(),
                             SessionUpdate::ToolCall(
                                 ToolCall::new("tc-1", "Bash")
+                                    .kind(agent_client_protocol::schema::v1::ToolKind::Execute)
                                     .status(ToolCallStatus::Pending),
                             ),
                         ));
@@ -567,9 +568,24 @@ pub async fn drive_load(resume_session_id: &str) -> (std::sync::Arc<crate::store
 /// The test runner spawns a tokio task (not an OS thread + fresh runtime) so
 /// the mock duplex's I/O stays on the test runtime, and drives the shared
 /// `run_client_loop` over the injected transport.
+/// Like [`run_via_harness_trait_collecting_events`], discarding the events.
 pub async fn run_via_harness_trait(
     prompt: &str,
 ) -> (std::sync::Arc<crate::store::Store>, String) {
+    let (store, session_pk, _events) = run_via_harness_trait_collecting_events(prompt).await;
+    (store, session_pk)
+}
+
+/// Build an [`AcpHarness`](crate::harness::acp::AcpHarness) wired to the
+/// in-process mock agent, start a session through the Spec 2 `Harness` trait,
+/// send `prompt`, and return `(store, session_pk, broadcast events)`.
+///
+/// The subscriber is created BEFORE `start_session`, so every `CoreEvent`
+/// emitted during the turn (user turn, streamed rows, tool updates) is
+/// captured and drained after the turn completes.
+pub async fn run_via_harness_trait_collecting_events(
+    prompt: &str,
+) -> (std::sync::Arc<crate::store::Store>, String, Vec<crate::domain::CoreEvent>) {
     use std::sync::Arc;
 
     use tokio::sync::broadcast;
@@ -583,9 +599,8 @@ pub async fn run_via_harness_trait(
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store: Arc<Store> = Arc::new(Store::open(tmp.path()).await.unwrap());
     let (events_tx, _events_rx) = broadcast::channel::<CoreEvent>(64);
+    let mut events_rx = events_tx.subscribe();
 
-    // Test runner factory: for each session, produce a runner that drives the
-    // shared client loop over a fresh mock duplex on a tokio task.
     let harness = AcpHarness::with_runner_factory(
         AcpAdapterDescriptor::default(),
         |_descriptor: &AcpAdapterDescriptor| {
@@ -593,8 +608,6 @@ pub async fn run_via_harness_trait(
         },
     );
 
-    // Use a stable ryuzi session_pk; messages will be keyed under this value
-    // (not under the ACP-assigned session id).
     let session_pk = "harness-test-session-pk".to_string();
 
     let ctx = SessionCtx {
@@ -624,8 +637,14 @@ pub async fn run_via_harness_trait(
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     session.end().await.expect("end failed");
+
+    let mut events = Vec::new();
+    while let Ok(ev) = events_rx.try_recv() {
+        events.push(ev);
+    }
+
     drop(tmp);
-    (store, session_pk)
+    (store, session_pk, events)
 }
 
 // ---------------------------------------------------------------------------
