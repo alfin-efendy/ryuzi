@@ -57,7 +57,7 @@ const oldIdentityPatterns: Array<[string, RegExp]> = [
   [
     "old short command token",
     new RegExp(
-      `(?:\`${oldShort}(?:\\.exe)?\`|\\b${oldShort}(?:\\.exe)?\\s+(?:doctor|run|config|--help|--version)|(?:^|[\\s"'=:])${oldShort}(?:\\.exe)?(?:[\\s"',)]|$))`,
+      `(?:\`${oldShort}(?:\\.exe)?\`|\\b${oldShort}(?:\\.exe)?\\s+(?:doctor|run|config|--help|--version)|(?:^|[\\s"'=:])${oldShort}(?:\\.exe)?(?!\\s*\\{)(?:[\\s"',)]|$))`,
     ),
   ],
   [

@@ -22,7 +22,7 @@ test("selectProject sets the selected project and clears the focused session", (
   expect(useStore.getState().focusedSessionPk).toBeNull();
 });
 
-test("message events project to lines by role/blockType and dedupe by seq", () => {
+test("message events project to rows by role/blockType and dedupe by seq", () => {
   reset();
   const s = useStore.getState();
   s.applyCoreEvent({ kind: "sessionCreated", session_pk: "s1", project_id: "p1" });
@@ -42,8 +42,8 @@ test("message events project to lines by role/blockType and dedupe by seq", () =
     session_pk: "s1",
     seq: 2,
     role: "assistant",
-    block_type: "status",
-    payload: { summary: "Bash: ls" },
+    block_type: "thought",
+    payload: { text: "pondering" },
     tool_call_id: null,
     status: null,
     tool_kind: null,
@@ -65,21 +65,132 @@ test("message events project to lines by role/blockType and dedupe by seq", () =
     session_pk: "s1",
     seq: 2,
     role: "assistant",
-    block_type: "status",
-    payload: { summary: "dup" },
+    block_type: "text",
+    payload: { text: "dup" },
     tool_call_id: null,
     status: null,
     tool_kind: null,
   });
 
-  const lines = useStore.getState().transcripts.s1;
-  expect(lines.map((l) => l.kind)).toEqual(["user", "status", "text"]);
-  expect(lines.map((l) => l.text)).toEqual(["hi", "Bash: ls", "hello"]);
+  const rows = useStore.getState().transcripts.s1;
+  expect(rows.map((r) => [r.seq, r.role, r.blockType, r.text])).toEqual([
+    [1, "user", "text", "hi"],
+    [2, "assistant", "thought", "pondering"],
+    [3, "assistant", "text", "hello"],
+  ]);
+});
+
+test("tool_call events append once, then merge in place by toolCallId (same-seq update)", () => {
+  reset();
+  const s = useStore.getState();
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 1,
+    role: "assistant",
+    block_type: "tool_call",
+    payload: { name: "Bash", input: { command: "ls" } },
+    tool_call_id: "tc-1",
+    status: "pending",
+    tool_kind: "execute",
+  });
+  // Completion re-emit re-uses seq 1 — must merge, not append, not be dropped.
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 1,
+    role: "assistant",
+    block_type: "tool_call",
+    payload: { name: "Bash", input: { command: "ls" }, output: "file.txt" },
+    tool_call_id: "tc-1",
+    status: "completed",
+    tool_kind: "execute",
+  });
+  // lastSeq high-water mark is untouched by the merge: a later fresh row still lands.
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 2,
+    role: "assistant",
+    block_type: "text",
+    payload: { text: "done" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+
+  const rows = useStore.getState().transcripts.s1;
+  expect(rows).toHaveLength(2);
+  expect(rows[0].toolCallId).toBe("tc-1");
+  expect(rows[0].toolStatus).toBe("completed");
+  expect(rows[0].toolName).toBe("Bash");
+  expect(rows[0].toolOutput).toBe("file.txt");
+  expect(rows[1].text).toBe("done");
 });
 
 test("hydrateTranscript replaces the transcript from persisted messages and sets lastSeq", async () => {
   reset();
   const rows = [
+    {
+      sessionPk: "s1",
+      seq: 1,
+      role: "user",
+      blockType: "text",
+      payload: { text: "hi" },
+      toolCallId: null,
+      status: null,
+      toolKind: null,
+      createdAt: 1,
+    },
+    {
+      sessionPk: "s1",
+      seq: 2,
+      role: "assistant",
+      blockType: "tool_call",
+      payload: { name: "Read", input: {}, output: { ok: true } },
+      toolCallId: "tc-9",
+      status: "completed",
+      toolKind: "read",
+      createdAt: 2,
+    },
+  ];
+  await useStore.getState().hydrateTranscript("s1", async () => rows);
+  const st = useStore.getState();
+  expect(st.transcripts.s1[0].text).toBe("hi");
+  expect(st.transcripts.s1[1].toolName).toBe("Read");
+  expect(st.transcripts.s1[1].toolOutput).toBe(JSON.stringify({ ok: true }, null, 2));
+  expect(st.lastSeq.s1).toBe(2);
+  expect(st.loaded.s1).toBe(true);
+
+  // A live non-tool event with seq <= lastSeq is ignored; a newer one appends.
+  st.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 2,
+    role: "assistant",
+    block_type: "text",
+    payload: { text: "again" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+  st.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 3,
+    role: "assistant",
+    block_type: "text",
+    payload: { text: "next" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+  expect(useStore.getState().transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3]);
+});
+
+test("hydrateTranscript keeps live rows that arrived during the fetch (and never regresses lastSeq)", async () => {
+  reset();
+  const dbRows = [
     {
       sessionPk: "s1",
       seq: 1,
@@ -103,36 +214,37 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
       createdAt: 2,
     },
   ];
-  await useStore.getState().hydrateTranscript("s1", async () => rows);
+  await useStore.getState().hydrateTranscript("s1", async () => {
+    // Simulates events landing while listMessages is in flight.
+    useStore.getState().applyCoreEvent({
+      kind: "message",
+      session_pk: "s1",
+      seq: 3,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "live" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    });
+    useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "transient" });
+    return dbRows;
+  });
   const st = useStore.getState();
-  expect(st.transcripts.s1.map((l) => l.text)).toEqual(["hi", "yo"]);
-  expect(st.lastSeq.s1).toBe(2);
-  expect(st.loaded.s1).toBe(true);
+  expect(st.transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3, 0]);
+  expect(st.transcripts.s1[2].text).toBe("live");
+  expect(st.transcripts.s1[3].blockType).toBe("error");
+  expect(st.lastSeq.s1).toBe(3);
+});
 
-  // A live event with seq <= lastSeq is ignored; a newer one appends.
-  st.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 2,
-    role: "assistant",
-    block_type: "text",
-    payload: { text: "again" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
-  st.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 3,
-    role: "assistant",
-    block_type: "text",
-    payload: { text: "next" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
-  expect(useStore.getState().transcripts.s1.map((l) => l.text)).toEqual(["hi", "yo", "next"]);
+test("transient error events append a seq-0 error row", () => {
+  reset();
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "spawn failed" });
+  const rows = useStore.getState().transcripts.s1;
+  expect(rows).toHaveLength(1);
+  expect(rows[0].seq).toBe(0);
+  expect(rows[0].blockType).toBe("error");
+  expect(rows[0].text).toBe("spawn failed");
 });
 
 test("approval.requested adds a pending approval; resolving removes it", () => {

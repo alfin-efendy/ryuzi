@@ -2,14 +2,14 @@ import { create } from "zustand";
 import { toast } from "sonner";
 import { commands, events, type Project, type Session, type CoreEvent, type Message } from "./bindings";
 import { basename } from "./lib/paths";
+import type { Row } from "./lib/transcript";
 
-export type Line = { kind: "user" | "text" | "status" | "error"; text: string };
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
 
 type State = {
   projects: Project[];
   sessions: Session[];
-  transcripts: Record<string, Line[]>;
+  transcripts: Record<string, Row[]>;
   pendingApprovals: PendingApproval[];
   focusedSessionPk: string | null;
   selectedProjectId: string | null;
@@ -31,17 +31,52 @@ type State = {
   init: () => Promise<void>;
 };
 
-function append(map: Record<string, Line[]>, pk: string, line: Line): Record<string, Line[]> {
-  return { ...map, [pk]: [...(map[pk] ?? []), line] };
+function append(map: Record<string, Row[]>, pk: string, row: Row): Record<string, Row[]> {
+  return { ...map, [pk]: [...(map[pk] ?? []), row] };
 }
 
-// Projects a persisted/streamed message block onto the render Line shape.
-function messageToLine(role: string, blockType: string, payload: unknown): Line {
+function outputPreview(v: unknown): string | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v === "string") return v;
+  return JSON.stringify(v, null, 2);
+}
+
+// Projects a persisted/streamed message block onto the render Row shape.
+// Unknown block types fall through as text (forward compatibility).
+export function messageToRow(
+  seq: number,
+  role: string,
+  blockType: string,
+  payload: unknown,
+  toolCallId: string | null,
+  status: string | null,
+  toolKind: string | null,
+): Row {
   const p = (payload ?? {}) as Record<string, unknown>;
-  if (role === "user") return { kind: "user", text: String(p.text ?? "") };
-  if (blockType === "status" || blockType === "tool_call") return { kind: "status", text: String(p.summary ?? p.name ?? "") };
-  if (blockType === "error") return { kind: "error", text: String(p.message ?? "") };
-  return { kind: "text", text: String(p.text ?? "") };
+  const text = blockType === "status" ? String(p.summary ?? "") : blockType === "error" ? String(p.message ?? "") : String(p.text ?? "");
+  return {
+    seq,
+    role,
+    blockType,
+    text,
+    toolCallId,
+    toolStatus: status,
+    toolKind,
+    toolName: blockType === "tool_call" && typeof p.name === "string" && p.name ? p.name : null,
+    toolOutput: blockType === "tool_call" ? outputPreview(p.output) : null,
+  };
+}
+
+// A tool-update re-emit re-uses the original row's seq: merge by identity.
+function mergeToolRow(prev: Row, payload: unknown, status: string | null, toolKind: string | null): Row {
+  const p = (payload ?? {}) as Record<string, unknown>;
+  return {
+    ...prev,
+    toolStatus: status ?? prev.toolStatus,
+    toolKind: toolKind ?? prev.toolKind,
+    toolName: typeof p.name === "string" && p.name ? p.name : prev.toolName,
+    toolOutput: outputPreview(p.output) ?? prev.toolOutput,
+  };
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -63,17 +98,41 @@ export const useStore = create<State>((set, get) => ({
             loaded: { ...st.loaded, [e.session_pk]: true },
           };
         case "message": {
-          const prev = st.lastSeq[e.session_pk] ?? 0;
+          const pk = e.session_pk;
+          // Tool updates re-use the original row's seq — upsert by identity
+          // BEFORE the seq high-water guard would drop them as stale.
+          if (e.tool_call_id) {
+            const rows = st.transcripts[pk] ?? [];
+            const idx = rows.findIndex((r) => r.toolCallId === e.tool_call_id);
+            if (idx >= 0) {
+              const next = rows.slice();
+              next[idx] = mergeToolRow(rows[idx], e.payload, e.status, e.tool_kind);
+              return { transcripts: { ...st.transcripts, [pk]: next } };
+            }
+          }
+          const prev = st.lastSeq[pk] ?? 0;
           if (e.seq <= prev) return {}; // stale/duplicate (covers reload/replay races)
-          const line = messageToLine(e.role, e.block_type, e.payload);
+          const row = messageToRow(e.seq, e.role, e.block_type, e.payload, e.tool_call_id, e.status, e.tool_kind);
           return {
-            transcripts: append(st.transcripts, e.session_pk, line),
-            lastSeq: { ...st.lastSeq, [e.session_pk]: e.seq },
+            transcripts: append(st.transcripts, pk, row),
+            lastSeq: { ...st.lastSeq, [pk]: e.seq },
           };
         }
         case "error":
-          // Transient infrastructure error (not a persisted transcript row).
-          return { transcripts: append(st.transcripts, e.session_pk, { kind: "error", text: e.message }) };
+          // Transient infrastructure error (not a persisted transcript row; seq 0).
+          return {
+            transcripts: append(st.transcripts, e.session_pk, {
+              seq: 0,
+              role: "system",
+              blockType: "error",
+              text: e.message,
+              toolCallId: null,
+              toolStatus: null,
+              toolKind: null,
+              toolName: null,
+              toolOutput: null,
+            }),
+          };
         case "approvalRequested":
           return {
             pendingApprovals: [
@@ -107,13 +166,18 @@ export const useStore = create<State>((set, get) => ({
           const res = await commands.listMessages(pk);
           return res.status === "ok" ? res.data : [];
         })();
-    const lines = rows.map((m) => messageToLine(m.role, m.blockType, m.payload));
+    const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind));
     const maxSeq = rows.reduce((mx, m) => Math.max(mx, m.seq), 0);
-    set((st) => ({
-      transcripts: { ...st.transcripts, [pk]: lines },
-      lastSeq: { ...st.lastSeq, [pk]: maxSeq },
-      loaded: { ...st.loaded, [pk]: true },
-    }));
+    set((st) => {
+      // Rows appended by applyCoreEvent while listMessages was in flight (fresher
+      // than the snapshot, or transient seq-0 error rows) must survive the replace.
+      const liveTail = (st.transcripts[pk] ?? []).filter((r) => r.seq > maxSeq || r.seq === 0);
+      return {
+        transcripts: { ...st.transcripts, [pk]: [...hydrated, ...liveTail] },
+        lastSeq: { ...st.lastSeq, [pk]: Math.max(st.lastSeq[pk] ?? 0, maxSeq) },
+        loaded: { ...st.loaded, [pk]: true },
+      };
+    });
   },
 
   // Selecting a project clears the focused session so the center shows the "start a new session" composer.

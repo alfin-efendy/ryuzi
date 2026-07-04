@@ -738,6 +738,7 @@ impl Harness for AcpHarness {
             session_pk: ctx.session_pk.clone(),
             session_id: ready.session_id,
             store: ctx.store.clone(),
+            events: ctx.events.clone(),
         }))
     }
 }
@@ -752,6 +753,8 @@ pub struct AcpSession {
     session_pk: String,
     session_id: SessionId,
     store: Arc<Store>,
+    /// Broadcast sender for `CoreEvent`s — same channel the sink clones.
+    events: tokio::sync::broadcast::Sender<CoreEvent>,
 }
 
 #[async_trait]
@@ -765,20 +768,32 @@ impl HarnessSession for AcpSession {
                 .ok_or_else(|| anyhow::anyhow!("ACP session already ended"))?
         };
 
-        // Persist the user turn (Spec 1) before driving the prompt. Persist
-        // `prompt.display` — the raw text the user typed — not the (possibly
+        // Persist the user turn (Spec 1) before driving the prompt, then
+        // broadcast it so the bubble appears live (backend-authoritative —
+        // there is deliberately no client-side echo). Persist `prompt.display`
+        // — the raw text the user typed — not the (possibly
         // attachment-manifest-decorated) `prompt.agent` text, so durable
         // history shows what the user actually typed.
         // Use ryuzi's own session_pk (not the ACP session id) so the frontend
         // can find the row via list_messages(session_pk).
-        let user_msg = NewMessage::block(
-            &self.session_pk,
-            "user",
-            "text",
-            serde_json::json!({ "text": prompt.display }),
-        );
-        if let Err(e) = self.store.insert_message(user_msg).await {
-            tracing::warn!("send_prompt: failed to persist user turn: {e}");
+        let payload = serde_json::json!({ "text": prompt.display });
+        let user_msg = NewMessage::block(&self.session_pk, "user", "text", payload.clone());
+        match self.store.insert_message(user_msg).await {
+            Ok(seq) => {
+                let _ = self.events.send(CoreEvent::Message {
+                    session_pk: self.session_pk.clone(),
+                    seq,
+                    role: "user".into(),
+                    block_type: "text".into(),
+                    payload,
+                    tool_call_id: None,
+                    status: None,
+                    tool_kind: None,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("send_prompt: failed to persist user turn: {e}");
+            }
         }
 
         let content = vec![ContentBlock::Text(TextContent::new(prompt.agent))];

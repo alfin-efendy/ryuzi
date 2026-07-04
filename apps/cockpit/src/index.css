@@ -86,3 +86,56 @@ textarea:focus,
 input:focus {
   outline: none;
 }
+
+/* --- Chat markdown (agent transcript) ---------------------------------- */
+/* Scoped under .chat-md so app chrome is unaffected. Sized for chat: the
+   whole scale tops out near the body size instead of document headings. */
+.chat-md > :first-child { margin-top: 0; }
+.chat-md > :last-child { margin-bottom: 0; }
+.chat-md p { margin: 0.45em 0; line-height: 1.6; }
+.chat-md h1, .chat-md h2, .chat-md h3, .chat-md h4, .chat-md h5, .chat-md h6 {
+  margin: 0.9em 0 0.35em; font-weight: 650; letter-spacing: -0.01em; line-height: 1.3;
+}
+.chat-md h1 { font-size: 15px; }
+.chat-md h2 { font-size: 14.5px; }
+.chat-md h3 { font-size: 14px; }
+.chat-md h4, .chat-md h5, .chat-md h6 { font-size: 13.5px; }
+.chat-md ul, .chat-md ol { margin: 0.35em 0; padding-left: 1.4em; }
+.chat-md li { margin: 0.15em 0; }
+.chat-md blockquote {
+  margin: 0.5em 0; padding: 0.1em 0 0.1em 0.9em;
+  border-left: 2px solid var(--border); color: var(--muted-foreground);
+}
+.chat-md a { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; }
+.chat-md hr { border: none; border-top: 1px solid var(--border); margin: 0.9em 0; }
+.chat-md code {
+  font-family: var(--font-mono); font-size: 12px;
+  background: var(--code); color: var(--code-foreground);
+  border: 1px solid var(--border); border-radius: 4px; padding: 0.1em 0.35em;
+}
+.chat-md pre {
+  margin: 0.55em 0; padding: 10px 12px;
+  background: var(--code); border: 1px solid var(--border); border-radius: 8px;
+  overflow-x: auto;
+}
+.chat-md pre code { background: transparent; border: none; padding: 0; font-size: 12px; line-height: 1.6; display: block; }
+.chat-md table { border-collapse: collapse; margin: 0.55em 0; display: block; max-width: 100%; overflow-x: auto; font-size: 12.5px; }
+.chat-md th, .chat-md td { border: 1px solid var(--border); padding: 4px 10px; text-align: left; }
+.chat-md th { font-weight: 600; background: color-mix(in oklab, var(--muted) 60%, transparent); }
+
+/* Syntax highlight theme mapped to app tokens (rehype-highlight emits hljs-*
+   classes). Base colors are light-theme; .dark overrides lift lightness. */
+.chat-md .hljs-comment, .chat-md .hljs-quote { color: var(--muted-foreground); font-style: italic; }
+.chat-md .hljs-keyword, .chat-md .hljs-selector-tag, .chat-md .hljs-built_in, .chat-md .hljs-type { color: oklch(0.5 0.18 285); }
+.chat-md .hljs-string, .chat-md .hljs-regexp, .chat-md .hljs-addition { color: oklch(0.52 0.12 150); }
+.chat-md .hljs-number, .chat-md .hljs-literal, .chat-md .hljs-symbol { color: oklch(0.55 0.15 60); }
+.chat-md .hljs-title, .chat-md .hljs-name, .chat-md .hljs-section, .chat-md .hljs-function { color: oklch(0.5 0.15 235); }
+.chat-md .hljs-attr, .chat-md .hljs-attribute, .chat-md .hljs-variable, .chat-md .hljs-template-variable, .chat-md .hljs-params { color: oklch(0.5 0.12 30); }
+.chat-md .hljs-deletion { color: var(--destructive); }
+.chat-md .hljs-emphasis { font-style: italic; }
+.chat-md .hljs-strong { font-weight: 600; }
+.dark .chat-md .hljs-keyword, .dark .chat-md .hljs-selector-tag, .dark .chat-md .hljs-built_in, .dark .chat-md .hljs-type { color: oklch(0.75 0.14 285); }
+.dark .chat-md .hljs-string, .dark .chat-md .hljs-regexp, .dark .chat-md .hljs-addition { color: oklch(0.75 0.12 150); }
+.dark .chat-md .hljs-number, .dark .chat-md .hljs-literal, .dark .chat-md .hljs-symbol { color: oklch(0.76 0.13 60); }
+.dark .chat-md .hljs-title, .dark .chat-md .hljs-name, .dark .chat-md .hljs-section, .dark .chat-md .hljs-function { color: oklch(0.75 0.12 235); }
+.dark .chat-md .hljs-attr, .dark .chat-md .hljs-attribute, .dark .chat-md .hljs-variable, .dark .chat-md .hljs-template-variable, .dark .chat-md .hljs-params { color: oklch(0.75 0.11 30); }
