@@ -127,9 +127,8 @@ pub struct Actor {
 }
 
 /// A file a user attached to a message, before it has been downloaded.
-/// Mirrors `packages/protocol/src/index.ts`'s `AttachmentRef` (not part of
-/// the specta/Tauri type export surface — this crosses gateway boundaries,
-/// not the cockpit IPC boundary).
+/// Not part of the specta/Tauri type export surface — this crosses gateway
+/// boundaries, not the cockpit IPC boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentRef {
@@ -248,7 +247,7 @@ pub enum CoreEvent {
         message: String,
     },
     /// Out-of-band announcement (e.g. "update available") rendered to every
-    /// surface of a session. TS parity: `{ kind: "notice", session_pk, text }`.
+    /// surface of a session.
     Notice {
         session_pk: String,
         text: String,

@@ -2,10 +2,10 @@
 
 This guide covers everything needed to build the monorepo from source across all platforms. The repo contains two stacks:
 
-- **JS/TS** (CLI, web, packages) — requires **Bun**
-- **Rust/Tauri** (Cockpit desktop app) — requires **Rust** + a C++ toolchain + **WebView**
+- **Rust** (the `ryuzi` CLI + engine in `crates/`, and the Cockpit desktop shell) — requires **Rust**; Cockpit additionally needs a C++ toolchain + **WebView**
+- **JS/TS** (Cockpit frontend in `apps/cockpit`, shared UI in `packages/ui`) — requires **Bun**
 
-If you only work on the JS side, you only need Bun. If you touch Cockpit (`apps/cockpit`), you need the full stack below.
+If you only work on the CLI/engine, you only need Rust. If you touch Cockpit (`apps/cockpit`), you need the full stack below.
 
 ---
 

@@ -8,15 +8,17 @@ import { useStore } from "@/store";
 import { commands } from "@/bindings";
 import { statusMeta } from "@/lib/status";
 import { sessionTitle } from "@/lib/sidebar";
-import { Card, CardHeader, CardHint, CardTitle } from "@/components/common/Card";
+import {
+  Button,
+  Segmented,
+  SettingsCard as Card,
+  SettingsCardHeader as CardHeader,
+  SettingsCardHint as CardHint,
+  SettingsCardTitle as CardTitle,
+} from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { Segmented } from "@/components/common/Segmented";
 import { QuotaTrack, StatusDot } from "@/components/common/bits";
 
-const smallBtn =
-  "h-[26px] shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-2.5 font-sans text-[11.5px] font-medium text-foreground hover:bg-accent";
-const runRow =
-  "flex w-full cursor-pointer items-center gap-2.5 border-none bg-transparent px-[18px] py-2 text-left font-sans hover:bg-accent";
 const sectionLabel = "px-[18px] pb-1 pt-2.5 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground";
 
 function HealthRow({ label, value }: { label: string; value: string }) {
@@ -81,27 +83,23 @@ export function GatewayDetailView({ id }: { id: string }) {
             <StatusDot color={statusColor} size={8} pulse={online} />
             {online ? "Connected" : "Offline"}
           </span>
-          <button
-            type="button"
-            onClick={() => void probe()}
-            disabled={probing}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent disabled:opacity-50"
-          >
-            <RefreshCw aria-hidden size={13} strokeWidth={2} className={probing ? "animate-spin" : ""} />
+          <Button variant="outline" onClick={() => void probe()} disabled={probing} className="shrink-0">
+            <RefreshCw aria-hidden size={13} strokeWidth={2} className={probing ? "size-[13px] animate-spin" : "size-[13px]"} />
             {probing ? "Probing…" : "Probe now"}
-          </button>
+          </Button>
           {g.kind === "ssh" && (
-            <button
-              type="button"
+            <Button
+              variant="outline"
+              size="icon"
               onClick={() => {
                 void remove(g.id);
                 nav.navigate({ kind: "gateways" });
               }}
               title="Remove gateway"
-              className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md border border-border bg-transparent text-destructive hover:bg-accent"
+              className="shrink-0 text-destructive hover:text-destructive"
             >
-              <Trash2 aria-hidden size={13} strokeWidth={2} />
-            </button>
+              <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+            </Button>
           )}
         </DetailHeader>
 
@@ -178,19 +176,19 @@ export function GatewayDetailView({ id }: { id: string }) {
               {gwSessions.map((s) => {
                 const m = statusMeta(s.status);
                 return (
-                  <button
+                  <Button
                     key={s.sessionPk}
-                    type="button"
+                    variant="ghost"
                     onClick={() => {
                       setFocused(s.sessionPk);
                       nav.navigate({ kind: "session" });
                     }}
-                    className={runRow}
+                    className="h-auto w-full justify-start gap-2.5 rounded-none px-[18px] py-2 text-left"
                   >
                     <StatusDot color={m.color} size={7} pulse={m.pulse} />
-                    <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-foreground">{sessionTitle(s)}</span>
-                    <span className="shrink-0 text-[11.5px] text-muted-foreground">Claude Code</span>
-                  </button>
+                    <span className="min-w-0 flex-1 truncate text-foreground">{sessionTitle(s)}</span>
+                    <span className="shrink-0 text-xs font-normal text-muted-foreground">Claude Code</span>
+                  </Button>
                 );
               })}
             </>
@@ -206,13 +204,14 @@ export function GatewayDetailView({ id }: { id: string }) {
             {g.fingerprint ? (
               <>
                 <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">{g.fingerprint}</span>
-                <button
-                  type="button"
+                <Button
+                  variant="outline"
+                  size="xs"
                   onClick={() => g.fingerprint && void navigator.clipboard.writeText(g.fingerprint)}
-                  className={smallBtn}
+                  className="shrink-0"
                 >
                   Copy
-                </button>
+                </Button>
               </>
             ) : (
               <span className="flex-1 text-xs text-muted-foreground">
@@ -233,9 +232,10 @@ export function GatewayDetailView({ id }: { id: string }) {
             {g.fsMode === "projects" && (
               <div className="flex flex-wrap gap-1.5">
                 {g.paths.map((p) => (
-                  <button
+                  <Button
                     key={p}
-                    type="button"
+                    variant="outline"
+                    size="xs"
                     title="Remove folder"
                     onClick={() =>
                       void updateFs(
@@ -244,20 +244,21 @@ export function GatewayDetailView({ id }: { id: string }) {
                         g.paths.filter((x) => x !== p),
                       )
                     }
-                    className="flex h-[26px] cursor-pointer items-center rounded-full border border-border bg-transparent px-2.5 font-mono text-[11px] text-foreground hover:bg-accent"
+                    className="rounded-full font-mono"
                   >
                     {p}
-                  </button>
+                  </Button>
                 ))}
                 {g.kind === "local" && (
-                  <button
-                    type="button"
+                  <Button
+                    variant="outline"
+                    size="xs"
                     onClick={() => void addFolder()}
-                    className="flex h-[26px] cursor-pointer items-center gap-[5px] rounded-full border border-dashed border-border bg-transparent px-2.5 font-sans text-[11.5px] text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                    className="rounded-full border-dashed text-muted-foreground"
                   >
-                    <Plus aria-hidden size={10} strokeWidth={2} />
+                    <Plus aria-hidden size={10} strokeWidth={2} className="size-2.5" />
                     Add folder
-                  </button>
+                  </Button>
                 )}
               </div>
             )}
@@ -269,9 +270,9 @@ export function GatewayDetailView({ id }: { id: string }) {
             <CardTitle>Log</CardTitle>
             <CardHint>Daemon events, most recent last</CardHint>
             <span className="flex-1" />
-            <button type="button" onClick={copyLog} className={smallBtn}>
+            <Button variant="outline" size="xs" onClick={copyLog} className="shrink-0">
               Copy
-            </button>
+            </Button>
           </CardHeader>
           <div className="overflow-x-auto bg-code px-[18px] py-3 font-mono text-[11.5px] leading-[1.75] text-code-foreground">
             {events.length === 0 && <div className="text-muted-foreground">No events recorded yet.</div>}

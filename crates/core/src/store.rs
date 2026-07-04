@@ -334,6 +334,23 @@ fn day_of(ts_ms: i64) -> String {
         .to_string()
 }
 
+/// Check out a pooled connection and run `f` on its dedicated blocking
+/// thread. Pool checkout errors, interact-layer failures (panicked or aborted
+/// closure), and the closure's own error all surface as one `anyhow::Result`.
+async fn interact_on<T, E, F>(pool: &Pool, f: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&mut rusqlite::Connection) -> Result<T, E> + Send + 'static,
+    T: Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let conn = pool.get().await?;
+    let out = conn
+        .interact(f)
+        .await
+        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+    Ok(out)
+}
+
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Store> {
         if let Some(parent) = path.parent() {
@@ -341,22 +358,19 @@ impl Store {
         }
         let cfg = Config::new(path);
         let pool = cfg.create_pool(Runtime::Tokio1)?;
-        let conn = pool.get().await?;
-        conn.interact(|c| {
+        interact_on(&pool, |c| {
             let _ = c.pragma_update(None, "journal_mode", "WAL");
             migrations().to_latest(c)
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        conn.interact(|c| {
+        .await?;
+        interact_on(&pool, |c| {
             c.execute_batch(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_gateways', 'discord');\
                  INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_runtimes', 'claude-code');\
                  INSERT OR IGNORE INTO settings(key, value) VALUES ('default_runtime', 'claude-code');",
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(Store { pool })
     }
 
@@ -368,12 +382,7 @@ impl Store {
         F: FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.pool.get().await?;
-        let out = conn
-            .interact(f)
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(out)
+        interact_on(&self.pool, f).await
     }
 
     pub async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -425,8 +434,7 @@ impl Store {
     }
 
     pub async fn insert_project(&self, p: Project) -> anyhow::Result<()> {
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "INSERT INTO projects(project_id,name,workdir,source,harness,model,effort,perm_mode,created_at) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -436,48 +444,38 @@ impl Store {
                 ],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
     pub async fn get_project(&self, id: &str) -> anyhow::Result<Option<Project>> {
         let id = id.to_string();
-        let conn = self.pool.get().await?;
-        let p = conn
-            .interact(move |c| {
-                c.query_row(
-                    &format!("SELECT {PROJECT_COLS} FROM projects WHERE project_id=?1"),
-                    params![id],
-                    row_to_project,
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(p)
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!("SELECT {PROJECT_COLS} FROM projects WHERE project_id=?1"),
+                params![id],
+                row_to_project,
+            )
+            .optional()
+        })
+        .await
     }
 
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .interact(|c| -> rusqlite::Result<Vec<Project>> {
-                let mut stmt = c.prepare(&format!(
-                    "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at"
-                ))?;
-                let items = stmt
-                    .query_map([], row_to_project)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(items)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(rows)
+        self.with_conn(|c| -> rusqlite::Result<Vec<Project>> {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at"
+            ))?;
+            let items = stmt
+                .query_map([], row_to_project)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
     }
 
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -488,26 +486,21 @@ impl Store {
                 ],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
     pub async fn get_session(&self, pk: &str) -> anyhow::Result<Option<Session>> {
         let pk = pk.to_string();
-        let conn = self.pool.get().await?;
-        let s = conn
-            .interact(move |c| {
-                c.query_row(
-                    &format!("SELECT {SESSION_COLS} FROM sessions WHERE session_pk=?1"),
-                    params![pk],
-                    row_to_session,
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(s)
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!("SELECT {SESSION_COLS} FROM sessions WHERE session_pk=?1"),
+                params![pk],
+                row_to_session,
+            )
+            .optional()
+        })
+        .await
     }
 
     /// List sessions in a given status, oldest-first — used by `reconcile` on
@@ -517,49 +510,41 @@ impl Store {
         status: SessionStatus,
     ) -> anyhow::Result<Vec<Session>> {
         let status = status.as_str().to_string();
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .interact(move |c| -> rusqlite::Result<Vec<Session>> {
-                let mut stmt = c.prepare(&format!(
-                    "SELECT {SESSION_COLS} FROM sessions WHERE status=?1 ORDER BY created_at"
-                ))?;
-                let items = stmt
-                    .query_map(params![status], row_to_session)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(items)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(rows)
+        self.with_conn(move |c| -> rusqlite::Result<Vec<Session>> {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SESSION_COLS} FROM sessions WHERE status=?1 ORDER BY created_at"
+            ))?;
+            let items = stmt
+                .query_map(params![status], row_to_session)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
     }
 
     pub async fn list_sessions(&self, project_id: Option<&str>) -> anyhow::Result<Vec<Session>> {
         let project_id = project_id.map(|s| s.to_string());
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .interact(move |c| {
-                match project_id {
-                    Some(pid) => {
-                        let mut stmt = c.prepare(&format!(
-                            "SELECT {SESSION_COLS} FROM sessions WHERE project_id=?1 ORDER BY created_at"
-                        ))?;
-                        let rows = stmt.query_map(params![pid], row_to_session)?
-                            .collect::<rusqlite::Result<Vec<_>>>();
-                        rows
-                    }
-                    None => {
-                        let mut stmt = c.prepare(&format!(
-                            "SELECT {SESSION_COLS} FROM sessions ORDER BY created_at"
-                        ))?;
-                        let rows = stmt.query_map([], row_to_session)?
-                            .collect::<rusqlite::Result<Vec<_>>>();
-                        rows
-                    }
-                }
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(rows)
+        self.with_conn(move |c| match project_id {
+            Some(pid) => {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {SESSION_COLS} FROM sessions WHERE project_id=?1 ORDER BY created_at"
+                ))?;
+                let rows = stmt
+                    .query_map(params![pid], row_to_session)?
+                    .collect::<rusqlite::Result<Vec<_>>>();
+                rows
+            }
+            None => {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {SESSION_COLS} FROM sessions ORDER BY created_at"
+                ))?;
+                let rows = stmt
+                    .query_map([], row_to_session)?
+                    .collect::<rusqlite::Result<Vec<_>>>();
+                rows
+            }
+        })
+        .await
     }
 
     pub async fn update_status(
@@ -569,15 +554,13 @@ impl Store {
         last_active: Option<i64>,
     ) -> anyhow::Result<()> {
         let pk = pk.to_string();
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "UPDATE sessions SET status=?2, last_active=COALESCE(?3, last_active) WHERE session_pk=?1",
                 params![pk, status.as_str(), last_active],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
@@ -593,28 +576,24 @@ impl Store {
         let model = model.map(|s| s.to_string());
         let effort = effort.map(|s| s.to_string());
         let perm = perm_mode.map(|m| m.as_str().to_string());
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "UPDATE projects SET model=COALESCE(?2, model), effort=COALESCE(?3, effort), \
                  perm_mode=COALESCE(?4, perm_mode) WHERE project_id=?1",
                 params![project_id, model, effort, perm],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
     /// Atomically demote `Running → Idle` only if the current status is still `Running`.
     /// A session already marked `Interrupted` or `Ended` is left untouched.
     /// Also resets `resume_attempts` to 0 — a turn that reaches a normal (or
-    /// errored-but-demoted) end clears the auto-resume cap (TS `runHarness`
-    /// finally parity).
+    /// errored-but-demoted) end clears the auto-resume cap.
     pub async fn demote_if_running(&self, pk: &str, last_active: i64) -> anyhow::Result<()> {
         let pk = pk.to_string();
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "UPDATE sessions SET status=?2, last_active=?3, resume_attempts = 0 WHERE session_pk=?1 AND status=?4",
                 params![
@@ -625,8 +604,7 @@ impl Store {
                 ],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
@@ -639,15 +617,13 @@ impl Store {
         resume_attempts: i64,
     ) -> anyhow::Result<()> {
         let pk = pk.to_string();
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "UPDATE sessions SET status=?2, resume_attempts=?3 WHERE session_pk=?1",
                 params![pk, status.as_str(), resume_attempts],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
@@ -672,71 +648,61 @@ impl Store {
     ) -> anyhow::Result<()> {
         let pk = pk.to_string();
         let agent = agent_session_id.to_string();
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "UPDATE sessions SET agent_session_id=?2 WHERE session_pk=?1",
                 params![pk, agent],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
     pub async fn insert_message(&self, m: NewMessage) -> anyhow::Result<i64> {
         let payload = serde_json::to_string(&m.payload)?;
         let created = now_ms();
-        let conn = self.pool.get().await?;
-        let seq = conn
-            .interact(move |c| {
-                c.query_row(
-                    "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at) \
-                     SELECT ?1, COALESCE(MAX(seq),0)+1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
-                     FROM messages WHERE session_pk=?1 \
-                     RETURNING seq",
-                    params![m.session_pk, m.role, m.block_type, payload,
-                            m.tool_call_id, m.status, m.tool_kind, created],
-                    |r| r.get::<_, i64>(0),
-                )
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(seq)
+        self.with_conn(move |c| {
+            c.query_row(
+                "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at) \
+                 SELECT ?1, COALESCE(MAX(seq),0)+1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+                 FROM messages WHERE session_pk=?1 \
+                 RETURNING seq",
+                params![m.session_pk, m.role, m.block_type, payload,
+                        m.tool_call_id, m.status, m.tool_kind, created],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .await
     }
 
     pub async fn list_messages(&self, session_pk: &str) -> anyhow::Result<Vec<Message>> {
         let session_pk = session_pk.to_string();
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .interact(move |c| -> rusqlite::Result<Vec<Message>> {
-                let mut stmt = c.prepare(
-                    "SELECT session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at \
-                     FROM messages WHERE session_pk=?1 ORDER BY seq",
-                )?;
-                let items = stmt
-                    .query_map(params![session_pk], |r| {
-                        let payload: String = r.get(4)?;
-                        Ok(Message {
-                            session_pk: r.get(0)?,
-                            seq: r.get(1)?,
-                            role: r.get(2)?,
-                            block_type: r.get(3)?,
-                            payload: serde_json::from_str(&payload).map_err(|e| {
-                                rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
-                            })?,
-                            tool_call_id: r.get(5)?,
-                            status: r.get(6)?,
-                            tool_kind: r.get(7)?,
-                            created_at: r.get(8)?,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(items)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(rows)
+        self.with_conn(move |c| -> rusqlite::Result<Vec<Message>> {
+            let mut stmt = c.prepare(
+                "SELECT session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at \
+                 FROM messages WHERE session_pk=?1 ORDER BY seq",
+            )?;
+            let items = stmt
+                .query_map(params![session_pk], |r| {
+                    let payload: String = r.get(4)?;
+                    Ok(Message {
+                        session_pk: r.get(0)?,
+                        seq: r.get(1)?,
+                        role: r.get(2)?,
+                        block_type: r.get(3)?,
+                        payload: serde_json::from_str(&payload).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                        })?,
+                        tool_call_id: r.get(5)?,
+                        status: r.get(6)?,
+                        tool_kind: r.get(7)?,
+                        created_at: r.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
     }
 
     /// Return the persisted decision for `(project_id, tool)`, or `None` if no
@@ -748,19 +714,15 @@ impl Store {
     ) -> anyhow::Result<Option<String>> {
         let project_id = project_id.to_string();
         let tool = tool.to_string();
-        let conn = self.pool.get().await?;
-        let result = conn
-            .interact(move |c| {
-                c.query_row(
-                    "SELECT decision FROM tool_policies WHERE project_id=?1 AND tool=?2",
-                    params![project_id, tool],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(result)
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT decision FROM tool_policies WHERE project_id=?1 AND tool=?2",
+                params![project_id, tool],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })
+        .await
     }
 
     /// Upsert a tool policy: set `decision` for `(project_id, tool)`.
@@ -774,8 +736,7 @@ impl Store {
         let project_id = project_id.to_string();
         let tool = tool.to_string();
         let decision = decision.to_string();
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "INSERT INTO tool_policies(project_id, tool, decision) \
                  VALUES (?1, ?2, ?3) \
@@ -783,8 +744,7 @@ impl Store {
                 params![project_id, tool, decision],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
@@ -803,9 +763,8 @@ impl Store {
         let tool_call_id = tool_call_id.to_string();
         let status = status.map(|s| s.to_string());
         let patch = serde_json::to_string(patch)?;
-        let conn = self.pool.get().await?;
-        let (seq, payload, tool_kind) = conn
-            .interact(move |c| {
+        let (seq, payload, tool_kind) = self
+            .with_conn(move |c| {
                 c.query_row(
                     "UPDATE messages SET payload=json_patch(payload, ?3), status=COALESCE(?4, status) \
                      WHERE session_pk=?1 AND tool_call_id=?2 RETURNING seq, payload, tool_kind",
@@ -819,8 +778,7 @@ impl Store {
                     },
                 )
             })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+            .await?;
         let payload: serde_json::Value = serde_json::from_str(&payload)?;
         Ok((seq, payload, tool_kind))
     }
@@ -829,52 +787,42 @@ impl Store {
     /// No defaults are applied here — that's the caller's job.
     pub async fn get_setting_raw(&self, key: &str) -> anyhow::Result<Option<String>> {
         let key = key.to_string();
-        let conn = self.pool.get().await?;
-        let result = conn
-            .interact(move |c| {
-                c.query_row(
-                    "SELECT value FROM settings WHERE key = ?1",
-                    params![key],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(result)
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })
+        .await
     }
 
     /// Upsert a raw setting value. No validation is performed.
     pub async fn set_setting_raw(&self, key: &str, value: &str) -> anyhow::Result<()> {
         let key = key.to_string();
         let value = value.to_string();
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "INSERT INTO settings(key, value) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![key, value],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
     /// List all persisted settings rows.
     pub async fn list_settings(&self) -> anyhow::Result<Vec<(String, String)>> {
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .interact(|c| -> rusqlite::Result<Vec<(String, String)>> {
-                let mut stmt = c.prepare("SELECT key, value FROM settings")?;
-                let items = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(items)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(rows)
+        self.with_conn(|c| -> rusqlite::Result<Vec<(String, String)>> {
+            let mut stmt = c.prepare("SELECT key, value FROM settings")?;
+            let items = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
     }
 
     /// Bind a gateway conversation to a session (upsert on the `(gateway,
@@ -888,8 +836,7 @@ impl Store {
         let gateway = gateway.to_string();
         let conversation_id = conversation_id.to_string();
         let session_pk = session_pk.to_string();
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "INSERT INTO session_surfaces(gateway, conversation_id, session_pk) \
                  VALUES (?1, ?2, ?3) \
@@ -897,33 +844,28 @@ impl Store {
                 params![gateway, conversation_id, session_pk],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
     /// List the gateway surfaces bound to a session.
     pub async fn surfaces(&self, session_pk: &str) -> anyhow::Result<Vec<Surface>> {
         let session_pk = session_pk.to_string();
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .interact(move |c| -> rusqlite::Result<Vec<Surface>> {
-                let mut stmt = c.prepare(
-                    "SELECT gateway, conversation_id FROM session_surfaces WHERE session_pk = ?1",
-                )?;
-                let items = stmt
-                    .query_map(params![session_pk], |r| {
-                        Ok(Surface {
-                            gateway: r.get(0)?,
-                            conversation_id: r.get(1)?,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(items)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(rows)
+        self.with_conn(move |c| -> rusqlite::Result<Vec<Surface>> {
+            let mut stmt = c.prepare(
+                "SELECT gateway, conversation_id FROM session_surfaces WHERE session_pk = ?1",
+            )?;
+            let items = stmt
+                .query_map(params![session_pk], |r| {
+                    Ok(Surface {
+                        gateway: r.get(0)?,
+                        conversation_id: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
     }
 
     /// Resolve the session bound to a `(gateway, conversation_id)` surface, if any.
@@ -934,23 +876,19 @@ impl Store {
     ) -> anyhow::Result<Option<Session>> {
         let gateway = gateway.to_string();
         let conversation_id = conversation_id.to_string();
-        let conn = self.pool.get().await?;
-        let s = conn
-            .interact(move |c| {
-                c.query_row(
-                    &format!(
-                        "SELECT s.{SESSION_COLS} FROM sessions s \
-                         JOIN session_surfaces sf ON sf.session_pk = s.session_pk \
-                         WHERE sf.gateway = ?1 AND sf.conversation_id = ?2"
-                    ),
-                    params![gateway, conversation_id],
-                    row_to_session,
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(s)
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT s.{SESSION_COLS} FROM sessions s \
+                     JOIN session_surfaces sf ON sf.session_pk = s.session_pk \
+                     WHERE sf.gateway = ?1 AND sf.conversation_id = ?2"
+                ),
+                params![gateway, conversation_id],
+                row_to_session,
+            )
+            .optional()
+        })
+        .await
     }
 
     /// Bind a gateway workspace to a project (upsert on the `(gateway,
@@ -964,8 +902,7 @@ impl Store {
         let gateway = gateway.to_string();
         let workspace_id = workspace_id.to_string();
         let project_id = project_id.to_string();
-        let conn = self.pool.get().await?;
-        conn.interact(move |c| {
+        self.with_conn(move |c| {
             c.execute(
                 "INSERT INTO project_bindings(gateway, workspace_id, project_id) \
                  VALUES (?1, ?2, ?3) \
@@ -973,8 +910,7 @@ impl Store {
                 params![gateway, workspace_id, project_id],
             )
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        .await?;
         Ok(())
     }
 
@@ -986,23 +922,19 @@ impl Store {
     ) -> anyhow::Result<Option<Project>> {
         let gateway = gateway.to_string();
         let workspace_id = workspace_id.to_string();
-        let conn = self.pool.get().await?;
-        let p = conn
-            .interact(move |c| {
-                c.query_row(
-                    &format!(
-                        "SELECT p.{PROJECT_COLS} FROM projects p \
-                         JOIN project_bindings b ON b.project_id = p.project_id \
-                         WHERE b.gateway = ?1 AND b.workspace_id = ?2"
-                    ),
-                    params![gateway, workspace_id],
-                    row_to_project,
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(p)
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT p.{PROJECT_COLS} FROM projects p \
+                     JOIN project_bindings b ON b.project_id = p.project_id \
+                     WHERE b.gateway = ?1 AND b.workspace_id = ?2"
+                ),
+                params![gateway, workspace_id],
+                row_to_project,
+            )
+            .optional()
+        })
+        .await
     }
 
     /// Insert one request_log row and upsert its usage_daily rollup atomically.

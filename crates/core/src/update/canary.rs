@@ -1,4 +1,4 @@
-//! Canary probe and promote handshake — port of `apps/cli/src/cli/update-canary.ts`.
+//! Canary probe and promote handshake.
 //! Coordinates a staged daemon rollout: probe the DB on the new binary, wait for an
 //! applier signal to promote, then return success or failure for watchdog rollback.
 
@@ -10,8 +10,9 @@ pub struct ProbeResult {
     pub detail: Option<String>,
 }
 
-/// Version check FIRST (TS parity) — callers short-circuit open_db when the
-/// versions already mismatch (see run_canary_with).
+/// Version check FIRST, before the db result is even looked at — callers
+/// short-circuit open_db when the versions already mismatch (see
+/// run_canary_with), so a wrong-version canary never reports a db failure.
 pub fn probe(open_db: anyhow::Result<()>, version: &str, target_version: &str) -> ProbeResult {
     if version != target_version {
         return ProbeResult {
@@ -74,7 +75,7 @@ pub async fn run_canary_with(cfg: &CanaryCfg, host: &dyn CanaryHost) -> CanaryOu
     };
     host.write_handoff(&hand(HandoffPhase::Probing, None));
 
-    // Version check first so a mismatched canary never opens the db (TS probe order).
+    // Version check first so a mismatched canary never opens the db.
     let open = if cfg.version == cfg.target_version {
         host.open_db().await
     } else {
@@ -90,8 +91,8 @@ pub async fn run_canary_with(cfg: &CanaryCfg, host: &dyn CanaryHost) -> CanaryOu
     let deadline = host.now() + cfg.timeout_ms as i64;
     while host.now() < deadline {
         if host.read_handoff().map(|h| h.phase) == Some(HandoffPhase::Promote) {
-            // Delta from TS (which crashed on a promote() rejection): record
-            // the failure so the applier's watchdog rolls back deterministically.
+            // A promote() failure is recorded in the handoff file (never a
+            // crash) so the applier's watchdog rolls back deterministically.
             if let Err(e) = host.promote().await {
                 host.write_handoff(&hand(
                     HandoffPhase::Failed,

@@ -1,4 +1,4 @@
-//! Spawn-before-swap applier state machine — port of `apps/cli/src/cli/update-applier.ts`.
+//! Spawn-before-swap applier state machine.
 //! Safely stages a binary update: spawn a canary, monitor health, drain in-flight requests,
 //! swap the live binary, and hand over to the new daemon, rolling back if anything fails.
 

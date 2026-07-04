@@ -1,18 +1,15 @@
 import type { ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
+import { Button } from "@ryuzi/ui";
 
 // Detail-screen header: breadcrumb back button, identity chip, title/subtitle,
 // then any right-aligned actions.
 export function BackButton({ label, onClick }: { label: string; onClick: () => void }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="-ml-1.5 mb-3.5 flex h-7 cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent pl-1.5 pr-2.5 font-sans text-[12.5px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-    >
-      <ArrowLeft aria-hidden size={13} strokeWidth={2} />
+    <Button variant="ghost" size="sm" onClick={onClick} className="-ml-1.5 mb-3.5 flex gap-1.5 pl-1.5 pr-2.5 text-muted-foreground">
+      <ArrowLeft aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
       {label}
-    </button>
+    </Button>
   );
 }
 

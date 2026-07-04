@@ -1,5 +1,5 @@
+import { MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel } from "@ryuzi/ui";
 import { useRuntimes } from "@/store-runtimes";
-import { MenuItem, MenuPanel, MenuSectionLabel } from "./MenuPanel";
 import { StatusDot } from "./bits";
 
 // "Run with" agent picker shared by the home and session composers. Lists

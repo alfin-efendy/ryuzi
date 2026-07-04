@@ -4,13 +4,19 @@ import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
 import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
-import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
+import {
+  Button,
+  Input,
+  SettingsCard as Card,
+  SettingsCardHeader as CardHeader,
+  SettingsCardHint as CardHint,
+  SettingsCardRow as CardRow,
+  SettingsCardTitle as CardTitle,
+  Textarea,
+} from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { Chip } from "@/components/common/bits";
 import { UsageChart } from "@/components/common/UsageChart";
-
-const field = "h-9 rounded-md border border-input bg-background px-3 font-sans text-[12.5px] text-foreground";
-const modelsField = "min-h-[96px] w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs text-foreground";
 
 export function ConnectionDetailView({ id }: { id: string }) {
   const nav = useNav();
@@ -99,22 +105,18 @@ export function ConnectionDetailView({ id }: { id: string }) {
           title={conn.label || conn.providerName}
           sub={conn.providerName}
         >
-          <button
-            type="button"
-            onClick={() => void runTest()}
-            disabled={testing}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent disabled:opacity-50"
-          >
+          <Button variant="outline" onClick={() => void runTest()} disabled={testing} className="shrink-0">
             {testing ? "Testing…" : "Test"}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="outline"
+            size="icon"
             title="Remove connection"
             onClick={() => void del()}
-            className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md border border-border bg-transparent text-destructive hover:bg-accent"
+            className="shrink-0 text-destructive hover:text-destructive"
           >
-            <Trash2 aria-hidden size={13} strokeWidth={2} />
-          </button>
+            <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+          </Button>
         </DetailHeader>
 
         <Card>
@@ -142,7 +144,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
           </CardRow>
           <CardRow>
             <span className="w-28 shrink-0 text-[13px] font-medium">Label</span>
-            <input className={`${field} flex-1`} value={label} onChange={(e) => setLabel(e.target.value)} placeholder={conn.providerName} />
+            <Input className="flex-1" value={label} onChange={(e) => setLabel(e.target.value)} placeholder={conn.providerName} />
           </CardRow>
         </Card>
 
@@ -156,9 +158,9 @@ export function ConnectionDetailView({ id }: { id: string }) {
           </CardRow>
           <CardRow>
             <span className="w-28 shrink-0 text-[13px] font-medium">Replace key</span>
-            <input
+            <Input
               type="password"
-              className={`${field} flex-1`}
+              className="flex-1"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder="Leave empty to keep the current key"
@@ -171,12 +173,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
             <CardTitle>Base URL</CardTitle>
           </CardHeader>
           <CardRow>
-            <input
-              className={`${field} flex-1`}
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="https://host/v1"
-            />
+            <Input className="flex-1" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://host/v1" />
           </CardRow>
           <div className="px-[18px] pb-3 text-[11.5px] text-muted-foreground">Leave empty for the provider default.</div>
         </Card>
@@ -186,8 +183,8 @@ export function ConnectionDetailView({ id }: { id: string }) {
             <CardTitle>Models</CardTitle>
           </CardHeader>
           <div className="px-[18px] py-3">
-            <textarea
-              className={modelsField}
+            <Textarea
+              className="min-h-[96px] resize-y font-mono text-xs"
               value={modelsText}
               onChange={(e) => setModelsText(e.target.value)}
               placeholder="one model per line"
@@ -197,14 +194,9 @@ export function ConnectionDetailView({ id }: { id: string }) {
         </Card>
 
         <div className="mt-4 flex justify-end">
-          <button
-            type="button"
-            onClick={() => void save()}
-            disabled={saving}
-            className="h-9 cursor-pointer rounded-md border-none bg-primary px-4 font-sans text-[13px] font-medium text-primary-foreground hover:opacity-85 disabled:opacity-50"
-          >
+          <Button size="lg" onClick={() => void save()} disabled={saving}>
             {saving ? "Saving…" : "Save"}
-          </button>
+          </Button>
         </div>
       </div>
     </div>

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Button } from "@ryuzi/ui";
 import {
   Brain,
   Check,
@@ -53,14 +54,15 @@ function ToolChip({ item }: { item: Extract<ActivityItem, { type: "tool" }> }) {
   return (
     <div className="flex max-w-fit flex-col">
       {expandable ? (
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="xs"
           aria-expanded={open}
           onClick={() => setOpen((v) => !v)}
-          className={`${chipClass} cursor-pointer hover:bg-accent`}
+          className={`${chipClass} h-auto cursor-pointer justify-start font-normal hover:bg-accent dark:hover:bg-accent`}
         >
           {chipContent}
-        </button>
+        </Button>
       ) : (
         <div className={chipClass}>{chipContent}</div>
       )}

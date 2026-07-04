@@ -1,6 +1,6 @@
-//! GitHub release check with injectable HTTP layer (Spec 4 slice 5, task 3).
-//! Never throws: any network/HTTP/JSON failure yields `none` result so a
-//! periodic check can never crash the daemon (TS parity from packages/core/src/update/check.ts).
+//! GitHub release check with injectable HTTP layer.
+//! Never throws: any network/HTTP/JSON failure yields a `none` result so a
+//! periodic check can never crash the daemon.
 
 use super::version::is_newer;
 
@@ -62,8 +62,8 @@ impl UpdateCheckResult {
     }
 }
 
-/// Check GitHub Releases for an update. Never throws (TS parity):
-/// any network error, non-OK status, or missing `tag_name` yields `none`.
+/// Check GitHub Releases for an update. Never throws: any network error,
+/// non-OK status, or missing `tag_name` yields `none`.
 pub fn check_for_update(
     current_version: &str,
     repo: &str,

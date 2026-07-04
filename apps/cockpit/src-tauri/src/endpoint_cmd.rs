@@ -183,13 +183,19 @@ pub struct UsageSeries {
     pub today_output_tokens: i64,
 }
 
-fn since_day(days: i64) -> String {
+/// Inclusive lower bound (UTC calendar day) of a usage window ending at
+/// `now_ms`; the window length is clamped to 1..=90 days.
+fn since_day_from(now_ms: i64, days: i64) -> String {
     let clamped = days.clamp(1, 90);
-    let ms = ryuzi_core::paths::now_ms() - clamped * 24 * 60 * 60 * 1000;
+    let ms = now_ms - clamped * 24 * 60 * 60 * 1000;
     chrono::DateTime::from_timestamp_millis(ms)
         .unwrap_or_default()
         .format("%Y-%m-%d")
         .to_string()
+}
+
+fn since_day(days: i64) -> String {
+    since_day_from(ryuzi_core::paths::now_ms(), days)
 }
 
 fn today() -> String {
@@ -256,4 +262,68 @@ pub async fn endpoint_usage(cp: State<'_, Arc<ControlPlane>>, days: i64) -> R<Us
         series.today_output_tokens += t.output_tokens;
     }
     Ok(series)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ryuzi_core::store::UsageDayRow;
+
+    fn row(day: &str, model: &str, requests: i64, input: i64, output: i64) -> UsageDayRow {
+        UsageDayRow {
+            day: day.into(),
+            connection_id: "c1".into(),
+            model: model.into(),
+            requests,
+            input_tokens: input,
+            output_tokens: output,
+        }
+    }
+
+    fn noon_utc() -> i64 {
+        chrono::DateTime::parse_from_rfc3339("2026-07-04T12:00:00Z")
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn since_day_counts_back_whole_days() {
+        assert_eq!(since_day_from(noon_utc(), 7), "2026-06-27");
+    }
+
+    #[test]
+    fn since_day_clamps_the_window_to_1_through_90() {
+        let now = noon_utc();
+        assert_eq!(since_day_from(now, 0), since_day_from(now, 1));
+        assert_eq!(since_day_from(now, -5), since_day_from(now, 1));
+        assert_eq!(since_day_from(now, 1000), since_day_from(now, 90));
+        assert_eq!(since_day_from(now, 90), "2026-04-05");
+    }
+
+    #[test]
+    fn series_folds_same_day_models_into_one_point() {
+        let series = to_series(vec![
+            row("2026-07-01", "model-a", 2, 10, 20),
+            row("2026-07-01", "model-b", 3, 30, 40),
+        ]);
+        assert_eq!(series.days.len(), 1);
+        let p = &series.days[0];
+        assert_eq!(p.day, "2026-07-01");
+        assert_eq!(p.requests, 5);
+        assert_eq!(p.input_tokens, 40);
+        assert_eq!(p.output_tokens, 60);
+    }
+
+    #[test]
+    fn series_orders_days_ascending_and_leaves_today_totals_zero() {
+        let series = to_series(vec![
+            row("2026-07-02", "model-a", 1, 1, 1),
+            row("2026-07-01", "model-a", 1, 1, 1),
+        ]);
+        let days: Vec<&str> = series.days.iter().map(|p| p.day.as_str()).collect();
+        assert_eq!(days, vec!["2026-07-01", "2026-07-02"]);
+        assert_eq!(series.today_requests, 0);
+        assert_eq!(series.today_input_tokens, 0);
+        assert_eq!(series.today_output_tokens, 0);
+    }
 }

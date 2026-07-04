@@ -1,3 +1,5 @@
+import { cn } from "../../lib/utils";
+
 type SegmentedOption<T extends string> = { id: T; label: string };
 
 type SegmentedProps<T extends string> = {
@@ -9,7 +11,7 @@ type SegmentedProps<T extends string> = {
 };
 
 // Segmented control: muted track, bordered raised segment for the selection.
-export function Segmented<T extends string>({ options, value, onChange, size = "md", pill = false }: SegmentedProps<T>) {
+function Segmented<T extends string>({ options, value, onChange, size = "md", pill = false }: SegmentedProps<T>) {
   const h = size === "sm" ? "h-[23px] px-[9px] text-[11px]" : "h-[25px] px-2.5 text-[11.5px]";
   return (
     <div className="flex w-fit gap-[2px] rounded-md bg-muted p-[2px]">
@@ -20,9 +22,13 @@ export function Segmented<T extends string>({ options, value, onChange, size = "
             key={o.id}
             type="button"
             onClick={() => onChange(o.id)}
-            className={`${h} cursor-pointer font-medium ${pill ? "rounded-full" : "rounded-sm"} border ${
-              sel ? "border-border bg-background text-foreground" : "border-transparent bg-transparent text-muted-foreground"
-            }`}
+            className={cn(
+              h,
+              "cursor-pointer font-medium",
+              pill ? "rounded-full" : "rounded-sm",
+              "border",
+              sel ? "border-border bg-background text-foreground" : "border-transparent bg-transparent text-muted-foreground",
+            )}
           >
             {o.label}
           </button>
@@ -31,3 +37,6 @@ export function Segmented<T extends string>({ options, value, onChange, size = "
     </div>
   );
 }
+
+export { Segmented };
+export type { SegmentedOption };

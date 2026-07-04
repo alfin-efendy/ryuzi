@@ -109,16 +109,25 @@ pub fn resolve_approval(cp: State<'_, Arc<ControlPlane>>, request_id: String, al
     cp.resolve_approval(&request_id, allow)
 }
 
+/// Largest file the viewer will load into memory.
+const MAX_READ_BYTES: u64 = 2 * 1024 * 1024; // 2 MB cap
+
+/// Reject reads past the viewer's size cap before touching file contents; the
+/// error carries the offending size.
+fn check_read_size(len: u64) -> Result<(), CmdError> {
+    if len > MAX_READ_BYTES {
+        return Err(CmdError {
+            message: format!("file too large ({len} bytes)"),
+        });
+    }
+    Ok(())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn read_file(path: String) -> R<String> {
-    const MAX: u64 = 2 * 1024 * 1024; // 2 MB cap
     let meta = tokio::fs::metadata(&path).await?;
-    if meta.len() > MAX {
-        return Err(CmdError {
-            message: format!("file too large ({} bytes)", meta.len()),
-        });
-    }
+    check_read_size(meta.len())?;
     Ok(tokio::fs::read_to_string(&path).await?)
 }
 
@@ -147,4 +156,21 @@ pub fn backdrop_capability(
     state: State<'_, crate::backdrop::BackdropState>,
 ) -> crate::backdrop::BackdropCapability {
     state.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_up_to_the_cap_pass() {
+        assert!(check_read_size(0).is_ok());
+        assert!(check_read_size(MAX_READ_BYTES).is_ok());
+    }
+
+    #[test]
+    fn sizes_over_the_cap_are_rejected_with_the_size() {
+        let err = check_read_size(MAX_READ_BYTES + 1).unwrap_err();
+        assert_eq!(err.message, "file too large (2097153 bytes)");
+    }
 }

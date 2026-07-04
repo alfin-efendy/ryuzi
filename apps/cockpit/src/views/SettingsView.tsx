@@ -1,10 +1,13 @@
-import { ACCENTS, type Mode, useTheme } from "@ryuzi/ui";
+import { ACCENTS, Button, Input, type Mode, SettingsCard as Card, SettingsCardRow as CardRow, Switch, useTheme } from "@ryuzi/ui";
 import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
-import { Card, CardRow } from "@/components/common/Card";
-import { Switch } from "@/components/common/Switch";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
+// Canonical brand assets (assets/brand/README.md). Explicit light/dark variants:
+// the app theme is class-driven, so the prefers-color-scheme adaptive SVG can't follow it.
+import wordmarkDark from "../../../../assets/brand/wordmark-dark.svg";
+import wordmarkLight from "../../../../assets/brand/wordmark-light.svg";
 
 // ——— Theme mode preview cards ———
 
@@ -54,7 +57,7 @@ const MODE_CARDS: ModeCard[] = [
 
 function ThemeModeCard({ card, selected, onPick }: { card: ModeCard; selected: boolean; onPick: () => void }) {
   return (
-    <button type="button" onClick={onPick} className="cursor-pointer border-none bg-transparent p-0 font-sans">
+    <Button variant="ghost" onClick={onPick} className="block h-auto w-full p-0 hover:bg-transparent dark:hover:bg-transparent">
       <div className={`relative h-[116px] overflow-hidden rounded-lg border-2 shadow-xs ${selected ? "border-primary" : "border-border"}`}>
         <div className="absolute inset-0 flex">
           <div className="flex-1" style={{ background: card.leftBg }} />
@@ -75,12 +78,10 @@ function ThemeModeCard({ card, selected, onPick }: { card: ModeCard; selected: b
           </div>
         </div>
       </div>
-      <div
-        className={`mt-2.5 text-center text-[12.5px] ${selected ? "font-semibold text-foreground" : "font-medium text-muted-foreground"}`}
-      >
+      <div className={`mt-2.5 text-center ${selected ? "font-semibold text-foreground" : "font-medium text-muted-foreground"}`}>
         {card.label}
       </div>
-    </button>
+    </Button>
   );
 }
 
@@ -131,33 +132,35 @@ function AccentRow() {
       <span className="flex-1 text-[13px] font-medium">Accent</span>
       <div className="flex flex-wrap items-center gap-2">
         {ACCENTS.map((a) => (
-          <button
+          <Button
             key={a.key}
-            type="button"
+            variant="ghost"
+            size="icon-xs"
             aria-label={a.label}
             title={a.label}
             onClick={() => setAccent(a.key)}
-            className={`h-5 w-5 cursor-pointer rounded-full border border-border ${activeKey === a.key ? "ring-2 ring-ring ring-offset-1 ring-offset-card" : ""}`}
+            className={`size-5 rounded-full border-border ${activeKey === a.key ? "ring-2 ring-ring ring-offset-1 ring-offset-card" : ""}`}
             style={{ background: a.primary || "oklch(0.6 0 0)" }}
           />
         ))}
         {systemAccentHex && (
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="icon-xs"
             aria-label="System accent"
             title="Follow the OS accent color"
             onClick={() => setAccent("system")}
-            className={`h-5 w-5 cursor-pointer rounded-full border border-border ${accent === "system" ? "ring-2 ring-ring ring-offset-1 ring-offset-card" : ""}`}
+            className={`size-5 rounded-full border-border ${accent === "system" ? "ring-2 ring-ring ring-offset-1 ring-offset-card" : ""}`}
             style={{ background: systemAccentHex }}
           />
         )}
-        <input
+        <Input
           type="color"
           aria-label="Custom accent"
           title="Custom accent"
           value={customValue}
           onChange={(e) => setAccent({ custom: e.target.value })}
-          className="h-5 w-5 cursor-pointer rounded-full border border-border bg-transparent p-0"
+          className="size-5 cursor-pointer rounded-full border-border p-0 dark:bg-transparent"
         />
       </div>
     </CardRow>
@@ -171,6 +174,13 @@ export function SettingsView() {
   const setMode = useTheme((s) => s.setMode);
   const transparency = useTheme((s) => s.transparency);
   const setTransparency = useTheme((s) => s.setTransparency);
+
+  const [version, setVersion] = useState<string | null>(null);
+  useEffect(() => {
+    getVersion()
+      .then(setVersion)
+      .catch(() => setVersion(null));
+  }, []);
 
   const [openAtLogin, setOpenAtLogin] = useState<boolean | null>(null);
   useEffect(() => {
@@ -230,6 +240,20 @@ export function SettingsView() {
               <div className="mt-0.5 text-[12.5px] text-muted-foreground">Start Cockpit when you sign in.</div>
             </div>
             <Switch on={openAtLogin === true} onToggle={toggleOpenAtLogin} label="Open at login" />
+          </div>
+        </Card>
+
+        <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">About</div>
+
+        <Card>
+          <div className="flex items-center gap-3.5 px-[18px] py-4">
+            <div className="flex-1">
+              <img src={wordmarkLight} alt="ryuzi" className="h-5 dark:hidden" />
+              <img src={wordmarkDark} alt="ryuzi" className="hidden h-5 dark:block" />
+              <div className="mt-1.5 text-[12.5px] text-muted-foreground">
+                Cockpit{version ? ` v${version}` : ""} — drive Claude Code from chat and terminal.
+              </div>
+            </div>
           </div>
         </Card>
       </div>

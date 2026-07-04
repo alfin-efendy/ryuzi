@@ -5,10 +5,18 @@ import { useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
-import { Card, CardHeader, CardRow, CardTitle } from "@/components/common/Card";
+import {
+  Button,
+  MenuPanel,
+  MenuPanelItem as MenuItem,
+  SettingsCard as Card,
+  SettingsCardHeader as CardHeader,
+  SettingsCardRow as CardRow,
+  SettingsCardTitle as CardTitle,
+  Switch,
+  Textarea,
+} from "@ryuzi/ui";
 import { BackButton } from "@/components/common/DetailHeader";
-import { MenuItem, MenuPanel } from "@/components/common/MenuPanel";
-import { Switch } from "@/components/common/Switch";
 import { StatusDot } from "@/components/common/bits";
 import { ScheduleCard, type ScheduleValue } from "./JobDetailView";
 
@@ -75,46 +83,34 @@ export function JobNewView() {
             <CardTitle>Prompt &amp; target</CardTitle>
           </CardHeader>
           <div className="px-[18px] pb-1 pt-3">
-            <textarea
+            <Textarea
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               placeholder="What should the agent do on every run?"
               rows={3}
-              className="box-border w-full resize-y rounded-md border border-input bg-background px-3 py-2.5 font-sans text-[13px] leading-[1.55] text-foreground"
+              className="resize-y"
             />
           </div>
           <div className="relative flex flex-wrap items-center gap-1.5 px-[18px] pb-3.5 pt-2">
-            <button
-              type="button"
-              onClick={() => setMenu(menu === "agent" ? null : "agent")}
-              className="flex h-7 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-2.5 font-sans text-xs font-semibold text-foreground hover:bg-accent"
-            >
+            <Button variant="outline" size="sm" onClick={() => setMenu(menu === "agent" ? null : "agent")}>
               <StatusDot color={agent?.color ?? "var(--muted-foreground)"} size={7} />
               {agent?.name ?? "No agent"}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} />
-            </button>
-            <button
-              type="button"
-              onClick={() => setMenu(menu === "project" ? null : "project")}
-              className="flex h-7 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-2.5 font-sans text-xs font-medium text-foreground hover:bg-accent"
-            >
-              <Folder aria-hidden size={12} strokeWidth={2} className="shrink-0" />
+              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setMenu(menu === "project" ? null : "project")}>
+              <Folder aria-hidden size={12} strokeWidth={2} className="size-3" />
               {project?.name ?? "No project"}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} />
-            </button>
+              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+            </Button>
             <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 font-mono text-[11.5px] text-muted-foreground">
               <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
               main
             </span>
-            <button
-              type="button"
-              onClick={() => setMenu(menu === "ws" ? null : "ws")}
-              className="flex h-7 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-2.5 font-sans text-xs font-medium text-foreground hover:bg-accent"
-            >
-              <Server aria-hidden size={12} strokeWidth={2} className="shrink-0" />
+            <Button variant="outline" size="sm" onClick={() => setMenu(menu === "ws" ? null : "ws")}>
+              <Server aria-hidden size={12} strokeWidth={2} className="size-3" />
               {wsName}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} />
-            </button>
+              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+            </Button>
             {menu === "agent" && (
               <MenuPanel onClose={() => setMenu(null)} className="bottom-11 left-[18px] w-[280px]">
                 {runnableAgents.length === 0 && (
@@ -209,22 +205,12 @@ export function JobNewView() {
         </Card>
 
         <div className="flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={goScheduler}
-            className="h-8 cursor-pointer rounded-md border border-border bg-transparent px-3.5 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
-          >
+          <Button variant="outline" onClick={goScheduler}>
             Cancel
-          </button>
-          <button
-            type="button"
-            onClick={() => void create()}
-            className={`h-8 rounded-md border-none bg-primary px-4 font-sans text-[12.5px] font-semibold text-primary-foreground ${
-              canCreate ? "cursor-pointer hover:opacity-85" : "cursor-default opacity-45"
-            }`}
-          >
+          </Button>
+          <Button onClick={() => void create()} disabled={!canCreate}>
             {saving ? "Creating…" : "Create job"}
-          </button>
+          </Button>
         </div>
       </div>
     </div>

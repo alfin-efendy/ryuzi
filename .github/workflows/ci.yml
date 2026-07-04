@@ -36,7 +36,6 @@ jobs:
           filters: |
             ts:
               - "packages/**"
-              - "apps/cli/**"
               - "apps/cockpit/src/**"
               - "apps/**/tsconfig*.json"
               - "scripts/**"

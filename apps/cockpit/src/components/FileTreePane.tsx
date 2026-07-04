@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { commands } from "@/bindings";
 import { joinPath } from "@/lib/paths";
 import { useUi } from "@/store-ui";
+import { Button } from "@ryuzi/ui";
 
 export type Node = { rel: string; name: string; dir: boolean; depth: number; open?: boolean; children?: Node[] };
 
@@ -90,11 +91,11 @@ export function FileTreePane({ sessionPk, filter, refreshKey }: { sessionPk: str
     <div className="flex flex-col">
       {visible.length === 0 && <div className="px-2 py-2 text-[12px] text-muted-foreground">No files.</div>}
       {visible.map((n) => (
-        <button
+        <Button
           key={n.rel}
-          type="button"
+          variant="ghost"
           onClick={() => (n.dir ? void toggleDir(n) : openLeaf(n))}
-          className="flex cursor-pointer items-center gap-1.5 rounded-sm border-none bg-transparent py-[5px] pr-2 text-left font-sans text-[12.5px] text-foreground hover:bg-accent"
+          className="h-auto w-full justify-start gap-1.5 rounded-sm py-[5px] pr-2 text-left"
           style={{ paddingLeft: 8 + n.depth * 14 }}
         >
           {n.dir ? (
@@ -102,14 +103,14 @@ export function FileTreePane({ sessionPk, filter, refreshKey }: { sessionPk: str
               aria-hidden
               size={11}
               strokeWidth={2}
-              className="shrink-0 text-muted-foreground transition-transform duration-100"
+              className="size-[11px] shrink-0 text-muted-foreground transition-transform duration-100"
               style={{ transform: n.open ? "rotate(90deg)" : undefined }}
             />
           ) : (
-            <FileText aria-hidden size={12} strokeWidth={2} className="shrink-0 text-muted-foreground" />
+            <FileText aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0 text-muted-foreground" />
           )}
           <span className="truncate">{n.name}</span>
-        </button>
+        </Button>
       ))}
     </div>
   );

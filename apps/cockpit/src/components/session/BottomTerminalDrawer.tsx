@@ -3,10 +3,8 @@ import { Copy, Plus, Search, SquareTerminal, X } from "lucide-react";
 import { useNav, clampPanelSize, BOTTOM_HEIGHT } from "@/store-nav";
 import { useTerms } from "@/store-terms";
 import { attach, detach, getTerm, refit, type TermInstance } from "@/lib/term-cache";
+import { Button, Input } from "@ryuzi/ui";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
-
-const toolBtn =
-  "flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground";
 
 function TerminalHost({ inst, className }: { inst: TermInstance; className?: string }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -62,22 +60,31 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
                   : "border-transparent text-muted-foreground hover:bg-accent"
               }`}
             >
-              <button
-                type="button"
+              <Button
+                variant="ghost"
+                size="xs"
                 onClick={() => setActive(sessionPk, t.termId)}
-                className={`cursor-pointer border-none bg-transparent font-sans text-inherit ${t.exited ? "line-through opacity-60" : ""}`}
+                className={`h-auto p-0 text-inherit hover:bg-transparent hover:text-inherit dark:hover:bg-transparent ${
+                  t.exited ? "line-through opacity-60" : ""
+                }`}
               >
                 {t.title}
-              </button>
-              <button type="button" title={`Close ${t.title}`} onClick={() => close(sessionPk, t.termId)} className={`${toolBtn} h-5 w-5`}>
-                <X aria-hidden size={10} strokeWidth={2} />
-              </button>
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                title={`Close ${t.title}`}
+                onClick={() => close(sessionPk, t.termId)}
+                className="size-5 text-muted-foreground"
+              >
+                <X aria-hidden size={10} strokeWidth={2} className="size-2.5" />
+              </Button>
             </div>
           ))}
         </div>
-        <button type="button" title="New terminal" onClick={() => void open(sessionPk)} className={`${toolBtn} h-7 w-7`}>
-          <Plus aria-hidden size={13} strokeWidth={2} />
-        </button>
+        <Button variant="ghost" size="icon-sm" title="New terminal" onClick={() => void open(sessionPk)} className="text-muted-foreground">
+          <Plus aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+        </Button>
         <form
           className="flex h-7 w-[180px] items-center gap-1.5 rounded-md border border-border px-2 [background:color-mix(in_oklab,var(--background)_45%,transparent)]"
           onSubmit={(e) => {
@@ -86,7 +93,7 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
           }}
         >
           <Search aria-hidden size={11} strokeWidth={2} className="shrink-0 text-muted-foreground" />
-          <input
+          <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
@@ -97,23 +104,24 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
             }}
             placeholder="Search"
             aria-label="Search terminal scrollback"
-            className="min-w-0 flex-1 border-none bg-transparent font-sans text-[11.5px] text-foreground outline-none"
+            className="h-full flex-1 rounded-none border-none bg-transparent px-0 text-foreground focus-visible:ring-0 dark:bg-transparent"
           />
         </form>
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="icon-sm"
           title={copyOnSelect ? "Copy on select: on" : "Copy on select: off"}
           aria-pressed={copyOnSelect}
           onClick={() => setCopyOnSelect(!copyOnSelect)}
-          className={`${toolBtn} h-7 w-7 ${copyOnSelect ? "bg-accent text-accent-foreground" : ""}`}
+          className={copyOnSelect ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
         >
-          <Copy aria-hidden size={12} strokeWidth={2} />
-        </button>
+          <Copy aria-hidden size={12} strokeWidth={2} className="size-3" />
+        </Button>
         <span className="font-mono text-[11px] text-muted-foreground">{projectName}</span>
         <div className="flex-1" />
-        <button type="button" title="Close panel" onClick={nav.toggleBottom} className={`${toolBtn} h-[26px] w-[26px]`}>
-          <X aria-hidden size={13} strokeWidth={2} />
-        </button>
+        <Button variant="ghost" size="icon-sm" title="Close panel" onClick={nav.toggleBottom} className="size-[26px] text-muted-foreground">
+          <X aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+        </Button>
       </div>
       {inst ? (
         <TerminalHost inst={inst} className="flex-1" />

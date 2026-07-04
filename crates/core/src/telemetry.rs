@@ -1,5 +1,4 @@
-//! Telemetry seam ported from the retired TS `observability` layer
-//! (`packages/core/src/observability/{types,console}.ts`).
+//! Telemetry seam.
 //!
 //! `Telemetry` is the seam `ControlPlane` instruments against. `NoopTelemetry`
 //! is the default (used by [`crate::control::ControlPlane::new`]); daemon
@@ -76,8 +75,7 @@ impl Telemetry for NoopTelemetry {
     }
 }
 
-/// A `Telemetry` that renders each event as one JSON line via `sink`,
-/// mirroring the TS `ConsoleTelemetry` (`observability/console.ts`) shapes:
+/// A `Telemetry` that renders each event as one JSON line via `sink`:
 /// - span: `{"kind":"span","name":..,"attrs":{..},"durationMs":N[,"error":msg]}`
 /// - count: `{"kind":"count","name":..,"attrs":{..}}`
 /// - record: `{"kind":"record","name":..,"value":N,"attrs":{..}}`
@@ -184,8 +182,8 @@ impl Telemetry for ConsoleTelemetry {
 }
 
 /// OTLP/HTTP signal URLs. opentelemetry-otlp uses a programmatic endpoint
-/// verbatim (no auto signal path), so we append the paths ourselves —
-/// same concatenation the retired TS otel.ts used.
+/// verbatim (no auto signal path), so we append the standard `/v1/traces`
+/// and `/v1/metrics` paths ourselves.
 ///
 /// Only called from `OtelTelemetry::new` (behind `#[cfg(feature = "otel")]`),
 /// so without the feature this is otherwise-dead code — its own unit tests
@@ -197,8 +195,7 @@ pub(crate) fn otlp_signal_urls(endpoint: &str) -> (String, String) {
     (format!("{base}/v1/traces"), format!("{base}/v1/metrics"))
 }
 
-/// OTLP/HTTP telemetry backend, ported from the retired TS
-/// `observability/otel.ts` adapter: batched span export to
+/// OTLP/HTTP telemetry backend: batched span export to
 /// `{endpoint}/v1/traces`, periodic metric export to `{endpoint}/v1/metrics`,
 /// service name `ryuzi`. Every `Telemetry`/`Span` method is infallible —
 /// failures are swallowed so telemetry can never interrupt core
@@ -248,7 +245,8 @@ fn attrs_to_kvs(attrs: &Attrs) -> Vec<opentelemetry::KeyValue> {
 impl OtelTelemetry {
     /// Build the OTLP/HTTP exporters + providers against `endpoint`. Spans
     /// are exported to `{endpoint}/v1/traces`, metrics to
-    /// `{endpoint}/v1/metrics`. Service name is fixed at `ryuzi` (TS parity).
+    /// `{endpoint}/v1/metrics`. Service name is fixed at `ryuzi` so all
+    /// deployments report under one name.
     pub fn new(endpoint: &str) -> anyhow::Result<Self> {
         use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_otlp::WithExportConfig;

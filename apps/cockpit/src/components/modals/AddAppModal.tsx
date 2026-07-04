@@ -1,11 +1,7 @@
 import { LayoutGrid } from "lucide-react";
 import { useState } from "react";
 import { useApps } from "@/store-apps";
-import { Segmented } from "@/components/common/Segmented";
-import { Modal } from "./Modal";
-
-const field = "h-9 w-full rounded-md border border-input bg-background px-3 font-sans text-[12.5px] text-foreground";
-const monoField = `${field} font-mono text-xs`;
+import { Button, FormField, Input, Modal, ModalFooter, Segmented, Textarea } from "@ryuzi/ui";
 
 // Add an MCP server by hand (stdio command or HTTP URL). Adding runs a real
 // handshake, so the card lands with a true status and discovered tool list.
@@ -57,10 +53,9 @@ export function AddAppModal({ onClose }: { onClose: () => void }) {
       </p>
       <div className="flex flex-col gap-3">
         <div className="flex gap-3">
-          <label className="flex flex-1 flex-col gap-1.5">
-            <span className="text-xs font-semibold">Name</span>
-            <input className={field} value={name} onChange={(e) => setName(e.target.value)} placeholder="GitHub" />
-          </label>
+          <FormField label="Name" className="flex-1">
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="GitHub" />
+          </FormField>
           <div className="flex flex-col gap-1.5">
             <span className="text-xs font-semibold">Transport</span>
             <Segmented
@@ -73,53 +68,45 @@ export function AddAppModal({ onClose }: { onClose: () => void }) {
             />
           </div>
         </div>
-        <label className="flex flex-col gap-1.5">
-          <span className="text-xs font-semibold">Description</span>
-          <input className={field} value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="What agents use it for" />
-        </label>
+        <FormField label="Description">
+          <Input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="What agents use it for" />
+        </FormField>
         {transport === "stdio" ? (
-          <label className="flex flex-col gap-1.5">
-            <span className="text-xs font-semibold">Command</span>
-            <input
-              className={monoField}
+          <FormField label="Command">
+            <Input
+              className="font-mono text-xs"
               value={command}
               onChange={(e) => setCommand(e.target.value)}
               placeholder="npx -y @modelcontextprotocol/server-github"
             />
-          </label>
+          </FormField>
         ) : (
-          <label className="flex flex-col gap-1.5">
-            <span className="text-xs font-semibold">URL</span>
-            <input className={monoField} value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://mcp.example.com" />
-          </label>
+          <FormField label="URL">
+            <Input
+              className="font-mono text-xs"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://mcp.example.com"
+            />
+          </FormField>
         )}
-        <label className="flex flex-col gap-1.5">
-          <span className="text-xs font-semibold">Environment (KEY=value, one per line)</span>
-          <textarea
-            className="min-h-[64px] w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs text-foreground"
+        <FormField label="Environment (KEY=value, one per line)">
+          <Textarea
+            className="resize-y font-mono text-xs"
             value={env}
             onChange={(e) => setEnv(e.target.value)}
             placeholder="GITHUB_TOKEN=ghp_…"
           />
-        </label>
+        </FormField>
       </div>
-      <div className="mt-[22px] flex items-center justify-end gap-2">
-        <button
-          type="button"
-          onClick={onClose}
-          className="h-8 cursor-pointer rounded-md border border-border bg-transparent px-3.5 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
-        >
+      <ModalFooter>
+        <Button variant="outline" onClick={onClose}>
           Cancel
-        </button>
-        <button
-          type="button"
-          disabled={!valid || saving}
-          onClick={() => void submit()}
-          className="h-8 cursor-pointer rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85 disabled:opacity-50"
-        >
+        </Button>
+        <Button disabled={!valid || saving} onClick={() => void submit()}>
           {saving ? "Connecting…" : "Add & connect"}
-        </button>
-      </div>
+        </Button>
+      </ModalFooter>
     </Modal>
   );
 }

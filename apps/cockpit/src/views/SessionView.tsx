@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, GitBranch, Mic, PanelBottom, PanelRight, Plus } from "lucide-react";
+import { Button, Textarea } from "@ryuzi/ui";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { runtimeById, defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
@@ -12,9 +13,6 @@ import { StatusDot } from "@/components/common/bits";
 import { Transcript } from "@/components/transcript/Transcript";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
-
-const toolBtn =
-  "flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground";
 
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects } = useStore();
@@ -66,22 +64,24 @@ export function SessionView() {
           </div>
           <div className="flex-1" />
           <div className="mx-0.5 h-[18px] w-px bg-border" />
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="icon-sm"
             title="Toggle bottom panel"
             onClick={nav.toggleBottom}
-            className={`${toolBtn} ${nav.bottomOpen ? "bg-accent text-accent-foreground" : ""}`}
+            className={nav.bottomOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
           >
-            <PanelBottom aria-hidden size={15} strokeWidth={2} />
-          </button>
-          <button
-            type="button"
+            <PanelBottom aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
             title="Toggle right panel"
             onClick={nav.toggleRight}
-            className={`${toolBtn} ${nav.rightOpen ? "bg-accent text-accent-foreground" : ""}`}
+            className={nav.rightOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
           >
-            <PanelRight aria-hidden size={15} strokeWidth={2} />
-          </button>
+            <PanelRight aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+          </Button>
         </div>
 
         {/* Transcript */}
@@ -92,7 +92,7 @@ export function SessionView() {
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
           <div className="acrylic-card relative rounded-2xl border border-border shadow-xs">
-            <textarea
+            <Textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
@@ -103,60 +103,34 @@ export function SessionView() {
               }}
               placeholder="Ask for follow-up changes"
               rows={1}
-              className="box-border w-full resize-none border-none bg-transparent px-4 pb-0.5 pt-[13px] font-sans text-[13.5px] leading-normal text-foreground"
+              className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
             />
             <div className="relative flex items-center gap-1.5 px-2.5 pb-2.5 pt-1.5">
-              <button
-                type="button"
-                title="Attach"
-                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border-none bg-transparent text-muted-foreground hover:bg-accent"
-              >
-                <Plus aria-hidden size={15} strokeWidth={2} />
-              </button>
-              <button
-                type="button"
-                className="flex h-7 cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2 font-sans text-xs font-medium hover:bg-accent"
-                style={{ color: "#E8703A" }}
-              >
-                <CircleAlert aria-hidden size={12} strokeWidth={2} />
+              <Button variant="ghost" size="icon-sm" title="Attach" className="rounded-full text-muted-foreground">
+                <Plus aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+              </Button>
+              <Button variant="ghost" size="sm" className="font-medium" style={{ color: "#E8703A" }}>
+                <CircleAlert aria-hidden size={12} strokeWidth={2} className="size-3" />
                 Full access
-                <ChevronDown aria-hidden size={11} strokeWidth={2} />
-              </button>
+                <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+              </Button>
               <div className="flex-1" />
-              <button
-                type="button"
-                onClick={() => setAgentMenuOpen((v) => !v)}
-                className="flex h-7 cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2 font-sans text-xs font-semibold text-foreground hover:bg-accent"
-              >
+              <Button variant="ghost" size="sm" onClick={() => setAgentMenuOpen((v) => !v)} className="font-semibold">
                 <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
                 {agent?.model || agent?.name || "No agent"}
-                <ChevronDown aria-hidden size={11} strokeWidth={2} />
-              </button>
-              <button
-                type="button"
-                title="Voice"
-                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border-none bg-transparent text-muted-foreground hover:bg-accent"
-              >
-                <Mic aria-hidden size={13} strokeWidth={2} />
-              </button>
+                <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+              </Button>
+              <Button variant="ghost" size="icon-sm" title="Voice" className="rounded-full text-muted-foreground">
+                <Mic aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+              </Button>
               {composerMode(session.status) === "stop" ? (
-                <button
-                  type="button"
-                  title="Stop"
-                  onClick={() => void stop(session.sessionPk)}
-                  className="flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-full border-none bg-primary text-primary-foreground hover:opacity-85"
-                >
+                <Button size="icon" title="Stop" onClick={() => void stop(session.sessionPk)} className="rounded-full">
                   <span className="h-[11px] w-[11px] rounded-[2px] bg-current" />
-                </button>
+                </Button>
               ) : (
-                <button
-                  type="button"
-                  title="Send"
-                  onClick={submit}
-                  className="flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-full border-none bg-primary text-primary-foreground hover:opacity-85"
-                >
-                  <ArrowUp aria-hidden size={14} strokeWidth={2.2} />
-                </button>
+                <Button size="icon" title="Send" onClick={submit} className="rounded-full">
+                  <ArrowUp aria-hidden size={14} strokeWidth={2.2} className="size-3.5" />
+                </Button>
               )}
               {agentMenuOpen && (
                 <AgentMenu
