@@ -524,6 +524,22 @@ async revokeEndpointKey(id: string) : Promise<Result<EndpointKeyInfo[], CmdError
     else return { status: "error", error: e  as any };
 }
 },
+async connectionUsage(connectionId: string, days: number) : Promise<Result<UsageSeries, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("connection_usage", { connectionId, days }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async endpointUsage(days: number) : Promise<Result<UsageSeries, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("endpoint_usage", { days }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listProviderCatalog() : Promise<Result<CatalogEntry[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_provider_catalog") };
@@ -709,6 +725,8 @@ data: string }
 export type TestResult = { ok: boolean; message: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type ToolInfo = { name: string; desc: string; perm: string }
+export type UsagePoint = { day: string; requests: number; inputTokens: number; outputTokens: number }
+export type UsageSeries = { days: UsagePoint[]; todayRequests: number; todayInputTokens: number; todayOutputTokens: number }
 export type WorktreeState = { 
 /**
  * Uncommitted work (staged, unstaged, or untracked).
