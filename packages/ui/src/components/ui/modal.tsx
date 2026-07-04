@@ -1,7 +1,9 @@
 import { useEffect, type ReactNode } from "react";
 
+import { cn } from "../../lib/utils";
+
 // Full-window modal scrim + centered panel per the design's dialog pattern.
-export function Modal({ onClose, width, children }: { onClose: () => void; width: number; children: ReactNode }) {
+function Modal({ onClose, width, className, children }: { onClose: () => void; width: number; className?: string; children: ReactNode }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -15,7 +17,7 @@ export function Modal({ onClose, width, children }: { onClose: () => void; width
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: click handler only swallows bubbling so the scrim doesn't dismiss */}
       <div
         onClick={(e) => e.stopPropagation()}
-        className="rounded-xl border border-border bg-popover p-[22px] text-popover-foreground shadow-2xl"
+        className={cn("rounded-xl border border-border bg-popover p-[22px] text-popover-foreground shadow-2xl", className)}
         style={{ width }}
         role="dialog"
       >
@@ -24,3 +26,11 @@ export function Modal({ onClose, width, children }: { onClose: () => void; width
     </div>
   );
 }
+
+// Right-aligned action row at the bottom of a Modal body. Insert a
+// `<div className="flex-1" />` child to push leading actions (e.g. Back) left.
+function ModalFooter({ className, children }: { className?: string; children: ReactNode }) {
+  return <div className={cn("mt-[22px] flex items-center justify-end gap-2", className)}>{children}</div>;
+}
+
+export { Modal, ModalFooter };

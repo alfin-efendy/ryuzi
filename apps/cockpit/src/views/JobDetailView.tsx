@@ -6,11 +6,20 @@ import { formatDuration, formatNextRun, formatStarted, jobById, toInput, useSche
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
-import { Card, CardHeader, CardRow, CardTitle } from "@/components/common/Card";
+import {
+  Button,
+  Input,
+  MenuPanel,
+  MenuPanelItem as MenuItem,
+  Segmented,
+  SettingsCard as Card,
+  SettingsCardHeader as CardHeader,
+  SettingsCardRow as CardRow,
+  SettingsCardTitle as CardTitle,
+  Switch,
+  Textarea,
+} from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { MenuItem, MenuPanel } from "@/components/common/MenuPanel";
-import { Segmented } from "@/components/common/Segmented";
-import { Switch } from "@/components/common/Switch";
 import { DiffStat, Pill, StatusDot } from "@/components/common/bits";
 
 // ---- Schedule editor (shared with JobNewView) -------------------------------
@@ -121,11 +130,11 @@ export function ScheduleCard({
       <div className="flex flex-col gap-2.5 px-[18px] py-3.5">
         {value.mode === "natural" && (
           <>
-            <input
+            <Input
               value={value.natural}
               onChange={(e) => onPatch({ natural: e.target.value })}
               placeholder="e.g. “every Monday at 9am” or “every 6 hours”"
-              className="box-border h-9 w-full rounded-md border border-input bg-background px-3 font-sans text-[13px] text-foreground"
+              className="h-9"
             />
             {parseFail && (
               <div className="flex items-center gap-[7px] text-xs" style={{ color: "#F59E0B" }}>
@@ -144,38 +153,31 @@ export function ScheduleCard({
                 {DAY_OPTIONS.map((d) => {
                   const sel = days.includes(d.n);
                   return (
-                    <button
+                    <Button
                       key={d.n}
-                      type="button"
+                      variant={sel ? "default" : "outline"}
+                      size="xs"
                       onClick={() => setVisual(freq, sel ? days.filter((x) => x !== d.n) : [...days, d.n], time)}
-                      className={`h-[26px] cursor-pointer rounded-full border px-[9px] font-sans text-[11.5px] font-medium ${
-                        sel
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-border bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                      }`}
+                      className="h-[26px] rounded-full px-[9px]"
                     >
                       {d.label}
-                    </button>
+                    </Button>
                   );
                 })}
               </div>
             )}
             {freq !== "hourly" && (
-              <input
+              <Input
                 type="time"
                 value={time}
                 onChange={(e) => setVisual(freq, days, e.target.value)}
-                className="h-[30px] rounded-md border border-input bg-background px-2.5 font-mono text-[12.5px] text-foreground"
+                className="h-[30px] w-auto font-mono"
               />
             )}
           </div>
         )}
         {value.mode === "cron" && (
-          <input
-            value={value.cron}
-            onChange={(e) => onPatch({ cron: e.target.value })}
-            className="box-border h-9 w-[200px] rounded-md border border-input bg-background px-3 font-mono text-[13px] text-foreground"
-          />
+          <Input value={value.cron} onChange={(e) => onPatch({ cron: e.target.value })} className="h-9 w-[200px] font-mono" />
         )}
         <div className="flex items-center gap-[7px] text-xs text-muted-foreground">
           <Check aria-hidden size={12} strokeWidth={2.5} className="shrink-0" style={{ color: "#22C55E" }} />
@@ -239,25 +241,21 @@ export function JobDetailView({ id }: { id: string }) {
           }
           sub={`${j.natural.trim() || j.cron} · next run ${j.enabled ? formatNextRun(j.nextRunMs) : "paused"}`}
         >
-          <button
-            type="button"
-            onClick={() => void runNow(j.id)}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
-          >
-            <Play aria-hidden size={13} strokeWidth={2} />
+          <Button variant="outline" onClick={() => void runNow(j.id)}>
+            <Play aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
             Run now
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="destructive"
+            size="icon"
             title="Delete job"
             onClick={() => {
               void remove(j.id);
               nav.navigate({ kind: "scheduler" });
             }}
-            className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md border border-border bg-transparent text-destructive hover:bg-accent"
           >
-            <Trash2 aria-hidden size={13} strokeWidth={2} />
-          </button>
+            <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+          </Button>
           <Switch on={j.enabled} onToggle={() => void toggle(j.id, !j.enabled)} label="Enabled" />
         </DetailHeader>
 
@@ -266,7 +264,7 @@ export function JobDetailView({ id }: { id: string }) {
             <CardTitle>Prompt &amp; target</CardTitle>
           </CardHeader>
           <div className="px-[18px] pb-1 pt-3">
-            <textarea
+            <Textarea
               value={promptDraft ?? j.prompt}
               onChange={(e) => setPromptDraft(e.target.value)}
               onBlur={() => {
@@ -274,19 +272,15 @@ export function JobDetailView({ id }: { id: string }) {
                 setPromptDraft(null);
               }}
               rows={3}
-              className="box-border w-full resize-y rounded-md border border-input bg-background px-3 py-2.5 font-sans text-[13px] leading-[1.55] text-foreground"
+              className="resize-y"
             />
           </div>
           <div className="relative flex flex-wrap items-center gap-1.5 px-[18px] pb-3.5 pt-2">
-            <button
-              type="button"
-              onClick={() => setAgentMenuOpen((v) => !v)}
-              className="flex h-7 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-2.5 font-sans text-xs font-semibold text-foreground hover:bg-accent"
-            >
+            <Button variant="outline" size="sm" onClick={() => setAgentMenuOpen((v) => !v)}>
               <StatusDot color={agent?.color ?? "var(--muted-foreground)"} size={7} />
               {agent?.name ?? j.agent}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} />
-            </button>
+              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+            </Button>
             <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs font-medium text-muted-foreground">
               <Folder aria-hidden size={12} strokeWidth={2} className="shrink-0" />
               {j.projectName}
@@ -390,18 +384,18 @@ export function JobDetailView({ id }: { id: string }) {
                     <DiffStat add={Number(r.addLines)} del={Number(r.delLines)} className="shrink-0 text-[11.5px]" />
                   )}
                   {r.sessionPk && (
-                    <button
-                      type="button"
+                    <Button
+                      variant="outline"
+                      size="xs"
                       onClick={() => {
                         if (!r.sessionPk) return;
                         setFocused(r.sessionPk);
                         nav.navigate({ kind: "session" });
                       }}
-                      className="flex h-[26px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md border border-border bg-transparent px-2.5 font-sans text-[11.5px] font-medium text-foreground hover:bg-accent"
                     >
                       Open session
-                      <ArrowUpRight aria-hidden size={11} strokeWidth={2} />
-                    </button>
+                      <ArrowUpRight aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                    </Button>
                   )}
                 </div>
               </div>

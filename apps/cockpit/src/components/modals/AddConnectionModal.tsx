@@ -3,11 +3,7 @@ import { ArrowLeft } from "lucide-react";
 import { useConnections } from "@/store-connections";
 import type { CatalogEntry } from "@/bindings";
 import { Chip, Pill } from "@/components/common/bits";
-import { Modal } from "./Modal";
-
-const cancelBtn =
-  "cursor-pointer rounded-md border border-border bg-transparent font-sans text-[12.5px] font-medium text-foreground hover:bg-accent";
-const field = "h-9 rounded-md border border-input bg-background px-3 font-sans text-[12.5px] text-foreground";
+import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
 
 // Two-step flow: pick a provider from the catalog, then supply its API key.
 // Only "api_key" category entries are wired up in this milestone — oauth/free
@@ -52,34 +48,32 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
             {catalog.map((ci) => {
               const disabled = ci.category !== "api_key";
               return (
-                <button
+                <Button
                   key={ci.id}
-                  type="button"
+                  variant="outline"
                   disabled={disabled}
                   onClick={() => setPicked(ci)}
-                  className={`flex cursor-pointer items-center gap-[11px] rounded-lg border border-border bg-transparent px-3 py-[11px] text-left font-sans text-popover-foreground hover:bg-accent ${
-                    disabled ? "pointer-events-none opacity-50" : ""
-                  }`}
+                  className="h-auto w-full justify-start gap-[11px] px-3 py-[11px] text-left"
                 >
                   <Chip initial={ci.initial} color={ci.color} size={32} />
                   <span className="min-w-0 flex-1">
-                    <span className="flex items-center gap-1.5 text-[13px] font-semibold">
+                    <span className="flex items-center gap-1.5 font-semibold">
                       {ci.name}
                       {disabled && <Pill>Coming soon</Pill>}
                     </span>
-                    <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-muted-foreground">
+                    <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11px] font-normal text-muted-foreground">
                       {ci.format === "anthropic" ? "Anthropic-compatible" : "OpenAI-compatible"}
                     </span>
                   </span>
-                </button>
+                </Button>
               );
             })}
           </div>
-          <div className="mt-[18px] flex justify-end">
-            <button type="button" onClick={close} className={`${cancelBtn} h-8 px-3.5`}>
+          <ModalFooter className="mt-[18px]">
+            <Button variant="outline" onClick={close}>
               Cancel
-            </button>
-          </div>
+            </Button>
+          </ModalFooter>
         </>
       ) : (
         <>
@@ -92,46 +86,38 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
           </div>
 
           <div className="mt-3.5 flex flex-col gap-3">
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-semibold">Label</span>
-              <input className={field} value={label} onChange={(e) => setLabel(e.target.value)} placeholder={picked.name} />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-semibold">API key</span>
-              <input type="password" className={field} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-semibold">
-                {picked.requiresBaseUrl ? "Base URL" : "Base URL override"}
-                {!picked.requiresBaseUrl && <span className="font-normal text-muted-foreground"> — optional</span>}
-              </span>
-              <input className={field} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://host/v1" />
-            </label>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => void submit()}
-            disabled={saving || baseUrlMissing}
-            className="mt-3.5 flex h-9 w-full cursor-pointer items-center justify-center gap-2 rounded-md border-none bg-primary font-sans text-[13px] font-medium text-primary-foreground hover:opacity-85 disabled:opacity-50"
-          >
-            {saving ? "Adding…" : `Add ${picked.name}`}
-          </button>
-
-          <div className="mt-4 flex items-center gap-2">
-            <button
-              type="button"
-              onClick={reset}
-              className="flex h-[30px] cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2.5 font-sans text-[12.5px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+            <FormField label="Label">
+              <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder={picked.name} />
+            </FormField>
+            <FormField label="API key">
+              <Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" />
+            </FormField>
+            <FormField
+              label={
+                <>
+                  {picked.requiresBaseUrl ? "Base URL" : "Base URL override"}
+                  {!picked.requiresBaseUrl && <span className="font-normal text-muted-foreground"> — optional</span>}
+                </>
+              }
             >
-              <ArrowLeft aria-hidden size={12} strokeWidth={2} />
-              Back
-            </button>
-            <div className="flex-1" />
-            <button type="button" onClick={close} className={`${cancelBtn} h-[30px] px-3`}>
-              Cancel
-            </button>
+              <Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://host/v1" />
+            </FormField>
           </div>
+
+          <Button size="lg" onClick={() => void submit()} disabled={saving || baseUrlMissing} className="mt-3.5 w-full">
+            {saving ? "Adding…" : `Add ${picked.name}`}
+          </Button>
+
+          <ModalFooter className="mt-4">
+            <Button variant="ghost" onClick={reset} className="text-muted-foreground">
+              <ArrowLeft aria-hidden size={12} strokeWidth={2} className="size-3" />
+              Back
+            </Button>
+            <div className="flex-1" />
+            <Button variant="outline" onClick={close}>
+              Cancel
+            </Button>
+          </ModalFooter>
         </>
       )}
     </Modal>

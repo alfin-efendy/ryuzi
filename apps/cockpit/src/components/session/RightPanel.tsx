@@ -5,13 +5,11 @@ import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav"
 import { commands } from "@/bindings";
 import { diffLineStyle, parseUnifiedDiff, type ReviewFile } from "@/lib/diff";
 import { basename, joinPath } from "@/lib/paths";
+import { Button, Input } from "@ryuzi/ui";
 import { FileViewer } from "@/components/FileViewer";
 import { FileTreePane } from "@/components/FileTreePane";
 import { DiffStat } from "@/components/common/bits";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
-
-const toolBtn =
-  "flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground";
 
 export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; branch: string | null; running: boolean }) {
   const nav = useNav();
@@ -97,28 +95,31 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
           const sel = nav.rightTab === t.id;
           const Icon = t.icon;
           return (
-            <button
+            <Button
               key={t.id}
-              type="button"
+              variant="ghost"
               onClick={() => nav.setRightTab(t.id)}
-              className={`flex h-[30px] cursor-pointer items-center gap-[7px] whitespace-nowrap rounded-md border px-3 font-sans text-[12.5px] font-medium hover:bg-accent hover:text-accent-foreground ${
-                sel ? "border-border bg-background text-foreground" : "border-transparent bg-transparent text-muted-foreground"
-              }`}
+              className={sel ? "border-border bg-background text-foreground" : "text-muted-foreground"}
             >
-              <Icon aria-hidden size={13} strokeWidth={2} />
+              <Icon aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
               {t.label}
-            </button>
+            </Button>
           );
         })}
         <div className="flex-1" />
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="icon-sm"
           title={nav.rightMaximized ? "Restore panel" : "Expand panel"}
           onClick={() => nav.setRightMaximized(!nav.rightMaximized)}
-          className={`${toolBtn} h-7 w-7`}
+          className="text-muted-foreground"
         >
-          {nav.rightMaximized ? <Minimize2 aria-hidden size={13} strokeWidth={2} /> : <Maximize2 aria-hidden size={13} strokeWidth={2} />}
-        </button>
+          {nav.rightMaximized ? (
+            <Minimize2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+          ) : (
+            <Maximize2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+          )}
+        </Button>
       </div>
 
       {/* Review tab — the worktree's real git diff */}
@@ -126,26 +127,24 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
         <>
           <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-4 py-2.5">
             <span className="font-mono text-xs text-muted-foreground">main → {branch ?? "worktree"}</span>
-            <button type="button" title="Refresh diff" onClick={fetchDiff} className={`${toolBtn} h-6 w-6`}>
+            <Button variant="ghost" size="icon-xs" title="Refresh diff" onClick={fetchDiff} className="text-muted-foreground">
               <RotateCw aria-hidden size={12} strokeWidth={2} className={reviewLoading ? "animate-spin" : ""} />
-            </button>
+            </Button>
             <DiffStat add={reviewAdd} del={reviewDel} className="ml-auto" />
           </div>
           <div className="flex min-h-0 flex-1">
             <div className="flex w-[200px] shrink-0 flex-col overflow-y-auto border-r border-border py-1.5">
               {reviewFiles.map((f, i) => (
-                <button
+                <Button
                   key={`${f.dir}${f.name}`}
-                  type="button"
+                  variant="ghost"
                   title={`${f.dir}${f.name}`}
                   onClick={() => setReviewFile(i)}
-                  className={`flex cursor-pointer items-center gap-2 border-none px-3 py-[5px] text-left font-mono text-[11.5px] text-foreground hover:bg-accent ${
-                    i === reviewFile ? "bg-accent" : "bg-transparent"
-                  }`}
+                  className={`h-auto w-full justify-start gap-2 rounded-none px-3 py-[5px] text-left font-mono ${i === reviewFile ? "bg-accent" : ""}`}
                 >
                   <span className="min-w-0 flex-1 truncate">{f.name}</span>
                   <DiffStat add={f.add} del={f.del} className="shrink-0 text-[11px]" />
-                </button>
+                </Button>
               ))}
               {reviewFiles.length === 0 && (
                 <div className="px-3 py-2 font-sans text-[12px] text-muted-foreground">
@@ -157,15 +156,15 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
               {reviewError && <div className="px-4 py-3 font-sans text-[12.5px] text-destructive">{reviewError}</div>}
               {!reviewError && review && (
                 <>
-                  <button
-                    type="button"
+                  <Button
+                    variant="link"
                     title="Open in Files tab"
                     onClick={() => void openInFiles(review)}
-                    className="mb-1 cursor-pointer border-none bg-transparent px-4 font-mono text-[11.5px] font-semibold text-foreground underline-offset-2 hover:underline"
+                    className="mb-1 h-auto justify-start px-4 py-0 font-mono font-semibold text-foreground underline-offset-2"
                   >
                     {review.dir}
                     {review.name}
-                  </button>
+                  </Button>
                   {review.lines.map((l, i) => {
                     const s = diffLineStyle(l);
                     return (
@@ -206,14 +205,15 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
                     </span>
                   ))}
                 <span className="font-semibold text-foreground">{basename(activeFileTab.path)}</span>
-                <button
-                  type="button"
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
                   title="Close file"
-                  className={`${toolBtn} ml-auto h-6 w-6`}
+                  className="ml-auto text-muted-foreground"
                   onClick={() => ui.closeTab(activeFileTab.id)}
                 >
                   <X aria-hidden size={12} strokeWidth={2} />
-                </button>
+                </Button>
               </>
             ) : (
               <form
@@ -226,11 +226,11 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
                 }}
               >
                 <Search aria-hidden size={12} strokeWidth={2} />
-                <input
+                <Input
                   value={pathDraft}
                   onChange={(e) => setPathDraft(e.target.value)}
                   placeholder="Open file by absolute path"
-                  className="flex-1 border-none bg-transparent font-mono text-[11.5px] text-foreground"
+                  className="h-full flex-1 rounded-none border-none bg-transparent px-0 font-mono text-foreground focus-visible:ring-0 dark:bg-transparent"
                 />
               </form>
             )}
@@ -246,16 +246,23 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
                       active ? "border-border bg-background text-foreground" : "border-transparent text-muted-foreground hover:bg-accent"
                     }`}
                   >
-                    <button
-                      type="button"
+                    <Button
+                      variant="ghost"
+                      size="xs"
                       onClick={() => ui.setActiveTab(t.id)}
-                      className="cursor-pointer border-none bg-transparent font-sans text-inherit"
+                      className="h-auto p-0 text-inherit hover:bg-transparent hover:text-inherit dark:hover:bg-transparent"
                     >
                       {t.title}
-                    </button>
-                    <button type="button" title={`Close ${t.title}`} onClick={() => ui.closeTab(t.id)} className={`${toolBtn} h-5 w-5`}>
-                      <X aria-hidden size={10} strokeWidth={2} />
-                    </button>
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      title={`Close ${t.title}`}
+                      onClick={() => ui.closeTab(t.id)}
+                      className="size-5 text-muted-foreground"
+                    >
+                      <X aria-hidden size={10} strokeWidth={2} className="size-2.5" />
+                    </Button>
                   </div>
                 );
               })}
@@ -275,21 +282,22 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
               <div className="flex items-center gap-1.5">
                 <div className="flex h-7 min-w-0 flex-1 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs text-muted-foreground [background:color-mix(in_oklab,var(--background)_45%,transparent)]">
                   <Search aria-hidden size={12} strokeWidth={2} />
-                  <input
+                  <Input
                     value={treeFilter}
                     onChange={(e) => setTreeFilter(e.target.value)}
                     placeholder="Filter files"
-                    className="min-w-0 flex-1 border-none bg-transparent font-sans text-xs text-foreground outline-none"
+                    className="h-full flex-1 rounded-none border-none bg-transparent px-0 text-foreground focus-visible:ring-0 dark:bg-transparent"
                   />
                 </div>
-                <button
-                  type="button"
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
                   title="Refresh file tree"
                   onClick={() => setTreeRefresh((n) => n + 1)}
-                  className={`${toolBtn} h-7 w-7 shrink-0`}
+                  className="text-muted-foreground"
                 >
-                  <RotateCw aria-hidden size={12} strokeWidth={2} />
-                </button>
+                  <RotateCw aria-hidden size={12} strokeWidth={2} className="size-3" />
+                </Button>
               </div>
               <FileTreePane sessionPk={sessionPk} filter={treeFilter} refreshKey={treeRefresh} />
             </div>

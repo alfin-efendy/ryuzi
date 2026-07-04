@@ -4,8 +4,7 @@ import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { formatNextRun, formatStarted, useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
-import { Card } from "@/components/common/Card";
-import { Switch } from "@/components/common/Switch";
+import { Button, SettingsCard as Card, Switch } from "@ryuzi/ui";
 import { Pill, StatusDot } from "@/components/common/bits";
 
 const RUN_COLORS: Record<string, string> = { success: "#22C55E", failed: "#EF4444", running: "#3B82F6" };
@@ -40,14 +39,10 @@ export function SchedulerView() {
               Recurring agent runs. Schedules fire while Cockpit is running and start a fresh session with the job's prompt.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => nav.navigate({ kind: "jobNew" })}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border-none bg-primary px-3 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85"
-          >
-            <Plus aria-hidden size={14} strokeWidth={2} />
+          <Button onClick={() => nav.navigate({ kind: "jobNew" })}>
+            <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             New job
-          </button>
+          </Button>
         </div>
 
         {loaded && jobs.length === 0 && (
@@ -66,13 +61,13 @@ export function SchedulerView() {
                   <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm bg-muted font-mono text-[8px] font-semibold text-muted-foreground">
                     {w.badge}
                   </span>
-                  <button
-                    type="button"
+                  <Button
+                    variant="link"
                     onClick={() => nav.navigate({ kind: "gatewayDetail", id: w.id })}
-                    className="cursor-pointer border-none bg-transparent p-0 font-sans text-[12.5px] font-semibold text-foreground hover:underline"
+                    className="h-auto p-0 font-semibold text-foreground"
                   >
                     {w.name}
-                  </button>
+                  </Button>
                   <span className="flex items-center gap-[5px] text-[11px]" style={{ color: statusColor }}>
                     <StatusDot color={statusColor} size={6} pulse={false} />
                     {offline ? "Offline" : "Connected"}
@@ -84,13 +79,13 @@ export function SchedulerView() {
                   const agent = runtimeById(runtimes, j.agent);
                   return (
                     <Card key={j.id} className="flex items-center gap-3.5 px-[18px] py-[15px]">
-                      <button
-                        type="button"
+                      <Button
+                        variant="ghost"
                         onClick={open}
-                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-3.5 border-none bg-transparent p-0 text-left font-sans text-foreground"
+                        className="h-auto min-w-0 flex-1 justify-start gap-3.5 whitespace-normal p-0 text-left font-normal text-foreground"
                       >
                         <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
-                          <Clock aria-hidden size={17} strokeWidth={2} />
+                          <Clock aria-hidden size={17} strokeWidth={2} className="size-[17px]" />
                         </span>
                         <span className="min-w-0 flex-1">
                           <span className="flex items-center gap-2">
@@ -100,7 +95,7 @@ export function SchedulerView() {
                             </Pill>
                           </span>
                           <span className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-                            <Folder aria-hidden size={12} strokeWidth={2} className="shrink-0" />
+                            <Folder aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
                             <span>{j.projectName}</span>
                             <span className="opacity-40">·</span>
                             <span>{agent?.name ?? j.agent}</span>
@@ -120,20 +115,15 @@ export function SchedulerView() {
                             </span>
                           )}
                         </span>
-                      </button>
+                      </Button>
                       <div className="shrink-0 text-right">
                         <div className="text-[11px] text-muted-foreground">Next run</div>
                         <div className="text-[12.5px] font-semibold">{j.enabled ? formatNextRun(j.nextRunMs) : "Paused"}</div>
                       </div>
                       <Switch on={j.enabled} onToggle={() => void toggle(j.id, !j.enabled)} label={`Enable ${j.name}`} />
-                      <button
-                        type="button"
-                        title="Details"
-                        onClick={open}
-                        className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                      >
-                        <ChevronRight aria-hidden size={14} strokeWidth={2} />
-                      </button>
+                      <Button variant="ghost" size="icon-sm" title="Details" onClick={open} className="text-muted-foreground">
+                        <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+                      </Button>
                     </Card>
                   );
                 })}

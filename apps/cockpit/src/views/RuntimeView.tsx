@@ -1,10 +1,8 @@
-import { cn } from "@ryuzi/ui";
+import { Button, cn, SettingsCard as Card, Switch } from "@ryuzi/ui";
 import { ChevronRight, Loader2, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { commands } from "@/bindings";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
-import { Card } from "@/components/common/Card";
-import { Switch } from "@/components/common/Switch";
 import { useRuntimes } from "@/store-runtimes";
 import { useNav } from "@/store-nav";
 
@@ -38,15 +36,10 @@ export function RuntimeView() {
               Cockpit is agent-agnostic. Any CLI coding agent can run a session — mix them across projects.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => void refresh()}
-            disabled={refreshing}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border bg-transparent px-3 font-sans text-xs font-medium text-foreground hover:bg-accent disabled:opacity-50"
-          >
-            <RefreshCw aria-hidden size={13} strokeWidth={2} className={refreshing ? "animate-spin" : ""} />
+          <Button variant="outline" onClick={() => void refresh()} disabled={refreshing}>
+            <RefreshCw aria-hidden size={13} strokeWidth={2} className={cn("size-[13px]", refreshing && "animate-spin")} />
             {refreshing ? "Detecting…" : "Re-detect"}
-          </button>
+          </Button>
         </div>
         <div className="flex flex-col gap-3">
           {runtimes.map((agent) => {
@@ -63,59 +56,51 @@ export function RuntimeView() {
             return (
               <Card key={agent.id} className={cn("flex items-center gap-3.5 px-[18px] py-4", isDefault && "border-ring")}>
                 <Chip initial={agent.initial} color={agent.color} size={36} onClick={open} />
-                <button
-                  type="button"
+                <Button
+                  variant="ghost"
                   onClick={open}
-                  className="min-w-0 flex-1 cursor-pointer border-none bg-transparent p-0 text-left font-sans"
+                  className="h-auto min-w-0 flex-1 flex-col items-start gap-0 whitespace-normal p-0 text-left"
                 >
                   <span className="flex items-center gap-2">
                     <span className="text-sm font-semibold text-foreground">{agent.name}</span>
                     {isDefault && <Pill variant="primary">Default</Pill>}
                     {configured[agent.id] && <Pill variant="mono">Routed via Ryuzi</Pill>}
                   </span>
-                  <span className="mt-0.5 block text-[12.5px] text-muted-foreground">
+                  <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
                     {installed ? `${agent.model || agent.connection} · ${agent.connection}` : "Not installed"}
                   </span>
-                </button>
+                </Button>
                 {hasUpdate && (
-                  <button
-                    type="button"
+                  <Button
+                    variant="ghost"
+                    size="xs"
                     disabled={isUpdating}
                     onClick={() => void beginUpdate(agent.id)}
                     title={agent.npmPackage ? `npm install -g ${agent.npmPackage}@latest` : undefined}
-                    className="flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-full border-none px-2 text-[10.5px] font-semibold tracking-[0.02em] disabled:cursor-not-allowed disabled:opacity-70"
+                    className="rounded-full text-[10.5px] font-semibold tracking-[0.02em]"
                     style={{ background: "color-mix(in oklab, #F59E0B 18%, transparent)", color: "#F59E0B" }}
                   >
-                    {isUpdating && <Loader2 aria-hidden size={10} strokeWidth={2} className="animate-spin" />}
+                    {isUpdating && <Loader2 aria-hidden size={10} strokeWidth={2} className="size-2.5 animate-spin" />}
                     {isUpdating ? "Updating…" : `Update ${agent.latestVersion}`}
-                  </button>
+                  </Button>
                 )}
                 <span className="flex shrink-0 items-center gap-1.5 text-xs" style={{ color: statusColor }}>
                   <StatusDot color={statusColor} />
                   {installed ? (agent.installedVersion ? `v${agent.installedVersion}` : "Installed") : "Not found"}
                 </span>
                 {!isDefault && agent.enabled && installed && (
-                  <button
-                    type="button"
-                    onClick={() => void setDefault(agent.id)}
-                    className="h-7 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3 font-sans text-xs font-medium text-foreground hover:bg-accent"
-                  >
+                  <Button variant="outline" size="sm" onClick={() => void setDefault(agent.id)}>
                     Make default
-                  </button>
+                  </Button>
                 )}
                 <Switch
                   on={agent.enabled && installed}
                   onToggle={() => installed && void update(agent.id, { enabled: !agent.enabled })}
                   label={`${agent.name} enabled`}
                 />
-                <button
-                  type="button"
-                  onClick={open}
-                  title="Details"
-                  className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                >
-                  <ChevronRight aria-hidden size={14} strokeWidth={2} />
-                </button>
+                <Button variant="ghost" size="icon-sm" onClick={open} title="Details" className="text-muted-foreground">
+                  <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+                </Button>
               </Card>
             );
           })}

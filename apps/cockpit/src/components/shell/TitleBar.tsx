@@ -1,6 +1,7 @@
 // apps/cockpit/src/components/shell/TitleBar.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, CornerDownLeft, FileText, PanelLeft, Search, SquareTerminal } from "lucide-react";
+import { Button, Input, useClickOutside } from "@ryuzi/ui";
 import { useStore } from "@/store";
 import type { Row } from "@/lib/transcript";
 import { useUi } from "@/store-ui";
@@ -10,19 +11,15 @@ import { SEARCH_COMMANDS } from "@/constants";
 import { runtimeById, defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { projectLabel, sessionTitle } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
-import { useClickOutside } from "@/components/common/MenuPanel";
 import { StatusDot } from "@/components/common/bits";
 import { WindowControls } from "./WindowControls";
 import type { Session } from "@/bindings";
 
 const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);
 
-const tool =
-  "flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground";
-
 const sectionLabel = "px-2.5 pb-1 pt-[7px] text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground";
-const resultBtn =
-  "flex w-full cursor-pointer items-start gap-2.5 rounded-md border-none bg-transparent px-2.5 py-2 text-left font-sans text-popover-foreground hover:bg-accent";
+// Layout-only overrides that turn a ghost DS Button into a palette result row.
+const resultBtn = "h-auto w-full items-start justify-start gap-2.5 whitespace-normal rounded-md px-2.5 py-2 text-left font-normal";
 
 type Snippet = { pre: string; hit: string; post: string } | null;
 
@@ -152,36 +149,48 @@ export function TitleBar() {
       className={`relative z-20 flex h-11 shrink-0 select-none items-center gap-2.5 bg-transparent ${isMac ? "pl-[78px]" : "pl-3.5"} pr-3.5`}
     >
       <div className="flex items-center gap-0.5">
-        <button type="button" title="Toggle sidebar" aria-label="Toggle sidebar" className={tool} onClick={toggleSidebar}>
-          <PanelLeft aria-hidden size={15} strokeWidth={2} />
-        </button>
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="icon-sm"
+          title="Toggle sidebar"
+          aria-label="Toggle sidebar"
+          className="text-muted-foreground"
+          onClick={toggleSidebar}
+        >
+          <PanelLeft aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
           title="Back"
           aria-label="Back"
-          className={`${tool} ${canBack ? "text-foreground" : "cursor-default opacity-50 hover:bg-transparent"}`}
+          className={canBack ? "text-foreground" : "text-muted-foreground"}
           onClick={goBack}
           disabled={!canBack}
         >
-          <ArrowLeft aria-hidden size={15} strokeWidth={2} />
-        </button>
-        <button
+          <ArrowLeft aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+        </Button>
+        <Button
           type="button"
+          variant="ghost"
+          size="icon-sm"
           title="Forward"
           aria-label="Forward"
-          className={`${tool} ${canForward ? "text-foreground" : "cursor-default opacity-50 hover:bg-transparent"}`}
+          className={canForward ? "text-foreground" : "text-muted-foreground"}
           onClick={goForward}
           disabled={!canForward}
         >
-          <ArrowRight aria-hidden size={15} strokeWidth={2} />
-        </button>
+          <ArrowRight aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+        </Button>
       </div>
 
       <div className="flex flex-1 justify-center">
         <div className="relative w-full max-w-[420px]" ref={paletteRef}>
           <div className="box-border flex h-[30px] items-center gap-2 rounded-md border border-border px-3 text-muted-foreground [background:color-mix(in_oklab,var(--background)_45%,transparent)]">
             <Search aria-hidden size={13} strokeWidth={2} />
-            <input
+            <Input
               ref={searchRef}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
@@ -190,7 +199,7 @@ export function TitleBar() {
                 if (e.key === "Escape") closePalette();
               }}
               placeholder="Search sessions, files, commands"
-              className="flex-1 border-none bg-transparent font-sans text-[12.5px] text-foreground"
+              className="h-full flex-1 rounded-none border-none bg-transparent p-0 text-foreground focus-visible:ring-0 dark:bg-transparent"
             />
             <kbd className="rounded-sm border border-border px-[5px] py-px font-mono text-[10.5px] text-muted-foreground">
               {isMac ? "⌘K" : "Ctrl K"}
@@ -207,10 +216,10 @@ export function TitleBar() {
                     const m = statusMeta(s.status);
                     const project = projects.find((p) => p.projectId === s.projectId);
                     return (
-                      <button key={s.sessionPk} type="button" className={resultBtn} onClick={() => openSessionHit(s)}>
+                      <Button key={s.sessionPk} type="button" variant="ghost" className={resultBtn} onClick={() => openSessionHit(s)}>
                         <StatusDot color={m.color} pulse={m.pulse} className="mt-[5px]" />
                         <span className="min-w-0 flex-1">
-                          <span className="block truncate text-[13px] font-medium">{sessionTitle(s)}</span>
+                          <span className="block truncate font-medium">{sessionTitle(s)}</span>
                           {snippet && (
                             <span className="mt-px block truncate text-[11.5px] text-muted-foreground">
                               {snippet.pre}
@@ -223,7 +232,7 @@ export function TitleBar() {
                           {project ? projectLabel(project) : s.projectId}
                           {sessionAgent ? ` · ${sessionAgent.name}` : ""}
                         </span>
-                      </button>
+                      </Button>
                     );
                   })}
                 </>
@@ -232,9 +241,10 @@ export function TitleBar() {
                 <>
                   <div className={sectionLabel}>Files</div>
                   {fileHits.map((t) => (
-                    <button
+                    <Button
                       key={t.id}
                       type="button"
+                      variant="ghost"
                       className={`${resultBtn} items-center`}
                       onClick={() => {
                         ui.setActiveTab(t.id);
@@ -244,17 +254,18 @@ export function TitleBar() {
                         closePalette();
                       }}
                     >
-                      <FileText aria-hidden size={13} strokeWidth={2} className="shrink-0 text-muted-foreground" />
+                      <FileText aria-hidden size={13} strokeWidth={2} className="size-[13px] shrink-0 text-muted-foreground" />
                       <span className="min-w-0 flex-1 truncate font-mono text-xs">{t.path}</span>
                       <span className="max-w-[180px] shrink-0 truncate text-[11px] text-muted-foreground">open tab</span>
-                    </button>
+                    </Button>
                   ))}
                   {projectFileHits
                     .filter((rel) => !fileHits.some((t) => t.path.endsWith(rel)))
                     .map((rel) => (
-                      <button
+                      <Button
                         key={rel}
                         type="button"
+                        variant="ghost"
                         className={`${resultBtn} items-center`}
                         onClick={() => {
                           if (!searchProject) return;
@@ -266,12 +277,12 @@ export function TitleBar() {
                           closePalette();
                         }}
                       >
-                        <FileText aria-hidden size={13} strokeWidth={2} className="shrink-0 text-muted-foreground" />
+                        <FileText aria-hidden size={13} strokeWidth={2} className="size-[13px] shrink-0 text-muted-foreground" />
                         <span className="min-w-0 flex-1 truncate font-mono text-xs">{rel}</span>
                         <span className="max-w-[180px] shrink-0 truncate text-[11px] text-muted-foreground">
                           {searchProject ? projectLabel(searchProject) : ""}
                         </span>
-                      </button>
+                      </Button>
                     ))}
                 </>
               )}
@@ -279,11 +290,17 @@ export function TitleBar() {
                 <>
                   <div className={sectionLabel}>Commands</div>
                   {cmdHits.map((c) => (
-                    <button key={c.id} type="button" className={`${resultBtn} items-center`} onClick={() => runCommand(c.id)}>
-                      <SquareTerminal aria-hidden size={13} strokeWidth={2} className="shrink-0 text-muted-foreground" />
-                      <span className="flex-1 text-[13px] font-medium">{c.label}</span>
-                      <CornerDownLeft aria-hidden size={12} strokeWidth={2} className="shrink-0 text-muted-foreground" />
-                    </button>
+                    <Button
+                      key={c.id}
+                      type="button"
+                      variant="ghost"
+                      className={`${resultBtn} items-center`}
+                      onClick={() => runCommand(c.id)}
+                    >
+                      <SquareTerminal aria-hidden size={13} strokeWidth={2} className="size-[13px] shrink-0 text-muted-foreground" />
+                      <span className="flex-1 font-medium">{c.label}</span>
+                      <CornerDownLeft aria-hidden size={12} strokeWidth={2} className="size-[12px] shrink-0 text-muted-foreground" />
+                    </Button>
                   ))}
                 </>
               )}

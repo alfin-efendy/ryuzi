@@ -18,16 +18,23 @@ import {
   Server,
   Settings,
 } from "lucide-react";
+import {
+  Button,
+  MenuPanel,
+  MenuPanelItem as MenuItem,
+  MenuPanelSection as MenuSectionLabel,
+  MenuPanelSeparator as MenuSeparator,
+  Modal,
+  ModalFooter,
+} from "@ryuzi/ui";
 import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
 import { useTerms } from "@/store-terms";
 import { commands, type Session } from "@/bindings";
-import { Modal } from "@/components/modals/Modal";
 import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
-import { MenuItem, MenuPanel, MenuSectionLabel, MenuSeparator } from "@/components/common/MenuPanel";
 import { StatusDot } from "@/components/common/bits";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
@@ -39,8 +46,8 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
   { label: "Settings", icon: Settings, view: { kind: "settings" }, group: ["settings"] },
 ];
 
-const iconBtn =
-  "flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground";
+// Layout-only overrides for the tiny ghost icon Buttons in tree rows.
+const iconBtn = "shrink-0 rounded-sm text-muted-foreground";
 
 const guideColor = "color-mix(in srgb, var(--sidebar-foreground) 20%, var(--sidebar))";
 
@@ -161,15 +168,16 @@ export function Sidebar() {
           const active = item.group.includes(view.kind);
           const Icon = item.icon;
           return (
-            <button
+            <Button
               key={item.label}
               type="button"
+              variant="ghost"
               onClick={() => nav.navigate(item.view)}
-              className={`flex cursor-pointer items-center gap-2.5 rounded-md border-none px-2.5 py-[7px] text-left font-sans text-[13.5px] font-medium text-sidebar-foreground hover:bg-sidebar-accent ${active ? "bg-sidebar-accent" : "bg-transparent"}`}
+              className={`h-auto w-full justify-start gap-2.5 rounded-md py-[7px] text-left text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground dark:hover:bg-sidebar-accent ${active ? "bg-sidebar-accent" : ""}`}
             >
-              <Icon aria-hidden size={15} strokeWidth={2} />
+              <Icon aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
               {item.label}
-            </button>
+            </Button>
           );
         })}
       </div>
@@ -177,8 +185,10 @@ export function Sidebar() {
       {/* Projects header */}
       <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-5 pr-3">
         <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Projects</span>
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="icon-xs"
           className={iconBtn}
           title="Sort and filter"
           onClick={() => {
@@ -186,11 +196,18 @@ export function Sidebar() {
             setOrderingSubOpen(false);
           }}
         >
-          <ListFilter aria-hidden size={14} strokeWidth={2} />
-        </button>
-        <button type="button" className={iconBtn} title="New project — open folder" onClick={() => void addProject()}>
-          <FolderPlus aria-hidden size={14} strokeWidth={2} />
-        </button>
+          <ListFilter aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          className={iconBtn}
+          title="New project — open folder"
+          onClick={() => void addProject()}
+        >
+          <FolderPlus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+        </Button>
 
         {projectsMenuOpen && (
           <MenuPanel onClose={() => setProjectsMenuOpen(false)} className="left-2.5 top-8 z-[70] w-[238px]">
@@ -255,28 +272,33 @@ export function Sidebar() {
           return (
             <div key={p.projectId} className="flex flex-col gap-px">
               <div className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent">
-                <button
+                <Button
                   type="button"
-                  className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 border-none bg-transparent p-0 text-left text-sidebar-foreground"
+                  variant="ghost"
+                  className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
                   onClick={() => setExpanded((e) => ({ ...e, [p.projectId]: !open }))}
                 >
                   {open ? (
-                    <FolderOpen aria-hidden size={14} strokeWidth={2} className="shrink-0 text-muted-foreground" />
+                    <FolderOpen aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
                   ) : (
-                    <Folder aria-hidden size={14} strokeWidth={2} className="shrink-0 text-muted-foreground" />
+                    <Folder aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
                   )}
-                  <span className="min-w-0 flex-1 truncate text-[13px] font-semibold">{projectLabel(p)}</span>
-                </button>
-                <button
+                  <span className="min-w-0 flex-1 truncate font-semibold">{projectLabel(p)}</span>
+                </Button>
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon-xs"
                   title="Project settings"
                   className={`${iconBtn} hidden group-hover:flex`}
                   onClick={() => nav.setProjectSettingsFor(p.projectId)}
                 >
-                  <Settings aria-hidden size={13} strokeWidth={2} />
-                </button>
-                <button
+                  <Settings aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                </Button>
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon-xs"
                   title="New session"
                   className={`${iconBtn} hidden group-hover:flex`}
                   onClick={() => {
@@ -285,8 +307,8 @@ export function Sidebar() {
                     setExpanded((e) => ({ ...e, [p.projectId]: true }));
                   }}
                 >
-                  <Plus aria-hidden size={14} strokeWidth={2} />
-                </button>
+                  <Plus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+                </Button>
               </div>
               {open && (
                 <>
@@ -305,44 +327,50 @@ export function Sidebar() {
                         <span
                           className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-[7px] pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
                         >
-                          <button
+                          <Button
                             type="button"
+                            variant="ghost"
                             onClick={() => openSession(s.sessionPk)}
-                            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 border-none bg-transparent p-0 text-left text-sidebar-foreground"
+                            className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
                           >
                             <StatusDot color={m.color} pulse={m.pulse} />
-                            <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium">{sessionTitle(s)}</span>
-                          </button>
-                          <button
+                            <span className="min-w-0 flex-1 truncate">{sessionTitle(s)}</span>
+                          </Button>
+                          <Button
                             type="button"
+                            variant="ghost"
+                            size="icon-xs"
                             title={isPinned ? "Unpin" : "Pin"}
-                            className={`h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent hover:bg-accent hover:text-accent-foreground ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
+                            className={`size-[22px] shrink-0 rounded-sm ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
                             onClick={() => togglePin(s.sessionPk)}
                           >
                             <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
-                          </button>
-                          <button
+                          </Button>
+                          <Button
                             type="button"
+                            variant="ghost"
+                            size="icon-xs"
                             title={archived[s.sessionPk] ? "Restore" : "Archive — ends the session and removes its worktree"}
                             disabled={archivingPk === s.sessionPk}
-                            className="hidden h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-40 group-hover:flex"
+                            className="hidden size-[22px] shrink-0 rounded-sm text-muted-foreground disabled:opacity-40 group-hover:flex"
                             onClick={() => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s))}
                           >
                             <Archive aria-hidden size={12} strokeWidth={2} />
-                          </button>
+                          </Button>
                         </span>
                       </div>
                     );
                   })}
                   {archCount > 0 && !archivedGlobal && (
-                    <button
+                    <Button
                       type="button"
-                      className="flex min-h-6 cursor-pointer items-stretch rounded-sm border-none bg-transparent pr-2 text-left text-[11.5px] text-muted-foreground hover:text-foreground"
+                      variant="ghost"
+                      className="h-auto min-h-6 items-stretch justify-start gap-0 rounded-sm border-0 p-0 pr-2 text-left text-[11.5px] font-normal text-muted-foreground hover:bg-transparent hover:text-foreground dark:hover:bg-transparent"
                       onClick={() => setShowArchived((m) => ({ ...m, [p.projectId]: !m[p.projectId] }))}
                     >
                       <TreeGuide tail={false} reach={1} />
                       <span className="self-center pl-[7px]">{showArchived[p.projectId] ? "Hide archived" : `${archCount} archived`}</span>
-                    </button>
+                    </Button>
                   )}
                 </>
               )}
@@ -353,13 +381,14 @@ export function Sidebar() {
 
       {/* Workspace / gateway switcher */}
       <div className="relative box-border w-[260px] shrink-0 px-2.5 py-2">
-        <button
+        <Button
           type="button"
+          variant="ghost"
           onClick={() => setWorkspaceMenuOpen((v) => !v)}
-          className={`flex w-full cursor-pointer items-center gap-2.5 rounded-md border-none px-2.5 py-2 text-left font-sans text-sidebar-foreground hover:bg-sidebar-accent ${workspaceMenuOpen ? "bg-sidebar-accent" : "bg-transparent"}`}
+          className={`h-auto w-full justify-start gap-2.5 rounded-md py-2 text-left text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground dark:hover:bg-sidebar-accent ${workspaceMenuOpen ? "bg-sidebar-accent" : ""}`}
         >
           <span className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-sidebar-border text-muted-foreground [background:color-mix(in_oklab,var(--sidebar-accent)_90%,transparent)]">
-            <Server aria-hidden size={15} strokeWidth={2} />
+            <Server aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
             <span
               className="absolute -bottom-0.5 -right-0.5 h-[9px] w-[9px] rounded-full border-2 border-sidebar"
               style={{ background: ws?.status === "connected" ? "#22C55E" : "#9CA3AF" }}
@@ -367,10 +396,10 @@ export function Sidebar() {
           </span>
           <span className="min-w-0 flex-1">
             <span className="block text-[10px] font-semibold uppercase tracking-[0.05em] text-muted-foreground">Workspace</span>
-            <span className="block truncate text-[13px] font-semibold">{ws?.name ?? "This PC"}</span>
+            <span className="block truncate font-semibold">{ws?.name ?? "This PC"}</span>
           </span>
-          <ChevronsUpDown aria-hidden size={14} strokeWidth={2} className="shrink-0 text-muted-foreground" />
-        </button>
+          <ChevronsUpDown aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
+        </Button>
 
         {workspaceMenuOpen && (
           <MenuPanel onClose={() => setWorkspaceMenuOpen(false)} className="bottom-14 left-2.5 right-2.5 z-[70]">
@@ -433,23 +462,19 @@ export function Sidebar() {
             <span className="font-mono text-xs">{confirmArchive.session.branch ?? "harness"}</span> branch — that work is discarded and
             unrecoverable. The transcript stays available.
           </p>
-          <div className="flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setConfirmArchive(null)}
-              className="h-8 cursor-pointer rounded-md border border-border bg-transparent px-3.5 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
-            >
+          <ModalFooter className="mt-0">
+            <Button type="button" variant="outline" onClick={() => setConfirmArchive(null)}>
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
+              variant="destructive"
               disabled={archivingPk !== null}
               onClick={() => void finishArchive(confirmArchive.session)}
-              className="h-8 cursor-pointer rounded-md border-none bg-destructive px-3.5 font-sans text-[12.5px] font-medium text-white hover:opacity-85 disabled:opacity-50"
             >
               {archivingPk !== null ? "Archiving…" : "Archive & discard work"}
-            </button>
-          </div>
+            </Button>
+          </ModalFooter>
         </Modal>
       )}
     </div>

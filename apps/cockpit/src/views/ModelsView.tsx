@@ -6,19 +6,21 @@ import { useConnections } from "@/store-connections";
 import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
 import type { ConnectionInfo } from "@/bindings";
-import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
+import {
+  Button,
+  Input,
+  Segmented,
+  SettingsCard as Card,
+  SettingsCardHeader as CardHeader,
+  SettingsCardHint as CardHint,
+  SettingsCardRow as CardRow,
+  SettingsCardTitle as CardTitle,
+  Switch,
+} from "@ryuzi/ui";
 import { Chip, StatusDot } from "@/components/common/bits";
-import { Segmented } from "@/components/common/Segmented";
-import { Switch } from "@/components/common/Switch";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
 
 type Tab = "endpoint" | "connections";
-
-const iconBtn =
-  "flex h-7 w-7 cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent";
-const field = "h-9 rounded-md border border-input bg-background px-3 font-sans text-[12.5px] text-foreground";
-const moveBtn =
-  "flex h-[15px] w-5 cursor-pointer items-center justify-center border-none bg-transparent p-0 text-muted-foreground hover:text-foreground";
 
 function EndpointTab() {
   const { status, keys, start, stop, setConfig, createKey, revokeKey } = useEndpoint();
@@ -92,20 +94,15 @@ function EndpointTab() {
             <div className="text-sm font-semibold text-foreground">{status?.running ? `Running on ${status.baseUrl}` : "Stopped"}</div>
             <div className="mt-0.5 text-xs text-muted-foreground">Local OpenAI-compatible endpoint for external tools.</div>
           </div>
-          <button
-            type="button"
-            onClick={() => void toggle()}
-            disabled={busy || !status}
-            className="h-8 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3.5 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent disabled:opacity-50"
-          >
+          <Button variant="outline" onClick={() => void toggle()} disabled={busy || !status}>
             {status?.running ? "Stop" : "Start"}
-          </button>
+          </Button>
         </div>
         <div className="flex items-center gap-2 px-[18px] py-3">
           <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{status?.baseUrl ?? "—"}</span>
-          <button type="button" title="Copy base URL" onClick={copyBaseUrl} className={iconBtn}>
-            <Copy aria-hidden size={13} strokeWidth={2} />
-          </button>
+          <Button variant="ghost" size="icon-sm" title="Copy base URL" onClick={copyBaseUrl} className="text-muted-foreground">
+            <Copy aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+          </Button>
         </div>
       </Card>
 
@@ -115,28 +112,16 @@ function EndpointTab() {
         </CardHeader>
         <CardRow>
           <span className="w-28 shrink-0 text-[13px] font-medium">Port</span>
-          <input type="number" className={`${field} w-28`} value={port} onChange={(e) => setPort(e.target.value)} />
+          <Input type="number" className="w-28" value={port} onChange={(e) => setPort(e.target.value)} />
         </CardRow>
         <CardRow>
-          <label className="flex flex-1 items-center gap-2 text-[13px] font-medium">
-            <input
-              type="checkbox"
-              checked={autostart}
-              onChange={(e) => setAutostart(e.target.checked)}
-              className="h-4 w-4 accent-primary"
-            />
-            Start automatically with Cockpit
-          </label>
+          <span className="flex-1 text-[13px] font-medium">Start automatically with Cockpit</span>
+          <Switch on={autostart} onToggle={() => setAutostart(!autostart)} label="Start automatically with Cockpit" />
         </CardRow>
         <div className="flex justify-end px-[18px] py-3">
-          <button
-            type="button"
-            onClick={() => void saveConfig()}
-            disabled={savingConfig}
-            className="h-8 cursor-pointer rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85 disabled:opacity-50"
-          >
+          <Button onClick={() => void saveConfig()} disabled={savingConfig}>
             {savingConfig ? "Saving…" : "Save"}
-          </button>
+          </Button>
         </div>
       </Card>
 
@@ -154,50 +139,37 @@ function EndpointTab() {
               <div className="text-[13px] font-semibold">{k.name}</div>
               <div className="mt-1 flex items-center gap-1.5">
                 <span className="truncate font-mono text-xs text-muted-foreground">{k.key}</span>
-                <button
-                  type="button"
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
                   title="Copy key"
                   onClick={() => {
                     void navigator.clipboard.writeText(k.key);
                     toast.success("Copied");
                   }}
-                  className={iconBtn}
+                  className="text-muted-foreground"
                 >
-                  <Copy aria-hidden size={12} strokeWidth={2} />
-                </button>
+                  <Copy aria-hidden size={12} strokeWidth={2} className="size-3" />
+                </Button>
               </div>
               <div className="mt-1 text-[11px] text-muted-foreground">
                 Created {new Date(k.createdAt).toLocaleDateString()} · Last used{" "}
                 {k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleDateString() : "never"}
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => void doRevoke(k.id, k.name)}
-              className="h-[27px] shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-[11px] font-sans text-xs font-medium text-destructive hover:bg-accent"
-            >
+            <Button variant="destructive" size="sm" onClick={() => void doRevoke(k.id, k.name)}>
               Revoke
-            </button>
+            </Button>
           </div>
         ))}
         {keys.length === 0 && (
           <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">No API keys yet — create one for external tools.</div>
         )}
         <div className="flex items-center gap-2 px-[18px] py-3">
-          <input
-            className={`${field} flex-1`}
-            value={keyName}
-            onChange={(e) => setKeyName(e.target.value)}
-            placeholder="Key name (e.g. VS Code)"
-          />
-          <button
-            type="button"
-            onClick={() => void submitKey()}
-            disabled={!keyName.trim() || creatingKey}
-            className="h-9 shrink-0 cursor-pointer rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85 disabled:opacity-50"
-          >
+          <Input className="flex-1" value={keyName} onChange={(e) => setKeyName(e.target.value)} placeholder="Key name (e.g. VS Code)" />
+          <Button size="lg" onClick={() => void submitKey()} disabled={!keyName.trim() || creatingKey}>
             {creatingKey ? "Creating…" : "New key"}
-          </button>
+          </Button>
         </div>
       </Card>
     </div>
@@ -226,33 +198,39 @@ function ConnectionRow({ conn, index, count }: { conn: ConnectionInfo; index: nu
   return (
     <div className="flex items-center gap-3 border-b border-border px-[18px] py-3.5 last:border-b-0">
       <div className="flex shrink-0 flex-col items-center gap-px">
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="icon-xs"
           title="Move up"
           onClick={() => void move(conn.id, -1)}
-          className={`${moveBtn} ${index === 0 ? "invisible" : ""}`}
+          className={`h-[15px] w-5 text-muted-foreground hover:bg-transparent hover:text-foreground dark:hover:bg-transparent ${index === 0 ? "invisible" : ""}`}
         >
-          <ChevronUp aria-hidden size={11} strokeWidth={2.5} />
-        </button>
+          <ChevronUp aria-hidden size={11} strokeWidth={2.5} className="size-[11px]" />
+        </Button>
         <span className="flex h-5 w-5 items-center justify-center rounded-full bg-muted font-mono text-[10.5px] font-semibold text-muted-foreground">
           {index + 1}
         </span>
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="icon-xs"
           title="Move down"
           onClick={() => void move(conn.id, 1)}
-          className={`${moveBtn} ${index === count - 1 ? "invisible" : ""}`}
+          className={`h-[15px] w-5 text-muted-foreground hover:bg-transparent hover:text-foreground dark:hover:bg-transparent ${index === count - 1 ? "invisible" : ""}`}
         >
-          <ChevronDown aria-hidden size={11} strokeWidth={2.5} />
-        </button>
+          <ChevronDown aria-hidden size={11} strokeWidth={2.5} className="size-[11px]" />
+        </Button>
       </div>
       <Chip initial={conn.initial} color={conn.color} size={34} onClick={open} />
-      <button type="button" onClick={open} className="min-w-0 flex-1 cursor-pointer border-none bg-transparent p-0 text-left font-sans">
+      <Button
+        variant="ghost"
+        onClick={open}
+        className="h-auto min-w-0 flex-1 flex-col items-start gap-0 whitespace-normal p-0 text-left font-normal"
+      >
         <span className="block text-sm font-semibold text-foreground">{conn.label || conn.providerName}</span>
         <span className="block text-xs text-muted-foreground">
           {conn.providerName} · {conn.keyMasked ?? "no key"} · {conn.models.length} model{conn.models.length === 1 ? "" : "s"}
         </span>
-      </button>
+      </Button>
       <Switch
         on={conn.enabled}
         onToggle={() =>
@@ -266,17 +244,12 @@ function ConnectionRow({ conn, index, count }: { conn: ConnectionInfo; index: nu
         }
         label="Enabled"
       />
-      <button
-        type="button"
-        onClick={() => void runTest()}
-        disabled={testing}
-        className="h-[27px] shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-[11px] font-sans text-xs font-medium text-foreground hover:bg-accent disabled:opacity-50"
-      >
+      <Button variant="outline" size="sm" onClick={() => void runTest()} disabled={testing}>
         {testing ? "Testing…" : "Test"}
-      </button>
-      <button type="button" title="Details" onClick={open} className={`${iconBtn} hover:text-accent-foreground`}>
-        <ChevronRight aria-hidden size={14} strokeWidth={2} />
-      </button>
+      </Button>
+      <Button variant="ghost" size="icon-sm" title="Details" onClick={open} className="text-muted-foreground">
+        <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+      </Button>
     </div>
   );
 }
@@ -299,14 +272,14 @@ function ProvidersTab({ onAdd }: { onAdd: () => void }) {
         </div>
       )}
       {loaded && (
-        <button
-          type="button"
+        <Button
+          variant="ghost"
           onClick={onAdd}
-          className="flex cursor-pointer items-center gap-3 rounded-xl border border-dashed border-border bg-transparent px-[18px] py-[15px] font-sans text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          className="h-auto w-full justify-start gap-3 rounded-xl border-dashed border-border px-[18px] py-[15px] text-muted-foreground"
         >
           <Plus aria-hidden size={16} strokeWidth={2} />
-          <span className="text-[13px] font-medium">Add connection</span>
-        </button>
+          Add connection
+        </Button>
       )}
     </div>
   );
