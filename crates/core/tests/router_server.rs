@@ -539,3 +539,28 @@ async fn passthrough_streaming_preserves_sse() {
     assert!(body.contains("llo"), "body: {body}");
     assert!(body.contains("data: [DONE]"), "body: {body}");
 }
+
+/// A served (passthrough) request writes a usage_daily row: validates the
+/// recording seam end to end, even though passthrough itself can't observe
+/// upstream token counts (zero tokens + status 200 is the intended shape).
+#[tokio::test]
+async fn served_request_records_usage() {
+    let (store, key, port) = setup().await; // existing helper: custom-openai -> mock, key created
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {key}"))
+        .json(&json!({"model": "custom-openai/mock-model",
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    // record() spawns a detached task; give it a beat.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let rows = store.usage_daily(None, &day).await.unwrap();
+    assert!(
+        rows.iter().any(|r| r.connection_id == "c1" && r.requests >= 1),
+        "expected a usage_daily row for c1, got {rows:?}"
+    );
+}

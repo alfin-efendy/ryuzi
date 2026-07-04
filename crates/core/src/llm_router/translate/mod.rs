@@ -526,6 +526,12 @@ impl OpenAiToAnthropicStream {
             json!({"type": "error", "error": {"type": "api_error", "message": message}}),
         )]
     }
+
+    /// Accumulated (input, output) token counts seen so far, from the
+    /// upstream `usage` field carried on OpenAI chunks.
+    pub fn usage(&self) -> (i64, i64) {
+        (self.input_tokens, self.output_tokens)
+    }
 }
 
 /// Upstream Anthropic SSE events → OpenAI chunks (client called
@@ -540,6 +546,7 @@ pub struct AnthropicToOpenAiStream {
     tool_index: std::collections::HashMap<i64, i64>,
     next_tool: i64,
     finish: Option<String>,
+    input_tokens: i64,
     usage_out: i64,
 }
 
@@ -559,6 +566,7 @@ impl AnthropicToOpenAiStream {
             tool_index: Default::default(),
             next_tool: 0,
             finish: None,
+            input_tokens: 0,
             usage_out: 0,
         }
     }
@@ -580,6 +588,9 @@ impl AnthropicToOpenAiStream {
                 if let Some(m) = data["message"]["model"].as_str() {
                     self.model = m.to_string();
                 }
+                self.input_tokens = data["message"]["usage"]["input_tokens"]
+                    .as_i64()
+                    .unwrap_or(self.input_tokens);
                 self.sent_role = true;
                 out.push(self.chunk(json!({"role": "assistant", "content": ""}), None));
             }
@@ -643,6 +654,12 @@ impl AnthropicToOpenAiStream {
     /// finish chunk + `[DONE]` when the upstream stream errored mid-flight.
     pub fn error_frame(&self, message: &str) -> Value {
         json!({"error": {"message": message, "type": "api_error"}})
+    }
+
+    /// Accumulated (input, output) token counts seen so far: input from
+    /// `message_start`'s usage, output from the terminal `message_delta`.
+    pub fn usage(&self) -> (i64, i64) {
+        (self.input_tokens, self.usage_out)
     }
 }
 

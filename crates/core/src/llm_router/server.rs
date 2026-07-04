@@ -86,6 +86,12 @@ impl RouterServer {
         let mut g = self.inner.lock().unwrap();
         g.shutdown = Some(tx);
         g.port = bound;
+        drop(g);
+        let prune_store = self.store.clone();
+        tokio::spawn(async move {
+            let cutoff = crate::paths::now_ms() - crate::llm_router::usage::PRUNE_AFTER_MS;
+            let _ = prune_store.prune_request_log(cutoff).await;
+        });
         Ok(bound)
     }
 
@@ -250,17 +256,54 @@ async fn handle_messages(
     body["model"] = json!(target.upstream_model);
 
     match target.desc.format {
-        ApiFormat::Anthropic => proxy_passthrough(&state, &target, &body, anthropic_error).await,
+        ApiFormat::Anthropic => {
+            let started = crate::paths::now_ms();
+            let resp = proxy_passthrough(&state, &target, &body, anthropic_error).await;
+            crate::llm_router::usage::record(
+                &state.store,
+                &target.conn.id,
+                &target.conn.provider,
+                &target.upstream_model,
+                "anthropic",
+                crate::llm_router::usage::Usage::default(),
+                resp.status().as_u16(),
+                started,
+                None,
+            );
+            resp
+        }
         ApiFormat::OpenAi => {
             let upstream_body = match translate::anthropic_to_openai_request(&body) {
                 Ok(b) => b,
                 Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e.to_string()),
             };
             if stream {
-                stream_openai_upstream_to_anthropic(&state, &target, &upstream_body).await
+                let ctx = RecordCtx {
+                    conn_id: target.conn.id.clone(),
+                    provider: target.conn.provider.clone(),
+                    model: target.upstream_model.clone(),
+                    client_format: "anthropic".to_string(),
+                    started: crate::paths::now_ms(),
+                };
+                stream_openai_upstream_to_anthropic(&state, &target, &upstream_body, ctx).await
             } else {
+                let started = crate::paths::now_ms();
                 match send_json(&state, &target, &upstream_body, anthropic_error).await {
-                    Ok(v) => Json(translate::openai_to_anthropic_response(&v)).into_response(),
+                    Ok(v) => {
+                        let u = crate::llm_router::usage::usage_from_openai(&v);
+                        crate::llm_router::usage::record(
+                            &state.store,
+                            &target.conn.id,
+                            &target.conn.provider,
+                            &target.upstream_model,
+                            "anthropic",
+                            u,
+                            200,
+                            started,
+                            None,
+                        );
+                        Json(translate::openai_to_anthropic_response(&v)).into_response()
+                    }
                     Err(r) => r,
                 }
             }
@@ -292,17 +335,54 @@ async fn handle_chat(
     body["model"] = json!(target.upstream_model);
 
     match target.desc.format {
-        ApiFormat::OpenAi => proxy_passthrough(&state, &target, &body, openai_error).await,
+        ApiFormat::OpenAi => {
+            let started = crate::paths::now_ms();
+            let resp = proxy_passthrough(&state, &target, &body, openai_error).await;
+            crate::llm_router::usage::record(
+                &state.store,
+                &target.conn.id,
+                &target.conn.provider,
+                &target.upstream_model,
+                "openai",
+                crate::llm_router::usage::Usage::default(),
+                resp.status().as_u16(),
+                started,
+                None,
+            );
+            resp
+        }
         ApiFormat::Anthropic => {
             let upstream_body = match translate::openai_to_anthropic_request(&body) {
                 Ok(b) => b,
                 Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
             };
             if stream {
-                stream_anthropic_upstream_to_openai(&state, &target, &upstream_body).await
+                let ctx = RecordCtx {
+                    conn_id: target.conn.id.clone(),
+                    provider: target.conn.provider.clone(),
+                    model: target.upstream_model.clone(),
+                    client_format: "openai".to_string(),
+                    started: crate::paths::now_ms(),
+                };
+                stream_anthropic_upstream_to_openai(&state, &target, &upstream_body, ctx).await
             } else {
+                let started = crate::paths::now_ms();
                 match send_json(&state, &target, &upstream_body, openai_error).await {
-                    Ok(v) => Json(translate::anthropic_to_openai_response(&v)).into_response(),
+                    Ok(v) => {
+                        let u = crate::llm_router::usage::usage_from_anthropic(&v);
+                        crate::llm_router::usage::record(
+                            &state.store,
+                            &target.conn.id,
+                            &target.conn.provider,
+                            &target.upstream_model,
+                            "openai",
+                            u,
+                            200,
+                            started,
+                            None,
+                        );
+                        Json(translate::anthropic_to_openai_response(&v)).into_response()
+                    }
                     Err(r) => r,
                 }
             }
@@ -431,9 +511,24 @@ fn format_sse(name: &str, data: &Value) -> bytes::Bytes {
     bytes::Bytes::from(format!("event: {name}\ndata: {data}\n\n"))
 }
 
+/// Recording context threaded into the streaming pumps so they can record a
+/// usage row once the upstream stream ends (clean or errored).
+struct RecordCtx {
+    conn_id: String,
+    provider: String,
+    model: String,
+    client_format: String,
+    started: i64,
+}
+
 /// Spawn a task that pumps `resp`'s bytes through SseParser + `tr`, sending
 /// formatted SSE bytes down an mpsc channel that backs the response Body.
-fn spawn_openai_to_anthropic_pump(resp: reqwest::Response, model: String) -> Body {
+fn spawn_openai_to_anthropic_pump(
+    resp: reqwest::Response,
+    model: String,
+    store: Arc<Store>,
+    ctx: RecordCtx,
+) -> Body {
     use futures::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -441,7 +536,7 @@ fn spawn_openai_to_anthropic_pump(resp: reqwest::Response, model: String) -> Bod
         let mut tr = translate::OpenAiToAnthropicStream::new(&model);
         let mut stream = resp.bytes_stream();
         let mut errored = false;
-        while let Some(item) = stream.next().await {
+        'pump: while let Some(item) = stream.next().await {
             let chunk = match item {
                 Ok(c) => c,
                 Err(e) => {
@@ -459,7 +554,9 @@ fn spawn_openai_to_anthropic_pump(resp: reqwest::Response, model: String) -> Bod
                 if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
                     for (name, data) in tr.feed(&v) {
                         if tx.send(Ok(format_sse(&name, &data))).await.is_err() {
-                            return;
+                            // Client disconnected; stop pumping but still
+                            // record what we saw so far.
+                            break 'pump;
                         }
                     }
                 }
@@ -470,11 +567,23 @@ fn spawn_openai_to_anthropic_pump(resp: reqwest::Response, model: String) -> Bod
                 let _ = tx.send(Ok(format_sse(&name, &data))).await;
             }
         }
+        let (input, output) = tr.usage();
+        crate::llm_router::usage::record(
+            &store,
+            &ctx.conn_id,
+            &ctx.provider,
+            &ctx.model,
+            &ctx.client_format,
+            crate::llm_router::usage::Usage { input, output },
+            if errored { 502 } else { 200 },
+            ctx.started,
+            errored.then(|| "stream interrupted".to_string()),
+        );
     });
     Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-fn spawn_anthropic_to_openai_pump(resp: reqwest::Response) -> Body {
+fn spawn_anthropic_to_openai_pump(resp: reqwest::Response, store: Arc<Store>, ctx: RecordCtx) -> Body {
     use futures::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -482,7 +591,7 @@ fn spawn_anthropic_to_openai_pump(resp: reqwest::Response) -> Body {
         let mut tr = translate::AnthropicToOpenAiStream::new();
         let mut stream = resp.bytes_stream();
         let mut errored = false;
-        while let Some(item) = stream.next().await {
+        'pump: while let Some(item) = stream.next().await {
             let chunk = match item {
                 Ok(c) => c,
                 Err(e) => {
@@ -498,7 +607,9 @@ fn spawn_anthropic_to_openai_pump(resp: reqwest::Response) -> Body {
                     for c in tr.feed(name, &v) {
                         let line = bytes::Bytes::from(format!("data: {c}\n\n"));
                         if tx.send(Ok(line)).await.is_err() {
-                            return;
+                            // Client disconnected; stop pumping but still
+                            // record what we saw so far.
+                            break 'pump;
                         }
                     }
                 }
@@ -507,6 +618,18 @@ fn spawn_anthropic_to_openai_pump(resp: reqwest::Response) -> Body {
         if !errored && tr.finish() {
             let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
         }
+        let (input, output) = tr.usage();
+        crate::llm_router::usage::record(
+            &store,
+            &ctx.conn_id,
+            &ctx.provider,
+            &ctx.model,
+            &ctx.client_format,
+            crate::llm_router::usage::Usage { input, output },
+            if errored { 502 } else { 200 },
+            ctx.started,
+            errored.then(|| "stream interrupted".to_string()),
+        );
     });
     Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
@@ -516,6 +639,7 @@ async fn stream_openai_upstream_to_anthropic(
     state: &AppState,
     target: &RouteTarget,
     upstream_body: &Value,
+    ctx: RecordCtx,
 ) -> Response {
     let model = upstream_body["model"].as_str().unwrap_or("").to_string();
     let req = match upstream_request(state, target, upstream_body) {
@@ -536,7 +660,12 @@ async fn stream_openai_upstream_to_anthropic(
             .to_string();
         return anthropic_error(status, &format!("[{}] {msg}", target.conn.provider));
     }
-    sse_response(spawn_openai_to_anthropic_pump(resp, model))
+    sse_response(spawn_openai_to_anthropic_pump(
+        resp,
+        model,
+        state.store.clone(),
+        ctx,
+    ))
 }
 
 /// Client=OpenAI, upstream=Anthropic, stream=true.
@@ -544,6 +673,7 @@ async fn stream_anthropic_upstream_to_openai(
     state: &AppState,
     target: &RouteTarget,
     upstream_body: &Value,
+    ctx: RecordCtx,
 ) -> Response {
     let req = match upstream_request(state, target, upstream_body) {
         Ok(r) => r,
@@ -563,5 +693,9 @@ async fn stream_anthropic_upstream_to_openai(
             .to_string();
         return openai_error(status, &format!("[{}] {msg}", target.conn.provider));
     }
-    sse_response(spawn_anthropic_to_openai_pump(resp))
+    sse_response(spawn_anthropic_to_openai_pump(
+        resp,
+        state.store.clone(),
+        ctx,
+    ))
 }

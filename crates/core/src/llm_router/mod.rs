@@ -6,3 +6,4 @@ pub mod registry;
 pub mod server;
 pub mod sse;
 pub mod translate;
+pub mod usage;
