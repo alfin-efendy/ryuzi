@@ -630,7 +630,12 @@ keyMasked: string | null }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | { kind: "sessionEnded"; session_pk: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | 
+/**
+ * Out-of-band announcement (e.g. "update available") rendered to every
+ * surface of a session. TS parity: `{ kind: "notice", session_pk, text }`.
+ */
+{ kind: "notice"; session_pk: string; text: string } | { kind: "sessionEnded"; session_pk: string } | 
 /**
  * A scheduled job run started or finished (status: running|success|failed).
  */
@@ -693,7 +698,7 @@ export type RuntimeInfo = { id: string; name: string; color: string; initial: st
  */
 runnable: boolean }
 export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
-export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
+export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 

@@ -277,8 +277,7 @@ pub fn parse_ollama_list(text: &str) -> Vec<String> {
 pub async fn list_configs(store: &Store) -> anyhow::Result<Vec<RuntimeConfig>> {
     store
         .with_conn(|c| {
-            let mut stmt =
-                c.prepare("SELECT id, enabled, model, perm_mode, flags FROM agents")?;
+            let mut stmt = c.prepare("SELECT id, enabled, model, perm_mode, flags FROM agents")?;
             let rows = stmt
                 .query_map([], |r| {
                     Ok(RuntimeConfig {
@@ -326,7 +325,13 @@ pub async fn upsert_config(store: &Store, cfg: RuntimeConfig) -> anyhow::Result<
                  ON CONFLICT(id) DO UPDATE SET \
                    enabled=excluded.enabled, model=excluded.model, \
                    perm_mode=excluded.perm_mode, flags=excluded.flags",
-                params![cfg.id, cfg.enabled as i64, cfg.model, cfg.perm_mode, cfg.flags],
+                params![
+                    cfg.id,
+                    cfg.enabled as i64,
+                    cfg.model,
+                    cfg.perm_mode,
+                    cfg.flags
+                ],
             )
             .map(|_| ())
         })
@@ -353,8 +358,8 @@ pub async fn list_tiers(store: &Store, agent_id: &str) -> anyhow::Result<Vec<Tie
     let defaults = desc.map(|d| d.tiers).unwrap_or(&[]);
     Ok(defaults
         .iter()
-        .map(|(tid, label, value, combo)| {
-            match persisted.iter().find(|(p, _, _)| p == tid) {
+        .map(
+            |(tid, label, value, combo)| match persisted.iter().find(|(p, _, _)| p == tid) {
                 Some((_, v, cb)) => TierRow {
                     tier_id: tid.to_string(),
                     label: label.to_string(),
@@ -367,8 +372,8 @@ pub async fn list_tiers(store: &Store, agent_id: &str) -> anyhow::Result<Vec<Tie
                     value: value.map(|s| s.to_string()),
                     combo: *combo,
                 },
-            }
-        })
+            },
+        )
         .collect())
 }
 
@@ -482,9 +487,15 @@ mod tests {
 
     #[test]
     fn parses_common_version_outputs() {
-        assert_eq!(parse_version("2.1.4 (Claude Code)").as_deref(), Some("2.1.4"));
+        assert_eq!(
+            parse_version("2.1.4 (Claude Code)").as_deref(),
+            Some("2.1.4")
+        );
         assert_eq!(parse_version("codex-cli 1.8.2").as_deref(), Some("1.8.2"));
-        assert_eq!(parse_version("ollama version is 0.6.4").as_deref(), Some("0.6.4"));
+        assert_eq!(
+            parse_version("ollama version is 0.6.4").as_deref(),
+            Some("0.6.4")
+        );
         assert_eq!(parse_version("v0.13.0").as_deref(), Some("0.13.0"));
         assert_eq!(parse_version("no digits here"), None);
         // A bare integer is not a version.
@@ -524,16 +535,32 @@ mod tests {
         assert_eq!(tiers[0].value.as_deref(), Some("claude-opus-4-5"));
 
         // Persist an override for one tier; others keep defaults.
-        set_tier(&store, "claude", "fast", Some("claude-sonnet-4-5".into()), false)
-            .await
-            .unwrap();
+        set_tier(
+            &store,
+            "claude",
+            "fast",
+            Some("claude-sonnet-4-5".into()),
+            false,
+        )
+        .await
+        .unwrap();
         let tiers = list_tiers(&store, "claude").await.unwrap();
         assert_eq!(
-            tiers.iter().find(|t| t.tier_id == "fast").unwrap().value.as_deref(),
+            tiers
+                .iter()
+                .find(|t| t.tier_id == "fast")
+                .unwrap()
+                .value
+                .as_deref(),
             Some("claude-sonnet-4-5")
         );
         assert_eq!(
-            tiers.iter().find(|t| t.tier_id == "default").unwrap().value.as_deref(),
+            tiers
+                .iter()
+                .find(|t| t.tier_id == "default")
+                .unwrap()
+                .value
+                .as_deref(),
             Some("claude-opus-4-5")
         );
 

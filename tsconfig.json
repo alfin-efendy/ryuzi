@@ -15,13 +15,6 @@
     "verbatimModuleSyntax": true,
     "noEmit": true,
 
-    // Monorepo: resolve workspace packages for `tsc --noEmit`
-    // (paths without baseUrl resolve relative to this tsconfig)
-    "paths": {
-      "@ryuzi/protocol": ["./packages/protocol/src/index.ts"],
-      "@ryuzi/core": ["./packages/core/src/index.ts"]
-    },
-
     // Best practices
     "strict": true,
     "skipLibCheck": true,
@@ -34,7 +27,7 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "include": ["apps", "packages"],
+  "include": ["apps", "packages", "scripts"],
   // apps/cockpit and packages/ui are DOM/React workspaces with their own tsconfig
   // (DOM lib + `@/` path alias). They are type-checked separately by the `typecheck`
   // script; excluded here so this Bun-side config (no DOM lib) does not false-fail them.

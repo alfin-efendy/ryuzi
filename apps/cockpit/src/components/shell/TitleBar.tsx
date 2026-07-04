@@ -1,7 +1,8 @@
 // apps/cockpit/src/components/shell/TitleBar.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, CornerDownLeft, FileText, PanelLeft, Search, SquareTerminal } from "lucide-react";
-import { useStore, type Line } from "@/store";
+import { useStore } from "@/store";
+import type { Row } from "@/lib/transcript";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { commands } from "@/bindings";
@@ -25,16 +26,16 @@ const resultBtn =
 
 type Snippet = { pre: string; hit: string; post: string } | null;
 
-function transcriptSnippet(lines: Line[], q: string): Snippet {
+function transcriptSnippet(rows: Row[], q: string): Snippet {
   const lower = q.toLowerCase();
-  for (const line of lines) {
-    const idx = line.text.toLowerCase().indexOf(lower);
+  for (const row of rows) {
+    const idx = row.text.toLowerCase().indexOf(lower);
     if (idx === -1) continue;
     const start = Math.max(0, idx - 32);
     return {
-      pre: (start > 0 ? "…" : "") + line.text.slice(start, idx),
-      hit: line.text.slice(idx, idx + q.length),
-      post: line.text.slice(idx + q.length, idx + q.length + 60),
+      pre: (start > 0 ? "…" : "") + row.text.slice(start, idx),
+      hit: row.text.slice(idx, idx + q.length),
+      post: row.text.slice(idx + q.length, idx + q.length + 60),
     };
   }
   return null;

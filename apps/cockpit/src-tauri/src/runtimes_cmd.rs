@@ -5,7 +5,7 @@
 //! re-probes binaries and asks npm, then persists the snapshot in settings.
 
 use crate::error::CmdError;
-use ryuzi_core::router::{keys, server::RouterServer};
+use ryuzi_core::llm_router::{keys, server::RouterServer};
 use ryuzi_core::runtime_config::{self, ConfigStatus, EndpointInfo, RuntimeMapping};
 use ryuzi_core::runtimes::{self, RuntimeConfig};
 use ryuzi_core::ControlPlane;

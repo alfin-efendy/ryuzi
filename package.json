@@ -9,7 +9,6 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit && tsc --noEmit -p apps/cockpit && tsc --noEmit -p packages/ui",
-    "ryuzi": "bun run apps/cli/src/cli/index.ts",
     "cockpit:dev": "cd apps/cockpit && bun run tauri dev",
     "cockpit:build": "cd apps/cockpit && bun run tauri build",
     "lint": "biome ci .",
@@ -18,7 +17,6 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.1",
     "@types/bun": "latest",
-    "react-devtools-core": "^7.0.1",
     "typescript": "^5"
   }
 }

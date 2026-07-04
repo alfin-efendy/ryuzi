@@ -1,7 +1,7 @@
 //! Endpoint tab commands: server lifecycle, port/autostart settings, keys.
 use crate::error::CmdError;
-use ryuzi_core::router::keys;
-use ryuzi_core::router::server::{RouterServer, DEFAULT_PORT};
+use ryuzi_core::llm_router::keys;
+use ryuzi_core::llm_router::server::{RouterServer, DEFAULT_PORT};
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
 use specta::Type;

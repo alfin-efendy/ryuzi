@@ -1,6 +1,6 @@
 //! End-to-end: mock upstream (OpenAI format) behind the router; client talks
 //! Anthropic (/v1/messages) and OpenAI (/v1/chat/completions).
-use ryuzi_core::router::{connections, keys, server::RouterServer};
+use ryuzi_core::llm_router::{connections, keys, server::RouterServer};
 use ryuzi_core::Store;
 use serde_json::json;
 use std::sync::Arc;

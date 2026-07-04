@@ -83,7 +83,10 @@ fn slugify(name: &str) -> String {
 }
 
 fn initial_of(name: &str) -> String {
-    name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into())
+    name.chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into())
 }
 
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
@@ -200,10 +203,18 @@ pub async fn add_app(cp: State<'_, Arc<ControlPlane>>, input: AddAppInput) -> R<
     let env: Vec<(String, String)> = input
         .env
         .iter()
-        .filter_map(|line| line.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+        .filter_map(|line| {
+            line.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        })
         .collect();
     let auth_kind = if env.is_empty() { "none" } else { "env" };
-    let auth_detail = (!env.is_empty()).then(|| env.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>().join(", "));
+    let auth_detail = (!env.is_empty()).then(|| {
+        env.iter()
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
     mcp::upsert_server(
         cp.store(),
         McpServerRow {
@@ -255,9 +266,11 @@ pub async fn update_app_scope(
     scope: String,
     scope_gateways: Vec<String>,
 ) -> R<Vec<AppInfo>> {
-    let mut row = mcp::get_server(cp.store(), &id).await?.ok_or_else(|| CmdError {
-        message: format!("unknown app: {id}"),
-    })?;
+    let mut row = mcp::get_server(cp.store(), &id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown app: {id}"),
+        })?;
     row.scope = scope;
     row.scope_gateways = scope_gateways;
     mcp::upsert_server(cp.store(), row).await?;

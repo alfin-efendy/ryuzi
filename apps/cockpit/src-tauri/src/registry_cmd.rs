@@ -42,15 +42,27 @@ pub fn map_entry(item: &serde_json::Value) -> Option<RegistryEntry> {
         .get("title")
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| reg_name.split('/').next_back().unwrap_or(&reg_name).to_string());
+        .unwrap_or_else(|| {
+            reg_name
+                .split('/')
+                .next_back()
+                .unwrap_or(&reg_name)
+                .to_string()
+        });
     let publisher = reg_name.split('/').next().unwrap_or("").to_string();
     let desc = server
         .get("description")
         .and_then(|d| d.as_str())
         .unwrap_or("")
         .to_string();
-    let version = server.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let website = server.get("websiteUrl").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let version = server
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let website = server
+        .get("websiteUrl")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Prefer an npm package (stdio), fall back to a remote URL.
     let npm = server
@@ -62,7 +74,11 @@ pub fn map_entry(item: &serde_json::Value) -> Option<RegistryEntry> {
                     .get("registryType")
                     .or_else(|| p.get("registry_type"))
                     .and_then(|r| r.as_str())?;
-                (reg_type == "npm").then(|| p.get("identifier").and_then(|i| i.as_str()).map(|s| s.to_string()))?
+                (reg_type == "npm").then(|| {
+                    p.get("identifier")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string())
+                })?
             })
         });
     let remote = server
@@ -101,7 +117,10 @@ pub fn map_page(v: &serde_json::Value) -> RegistryPage {
         .pointer("/metadata/nextCursor")
         .and_then(|c| c.as_str())
         .map(|s| s.to_string());
-    RegistryPage { entries, next_cursor }
+    RegistryPage {
+        entries,
+        next_cursor,
+    }
 }
 
 #[tauri::command]
@@ -110,7 +129,9 @@ pub async fn registry_search(query: Option<String>, cursor: Option<String>) -> R
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .build()
-        .map_err(|e| CmdError { message: e.to_string() })?;
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
     let mut req = client.get(REGISTRY_BASE).query(&[("limit", "30")]);
     if let Some(q) = query.as_deref().filter(|q| !q.trim().is_empty()) {
         req = req.query(&[("search", q.trim())]);
@@ -168,7 +189,10 @@ mod tests {
 
         let remote = &page.entries[1];
         assert_eq!(remote.kind, "http");
-        assert_eq!(remote.install_target.as_deref(), Some("https://sh.inference.ac"));
+        assert_eq!(
+            remote.install_target.as_deref(),
+            Some("https://sh.inference.ac")
+        );
         // No title → falls back to the last path segment of the name.
         assert_eq!(remote.name, "mcp");
     }

@@ -198,7 +198,12 @@ impl TerminalManager {
             let notify_for_thread = exit_notify.clone();
             let child_for_thread = child.clone();
             std::thread::spawn(move || {
-                drain_pty(reader, state_for_thread, notify_for_thread, child_for_thread);
+                drain_pty(
+                    reader,
+                    state_for_thread,
+                    notify_for_thread,
+                    child_for_thread,
+                );
             })
         };
 
@@ -262,7 +267,7 @@ impl TerminalManager {
                 return Ok(());
             }
             notified.await; // any notify_waiters() after enable() is observed
-            // Loop re-checks `exited` to guard against spurious wakeups.
+                            // Loop re-checks `exited` to guard against spurious wakeups.
         }
     }
 
@@ -435,9 +440,7 @@ mod tests {
     async fn terminal_runs_in_cwd() {
         let root = tempfile::tempdir().unwrap();
         let mgr = TerminalManager::new();
-        let id = mgr
-            .create("pwd", root.path().to_path_buf(), 4096)
-            .unwrap();
+        let id = mgr.create("pwd", root.path().to_path_buf(), 4096).unwrap();
         mgr.wait_for_exit(&id).await.unwrap();
         let out = mgr.output(&id).unwrap();
         // The pwd output should contain the temp dir's real path.
@@ -479,9 +482,7 @@ mod tests {
         // path and return without blocking.
         let root = tempfile::tempdir().unwrap();
         let mgr = TerminalManager::new();
-        let id = mgr
-            .create("true", root.path().to_path_buf(), 1024)
-            .unwrap();
+        let id = mgr.create("true", root.path().to_path_buf(), 1024).unwrap();
         // First wait: let the process finish and `exited` become true.
         tokio::time::timeout(std::time::Duration::from_secs(10), mgr.wait_for_exit(&id))
             .await

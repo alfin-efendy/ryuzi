@@ -1,7 +1,7 @@
 //! Providers tab commands: catalog + credentialed connections CRUD + test.
 use crate::error::CmdError;
-use ryuzi_core::router::connections::{self, ConnectionData, ConnectionRow};
-use ryuzi_core::router::registry::{self, ApiFormat, AuthScheme, ProviderCategory};
+use ryuzi_core::llm_router::connections::{self, ConnectionData, ConnectionRow};
+use ryuzi_core::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderCategory};
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
 use specta::Type;

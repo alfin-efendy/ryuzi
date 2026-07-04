@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowUp,
   ChevronDown,
@@ -32,6 +32,7 @@ import { FileTreePane } from "@/components/FileTreePane";
 import { TerminalPane } from "@/components/TerminalPane";
 import { AgentMenu } from "@/components/common/AgentMenu";
 import { DiffStat, StatusDot } from "@/components/common/bits";
+import { Transcript } from "@/components/transcript/Transcript";
 
 const toolBtn =
   "flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground";
@@ -59,20 +60,13 @@ export function SessionView() {
   const [reviewFiles, setReviewFiles] = useState<ReviewFile[]>([]);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewError, setReviewError] = useState<string | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
-  // Persisted transcripts can carry empty text blocks (e.g. tool-only turns); skip them.
-  const lines = ((focusedSessionPk && transcripts[focusedSessionPk]) || []).filter((l) => l.kind !== "text" || l.text.trim().length > 0);
+  const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
   const runtimes = useRuntimes((s) => s.runtimes);
   const agent = runtimeById(runtimes, nav.composerAgent) ?? defaultRuntimeOf(runtimes);
   const project = projects.find((p) => p.projectId === session?.projectId);
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies(lines.length): re-run to pin the scroll to the bottom whenever the transcript grows
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [lines.length]);
 
   // Real diff of the session worktree; refreshed when the Review tab opens
   // and whenever the running turn finishes (the agent may have edited files).
@@ -165,55 +159,9 @@ export function SessionView() {
         </div>
 
         {/* Transcript */}
-        <div ref={scrollRef} className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-6 py-5">
-          {lines.map((line, i) => {
-            const key = `${i}-${line.kind}`;
-            if (line.kind === "user")
-              return (
-                <div key={key} className="flex flex-col">
-                  <div className="max-w-[70%] self-end rounded-xl bg-secondary px-3.5 py-2.5 text-[13.5px] leading-[1.55] text-secondary-foreground">
-                    {line.text}
-                  </div>
-                </div>
-              );
-            if (line.kind === "status")
-              return (
-                <div key={key} className="flex flex-col">
-                  <div className="acrylic-panel flex max-w-fit items-center gap-2 rounded-md border border-border px-3 py-[7px] font-mono text-xs text-muted-foreground">
-                    <span style={{ color: "#22C55E" }}>›</span>
-                    <span className="text-foreground">{line.text}</span>
-                  </div>
-                </div>
-              );
-            if (line.kind === "error")
-              return (
-                <div key={key} className="flex flex-col">
-                  <div className="flex max-w-fit items-center gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-[7px] text-xs text-destructive">
-                    {line.text}
-                  </div>
-                </div>
-              );
-            return (
-              <div key={key} className="flex max-w-[82%] flex-col text-[13.5px] leading-relaxed text-foreground">
-                <div className="mb-1 flex items-center gap-1.5 text-[11.5px] font-semibold text-muted-foreground">
-                  <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
-                  {agent?.name ?? "Agent"}
-                </div>
-                <div className="whitespace-pre-wrap">{line.text}</div>
-              </div>
-            );
-          })}
-          {running && (
-            <div className="flex items-center gap-2 text-[12.5px] text-muted-foreground">
-              <span
-                className="h-2 w-2 rounded-full"
-                style={{ background: agent?.color ?? "var(--muted-foreground)", animation: "relay-pulse 1.2s ease-in-out infinite" }}
-              />
-              Working…
-            </div>
-          )}
+        <Transcript rows={rows} agentName={agent?.name ?? "Agent"} agentColor={agent?.color ?? "var(--muted-foreground)"} running={running}>
           {hasApproval && <ApprovalPrompt sessionPk={session.sessionPk} />}
-        </div>
+        </Transcript>
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">

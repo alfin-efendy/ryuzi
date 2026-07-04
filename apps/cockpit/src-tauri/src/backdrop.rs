@@ -18,6 +18,11 @@ pub struct BackdropState(pub BackdropCapability);
 /// Mica needs Windows 11 (build 22000+); older builds get opaque. The version
 /// gate here IS the capability check — Tauri returns Ok from set_effects even
 /// when the OS refuses the effect, so a failed apply is undetectable.
+///
+/// Only called from the `windows`-gated branch of `apply_backdrop`; kept
+/// cross-platform (and exercised by the tests below) so the build-number
+/// threshold is verified everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn windows_capability(build: u32) -> BackdropCapability {
     if build >= 22000 {
         BackdropCapability::Mica

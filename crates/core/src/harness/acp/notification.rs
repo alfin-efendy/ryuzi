@@ -168,12 +168,7 @@ impl NotificationSink {
     /// On store error → `tracing::warn!` + skip (same as the sink's rule).
     pub async fn record_status(&self, summary: String) {
         let payload = serde_json::json!({ "summary": summary });
-        let msg = NewMessage::block(
-            &self.session_pk,
-            "system",
-            "status",
-            payload.clone(),
-        );
+        let msg = NewMessage::block(&self.session_pk, "system", "status", payload.clone());
         match self.store.insert_message(msg).await {
             Ok(seq) => {
                 let _ = self.events.send(CoreEvent::Message {
@@ -287,9 +282,7 @@ pub async fn handle(notification: SessionNotification, sink: &NotificationSink) 
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "notification: failed to insert tool_call row (id={id}): {e}"
-                    );
+                    tracing::warn!("notification: failed to insert tool_call row (id={id}): {e}");
                 }
             }
         }
@@ -305,22 +298,24 @@ pub async fn handle(notification: SessionNotification, sink: &NotificationSink) 
                 .update_tool_call(&session_pk, &id, Some(status), &output_payload)
                 .await
             {
-                Ok(seq) => {
+                // Re-emit with the ORIGINAL row seq (identity-correct: the
+                // frontend upserts by tool_call_id, not seq) and the MERGED
+                // payload + persisted kind, so live completion renders with
+                // name + input + output intact.
+                Ok((seq, merged_payload, tool_kind)) => {
                     let _ = sink.events.send(CoreEvent::Message {
                         session_pk: session_pk.clone(),
                         seq,
                         role: "assistant".into(),
                         block_type: "tool_call".into(),
-                        payload: output_payload,
+                        payload: merged_payload,
                         tool_call_id: Some(id),
                         status: Some(status.into()),
-                        tool_kind: None,
+                        tool_kind,
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "notification: failed to update tool_call row (id={id}): {e}"
-                    );
+                    tracing::warn!("notification: failed to update tool_call row (id={id}): {e}");
                 }
             }
         }
@@ -333,8 +328,7 @@ pub async fn handle(notification: SessionNotification, sink: &NotificationSink) 
 mod tests {
     #[tokio::test]
     async fn streamed_updates_persist_to_messages() {
-        let (store, session_pk) =
-            crate::harness::acp::testkit::run_prompt_and_collect().await;
+        let (store, session_pk) = crate::harness::acp::testkit::run_prompt_and_collect().await;
         let msgs = store.list_messages(&session_pk).await.unwrap();
 
         // assistant text row
@@ -352,5 +346,69 @@ mod tests {
             .expect("tool_call row");
         assert_eq!(tc.status.as_deref(), Some("completed"));
         assert_eq!(tc.tool_call_id.as_deref(), Some("tc-1"));
+    }
+
+    #[tokio::test]
+    async fn tool_completion_reemits_merged_payload_and_kind() {
+        use crate::domain::CoreEvent;
+
+        let (store, session_pk, events) =
+            crate::harness::acp::testkit::run_via_harness_trait_collecting_events("hi").await;
+
+        // The live completion event carries the MERGED payload and the
+        // persisted kind (not just {output} / None as before).
+        let done = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::Message {
+                    block_type,
+                    status: Some(s),
+                    payload,
+                    tool_kind,
+                    ..
+                } if block_type == "tool_call" && s == "completed" => {
+                    Some((payload.clone(), tool_kind.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected a completed tool_call Message event");
+        assert_eq!(done.0["name"], "Bash");
+        assert_eq!(done.0["output"], "output text");
+        assert_eq!(done.1.as_deref(), Some("execute"));
+
+        // And the persisted row kept name + input alongside the output.
+        let msgs = store.list_messages(&session_pk).await.unwrap();
+        let tc = msgs
+            .iter()
+            .find(|m| m.block_type == "tool_call")
+            .expect("tool_call row");
+        assert_eq!(tc.payload["name"], "Bash");
+        assert_eq!(tc.payload["output"], "output text");
+        assert_eq!(tc.tool_kind.as_deref(), Some("execute"));
+    }
+
+    #[tokio::test]
+    async fn user_turn_is_broadcast_live() {
+        use crate::domain::CoreEvent;
+
+        let (_store, _session_pk, events) =
+            crate::harness::acp::testkit::run_via_harness_trait_collecting_events("hello there")
+                .await;
+
+        let user = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::Message {
+                    role,
+                    block_type,
+                    payload,
+                    seq,
+                    ..
+                } if role == "user" && block_type == "text" => Some((payload.clone(), *seq)),
+                _ => None,
+            })
+            .expect("expected a live user-turn Message event");
+        assert_eq!(user.0["text"], "hello there");
+        assert!(user.1 >= 1, "user turn must carry a real DB seq");
     }
 }

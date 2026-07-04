@@ -50,7 +50,10 @@ fn default_shell() -> (String, Vec<String>) {
             ("powershell".into(), vec!["-NoLogo".into()])
         }
     } else {
-        (std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into()), vec![])
+        (
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into()),
+            vec![],
+        )
     }
 }
 
@@ -65,9 +68,13 @@ pub async fn term_open(
     cols: u16,
     rows: u16,
 ) -> R<String> {
-    let session = cp.store().get_session(&session_pk).await?.ok_or_else(|| CmdError {
-        message: format!("unknown session: {session_pk}"),
-    })?;
+    let session = cp
+        .store()
+        .get_session(&session_pk)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown session: {session_pk}"),
+        })?;
     let cwd = match &session.worktree_path {
         Some(wt) if std::path::Path::new(wt).exists() => wt.clone(),
         _ => {
@@ -136,7 +143,10 @@ pub async fn term_open(
                 }
             }
         }
-        let _ = TermExitMsg { id: id_reader.clone() }.emit(&app_reader);
+        let _ = TermExitMsg {
+            id: id_reader.clone(),
+        }
+        .emit(&app_reader);
     });
 
     // Reaper thread: don't leave zombie shells behind.
@@ -154,9 +164,12 @@ pub fn term_input(terms: State<'_, Arc<UiTerms>>, id: String, data: String) -> R
     let handle = map.get_mut(&id).ok_or_else(|| CmdError {
         message: "terminal closed".into(),
     })?;
-    handle.writer.write_all(data.as_bytes()).map_err(|e| CmdError {
-        message: format!("write failed: {e}"),
-    })?;
+    handle
+        .writer
+        .write_all(data.as_bytes())
+        .map_err(|e| CmdError {
+            message: format!("write failed: {e}"),
+        })?;
     let _ = handle.writer.flush();
     Ok(())
 }

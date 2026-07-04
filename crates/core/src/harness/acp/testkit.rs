@@ -69,7 +69,10 @@ impl MockAgent {
             .mcp_capabilities(McpCapabilities::new().http(self.mcp_http));
 
         InitializeResponse::new(req.protocol_version)
-            .agent_info(Implementation::new("ryuzi-mock-agent", env!("CARGO_PKG_VERSION")))
+            .agent_info(Implementation::new(
+                "ryuzi-mock-agent",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .agent_capabilities(capabilities)
     }
 
@@ -194,6 +197,7 @@ impl HandleDispatchFrom<Client> for MockAgent {
                             session_id.clone(),
                             SessionUpdate::ToolCall(
                                 ToolCall::new("tc-1", "Bash")
+                                    .kind(agent_client_protocol::schema::v1::ToolKind::Execute)
                                     .status(ToolCallStatus::Pending),
                             ),
                         ));
@@ -396,11 +400,11 @@ pub async fn drive_lifecycle(
     mode: &str,
     prompt_text: &str,
 ) -> Result<LifecycleOutcome, agent_client_protocol::Error> {
-    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
         ClientCapabilities, InitializeRequest, RequestPermissionOutcome, RequestPermissionRequest,
         RequestPermissionResponse, SessionNotification,
     };
+    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::Client;
 
     let mode = mode.to_string();
@@ -480,8 +484,8 @@ pub async fn drive_lifecycle(
 pub async fn drive_load(resume_session_id: &str) -> (std::sync::Arc<crate::store::Store>, String) {
     use std::sync::Arc;
 
-    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{ClientCapabilities, InitializeResponse};
+    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::Client;
     use tokio::sync::broadcast;
 
@@ -567,9 +571,26 @@ pub async fn drive_load(resume_session_id: &str) -> (std::sync::Arc<crate::store
 /// The test runner spawns a tokio task (not an OS thread + fresh runtime) so
 /// the mock duplex's I/O stays on the test runtime, and drives the shared
 /// `run_client_loop` over the injected transport.
-pub async fn run_via_harness_trait(
+/// Like [`run_via_harness_trait_collecting_events`], discarding the events.
+pub async fn run_via_harness_trait(prompt: &str) -> (std::sync::Arc<crate::store::Store>, String) {
+    let (store, session_pk, _events) = run_via_harness_trait_collecting_events(prompt).await;
+    (store, session_pk)
+}
+
+/// Build an [`AcpHarness`](crate::harness::acp::AcpHarness) wired to the
+/// in-process mock agent, start a session through the Spec 2 `Harness` trait,
+/// send `prompt`, and return `(store, session_pk, broadcast events)`.
+///
+/// The subscriber is created BEFORE `start_session`, so every `CoreEvent`
+/// emitted during the turn (user turn, streamed rows, tool updates) is
+/// captured and drained after the turn completes.
+pub async fn run_via_harness_trait_collecting_events(
     prompt: &str,
-) -> (std::sync::Arc<crate::store::Store>, String) {
+) -> (
+    std::sync::Arc<crate::store::Store>,
+    String,
+    Vec<crate::domain::CoreEvent>,
+) {
     use std::sync::Arc;
 
     use tokio::sync::broadcast;
@@ -577,24 +598,19 @@ pub async fn run_via_harness_trait(
     use crate::approval::ApprovalHub;
     use crate::domain::{CoreEvent, PermMode};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
-    use crate::harness::{Harness, SessionCtx};
+    use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store: Arc<Store> = Arc::new(Store::open(tmp.path()).await.unwrap());
     let (events_tx, _events_rx) = broadcast::channel::<CoreEvent>(64);
+    let mut events_rx = events_tx.subscribe();
 
-    // Test runner factory: for each session, produce a runner that drives the
-    // shared client loop over a fresh mock duplex on a tokio task.
     let harness = AcpHarness::with_runner_factory(
         AcpAdapterDescriptor::default(),
-        |_descriptor: &AcpAdapterDescriptor| {
-            crate::harness::acp::mock_runner()
-        },
+        |_descriptor: &AcpAdapterDescriptor| crate::harness::acp::mock_runner(),
     );
 
-    // Use a stable ryuzi session_pk; messages will be keyed under this value
-    // (not under the ACP-assigned session id).
     let session_pk = "harness-test-session-pk".to_string();
 
     let ctx = SessionCtx {
@@ -616,7 +632,10 @@ pub async fn run_via_harness_trait(
         .expect("start_session via Harness trait failed");
 
     session
-        .send_prompt(prompt.to_string())
+        .send_prompt(TurnPrompt {
+            agent: prompt.to_string(),
+            display: prompt.to_string(),
+        })
         .await
         .expect("send_prompt failed");
 
@@ -624,8 +643,14 @@ pub async fn run_via_harness_trait(
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     session.end().await.expect("end failed");
+
+    let mut events = Vec::new();
+    while let Ok(ev) = events_rx.try_recv() {
+        events.push(ev);
+    }
+
     drop(tmp);
-    (store, session_pk)
+    (store, session_pk, events)
 }
 
 // ---------------------------------------------------------------------------
@@ -645,8 +670,16 @@ pub fn perm_request_with_kinds() -> RequestPermissionRequest {
         ToolCallUpdateFields::new().title("Bash".to_string()),
     );
     let options = vec![
-        PermissionOption::new(PERM_ALLOW_ONCE_ID, "Allow once", PermissionOptionKind::AllowOnce),
-        PermissionOption::new(PERM_REJECT_ONCE_ID, "Reject once", PermissionOptionKind::RejectOnce),
+        PermissionOption::new(
+            PERM_ALLOW_ONCE_ID,
+            "Allow once",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            PERM_REJECT_ONCE_ID,
+            "Reject once",
+            PermissionOptionKind::RejectOnce,
+        ),
     ];
     RequestPermissionRequest::new(session_id, tool_call, options)
 }
@@ -806,13 +839,16 @@ impl HandleDispatchFrom<Client> for PermMockAgent {
 /// `AllowOnce | AllowAlways` → `true` (allow), everything else → `false` (deny).
 pub async fn run_prompt_with_permission(
     decision: crate::domain::ApprovalDecision,
-) -> (std::sync::Arc<crate::approval::ApprovalHub>, PermissionResult) {
+) -> (
+    std::sync::Arc<crate::approval::ApprovalHub>,
+    PermissionResult,
+) {
     use std::sync::Arc;
 
-    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
         ClientCapabilities, InitializeRequest, InitializeResponse,
     };
+    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::Client;
 
     use crate::approval::ApprovalHub;
@@ -820,8 +856,7 @@ pub async fn run_prompt_with_permission(
 
     let hub: Arc<ApprovalHub> = Arc::new(ApprovalHub::new());
     let (events_tx, _rx) = tokio::sync::broadcast::channel::<CoreEvent>(64);
-    let allowed_slot: Arc<tokio::sync::Mutex<bool>> =
-        Arc::new(tokio::sync::Mutex::new(false));
+    let allowed_slot: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
 
     let perm_agent = PermMockAgent {
         allowed_slot: allowed_slot.clone(),
@@ -849,10 +884,8 @@ pub async fn run_prompt_with_permission(
             .await;
     });
 
-    let transport = agent_client_protocol::ByteStreams::new(
-        client_write.compat_write(),
-        client_read.compat(),
-    );
+    let transport =
+        agent_client_protocol::ByteStreams::new(client_write.compat_write(), client_read.compat());
 
     // The binary allow/deny value derived from the decision.
     let allow = matches!(
@@ -899,7 +932,8 @@ pub async fn run_prompt_with_permission(
                     } else {
                         crate::domain::ApprovalDecision::RejectOnce
                     };
-                    let response = crate::harness::acp::permission::map_response(&request, decision);
+                    let response =
+                        crate::harness::acp::permission::map_response(&request, decision);
                     responder.respond(response)
                 }
             },
@@ -1107,7 +1141,7 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
     use crate::approval::ApprovalHub;
     use crate::domain::{CoreEvent, PermMode};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
-    use crate::harness::{Harness, SessionCtx};
+    use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
 
     let tmp_store = tempfile::NamedTempFile::new().unwrap();
@@ -1138,7 +1172,9 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
             Box::new(move |args: crate::harness::acp::ClientLoopArgs| {
                 let (client_read, server_write) = tokio::io::duplex(64 * 1024);
                 let (server_read, client_write) = tokio::io::duplex(64 * 1024);
-                use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+                use tokio_util::compat::{
+                    TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _,
+                };
 
                 tokio::spawn(async move {
                     let _ = SacpAgent
@@ -1184,7 +1220,10 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
         .expect("run_prompt_with_fs_calls: start_session failed");
 
     session
-        .send_prompt("write and read".to_string())
+        .send_prompt(TurnPrompt {
+            agent: "write and read".to_string(),
+            display: "write and read".to_string(),
+        })
         .await
         .expect("run_prompt_with_fs_calls: send_prompt failed");
 
@@ -1375,7 +1414,7 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
     use crate::approval::ApprovalHub;
     use crate::domain::{CoreEvent, PermMode};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
-    use crate::harness::{Harness, SessionCtx};
+    use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
 
     let tmp_store = tempfile::NamedTempFile::new().unwrap();
@@ -1404,7 +1443,9 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
             Box::new(move |args: crate::harness::acp::ClientLoopArgs| {
                 let (client_read, server_write) = tokio::io::duplex(64 * 1024);
                 let (server_read, client_write) = tokio::io::duplex(64 * 1024);
-                use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+                use tokio_util::compat::{
+                    TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _,
+                };
 
                 tokio::spawn(async move {
                     let _ = SacpAgent
@@ -1450,7 +1491,10 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
         .expect("run_prompt_with_terminal_calls: start_session failed");
 
     session
-        .send_prompt("run terminal".to_string())
+        .send_prompt(TurnPrompt {
+            agent: "run terminal".to_string(),
+            display: "run terminal".to_string(),
+        })
         .await
         .expect("run_prompt_with_terminal_calls: send_prompt failed");
 
@@ -1483,6 +1527,13 @@ pub struct PermBridgeOutcome {
     /// `true` when the `ApprovalHub` was never registered during the request
     /// (i.e. the bridge short-circuited before hitting the hub).
     pub hub_was_never_registered: bool,
+    /// The ryuzi `session_pk` this test wired into `SessionCtx` (all rows and
+    /// events for the session should be keyed under this value).
+    pub session_pk: String,
+    /// The `session_pk` captured off the broadcast `CoreEvent::ApprovalRequested`
+    /// (`None` if the request never reached the hub-prompt path, e.g. AutoAllow).
+    /// Should equal `session_pk` above, NOT the ACP-assigned session id.
+    pub captured_session_pk: Option<String>,
     /// The store, for further assertions.
     #[allow(dead_code)]
     pub store: std::sync::Arc<crate::store::Store>,
@@ -1507,7 +1558,7 @@ pub async fn run_perm_mock_via_harness(
     use crate::approval::ApprovalHub;
     use crate::domain::{CoreEvent, PermMode, Project, Session, SessionStatus};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
-    use crate::harness::{Harness, SessionCtx};
+    use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
 
     let tmp_store = tempfile::NamedTempFile::new().unwrap();
@@ -1537,22 +1588,58 @@ pub async fn run_perm_mock_via_harness(
         branch: None,
         title: None,
         status: SessionStatus::Running,
+        started_by: None,
         created_at: None,
         last_active: None,
+        resume_attempts: 0,
     };
     store.insert_session(session).await.unwrap();
 
     // Pre-set a tool policy if requested.
     if let Some((tool, decision)) = tool_policy {
-        store.set_tool_policy(project_id, tool, decision).await.unwrap();
+        store
+            .set_tool_policy(project_id, tool, decision)
+            .await
+            .unwrap();
     }
 
     // Track whether the hub was ever registered.
     let hub: Arc<ApprovalHub> = Arc::new(ApprovalHub::new());
     let hub_registrations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let allowed_slot: Arc<tokio::sync::Mutex<bool>> =
-        Arc::new(tokio::sync::Mutex::new(false));
+    // Capture the session_pk carried by a broadcast CoreEvent::ApprovalRequested
+    // (if the request reaches the hub-prompt path) and drive the hub
+    // resolution — standing in for a real consumer (e.g. the CLI) that
+    // watches the event stream and resolves the approval once the user
+    // answers. Subscribing here (before `events_tx` is moved into `ctx`)
+    // ensures we see the event even though it fires inside `send_prompt`.
+    let captured_session_pk: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    {
+        let mut approval_rx = events_tx.subscribe();
+        let captured = captured_session_pk.clone();
+        let hub_for_resolver = hub.clone();
+        tokio::spawn(async move {
+            if let Ok(CoreEvent::ApprovalRequested {
+                session_pk,
+                request_id,
+                ..
+            }) = approval_rx.recv().await
+            {
+                *captured.lock().await = Some(session_pk);
+                // The bridge calls hub.register(..) right after emitting the
+                // event; retry briefly so we don't race ahead of it.
+                for _ in 0..200 {
+                    if hub_for_resolver.resolve(&request_id, true) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        });
+    }
+
+    let allowed_slot: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
     let allowed_slot_for_agent = allowed_slot.clone();
 
     let perm_agent = PermMockAgent {
@@ -1569,7 +1656,9 @@ pub async fn run_perm_mock_via_harness(
             Box::new(move |args: crate::harness::acp::ClientLoopArgs| {
                 let (client_read, server_write) = tokio::io::duplex(64 * 1024);
                 let (server_read, client_write) = tokio::io::duplex(64 * 1024);
-                use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+                use tokio_util::compat::{
+                    TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _,
+                };
 
                 tokio::spawn(async move {
                     let _ = SacpAgent
@@ -1622,7 +1711,10 @@ pub async fn run_perm_mock_via_harness(
         .expect("run_perm_mock_via_harness: start_session failed");
 
     session
-        .send_prompt("trigger permission".to_string())
+        .send_prompt(TurnPrompt {
+            agent: "trigger permission".to_string(),
+            display: "trigger permission".to_string(),
+        })
         .await
         .expect("run_perm_mock_via_harness: send_prompt failed");
 
@@ -1631,10 +1723,13 @@ pub async fn run_perm_mock_via_harness(
     let allowed = *allowed_slot.lock().await;
     // The hub has no pending registrations if nothing called hub.register().
     let hub_was_never_registered = !hub.has_pending();
+    let captured_session_pk = captured_session_pk.lock().await.clone();
 
     PermBridgeOutcome {
         allowed,
         hub_was_never_registered,
+        session_pk,
+        captured_session_pk,
         store,
         _tmp_store: tmp_store,
     }

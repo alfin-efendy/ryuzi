@@ -124,8 +124,16 @@ async fn assemble(cp: &ControlPlane, probe: bool) -> anyhow::Result<Vec<GatewayI
     let is_windows = cfg!(windows);
     out.push(GatewayInfo {
         id: "local".into(),
-        name: if is_windows { "This PC".into() } else { "This Mac".into() },
-        badge: if is_windows { "WIN".into() } else { "MAC".into() },
+        name: if is_windows {
+            "This PC".into()
+        } else {
+            "This Mac".into()
+        },
+        badge: if is_windows {
+            "WIN".into()
+        } else {
+            "MAC".into()
+        },
         kind: "local".into(),
         detail: format!("{} · {}", snap.os_label, snap.host_name),
         meta_line: format!(
@@ -190,8 +198,17 @@ async fn assemble(cp: &ControlPlane, probe: bool) -> anyhow::Result<Vec<GatewayI
             kind: "wsl".into(),
             detail: format!("{} · localhost", distro.name),
             meta_line: format!("{} · WSL 2 · shares local hardware", distro.name),
-            status: if distro.running { "connected" } else { "offline" }.into(),
-            latency: if distro.running { Some("0ms".into()) } else { None },
+            status: if distro.running {
+                "connected"
+            } else {
+                "offline"
+            }
+            .into(),
+            latency: if distro.running {
+                Some("0ms".into())
+            } else {
+                None
+            },
             daemon_version: format!("v{app_version}"),
             uptime: None,
             last_seen_ms: last_seen(cp, &id).await,
@@ -214,10 +231,22 @@ async fn assemble(cp: &ControlPlane, probe: bool) -> anyhow::Result<Vec<GatewayI
             match l {
                 Some(ms) => {
                     set_last_seen(cp, &row.id).await;
-                    let _ = gateways::add_event(cp.store(), &row.id, "info", &format!("probe ok ({ms}ms)")).await;
+                    let _ = gateways::add_event(
+                        cp.store(),
+                        &row.id,
+                        "info",
+                        &format!("probe ok ({ms}ms)"),
+                    )
+                    .await;
                 }
                 None => {
-                    let _ = gateways::add_event(cp.store(), &row.id, "error", "probe failed — host unreachable").await;
+                    let _ = gateways::add_event(
+                        cp.store(),
+                        &row.id,
+                        "error",
+                        "probe failed — host unreachable",
+                    )
+                    .await;
                 }
             }
             l
@@ -273,7 +302,13 @@ pub async fn add_gateway(
     port: u16,
     username: String,
 ) -> R<Vec<GatewayInfo>> {
-    let id = format!("ssh-{}", ryuzi_core::paths::new_id().chars().take(8).collect::<String>());
+    let id = format!(
+        "ssh-{}",
+        ryuzi_core::paths::new_id()
+            .chars()
+            .take(8)
+            .collect::<String>()
+    );
     gateways::upsert_row(
         cp.store(),
         GatewayRow {

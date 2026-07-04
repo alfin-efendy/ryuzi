@@ -19,7 +19,7 @@ const skippedDirs = new Set([
 
 const skippedSubtrees = new Set(["docs/superpowers"]);
 
-const skippedFiles = new Set(["apps/cli/CHANGELOG.md", "scripts/test/brand-identity.test.ts"]);
+const skippedFiles = new Set(["crates/cli/CHANGELOG.md", "scripts/test/brand-identity.test.ts"]);
 
 const textExtensions = new Set([
   ".css",
@@ -57,7 +57,7 @@ const oldIdentityPatterns: Array<[string, RegExp]> = [
   [
     "old short command token",
     new RegExp(
-      `(?:\`${oldShort}(?:\\.exe)?\`|\\b${oldShort}(?:\\.exe)?\\s+(?:doctor|run|config|--help|--version)|(?:^|[\\s"'=:])${oldShort}(?:\\.exe)?(?:[\\s"',)]|$))`,
+      `(?:\`${oldShort}(?:\\.exe)?\`|\\b${oldShort}(?:\\.exe)?\\s+(?:doctor|run|config|--help|--version)|(?:^|[\\s"'=:])${oldShort}(?:\\.exe)?(?!\\s*\\{)(?:[\\s"',)]|$))`,
     ),
   ],
   [

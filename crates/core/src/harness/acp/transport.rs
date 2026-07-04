@@ -22,6 +22,11 @@ use super::AcpAdapterDescriptor;
 pub struct PermissionContext {
     pub hub: Arc<crate::approval::ApprovalHub>,
     pub events: tokio::sync::broadcast::Sender<CoreEvent>,
+    /// Ryuzi's own DB primary key for this session. `CoreEvent::ApprovalRequested`
+    /// is keyed under this value, NOT the ACP-assigned session id, so that
+    /// consumers who route by ryuzi pk (the CLI, the daemon fan-out) can match
+    /// the event back to the session that raised it.
+    pub session_pk: String,
     /// The ryuzi project id for this session (used to look up per-project policies).
     pub project_id: String,
     /// The effective permission mode for this session.
@@ -55,7 +60,6 @@ pub async fn spawn_adapter(
 
     cmd.spawn()
 }
-
 
 #[cfg(test)]
 mod tests {

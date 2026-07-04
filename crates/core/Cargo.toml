@@ -19,13 +19,19 @@ specta = { version = "2.0.0-rc.22", features = ["derive", "serde_json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 deadpool-sqlite = { version = "0.8", features = ["rt_tokio_1"] }
 rusqlite_migration = "1.2"
-git2 = "0.20"
+# Local worktree/init/commit only — clones go through the git CLI
+# (provision_project), so the https/ssh default features (openssl-sys) are
+# dead weight and the main obstacle to zigbuild cross-compilation.
+git2 = { version = "0.20", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 anyhow = "1"
 async-trait = "0.1"
 tracing = "0.1"
 portable-pty = "0.8"
+ureq = "2"
+sha2 = "0.10"
+url = "2"
 sysinfo = "0.33"
 croner = "2"
 chrono = "0.4"
@@ -34,6 +40,18 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 bytes = "1"
 tokio-stream = "0.1"
 toml_edit = "0.22"
+opentelemetry = { version = "0.32.0", features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.32.1", features = ["trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.32.0", features = ["trace", "metrics", "http-proto", "reqwest-blocking-client"], optional = true }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "http", "builder", "collector"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "3"
+
+[features]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+discord = ["dep:serenity"]
