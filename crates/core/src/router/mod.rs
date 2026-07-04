@@ -3,3 +3,4 @@
 pub mod connections;
 pub mod keys;
 pub mod registry;
+pub mod translate;
