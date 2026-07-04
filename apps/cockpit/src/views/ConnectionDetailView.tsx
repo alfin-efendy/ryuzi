@@ -2,10 +2,12 @@ import { useEffect, useState } from "react";
 import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
+import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
-import { Card, CardHeader, CardRow, CardTitle } from "@/components/common/Card";
+import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { Chip } from "@/components/common/bits";
+import { UsageChart } from "@/components/common/UsageChart";
 
 const field = "h-9 rounded-md border border-input bg-background px-3 font-sans text-[12.5px] text-foreground";
 const modelsField = "min-h-[96px] w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs text-foreground";
@@ -13,6 +15,8 @@ const modelsField = "min-h-[96px] w-full resize-y rounded-md border border-input
 export function ConnectionDetailView({ id }: { id: string }) {
   const nav = useNav();
   const { connections, loaded, hydrate, update, remove, test } = useConnections();
+  const usage = useUsage((s) => s.byConnection[id]);
+  const loadUsage = useUsage((s) => s.loadConnection);
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
@@ -24,6 +28,10 @@ export function ConnectionDetailView({ id }: { id: string }) {
   useEffect(() => {
     if (!loaded) void hydrate();
   }, [loaded, hydrate]);
+
+  useEffect(() => {
+    void loadUsage(id);
+  }, [id, loadUsage]);
 
   const conn = connections.find((c) => c.id === id);
 
@@ -110,6 +118,21 @@ export function ConnectionDetailView({ id }: { id: string }) {
         </DetailHeader>
 
         <Card>
+          <CardHeader>
+            <CardTitle>Usage</CardTitle>
+            <CardHint>Last 14 days of traffic through this connection</CardHint>
+          </CardHeader>
+          <div className="px-[18px] py-3">
+            <UsageChart points={usage?.days ?? []} />
+            {usage && (
+              <div className="mt-2 text-xs text-muted-foreground">
+                Today: {usage.todayRequests} req · {(usage.todayInputTokens + usage.todayOutputTokens).toLocaleString()} tokens
+              </div>
+            )}
+          </div>
+        </Card>
+
+        <Card className="mt-3">
           <CardHeader>
             <CardTitle>Identity</CardTitle>
           </CardHeader>

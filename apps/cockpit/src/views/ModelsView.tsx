@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, ChevronUp, Copy, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { useEndpoint } from "@/store-endpoint";
 import { useConnections } from "@/store-connections";
+import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
 import type { ConnectionInfo } from "@/bindings";
 import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
@@ -21,6 +22,8 @@ const moveBtn =
 
 function EndpointTab() {
   const { status, keys, start, stop, setConfig, createKey, revokeKey } = useEndpoint();
+  const endpointUsage = useUsage((s) => s.endpoint);
+  const loadEndpointUsage = useUsage((s) => s.loadEndpoint);
   const [port, setPort] = useState("");
   const [autostart, setAutostart] = useState(false);
   const [portInit, setPortInit] = useState(false);
@@ -38,6 +41,10 @@ function EndpointTab() {
       setPortInit(true);
     }
   }, [status, portInit]);
+
+  useEffect(() => {
+    void loadEndpointUsage();
+  }, [loadEndpointUsage]);
 
   const toggle = async () => {
     setBusy(true);
@@ -136,7 +143,10 @@ function EndpointTab() {
       <Card>
         <CardHeader>
           <CardTitle>API keys</CardTitle>
-          <CardHint>Required by external tools calling the local endpoint</CardHint>
+          <CardHint>
+            Required by external tools calling the local endpoint
+            {endpointUsage ? ` · ${endpointUsage.days.reduce((n, d) => n + d.requests, 0)} requests (14d)` : ""}
+          </CardHint>
         </CardHeader>
         {keys.map((k) => (
           <div key={k.id} className="flex items-center gap-3 border-b border-border px-[18px] py-3 last:border-b-0">
