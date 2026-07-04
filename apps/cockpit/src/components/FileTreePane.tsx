@@ -3,11 +3,16 @@ import { useCallback, useEffect, useState } from "react";
 import { commands } from "@/bindings";
 import { useUi } from "@/store-ui";
 
-type Node = { rel: string; name: string; dir: boolean; depth: number; open?: boolean; children?: Node[] };
+export type Node = { rel: string; name: string; dir: boolean; depth: number; open?: boolean; children?: Node[] };
+
+/** Rel paths of every expanded directory, for restoring after a reload. */
+export function collectOpenDirs(nodes: Node[]): string[] {
+  return nodes.flatMap((n) => (n.dir && n.open ? [n.rel, ...(n.children ? collectOpenDirs(n.children) : [])] : []));
+}
 
 // Real lazy file tree over the session worktree; clicking a file opens it in
 // the dock's file viewer through the existing read_file path.
-export function FileTreePane({ sessionPk, filter }: { sessionPk: string; filter: string }) {
+export function FileTreePane({ sessionPk, filter, refreshKey }: { sessionPk: string; filter: string; refreshKey: number }) {
   const openFile = useUi((s) => s.openFile);
   const [root, setRoot] = useState<Node[]>([]);
   const [workdir, setWorkdir] = useState<string | null>(null);
@@ -32,6 +37,22 @@ export function FileTreePane({ sessionPk, filter }: { sessionPk: string; filter:
       if (res.status === "ok") setWorkdir(res.data);
     });
   }, [sessionPk, load]);
+
+  const reload = useCallback(async () => {
+    const open = new Set(collectOpenDirs(root));
+    const rebuild = async (rel: string, depth: number): Promise<Node[]> => {
+      const nodes = await load(rel, depth);
+      return Promise.all(
+        nodes.map(async (n) => (n.dir && open.has(n.rel) ? { ...n, open: true, children: await rebuild(n.rel, depth + 1) } : n)),
+      );
+    };
+    setRoot(await rebuild("", 0));
+  }, [root, load]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refresh is edge-triggered off refreshKey only
+  useEffect(() => {
+    if (refreshKey > 0) void reload();
+  }, [refreshKey]);
 
   const toggleDir = async (node: Node) => {
     const update = (nodes: Node[]): Node[] =>

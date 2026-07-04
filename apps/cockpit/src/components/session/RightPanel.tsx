@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { ChevronRight, FileText, Maximize2, Minimize2, Search, SquareCheck, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronRight, FileText, Maximize2, Minimize2, RotateCw, Search, SquareCheck, X } from "lucide-react";
 import { useUi } from "@/store-ui";
 import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav";
 import { commands } from "@/bindings";
@@ -22,8 +22,17 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
   const [reviewFiles, setReviewFiles] = useState<ReviewFile[]>([]);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewError, setReviewError] = useState<string | null>(null);
+  const [treeRefresh, setTreeRefresh] = useState(0);
 
   const activeFileTab = ui.tabs.find((t) => t.id === ui.activeTabId) ?? ui.tabs[0];
+
+  // Auto-refresh the file tree when a running turn ends — the agent may have
+  // created or removed files while it was running.
+  const prevRunning = useRef(running);
+  useEffect(() => {
+    if (prevRunning.current && !running) setTreeRefresh((n) => n + 1);
+    prevRunning.current = running;
+  }, [running]);
 
   // Real diff of the session worktree; refreshed when the Review tab opens
   // and whenever the running turn finishes (the agent may have edited files).
@@ -201,6 +210,32 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
               </form>
             )}
           </div>
+          {ui.tabs.length > 1 && (
+            <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border px-2 py-1.5">
+              {ui.tabs.map((t) => {
+                const active = t.id === (activeFileTab?.id ?? "");
+                return (
+                  <div
+                    key={t.id}
+                    className={`flex h-7 shrink-0 items-center gap-1 rounded-md border pl-2.5 pr-1 font-sans text-[12px] ${
+                      active ? "border-border bg-background text-foreground" : "border-transparent text-muted-foreground hover:bg-accent"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => ui.setActiveTab(t.id)}
+                      className="cursor-pointer border-none bg-transparent font-sans text-inherit"
+                    >
+                      {t.title}
+                    </button>
+                    <button type="button" title={`Close ${t.title}`} onClick={() => ui.closeTab(t.id)} className={`${toolBtn} h-5 w-5`}>
+                      <X aria-hidden size={10} strokeWidth={2} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
           <div className="flex min-h-0 flex-1">
             <div className="flex min-w-0 flex-1 flex-col overflow-auto text-xs">
               {activeFileTab ? (
@@ -212,16 +247,26 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
               )}
             </div>
             <div className="flex w-[200px] shrink-0 flex-col gap-2 overflow-y-auto border-l border-border p-2.5">
-              <div className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs text-muted-foreground [background:color-mix(in_oklab,var(--background)_45%,transparent)]">
-                <Search aria-hidden size={12} strokeWidth={2} />
-                <input
-                  value={treeFilter}
-                  onChange={(e) => setTreeFilter(e.target.value)}
-                  placeholder="Filter files"
-                  className="min-w-0 flex-1 border-none bg-transparent font-sans text-xs text-foreground outline-none"
-                />
+              <div className="flex items-center gap-1.5">
+                <div className="flex h-7 min-w-0 flex-1 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs text-muted-foreground [background:color-mix(in_oklab,var(--background)_45%,transparent)]">
+                  <Search aria-hidden size={12} strokeWidth={2} />
+                  <input
+                    value={treeFilter}
+                    onChange={(e) => setTreeFilter(e.target.value)}
+                    placeholder="Filter files"
+                    className="min-w-0 flex-1 border-none bg-transparent font-sans text-xs text-foreground outline-none"
+                  />
+                </div>
+                <button
+                  type="button"
+                  title="Refresh file tree"
+                  onClick={() => setTreeRefresh((n) => n + 1)}
+                  className={`${toolBtn} h-7 w-7 shrink-0`}
+                >
+                  <RotateCw aria-hidden size={12} strokeWidth={2} />
+                </button>
               </div>
-              <FileTreePane sessionPk={sessionPk} filter={treeFilter} />
+              <FileTreePane sessionPk={sessionPk} filter={treeFilter} refreshKey={treeRefresh} />
             </div>
           </div>
         </>
