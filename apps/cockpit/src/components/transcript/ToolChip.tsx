@@ -40,19 +40,30 @@ function ToolChip({ item }: { item: Extract<ActivityItem, { type: "tool" }> }) {
   const [open, setOpen] = useState(false);
   const Icon = (item.kind && kindIcon[item.kind]) || Wrench;
   const expandable = !!item.output;
+  const chipClass = "acrylic-panel flex items-center gap-2 rounded-md border border-border px-3 py-[7px] font-mono text-xs text-foreground";
+
+  const chipContent = (
+    <>
+      <Icon aria-hidden size={12} strokeWidth={2} className="text-muted-foreground" />
+      {item.name}
+      <StatusMark status={item.status} />
+    </>
+  );
+
   return (
     <div className="flex max-w-fit flex-col">
-      <button
-        type="button"
-        onClick={() => expandable && setOpen((v) => !v)}
-        className={`acrylic-panel flex items-center gap-2 rounded-md border border-border px-3 py-[7px] font-mono text-xs text-foreground ${
-          expandable ? "cursor-pointer hover:bg-accent" : "cursor-default"
-        }`}
-      >
-        <Icon aria-hidden size={12} strokeWidth={2} className="text-muted-foreground" />
-        {item.name}
-        <StatusMark status={item.status} />
-      </button>
+      {expandable ? (
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+          className={`${chipClass} cursor-pointer hover:bg-accent`}
+        >
+          {chipContent}
+        </button>
+      ) : (
+        <div className={chipClass}>{chipContent}</div>
+      )}
       {open && item.output && (
         <pre className="mt-1 max-h-48 max-w-[560px] overflow-auto rounded-md border border-border bg-code p-2.5 font-mono text-[11.5px] leading-[1.6] text-code-foreground">
           {item.output}
@@ -65,7 +76,9 @@ function ToolChip({ item }: { item: Extract<ActivityItem, { type: "tool" }> }) {
 function StatusChip({ text }: { text: string }) {
   return (
     <div className="acrylic-panel flex max-w-fit items-center gap-2 rounded-md border border-border px-3 py-[7px] font-mono text-xs text-muted-foreground">
-      <span style={{ color: "#22C55E" }}>›</span>
+      <span aria-hidden style={{ color: "#22C55E" }}>
+        ›
+      </span>
       <span className="text-foreground">{text}</span>
     </div>
   );

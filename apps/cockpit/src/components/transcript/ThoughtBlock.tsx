@@ -11,6 +11,7 @@ export function ThoughtBlock({ markdown, streaming }: { markdown: string; stream
     <div className="flex max-w-[82%] flex-col">
       <button
         type="button"
+        aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
         className="flex max-w-fit cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-1 py-0.5 text-[11.5px] font-semibold text-muted-foreground hover:text-foreground"
       >
