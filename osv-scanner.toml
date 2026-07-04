@@ -1,0 +1,7 @@
+# Accepted-risk ignore list for osv-scanner (CI job `osv` scans bun.lock and
+# Cargo.lock on PRs touching dependencies, and nightly).
+# Every entry MUST carry a reason. Example:
+#
+# [[IgnoredVulns]]
+# id = "GHSA-xxxx-xxxx-xxxx"
+# reason = "dev-only dependency; upstream fix tracked in <issue link>"
