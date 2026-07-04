@@ -1,4 +1,4 @@
-import { afterEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, UsageSeries } from "@/bindings";
 
@@ -47,11 +47,20 @@ const { useEndpoint } = await import("@/store-endpoint");
 const { useConnections } = await import("@/store-connections");
 const { useUsage } = await import("@/store-usage");
 
-afterEach(() => {
-  cleanup();
+// The zustand singletons are shared across test files in one bun process, so
+// reset BEFORE each test too — an earlier file's hydration (with its own
+// fixtures) would otherwise satisfy the `loaded` guard and skip ours.
+function resetStores() {
   useEndpoint.setState({ status: null, keys: [], loaded: false });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
   useUsage.setState({ byConnection: {}, endpoint: null });
+}
+
+beforeEach(resetStores);
+
+afterEach(() => {
+  cleanup();
+  resetStores();
 });
 
 test("renders the Models heading and endpoint status after hydration", async () => {

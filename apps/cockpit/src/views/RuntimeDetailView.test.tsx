@@ -112,7 +112,16 @@ beforeEach(() => {
   useConnections.setState({ catalog: [], connections: [], loaded: false });
 });
 
-afterEach(cleanup);
+// Reset the shared zustand singletons on the way out too: the view's mount
+// hydrate marks them loaded with THIS file's fixtures, and a later test file
+// in the same bun process would otherwise inherit that state.
+afterEach(() => {
+  cleanup();
+  useRuntimes.setState({ runtimes: [], loaded: false, refreshing: false, updating: {}, updateLog: {} });
+  useApps.setState({ apps: [], loaded: false, probing: null });
+  useEndpoint.setState({ status: null, keys: [], loaded: false });
+  useConnections.setState({ catalog: [], connections: [], loaded: false });
+});
 
 // Render and flush the mount-effect hydrates (config status, endpoint,
 // connections) inside act so their setState calls do not fire mid-assertion.
