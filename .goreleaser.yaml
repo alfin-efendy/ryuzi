@@ -49,21 +49,8 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
-homebrew_casks:
-  - name: ryuzi
-    ids: [default]
-    binaries: [ryuzi]
-    repository:
-      owner: alfin-efendy
-      name: homebrew-ryuzi
-      branch: main
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
-    directory: Casks
-    homepage: "https://github.com/alfin-efendy/ryuzi"
-    description: "Gateway-agnostic control plane for agent harnesses (ryuzi CLI)"
-    commit_author:
-      name: goreleaserbot
-      email: bot@ryuzi.dev
+# homebrew_casks: REMOVED (2026-07-04) — brew distribution dropped by decision;
+# no tap repo/token exists. Install paths are curl|sh, npm, and GitHub Releases.
 
 # scoops: REMOVED — the Rust CLI ships no Windows binaries (unix-only daemon).
 # In-field TS scoop installs stay on 0.3.0; their updater no-ops by design.
