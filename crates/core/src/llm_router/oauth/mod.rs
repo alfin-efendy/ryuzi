@@ -5,6 +5,7 @@
 pub mod callback;
 pub mod flow;
 pub mod pkce;
+pub mod refresh;
 
 /// Tokens returned by a completed OAuth code exchange (or refresh).
 #[derive(Debug, Clone)]
