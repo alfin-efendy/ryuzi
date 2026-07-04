@@ -189,3 +189,36 @@ jobs:
         with:
           header: ci-report
           path: report.md
+
+  # Post-merge safety net: PRs get the sticky comment, main/nightly gets an
+  # issue so macOS-only or nightly-only breakage cannot pass silently.
+  watchdog:
+    needs: [changes, lint, ts, rust, e2e-cockpit, osv]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open/update or close the ci-failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result == "failure") | .key' <<<"$NEEDS_JSON" | paste -sd ", " -)
+          existing=$(gh issue list --repo "$REPO" --label ci-failure --state open --json number --jq '.[0].number // empty')
+          if [ -n "$failed" ]; then
+            title="CI failure on ${EVENT}: ${failed}"
+            body=$(printf 'Failed jobs: %s\nRun: %s' "$failed" "$RUN_URL")
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --repo "$REPO" --title "$title"
+              gh issue comment "$existing" --repo "$REPO" --body "$body"
+            else
+              gh issue create --repo "$REPO" --label ci-failure --title "$title" --body "$body"
+            fi
+          elif [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" --comment "Green again: $RUN_URL"
+          fi
