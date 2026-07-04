@@ -63,7 +63,8 @@ struct Snapshot {
 
 async fn read_snapshots(cp: &ControlPlane) -> std::collections::HashMap<String, Snapshot> {
     let raw = cp.store().get_setting(SNAPSHOT_KEY).await.ok().flatten();
-    raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AgentInfo>> {
@@ -112,7 +113,9 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AgentInfo>> {
             // Zero-config default: detected agents start enabled.
             enabled: cfg.map(|c| c.enabled).unwrap_or(detected),
             model,
-            perm_mode: cfg.map(|c| c.perm_mode.clone()).unwrap_or_else(|| "ask".into()),
+            perm_mode: cfg
+                .map(|c| c.perm_mode.clone())
+                .unwrap_or_else(|| "ask".into()),
             flags: cfg.map(|c| c.flags.clone()).unwrap_or_default(),
             tiers,
             is_default: default_agent == desc.id,

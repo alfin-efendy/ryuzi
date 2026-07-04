@@ -12,7 +12,6 @@ const PLATFORM_PACKAGES = {
   "linux arm64 musl": "ryuzi-linux-arm64-musl",
   "darwin x64": "ryuzi-darwin-x64",
   "darwin arm64": "ryuzi-darwin-arm64",
-  "win32 x64": "ryuzi-win32-x64",
 };
 
 function isMusl() {

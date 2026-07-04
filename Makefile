@@ -34,8 +34,8 @@ doctor: ## Check the required toolchain is present
 dev: ## Run the Cockpit desktop app with HMR (tauri dev)
 	bun run cockpit:dev
 cockpit: dev ## Alias for `dev`
-cli: ## Run the ryuzi CLI — pass flags via ARGS, e.g. make cli ARGS="status"
-	bun run ryuzi $(ARGS)
+cli: ## Run the ryuzi CLI (Rust) — pass flags via ARGS, e.g. make cli ARGS="status"
+	cargo run -p ryuzi-cli -- $(ARGS)
 
 ##@ Build
 .PHONY: build build-web run-release bundles

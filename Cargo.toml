@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/hook", "apps/cockpit/src-tauri"]
+members = ["crates/core", "crates/cli", "apps/cockpit/src-tauri"]
 
 [workspace.package]
 edition = "2021"
@@ -9,4 +9,4 @@ license = "MIT"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }

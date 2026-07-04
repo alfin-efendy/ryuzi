@@ -124,7 +124,12 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<ProviderInfo>> {
             })
             .collect();
 
-        let initial = p.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
+        let initial = p
+            .name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".into());
         out.push(ProviderInfo {
             id: p.id.clone(),
             name: p.name,

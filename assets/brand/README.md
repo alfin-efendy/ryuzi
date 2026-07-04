@@ -46,4 +46,4 @@ Use explicit variants when the logo is placed on a custom background that may no
 <img src="/assets/brand/wordmark-dark.svg" alt="Ryuzi">
 ```
 
-For CLI text surfaces, use the text identity from `apps/cli/src/cli/brand.ts`: the glyph is `r`, and the brand name is `ryuzi`.
+For CLI text surfaces, use the text identity: the glyph is `r`, and the brand name is `ryuzi`.

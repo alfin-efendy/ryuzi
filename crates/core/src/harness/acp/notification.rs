@@ -168,12 +168,7 @@ impl NotificationSink {
     /// On store error → `tracing::warn!` + skip (same as the sink's rule).
     pub async fn record_status(&self, summary: String) {
         let payload = serde_json::json!({ "summary": summary });
-        let msg = NewMessage::block(
-            &self.session_pk,
-            "system",
-            "status",
-            payload.clone(),
-        );
+        let msg = NewMessage::block(&self.session_pk, "system", "status", payload.clone());
         match self.store.insert_message(msg).await {
             Ok(seq) => {
                 let _ = self.events.send(CoreEvent::Message {
@@ -287,9 +282,7 @@ pub async fn handle(notification: SessionNotification, sink: &NotificationSink) 
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "notification: failed to insert tool_call row (id={id}): {e}"
-                    );
+                    tracing::warn!("notification: failed to insert tool_call row (id={id}): {e}");
                 }
             }
         }
@@ -318,9 +311,7 @@ pub async fn handle(notification: SessionNotification, sink: &NotificationSink) 
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "notification: failed to update tool_call row (id={id}): {e}"
-                    );
+                    tracing::warn!("notification: failed to update tool_call row (id={id}): {e}");
                 }
             }
         }
@@ -333,8 +324,7 @@ pub async fn handle(notification: SessionNotification, sink: &NotificationSink) 
 mod tests {
     #[tokio::test]
     async fn streamed_updates_persist_to_messages() {
-        let (store, session_pk) =
-            crate::harness::acp::testkit::run_prompt_and_collect().await;
+        let (store, session_pk) = crate::harness::acp::testkit::run_prompt_and_collect().await;
         let msgs = store.list_messages(&session_pk).await.unwrap();
 
         // assistant text row

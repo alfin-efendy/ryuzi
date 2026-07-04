@@ -162,6 +162,8 @@ const runningSession = (pk: string) => ({
   status: "running" as const,
   createdAt: null,
   lastActive: null,
+  startedBy: null,
+  resumeAttempts: 0,
 });
 
 test("result event flips the session status back to idle (so the composer leaves Stop mode)", () => {

@@ -9,7 +9,9 @@ pub struct Registry<F: ?Sized> {
 
 impl<F: ?Sized> Registry<F> {
     pub fn new() -> Self {
-        Registry { entries: HashMap::new() }
+        Registry {
+            entries: HashMap::new(),
+        }
     }
 
     /// Register (or replace) a factory under `name`.

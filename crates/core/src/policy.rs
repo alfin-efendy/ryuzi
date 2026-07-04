@@ -60,6 +60,64 @@ pub fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     name.to_string()
 }
 
+/// Whether a clicker may approve a tool. The session starter always may. If
+/// NO approver roles are configured, only the starter may approve
+/// (safe-by-default). Otherwise the clicker must hold one of the approver
+/// roles. Ported from TS `canApprove` (`core/permissions.ts`).
+pub fn can_approve(
+    clicker_role_ids: &[String],
+    approver_role_ids: &[String],
+    is_starter: bool,
+) -> bool {
+    if is_starter {
+        return true;
+    }
+    if approver_role_ids.is_empty() {
+        return false;
+    }
+    clicker_role_ids
+        .iter()
+        .any(|r| approver_role_ids.contains(r))
+}
+
+/// Whether a user holds an admin role. If NO admin roles are configured,
+/// everyone is treated as admin — opposite default from `can_approve`, and
+/// preserves the zero-config single-user UX. Ported from TS `isAdmin`.
+pub fn is_admin(user_role_ids: &[String], admin_role_ids: &[String]) -> bool {
+    if admin_role_ids.is_empty() {
+        return true;
+    }
+    user_role_ids.iter().any(|r| admin_role_ids.contains(r))
+}
+
+/// Clamp a privileged permission mode for non-admins. Only `BypassPermissions`
+/// is gated (it disables all tool approval). Returns the effective mode and
+/// whether it was downgraded, so the caller can warn the user. Ported from TS
+/// `gatePermMode`.
+pub fn gate_perm_mode(requested: PermMode, is_admin_user: bool) -> (PermMode, bool) {
+    if !is_admin_user && requested == PermMode::BypassPermissions {
+        return (PermMode::Default, true);
+    }
+    (requested, false)
+}
+
+/// Split a comma-separated role-id setting into a trimmed, non-empty list.
+/// Identical semantics to [`crate::settings::csv`] — ported from TS
+/// `parseRoleIds`, which itself matches the settings CSV parser.
+pub fn parse_role_ids(raw: Option<&str>) -> Vec<String> {
+    crate::settings::csv(raw)
+}
+
+/// Summarize a tool call for display: `Bash` truncates its command to 80
+/// chars, others fall back to a `file_path`/`path`/`pattern` string input, or
+/// the bare tool name. Ported from TS `summarizeTool`; delegates to
+/// [`tool_summary`] above, which already implements identical behavior (kept
+/// as a distinct name for parity with the TS port surface named in the task
+/// brief).
+pub fn summarize_tool(tool_name: &str, input: &serde_json::Value) -> String {
+    tool_summary(tool_name, input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +198,87 @@ mod tests {
             "Read: /a/b.rs"
         );
         assert_eq!(tool_summary("Weird", &json!({})), "Weird");
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn can_approve_starter_always_wins() {
+        assert!(can_approve(&ids(&[]), &ids(&[]), true));
+    }
+
+    #[test]
+    fn can_approve_empty_approver_list_means_starter_only() {
+        assert!(!can_approve(&ids(&[]), &ids(&[]), false));
+    }
+
+    #[test]
+    fn can_approve_role_intersection() {
+        assert!(can_approve(&ids(&["r1"]), &ids(&["r1"]), false));
+        assert!(!can_approve(&ids(&["r2"]), &ids(&["r1"]), false));
+    }
+
+    #[test]
+    fn is_admin_empty_admin_list_means_everyone_is_admin() {
+        assert!(is_admin(&ids(&[]), &ids(&[])));
+        assert!(is_admin(&ids(&["x"]), &ids(&[])));
+    }
+
+    #[test]
+    fn is_admin_configured_roles_gate_membership() {
+        assert!(is_admin(&ids(&["admin"]), &ids(&["admin"])));
+        assert!(!is_admin(&ids(&["other"]), &ids(&["admin"])));
+        assert!(!is_admin(&ids(&[]), &ids(&["admin"])));
+    }
+
+    #[test]
+    fn gate_perm_mode_clamps_only_bypass_permissions_for_non_admins() {
+        assert_eq!(
+            gate_perm_mode(PermMode::BypassPermissions, false),
+            (PermMode::Default, true)
+        );
+        assert_eq!(
+            gate_perm_mode(PermMode::BypassPermissions, true),
+            (PermMode::BypassPermissions, false)
+        );
+        assert_eq!(
+            gate_perm_mode(PermMode::AcceptEdits, false),
+            (PermMode::AcceptEdits, false)
+        );
+        assert_eq!(
+            gate_perm_mode(PermMode::Default, false),
+            (PermMode::Default, false)
+        );
+    }
+
+    #[test]
+    fn parse_role_ids_splits_trims_and_drops_empties() {
+        assert_eq!(parse_role_ids(Some("a, b ,,c")), vec!["a", "b", "c"]);
+        assert!(parse_role_ids(Some("")).is_empty());
+        assert!(parse_role_ids(None).is_empty());
+    }
+
+    #[test]
+    fn summarize_tool_bash_slices_command_to_80_chars() {
+        let long = "a".repeat(100);
+        assert_eq!(
+            summarize_tool("Bash", &json!({ "command": long })),
+            format!("Bash: {}", "a".repeat(80))
+        );
+    }
+
+    #[test]
+    fn summarize_tool_formats_bash_and_paths_or_bare_name() {
+        assert_eq!(
+            summarize_tool("Bash", &json!({"command": "echo hi"})),
+            "Bash: echo hi"
+        );
+        assert_eq!(
+            summarize_tool("Edit", &json!({"file_path": "src/a.ts"})),
+            "Edit: src/a.ts"
+        );
+        assert_eq!(summarize_tool("Glob", &json!({})), "Glob");
     }
 }

@@ -87,11 +87,18 @@ mod tests {
             .find_branch("harness/abcdef01", git2::BranchType::Local)
             .is_ok());
 
-        remove(repo_dir.path(), "abcdef01", Some("harness/abcdef01"), &wt_path).unwrap();
+        remove(
+            repo_dir.path(),
+            "abcdef01",
+            Some("harness/abcdef01"),
+            &wt_path,
+        )
+        .unwrap();
         assert!(!wt_path.exists());
         // The session branch is engine-owned and must go with the worktree.
         assert!(
-            repo.find_branch("harness/abcdef01", git2::BranchType::Local).is_err(),
+            repo.find_branch("harness/abcdef01", git2::BranchType::Local)
+                .is_err(),
             "session branch must be deleted with its worktree"
         );
     }
@@ -107,6 +114,8 @@ mod tests {
         remove(repo_dir.path(), "abcdef02", None, &wt_path).unwrap();
 
         let repo = git2::Repository::open(repo_dir.path()).unwrap();
-        assert!(repo.find_branch("harness/abcdef02", git2::BranchType::Local).is_ok());
+        assert!(repo
+            .find_branch("harness/abcdef02", git2::BranchType::Local)
+            .is_ok());
     }
 }

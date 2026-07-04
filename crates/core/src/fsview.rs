@@ -9,7 +9,14 @@ pub struct DirEntry {
     pub dir: bool,
 }
 
-const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".sidecar-build", "dist", ".next"];
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    ".sidecar-build",
+    "dist",
+    ".next",
+];
 
 /// Resolve `rel` under `root`, rejecting absolute paths and `..` escapes.
 pub fn jail(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
@@ -17,7 +24,10 @@ pub fn jail(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     if rel_path.is_absolute() {
         anyhow::bail!("absolute paths are not allowed");
     }
-    if rel_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if rel_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         anyhow::bail!("path escapes the workspace");
     }
     Ok(root.join(rel_path))
@@ -36,7 +46,11 @@ pub fn list_dir(root: &Path, rel: &str) -> anyhow::Result<Vec<DirEntry>> {
         }
         out.push(DirEntry { name, dir: is_dir });
     }
-    out.sort_by(|a, b| b.dir.cmp(&a.dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    out.sort_by(|a, b| {
+        b.dir
+            .cmp(&a.dir)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     Ok(out)
 }
 
@@ -67,8 +81,16 @@ pub async fn unmerged_commit_count(workdir: &str, branch: &str) -> anyhow::Resul
     let exclude = format!("--exclude={branch}");
     let out = tokio::process::Command::new("git")
         .args([
-            "-C", workdir, "rev-list", "--count", "HEAD", "--not",
-            &exclude, "--branches", "--tags", "--remotes",
+            "-C",
+            workdir,
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--not",
+            &exclude,
+            "--branches",
+            "--tags",
+            "--remotes",
         ])
         .output()
         .await?;
@@ -78,7 +100,10 @@ pub async fn unmerged_commit_count(workdir: &str, branch: &str) -> anyhow::Resul
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0))
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0))
 }
 
 /// The working tree's diff against HEAD (staged + unstaged), unified format.
@@ -151,7 +176,10 @@ mod tests {
         let tmp = tree();
         let entries = list_dir(tmp.path(), "").unwrap();
         let names: Vec<(String, bool)> = entries.iter().map(|e| (e.name.clone(), e.dir)).collect();
-        assert_eq!(names, vec![("src".to_string(), true), ("README.md".to_string(), false)]);
+        assert_eq!(
+            names,
+            vec![("src".to_string(), true), ("README.md".to_string(), false)]
+        );
 
         let sub = list_dir(tmp.path(), "src").unwrap();
         assert_eq!(sub[0].name, "components");
@@ -181,7 +209,11 @@ mod tests {
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-b", "main"]);
         std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
@@ -191,7 +223,10 @@ mod tests {
         // Clean checkout on a session branch that matches main → nothing at risk.
         git(&["checkout", "-b", "harness/abc123"]);
         assert!(!is_dirty(&dir).await.unwrap());
-        assert_eq!(unmerged_commit_count(&dir, "harness/abc123").await.unwrap(), 0);
+        assert_eq!(
+            unmerged_commit_count(&dir, "harness/abc123").await.unwrap(),
+            0
+        );
 
         // Uncommitted (untracked) work → dirty.
         std::fs::write(tmp.path().join("b.txt"), "b").unwrap();
@@ -201,7 +236,10 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-m", "session work"]);
         assert!(!is_dirty(&dir).await.unwrap());
-        assert_eq!(unmerged_commit_count(&dir, "harness/abc123").await.unwrap(), 1);
+        assert_eq!(
+            unmerged_commit_count(&dir, "harness/abc123").await.unwrap(),
+            1
+        );
     }
 
     #[test]

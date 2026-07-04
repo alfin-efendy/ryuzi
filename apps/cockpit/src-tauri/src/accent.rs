@@ -10,6 +10,10 @@ pub struct AccentChangedMsg {
 }
 
 /// `#rrggbb` (alpha dropped) — the exact form theme.ts's hexLuminance parses.
+///
+/// Only called from the `windows`-gated `read_accent_hex`; kept cross-platform
+/// (and exercised by the test below) so its formatting is verified everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn rgb_to_hex(r: u8, g: u8, b: u8) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
@@ -44,7 +48,9 @@ pub fn spawn_accent_watcher(app: &tauri::AppHandle) {
     use windows::Foundation::TypedEventHandler;
     use windows::UI::ViewManagement::UISettings;
 
-    let Ok(settings) = UISettings::new() else { return };
+    let Ok(settings) = UISettings::new() else {
+        return;
+    };
     let handle = app.clone();
     let handler = TypedEventHandler::new(move |_, _| {
         if let Some(hex) = read_accent_hex() {

@@ -80,8 +80,12 @@ fn server_from(r: &rusqlite::Row) -> rusqlite::Result<McpServerRow> {
 pub async fn list_servers(store: &Store) -> anyhow::Result<Vec<McpServerRow>> {
     store
         .with_conn(|c| {
-            let mut stmt = c.prepare(&format!("SELECT {SERVER_COLS} FROM mcp_servers ORDER BY created_at"))?;
-            let rows = stmt.query_map([], server_from)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SERVER_COLS} FROM mcp_servers ORDER BY created_at"
+            ))?;
+            let rows = stmt
+                .query_map([], server_from)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
         .await
@@ -139,8 +143,12 @@ pub async fn remove_server(store: &Store, id: &str) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute("DELETE FROM mcp_tools WHERE server_id=?1", params![id])?;
-            c.execute("DELETE FROM mcp_agent_access WHERE server_id=?1", params![id])?;
-            c.execute("DELETE FROM mcp_servers WHERE id=?1", params![id]).map(|_| ())
+            c.execute(
+                "DELETE FROM mcp_agent_access WHERE server_id=?1",
+                params![id],
+            )?;
+            c.execute("DELETE FROM mcp_servers WHERE id=?1", params![id])
+                .map(|_| ())
         })
         .await
 }
@@ -167,7 +175,11 @@ pub async fn list_tools(store: &Store, server_id: &str) -> anyhow::Result<Vec<Mc
 }
 
 /// Replace the discovered tool list, preserving perms for tools that survive.
-pub async fn replace_tools(store: &Store, server_id: &str, tools: Vec<(String, String)>) -> anyhow::Result<()> {
+pub async fn replace_tools(
+    store: &Store,
+    server_id: &str,
+    tools: Vec<(String, String)>,
+) -> anyhow::Result<()> {
     let existing = list_tools(store, server_id).await?;
     let server_id = server_id.to_string();
     store
@@ -189,7 +201,12 @@ pub async fn replace_tools(store: &Store, server_id: &str, tools: Vec<(String, S
         .await
 }
 
-pub async fn set_tool_perm(store: &Store, server_id: &str, tool: &str, perm: &str) -> anyhow::Result<()> {
+pub async fn set_tool_perm(
+    store: &Store,
+    server_id: &str,
+    tool: &str,
+    perm: &str,
+) -> anyhow::Result<()> {
     let server_id = server_id.to_string();
     let tool = tool.to_string();
     let perm = perm.to_string();
@@ -220,7 +237,12 @@ pub async fn agent_access(store: &Store, server_id: &str) -> anyhow::Result<Vec<
         .await
 }
 
-pub async fn set_agent_access(store: &Store, server_id: &str, agent_id: &str, allowed: bool) -> anyhow::Result<()> {
+pub async fn set_agent_access(
+    store: &Store,
+    server_id: &str,
+    agent_id: &str,
+    allowed: bool,
+) -> anyhow::Result<()> {
     let server_id = server_id.to_string();
     let agent_id = agent_id.to_string();
     store
@@ -251,7 +273,10 @@ pub async fn agent_allowed(store: &Store, server_id: &str, agent_id: &str) -> an
 
 /// The MCP servers to attach to a new local session for `agent_id`: enabled
 /// scope (global or explicitly including `local`) and agent access allowed.
-pub async fn servers_for_session(store: &Store, agent_id: &str) -> anyhow::Result<Vec<McpServerSpec>> {
+pub async fn servers_for_session(
+    store: &Store,
+    agent_id: &str,
+) -> anyhow::Result<Vec<McpServerSpec>> {
     let mut out = Vec::new();
     for row in list_servers(store).await? {
         let in_scope = row.scope == "global" || row.scope_gateways.iter().any(|g| g == "local");
@@ -290,11 +315,19 @@ pub fn to_acp(spec: &McpServerSpec) -> agent_client_protocol_schema::v1::McpServ
         McpTransport::Stdio { command, args, env } => acp::McpServer::Stdio(
             acp::McpServerStdio::new(spec.name.clone(), command.clone())
                 .args(args.clone())
-                .env(env.iter().map(|(k, v)| acp::EnvVariable::new(k.clone(), v.clone())).collect()),
+                .env(
+                    env.iter()
+                        .map(|(k, v)| acp::EnvVariable::new(k.clone(), v.clone()))
+                        .collect(),
+                ),
         ),
         McpTransport::Http { url, headers } => acp::McpServer::Http(
-            acp::McpServerHttp::new(spec.name.clone(), url.clone())
-                .headers(headers.iter().map(|(k, v)| acp::HttpHeader::new(k.clone(), v.clone())).collect()),
+            acp::McpServerHttp::new(spec.name.clone(), url.clone()).headers(
+                headers
+                    .iter()
+                    .map(|(k, v)| acp::HttpHeader::new(k.clone(), v.clone()))
+                    .collect(),
+            ),
         ),
     }
 }
@@ -360,7 +393,10 @@ pub fn parse_tools_result(v: &serde_json::Value) -> Vec<(String, String)> {
                 .filter_map(|t| {
                     Some((
                         t.get("name")?.as_str()?.to_string(),
-                        t.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+                        t.get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                     ))
                 })
                 .collect()
@@ -370,7 +406,12 @@ pub fn parse_tools_result(v: &serde_json::Value) -> Vec<(String, String)> {
 
 /// Spawn a stdio MCP server, run initialize → tools/list, and tear it down.
 pub async fn probe_stdio(command: &str, args: &[String], env: &[(String, String)]) -> ProbeResult {
-    match tokio::time::timeout(Duration::from_secs(25), probe_stdio_inner(command, args, env)).await {
+    match tokio::time::timeout(
+        Duration::from_secs(25),
+        probe_stdio_inner(command, args, env),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => ProbeResult {
             ok: false,
@@ -380,7 +421,11 @@ pub async fn probe_stdio(command: &str, args: &[String], env: &[(String, String)
     }
 }
 
-async fn probe_stdio_inner(command: &str, args: &[String], env: &[(String, String)]) -> ProbeResult {
+async fn probe_stdio_inner(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+) -> ProbeResult {
     let fail = |error: String| ProbeResult {
         ok: false,
         error: Some(error),
@@ -453,7 +498,8 @@ async fn probe_stdio_inner(command: &str, args: &[String], env: &[(String, Strin
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let initialized = serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    let initialized =
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
     let _ = stdin.write_all(format!("{initialized}\n").as_bytes()).await;
 
     let tools_req = serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
@@ -488,8 +534,14 @@ mod tests {
 
     #[test]
     fn splits_mcp_tool_titles() {
-        assert_eq!(mcp_tool_parts("mcp__github__create_pr"), Some(("github", "create_pr")));
-        assert_eq!(mcp_tool_parts("mcp__pg__query__nested"), Some(("pg", "query__nested")));
+        assert_eq!(
+            mcp_tool_parts("mcp__github__create_pr"),
+            Some(("github", "create_pr"))
+        );
+        assert_eq!(
+            mcp_tool_parts("mcp__pg__query__nested"),
+            Some(("pg", "query__nested"))
+        );
         assert_eq!(mcp_tool_parts("Bash"), None);
         assert_eq!(mcp_tool_parts("mcp__justserver"), None);
     }
@@ -506,7 +558,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             parse_tools_result(&v),
-            vec![("query".to_string(), "Run SQL".to_string()), ("bare".to_string(), String::new())]
+            vec![
+                ("query".to_string(), "Run SQL".to_string()),
+                ("bare".to_string(), String::new())
+            ]
         );
     }
 
@@ -515,45 +570,95 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
 
-        upsert_server(&store, McpServerRow {
-            id: "github".into(), name: "GitHub".into(), kind: "MCP server".into(),
-            color: "#24292F".into(), description: "PRs and issues".into(),
-            transport: "stdio".into(), command: Some("npx".into()),
-            args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
-            env: vec![("GITHUB_TOKEN".into(), "x".into())], url: None,
-            scope: "global".into(), scope_gateways: vec![], version: Some("1.0.0".into()),
-            publisher: Some("github".into()), status: "unknown".into(), status_detail: None,
-            auth_kind: "env".into(), auth_detail: Some("GITHUB_TOKEN".into()),
-        }).await.unwrap();
+        upsert_server(
+            &store,
+            McpServerRow {
+                id: "github".into(),
+                name: "GitHub".into(),
+                kind: "MCP server".into(),
+                color: "#24292F".into(),
+                description: "PRs and issues".into(),
+                transport: "stdio".into(),
+                command: Some("npx".into()),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                env: vec![("GITHUB_TOKEN".into(), "x".into())],
+                url: None,
+                scope: "global".into(),
+                scope_gateways: vec![],
+                version: Some("1.0.0".into()),
+                publisher: Some("github".into()),
+                status: "unknown".into(),
+                status_detail: None,
+                auth_kind: "env".into(),
+                auth_detail: Some("GITHUB_TOKEN".into()),
+            },
+        )
+        .await
+        .unwrap();
 
         let rows = list_servers(&store).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].env, vec![("GITHUB_TOKEN".to_string(), "x".to_string())]);
+        assert_eq!(
+            rows[0].env,
+            vec![("GITHUB_TOKEN".to_string(), "x".to_string())]
+        );
 
         // Tool discovery keeps perms across refreshes.
-        replace_tools(&store, "github", vec![("create_pr".into(), "Open a PR".into())]).await.unwrap();
-        set_tool_perm(&store, "github", "create_pr", "deny").await.unwrap();
-        replace_tools(&store, "github", vec![
-            ("create_pr".into(), "Open a PR".into()),
-            ("list_issues".into(), "List issues".into()),
-        ]).await.unwrap();
+        replace_tools(
+            &store,
+            "github",
+            vec![("create_pr".into(), "Open a PR".into())],
+        )
+        .await
+        .unwrap();
+        set_tool_perm(&store, "github", "create_pr", "deny")
+            .await
+            .unwrap();
+        replace_tools(
+            &store,
+            "github",
+            vec![
+                ("create_pr".into(), "Open a PR".into()),
+                ("list_issues".into(), "List issues".into()),
+            ],
+        )
+        .await
+        .unwrap();
         let tools = list_tools(&store, "github").await.unwrap();
-        assert_eq!(tools.iter().find(|t| t.name == "create_pr").unwrap().perm, "deny");
-        assert_eq!(tools.iter().find(|t| t.name == "list_issues").unwrap().perm, "ask");
+        assert_eq!(
+            tools.iter().find(|t| t.name == "create_pr").unwrap().perm,
+            "deny"
+        );
+        assert_eq!(
+            tools.iter().find(|t| t.name == "list_issues").unwrap().perm,
+            "ask"
+        );
 
         // Perm lookup by mcp title.
-        assert_eq!(tool_perm_for_title(&store, "mcp__github__create_pr").await.as_deref(), Some("deny"));
+        assert_eq!(
+            tool_perm_for_title(&store, "mcp__github__create_pr")
+                .await
+                .as_deref(),
+            Some("deny")
+        );
         assert_eq!(tool_perm_for_title(&store, "Bash").await, None);
 
         // Agent access defaults to allowed until set.
         assert!(agent_allowed(&store, "github", "claude").await.unwrap());
-        set_agent_access(&store, "github", "claude", false).await.unwrap();
+        set_agent_access(&store, "github", "claude", false)
+            .await
+            .unwrap();
         assert!(!agent_allowed(&store, "github", "claude").await.unwrap());
 
         // Session attachment honors scope + access.
         let specs = servers_for_session(&store, "claude").await.unwrap();
-        assert!(specs.is_empty(), "denied agent access must exclude the server");
-        set_agent_access(&store, "github", "claude", true).await.unwrap();
+        assert!(
+            specs.is_empty(),
+            "denied agent access must exclude the server"
+        );
+        set_agent_access(&store, "github", "claude", true)
+            .await
+            .unwrap();
         let specs = servers_for_session(&store, "claude").await.unwrap();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "github");

@@ -166,10 +166,16 @@ pub async fn create_job(cp: State<'_, Arc<ControlPlane>>, input: JobInput) -> R<
 
 #[tauri::command]
 #[specta::specta]
-pub async fn update_job(cp: State<'_, Arc<ControlPlane>>, id: String, input: JobInput) -> R<Vec<JobInfo>> {
-    let existing = scheduler::get_job(cp.store(), &id).await?.ok_or_else(|| CmdError {
-        message: format!("unknown job: {id}"),
-    })?;
+pub async fn update_job(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+    input: JobInput,
+) -> R<Vec<JobInfo>> {
+    let existing = scheduler::get_job(cp.store(), &id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown job: {id}"),
+        })?;
     let cron = resolve_cron(&input)?;
     scheduler::upsert_job(
         cp.store(),
@@ -195,15 +201,24 @@ pub async fn update_job(cp: State<'_, Arc<ControlPlane>>, id: String, input: Job
 
 #[tauri::command]
 #[specta::specta]
-pub async fn toggle_job(cp: State<'_, Arc<ControlPlane>>, id: String, enabled: bool) -> R<Vec<JobInfo>> {
-    let mut job = scheduler::get_job(cp.store(), &id).await?.ok_or_else(|| CmdError {
-        message: format!("unknown job: {id}"),
-    })?;
+pub async fn toggle_job(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+    enabled: bool,
+) -> R<Vec<JobInfo>> {
+    let mut job = scheduler::get_job(cp.store(), &id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown job: {id}"),
+        })?;
     job.enabled = enabled;
     scheduler::upsert_job(cp.store(), job).await?;
     // Re-anchor so enabling doesn't immediately fire a long-past occurrence.
     cp.store()
-        .set_setting(&format!("job_last_fired.{id}"), &ryuzi_core::paths::now_ms().to_string())
+        .set_setting(
+            &format!("job_last_fired.{id}"),
+            &ryuzi_core::paths::now_ms().to_string(),
+        )
         .await?;
     Ok(assemble(&cp).await?)
 }
@@ -218,9 +233,11 @@ pub async fn delete_job(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<J
 #[tauri::command]
 #[specta::specta]
 pub async fn run_job_now(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<JobInfo>> {
-    let job = scheduler::get_job(cp.store(), &id).await?.ok_or_else(|| CmdError {
-        message: format!("unknown job: {id}"),
-    })?;
+    let job = scheduler::get_job(cp.store(), &id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown job: {id}"),
+        })?;
     if scheduler::has_running_run(cp.store(), &id).await? {
         return Err(CmdError {
             message: "a run is already in progress for this job".into(),

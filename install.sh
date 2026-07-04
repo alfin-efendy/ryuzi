@@ -15,21 +15,25 @@ os=$(uname -s)
 arch=$(uname -m)
 
 case "$os" in
-  Linux)  goos="linux" ;;
-  Darwin) goos="darwin" ;;
-  *) err "unsupported OS: $os (use the Windows zip from GitHub Releases or Scoop)" ;;
+  Linux)  ;;
+  Darwin) ;;
+  *) err "unsupported OS: $os" ;;
 esac
 
 case "$arch" in
-  x86_64|amd64) goarch="amd64" ;;
-  aarch64|arm64) goarch="arm64" ;;
-  *) err "unsupported arch: $arch" ;;
+  x86_64|amd64)  cpu="x86_64" ;;
+  aarch64|arm64) cpu="aarch64" ;;
+  *) err "unsupported architecture: $arch" ;;
 esac
 
-# musl vs glibc (Linux only)
-suffix=""
-if [ "$goos" = "linux" ] && ldd --version 2>&1 | grep -qi musl; then
-  suffix="_musl"
+if [ "$os" = "Darwin" ]; then
+  triple="${cpu}-apple-darwin"
+else
+  libc="gnu"
+  if ldd --version 2>&1 | grep -qi musl; then
+    libc="musl"
+  fi
+  triple="${cpu}-unknown-linux-${libc}"
 fi
 
 if [ "$VERSION" = "latest" ]; then
@@ -46,7 +50,7 @@ case "$tag" in
 esac
 
 ver="${tag#v}"
-asset="ryuzi_${ver}_${goos}_${goarch}${suffix}.tar.gz"
+asset="ryuzi-${ver}-${triple}.tar.gz"
 base="https://github.com/$REPO/releases/download/$tag"
 
 tmp=$(mktemp -d)

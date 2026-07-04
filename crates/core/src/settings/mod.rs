@@ -1,0 +1,52 @@
+//! Settings schema, provider catalog, and validated settings store facade.
+//!
+//! Transcribed verbatim from the retired TypeScript
+//! `packages/core/src/config/{schema,required,store}.ts` and
+//! `packages/core/src/providers/{types,catalog,gateways/discord,runtimes/claude-code}.ts`.
+
+pub mod catalog;
+pub mod fields;
+pub mod store;
+
+pub use catalog::{all_fields, find_field, is_secret, CATALOG};
+pub use catalog::{GatewayDescriptor, ProviderCatalog, RuntimeDescriptor};
+pub use fields::{ConfigField, FieldType, GLOBAL_FIELDS};
+pub use store::{csv, validate_setting, SettingsStore};
+
+/// Expand a leading `~` / `~/` to `$HOME`. `~` is a shell-ism; Rust path ops
+/// and git do NOT expand it, so a stored path like `workdir_root: ~/repos`
+/// must be expanded before use or it becomes a literal `~` directory and
+/// breaks worktree/cwd resolution. Mirrors the retired TypeScript
+/// `packages/core/src/config/paths.ts`'s `expandHome`; moved here (from
+/// `crates/cli/src/run_cmd.rs`) so `ControlPlane` can share it too.
+pub fn expand_home(dir: &str) -> std::path::PathBuf {
+    if let Some(rest) = dir.strip_prefix('~') {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest.trim_start_matches('/'));
+        }
+    }
+    std::path::PathBuf::from(dir)
+}
+
+#[cfg(test)]
+mod expand_home_tests {
+    use super::expand_home;
+    use serial_test::serial;
+
+    /// `HOME` is process-global — `#[serial]` so this doesn't race other
+    /// tests that read/set it (e.g. `control::tests::StateDirGuard`).
+    #[test]
+    #[serial]
+    fn expands_leading_tilde_variants() {
+        std::env::set_var("HOME", "/home/u");
+        assert_eq!(expand_home("~"), std::path::PathBuf::from("/home/u"));
+        assert_eq!(
+            expand_home("~/repos"),
+            std::path::PathBuf::from("/home/u/repos")
+        );
+        assert_eq!(
+            expand_home("/already/abs"),
+            std::path::PathBuf::from("/already/abs")
+        );
+    }
+}

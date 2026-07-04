@@ -41,9 +41,8 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, CreateTerminalRequest,
     CreateTerminalResponse, FileSystemCapabilities, InitializeRequest, InitializeResponse,
     KillTerminalRequest, KillTerminalResponse, ReadTextFileRequest, ReleaseTerminalRequest,
-    ReleaseTerminalResponse, SessionId, TerminalOutputRequest,
-    TerminalOutputResponse, TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest,
+    ReleaseTerminalResponse, SessionId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Client, ConnectionTo};
@@ -54,7 +53,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::domain::{CoreEvent, NewMessage};
 use crate::harness::acp::notification::NotificationSink;
 use crate::harness::acp::transport::PermissionContext;
-use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
+use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use crate::store::Store;
 
 /// One request the [`AcpSession`] hands to the client loop. Each carries a
@@ -123,7 +122,14 @@ async fn run_client_loop(
 
     let sink_for_handler = sink.clone();
     let sink_for_write = sink.clone();
-    let perm = (perm.hub, perm.events, perm.project_id, perm.perm_mode, perm.store);
+    let perm = (
+        perm.hub,
+        perm.events,
+        perm.session_pk,
+        perm.project_id,
+        perm.perm_mode,
+        perm.store,
+    );
     // Clone work_dir for the fs/terminal handler closures (they must be 'static + Send).
     let work_dir_for_read = work_dir.clone();
     let work_dir_for_write = work_dir.clone();
@@ -156,12 +162,23 @@ async fn run_client_loop(
         )
         .on_receive_request(
             {
-                let (hub, events, project_id, perm_mode_for_perm, store_for_perm) = perm;
+                let (
+                    hub,
+                    events,
+                    session_pk_for_perm,
+                    project_id,
+                    perm_mode_for_perm,
+                    store_for_perm,
+                ) = perm;
                 async move |request: agent_client_protocol::schema::v1::RequestPermissionRequest,
                             responder,
                             _cx| {
                     let request_id = request.tool_call.tool_call_id.0.to_string();
-                    let session_pk = request.session_id.0.to_string();
+                    // Ryuzi's own session_pk (NOT `request.session_id`, which is the
+                    // ACP-assigned id) — consumers route ApprovalRequested by ryuzi
+                    // pk (see e.g. `run_cmd.rs`'s `session_pk == session.session_pk`
+                    // guard and the daemon fan-out), mirroring the notification sink.
+                    let session_pk = session_pk_for_perm.clone();
                     let tool = request
                         .tool_call
                         .fields
@@ -303,7 +320,8 @@ async fn run_client_loop(
                         }
                     };
                     let output_byte_limit = request.output_byte_limit.unwrap_or(1024 * 1024);
-                    match term_mgr_create.create(&request.command, sandboxed_cwd, output_byte_limit) {
+                    match term_mgr_create.create(&request.command, sandboxed_cwd, output_byte_limit)
+                    {
                         Ok(terminal_id) => {
                             responder.respond(CreateTerminalResponse::new(terminal_id))
                         }
@@ -322,23 +340,22 @@ async fn run_client_loop(
         // terminal/output — return accumulated output and exit status.
         .on_receive_request(
             {
-                async move |request: TerminalOutputRequest, responder, _cx| {
-                    match term_mgr_output.output(&request.terminal_id) {
-                        Ok(out) => {
-                            let mut resp =
-                                TerminalOutputResponse::new(out.output, out.truncated);
-                            if let Some(status) = out.exit_status {
-                                resp = resp.exit_status(status);
-                            }
-                            responder.respond(resp)
+                async move |request: TerminalOutputRequest, responder, _cx| match term_mgr_output
+                    .output(&request.terminal_id)
+                {
+                    Ok(out) => {
+                        let mut resp = TerminalOutputResponse::new(out.output, out.truncated);
+                        if let Some(status) = out.exit_status {
+                            resp = resp.exit_status(status);
                         }
-                        Err(err) => {
-                            tracing::warn!("terminal/output failed: {err}");
-                            responder.respond_with_error(
-                                agent_client_protocol::Error::internal_error()
-                                    .data(format!("terminal/output: {err}")),
-                            )
-                        }
+                        responder.respond(resp)
+                    }
+                    Err(err) => {
+                        tracing::warn!("terminal/output failed: {err}");
+                        responder.respond_with_error(
+                            agent_client_protocol::Error::internal_error()
+                                .data(format!("terminal/output: {err}")),
+                        )
                     }
                 }
             },
@@ -374,16 +391,16 @@ async fn run_client_loop(
         // terminal/kill — send SIGKILL to the child process.
         .on_receive_request(
             {
-                async move |request: KillTerminalRequest, responder, _cx| {
-                    match term_mgr_kill.kill(&request.terminal_id) {
-                        Ok(()) => responder.respond(KillTerminalResponse::new()),
-                        Err(err) => {
-                            tracing::warn!("terminal/kill failed: {err}");
-                            responder.respond_with_error(
-                                agent_client_protocol::Error::internal_error()
-                                    .data(format!("terminal/kill: {err}")),
-                            )
-                        }
+                async move |request: KillTerminalRequest, responder, _cx| match term_mgr_kill
+                    .kill(&request.terminal_id)
+                {
+                    Ok(()) => responder.respond(KillTerminalResponse::new()),
+                    Err(err) => {
+                        tracing::warn!("terminal/kill failed: {err}");
+                        responder.respond_with_error(
+                            agent_client_protocol::Error::internal_error()
+                                .data(format!("terminal/kill: {err}")),
+                        )
                     }
                 }
             },
@@ -392,112 +409,124 @@ async fn run_client_loop(
         // terminal/release — free the terminal's resources.
         .on_receive_request(
             {
-                async move |request: ReleaseTerminalRequest, responder, _cx| {
-                    match term_mgr_release.release(&request.terminal_id) {
-                        Ok(()) => responder.respond(ReleaseTerminalResponse::new()),
-                        Err(err) => {
-                            tracing::warn!("terminal/release failed: {err}");
-                            responder.respond_with_error(
-                                agent_client_protocol::Error::internal_error()
-                                    .data(format!("terminal/release: {err}")),
-                            )
-                        }
+                async move |request: ReleaseTerminalRequest, responder, _cx| match term_mgr_release
+                    .release(&request.terminal_id)
+                {
+                    Ok(()) => responder.respond(ReleaseTerminalResponse::new()),
+                    Err(err) => {
+                        tracing::warn!("terminal/release failed: {err}");
+                        responder.respond_with_error(
+                            agent_client_protocol::Error::internal_error()
+                                .data(format!("terminal/release: {err}")),
+                        )
                     }
                 }
             },
             agent_client_protocol::on_receive_request!(),
         )
-        .connect_with(transport, async move |cx: ConnectionTo<agent_client_protocol::Agent>| {
-            // --- handshake: initialize (advertising fs read+write + terminal) ---------
-            let init: InitializeResponse = cx
-                .send_request(
-                    InitializeRequest::new(ProtocolVersion::LATEST)
-                        .client_capabilities(
+        .connect_with(
+            transport,
+            async move |cx: ConnectionTo<agent_client_protocol::Agent>| {
+                // --- handshake: initialize (advertising fs read+write + terminal) ---------
+                let init: InitializeResponse = cx
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::LATEST).client_capabilities(
                             ClientCapabilities::new()
-                                .fs(
-                                    FileSystemCapabilities::new()
-                                        .read_text_file(true)
-                                        .write_text_file(true),
-                                )
+                                .fs(FileSystemCapabilities::new()
+                                    .read_text_file(true)
+                                    .write_text_file(true))
                                 .terminal(true),
                         ),
-                )
-                .block_task()
-                .await
-                .map_err(|err| {
-                    let msg = format!("ACP {} failed: {err}", AGENT_METHOD_NAMES.initialize);
-                    if let Some(tx) = ready_tx_opt.take() {
-                        let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
-                    }
-                    agent_client_protocol::Error::internal_error().data(msg)
-                })?;
-            let supports_load = init.agent_capabilities.load_session;
-
-            // --- establish the session: load (resume) or new + set_mode ----
-            let session_id = if let Some(ref resume_id) = resume {
-                if supports_load {
-                    let sid = SessionId::from(resume_id.clone());
-                    crate::harness::acp::lifecycle::load_session(
-                        &cx,
-                        supports_load,
-                        sid.clone(),
-                        work_dir.clone(),
-                        acp_mcp_servers.clone(),
                     )
+                    .block_task()
                     .await
                     .map_err(|err| {
-                        let msg = format!("ACP session/load failed: {err}");
+                        let msg = format!("ACP {} failed: {err}", AGENT_METHOD_NAMES.initialize);
                         if let Some(tx) = ready_tx_opt.take() {
                             let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
                         }
-                        err
+                        agent_client_protocol::Error::internal_error().data(msg)
                     })?;
-                    sid
-                } else {
-                    // Agent can't resume; fall back to a fresh session.
-                    fresh_session_propagating(&cx, work_dir.clone(), perm_mode, acp_mcp_servers.clone(), &mut ready_tx_opt)
-                        .await?
-                }
-            } else {
-                fresh_session_propagating(&cx, work_dir.clone(), perm_mode, acp_mcp_servers.clone(), &mut ready_tx_opt)
-                    .await?
-            };
+                let supports_load = init.agent_capabilities.load_session;
 
-            // Signal readiness back to start_session.
-            if let Some(tx) = ready_tx_opt.take() {
-                let _ = tx.send(Ok(Ready {
-                    session_id: session_id.clone(),
-                }));
-            }
-
-            // --- drain ClientRequests until the sender is dropped ----------
-            while let Some(req) = rx.recv().await {
-                match req {
-                    ClientRequest::Prompt { content, reply } => {
-                        let outcome = crate::harness::acp::lifecycle::prompt(
+                // --- establish the session: load (resume) or new + set_mode ----
+                let session_id = if let Some(ref resume_id) = resume {
+                    if supports_load {
+                        let sid = SessionId::from(resume_id.clone());
+                        crate::harness::acp::lifecycle::load_session(
                             &cx,
-                            session_id.clone(),
-                            content,
+                            supports_load,
+                            sid.clone(),
+                            work_dir.clone(),
+                            acp_mcp_servers.clone(),
                         )
-                        .await;
-                        let result = outcome
-                            .map(|(stop, _usage)| format!("{stop:?}"))
-                            .map_err(|e| anyhow::anyhow!("{e}"));
-                        let _ = reply.send(result);
+                        .await
+                        .map_err(|err| {
+                            let msg = format!("ACP session/load failed: {err}");
+                            if let Some(tx) = ready_tx_opt.take() {
+                                let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+                            }
+                            err
+                        })?;
+                        sid
+                    } else {
+                        // Agent can't resume; fall back to a fresh session.
+                        fresh_session_propagating(
+                            &cx,
+                            work_dir.clone(),
+                            perm_mode,
+                            acp_mcp_servers.clone(),
+                            &mut ready_tx_opt,
+                        )
+                        .await?
                     }
-                    ClientRequest::Cancel { reply } => {
-                        let _ = cx
-                            .send_notification(CancelNotification::new(session_id.clone()));
-                        let _ = reply.send(());
+                } else {
+                    fresh_session_propagating(
+                        &cx,
+                        work_dir.clone(),
+                        perm_mode,
+                        acp_mcp_servers.clone(),
+                        &mut ready_tx_opt,
+                    )
+                    .await?
+                };
+
+                // Signal readiness back to start_session.
+                if let Some(tx) = ready_tx_opt.take() {
+                    let _ = tx.send(Ok(Ready {
+                        session_id: session_id.clone(),
+                    }));
+                }
+
+                // --- drain ClientRequests until the sender is dropped ----------
+                while let Some(req) = rx.recv().await {
+                    match req {
+                        ClientRequest::Prompt { content, reply } => {
+                            let outcome = crate::harness::acp::lifecycle::prompt(
+                                &cx,
+                                session_id.clone(),
+                                content,
+                            )
+                            .await;
+                            let result = outcome
+                                .map(|(stop, _usage)| format!("{stop:?}"))
+                                .map_err(|e| anyhow::anyhow!("{e}"));
+                            let _ = reply.send(result);
+                        }
+                        ClientRequest::Cancel { reply } => {
+                            let _ =
+                                cx.send_notification(CancelNotification::new(session_id.clone()));
+                            let _ = reply.send(());
+                        }
                     }
                 }
-            }
 
-            // Session is ending — release all terminal resources.
-            term_mgr.release_all();
+                // Session is ending — release all terminal resources.
+                term_mgr.release_all();
 
-            Ok::<(), agent_client_protocol::Error>(())
-        })
+                Ok::<(), agent_client_protocol::Error>(())
+            },
+        )
         .await;
 
     if let Err(err) = result {
@@ -535,8 +564,8 @@ async fn fresh_session_propagating(
         .map(|m| m.available_modes.as_slice())
         .unwrap_or(&[]);
     // set_mode is best-effort: if the agent didn't offer the mode, stay put.
-    let _ = crate::harness::acp::lifecycle::set_mode(cx, session_id.clone(), mode_id, available)
-        .await;
+    let _ =
+        crate::harness::acp::lifecycle::set_mode(cx, session_id.clone(), mode_id, available).await;
 
     Ok(session_id)
 }
@@ -577,23 +606,23 @@ fn spawn_thread_runner(descriptor: AcpAdapterDescriptor) -> ClientLoopRunner {
                 let stdin = match child.stdin.take() {
                     Some(s) => s,
                     None => {
-                        let _ =
-                            args.ready_tx.send(Err(anyhow::anyhow!("adapter has no stdin")));
+                        let _ = args
+                            .ready_tx
+                            .send(Err(anyhow::anyhow!("adapter has no stdin")));
                         return;
                     }
                 };
                 let stdout = match child.stdout.take() {
                     Some(s) => s,
                     None => {
-                        let _ =
-                            args.ready_tx.send(Err(anyhow::anyhow!("adapter has no stdout")));
+                        let _ = args
+                            .ready_tx
+                            .send(Err(anyhow::anyhow!("adapter has no stdout")));
                         return;
                     }
                 };
-                let byte_streams = agent_client_protocol::ByteStreams::new(
-                    stdin.compat_write(),
-                    stdout.compat(),
-                );
+                let byte_streams =
+                    agent_client_protocol::ByteStreams::new(stdin.compat_write(), stdout.compat());
                 run_client_loop(byte_streams, args).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -608,8 +637,9 @@ fn spawn_thread_runner(descriptor: AcpAdapterDescriptor) -> ClientLoopRunner {
 #[cfg(test)]
 pub(crate) fn mock_runner() -> ClientLoopRunner {
     Box::new(|args: ClientLoopArgs| {
-        let (transport, _join) =
-            crate::harness::acp::testkit::connect_mock(crate::harness::acp::testkit::MockAgent::new());
+        let (transport, _join) = crate::harness::acp::testkit::connect_mock(
+            crate::harness::acp::testkit::MockAgent::new(),
+        );
         tokio::spawn(async move {
             run_client_loop(transport, args).await;
         });
@@ -675,6 +705,7 @@ impl Harness for AcpHarness {
         let perm = PermissionContext {
             hub: ctx.approvals.clone(),
             events: ctx.events.clone(),
+            session_pk: ctx.session_pk.clone(),
             project_id,
             perm_mode: ctx.perm_mode,
             store: ctx.store.clone(),
@@ -725,7 +756,7 @@ pub struct AcpSession {
 
 #[async_trait]
 impl HarnessSession for AcpSession {
-    async fn send_prompt(&self, prompt: String) -> anyhow::Result<()> {
+    async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
         let tx = {
             let guard = self.tx.lock().await;
             guard
@@ -734,20 +765,23 @@ impl HarnessSession for AcpSession {
                 .ok_or_else(|| anyhow::anyhow!("ACP session already ended"))?
         };
 
-        // Persist the user turn (Spec 1) before driving the prompt.
+        // Persist the user turn (Spec 1) before driving the prompt. Persist
+        // `prompt.display` — the raw text the user typed — not the (possibly
+        // attachment-manifest-decorated) `prompt.agent` text, so durable
+        // history shows what the user actually typed.
         // Use ryuzi's own session_pk (not the ACP session id) so the frontend
         // can find the row via list_messages(session_pk).
         let user_msg = NewMessage::block(
             &self.session_pk,
             "user",
             "text",
-            serde_json::json!({ "text": prompt }),
+            serde_json::json!({ "text": prompt.display }),
         );
         if let Err(e) = self.store.insert_message(user_msg).await {
             tracing::warn!("send_prompt: failed to persist user turn: {e}");
         }
 
-        let content = vec![ContentBlock::Text(TextContent::new(prompt))];
+        let content = vec![ContentBlock::Text(TextContent::new(prompt.agent))];
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(ClientRequest::Prompt {
             content,
@@ -846,20 +880,19 @@ mod tests {
         // Build an AcpHarness on the mock-transport seam, start a session through
         // the Spec 2 Harness trait, send a prompt, and assert the transcript
         // persisted (an assistant text row) plus the user turn.
-        let (store, session_pk) =
-            crate::harness::acp::testkit::run_via_harness_trait("hi").await;
+        let (store, session_pk) = crate::harness::acp::testkit::run_via_harness_trait("hi").await;
         let msgs = store.list_messages(&session_pk).await.unwrap();
 
         // assistant streamed text row (from the mock's prompt notifications)
         assert!(
-            msgs.iter().any(|m| m.role == "assistant" && m.block_type == "text"),
+            msgs.iter()
+                .any(|m| m.role == "assistant" && m.block_type == "text"),
             "expected an assistant text row, got: {msgs:?}"
         );
         // user turn persisted by send_prompt (Spec 1)
         assert!(
-            msgs.iter().any(|m| m.role == "user"
-                && m.block_type == "text"
-                && m.payload["text"] == "hi"),
+            msgs.iter()
+                .any(|m| m.role == "user" && m.block_type == "text" && m.payload["text"] == "hi"),
             "expected the persisted user turn, got: {msgs:?}"
         );
     }
@@ -920,10 +953,33 @@ mod tests {
         )
         .await;
 
-        assert!(outcome.allowed, "mock agent should have received an allow selection");
+        assert!(
+            outcome.allowed,
+            "mock agent should have received an allow selection"
+        );
         assert!(
             outcome.hub_was_never_registered,
             "hub should NOT have been registered when policy is allowAlways"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_requested_carries_the_ryuzi_session_pk_not_the_acp_session_id() {
+        // No per-project tool policy is set, so "Bash" in PermMode::Default
+        // falls through to the hub-prompt path (not AutoAllow), which emits
+        // CoreEvent::ApprovalRequested. The mock agent's session/new always
+        // assigns a fresh random ACP session id (a UUID), which necessarily
+        // differs from ryuzi's own session_pk ("perm-bridge-session-pk") —
+        // the emitted event must carry the ryuzi pk, not the ACP-assigned id.
+        let outcome =
+            crate::harness::acp::testkit::run_perm_mock_via_harness("p-approval-pk", None).await;
+
+        assert_eq!(
+            outcome.captured_session_pk.as_deref(),
+            Some(outcome.session_pk.as_str()),
+            "ApprovalRequested.session_pk should be ryuzi's own session_pk ({:?}), \
+             not the ACP-assigned session id",
+            outcome.session_pk
         );
     }
 

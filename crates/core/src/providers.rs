@@ -40,7 +40,8 @@ pub struct UsageDay {
     pub est_tokens: f64,
 }
 
-const PROVIDER_COLS: &str = "id,name,kind,color,enabled,strategy,fail_auto,threshold,return_to_primary";
+const PROVIDER_COLS: &str =
+    "id,name,kind,color,enabled,strategy,fail_auto,threshold,return_to_primary";
 
 fn provider_from(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
     Ok(ProviderRow {
@@ -76,8 +77,12 @@ fn account_from(r: &rusqlite::Row) -> rusqlite::Result<AccountRow> {
 pub async fn list_providers(store: &Store) -> anyhow::Result<Vec<ProviderRow>> {
     store
         .with_conn(|c| {
-            let mut stmt = c.prepare(&format!("SELECT {PROVIDER_COLS} FROM providers ORDER BY created_at"))?;
-            let rows = stmt.query_map([], provider_from)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT {PROVIDER_COLS} FROM providers ORDER BY created_at"
+            ))?;
+            let rows = stmt
+                .query_map([], provider_from)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
         .await
@@ -122,8 +127,12 @@ pub async fn remove_provider(store: &Store, id: &str) -> anyhow::Result<()> {
     let id = id.to_string();
     store
         .with_conn(move |c| {
-            c.execute("DELETE FROM provider_accounts WHERE provider_id=?1", params![id])?;
-            c.execute("DELETE FROM providers WHERE id=?1", params![id]).map(|_| ())
+            c.execute(
+                "DELETE FROM provider_accounts WHERE provider_id=?1",
+                params![id],
+            )?;
+            c.execute("DELETE FROM providers WHERE id=?1", params![id])
+                .map(|_| ())
         })
         .await
 }
@@ -170,24 +179,44 @@ pub async fn remove_account(store: &Store, account_id: &str) -> anyhow::Result<(
     let account_id = account_id.to_string();
     store
         .with_conn(move |c| {
-            c.execute("DELETE FROM provider_accounts WHERE id=?1", params![account_id]).map(|_| ())
+            c.execute(
+                "DELETE FROM provider_accounts WHERE id=?1",
+                params![account_id],
+            )
+            .map(|_| ())
         })
         .await
 }
 
-pub async fn set_active_account(store: &Store, provider_id: &str, account_id: &str) -> anyhow::Result<()> {
+pub async fn set_active_account(
+    store: &Store,
+    provider_id: &str,
+    account_id: &str,
+) -> anyhow::Result<()> {
     let provider_id = provider_id.to_string();
     let account_id = account_id.to_string();
     store
         .with_conn(move |c| {
-            c.execute("UPDATE provider_accounts SET active=0 WHERE provider_id=?1", params![provider_id])?;
-            c.execute("UPDATE provider_accounts SET active=1 WHERE id=?1", params![account_id]).map(|_| ())
+            c.execute(
+                "UPDATE provider_accounts SET active=0 WHERE provider_id=?1",
+                params![provider_id],
+            )?;
+            c.execute(
+                "UPDATE provider_accounts SET active=1 WHERE id=?1",
+                params![account_id],
+            )
+            .map(|_| ())
         })
         .await
 }
 
 /// Swap the account at `account_id` with its neighbor (`dir` = -1 up / +1 down).
-pub async fn move_account(store: &Store, provider_id: &str, account_id: &str, dir: i32) -> anyhow::Result<()> {
+pub async fn move_account(
+    store: &Store,
+    provider_id: &str,
+    account_id: &str,
+    dir: i32,
+) -> anyhow::Result<()> {
     let accounts = list_accounts(store, provider_id).await?;
     let Some(i) = accounts.iter().position(|a| a.id == account_id) else {
         return Ok(());
@@ -200,8 +229,15 @@ pub async fn move_account(store: &Store, provider_id: &str, account_id: &str, di
     let (sa, sb) = (i as i64, j);
     store
         .with_conn(move |c| {
-            c.execute("UPDATE provider_accounts SET sort=?2 WHERE id=?1", params![a, sb])?;
-            c.execute("UPDATE provider_accounts SET sort=?2 WHERE id=?1", params![b, sa]).map(|_| ())
+            c.execute(
+                "UPDATE provider_accounts SET sort=?2 WHERE id=?1",
+                params![a, sb],
+            )?;
+            c.execute(
+                "UPDATE provider_accounts SET sort=?2 WHERE id=?1",
+                params![b, sa],
+            )
+            .map(|_| ())
         })
         .await
 }
@@ -310,16 +346,38 @@ mod tests {
         assert_eq!(providers[0].id, "anthropic");
 
         // First account auto-activates; second stays standby.
-        add_account(&store, AccountRow {
-            id: "a1".into(), provider_id: "anthropic".into(), label: "Account 1".into(),
-            email: "a@x.io".into(), plan: "Max".into(), sort: 0, active: false,
-            session_limit_tokens: Some(5_000_000), weekly_limit_tokens: None,
-        }).await.unwrap();
-        add_account(&store, AccountRow {
-            id: "a2".into(), provider_id: "anthropic".into(), label: "Account 2".into(),
-            email: "b@x.io".into(), plan: "Pro".into(), sort: 0, active: false,
-            session_limit_tokens: None, weekly_limit_tokens: None,
-        }).await.unwrap();
+        add_account(
+            &store,
+            AccountRow {
+                id: "a1".into(),
+                provider_id: "anthropic".into(),
+                label: "Account 1".into(),
+                email: "a@x.io".into(),
+                plan: "Max".into(),
+                sort: 0,
+                active: false,
+                session_limit_tokens: Some(5_000_000),
+                weekly_limit_tokens: None,
+            },
+        )
+        .await
+        .unwrap();
+        add_account(
+            &store,
+            AccountRow {
+                id: "a2".into(),
+                provider_id: "anthropic".into(),
+                label: "Account 2".into(),
+                email: "b@x.io".into(),
+                plan: "Pro".into(),
+                sort: 0,
+                active: false,
+                session_limit_tokens: None,
+                weekly_limit_tokens: None,
+            },
+        )
+        .await
+        .unwrap();
         let accounts = list_accounts(&store, "anthropic").await.unwrap();
         assert!(accounts[0].active && !accounts[1].active);
 
@@ -329,7 +387,10 @@ mod tests {
         assert_eq!(accounts[0].id, "a2");
         // Out-of-range moves are no-ops.
         move_account(&store, "anthropic", "a2", -1).await.unwrap();
-        assert_eq!(list_accounts(&store, "anthropic").await.unwrap()[0].id, "a2");
+        assert_eq!(
+            list_accounts(&store, "anthropic").await.unwrap()[0].id,
+            "a2"
+        );
 
         set_active_account(&store, "anthropic", "a2").await.unwrap();
         let accounts = list_accounts(&store, "anthropic").await.unwrap();
@@ -352,7 +413,12 @@ mod tests {
         // 400 chars of payload ≈ 100 tokens (chars/4), plus JSON overhead.
         let text = "x".repeat(400);
         store
-            .insert_message(NewMessage::block("s1", "assistant", "text", serde_json::json!({ "text": text })))
+            .insert_message(NewMessage::block(
+                "s1",
+                "assistant",
+                "text",
+                serde_json::json!({ "text": text }),
+            ))
             .await
             .unwrap();
 
