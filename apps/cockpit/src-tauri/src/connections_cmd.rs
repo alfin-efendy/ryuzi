@@ -172,6 +172,7 @@ pub async fn add_connection(
                 },
                 base_url_override: base_url.filter(|s| !s.is_empty()),
                 models_override: None,
+                ..Default::default()
             },
             created_at: now,
             updated_at: now,
