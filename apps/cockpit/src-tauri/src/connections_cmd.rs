@@ -125,6 +125,9 @@ pub async fn add_connection(
     let desc = registry::descriptor(&provider).ok_or_else(|| CmdError {
         message: format!("unknown provider: {provider}"),
     })?;
+    if desc.category != ProviderCategory::ApiKey {
+        return Err(CmdError { message: format!("{} is coming in a later phase.", desc.name) });
+    }
     if desc.requires_base_url && base_url.as_deref().map(str::is_empty).unwrap_or(true) {
         return Err(CmdError { message: format!("{} requires a base URL", desc.name) });
     }

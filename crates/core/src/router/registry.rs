@@ -115,6 +115,26 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "C", category: ApiKey, format: ApiFormat::Anthropic,
         base_url: None, auth: AuthScheme::XApiKey, models: &[], requires_base_url: true,
     },
+    // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
+    // Not connectable in F1 (add_connection refuses non-ApiKey categories).
+    ProviderDescriptor {
+        id: "anthropic-oauth", name: "Anthropic (Claude subscription)", color: "#D97757",
+        initial: "A", category: OAuth, format: ApiFormat::Anthropic,
+        base_url: Some("https://api.anthropic.com/v1"), auth: AuthScheme::Bearer,
+        models: &[], requires_base_url: false,
+    },
+    ProviderDescriptor {
+        id: "openai-oauth", name: "OpenAI (ChatGPT)", color: "#0FA47F",
+        initial: "O", category: OAuth, format: ApiFormat::OpenAi,
+        base_url: Some("https://api.openai.com/v1"), auth: AuthScheme::Bearer,
+        models: &[], requires_base_url: false,
+    },
+    ProviderDescriptor {
+        id: "kiro", name: "Kiro (free tier)", color: "#7C3AED",
+        initial: "K", category: Free, format: ApiFormat::OpenAi,
+        base_url: None, auth: AuthScheme::Bearer,
+        models: &[], requires_base_url: true,
+    },
 ];
 
 pub fn descriptor(id: &str) -> Option<&'static ProviderDescriptor> {
@@ -153,5 +173,13 @@ mod tests {
         for d in CATALOG.iter().filter(|d| d.category == ProviderCategory::ApiKey) {
             assert!(d.requires_base_url || d.base_url.is_some());
         }
+    }
+
+    #[test]
+    fn catalog_has_oauth_and_free_teasers() {
+        // Phase 1 shows OAuth/Free entries in the catalog, greyed "Coming
+        // soon" in the UI; add_connection refuses to activate them.
+        assert!(CATALOG.iter().any(|d| d.category == ProviderCategory::OAuth));
+        assert!(CATALOG.iter().any(|d| d.category == ProviderCategory::Free));
     }
 }
