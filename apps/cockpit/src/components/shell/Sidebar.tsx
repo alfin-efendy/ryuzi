@@ -22,6 +22,7 @@ import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
+import { useTerms } from "@/store-terms";
 import { commands, type Session } from "@/bindings";
 import { Modal } from "@/components/modals/Modal";
 import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
@@ -85,6 +86,7 @@ export function Sidebar() {
       // Shells opened for this session hold their cwd inside the worktree;
       // kill them first or the directory removal fails on Windows.
       await commands.termCloseSession(s.sessionPk);
+      useTerms.getState().disposeSession(s.sessionPk);
       const ok = await end(s.sessionPk);
       if (!ok) return; // end() already toasted; leave the row visible
       setArchived(s.sessionPk, true);
