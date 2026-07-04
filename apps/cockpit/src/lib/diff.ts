@@ -65,3 +65,30 @@ export function parseUnifiedDiff(diff: string): ReviewFile[] {
   }
   return files;
 }
+
+export type DiffLineStyle = { bg: string; numBg: string; sign: string; signColor: string; color: string };
+
+/** Per-line render style for the unified-diff view. Colors come from the
+ *  --diff-* theme tokens so the Settings preview and Review tab stay in sync. */
+export function diffLineStyle(l: DiffLine): DiffLineStyle {
+  const [type] = l;
+  if (type === "hunk")
+    return { bg: "var(--muted)", numBg: "transparent", sign: "⇅", signColor: "var(--muted-foreground)", color: "var(--muted-foreground)" };
+  if (type === "add")
+    return {
+      bg: "var(--diff-add-bg)",
+      numBg: "var(--diff-add-bg)",
+      sign: "+",
+      signColor: "var(--diff-add-fg)",
+      color: "var(--foreground)",
+    };
+  if (type === "del")
+    return {
+      bg: "var(--diff-del-bg)",
+      numBg: "var(--diff-del-bg)",
+      sign: "−",
+      signColor: "var(--diff-del-fg)",
+      color: "var(--foreground)",
+    };
+  return { bg: "transparent", numBg: "transparent", sign: "", signColor: "transparent", color: "var(--code-foreground)" };
+}

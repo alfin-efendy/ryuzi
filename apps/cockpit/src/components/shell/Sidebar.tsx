@@ -22,6 +22,7 @@ import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
+import { useTerms } from "@/store-terms";
 import { commands, type Session } from "@/bindings";
 import { Modal } from "@/components/modals/Modal";
 import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
@@ -89,6 +90,12 @@ export function Sidebar() {
       if (!ok) return; // end() already toasted; leave the row visible
       setArchived(s.sessionPk, true);
       if (focusedSessionPk === s.sessionPk) setFocused(null);
+      // Drop the JS-side terminal cache only now — after teardown succeeded and
+      // the drawer has unmounted (setFocused(null)). Emptying the tabs earlier
+      // would let the drawer's auto-spawn open a fresh PTY into the worktree
+      // being removed. termCloseSession already emitted the exit events, so on
+      // the failure path above we intentionally leave the cache alone.
+      useTerms.getState().disposeSession(s.sessionPk);
     } finally {
       setArchivingPk(null);
       setConfirmArchive(null);
