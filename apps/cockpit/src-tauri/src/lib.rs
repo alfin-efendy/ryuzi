@@ -225,6 +225,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             endpoint_cmd::list_endpoint_keys,
             endpoint_cmd::create_endpoint_key,
             endpoint_cmd::revoke_endpoint_key,
+            endpoint_cmd::connection_usage,
+            endpoint_cmd::endpoint_usage,
             connections_cmd::list_provider_catalog,
             connections_cmd::list_connections,
             connections_cmd::add_connection,

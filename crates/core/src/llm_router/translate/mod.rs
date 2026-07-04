@@ -62,6 +62,11 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
     if let Some(v) = body.get("stop_sequences") {
         out.insert("stop".into(), v.clone());
     }
+    // Streamed requests ask the OpenAI-format upstream for a final usage
+    // frame so the router can capture real token counts (spec follow-up).
+    if out.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        out.insert("stream_options".into(), json!({"include_usage": true}));
+    }
 
     let mut messages: Vec<Value> = Vec::new();
     // system: string or [{type:text}] blocks → one system message.
@@ -516,6 +521,30 @@ impl OpenAiToAnthropicStream {
         out.push(("message_stop".into(), json!({"type": "message_stop"})));
         out
     }
+
+    /// Terminal error event in Anthropic SSE shape. Emit this INSTEAD of
+    /// `finish()` when the upstream stream errored mid-flight; do not follow
+    /// it with `message_stop`.
+    pub fn error_frame(&self, message: &str) -> Vec<(String, Value)> {
+        vec![(
+            "error".into(),
+            json!({"type": "error", "error": {"type": "api_error", "message": message}}),
+        )]
+    }
+
+    /// Accumulated (input, output) token counts seen so far, from the
+    /// upstream `usage` field carried on OpenAI chunks.
+    pub fn usage(&self) -> (i64, i64) {
+        (self.input_tokens, self.output_tokens)
+    }
+
+    /// True once a `finish_reason` chunk was observed. When the upstream
+    /// stream ends cleanly WITHOUT ever seeing one, the caller must emit
+    /// `error_frame` instead of `finish` — a clean EOF with no terminal event
+    /// is a truncated stream, not a completed one.
+    pub fn saw_terminal(&self) -> bool {
+        self.finish_reason.is_some()
+    }
 }
 
 /// Upstream Anthropic SSE events → OpenAI chunks (client called
@@ -530,6 +559,7 @@ pub struct AnthropicToOpenAiStream {
     tool_index: std::collections::HashMap<i64, i64>,
     next_tool: i64,
     finish: Option<String>,
+    input_tokens: i64,
     usage_out: i64,
 }
 
@@ -549,6 +579,7 @@ impl AnthropicToOpenAiStream {
             tool_index: Default::default(),
             next_tool: 0,
             finish: None,
+            input_tokens: 0,
             usage_out: 0,
         }
     }
@@ -570,6 +601,9 @@ impl AnthropicToOpenAiStream {
                 if let Some(m) = data["message"]["model"].as_str() {
                     self.model = m.to_string();
                 }
+                self.input_tokens = data["message"]["usage"]["input_tokens"]
+                    .as_i64()
+                    .unwrap_or(self.input_tokens);
                 self.sent_role = true;
                 out.push(self.chunk(json!({"role": "assistant", "content": ""}), None));
             }
@@ -628,6 +662,18 @@ impl AnthropicToOpenAiStream {
     pub fn finish(&self) -> bool {
         self.done
     }
+
+    /// Terminal error chunk in OpenAI shape. Emit this INSTEAD of the normal
+    /// finish chunk + `[DONE]` when the upstream stream errored mid-flight.
+    pub fn error_frame(&self, message: &str) -> Value {
+        json!({"error": {"message": message, "type": "api_error"}})
+    }
+
+    /// Accumulated (input, output) token counts seen so far: input from
+    /// `message_start`'s usage, output from the terminal `message_delta`.
+    pub fn usage(&self) -> (i64, i64) {
+        (self.input_tokens, self.usage_out)
+    }
 }
 
 #[cfg(test)]
@@ -681,6 +727,16 @@ mod tests {
         assert_eq!(out["tool_choice"], "auto");
         assert!(out.get("system").is_none());
         assert!(out.get("stop_sequences").is_none());
+    }
+
+    #[test]
+    fn anthropic_stream_true_adds_openai_stream_options() {
+        let req = json!({
+            "model": "m", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = anthropic_to_openai_request(&req).unwrap();
+        assert_eq!(out["stream_options"], json!({"include_usage": true}));
     }
 
     #[test]
@@ -942,6 +998,16 @@ mod tests {
     }
 
     #[test]
+    fn openai_to_anthropic_stream_saw_terminal_tracks_finish_reason() {
+        let mut s = OpenAiToAnthropicStream::new("m");
+        assert!(!s.saw_terminal());
+        s.feed(&json!({"id": "c1", "choices": [{"index": 0, "delta": {"content": "hi"}}]}));
+        assert!(!s.saw_terminal(), "content deltas alone aren't terminal");
+        s.feed(&json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
+        assert!(s.saw_terminal());
+    }
+
+    #[test]
     fn anthropic_events_translate_to_openai_chunks() {
         let mut s = AnthropicToOpenAiStream::new();
         let mut chunks = Vec::new();
@@ -988,5 +1054,30 @@ mod tests {
         // finish chunk
         let last = chunks.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn openai_to_anthropic_error_frame_is_anthropic_shaped() {
+        let s = OpenAiToAnthropicStream::new("m");
+        let ev = s.error_frame("upstream stream interrupted: boom");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].0, "error");
+        assert_eq!(ev[0].1["type"], "error");
+        assert_eq!(ev[0].1["error"]["type"], "api_error");
+        assert_eq!(
+            ev[0].1["error"]["message"],
+            "upstream stream interrupted: boom"
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_error_frame_is_openai_shaped() {
+        let s = AnthropicToOpenAiStream::new();
+        let chunk = s.error_frame("upstream stream interrupted: boom");
+        assert_eq!(
+            chunk["error"]["message"],
+            "upstream stream interrupted: boom"
+        );
+        assert_eq!(chunk["error"]["type"], "api_error");
     }
 }

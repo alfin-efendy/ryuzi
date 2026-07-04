@@ -4266,6 +4266,7 @@ name = "ryuzi-cockpit"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs 5.0.1",
  "portable-pty",
  "reqwest 0.12.28",

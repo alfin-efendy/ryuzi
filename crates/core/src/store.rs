@@ -240,6 +240,35 @@ fn migrations() -> Migrations<'static> {
         // no credentials) superseded by provider_connections — approved
         // destructive drop, spec §4.2.
         M::up("DROP TABLE providers; DROP TABLE provider_accounts;"),
+        // F2a usage tracking (design: docs/design/2026-07-04-models-runtime-f2-design.md §3.2):
+        // request_log = one row per served request (pruned to 30 days);
+        // usage_daily = permanent rollup for charts.
+        M::up(
+            "CREATE TABLE request_log (\
+                id TEXT PRIMARY KEY,\
+                ts INTEGER NOT NULL,\
+                connection_id TEXT NOT NULL,\
+                provider TEXT NOT NULL,\
+                model TEXT NOT NULL,\
+                client_format TEXT NOT NULL,\
+                input_tokens INTEGER NOT NULL DEFAULT 0,\
+                output_tokens INTEGER NOT NULL DEFAULT 0,\
+                status_code INTEGER NOT NULL,\
+                duration_ms INTEGER NOT NULL,\
+                error TEXT\
+            );\
+            CREATE INDEX idx_request_log_ts ON request_log(ts);\
+            CREATE INDEX idx_request_log_conn ON request_log(connection_id, ts);\
+            CREATE TABLE usage_daily (\
+                day TEXT NOT NULL,\
+                connection_id TEXT NOT NULL,\
+                model TEXT NOT NULL,\
+                requests INTEGER NOT NULL DEFAULT 0,\
+                input_tokens INTEGER NOT NULL DEFAULT 0,\
+                output_tokens INTEGER NOT NULL DEFAULT 0,\
+                PRIMARY KEY (day, connection_id, model)\
+            );",
+        ),
     ])
 }
 
@@ -264,6 +293,46 @@ fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
 
 const PROJECT_COLS: &str =
     "project_id,name,workdir,source,harness,model,effort,perm_mode,created_at";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageRecord {
+    pub connection_id: String,
+    pub provider: String,
+    pub model: String,
+    pub client_format: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub status_code: i64,
+    pub duration_ms: i64,
+    pub error: Option<String>,
+    pub ts: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageDayRow {
+    pub day: String,
+    pub connection_id: String,
+    pub model: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageTotalRow {
+    pub connection_id: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+/// UTC calendar day (YYYY-MM-DD) for a millisecond timestamp.
+fn day_of(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .unwrap_or_default()
+        .format("%Y-%m-%d")
+        .to_string()
+}
 
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Store> {
@@ -935,6 +1004,115 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
         Ok(p)
     }
+
+    /// Insert one request_log row and upsert its usage_daily rollup atomically.
+    pub async fn record_request(&self, r: UsageRecord) -> anyhow::Result<()> {
+        let day = day_of(r.ts);
+        let id = crate::paths::new_id();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO request_log(id,ts,connection_id,provider,model,client_format,\
+                 input_tokens,output_tokens,status_code,duration_ms,error) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![id, r.ts, r.connection_id, r.provider, r.model, r.client_format,
+                    r.input_tokens, r.output_tokens, r.status_code, r.duration_ms, r.error],
+            )?;
+            tx.execute(
+                "INSERT INTO usage_daily(day,connection_id,model,requests,input_tokens,output_tokens) \
+                 VALUES (?1,?2,?3,1,?4,?5) \
+                 ON CONFLICT(day,connection_id,model) DO UPDATE SET \
+                   requests=requests+1, \
+                   input_tokens=input_tokens+excluded.input_tokens, \
+                   output_tokens=output_tokens+excluded.output_tokens",
+                params![day, r.connection_id, r.model, r.input_tokens, r.output_tokens],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Daily usage rollup rows, optionally filtered to one connection, from
+    /// `since_day` (inclusive, `YYYY-MM-DD`) onward.
+    pub async fn usage_daily(
+        &self,
+        connection_id: Option<&str>,
+        since_day: &str,
+    ) -> anyhow::Result<Vec<UsageDayRow>> {
+        let conn_filter = connection_id.map(|s| s.to_string());
+        let since = since_day.to_string();
+        self.with_conn(move |c| {
+            let sql = "SELECT day,connection_id,model,requests,input_tokens,output_tokens \
+                       FROM usage_daily WHERE day >= ?1 \
+                       AND (?2 IS NULL OR connection_id = ?2) \
+                       ORDER BY day ASC";
+            let mut stmt = c.prepare(sql)?;
+            let rows = stmt
+                .query_map(params![since, conn_filter], |r| {
+                    Ok(UsageDayRow {
+                        day: r.get(0)?,
+                        connection_id: r.get(1)?,
+                        model: r.get(2)?,
+                        requests: r.get(3)?,
+                        input_tokens: r.get(4)?,
+                        output_tokens: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Per-connection request/token totals for one UTC day.
+    pub async fn today_totals(&self, day: &str) -> anyhow::Result<Vec<UsageTotalRow>> {
+        let day = day.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT connection_id, SUM(requests), SUM(input_tokens), SUM(output_tokens) \
+                 FROM usage_daily WHERE day = ?1 GROUP BY connection_id",
+            )?;
+            let rows = stmt
+                .query_map(params![day], |r| {
+                    Ok(UsageTotalRow {
+                        connection_id: r.get(0)?,
+                        requests: r.get(1)?,
+                        input_tokens: r.get(2)?,
+                        output_tokens: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Count of request_log rows with `ts >= since_ms` — overall (F2a has no
+    /// per-key routing identity, so this isn't per-key).
+    pub async fn total_requests_since(&self, since_ms: i64) -> anyhow::Result<i64> {
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM request_log WHERE ts >= ?1",
+                params![since_ms],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .await
+    }
+
+    /// Delete request_log rows older than `older_than_ms`; usage_daily
+    /// rollups are untouched (they're the permanent record for charts).
+    pub async fn prune_request_log(&self, older_than_ms: i64) -> anyhow::Result<usize> {
+        self.with_conn(move |c| {
+            let n = c.execute(
+                "DELETE FROM request_log WHERE ts < ?1",
+                params![older_than_ms],
+            )?;
+            Ok(n)
+        })
+        .await
+    }
 }
 
 const SESSION_COLS: &str =
@@ -1454,5 +1632,87 @@ mod tests {
                 .as_deref(),
             Some("discord")
         );
+    }
+
+    #[tokio::test]
+    async fn usage_record_writes_log_and_rolls_up_daily() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let base = 1_700_000_000_000_i64; // fixed ms -> a stable UTC day
+        let day = super::day_of(base);
+
+        store
+            .record_request(UsageRecord {
+                connection_id: "c1".into(),
+                provider: "openai".into(),
+                model: "gpt-x".into(),
+                client_format: "openai".into(),
+                input_tokens: 10,
+                output_tokens: 5,
+                status_code: 200,
+                duration_ms: 42,
+                error: None,
+                ts: base,
+            })
+            .await
+            .unwrap();
+        store
+            .record_request(UsageRecord {
+                connection_id: "c1".into(),
+                provider: "openai".into(),
+                model: "gpt-x".into(),
+                client_format: "openai".into(),
+                input_tokens: 7,
+                output_tokens: 3,
+                status_code: 200,
+                duration_ms: 30,
+                error: None,
+                ts: base + 1000,
+            })
+            .await
+            .unwrap();
+
+        let rows = store.usage_daily(Some("c1"), &day).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requests, 2);
+        assert_eq!(rows[0].input_tokens, 17);
+        assert_eq!(rows[0].output_tokens, 8);
+
+        let totals = store.today_totals(&day).await.unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].connection_id, "c1");
+        assert_eq!(totals[0].requests, 2);
+
+        assert_eq!(store.total_requests_since(base).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_old_request_log_but_keeps_daily() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let old = 1_000_000_000_000_i64;
+        store
+            .record_request(UsageRecord {
+                connection_id: "c1".into(),
+                provider: "p".into(),
+                model: "m".into(),
+                client_format: "openai".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                status_code: 200,
+                duration_ms: 1,
+                error: None,
+                ts: old,
+            })
+            .await
+            .unwrap();
+        let removed = store.prune_request_log(old + 1).await.unwrap();
+        assert_eq!(removed, 1);
+        // rollup survives the prune
+        let rows = store
+            .usage_daily(Some("c1"), &super::day_of(old))
+            .await
+            .unwrap();
+        assert_eq!(rows[0].requests, 1);
     }
 }

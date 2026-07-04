@@ -247,8 +247,8 @@ pub fn codex_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> anyhow
     let mut tbl = toml_edit::Table::new();
     tbl["name"] = toml_edit::value("Ryuzi");
     tbl["base_url"] = toml_edit::value(format!("{}/v1", ep.base_url));
-    // F1 serves Chat Completions only; switch to "responses" when F2 adds /v1/responses.
-    tbl["wire_api"] = toml_edit::value("chat");
+    // F2a serves /v1/responses, so Codex uses its native Responses wire.
+    tbl["wire_api"] = toml_edit::value("responses");
     tbl["env_key"] = toml_edit::value("OPENAI_API_KEY");
     if !doc.contains_key("model_providers") {
         doc["model_providers"] = toml_edit::Item::Table(toml_edit::Table::new());
@@ -477,7 +477,7 @@ mod tests {
         );
         assert!(text.contains("model_provider = \"ryuzi\""));
         assert!(text.contains("base_url = \"http://127.0.0.1:21128/v1\""));
-        assert!(text.contains("wire_api = \"chat\""));
+        assert!(text.contains("wire_api = \"responses\""));
         let auth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home.path().join(".codex/auth.json")).unwrap(),
         )
