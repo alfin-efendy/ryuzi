@@ -66,6 +66,8 @@ impl RouterServer {
             .route("/v1/messages/count_tokens", post(handle_count_tokens))
             .route("/v1/chat/completions", post(handle_chat))
             .route("/v1/models", get(handle_models))
+            // Agent conversations with inline images exceed axum's 2 MB default.
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
             .with_state(state);
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {

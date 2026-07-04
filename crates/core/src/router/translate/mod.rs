@@ -126,15 +126,22 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
                         msg.insert("tool_calls".into(), Value::Array(tool_calls));
                     }
                     messages.push(Value::Object(msg));
-                } else if !text_parts.is_empty() {
-                    // Single text part → plain string; mixed parts stay array.
-                    let only_text = text_parts.len() == 1 && text_parts[0]["type"] == "text";
-                    let content = if only_text {
-                        text_parts[0]["text"].clone()
-                    } else {
-                        Value::Array(text_parts)
-                    };
-                    messages.push(json!({"role": "user", "content": content}));
+                } else {
+                    // tool_result blocks must land immediately after the
+                    // assistant tool_calls turn, before this turn's own user
+                    // text — OpenAI-compat providers 400 on a `role: tool`
+                    // message that doesn't directly follow it.
+                    messages.append(&mut tool_results);
+                    if !text_parts.is_empty() {
+                        // Single text part → plain string; mixed parts stay array.
+                        let only_text = text_parts.len() == 1 && text_parts[0]["type"] == "text";
+                        let content = if only_text {
+                            text_parts[0]["text"].clone()
+                        } else {
+                            Value::Array(text_parts)
+                        };
+                        messages.push(json!({"role": "user", "content": content}));
+                    }
                 }
                 messages.extend(tool_results);
             }
@@ -757,6 +764,34 @@ mod tests {
         assert_eq!(parts[0]["type"], "image_url");
         assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,AAAA");
         assert_eq!(parts[1], json!({"type": "text", "text": "what is this"}));
+    }
+
+    #[test]
+    fn mixed_tool_result_and_text_turn_orders_tool_first() {
+        let req = json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "what's the weather"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Jakarta"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "sunny"},
+                    {"type": "text", "text": "also note X"}
+                ]}
+            ]
+        });
+        let out = anthropic_to_openai_request(&req).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0], json!({"role": "user", "content": "what's the weather"}));
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], "tu_1");
+        // The tool result must come immediately after the assistant tool_calls
+        // turn, before the accompanying user text — OpenAI-compat providers
+        // 400 on a `role: tool` message that doesn't directly follow it.
+        assert_eq!(msgs[2], json!({"role": "tool", "tool_call_id": "tu_1", "content": "sunny"}));
+        assert_eq!(msgs[3], json!({"role": "user", "content": "also note X"}));
     }
 
     #[test]

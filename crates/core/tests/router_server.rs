@@ -10,33 +10,43 @@ async fn mock_openai_upstream() -> (u16, tokio::task::JoinHandle<()>) {
     use axum::http::header;
     use axum::response::{IntoResponse, Response};
     use axum::{routing::post, Json, Router};
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(|Json(body): Json<serde_json::Value>| async move {
-            assert_eq!(body["messages"][0]["content"], "hi");
-            if body["stream"].as_bool().unwrap_or(false) {
-                let sse = concat!(
-                    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"He\"}}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"llo\"}}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n",
-                    "data: [DONE]\n\n",
-                );
-                return Response::builder()
-                    .status(200)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from(sse))
-                    .unwrap()
-                    .into_response();
-            }
-            Json(json!({
-                "id": "chatcmpl-mock", "object": "chat.completion", "model": body["model"],
-                "choices": [{"index": 0, "finish_reason": "stop",
-                             "message": {"role": "assistant", "content": "hello from mock"}}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 2}
-            }))
-            .into_response()
-        }),
-    );
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                let content = body["messages"][0]["content"].as_str().unwrap_or_default();
+                // Small fixture requests keep the original strict check; the
+                // large-body test below sends a multi-MB payload instead.
+                if content.len() <= 64 {
+                    assert_eq!(content, "hi");
+                }
+                if body["stream"].as_bool().unwrap_or(false) {
+                    let sse = concat!(
+                        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"He\"}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"llo\"}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    return Response::builder()
+                        .status(200)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                        .into_response();
+                }
+                Json(json!({
+                    "id": "chatcmpl-mock", "object": "chat.completion", "model": body["model"],
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": "hello from mock"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+                }))
+                .into_response()
+            }),
+        )
+        // Stand-in for a real upstream: real OpenAI-compatible APIs don't run
+        // behind axum's 2 MB default, so the mock shouldn't either — this
+        // test is about the router's own limit, not the mock's.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -317,6 +327,24 @@ async fn openai_client_streams_from_anthropic_upstream() {
     assert!(idx_role < idx_content, "role chunk must precede content chunk");
     assert!(idx_content < idx_finish, "content chunk must precede finish_reason chunk");
     assert!(idx_finish < idx_done, "finish_reason chunk must precede [DONE]");
+}
+
+/// Claude Code posts multi-MB conversations (base64 images) to /v1/messages;
+/// axum's 2 MB default body limit must not 413 those.
+#[tokio::test]
+async fn large_bodies_are_accepted() {
+    let (_store, key, port) = setup().await;
+    let client = reqwest::Client::new();
+    let big_content = "a".repeat(3_000_000);
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", &key)
+        .json(&json!({"model": "custom-openai/mock-model", "max_tokens": 8,
+                      "messages": [{"role": "user", "content": big_content}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]

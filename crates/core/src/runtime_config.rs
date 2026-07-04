@@ -207,6 +207,16 @@ pub fn codex_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> anyhow
     } else {
         toml_edit::DocumentMut::new()
     };
+    // Guard against valid-but-wrong-shape TOML (e.g. `model_providers = "x"`):
+    // `doc["model_providers"]["ryuzi"] = ..` below panics if model_providers
+    // exists but isn't a table, so refuse up front — before any write, same
+    // as the unparseable-doc / corrupt-auth.json guards.
+    if doc.get("model_providers").is_some_and(|item| item.as_table().is_none()) {
+        return Err(anyhow::anyhow!(
+            "refusing to modify {}: model_providers is not a table",
+            path.display()
+        ));
+    }
     // auth.json: OPENAI_API_KEY so codex sends our key to the ryuzi provider.
     // Parse + shape-check it BEFORE writing config.toml so a corrupt auth.json
     // can never leave config.toml half-applied.
@@ -539,6 +549,22 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), cfg_text);
         assert_eq!(std::fs::read_to_string(&auth).unwrap(), "null");
+    }
+
+    // -- Final-review F3: panic on valid-but-non-table model_providers -------
+
+    #[test]
+    fn codex_apply_refuses_non_table_model_providers() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = home.path().join(".codex/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        let cfg_text = "model_providers = \"x\"\n";
+        std::fs::write(&cfg, cfg_text).unwrap();
+
+        assert!(codex_apply(home.path(), &ep(), &mapping()).is_err());
+
+        // Untouched: refuse before any write, same as the other codex guards.
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), cfg_text);
     }
 
     // -- Minor: no-op reset must not rewrite/reformat JSON --------------------
