@@ -1,137 +1,92 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { useStore } from "./store";
-import { useUi } from "./store-ui";
-import { ProjectsTree } from "./components/ProjectsTree";
-import { SessionTranscript } from "./components/SessionTranscript";
-import { RightDock } from "./components/RightDock";
-import { TitleBar } from "./components/shell/TitleBar";
+import { useAgents } from "./store-agents";
+import { useNav } from "./store-nav";
 import { useDisableContextMenu } from "./lib/contextMenu";
-import {
-  Badge,
-  ResizableGroup,
-  ResizablePanel,
-  ResizableSeparator,
-  Toaster,
-  useDefaultLayout,
-  type PanelImperativeHandle,
-} from "@ryuzi/ui";
+import { TitleBar } from "./components/shell/TitleBar";
+import { Sidebar } from "./components/shell/Sidebar";
+import { ProjectSettingsModal } from "./components/modals/ProjectSettingsModal";
+import { HomeView } from "./views/HomeView";
+import { SessionView } from "./views/SessionView";
+import { ProvidersView } from "./views/ProvidersView";
+import { ProviderDetailView } from "./views/ProviderDetailView";
+import { AgentsView } from "./views/AgentsView";
+import { AgentDetailView } from "./views/AgentDetailView";
+import { SchedulerView } from "./views/SchedulerView";
+import { JobDetailView } from "./views/JobDetailView";
+import { JobNewView } from "./views/JobNewView";
+import { AppsView } from "./views/AppsView";
+import { AppDetailView } from "./views/AppDetailView";
+import { RegistryView } from "./views/RegistryView";
+import { GatewaysView } from "./views/GatewaysView";
+import { GatewayDetailView } from "./views/GatewayDetailView";
+import { SettingsView } from "./views/SettingsView";
+import { Badge, Toaster } from "@ryuzi/ui";
 
-/**
- * Animate programmatic collapse/expand only — drag must stay direct.
- *
- * `suppressSync` guards against a feedback loop: onResize fires for every
- * animation frame via ResizeObserver; the library's layout store already
- * reflects the target state synchronously, so the flag is defense-in-depth
- * against epsilon/timing edge cases and keeps sync semantics obvious. The
- * flag is raised before the imperative call and lowered by the same timeout
- * that removes the animation class, so drag-resize (which never raises it)
- * still syncs normally.
- */
-function useToggleSync(
-  open: boolean,
-  panel: React.RefObject<PanelImperativeHandle | null>,
-  group: React.RefObject<HTMLDivElement | null>,
-  suppressSync: React.RefObject<boolean>,
-) {
-  useEffect(() => {
-    const p = panel.current;
-    if (!p) return;
-    if (open === !p.isCollapsed()) return;
-    const g = group.current;
-    suppressSync.current = true;
-    g?.classList.add("panels-animating");
-    if (open) p.expand();
-    else p.collapse();
-    const t = setTimeout(() => {
-      suppressSync.current = false;
-      g?.classList.remove("panels-animating");
-    }, 250);
-    return () => {
-      // Reset eagerly on re-run/unmount so neither the class nor the flag can
-      // outlive a cancelled timer (e.g. StrictMode double-invoke, rapid
-      // toggles). A proceeding re-run re-raises both immediately.
-      clearTimeout(t);
-      suppressSync.current = false;
-      g?.classList.remove("panels-animating");
-    };
-  }, [open, panel, group, suppressSync]);
+function MainView() {
+  const view = useNav((s) => s.history.current);
+  switch (view.kind) {
+    case "home":
+      return <HomeView />;
+    case "session":
+      return <SessionView />;
+    case "providers":
+      return <ProvidersView />;
+    case "providerDetail":
+      return <ProviderDetailView id={view.id} />;
+    case "agents":
+      return <AgentsView />;
+    case "agentDetail":
+      return <AgentDetailView id={view.id} />;
+    case "scheduler":
+      return <SchedulerView />;
+    case "jobDetail":
+      return <JobDetailView id={view.id} />;
+    case "jobNew":
+      return <JobNewView />;
+    case "apps":
+      return <AppsView />;
+    case "appDetail":
+      return <AppDetailView id={view.id} />;
+    case "registry":
+      return <RegistryView />;
+    case "gateways":
+      return <GatewaysView />;
+    case "gatewayDetail":
+      return <GatewayDetailView id={view.id} />;
+    case "settings":
+      return <SettingsView />;
+  }
 }
 
 export default function App() {
   const init = useStore((s) => s.init);
+  const hydrateAgents = useAgents((s) => s.hydrate);
   const pending = useStore((s) => s.pendingApprovals.length);
-  const { leftPanelOpen, rightPanelOpen, setLeft, setRight } = useUi();
-  const leftPanel = useRef<PanelImperativeHandle>(null);
-  const rightPanel = useRef<PanelImperativeHandle>(null);
-  const groupEl = useRef<HTMLDivElement>(null);
-  const suppressLeftSync = useRef(false);
-  const suppressRightSync = useRef(false);
-  // Panels are always mounted (never conditionally rendered), so panelIds is
-  // unnecessary here — it only matters for conditionally-rendered panels per
-  // the useDefaultLayout .d.ts JSDoc.
-  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
-    id: "cockpit-main",
-    storage: typeof localStorage === "undefined" ? undefined : localStorage,
-  });
   useDisableContextMenu();
   useEffect(() => {
     init();
-  }, [init]);
-  useToggleSync(leftPanelOpen, leftPanel, groupEl, suppressLeftSync);
-  useToggleSync(rightPanelOpen, rightPanel, groupEl, suppressRightSync);
+    void hydrateAgents();
+  }, [init, hydrateAgents]);
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-surface-window text-foreground">
+    <div className="relative flex h-screen flex-col overflow-hidden text-sm text-foreground antialiased">
+      {/* Wallpaper behind the glass chrome; collapses to transparent when an OS backdrop is active. */}
+      <div aria-hidden className="absolute inset-0 z-0" style={{ background: "var(--wallpaper)" }} />
+      {/* Full-window glass layer — one blur pass for the whole chrome. */}
+      <div aria-hidden className="acrylic-chrome absolute inset-0 z-0" />
       <TitleBar />
       {pending > 0 && (
-        <div className="flex shrink-0 items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+        <div className="relative z-10 flex shrink-0 items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-700 dark:text-amber-300">
           <Badge variant="secondary">{pending}</Badge> session(s) need approval
         </div>
       )}
-      <ResizableGroup
-        elementRef={groupEl}
-        orientation="horizontal"
-        className="min-h-0 flex-1"
-        defaultLayout={defaultLayout}
-        onLayoutChanged={onLayoutChanged}
-      >
-        <ResizablePanel
-          panelRef={leftPanel}
-          id="left"
-          collapsible
-          defaultSize="260px"
-          minSize="200px"
-          maxSize="400px"
-          className="min-h-0"
-          onResize={() => {
-            if (suppressLeftSync.current) return;
-            const p = leftPanel.current;
-            if (p) setLeft(!p.isCollapsed());
-          }}
-        >
-          <ProjectsTree />
-        </ResizablePanel>
-        <ResizableSeparator />
-        <ResizablePanel id="center" minSize="360px" className="flex min-h-0 min-w-0 flex-col bg-surface-layer">
-          <SessionTranscript />
-        </ResizablePanel>
-        <ResizableSeparator />
-        <ResizablePanel
-          panelRef={rightPanel}
-          id="right"
-          collapsible
-          defaultSize="360px"
-          minSize="280px"
-          maxSize="560px"
-          className="min-h-0 bg-surface-layer"
-          onResize={() => {
-            if (suppressRightSync.current) return;
-            const p = rightPanel.current;
-            if (p) setRight(!p.isCollapsed());
-          }}
-        >
-          <RightDock />
-        </ResizablePanel>
-      </ResizableGroup>
+      <div className="relative z-10 flex min-h-0 flex-1">
+        <Sidebar />
+        <main className="acrylic-main mx-2.5 mb-2.5 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-border shadow-sm">
+          <MainView />
+        </main>
+      </div>
+      <ProjectSettingsModal />
       <Toaster richColors position="bottom-right" />
     </div>
   );

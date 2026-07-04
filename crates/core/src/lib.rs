@@ -1,13 +1,19 @@
+pub mod agents;
 pub mod approval;
 pub mod connector;
 pub mod control;
 pub mod domain;
+pub mod fsview;
 pub mod gateway;
+pub mod gateways;
 pub mod harness;
 pub mod integration;
+pub mod mcp;
 pub mod paths;
 pub mod policy;
+pub mod providers;
 pub mod registry;
+pub mod scheduler;
 pub mod store;
 pub mod worktree;
 

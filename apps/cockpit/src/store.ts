@@ -24,7 +24,8 @@ type State = {
   start: (projectId: string, prompt: string) => Promise<void>;
   send: (sessionPk: string, prompt: string) => Promise<void>;
   stop: (sessionPk: string) => Promise<void>;
-  end: (sessionPk: string) => Promise<void>;
+  /** Resolves true only when the backend teardown actually succeeded. */
+  end: (sessionPk: string) => Promise<boolean>;
   resolveApproval: (requestId: string, allow: boolean) => Promise<void>;
   hydrateTranscript: (pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
   init: () => Promise<void>;
@@ -167,6 +168,7 @@ export const useStore = create<State>((set, get) => ({
       toast.error("Couldn't end session: " + res.error.message);
     }
     await get().refresh();
+    return res.status === "ok";
   },
   resolveApproval: async (requestId, allow) => {
     try {
@@ -180,6 +182,11 @@ export const useStore = create<State>((set, get) => ({
 
   init: async () => {
     await get().refresh();
-    await events.coreEventMsg.listen((e) => get().applyCoreEvent(e.payload.event));
+    await events.coreEventMsg.listen((e) => {
+      get().applyCoreEvent(e.payload.event);
+      // Sessions can be created outside UI actions (e.g. scheduler runs) —
+      // refresh the list so they appear in the sidebar immediately.
+      if (e.payload.event.kind === "sessionCreated") void get().refresh();
+    });
   },
 }));

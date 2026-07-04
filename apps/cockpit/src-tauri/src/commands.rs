@@ -1,10 +1,39 @@
 use crate::error::CmdError;
-use ryuzi_core::{ControlPlane, Message, Project, Session};
+use ryuzi_core::{ControlPlane, Message, PermMode, Project, Session};
 use std::sync::Arc;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
 type R<T> = Result<T, CmdError>;
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_setting(cp: State<'_, Arc<ControlPlane>>, key: String) -> R<Option<String>> {
+    Ok(cp.store().get_setting(&key).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_setting(cp: State<'_, Arc<ControlPlane>>, key: String, value: String) -> R<()> {
+    Ok(cp.store().set_setting(&key, &value).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_project(
+    cp: State<'_, Arc<ControlPlane>>,
+    project_id: String,
+    model: Option<String>,
+    perm_mode: PermMode,
+    harness: String,
+) -> R<Project> {
+    cp.store()
+        .update_project(&project_id, model, perm_mode, &harness)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown project: {project_id}"),
+        })
+}
 
 #[tauri::command]
 #[specta::specta]

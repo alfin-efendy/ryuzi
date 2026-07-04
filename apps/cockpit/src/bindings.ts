@@ -86,6 +86,405 @@ async pickDirectory() : Promise<string | null> {
 async backdropCapability() : Promise<BackdropCapability> {
     return await TAURI_INVOKE("backdrop_capability");
 },
+async getSetting(key: string) : Promise<Result<string | null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_setting", { key }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setSetting(key: string, value: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_setting", { key, value }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProject(projectId: string, model: string | null, permMode: PermMode, harness: string) : Promise<Result<Project, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project", { projectId, model, permMode, harness }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listAgents() : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_agents") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Re-probe every catalog agent (PATH + --version + npm latest + local model
+ * list for ollama), persist the snapshot, and return the fresh assembly.
+ */
+async refreshAgents() : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_agents") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateAgent(id: string, enabled: boolean, model: string | null, permMode: string, flags: string) : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_agent", { id, enabled, model, permMode, flags }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setAgentTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_agent_tier", { id, tierId, value, combo }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setDefaultAgent(id: string) : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_default_agent", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listGateways() : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_gateways") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Live probe: local telemetry, WSL detection, and SSH TCP reachability.
+ */
+async probeGateways() : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("probe_gateways") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addGateway(name: string, host: string, port: number, username: string) : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_gateway", { name, host, port, username }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeGateway(id: string) : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_gateway", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateGateway(id: string, fsMode: string, paths: string[]) : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_gateway", { id, fsMode, paths }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async gatewayEvents(id: string) : Promise<Result<GatewayEventInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("gateway_events", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listProviders() : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_providers") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addProvider(id: string, name: string, kind: string, color: string) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_provider", { id, name, kind, color }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeProvider(id: string) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_provider", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProvider(id: string, enabled: boolean, strategy: string, failAuto: boolean, threshold: number, returnToPrimary: boolean) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_provider", { id, enabled, strategy, failAuto, threshold, returnToPrimary }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addProviderAccount(providerId: string, label: string, email: string, plan: string, sessionLimitTokens: number | null, weeklyLimitTokens: number | null) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_provider_account", { providerId, label, email, plan, sessionLimitTokens, weeklyLimitTokens }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeProviderAccount(accountId: string) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_provider_account", { accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setActiveAccount(providerId: string, accountId: string) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_active_account", { providerId, accountId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async moveProviderAccount(providerId: string, accountId: string, dir: number) : Promise<Result<ProviderInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("move_provider_account", { providerId, accountId, dir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listJobs() : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_jobs") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createJob(input: JobInput) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_job", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateJob(id: string, input: JobInput) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_job", { id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async toggleJob(id: string, enabled: boolean) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("toggle_job", { id, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteJob(id: string) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_job", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async runJobNow(id: string) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("run_job_now", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Preview helper for the natural-language schedule editor.
+ */
+async parseNaturalSchedule(text: string) : Promise<string | null> {
+    return await TAURI_INVOKE("parse_natural_schedule", { text });
+},
+async listApps() : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_apps") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addApp(input: AddAppInput) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_app", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeApp(id: string) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_app", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async probeApp(id: string) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("probe_app", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateAppScope(id: string, scope: string, scopeGateways: string[]) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_app_scope", { id, scope, scopeGateways }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setAppToolPerm(id: string, tool: string, perm: string) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_app_tool_perm", { id, tool, perm }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async toggleAppAgent(id: string, agentId: string, allowed: boolean) : Promise<Result<AppInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("toggle_app_agent", { id, agentId, allowed }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async registrySearch(query: string | null, cursor: string | null) : Promise<Result<RegistryPage, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("registry_search", { query, cursor }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listDir(sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_dir", { sessionPk, rel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Absolute root path of the session's working tree (for opening files).
+ */
+async sessionWorkdir(sessionPk: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("session_workdir", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * What the session's OWN worktree would lose on teardown — the archive flow
+ * asks before discarding either kind of work. Sessions whose worktree is
+ * gone (or isn't a repo, e.g. an emptied leftover dir) report clean —
+ * deliberately NOT the project-workdir fallback: the main checkout's state
+ * is the user's business, not the session's.
+ */
+async worktreeDirty(sessionPk: string) : Promise<Result<WorktreeState, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("worktree_dirty", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async gitDiff(sessionPk: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("git_diff", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async searchFiles(projectId: string, query: string) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("search_files", { projectId, query }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open a shell in the session's worktree (or the project workdir).
+ */
+async termOpen(sessionPk: string, cols: number, rows: number) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_open", { sessionPk, cols, rows }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async termInput(id: string, data: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_input", { id, data }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async termResize(id: string, cols: number, rows: number) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_resize", { id, cols, rows }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async termClose(id: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_close", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Kill every shell opened for a session — the archive/end flow runs this
+ * BEFORE worktree teardown, or the shells' cwd handles block the directory
+ * removal on Windows.
+ */
+async termCloseSession(sessionPk: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("term_close_session", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 }
@@ -96,10 +495,14 @@ async systemAccentColor() : Promise<string | null> {
 
 export const events = __makeEvents__<{
 accentChangedMsg: AccentChangedMsg,
-coreEventMsg: CoreEventMsg
+coreEventMsg: CoreEventMsg,
+termExitMsg: TermExitMsg,
+termOutputMsg: TermOutputMsg
 }>({
 accentChangedMsg: "accent-changed-msg",
-coreEventMsg: "core-event-msg"
+coreEventMsg: "core-event-msg",
+termExitMsg: "term-exit-msg",
+termOutputMsg: "term-output-msg"
 })
 
 /** user-defined constants **/
@@ -109,13 +512,48 @@ coreEventMsg: "core-event-msg"
 /** user-defined types **/
 
 export type AccentChangedMsg = { hex: string }
+export type AccountInfo = { id: string; label: string; email: string; plan: string; active: boolean; sessionLimitTokens: number | null; weeklyLimitTokens: number | null; quotas: QuotaInfo[] }
+export type AddAppInput = { id: string | null; name: string; description: string; kind: string | null; 
+/**
+ * stdio | http
+ */
+transport: string; command: string | null; args: string[]; 
+/**
+ * KEY=VALUE pairs.
+ */
+env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
+export type AgentAccessInfo = { agentId: string; allowed: boolean }
+export type AgentInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
+/**
+ * Whether Cockpit has a session harness for this agent today.
+ */
+runnable: boolean }
+export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CmdError = { message: string }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | { kind: "sessionEnded"; session_pk: string }
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | { kind: "sessionEnded"; session_pk: string } | 
+/**
+ * A scheduled job run started or finished (status: running|success|failed).
+ */
+{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string }
 export type CoreEventMsg = { event: CoreEvent }
+export type DirEntryInfo = { name: string; dir: boolean }
+export type GatewayEventInfo = { at: number; level: string; text: string }
+export type GatewayInfo = { id: string; name: string; badge: string; 
+/**
+ * local | wsl | ssh
+ */
+kind: string; detail: string; metaLine: string; 
+/**
+ * connected | offline
+ */
+status: string; latency: string | null; daemonVersion: string; uptime: string | null; lastSeenMs: number | null; resources: GatewayResourceInfo[]; fingerprint: string | null; fsMode: string; paths: string[] }
+export type GatewayResourceInfo = { label: string; sub: string; pct: number }
+export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
+export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
@@ -123,8 +561,53 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | Partial
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
+export type ProviderInfo = { id: string; name: string; color: string; initial: string; kind: string; enabled: boolean; strategy: string; failAuto: boolean; threshold: number; returnToPrimary: boolean; accounts: AccountInfo[]; usage: UsagePoint[]; 
+/**
+ * Whether local usage data is attributable to this provider (the engine
+ * runs Claude today, so only `anthropic` gets the local usage series).
+ */
+tracksUsage: boolean }
+export type QuotaInfo = { label: string; pct: number; used: string; max: string; resets: string }
+export type RegistryEntry = { 
+/**
+ * Registry name, e.g. `io.github.owner/server`.
+ */
+id: string; name: string; desc: string; version: string | null; publisher: string; 
+/**
+ * stdio (npm package) | http (remote)
+ */
+kind: string; 
+/**
+ * npm identifier for stdio entries; URL for remotes.
+ */
+installTarget: string | null; website: string | null }
+export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null }
+export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
+export type TermExitMsg = { id: string }
+export type TermOutputMsg = { id: string; 
+/**
+ * UTF-8 chunk (lossy) of PTY output.
+ */
+data: string }
+export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
+export type ToolInfo = { name: string; desc: string; perm: string }
+export type UsagePoint = { day: string; 
+/**
+ * Estimated tokens that day (chars/4 over persisted transcripts).
+ */
+tok: number }
+export type WorktreeState = { 
+/**
+ * Uncommitted work (staged, unstaged, or untracked).
+ */
+dirty: boolean; 
+/**
+ * Commits reachable only from the session branch — deleting the branch
+ * would strand them.
+ */
+unmergedCommits: number }
 
 /** tauri-specta globals **/
 

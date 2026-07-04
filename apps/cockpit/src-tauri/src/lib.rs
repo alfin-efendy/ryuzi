@@ -1,8 +1,16 @@
 mod accent;
+mod agents_cmd;
+mod apps_cmd;
 mod backdrop;
 mod commands;
 mod error;
 mod events;
+mod fsview_cmd;
+mod gateways_cmd;
+mod providers_cmd;
+mod registry_cmd;
+mod scheduler_cmd;
+mod term;
 
 use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
 use tauri::Manager;
@@ -171,9 +179,75 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::read_file,
             commands::pick_directory,
             commands::backdrop_capability,
+            commands::get_setting,
+            commands::set_setting,
+            commands::update_project,
+            agents_cmd::list_agents,
+            agents_cmd::refresh_agents,
+            agents_cmd::update_agent,
+            agents_cmd::set_agent_tier,
+            agents_cmd::set_default_agent,
+            gateways_cmd::list_gateways,
+            gateways_cmd::probe_gateways,
+            gateways_cmd::add_gateway,
+            gateways_cmd::remove_gateway,
+            gateways_cmd::update_gateway,
+            gateways_cmd::gateway_events,
+            providers_cmd::list_providers,
+            providers_cmd::add_provider,
+            providers_cmd::remove_provider,
+            providers_cmd::update_provider,
+            providers_cmd::add_provider_account,
+            providers_cmd::remove_provider_account,
+            providers_cmd::set_active_account,
+            providers_cmd::move_provider_account,
+            scheduler_cmd::list_jobs,
+            scheduler_cmd::create_job,
+            scheduler_cmd::update_job,
+            scheduler_cmd::toggle_job,
+            scheduler_cmd::delete_job,
+            scheduler_cmd::run_job_now,
+            scheduler_cmd::parse_natural_schedule,
+            apps_cmd::list_apps,
+            apps_cmd::add_app,
+            apps_cmd::remove_app,
+            apps_cmd::probe_app,
+            apps_cmd::update_app_scope,
+            apps_cmd::set_app_tool_perm,
+            apps_cmd::toggle_app_agent,
+            registry_cmd::registry_search,
+            fsview_cmd::list_dir,
+            fsview_cmd::session_workdir,
+            fsview_cmd::worktree_dirty,
+            fsview_cmd::git_diff,
+            fsview_cmd::search_files,
+            term::term_open,
+            term::term_input,
+            term::term_resize,
+            term::term_close,
+            term::term_close_session,
             accent::system_accent_color,
         ])
-        .events(collect_events![events::CoreEventMsg, accent::AccentChangedMsg])
+        .events(collect_events![
+            events::CoreEventMsg,
+            accent::AccentChangedMsg,
+            term::TermOutputMsg,
+            term::TermExitMsg
+        ])
+}
+
+/// Write `src/bindings.ts` for the current command/event surface. Used by the
+/// dev-run export, the `export_bindings` test, and the `gen-bindings` bin
+/// (which exists because the Windows lib-test harness crashes at startup —
+/// tauri-apps/tauri#13419 — while bin artifacts get the app manifest linked).
+pub fn export_bindings(out: &std::path::Path) {
+    make_builder()
+        .export(
+            specta_typescript::Typescript::default()
+                .bigint(specta_typescript::BigIntExportBehavior::Number),
+            out,
+        )
+        .expect("export bindings");
 }
 
 pub fn run() {
@@ -182,13 +256,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
-        builder
-            .export(
-                specta_typescript::Typescript::default()
-                    .bigint(specta_typescript::BigIntExportBehavior::Number),
-                &out,
-            )
-            .expect("export bindings");
+        export_bindings(&out);
     }
 
     tauri::Builder::default()
@@ -207,8 +275,13 @@ pub fn run() {
             });
             // Subscribe BEFORE manage() moves the Arc.
             let mut rx = cp.subscribe();
+            // The scheduler loop fires enabled jobs for real (30s tick). Runs
+            // on the tauri async runtime — setup() has no ambient tokio context.
+            tauri::async_runtime::spawn(ryuzi_core::scheduler::run_loop(cp.clone()));
             // Make Arc<ControlPlane> available to all Tauri commands.
             app.manage(cp);
+            // UI terminal registry (session shells over portable-pty).
+            app.manage(std::sync::Arc::new(term::UiTerms::default()));
             // Apply the OS backdrop (mica/vibrancy) at runtime and record what
             // actually applied. Static windowEffects config is forbidden: Tauri
             // picks effects by platform family and swallows failures, which on
@@ -249,16 +322,12 @@ mod tests {
 
     /// Generates `src/bindings.ts` without launching the Tauri GUI.
     /// Run via: `cargo test -p ryuzi-cockpit export_bindings -- --nocapture`
+    /// (On Windows prefer `cargo run -p ryuzi-cockpit --bin gen-bindings` —
+    /// the lib-test harness crashes at startup, tauri-apps/tauri#13419.)
     #[test]
-    fn export_bindings() {
+    fn export_bindings_test() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
-        make_builder()
-            .export(
-                specta_typescript::Typescript::default()
-                    .bigint(specta_typescript::BigIntExportBehavior::Number),
-                &out,
-            )
-            .expect("export bindings");
+        export_bindings(&out);
     }
 
     #[test]
