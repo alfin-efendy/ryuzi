@@ -583,30 +583,41 @@ impl Store {
         Ok(())
     }
 
+    /// Merge `patch` into the tool_call row's payload (SQLite `json_patch`,
+    /// so the original `{name, input}` survives an `{output: …}` update),
+    /// optionally flip status, and return the row's seq, the merged payload,
+    /// and its persisted tool_kind — the caller re-emits all three.
     pub async fn update_tool_call(
         &self,
         session_pk: &str,
         tool_call_id: &str,
         status: Option<&str>,
-        payload: &serde_json::Value,
-    ) -> anyhow::Result<i64> {
+        patch: &serde_json::Value,
+    ) -> anyhow::Result<(i64, serde_json::Value, Option<String>)> {
         let session_pk = session_pk.to_string();
         let tool_call_id = tool_call_id.to_string();
         let status = status.map(|s| s.to_string());
-        let payload = serde_json::to_string(payload)?;
+        let patch = serde_json::to_string(patch)?;
         let conn = self.pool.get().await?;
-        let seq = conn
+        let (seq, payload, tool_kind) = conn
             .interact(move |c| {
                 c.query_row(
-                    "UPDATE messages SET payload=?3, status=COALESCE(?4, status) \
-                     WHERE session_pk=?1 AND tool_call_id=?2 RETURNING seq",
-                    params![session_pk, tool_call_id, payload, status],
-                    |r| r.get::<_, i64>(0),
+                    "UPDATE messages SET payload=json_patch(payload, ?3), status=COALESCE(?4, status) \
+                     WHERE session_pk=?1 AND tool_call_id=?2 RETURNING seq, payload, tool_kind",
+                    params![session_pk, tool_call_id, patch, status],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
                 )
             })
             .await
             .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
-        Ok(seq)
+        let payload: serde_json::Value = serde_json::from_str(&payload)?;
+        Ok((seq, payload, tool_kind))
     }
 }
 
@@ -703,7 +714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_call_row_can_be_upserted_by_tool_call_id() {
+    async fn tool_call_update_merges_output_and_returns_kind() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
 
@@ -714,15 +725,27 @@ mod tests {
             tool_kind: Some("execute".into()),
         }).await.unwrap();
 
-        let updated_seq = store.update_tool_call("s1", "tc-1", Some("completed"),
-            &serde_json::json!({"name": "Bash", "input": {"command": "ls"}, "output": "file.txt"}))
+        // The caller now sends ONLY the update patch; the store merges it.
+        let (seq, merged, kind) = store.update_tool_call("s1", "tc-1", Some("completed"),
+            &serde_json::json!({"output": "file.txt"}))
             .await.unwrap();
-        assert_eq!(updated_seq, 1, "update_tool_call must return the row's real seq");
+        assert_eq!(seq, 1, "update_tool_call must return the row's real seq");
+        assert_eq!(merged["name"], "Bash", "merge must preserve the original name");
+        assert_eq!(merged["input"]["command"], "ls", "merge must preserve the original input");
+        assert_eq!(merged["output"], "file.txt", "merge must add the output");
+        assert_eq!(kind.as_deref(), Some("execute"), "must return the row's persisted tool_kind");
 
         let rows = store.list_messages("s1").await.unwrap();
         assert_eq!(rows.len(), 1, "update must not insert a new row");
         assert_eq!(rows[0].status.as_deref(), Some("completed"));
+        assert_eq!(rows[0].payload["name"], "Bash");
         assert_eq!(rows[0].payload["output"], "file.txt");
+
+        // An empty patch (ToolCallDone with no raw_output) must leave payload intact.
+        let (_, merged2, _) = store.update_tool_call("s1", "tc-1", None,
+            &serde_json::json!({})).await.unwrap();
+        assert_eq!(merged2["name"], "Bash");
+        assert_eq!(merged2["output"], "file.txt");
     }
 
     #[tokio::test]

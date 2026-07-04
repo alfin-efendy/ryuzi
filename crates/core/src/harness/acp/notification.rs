@@ -305,16 +305,20 @@ pub async fn handle(notification: SessionNotification, sink: &NotificationSink) 
                 .update_tool_call(&session_pk, &id, Some(status), &output_payload)
                 .await
             {
-                Ok(seq) => {
+                // Re-emit with the ORIGINAL row seq (identity-correct: the
+                // frontend upserts by tool_call_id, not seq) and the MERGED
+                // payload + persisted kind, so live completion renders with
+                // name + input + output intact.
+                Ok((seq, merged_payload, tool_kind)) => {
                     let _ = sink.events.send(CoreEvent::Message {
                         session_pk: session_pk.clone(),
                         seq,
                         role: "assistant".into(),
                         block_type: "tool_call".into(),
-                        payload: output_payload,
+                        payload: merged_payload,
                         tool_call_id: Some(id),
                         status: Some(status.into()),
-                        tool_kind: None,
+                        tool_kind,
                     });
                 }
                 Err(e) => {
