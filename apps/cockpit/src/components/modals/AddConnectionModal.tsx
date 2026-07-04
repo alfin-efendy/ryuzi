@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Loader2 } from "lucide-react";
 import { useConnections } from "@/store-connections";
 import type { CatalogEntry, ManualStartInfo } from "@/bindings";
@@ -31,6 +31,15 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
   const [oauthStep, setOauthStep] = useState<OauthStep>("form");
   const [manualInfo, setManualInfo] = useState<ManualStartInfo | null>(null);
   const [pasted, setPasted] = useState("");
+
+  // Tracks the "currently picked" provider even inside async closures that
+  // captured an earlier `picked` value — lets in-flight requests detect that
+  // the user backed out and switched providers while they were awaiting.
+  const pickedRef = useRef<CatalogEntry | null>(picked);
+  useEffect(() => {
+    pickedRef.current = picked;
+  }, [picked]);
+
   if (!open) return null;
 
   const reset = () => {
@@ -38,6 +47,7 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
     setLabel("");
     setApiKey("");
     setBaseUrl("");
+    setSaving(false);
     setOauthStep("form");
     setManualInfo(null);
     setPasted("");
@@ -67,9 +77,14 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
 
   const connectBrowser = async () => {
     if (!picked || saving) return;
+    const target = picked;
     setSaving(true);
     setOauthStep("waiting-browser");
-    const ok = await connectOauth(picked.id, label.trim() || picked.name);
+    const ok = await connectOauth(target.id, label.trim() || target.name);
+    // The user may have backed out and picked a different provider while
+    // this was in flight — if so, this result is stale and must not touch
+    // state that now belongs to the new pick (e.g. force-closing the modal).
+    if (pickedRef.current?.id !== target.id) return;
     setSaving(false);
     if (ok) close();
     else setOauthStep("form");
@@ -77,8 +92,10 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
 
   const startManual = async () => {
     if (!picked || saving) return;
+    const target = picked;
     setSaving(true);
-    const info = await beginOauthManual(picked.id);
+    const info = await beginOauthManual(target.id);
+    if (pickedRef.current?.id !== target.id) return;
     setSaving(false);
     if (info) {
       setManualInfo(info);
@@ -88,15 +105,18 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
 
   const submitManual = async () => {
     if (!picked || !manualInfo || saving || pasted.trim().length === 0) return;
+    const target = picked;
+    const targetInfo = manualInfo;
     setSaving(true);
     const ok = await completeOauthManual(
-      picked.id,
-      label.trim() || picked.name,
-      manualInfo.verifier,
-      manualInfo.state,
+      target.id,
+      label.trim() || target.name,
+      targetInfo.verifier,
+      targetInfo.state,
       pasted.trim(),
-      manualInfo.redirectUri,
+      targetInfo.redirectUri,
     );
+    if (pickedRef.current?.id !== target.id) return;
     setSaving(false);
     if (ok) close();
   };
@@ -109,7 +129,10 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
           <p className="mb-4 mt-1 text-[12.5px] text-muted-foreground">Pick a provider to connect.</p>
           <div className="grid grid-cols-2 gap-2">
             {catalog.map((ci) => {
-              const disabled = NOT_YET_WIRED.has(ci.id);
+              // `saving` means an oauth/api-key/free request is in flight for the
+              // currently picked provider — block switching providers mid-flight
+              // so a late-resolving promise can't apply to the wrong pick.
+              const disabled = NOT_YET_WIRED.has(ci.id) || saving;
               return (
                 <button
                   key={ci.id}
@@ -200,7 +223,7 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
 
           {picked.category === "oauth" && (
             <>
-              {oauthStep !== "manual" && (
+              {oauthStep === "form" && (
                 <div className="mt-3.5 flex flex-col gap-3">
                   <label className="flex flex-col gap-1.5">
                     <span className="text-xs font-semibold">Label</span>
@@ -258,7 +281,8 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
             <button
               type="button"
               onClick={reset}
-              className="flex h-[30px] cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2.5 font-sans text-[12.5px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              disabled={saving}
+              className="flex h-[30px] cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2.5 font-sans text-[12.5px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               <ArrowLeft aria-hidden size={12} strokeWidth={2} />
               Back
