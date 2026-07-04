@@ -27,6 +27,7 @@ specta = { version = "2.0.0-rc.22", features = ["derive"] }
 tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }
 specta-typescript = "0.0.9"
 anyhow = "1"
+dirs = "5"
 
 [target."cfg(windows)".dependencies]
 windows = { version = "0.62.2", features = ["UI_ViewManagement", "Foundation"] }

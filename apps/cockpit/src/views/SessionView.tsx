@@ -21,7 +21,7 @@ import { useUi } from "@/store-ui";
 import { useNav, type RightTab } from "@/store-nav";
 import { commands } from "@/bindings";
 import { parseUnifiedDiff, type DiffLine, type ReviewFile } from "@/lib/diff";
-import { agentById, defaultAgentOf, useAgents } from "@/store-agents";
+import { runtimeById, defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { basename } from "@/lib/paths";
 import { projectLabel } from "@/lib/sidebar";
@@ -63,8 +63,8 @@ export function SessionView() {
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
   const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
-  const agents = useAgents((s) => s.agents);
-  const agent = agentById(agents, nav.composerAgent) ?? defaultAgentOf(agents);
+  const runtimes = useRuntimes((s) => s.runtimes);
+  const agent = runtimeById(runtimes, nav.composerAgent) ?? defaultRuntimeOf(runtimes);
   const project = projects.find((p) => p.projectId === session?.projectId);
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
 

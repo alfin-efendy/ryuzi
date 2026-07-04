@@ -262,6 +262,17 @@ pub enum CoreEvent {
         run_id: String,
         status: String,
     },
+    /// A runtime npm install/update produced an output line.
+    RuntimeUpdateLog {
+        runtime_id: String,
+        line: String,
+    },
+    /// A runtime npm install/update finished (ok=false → message has detail).
+    RuntimeUpdateDone {
+        runtime_id: String,
+        ok: bool,
+        message: Option<String>,
+    },
 }
 
 #[cfg(test)]

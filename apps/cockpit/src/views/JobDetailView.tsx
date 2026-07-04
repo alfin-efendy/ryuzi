@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ArrowUpRight, Check, ChevronDown, CircleAlert, Clock, Folder, GitBranch, Play, Server, Trash2 } from "lucide-react";
 import { commands } from "@/bindings";
-import { agentById, useAgents } from "@/store-agents";
+import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { formatDuration, formatNextRun, formatStarted, jobById, toInput, useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
@@ -198,7 +198,7 @@ const RUN_META: Record<string, { color: string; label: string }> = {
 
 export function JobDetailView({ id }: { id: string }) {
   const { jobs, loaded, hydrate, toggle, updateJob, remove, runNow } = useScheduler();
-  const agents = useAgents((s) => s.agents);
+  const runtimes = useRuntimes((s) => s.runtimes);
   const gateways = useGateways((s) => s.gateways);
   const setFocused = useStore((s) => s.setFocused);
   const nav = useNav();
@@ -214,7 +214,7 @@ export function JobDetailView({ id }: { id: string }) {
     return <div className="flex flex-1 items-center justify-center text-[13px] text-muted-foreground">Job not found.</div>;
   }
 
-  const agent = agentById(agents, j.agent);
+  const agent = runtimeById(runtimes, j.agent);
   const ws = gateways.find((w) => w.id === j.gateway);
   const wsName = ws?.name ?? j.gateway;
   const failedRuns = j.history.filter((r) => r.status === "failed").length;
@@ -301,7 +301,7 @@ export function JobDetailView({ id }: { id: string }) {
             </span>
             {agentMenuOpen && (
               <MenuPanel onClose={() => setAgentMenuOpen(false)} className="bottom-11 left-[18px] w-[280px]">
-                {agents
+                {runtimes
                   .filter((a) => a.enabled && a.binaryPath && a.runnable)
                   .map((a) => (
                     <MenuItem

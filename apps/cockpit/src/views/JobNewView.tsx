@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { ChevronDown, Folder, GitBranch, Server } from "lucide-react";
-import { useAgents } from "@/store-agents";
+import { useRuntimes } from "@/store-runtimes";
 import { useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
@@ -16,7 +16,7 @@ export function JobNewView() {
   const { createJob } = useScheduler();
   const nav = useNav();
   const projects = useStore((s) => s.projects);
-  const agents = useAgents((s) => s.agents);
+  const runtimes = useRuntimes((s) => s.runtimes);
   const { gateways, loaded: gwLoaded, hydrate: hydrateGw } = useGateways();
 
   const [prompt, setPrompt] = useState("");
@@ -33,8 +33,8 @@ export function JobNewView() {
     if (!gwLoaded) void hydrateGw();
   }, [gwLoaded, hydrateGw]);
 
-  const runnableAgents = agents.filter((a) => a.enabled && a.binaryPath && a.runnable);
-  const agent = agents.find((a) => a.id === agentId) ?? runnableAgents[0];
+  const runnableAgents = runtimes.filter((a) => a.enabled && a.binaryPath && a.runnable);
+  const agent = runtimes.find((a) => a.id === agentId) ?? runnableAgents[0];
   const project = projects.find((p) => p.projectId === projectId) ?? projects[0];
   const wsName = gateways.find((w) => w.id === gateway)?.name ?? gateway;
   const canCreate = prompt.trim().length > 0 && project !== undefined && !saving;

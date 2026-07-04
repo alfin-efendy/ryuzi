@@ -1,6 +1,6 @@
-//! Agents domain: the catalog of CLI coding agents Cockpit can drive, real
-//! binary detection, and the persisted per-agent configuration overlay
-//! (enabled/model/perm-mode/flags/tiers) that feeds session start.
+//! Runtimes domain: the catalog of CLI coding agents (runtimes) Cockpit can
+//! drive, real binary detection, and the persisted per-agent configuration
+//! overlay (enabled/model/perm-mode/flags/tiers) that feeds session start.
 //!
 //! Identity (names, colors, npm packages, model lists) is code; only user
 //! choices and detection snapshots persist.
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Static identity of a supported agent CLI.
-pub struct AgentDescriptor {
+pub struct RuntimeDescriptor {
     pub id: &'static str,
     pub name: &'static str,
     pub color: &'static str,
@@ -28,8 +28,8 @@ pub struct AgentDescriptor {
     pub tiers: &'static [(&'static str, &'static str, Option<&'static str>, bool)],
 }
 
-pub const CATALOG: &[AgentDescriptor] = &[
-    AgentDescriptor {
+pub const CATALOG: &[RuntimeDescriptor] = &[
+    RuntimeDescriptor {
         id: "claude",
         name: "Claude Code",
         color: "#D97757",
@@ -45,7 +45,7 @@ pub const CATALOG: &[AgentDescriptor] = &[
             ("fast", "Fast", Some("claude-haiku-4-5"), false),
         ],
     },
-    AgentDescriptor {
+    RuntimeDescriptor {
         id: "codex",
         name: "OpenAI Codex",
         color: "#0FA47F",
@@ -61,7 +61,7 @@ pub const CATALOG: &[AgentDescriptor] = &[
             ("fast", "Fast", None, false),
         ],
     },
-    AgentDescriptor {
+    RuntimeDescriptor {
         id: "gemini",
         name: "Gemini CLI",
         color: "#4285F4",
@@ -77,7 +77,7 @@ pub const CATALOG: &[AgentDescriptor] = &[
             ("fast", "Fast", Some("gemini-3.0-flash"), false),
         ],
     },
-    AgentDescriptor {
+    RuntimeDescriptor {
         id: "ollama",
         name: "Ollama (local)",
         color: "#8B8B8B",
@@ -93,15 +93,31 @@ pub const CATALOG: &[AgentDescriptor] = &[
             ("fast", "Fast", None, false),
         ],
     },
+    RuntimeDescriptor {
+        id: "opencode",
+        name: "OpenCode",
+        color: "#F5A623",
+        initial: "OC",
+        connection: "Multi-provider CLI",
+        binary: "opencode",
+        npm_package: Some("opencode-ai"),
+        models: &[],
+        default_model: "",
+        tiers: &[
+            ("default", "Default", None, false),
+            ("plan", "Plan", None, false),
+            ("fast", "Fast", None, false),
+        ],
+    },
 ];
 
-pub fn descriptor(id: &str) -> Option<&'static AgentDescriptor> {
+pub fn descriptor(id: &str) -> Option<&'static RuntimeDescriptor> {
     CATALOG.iter().find(|d| d.id == id)
 }
 
 /// Persisted per-agent user configuration.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AgentConfig {
+pub struct RuntimeConfig {
     pub id: String,
     pub enabled: bool,
     pub model: Option<String>,
@@ -255,13 +271,16 @@ pub fn parse_ollama_list(text: &str) -> Vec<String> {
 // Persistence
 // ---------------------------------------------------------------------------
 
-pub async fn list_configs(store: &Store) -> anyhow::Result<Vec<AgentConfig>> {
+// NOTE: the backing tables keep their legacy names `agents` / `agent_tiers`
+// (and the settings key `default_agent`) — renaming stored identifiers buys
+// nothing and would need a data migration.
+pub async fn list_configs(store: &Store) -> anyhow::Result<Vec<RuntimeConfig>> {
     store
         .with_conn(|c| {
             let mut stmt = c.prepare("SELECT id, enabled, model, perm_mode, flags FROM agents")?;
             let rows = stmt
                 .query_map([], |r| {
-                    Ok(AgentConfig {
+                    Ok(RuntimeConfig {
                         id: r.get(0)?,
                         enabled: r.get::<_, i64>(1)? != 0,
                         model: r.get(2)?,
@@ -275,7 +294,7 @@ pub async fn list_configs(store: &Store) -> anyhow::Result<Vec<AgentConfig>> {
         .await
 }
 
-pub async fn get_config(store: &Store, id: &str) -> anyhow::Result<Option<AgentConfig>> {
+pub async fn get_config(store: &Store, id: &str) -> anyhow::Result<Option<RuntimeConfig>> {
     let id = id.to_string();
     store
         .with_conn(move |c| {
@@ -283,7 +302,7 @@ pub async fn get_config(store: &Store, id: &str) -> anyhow::Result<Option<AgentC
                 "SELECT id, enabled, model, perm_mode, flags FROM agents WHERE id=?1",
                 params![id],
                 |r| {
-                    Ok(AgentConfig {
+                    Ok(RuntimeConfig {
                         id: r.get(0)?,
                         enabled: r.get::<_, i64>(1)? != 0,
                         model: r.get(2)?,
@@ -297,7 +316,7 @@ pub async fn get_config(store: &Store, id: &str) -> anyhow::Result<Option<AgentC
         .await
 }
 
-pub async fn upsert_config(store: &Store, cfg: AgentConfig) -> anyhow::Result<()> {
+pub async fn upsert_config(store: &Store, cfg: RuntimeConfig) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
@@ -387,6 +406,65 @@ pub async fn set_tier(
 pub struct SessionDefaults {
     pub model: Option<String>,
     pub perm_mode: Option<PermMode>,
+}
+
+/// Build the npm argv for updating `pkg` (separated for testability).
+pub fn npm_update_argv(pkg: &str) -> Vec<String> {
+    vec!["install".into(), "-g".into(), format!("{pkg}@latest")]
+}
+
+/// Run `npm install -g <pkg>@latest`, streaming each output line as a
+/// RuntimeUpdateLog event. Returns Ok(exit_success).
+pub async fn run_npm_update(
+    events: tokio::sync::broadcast::Sender<crate::domain::CoreEvent>,
+    id: &str,
+    pkg: &str,
+) -> anyhow::Result<bool> {
+    use tokio::io::AsyncBufReadExt;
+    let args = npm_update_argv(pkg);
+    // npm is a .cmd shim on Windows — run through cmd.exe like the version probe.
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg("npm").args(&args);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("npm");
+        c.args(&args);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn()?;
+    let mut out = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut errl = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let (id_a, id_b) = (id.to_string(), id.to_string());
+    let (ev_a, ev_b) = (events.clone(), events.clone());
+    let a = tokio::spawn(async move {
+        while let Ok(Some(line)) = out.next_line().await {
+            let _ = ev_a.send(crate::domain::CoreEvent::RuntimeUpdateLog {
+                runtime_id: id_a.clone(),
+                line,
+            });
+        }
+    });
+    let b = tokio::spawn(async move {
+        while let Ok(Some(line)) = errl.next_line().await {
+            let _ = ev_b.send(crate::domain::CoreEvent::RuntimeUpdateLog {
+                runtime_id: id_b.clone(),
+                line,
+            });
+        }
+    });
+    let status = child.wait().await?;
+    let _ = a.await;
+    let _ = b.await;
+    Ok(status.success())
 }
 
 pub async fn session_defaults(store: &Store) -> anyhow::Result<SessionDefaults> {
@@ -489,7 +567,7 @@ mod tests {
         // Agent config upsert round-trips.
         upsert_config(
             &store,
-            AgentConfig {
+            RuntimeConfig {
                 id: "claude".into(),
                 enabled: true,
                 model: Some("claude-sonnet-4-5".into()),
@@ -517,7 +595,7 @@ mod tests {
 
         upsert_config(
             &store,
-            AgentConfig {
+            RuntimeConfig {
                 id: "claude".into(),
                 enabled: true,
                 model: Some("claude-haiku-4-5".into()),
@@ -530,5 +608,16 @@ mod tests {
         let d = session_defaults(&store).await.unwrap();
         assert_eq!(d.model.as_deref(), Some("claude-haiku-4-5"));
         assert_eq!(d.perm_mode, Some(PermMode::BypassPermissions));
+    }
+}
+
+#[cfg(test)]
+mod npm_tests {
+    #[test]
+    fn npm_argv_targets_latest() {
+        assert_eq!(
+            super::npm_update_argv("@anthropic-ai/claude-code"),
+            vec!["install", "-g", "@anthropic-ai/claude-code@latest"]
+        );
     }
 }

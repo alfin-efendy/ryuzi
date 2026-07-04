@@ -6,7 +6,7 @@ import { Segmented } from "@/components/common/Segmented";
 import { Switch } from "@/components/common/Switch";
 import { Chip, StatusDot } from "@/components/common/bits";
 import { agentAllowed, appById, useApps } from "@/store-apps";
-import { useAgents } from "@/store-agents";
+import { useRuntimes } from "@/store-runtimes";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 
@@ -15,7 +15,7 @@ const rowLabel = "w-[120px] shrink-0 text-[13px] font-medium";
 export function AppDetailView({ id }: { id: string }) {
   const nav = useNav();
   const { apps, loaded, hydrate, probing, probe, remove, setScope, setToolPerm, toggleAgent } = useApps();
-  const agents = useAgents((s) => s.agents);
+  const runtimes = useRuntimes((s) => s.runtimes);
   const gateways = useGateways((s) => s.gateways);
   const goApps = () => nav.navigate({ kind: "apps" });
 
@@ -172,7 +172,7 @@ export function AppDetailView({ id }: { id: string }) {
             <CardTitle>Agent access</CardTitle>
             <CardHint>Which agents may call this app</CardHint>
           </CardHeader>
-          {agents.map((agent) => (
+          {runtimes.map((agent) => (
             <div key={agent.id} className="flex items-center gap-3 border-b border-border px-[18px] py-[11px] last:border-b-0">
               <StatusDot color={agent.color} size={8} />
               <span className="min-w-0 flex-1">

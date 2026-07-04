@@ -3,7 +3,7 @@ import { ArrowUp, ChevronDown, CircleAlert, FolderOpen, GitBranch, Mic, Plus } f
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { HOME_SUGGESTIONS } from "@/constants";
-import { agentById, defaultAgentOf, useAgents } from "@/store-agents";
+import { runtimeById, defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { projectLabel } from "@/lib/sidebar";
 import { AgentMenu } from "@/components/common/AgentMenu";
 import { MenuItem, MenuPanel, MenuSectionLabel, MenuSeparator } from "@/components/common/MenuPanel";
@@ -23,8 +23,8 @@ export function HomeView() {
   const [branchMenuOpen, setBranchMenuOpen] = useState(false);
 
   const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
-  const agents = useAgents((s) => s.agents);
-  const agent = agentById(agents, nav.composerAgent) ?? defaultAgentOf(agents);
+  const runtimes = useRuntimes((s) => s.runtimes);
+  const agent = runtimeById(runtimes, nav.composerAgent) ?? defaultRuntimeOf(runtimes);
 
   const branches = useMemo(() => {
     const fromSessions = sessions.filter((s) => s.projectId === project?.projectId && s.branch).map((s) => s.branch as string);

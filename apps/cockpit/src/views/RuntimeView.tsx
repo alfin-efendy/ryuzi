@@ -1,25 +1,39 @@
 import { cn } from "@ryuzi/ui";
-import { ChevronRight, RefreshCw } from "lucide-react";
+import { ChevronRight, Loader2, RefreshCw } from "lucide-react";
+import { useEffect, useState } from "react";
+import { commands } from "@/bindings";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { Card } from "@/components/common/Card";
 import { Switch } from "@/components/common/Switch";
-import { useAgents } from "@/store-agents";
+import { useRuntimes } from "@/store-runtimes";
 import { useNav } from "@/store-nav";
 
 const SUCCESS = "#22C55E";
 
-// Agents settings list: every CLI agent Cockpit can drive, with real binary
+// Runtime settings list: every CLI agent Cockpit can drive, with real binary
 // detection, default/update badges, enable toggles, and a detail screen path.
-export function AgentsView() {
-  const { agents, refreshing, refresh, update, setDefault } = useAgents();
+export function RuntimeView() {
+  const { runtimes, refreshing, refresh, update, setDefault, updating, beginUpdate } = useRuntimes();
   const navigate = useNav((s) => s.navigate);
+  const [configured, setConfigured] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (runtimes.length === 0) return;
+    void Promise.all(runtimes.map((r) => commands.runtimeConfigStatus(r.id))).then((results) => {
+      const next: Record<string, boolean> = {};
+      results.forEach((res, i) => {
+        if (res.status === "ok") next[runtimes[i].id] = res.data.configured;
+      });
+      setConfigured(next);
+    });
+  }, [runtimes]);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
       <div className="mx-auto max-w-[720px]">
         <div className="flex items-start gap-3">
           <div className="min-w-0 flex-1">
-            <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">Agents</h2>
+            <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">Runtime</h2>
             <p className="m-0 mb-5 text-[13px] text-muted-foreground">
               Cockpit is agent-agnostic. Any CLI coding agent can run a session — mix them across projects.
             </p>
@@ -35,7 +49,7 @@ export function AgentsView() {
           </button>
         </div>
         <div className="flex flex-col gap-3">
-          {agents.map((agent) => {
+          {runtimes.map((agent) => {
             const installed = agent.binaryPath !== null;
             const isDefault = agent.isDefault;
             const hasUpdate =
@@ -44,7 +58,8 @@ export function AgentsView() {
               agent.installedVersion !== null &&
               agent.latestVersion !== agent.installedVersion;
             const statusColor = installed ? SUCCESS : "var(--muted-foreground)";
-            const open = () => navigate({ kind: "agentDetail", id: agent.id });
+            const open = () => navigate({ kind: "runtimeDetail", id: agent.id });
+            const isUpdating = updating[agent.id] === true;
             return (
               <Card key={agent.id} className={cn("flex items-center gap-3.5 px-[18px] py-4", isDefault && "border-ring")}>
                 <Chip initial={agent.initial} color={agent.color} size={36} onClick={open} />
@@ -56,12 +71,25 @@ export function AgentsView() {
                   <span className="flex items-center gap-2">
                     <span className="text-sm font-semibold text-foreground">{agent.name}</span>
                     {isDefault && <Pill variant="primary">Default</Pill>}
-                    {hasUpdate && <Pill variant="warn">Update {agent.latestVersion}</Pill>}
+                    {configured[agent.id] && <Pill variant="mono">Routed via Ryuzi</Pill>}
                   </span>
                   <span className="mt-0.5 block text-[12.5px] text-muted-foreground">
                     {installed ? `${agent.model || agent.connection} · ${agent.connection}` : "Not installed"}
                   </span>
                 </button>
+                {hasUpdate && (
+                  <button
+                    type="button"
+                    disabled={isUpdating}
+                    onClick={() => void beginUpdate(agent.id)}
+                    title={agent.npmPackage ? `npm install -g ${agent.npmPackage}@latest` : undefined}
+                    className="flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-full border-none px-2 text-[10.5px] font-semibold tracking-[0.02em] disabled:cursor-not-allowed disabled:opacity-70"
+                    style={{ background: "color-mix(in oklab, #F59E0B 18%, transparent)", color: "#F59E0B" }}
+                  >
+                    {isUpdating && <Loader2 aria-hidden size={10} strokeWidth={2} className="animate-spin" />}
+                    {isUpdating ? "Updating…" : `Update ${agent.latestVersion}`}
+                  </button>
+                )}
                 <span className="flex shrink-0 items-center gap-1.5 text-xs" style={{ color: statusColor }}>
                   <StatusDot color={statusColor} />
                   {installed ? (agent.installedVersion ? `v${agent.installedVersion}` : "Installed") : "Not found"}

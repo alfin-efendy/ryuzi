@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useStore } from "./store";
-import { useAgents } from "./store-agents";
+import { useRuntimes } from "./store-runtimes";
 import { useNav } from "./store-nav";
 import { useDisableContextMenu } from "./lib/contextMenu";
 import { TitleBar } from "./components/shell/TitleBar";
@@ -8,10 +8,10 @@ import { Sidebar } from "./components/shell/Sidebar";
 import { ProjectSettingsModal } from "./components/modals/ProjectSettingsModal";
 import { HomeView } from "./views/HomeView";
 import { SessionView } from "./views/SessionView";
-import { ProvidersView } from "./views/ProvidersView";
-import { ProviderDetailView } from "./views/ProviderDetailView";
-import { AgentsView } from "./views/AgentsView";
-import { AgentDetailView } from "./views/AgentDetailView";
+import { ModelsView } from "./views/ModelsView";
+import { ConnectionDetailView } from "./views/ConnectionDetailView";
+import { RuntimeView } from "./views/RuntimeView";
+import { RuntimeDetailView } from "./views/RuntimeDetailView";
 import { SchedulerView } from "./views/SchedulerView";
 import { JobDetailView } from "./views/JobDetailView";
 import { JobNewView } from "./views/JobNewView";
@@ -30,14 +30,14 @@ function MainView() {
       return <HomeView />;
     case "session":
       return <SessionView />;
-    case "providers":
-      return <ProvidersView />;
-    case "providerDetail":
-      return <ProviderDetailView id={view.id} />;
-    case "agents":
-      return <AgentsView />;
-    case "agentDetail":
-      return <AgentDetailView id={view.id} />;
+    case "models":
+      return <ModelsView />;
+    case "connectionDetail":
+      return <ConnectionDetailView id={view.id} />;
+    case "runtime":
+      return <RuntimeView />;
+    case "runtimeDetail":
+      return <RuntimeDetailView id={view.id} />;
     case "scheduler":
       return <SchedulerView />;
     case "jobDetail":
@@ -61,7 +61,7 @@ function MainView() {
 
 export default function App() {
   const init = useStore((s) => s.init);
-  const hydrateAgents = useAgents((s) => s.hydrate);
+  const hydrateAgents = useRuntimes((s) => s.hydrate);
   const pending = useStore((s) => s.pendingApprovals.length);
   useDisableContextMenu();
   useEffect(() => {

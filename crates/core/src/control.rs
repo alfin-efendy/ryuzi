@@ -213,6 +213,11 @@ impl ControlPlane {
         self.events.send(e).is_ok()
     }
 
+    /// Clone of the broadcast sender for long-running domain tasks.
+    pub fn events_sender(&self) -> broadcast::Sender<CoreEvent> {
+        self.events.clone()
+    }
+
     pub fn resolve_approval(&self, request_id: &str, allow: bool) -> bool {
         let resolved = self.approvals.resolve(request_id, allow);
         let name = if allow {
@@ -390,9 +395,9 @@ impl ControlPlane {
             .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
 
         // Projects without pinned settings inherit the default agent's
-        // configured model / permission mode (Agents screen → real effect).
+        // configured model / permission mode (Runtime screen → real effect).
         if project.model.is_none() || project.perm_mode == PermMode::Default {
-            if let Ok(defaults) = crate::agents::session_defaults(&self.store).await {
+            if let Ok(defaults) = crate::runtimes::session_defaults(&self.store).await {
                 if project.model.is_none() {
                     project.model = defaults.model;
                 }

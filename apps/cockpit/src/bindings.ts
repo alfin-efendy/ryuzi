@@ -110,9 +110,9 @@ async updateProject(projectId: string, model: string | null, permMode: PermMode,
     else return { status: "error", error: e  as any };
 }
 },
-async listAgents() : Promise<Result<AgentInfo[], CmdError>> {
+async listRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_agents") };
+    return { status: "ok", data: await TAURI_INVOKE("list_runtimes") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -122,33 +122,74 @@ async listAgents() : Promise<Result<AgentInfo[], CmdError>> {
  * Re-probe every catalog agent (PATH + --version + npm latest + local model
  * list for ollama), persist the snapshot, and return the fresh assembly.
  */
-async refreshAgents() : Promise<Result<AgentInfo[], CmdError>> {
+async refreshRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("refresh_agents") };
+    return { status: "ok", data: await TAURI_INVOKE("refresh_runtimes") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateAgent(id: string, enabled: boolean, model: string | null, permMode: string, flags: string) : Promise<Result<AgentInfo[], CmdError>> {
+async updateRuntimeConfig(id: string, enabled: boolean, model: string | null, permMode: string, flags: string) : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_agent", { id, enabled, model, permMode, flags }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_runtime_config", { id, enabled, model, permMode, flags }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setAgentTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<AgentInfo[], CmdError>> {
+/**
+ * Fire-and-forget npm update; progress streams via CoreEvent
+ * RuntimeUpdateLog / RuntimeUpdateDone, then a refreshed snapshot matters —
+ * the UI calls refreshRuntimes() on Done.
+ */
+async updateRuntime(id: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_agent_tier", { id, tierId, value, combo }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_runtime", { id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setDefaultAgent(id: string) : Promise<Result<AgentInfo[], CmdError>> {
+async setRuntimeTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_default_agent", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_runtime_tier", { id, tierId, value, combo }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setDefaultRuntime(id: string) : Promise<Result<RuntimeInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_default_runtime", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async runtimeConfigStatus(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("runtime_config_status", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Guard (spec §5): refuse to write configs that point at a dead endpoint —
+ * the server must be running and at least one endpoint key must exist.
+ */
+async applyRuntimeConfig(id: string, mapping: RuntimeMappingArg) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("apply_runtime_config", { id, mapping }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async resetRuntimeConfig(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reset_runtime_config", { id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -200,70 +241,6 @@ async updateGateway(id: string, fsMode: string, paths: string[]) : Promise<Resul
 async gatewayEvents(id: string) : Promise<Result<GatewayEventInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("gateway_events", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async listProviders() : Promise<Result<ProviderInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("list_providers") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async addProvider(id: string, name: string, kind: string, color: string) : Promise<Result<ProviderInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("add_provider", { id, name, kind, color }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async removeProvider(id: string) : Promise<Result<ProviderInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("remove_provider", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async updateProvider(id: string, enabled: boolean, strategy: string, failAuto: boolean, threshold: number, returnToPrimary: boolean) : Promise<Result<ProviderInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("update_provider", { id, enabled, strategy, failAuto, threshold, returnToPrimary }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async addProviderAccount(providerId: string, label: string, email: string, plan: string, sessionLimitTokens: number | null, weeklyLimitTokens: number | null) : Promise<Result<ProviderInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("add_provider_account", { providerId, label, email, plan, sessionLimitTokens, weeklyLimitTokens }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async removeProviderAccount(accountId: string) : Promise<Result<ProviderInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("remove_provider_account", { accountId }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setActiveAccount(providerId: string, accountId: string) : Promise<Result<ProviderInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_active_account", { providerId, accountId }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async moveProviderAccount(providerId: string, accountId: string, dir: number) : Promise<Result<ProviderInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("move_provider_account", { providerId, accountId, dir }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -487,6 +464,125 @@ async termCloseSession(sessionPk: string) : Promise<Result<null, CmdError>> {
 },
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
+},
+async endpointStatus() : Promise<Result<EndpointStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("endpoint_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async startEndpoint() : Promise<Result<EndpointStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_endpoint") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async stopEndpoint() : Promise<Result<EndpointStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_endpoint") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Persist port + autostart; restart the server when it was running.
+ */
+async setEndpointConfig(port: number, autostart: boolean) : Promise<Result<EndpointStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_endpoint_config", { port, autostart }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listEndpointKeys() : Promise<Result<EndpointKeyInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_endpoint_keys") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createEndpointKey(name: string) : Promise<Result<EndpointKeyInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_endpoint_key", { name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async revokeEndpointKey(id: string) : Promise<Result<EndpointKeyInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("revoke_endpoint_key", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listProviderCatalog() : Promise<Result<CatalogEntry[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_provider_catalog") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listConnections() : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_connections") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addConnection(provider: string, label: string, apiKey: string, baseUrl: string | null) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_connection", { provider, label, apiKey, baseUrl }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateConnection(id: string, label: string, enabled: boolean, apiKey: string | null, baseUrl: string | null, models: string[]) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_connection", { id, label, enabled, apiKey, baseUrl, models }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeConnection(id: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_connection", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async moveConnection(id: string, dir: number) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("move_connection", { id, dir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Hit the upstream's model-list (openai) / a 1-token message (anthropic)
+ * to distinguish bad key (401/403) from network trouble.
+ */
+async testConnection(id: string) : Promise<Result<TestResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("test_connection", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -512,7 +608,6 @@ termOutputMsg: "term-output-msg"
 /** user-defined types **/
 
 export type AccentChangedMsg = { hex: string }
-export type AccountInfo = { id: string; label: string; email: string; plan: string; active: boolean; sessionLimitTokens: number | null; weeklyLimitTokens: number | null; quotas: QuotaInfo[] }
 export type AddAppInput = { id: string | null; name: string; description: string; kind: string | null; 
 /**
  * stdio | http
@@ -523,14 +618,15 @@ transport: string; command: string | null; args: string[];
  */
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
-export type AgentInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
-/**
- * Whether Cockpit has a session harness for this agent today.
- */
-runnable: boolean }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
+export type CatalogEntry = { id: string; name: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
 export type CmdError = { message: string }
+export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; baseUrl: string | null; models: string[]; 
+/**
+ * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
+ */
+keyMasked: string | null }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
@@ -543,9 +639,19 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 /**
  * A scheduled job run started or finished (status: running|success|failed).
  */
-{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string }
+{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string } | 
+/**
+ * A runtime npm install/update produced an output line.
+ */
+{ kind: "runtimeUpdateLog"; runtime_id: string; line: string } | 
+/**
+ * A runtime npm install/update finished (ok=false → message has detail).
+ */
+{ kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null }
 export type CoreEventMsg = { event: CoreEvent }
 export type DirEntryInfo = { name: string; dir: boolean }
+export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
+export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string; 
 /**
@@ -566,13 +672,6 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | Partial
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
-export type ProviderInfo = { id: string; name: string; color: string; initial: string; kind: string; enabled: boolean; strategy: string; failAuto: boolean; threshold: number; returnToPrimary: boolean; accounts: AccountInfo[]; usage: UsagePoint[]; 
-/**
- * Whether local usage data is attributable to this provider (the engine
- * runs Claude today, so only `anthropic` gets the local usage series).
- */
-tracksUsage: boolean }
-export type QuotaInfo = { label: string; pct: number; used: string; max: string; resets: string }
 export type RegistryEntry = { 
 /**
  * Registry name, e.g. `io.github.owner/server`.
@@ -588,6 +687,17 @@ kind: string;
 installTarget: string | null; website: string | null }
 export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
+export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
+/**
+ * False for runtimes without an F1 handler (gemini, ollama).
+ */
+supported: boolean }
+export type RuntimeInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
+/**
+ * Whether Cockpit has a session harness for this agent today.
+ */
+runnable: boolean }
+export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TermExitMsg = { id: string }
@@ -596,13 +706,9 @@ export type TermOutputMsg = { id: string;
  * UTF-8 chunk (lossy) of PTY output.
  */
 data: string }
+export type TestResult = { ok: boolean; message: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type ToolInfo = { name: string; desc: string; perm: string }
-export type UsagePoint = { day: string; 
-/**
- * Estimated tokens that day (chars/4 over persisted transcripts).
- */
-tok: number }
 export type WorktreeState = { 
 /**
  * Uncommitted work (staged, unstaged, or untracked).

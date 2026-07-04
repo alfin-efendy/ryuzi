@@ -313,7 +313,9 @@ impl Router {
             }
             CoreEvent::SessionCreated { .. }
             | CoreEvent::ApprovalRequested { .. }
-            | CoreEvent::JobRunChanged { .. } => {}
+            | CoreEvent::JobRunChanged { .. }
+            | CoreEvent::RuntimeUpdateLog { .. }
+            | CoreEvent::RuntimeUpdateDone { .. } => {}
         }
     }
 
