@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import { Plus, SquareTerminal, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Copy, Plus, Search, SquareTerminal, X } from "lucide-react";
 import { useNav, clampPanelSize, BOTTOM_HEIGHT } from "@/store-nav";
 import { useTerms } from "@/store-terms";
 import { attach, detach, getTerm, refit, type TermInstance } from "@/lib/term-cache";
@@ -29,6 +29,9 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
   const tabs = useTerms((s) => s.tabs[sessionPk] ?? []);
   const activeId = useTerms((s) => s.active[sessionPk]);
   const { open, ensureOne, close, setActive } = useTerms();
+  const [query, setQuery] = useState("");
+  const copyOnSelect = useTerms((s) => s.copyOnSelect);
+  const setCopyOnSelect = useTerms((s) => s.setCopyOnSelect);
 
   // First open of the drawer spawns Terminal 1 (StrictMode-safe: the store's
   // module-level in-flight guard survives dev double-mount).
@@ -72,6 +75,37 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
         </div>
         <button type="button" title="New terminal" onClick={() => void open(sessionPk)} className={`${toolBtn} h-7 w-7`}>
           <Plus aria-hidden size={13} strokeWidth={2} />
+        </button>
+        <form
+          className="flex h-7 w-[180px] items-center gap-1.5 rounded-md border border-border px-2 [background:color-mix(in_oklab,var(--background)_45%,transparent)]"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (inst && query) inst.search.findNext(query);
+          }}
+        >
+          <Search aria-hidden size={11} strokeWidth={2} className="shrink-0 text-muted-foreground" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && e.shiftKey && inst && query) {
+                e.preventDefault();
+                inst.search.findPrevious(query);
+              }
+            }}
+            placeholder="Search"
+            aria-label="Search terminal scrollback"
+            className="min-w-0 flex-1 border-none bg-transparent font-sans text-[11.5px] text-foreground outline-none"
+          />
+        </form>
+        <button
+          type="button"
+          title={copyOnSelect ? "Copy on select: on" : "Copy on select: off"}
+          aria-pressed={copyOnSelect}
+          onClick={() => setCopyOnSelect(!copyOnSelect)}
+          className={`${toolBtn} h-7 w-7 ${copyOnSelect ? "bg-accent text-accent-foreground" : ""}`}
+        >
+          <Copy aria-hidden size={12} strokeWidth={2} />
         </button>
         <span className="font-mono text-[11px] text-muted-foreground">{projectName}</span>
         <div className="flex-1" />

@@ -1,6 +1,13 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { createTerm, getTerm, setOnExit } from "./lib/term-cache";
+import { createTerm, getTerm, setOnExit, setCopyOnSelect as cacheSetCopyOnSelect } from "./lib/term-cache";
+
+const KEY_COPY = "cockpit.term.copyOnSelect";
+
+function readCopyOnSelect(): boolean {
+  if (typeof localStorage === "undefined") return false;
+  return localStorage.getItem(KEY_COPY) === "1";
+}
 
 export type TermTab = { termId: string; title: string; exited: boolean };
 
@@ -34,6 +41,8 @@ type TermsState = {
   /** Archive teardown: drop every cached terminal for a session. The backend
    *  term_close_session already killed the PTYs; this clears the JS side. */
   disposeSession: (sessionPk: string) => void;
+  copyOnSelect: boolean;
+  setCopyOnSelect: (v: boolean) => void;
 };
 
 const inflight = new Set<string>();
@@ -98,6 +107,17 @@ export const useTerms = create<TermsState>((set, get) => {
         delete active[sessionPk];
         return { tabs, active };
       });
+    },
+
+    copyOnSelect: (() => {
+      const v = readCopyOnSelect();
+      cacheSetCopyOnSelect(v);
+      return v;
+    })(),
+    setCopyOnSelect: (v: boolean) => {
+      if (typeof localStorage !== "undefined") localStorage.setItem(KEY_COPY, v ? "1" : "0");
+      cacheSetCopyOnSelect(v);
+      set({ copyOnSelect: v });
     },
   };
 });
