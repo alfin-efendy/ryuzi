@@ -273,9 +273,9 @@ pub async fn list_events(
         .with_conn(move |c| {
             let mut stmt = c.prepare(
                 "SELECT at, level, text FROM ( \
-                   SELECT at, level, text FROM gateway_events \
+                   SELECT id, at, level, text FROM gateway_events \
                    WHERE gateway_id=?1 ORDER BY at DESC, id DESC LIMIT ?2 \
-                 ) ORDER BY at ASC",
+                 ) ORDER BY at ASC, id ASC",
             )?;
             let rows = stmt
                 .query_map(params![gateway_id, limit], |r| {
