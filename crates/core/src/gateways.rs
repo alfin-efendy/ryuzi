@@ -61,7 +61,8 @@ pub fn local_snapshot() -> LocalSnapshot {
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
     LocalSnapshot {
         host_name: System::host_name().unwrap_or_else(|| "local".into()),
-        os_label: System::long_os_version().unwrap_or_else(|| System::name().unwrap_or_else(|| "unknown OS".into())),
+        os_label: System::long_os_version()
+            .unwrap_or_else(|| System::name().unwrap_or_else(|| "unknown OS".into())),
         arch: System::cpu_arch(),
         cores: sys.cpus().len(),
         cpu_pct: sys.global_cpu_usage().round() as u32,
@@ -172,8 +173,12 @@ const GW_COLS: &str = "id,name,kind,host,port,username,fs_mode,paths";
 pub async fn list_rows(store: &Store) -> anyhow::Result<Vec<GatewayRow>> {
     store
         .with_conn(|c| {
-            let mut stmt = c.prepare(&format!("SELECT {GW_COLS} FROM gateways ORDER BY created_at"))?;
-            let rows = stmt.query_map([], row_from)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT {GW_COLS} FROM gateways ORDER BY created_at"
+            ))?;
+            let rows = stmt
+                .query_map([], row_from)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
         .await
@@ -227,13 +232,21 @@ pub async fn remove_row(store: &Store, id: &str) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute("DELETE FROM gateways WHERE id=?1", params![id])?;
-            c.execute("DELETE FROM gateway_events WHERE gateway_id=?1", params![id])
-                .map(|_| ())
+            c.execute(
+                "DELETE FROM gateway_events WHERE gateway_id=?1",
+                params![id],
+            )
+            .map(|_| ())
         })
         .await
 }
 
-pub async fn add_event(store: &Store, gateway_id: &str, level: &str, text: &str) -> anyhow::Result<()> {
+pub async fn add_event(
+    store: &Store,
+    gateway_id: &str,
+    level: &str,
+    text: &str,
+) -> anyhow::Result<()> {
     let gateway_id = gateway_id.to_string();
     let level = level.to_string();
     let text = text.to_string();
@@ -250,15 +263,19 @@ pub async fn add_event(store: &Store, gateway_id: &str, level: &str, text: &str)
 }
 
 /// Most recent `limit` events, oldest first (log renders top-down).
-pub async fn list_events(store: &Store, gateway_id: &str, limit: u32) -> anyhow::Result<Vec<GatewayEvent>> {
+pub async fn list_events(
+    store: &Store,
+    gateway_id: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<GatewayEvent>> {
     let gateway_id = gateway_id.to_string();
     store
         .with_conn(move |c| {
             let mut stmt = c.prepare(
                 "SELECT at, level, text FROM ( \
-                   SELECT at, level, text FROM gateway_events \
+                   SELECT id, at, level, text FROM gateway_events \
                    WHERE gateway_id=?1 ORDER BY at DESC, id DESC LIMIT ?2 \
-                 ) ORDER BY at ASC",
+                 ) ORDER BY at ASC, id ASC",
             )?;
             let rows = stmt
                 .query_map(params![gateway_id, limit], |r| {
@@ -285,8 +302,20 @@ mod tests {
                       Debian          Stopped         2\n";
         let distros = parse_wsl_list(text);
         assert_eq!(distros.len(), 2);
-        assert_eq!(distros[0], WslDistro { name: "Ubuntu".into(), running: true });
-        assert_eq!(distros[1], WslDistro { name: "Debian".into(), running: false });
+        assert_eq!(
+            distros[0],
+            WslDistro {
+                name: "Ubuntu".into(),
+                running: true
+            }
+        );
+        assert_eq!(
+            distros[1],
+            WslDistro {
+                name: "Debian".into(),
+                running: false
+            }
+        );
     }
 
     #[test]
@@ -328,10 +357,17 @@ mod tests {
         let mut row = rows[0].clone();
         row.fs_mode = "read".into();
         upsert_row(&store, row).await.unwrap();
-        assert_eq!(get_row(&store, "ssh-dev").await.unwrap().unwrap().fs_mode, "read");
+        assert_eq!(
+            get_row(&store, "ssh-dev").await.unwrap().unwrap().fs_mode,
+            "read"
+        );
 
-        add_event(&store, "ssh-dev", "info", "probe ok (12ms)").await.unwrap();
-        add_event(&store, "ssh-dev", "error", "probe failed").await.unwrap();
+        add_event(&store, "ssh-dev", "info", "probe ok (12ms)")
+            .await
+            .unwrap();
+        add_event(&store, "ssh-dev", "error", "probe failed")
+            .await
+            .unwrap();
         let events = list_events(&store, "ssh-dev", 10).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].text, "probe ok (12ms)");

@@ -17,8 +17,9 @@ use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
 /// The base name of the ACP adapter sidecar binary (no target-triple suffix,
-/// no `.exe`).  Must match the `bundle.externalBin` entry in tauri.conf.json
-/// and the filename produced by `apps/cockpit/scripts/build-acp-sidecar.ts`.
+/// no `.exe`). Used only as the dev/PATH fallback name when the shared
+/// resolver (`ryuzi_core::sidecar::host_manager`) fails to resolve a cached
+/// or downloaded artifact — see `resolve_acp_adapter` below.
 ///
 /// Package: @agentclientprotocol/claude-agent-acp
 /// NOTE: the adapter refuses to start inside a nested Claude Code session, so
@@ -27,33 +28,20 @@ use tauri_specta::{collect_commands, collect_events, Builder};
 /// session is reused; no credentials are managed here.
 const ADAPTER_BIN: &str = "claude-agent-acp";
 
-/// Resolve the ACP adapter command, preferring the Tauri-bundled sidecar.
-///
-/// Resolution order:
-///   1. Bundled sidecar: `<exe_dir>/claude-agent-acp[.exe]` — present in
-///      production (tauri build) and after running build-acp-sidecar.ts.
-///   2. PATH fallback — for `cargo build` / `tauri dev` when the sidecar
-///      binary has not been compiled yet.  A missing PATH entry produces a
-///      clear runtime error on first session start, not at launch.
-fn resolve_acp_adapter_command() -> String {
-    // Tauri places sidecars next to the main executable at runtime.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            // Check platform-specific name: <dir>/claude-agent-acp[.exe]
-            #[cfg(windows)]
-            let candidate = dir.join(format!("{}.exe", ADAPTER_BIN));
-            #[cfg(not(windows))]
-            let candidate = dir.join(ADAPTER_BIN);
-
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
+/// Resolve the ACP adapter via the shared tiered resolver (Spec 4 §4):
+/// RYUZI_ACP_PATH override → cached artifact → download (bun bundle if a
+/// host bun exists, else the standalone binary). First run needs network or
+/// Bun — the same contract as the CLI. On resolver failure we fall back to
+/// the bare adapter name (dev PATH behavior): launch succeeds, and the first
+/// session start fails with a clear spawn error instead.
+fn resolve_acp_adapter() -> (String, Vec<String>) {
+    match ryuzi_core::sidecar::host_manager().resolve() {
+        Ok(r) => (r.command, r.args),
+        Err(e) => {
+            eprintln!("[ryuzi] sidecar resolve failed: {e:#}; falling back to PATH lookup of {ADAPTER_BIN}");
+            (ADAPTER_BIN.to_string(), vec![])
         }
     }
-    // Dev / PATH fallback — allows `cargo build` + `tauri dev` to compile and
-    // launch without the sidecar binary present.  Starting a session without
-    // the sidecar installed will fail with a clear spawn error at runtime.
-    ADAPTER_BIN.to_string()
 }
 
 /// Map Rust's `std::env::consts::{OS, ARCH}` to the npm platform-package
@@ -84,6 +72,7 @@ fn sdk_platform_package(os: &str, arch: &str) -> String {
 ///      for future packaged builds; nothing bundles it yet).
 ///   3. Dev builds only: the SDK platform package inside the sidecar
 ///      isolated build dir produced by scripts/build-acp-sidecar.ts.
+///
 /// Returns None when nothing is found — the adapter then falls back to its
 /// own resolution, which works when it runs un-compiled under bun/node.
 fn resolve_claude_code_executable() -> Option<String> {
@@ -111,7 +100,11 @@ fn resolve_claude_code_executable() -> Option<String> {
     // sidecar build dir (see scripts/build-acp-sidecar.ts).
     #[cfg(debug_assertions)]
     {
-        let bin_name = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let bin_name = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
         let scope_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".sidecar-build")
             .join("node_modules")
@@ -151,9 +144,10 @@ fn build_registries() -> Registries {
     if let Some(cli) = resolve_claude_code_executable() {
         env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
     }
+    let (command, args) = resolve_acp_adapter();
     let descriptor = AcpAdapterDescriptor {
-        command: resolve_acp_adapter_command(),
-        args: vec![],
+        command,
+        args,
         env,
         // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's running
         // inside a Claude Code session and refuses to start.
@@ -287,9 +281,7 @@ pub fn run() {
             // actually applied. Static windowEffects config is forbidden: Tauri
             // picks effects by platform family and swallows failures, which on
             // Win10 would yield a transparent window with no backdrop.
-            let main_window = app
-                .get_webview_window("main")
-                .expect("main window exists");
+            let main_window = app.get_webview_window("main").expect("main window exists");
             let cap = backdrop::apply_backdrop(&main_window);
             app.manage(backdrop::BackdropState(cap));
             accent::spawn_accent_watcher(app.handle());
@@ -333,16 +325,25 @@ mod tests {
 
     #[test]
     fn sdk_platform_package_maps_windows_x86_64() {
-        assert_eq!(sdk_platform_package("windows", "x86_64"), "claude-agent-sdk-win32-x64");
+        assert_eq!(
+            sdk_platform_package("windows", "x86_64"),
+            "claude-agent-sdk-win32-x64"
+        );
     }
 
     #[test]
     fn sdk_platform_package_maps_macos_aarch64() {
-        assert_eq!(sdk_platform_package("macos", "aarch64"), "claude-agent-sdk-darwin-arm64");
+        assert_eq!(
+            sdk_platform_package("macos", "aarch64"),
+            "claude-agent-sdk-darwin-arm64"
+        );
     }
 
     #[test]
     fn sdk_platform_package_maps_linux_x86_64() {
-        assert_eq!(sdk_platform_package("linux", "x86_64"), "claude-agent-sdk-linux-x64");
+        assert_eq!(
+            sdk_platform_package("linux", "x86_64"),
+            "claude-agent-sdk-linux-x64"
+        );
     }
 }

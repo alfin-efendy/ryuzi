@@ -36,10 +36,28 @@ pub trait Harness: Send + Sync {
     async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>>;
 }
 
+/// One turn's prompt, split into the agent-visible and display strings.
+///
+/// `with_attachments` may decorate the raw user text with an attachment
+/// manifest before it reaches the agent — but that decorated text must never
+/// be what durable history (and thus the cockpit UI) shows as "what the user
+/// typed". `agent` is what's sent to the harness/agent (possibly
+/// manifest-decorated); `display` is the raw text to persist as the
+/// `"user"/"text"` transcript row.
+#[derive(Debug, Clone)]
+pub struct TurnPrompt {
+    /// Sent to the harness/agent — may be decorated (e.g. with an attachment
+    /// manifest).
+    pub agent: String,
+    /// Persisted as the durable `"user"/"text"` transcript row — the raw text
+    /// the user actually typed.
+    pub display: String,
+}
+
 /// A live session driven by a `Harness`. Output is emitted via `SessionCtx.events`.
 #[async_trait]
 pub trait HarnessSession: Send + Sync {
-    async fn send_prompt(&self, prompt: String) -> anyhow::Result<()>;
+    async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()>;
     async fn cancel(&self) -> anyhow::Result<()>;
     async fn end(&self) -> anyhow::Result<()>;
     fn agent_session_id(&self) -> Option<String>;
@@ -61,7 +79,7 @@ mod tests {
     struct FakeSession;
     #[async_trait]
     impl HarnessSession for FakeSession {
-        async fn send_prompt(&self, _prompt: String) -> anyhow::Result<()> {
+        async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
             Ok(())
         }
         async fn cancel(&self) -> anyhow::Result<()> {
@@ -115,7 +133,10 @@ mod tests {
         reg.register("codex", Arc::new(FakeHarnessFactory));
         assert!(reg.get("claude-code").is_some());
         assert!(reg.get("unknown").is_none());
-        assert_eq!(reg.names(), vec!["claude-code".to_string(), "codex".to_string()]);
+        assert_eq!(
+            reg.names(),
+            vec!["claude-code".to_string(), "codex".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -124,6 +145,12 @@ mod tests {
         let harness = factory.create().unwrap();
         let session = harness.start_session(make_ctx().await).await.unwrap();
         assert!(session.agent_session_id().is_none());
-        session.send_prompt("hello".into()).await.unwrap();
+        session
+            .send_prompt(TurnPrompt {
+                agent: "hello".into(),
+                display: "hello".into(),
+            })
+            .await
+            .unwrap();
     }
 }

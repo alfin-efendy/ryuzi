@@ -47,7 +47,9 @@ pub async fn list_dir(
     let root = session_root(&cp, &session_pk).await?;
     let entries = tokio::task::spawn_blocking(move || fsview::list_dir(&root, &rel))
         .await
-        .map_err(|e| CmdError { message: e.to_string() })??;
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })??;
     Ok(entries
         .into_iter()
         .map(|e| DirEntryInfo {
@@ -61,7 +63,10 @@ pub async fn list_dir(
 #[tauri::command]
 #[specta::specta]
 pub async fn session_workdir(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -> R<String> {
-    Ok(session_root(&cp, &session_pk).await?.to_string_lossy().into_owned())
+    Ok(session_root(&cp, &session_pk)
+        .await?
+        .to_string_lossy()
+        .into_owned())
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -81,7 +86,10 @@ pub struct WorktreeState {
 /// is the user's business, not the session's.
 #[tauri::command]
 #[specta::specta]
-pub async fn worktree_dirty(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -> R<WorktreeState> {
+pub async fn worktree_dirty(
+    cp: State<'_, Arc<ControlPlane>>,
+    session_pk: String,
+) -> R<WorktreeState> {
     let session = cp
         .store()
         .get_session(&session_pk)
@@ -134,6 +142,8 @@ pub async fn search_files(
     let root = PathBuf::from(project.workdir);
     let hits = tokio::task::spawn_blocking(move || fsview::search_files(&root, &query, 50))
         .await
-        .map_err(|e| CmdError { message: e.to_string() })?;
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
     Ok(hits)
 }

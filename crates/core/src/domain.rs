@@ -81,8 +81,10 @@ pub struct Session {
     pub branch: Option<String>,
     pub title: Option<String>,
     pub status: SessionStatus,
+    pub started_by: Option<String>,
     pub created_at: Option<i64>,
     pub last_active: Option<i64>,
+    pub resume_attempts: i64,
 }
 
 /// An MCP server the agent can use as tools (attached to an ACP session in Spec 3).
@@ -124,6 +126,19 @@ pub struct Actor {
     pub gateway: String,
 }
 
+/// A file a user attached to a message, before it has been downloaded.
+/// Mirrors `packages/protocol/src/index.ts`'s `AttachmentRef` (not part of
+/// the specta/Tauri type export surface — this crosses gateway boundaries,
+/// not the cockpit IPC boundary).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRef {
+    pub name: String,
+    pub url: String,
+    pub content_type: Option<String>,
+    pub size: u64,
+}
+
 /// A tool-approval request surfaced to a gateway / UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +146,16 @@ pub struct ApprovalRequest {
     pub request_id: String,
     pub tool: String,
     pub summary: String,
+    /// Role ids allowed to approve, beyond the session starter. Empty means
+    /// "starter only" (see `policy::can_approve`).
+    #[serde(default)]
+    pub approver_role_ids: Vec<String>,
+    /// Actor id that started the session, for starter-always approval.
+    #[serde(default)]
+    pub started_by: Option<String>,
+    /// Optional approval timeout, in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// The user's decision on a tool-approval request. Mirrors ACP permission kinds.
@@ -173,7 +198,12 @@ pub struct NewMessage {
 
 impl NewMessage {
     /// Convenience for a simple text/status/error block.
-    pub fn block(session_pk: &str, role: &str, block_type: &str, payload: serde_json::Value) -> Self {
+    pub fn block(
+        session_pk: &str,
+        role: &str,
+        block_type: &str,
+        payload: serde_json::Value,
+    ) -> Self {
         NewMessage {
             session_pk: session_pk.to_string(),
             role: role.to_string(),
@@ -216,6 +246,12 @@ pub enum CoreEvent {
     Error {
         session_pk: String,
         message: String,
+    },
+    /// Out-of-band announcement (e.g. "update available") rendered to every
+    /// surface of a session. TS parity: `{ kind: "notice", session_pk, text }`.
+    Notice {
+        session_pk: String,
+        text: String,
     },
     SessionEnded {
         session_pk: String,

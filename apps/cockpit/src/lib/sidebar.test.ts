@@ -11,8 +11,10 @@ function sess(pk: string, projectId: string, title: string | null, lastActive = 
     branch: null,
     title,
     status: "idle",
+    startedBy: null,
     createdAt: null,
     lastActive,
+    resumeAttempts: 0,
   };
 }
 

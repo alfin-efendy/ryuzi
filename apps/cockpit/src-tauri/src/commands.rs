@@ -70,7 +70,11 @@ pub async fn start_session(
     prompt: String,
 ) -> R<Session> {
     // `.inner()` -> &Arc<ControlPlane>: start/continue_session take `self: &Arc<Self>`.
-    Ok(cp.inner().start_session(&project_id, &prompt).await?)
+    // Cockpit doesn't source attachments yet (Discord-only for now) — always `&[]`.
+    Ok(cp
+        .inner()
+        .start_session(&project_id, &prompt, "cockpit", &[])
+        .await?)
 }
 
 #[tauri::command]
@@ -81,7 +85,10 @@ pub async fn continue_session(
     prompt: String,
 ) -> R<()> {
     // `.inner()` -> &Arc<ControlPlane>: start/continue_session take `self: &Arc<Self>`.
-    Ok(cp.inner().continue_session(&session_pk, &prompt).await?)
+    Ok(cp
+        .inner()
+        .continue_session(&session_pk, &prompt, &[])
+        .await?)
 }
 
 #[tauri::command]

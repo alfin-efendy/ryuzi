@@ -22,7 +22,6 @@
     "ryuzi-linux-x64-musl": "0.2.0",
     "ryuzi-linux-arm64-musl": "0.2.0",
     "ryuzi-darwin-x64": "0.2.0",
-    "ryuzi-darwin-arm64": "0.2.0",
-    "ryuzi-win32-x64": "0.2.0"
+    "ryuzi-darwin-arm64": "0.2.0"
   }
 }

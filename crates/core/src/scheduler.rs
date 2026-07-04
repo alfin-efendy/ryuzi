@@ -78,7 +78,10 @@ pub fn natural_to_cron(text: &str) -> Option<String> {
     if t == "minute" {
         return Some("* * * * *".into());
     }
-    if let Some(rest) = t.strip_suffix(" minutes").or_else(|| t.strip_suffix(" mins")) {
+    if let Some(rest) = t
+        .strip_suffix(" minutes")
+        .or_else(|| t.strip_suffix(" mins"))
+    {
         let n: u32 = rest.trim().parse().ok()?;
         if (1..60).contains(&n) {
             return Some(format!("*/{n} * * * *"));
@@ -136,13 +139,29 @@ fn parse_time(t: &str) -> Option<(u32, u32)> {
     }
     let hour = match pm {
         Some(true) => {
-            if h == 12 { 12 } else if h < 12 { h + 12 } else { return None }
+            if h == 12 {
+                12
+            } else if h < 12 {
+                h + 12
+            } else {
+                return None;
+            }
         }
         Some(false) => {
-            if h == 12 { 0 } else if h < 12 { h } else { return None }
+            if h == 12 {
+                0
+            } else if h < 12 {
+                h
+            } else {
+                return None;
+            }
         }
         None => {
-            if h < 24 { h } else { return None }
+            if h < 24 {
+                h
+            } else {
+                return None;
+            }
         }
     };
     Some((hour, m))
@@ -176,8 +195,12 @@ fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 pub async fn list_jobs(store: &Store) -> anyhow::Result<Vec<JobRow>> {
     store
         .with_conn(|c| {
-            let mut stmt = c.prepare(&format!("SELECT {JOB_COLS} FROM jobs ORDER BY created_at DESC"))?;
-            let rows = stmt.query_map([], job_from)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT {JOB_COLS} FROM jobs ORDER BY created_at DESC"
+            ))?;
+            let rows = stmt
+                .query_map([], job_from)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
         .await
@@ -187,8 +210,12 @@ pub async fn get_job(store: &Store, id: &str) -> anyhow::Result<Option<JobRow>> 
     let id = id.to_string();
     store
         .with_conn(move |c| {
-            c.query_row(&format!("SELECT {JOB_COLS} FROM jobs WHERE id=?1"), params![id], job_from)
-                .optional()
+            c.query_row(
+                &format!("SELECT {JOB_COLS} FROM jobs WHERE id=?1"),
+                params![id],
+                job_from,
+            )
+            .optional()
         })
         .await
 }
@@ -222,12 +249,14 @@ pub async fn delete_job(store: &Store, id: &str) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute("DELETE FROM job_runs WHERE job_id=?1", params![id])?;
-            c.execute("DELETE FROM jobs WHERE id=?1", params![id]).map(|_| ())
+            c.execute("DELETE FROM jobs WHERE id=?1", params![id])
+                .map(|_| ())
         })
         .await
 }
 
-const RUN_COLS: &str = "id,job_id,status,started_at,finished_at,session_pk,error,add_lines,del_lines,note,log";
+const RUN_COLS: &str =
+    "id,job_id,status,started_at,finished_at,session_pk,error,add_lines,del_lines,note,log";
 
 fn run_from(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
     Ok(RunRow {
@@ -264,10 +293,21 @@ pub async fn insert_run(store: &Store, run: RunRow) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
-                &format!("INSERT INTO job_runs({RUN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"),
+                &format!(
+                    "INSERT INTO job_runs({RUN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
+                ),
                 params![
-                    run.id, run.job_id, run.status, run.started_at, run.finished_at,
-                    run.session_pk, run.error, run.add_lines, run.del_lines, run.note, run.log
+                    run.id,
+                    run.job_id,
+                    run.status,
+                    run.started_at,
+                    run.finished_at,
+                    run.session_pk,
+                    run.error,
+                    run.add_lines,
+                    run.del_lines,
+                    run.note,
+                    run.log
                 ],
             )
             .map(|_| ())
@@ -364,16 +404,42 @@ pub async fn execute_job(cp: &Arc<ControlPlane>, job: &JobRow) -> anyhow::Result
         },
     )
     .await?;
-    let _ = crate::gateways::add_event(&store, &job.gateway, "info", &format!("job {} run {run_id} started", job.name)).await;
+    let _ = crate::gateways::add_event(
+        &store,
+        &job.gateway,
+        "info",
+        &format!("job {} run {run_id} started", job.name),
+    )
+    .await;
 
     // Subscribe BEFORE starting so a fast turn can't slip past the listener.
     let mut rx = cp.subscribe();
-    let session = match cp.start_session(&job.project_id, &job.prompt).await {
+    let session = match cp
+        .start_session(&job.project_id, &job.prompt, "scheduler", &[])
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             let now = crate::paths::now_ms();
-            finalize_run(&store, &run_id, "failed", now, None, Some(e.to_string()), None, None, None).await?;
-            let _ = crate::gateways::add_event(&store, &job.gateway, "error", &format!("job {} run {run_id} failed to start: {e}", job.name)).await;
+            finalize_run(
+                &store,
+                &run_id,
+                "failed",
+                now,
+                None,
+                Some(e.to_string()),
+                None,
+                None,
+                None,
+            )
+            .await?;
+            let _ = crate::gateways::add_event(
+                &store,
+                &job.gateway,
+                "error",
+                &format!("job {} run {run_id} failed to start: {e}", job.name),
+            )
+            .await;
             let _ = cp.send_event(CoreEvent::JobRunChanged {
                 job_id: job.id.clone(),
                 run_id: run_id.clone(),
@@ -400,7 +466,10 @@ pub async fn execute_job(cp: &Arc<ControlPlane>, job: &JobRow) -> anyhow::Result
                     outcome = ("success", None);
                     break;
                 }
-                Ok(Ok(CoreEvent::Error { session_pk: pk, message })) if pk == session_pk => {
+                Ok(Ok(CoreEvent::Error {
+                    session_pk: pk,
+                    message,
+                })) if pk == session_pk => {
                     outcome = ("failed", Some(message));
                     break;
                 }
@@ -436,7 +505,11 @@ pub async fn execute_job(cp: &Arc<ControlPlane>, job: &JobRow) -> anyhow::Result
             note,
         )
         .await;
-        let level = if status == "success" { "success" } else { "error" };
+        let level = if status == "success" {
+            "success"
+        } else {
+            "error"
+        };
         let text = match &error {
             Some(e) => format!("job {job_name} run {run_id2} failed — {e}"),
             None => format!("job {job_name} run {run_id2} finished — +{add} −{del}"),
@@ -454,12 +527,20 @@ pub async fn execute_job(cp: &Arc<ControlPlane>, job: &JobRow) -> anyhow::Result
     Ok(run_id)
 }
 
-async fn finalize_partial_session(store: &Store, run_id: &str, session_pk: &str) -> anyhow::Result<()> {
+async fn finalize_partial_session(
+    store: &Store,
+    run_id: &str,
+    session_pk: &str,
+) -> anyhow::Result<()> {
     let run_id = run_id.to_string();
     let session_pk = session_pk.to_string();
     store
         .with_conn(move |c| {
-            c.execute("UPDATE job_runs SET session_pk=?2 WHERE id=?1", params![run_id, session_pk]).map(|_| ())
+            c.execute(
+                "UPDATE job_runs SET session_pk=?2 WHERE id=?1",
+                params![run_id, session_pk],
+            )
+            .map(|_| ())
         })
         .await
 }
@@ -520,14 +601,38 @@ mod tests {
 
     #[test]
     fn natural_phrases_map_to_cron() {
-        assert_eq!(natural_to_cron("every day at 2am").as_deref(), Some("0 2 * * *"));
-        assert_eq!(natural_to_cron("every day at 14:30").as_deref(), Some("30 14 * * *"));
-        assert_eq!(natural_to_cron("every monday at 9am").as_deref(), Some("0 9 * * 1"));
-        assert_eq!(natural_to_cron("weekdays at 9:15am").as_deref(), Some("15 9 * * 1-5"));
-        assert_eq!(natural_to_cron("every 6 hours").as_deref(), Some("0 */6 * * *"));
-        assert_eq!(natural_to_cron("every 15 minutes").as_deref(), Some("*/15 * * * *"));
-        assert_eq!(natural_to_cron("every day at 12am").as_deref(), Some("0 0 * * *"));
-        assert_eq!(natural_to_cron("every day at 12pm").as_deref(), Some("0 12 * * *"));
+        assert_eq!(
+            natural_to_cron("every day at 2am").as_deref(),
+            Some("0 2 * * *")
+        );
+        assert_eq!(
+            natural_to_cron("every day at 14:30").as_deref(),
+            Some("30 14 * * *")
+        );
+        assert_eq!(
+            natural_to_cron("every monday at 9am").as_deref(),
+            Some("0 9 * * 1")
+        );
+        assert_eq!(
+            natural_to_cron("weekdays at 9:15am").as_deref(),
+            Some("15 9 * * 1-5")
+        );
+        assert_eq!(
+            natural_to_cron("every 6 hours").as_deref(),
+            Some("0 */6 * * *")
+        );
+        assert_eq!(
+            natural_to_cron("every 15 minutes").as_deref(),
+            Some("*/15 * * * *")
+        );
+        assert_eq!(
+            natural_to_cron("every day at 12am").as_deref(),
+            Some("0 0 * * *")
+        );
+        assert_eq!(
+            natural_to_cron("every day at 12pm").as_deref(),
+            Some("0 12 * * *")
+        );
         assert_eq!(natural_to_cron("whenever I feel like it"), None);
         assert_eq!(natural_to_cron("every day at 25:00"), None);
     }
@@ -565,16 +670,39 @@ mod tests {
         upsert_job(&store, job.clone()).await.unwrap();
         assert_eq!(get_job(&store, "j1").await.unwrap().unwrap(), job);
 
-        insert_run(&store, RunRow {
-            id: "r1".into(), job_id: "j1".into(), status: "running".into(),
-            started_at: 1000, finished_at: None, session_pk: None, error: None,
-            add_lines: None, del_lines: None, note: None, log: None,
-        }).await.unwrap();
+        insert_run(
+            &store,
+            RunRow {
+                id: "r1".into(),
+                job_id: "j1".into(),
+                status: "running".into(),
+                started_at: 1000,
+                finished_at: None,
+                session_pk: None,
+                error: None,
+                add_lines: None,
+                del_lines: None,
+                note: None,
+                log: None,
+            },
+        )
+        .await
+        .unwrap();
         assert!(has_running_run(&store, "j1").await.unwrap());
 
-        finalize_run(&store, "r1", "success", 2000, Some("s-1".into()), None, Some(12), Some(4), None)
-            .await
-            .unwrap();
+        finalize_run(
+            &store,
+            "r1",
+            "success",
+            2000,
+            Some("s-1".into()),
+            None,
+            Some(12),
+            Some(4),
+            None,
+        )
+        .await
+        .unwrap();
         let runs = list_runs(&store, "j1", 10).await.unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "success");
