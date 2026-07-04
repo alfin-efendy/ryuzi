@@ -47,7 +47,6 @@ function diffLineStyle(l: DiffLine): { bg: string; numBg: string; sign: string; 
   return { bg: "transparent", numBg: "transparent", sign: "", signColor: "transparent", color: "var(--code-foreground)" };
 }
 
-
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects } = useStore();
   const nav = useNav();

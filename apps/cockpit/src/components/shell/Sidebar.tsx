@@ -109,9 +109,7 @@ export function Sidebar() {
         const parts: string[] = [];
         if (res.data.dirty) parts.push("uncommitted changes");
         if (res.data.unmergedCommits > 0)
-          parts.push(
-            `${res.data.unmergedCommits} commit${res.data.unmergedCommits === 1 ? "" : "s"} that exist only on its branch`,
-          );
+          parts.push(`${res.data.unmergedCommits} commit${res.data.unmergedCommits === 1 ? "" : "s"} that exist only on its branch`);
         setConfirmArchive({ session: s, reason: `This session's worktree still has ${parts.join(" and ")}.` });
         return;
       }
@@ -321,9 +319,7 @@ export function Sidebar() {
                             title={archived[s.sessionPk] ? "Restore" : "Archive — ends the session and removes its worktree"}
                             disabled={archivingPk === s.sessionPk}
                             className="hidden h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-40 group-hover:flex"
-                            onClick={() =>
-                              archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s)
-                            }
+                            onClick={() => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s))}
                           >
                             <Archive aria-hidden size={12} strokeWidth={2} />
                           </button>
@@ -424,9 +420,7 @@ export function Sidebar() {
             <Archive aria-hidden size={16} strokeWidth={2} className="text-muted-foreground" />
             <span className="text-[15px] font-semibold tracking-[-0.01em]">Archive session?</span>
           </div>
-          <p className="mb-1 mt-2 text-[13px] leading-[1.55] text-foreground">
-            “{sessionTitle(confirmArchive.session)}”
-          </p>
+          <p className="mb-1 mt-2 text-[13px] leading-[1.55] text-foreground">“{sessionTitle(confirmArchive.session)}”</p>
           <p className="mb-[18px] mt-1 text-[12.5px] leading-[1.55] text-muted-foreground">
             {confirmArchive.reason} Archiving ends the session and deletes the worktree and its{" "}
             <span className="font-mono text-xs">{confirmArchive.session.branch ?? "harness"}</span> branch — that work is discarded and

@@ -1,16 +1,5 @@
 import { useEffect, useState } from "react";
-import {
-  ArrowUpRight,
-  Check,
-  ChevronDown,
-  CircleAlert,
-  Clock,
-  Folder,
-  GitBranch,
-  Play,
-  Server,
-  Trash2,
-} from "lucide-react";
+import { ArrowUpRight, Check, ChevronDown, CircleAlert, Clock, Folder, GitBranch, Play, Server, Trash2 } from "lucide-react";
 import { commands } from "@/bindings";
 import { agentById, useAgents } from "@/store-agents";
 import { formatDuration, formatNextRun, formatStarted, jobById, toInput, useScheduler } from "@/store-scheduler";
@@ -141,8 +130,8 @@ export function ScheduleCard({
             {parseFail && (
               <div className="flex items-center gap-[7px] text-xs" style={{ color: "#F59E0B" }}>
                 <CircleAlert aria-hidden size={12} strokeWidth={2} className="shrink-0" />
-                Couldn&#8217;t parse that — try &#8220;every day at 2am&#8221;, &#8220;every monday at 9am&#8221;, &#8220;every 6 hours&#8221;, or
-                switch to cron mode.
+                Couldn&#8217;t parse that — try &#8220;every day at 2am&#8221;, &#8220;every monday at 9am&#8221;, &#8220;every 6
+                hours&#8221;, or switch to cron mode.
               </div>
             )}
           </>

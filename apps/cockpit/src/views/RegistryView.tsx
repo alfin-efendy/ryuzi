@@ -122,15 +122,16 @@ export function RegistryView() {
         </div>
 
         {error && (
-          <div className="mb-4 flex items-center gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]" style={{ color: "#F59E0B" }}>
+          <div
+            className="mb-4 flex items-center gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]"
+            style={{ color: "#F59E0B" }}
+          >
             <CircleAlert aria-hidden size={14} strokeWidth={2} className="shrink-0" />
             {error}
           </div>
         )}
 
-        {!loading && !error && entries.length === 0 && (
-          <div className="py-8 text-[13px] text-muted-foreground">No results found.</div>
-        )}
+        {!loading && !error && entries.length === 0 && <div className="py-8 text-[13px] text-muted-foreground">No results found.</div>}
 
         <div className="grid grid-cols-2 gap-3">
           {entries.map((rg) => {

@@ -60,8 +60,7 @@ export function FileTreePane({ sessionPk, filter }: { sessionPk: string; filter:
     openFile(`${workdir}${sep}${node.rel.split("/").join(sep)}`);
   };
 
-  const flatten = (nodes: Node[]): Node[] =>
-    nodes.flatMap((n) => (n.open && n.children ? [n, ...flatten(n.children)] : [n]));
+  const flatten = (nodes: Node[]): Node[] => nodes.flatMap((n) => (n.open && n.children ? [n, ...flatten(n.children)] : [n]));
 
   const needle = filter.trim().toLowerCase();
   const visible = flatten(root).filter((n) => needle === "" || n.rel.toLowerCase().includes(needle));

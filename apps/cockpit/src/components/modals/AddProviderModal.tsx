@@ -80,9 +80,7 @@ export function AddProviderModal({
       {target === null ? (
         <>
           <div className="text-[15px] font-semibold tracking-[-0.01em]">Connect provider</div>
-          <p className="mb-4 mt-1 text-[12.5px] text-muted-foreground">
-            Pick a provider, then record the account it should track.
-          </p>
+          <p className="mb-4 mt-1 text-[12.5px] text-muted-foreground">Pick a provider, then record the account it should track.</p>
           <div className="grid grid-cols-2 gap-2">
             {PROVIDER_CATALOG.map((ci) => (
               <button
@@ -117,16 +115,14 @@ export function AddProviderModal({
           <div className="flex items-center gap-3">
             <Chip initial={target.initial} color={target.color} size={36} />
             <div className="min-w-0 flex-1">
-              <div className="text-[15px] font-semibold tracking-[-0.01em]">
-                {forProviderId ? "Add account" : "Connect provider"}
-              </div>
+              <div className="text-[15px] font-semibold tracking-[-0.01em]">{forProviderId ? "Add account" : "Connect provider"}</div>
               <div className="text-xs text-muted-foreground">{target.name}</div>
             </div>
           </div>
 
           <p className="mb-3.5 mt-3 text-[12.5px] leading-[1.55] text-muted-foreground">
-            Credentials stay with the agent CLI (e.g. <span className="font-mono text-xs">claude login</span>). Cockpit records the
-            account and tracks estimated usage locally against the limits you set.
+            Credentials stay with the agent CLI (e.g. <span className="font-mono text-xs">claude login</span>). Cockpit records the account
+            and tracks estimated usage locally against the limits you set.
           </p>
 
           <div className="flex flex-col gap-3">
@@ -147,21 +143,11 @@ export function AddProviderModal({
             <div className="flex gap-3">
               <label className="flex flex-1 flex-col gap-1.5">
                 <span className="text-xs font-semibold">Session limit (M tokens / 5h)</span>
-                <input
-                  className={field}
-                  value={sessionLimit}
-                  onChange={(e) => setSessionLimit(e.target.value)}
-                  placeholder="e.g. 5"
-                />
+                <input className={field} value={sessionLimit} onChange={(e) => setSessionLimit(e.target.value)} placeholder="e.g. 5" />
               </label>
               <label className="flex flex-1 flex-col gap-1.5">
                 <span className="text-xs font-semibold">Weekly limit (M tokens)</span>
-                <input
-                  className={field}
-                  value={weeklyLimit}
-                  onChange={(e) => setWeeklyLimit(e.target.value)}
-                  placeholder="e.g. 40"
-                />
+                <input className={field} value={weeklyLimit} onChange={(e) => setWeeklyLimit(e.target.value)} placeholder="e.g. 40" />
               </label>
             </div>
             <span className="text-[11.5px] text-muted-foreground">

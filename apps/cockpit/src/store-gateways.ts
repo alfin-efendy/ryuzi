@@ -22,11 +22,7 @@ type GatewaysState = {
   setActive: (id: string) => void;
 };
 
-function applyResult(
-  set: (partial: Partial<GatewaysState>) => void,
-  res: Result<GatewayInfo[], CmdError>,
-  action: string,
-): boolean {
+function applyResult(set: (partial: Partial<GatewaysState>) => void, res: Result<GatewayInfo[], CmdError>, action: string): boolean {
   if (res.status === "ok") {
     set({ gateways: res.data, loaded: true });
     return true;

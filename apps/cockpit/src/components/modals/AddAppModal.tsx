@@ -4,8 +4,7 @@ import { useApps } from "@/store-apps";
 import { Segmented } from "@/components/common/Segmented";
 import { Modal } from "./Modal";
 
-const field =
-  "h-9 w-full rounded-md border border-input bg-background px-3 font-sans text-[12.5px] text-foreground";
+const field = "h-9 w-full rounded-md border border-input bg-background px-3 font-sans text-[12.5px] text-foreground";
 const monoField = `${field} font-mono text-xs`;
 
 // Add an MCP server by hand (stdio command or HTTP URL). Adding runs a real
@@ -20,8 +19,7 @@ export function AddAppModal({ onClose }: { onClose: () => void }) {
   const [env, setEnv] = useState("");
   const [saving, setSaving] = useState(false);
 
-  const valid =
-    name.trim().length > 0 && (transport === "stdio" ? command.trim().length > 0 : url.trim().length > 0);
+  const valid = name.trim().length > 0 && (transport === "stdio" ? command.trim().length > 0 : url.trim().length > 0);
 
   const submit = async () => {
     if (!valid || saving) return;

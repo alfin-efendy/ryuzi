@@ -169,9 +169,7 @@ export function GatewayDetailView({ id }: { id: string }) {
           </CardHeader>
           {gwSessions.length === 0 && (
             <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
-              {id === "local"
-                ? "Nothing runs here yet. Start a session from Home."
-                : "Remote sessions arrive with the gateway daemon."}
+              {id === "local" ? "Nothing runs here yet. Start a session from Home." : "Remote sessions arrive with the gateway daemon."}
             </div>
           )}
           {gwSessions.length > 0 && (
@@ -239,7 +237,13 @@ export function GatewayDetailView({ id }: { id: string }) {
                     key={p}
                     type="button"
                     title="Remove folder"
-                    onClick={() => void updateFs(g.id, g.fsMode, g.paths.filter((x) => x !== p))}
+                    onClick={() =>
+                      void updateFs(
+                        g.id,
+                        g.fsMode,
+                        g.paths.filter((x) => x !== p),
+                      )
+                    }
                     className="flex h-[26px] cursor-pointer items-center rounded-full border border-border bg-transparent px-2.5 font-mono text-[11px] text-foreground hover:bg-accent"
                   >
                     {p}

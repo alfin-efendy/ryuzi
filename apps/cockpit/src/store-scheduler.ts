@@ -17,11 +17,7 @@ type SchedulerState = {
   runNow: (id: string) => Promise<void>;
 };
 
-function applyResult(
-  set: (partial: Partial<SchedulerState>) => void,
-  res: Result<JobInfo[], CmdError>,
-  action: string,
-): boolean {
+function applyResult(set: (partial: Partial<SchedulerState>) => void, res: Result<JobInfo[], CmdError>, action: string): boolean {
   if (res.status === "ok") {
     set({ jobs: res.data, loaded: true });
     return true;

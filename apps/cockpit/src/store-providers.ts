@@ -28,11 +28,7 @@ type ProvidersState = {
   moveAccount: (providerId: string, accountId: string, dir: -1 | 1) => Promise<void>;
 };
 
-function applyResult(
-  set: (partial: Partial<ProvidersState>) => void,
-  res: Result<ProviderInfo[], CmdError>,
-  action: string,
-): boolean {
+function applyResult(set: (partial: Partial<ProvidersState>) => void, res: Result<ProviderInfo[], CmdError>, action: string): boolean {
   if (res.status === "ok") {
     set({ providers: res.data, loaded: true });
     return true;
@@ -68,11 +64,7 @@ export const useProviders = create<ProvidersState>((set, get) => ({
   },
 
   addAccount: async (providerId, label, email, plan, sessionLimit, weeklyLimit) =>
-    applyResult(
-      set,
-      await commands.addProviderAccount(providerId, label, email, plan, sessionLimit, weeklyLimit),
-      "Add account",
-    ),
+    applyResult(set, await commands.addProviderAccount(providerId, label, email, plan, sessionLimit, weeklyLimit), "Add account"),
 
   removeAccount: async (accountId) => {
     applyResult(set, await commands.removeProviderAccount(accountId), "Remove account");

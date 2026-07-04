@@ -19,11 +19,7 @@ type AgentsState = {
   setDefault: (id: string) => Promise<void>;
 };
 
-function applyResult(
-  set: (partial: Partial<AgentsState>) => void,
-  res: Result<AgentInfo[], CmdError>,
-  action: string,
-) {
+function applyResult(set: (partial: Partial<AgentsState>) => void, res: Result<AgentInfo[], CmdError>, action: string) {
   if (res.status === "ok") set({ agents: res.data });
   else toast.error(`${action} failed: ${res.error.message}`);
 }
@@ -57,11 +53,7 @@ export const useAgents = create<AgentsState>((set, get) => ({
     const next = { ...current, ...patch };
     // Optimistic paint; the command returns the authoritative list.
     set({ agents: get().agents.map((a) => (a.id === id ? next : a)) });
-    applyResult(
-      set,
-      await commands.updateAgent(id, next.enabled, next.model || null, next.permMode, next.flags),
-      "Agent update",
-    );
+    applyResult(set, await commands.updateAgent(id, next.enabled, next.model || null, next.permMode, next.flags), "Agent update");
   },
 
   setTier: async (id, tierId, value, combo = false) => {

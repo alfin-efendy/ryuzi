@@ -60,11 +60,7 @@ function GatewayCard({ g }: { g: GatewayInfo }) {
           ))}
         </div>
       )}
-      {!online && (
-        <div className="px-[18px] pb-3.5 text-xs text-muted-foreground">
-          Offline — last seen {formatLastSeen(g.lastSeenMs)}.
-        </div>
-      )}
+      {!online && <div className="px-[18px] pb-3.5 text-xs text-muted-foreground">Offline — last seen {formatLastSeen(g.lastSeenMs)}.</div>}
     </Card>
   );
 }
@@ -110,9 +106,7 @@ export function GatewaysView() {
           {gateways.map((g) => (
             <GatewayCard key={g.id} g={g} />
           ))}
-          {loaded && gateways.length === 0 && (
-            <div className="py-8 text-center text-[13px] text-muted-foreground">Detecting gateways…</div>
-          )}
+          {loaded && gateways.length === 0 && <div className="py-8 text-center text-[13px] text-muted-foreground">Detecting gateways…</div>}
         </div>
       </div>
       {addOpen && <AddGatewayModal onClose={() => setAddOpen(false)} />}

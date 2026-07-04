@@ -28,20 +28,13 @@ export function AgentDetailView({ id }: { id: string }) {
 
   const agent = agentById(agents, id);
   if (!agent) {
-    return (
-      <div className="flex min-h-0 flex-1 items-center justify-center text-[13px] text-muted-foreground">
-        Unknown agent.
-      </div>
-    );
+    return <div className="flex min-h-0 flex-1 items-center justify-center text-[13px] text-muted-foreground">Unknown agent.</div>;
   }
 
   const installed = agent.binaryPath !== null;
   const isDefault = agent.isDefault;
   const hasUpdate =
-    installed &&
-    agent.latestVersion !== null &&
-    agent.installedVersion !== null &&
-    agent.latestVersion !== agent.installedVersion;
+    installed && agent.latestVersion !== null && agent.installedVersion !== null && agent.latestVersion !== agent.installedVersion;
   const updateCmd = agent.npmPackage ? `npm install -g ${agent.npmPackage}` : null;
   const permDesc = PERM_MODES.find((m) => m.id === agent.permMode)?.desc ?? "";
 
@@ -199,9 +192,7 @@ export function AgentDetailView({ id }: { id: string }) {
           </CardRow>
           <CardRow>
             <span className="w-[110px] shrink-0 text-[13px] font-medium">Binary</span>
-            <span className="flex-1 truncate font-mono text-xs text-muted-foreground">
-              {agent.binaryPath ?? "not found on PATH"}
-            </span>
+            <span className="flex-1 truncate font-mono text-xs text-muted-foreground">{agent.binaryPath ?? "not found on PATH"}</span>
           </CardRow>
         </Card>
 

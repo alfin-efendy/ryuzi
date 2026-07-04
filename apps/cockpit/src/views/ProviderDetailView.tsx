@@ -213,7 +213,11 @@ export function ProviderDetailView({ id }: { id: string }) {
                         <div className="text-[13px] font-medium">Auto-switch accounts</div>
                         <div className="mt-px text-[11.5px] text-muted-foreground">Rotate to the next account when a quota runs out.</div>
                       </div>
-                      <Switch on={provider.failAuto} onToggle={() => void update(id, { failAuto: !provider.failAuto })} label="Auto-switch accounts" />
+                      <Switch
+                        on={provider.failAuto}
+                        onToggle={() => void update(id, { failAuto: !provider.failAuto })}
+                        label="Auto-switch accounts"
+                      />
                     </CardRow>
                     <div className="flex flex-col border-b border-border px-[18px] pb-3 pt-2.5 last:border-b-0">
                       <span className="pb-1.5 pt-0.5 text-[13px] font-medium">Rotation strategy</span>

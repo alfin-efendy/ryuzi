@@ -18,11 +18,7 @@ type AppsState = {
   toggleAgent: (id: string, agentId: string, allowed: boolean) => Promise<void>;
 };
 
-function applyResult(
-  set: (partial: Partial<AppsState>) => void,
-  res: Result<AppInfo[], CmdError>,
-  action: string,
-): boolean {
+function applyResult(set: (partial: Partial<AppsState>) => void, res: Result<AppInfo[], CmdError>, action: string): boolean {
   if (res.status === "ok") {
     set({ apps: res.data, loaded: true });
     return true;
@@ -61,9 +57,7 @@ export const useApps = create<AppsState>((set, get) => ({
 
   setToolPerm: async (id, tool, perm) => {
     set({
-      apps: get().apps.map((a) =>
-        a.id === id ? { ...a, tools: a.tools.map((t) => (t.name === tool ? { ...t, perm } : t)) } : a,
-      ),
+      apps: get().apps.map((a) => (a.id === id ? { ...a, tools: a.tools.map((t) => (t.name === tool ? { ...t, perm } : t)) } : a)),
     });
     applyResult(set, await commands.setAppToolPerm(id, tool, perm), "Tool permission");
   },
@@ -71,9 +65,7 @@ export const useApps = create<AppsState>((set, get) => ({
   toggleAgent: async (id, agentId, allowed) => {
     set({
       apps: get().apps.map((a) =>
-        a.id === id
-          ? { ...a, agentAccess: a.agentAccess.map((x) => (x.agentId === agentId ? { ...x, allowed } : x)) }
-          : a,
+        a.id === id ? { ...a, agentAccess: a.agentAccess.map((x) => (x.agentId === agentId ? { ...x, allowed } : x)) } : a,
       ),
     });
     applyResult(set, await commands.toggleAppAgent(id, agentId, allowed), "Agent access");

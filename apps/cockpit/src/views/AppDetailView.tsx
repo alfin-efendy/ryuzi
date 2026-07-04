@@ -120,11 +120,7 @@ export function AppDetailView({ id }: { id: string }) {
                     key={w.id}
                     type="button"
                     onClick={() =>
-                      void setScope(
-                        app.id,
-                        app.scope,
-                        sel ? app.scopeGateways.filter((x) => x !== w.id) : [...app.scopeGateways, w.id],
-                      )
+                      void setScope(app.id, app.scope, sel ? app.scopeGateways.filter((x) => x !== w.id) : [...app.scopeGateways, w.id])
                     }
                     className={`flex h-7 cursor-pointer items-center gap-[7px] rounded-full border px-[11px] font-sans text-xs font-medium ${
                       sel ? "border-transparent bg-primary text-primary-foreground" : "border-border bg-transparent text-muted-foreground"
@@ -143,9 +139,7 @@ export function AppDetailView({ id }: { id: string }) {
           <CardHeader>
             <CardTitle>Tools</CardTitle>
             <CardHint>
-              {app.tools.length > 0
-                ? `${app.tools.length} tools · per-tool permission for every agent`
-                : "Discovered on connect"}
+              {app.tools.length > 0 ? `${app.tools.length} tools · per-tool permission for every agent` : "Discovered on connect"}
             </CardHint>
           </CardHeader>
           {app.tools.length === 0 && (

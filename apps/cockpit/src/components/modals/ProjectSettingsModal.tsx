@@ -53,9 +53,7 @@ export function ProjectSettingsModal() {
             </button>
             {agentMenuOpen && (
               <MenuPanel onClose={() => setAgentMenuOpen(false)} className="right-0 top-[62px] z-50 w-[220px]">
-                {pickable.length === 0 && (
-                  <div className="px-3 py-2 text-[12px] text-muted-foreground">No agents detected.</div>
-                )}
+                {pickable.length === 0 && <div className="px-3 py-2 text-[12px] text-muted-foreground">No agents detected.</div>}
                 {pickable.map((a) => (
                   <MenuItem
                     key={a.id}

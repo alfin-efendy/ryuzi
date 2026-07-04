@@ -3,8 +3,7 @@ import { useState } from "react";
 import { useGateways } from "@/store-gateways";
 import { Modal } from "./Modal";
 
-const field =
-  "h-[34px] w-full rounded-md border border-input bg-background px-3 font-sans text-[13px] text-foreground";
+const field = "h-[34px] w-full rounded-md border border-input bg-background px-3 font-sans text-[13px] text-foreground";
 
 // Connect an SSH gateway: persisted config + TCP reachability probe. Remote
 // execution lands with the daemon; until then this is a monitoring entry.

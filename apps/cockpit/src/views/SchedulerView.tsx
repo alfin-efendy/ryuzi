@@ -22,9 +22,7 @@ export function SchedulerView() {
   }, [hydrate, gwLoaded, hydrateGw]);
 
   // Group real jobs under their gateway; unknown gateways group under local.
-  const groups = gateways
-    .map((w) => ({ gateway: w, jobs: jobs.filter((j) => j.gateway === w.id) }))
-    .filter((g) => g.jobs.length > 0);
+  const groups = gateways.map((w) => ({ gateway: w, jobs: jobs.filter((j) => j.gateway === w.id) })).filter((g) => g.jobs.length > 0);
   const orphaned = jobs.filter((j) => !gateways.some((w) => w.id === j.gateway));
   if (orphaned.length > 0 && gateways.length > 0) {
     const local = groups.find((g) => g.gateway.id === "local");
