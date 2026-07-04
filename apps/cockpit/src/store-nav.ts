@@ -8,8 +8,8 @@ export type AgentId = string;
 export type View =
   | { kind: "home" }
   | { kind: "session" }
-  | { kind: "providers" }
-  | { kind: "providerDetail"; id: string }
+  | { kind: "models" }
+  | { kind: "connectionDetail"; id: string }
   | { kind: "runtime" }
   | { kind: "runtimeDetail"; id: AgentId }
   | { kind: "scheduler" }

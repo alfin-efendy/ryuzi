@@ -210,6 +210,10 @@ fn migrations() -> Migrations<'static> {
                 last_used_at INTEGER\
             );",
         ),
+        // Legacy providers/accounts (label + transcript-estimated quota only,
+        // no credentials) superseded by provider_connections — approved
+        // destructive drop, spec §4.2.
+        M::up("DROP TABLE providers; DROP TABLE provider_accounts;"),
     ])
 }
 

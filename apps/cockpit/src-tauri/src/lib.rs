@@ -8,7 +8,6 @@ mod error;
 mod events;
 mod fsview_cmd;
 mod gateways_cmd;
-mod providers_cmd;
 mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
@@ -195,14 +194,6 @@ fn make_builder() -> Builder<tauri::Wry> {
             gateways_cmd::remove_gateway,
             gateways_cmd::update_gateway,
             gateways_cmd::gateway_events,
-            providers_cmd::list_providers,
-            providers_cmd::add_provider,
-            providers_cmd::remove_provider,
-            providers_cmd::update_provider,
-            providers_cmd::add_provider_account,
-            providers_cmd::remove_provider_account,
-            providers_cmd::set_active_account,
-            providers_cmd::move_provider_account,
             scheduler_cmd::list_jobs,
             scheduler_cmd::create_job,
             scheduler_cmd::update_job,

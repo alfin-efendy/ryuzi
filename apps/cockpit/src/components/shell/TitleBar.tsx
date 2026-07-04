@@ -132,7 +132,7 @@ export function TitleBar() {
     const target: Record<string, View> = {
       "new-session": { kind: "home" },
       gateways: { kind: "gateways" },
-      providers: { kind: "providers" },
+      models: { kind: "models" },
       scheduler: { kind: "jobNew" },
       settings: { kind: "settings" },
     };

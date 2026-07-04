@@ -10,7 +10,6 @@ pub mod integration;
 pub mod mcp;
 pub mod paths;
 pub mod policy;
-pub mod providers;
 pub mod registry;
 pub mod router;
 pub mod runtimes;

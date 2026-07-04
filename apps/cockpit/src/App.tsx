@@ -8,8 +8,8 @@ import { Sidebar } from "./components/shell/Sidebar";
 import { ProjectSettingsModal } from "./components/modals/ProjectSettingsModal";
 import { HomeView } from "./views/HomeView";
 import { SessionView } from "./views/SessionView";
-import { ProvidersView } from "./views/ProvidersView";
-import { ProviderDetailView } from "./views/ProviderDetailView";
+import { ModelsView } from "./views/ModelsView";
+import { ConnectionDetailView } from "./views/ConnectionDetailView";
 import { RuntimeView } from "./views/RuntimeView";
 import { RuntimeDetailView } from "./views/RuntimeDetailView";
 import { SchedulerView } from "./views/SchedulerView";
@@ -30,10 +30,10 @@ function MainView() {
       return <HomeView />;
     case "session":
       return <SessionView />;
-    case "providers":
-      return <ProvidersView />;
-    case "providerDetail":
-      return <ProviderDetailView id={view.id} />;
+    case "models":
+      return <ModelsView />;
+    case "connectionDetail":
+      return <ConnectionDetailView id={view.id} />;
     case "runtime":
       return <RuntimeView />;
     case "runtimeDetail":
