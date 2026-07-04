@@ -16,9 +16,7 @@
       "changelog-path": "CHANGELOG.md",
       "include-component-in-tag": true,
       "bump-minor-pre-major": true,
-      "extra-files": [
-        { "type": "json", "path": "tauri.conf.json", "jsonpath": "$.version" }
-      ]
+      "extra-files": [{ "type": "json", "path": "tauri.conf.json", "jsonpath": "$.version" }]
     }
   },
   "plugins": [{ "type": "cargo-workspace" }]

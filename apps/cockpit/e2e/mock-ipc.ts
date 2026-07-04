@@ -54,10 +54,7 @@ const FIXTURES: Record<string, unknown> = {
  * missing Tauri bridge. `plugin:*` invokes (event listen, window show)
  * resolve to null. Every call is recorded on `window.__mockCalls`.
  */
-export async function installMockIPC(
-  page: Page,
-  overrides: Record<string, unknown> = {},
-): Promise<void> {
+export async function installMockIPC(page: Page, overrides: Record<string, unknown> = {}): Promise<void> {
   await page.addInitScript(
     (fixtures) => {
       const calls: Array<{ cmd: string; args: unknown }> = [];
@@ -88,10 +85,6 @@ export async function installMockIPC(
   );
 }
 
-export async function mockCalls(
-  page: Page,
-): Promise<Array<{ cmd: string; args: Record<string, unknown> | undefined }>> {
-  return page.evaluate(
-    () => (window as unknown as { __mockCalls: [] }).__mockCalls,
-  );
+export async function mockCalls(page: Page): Promise<Array<{ cmd: string; args: Record<string, unknown> | undefined }>> {
+  return page.evaluate(() => (window as unknown as { __mockCalls: [] }).__mockCalls);
 }

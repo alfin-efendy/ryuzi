@@ -7,9 +7,7 @@ test.beforeEach(async ({ page }) => {
 
 test("boots to Home with the project loaded", async ({ page }) => {
   await page.goto("/");
-  await expect(
-    page.getByRole("heading", { name: /What should we build/ }),
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: /What should we build/ })).toBeVisible();
   const calls = await mockCalls(page);
   expect(calls.some((c) => c.cmd === "list_projects")).toBe(true);
   expect(calls.some((c) => c.cmd === "list_sessions")).toBe(true);
@@ -33,12 +31,8 @@ test("composer Enter starts a session and navigates to it", async ({ page }) => 
   const composer = page.getByPlaceholder("Do anything");
   await composer.fill("build me a test");
   await composer.press("Enter");
-  await expect
-    .poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_session"))
-    .toBe(true);
-  await expect(
-    page.getByRole("heading", { name: /What should we build/ }),
-  ).toHaveCount(0);
+  await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_session")).toBe(true);
+  await expect(page.getByRole("heading", { name: /What should we build/ })).toHaveCount(0);
   const start = (await mockCalls(page)).find((c) => c.cmd === "start_session");
   expect(start?.args).toMatchObject({
     projectId: "p-demo",
