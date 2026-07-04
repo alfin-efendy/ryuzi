@@ -1,8 +1,8 @@
 name: npm-publish
 # Manually publish the npm binary-wrapper packages on demand, for a given version.
-# Builds the 7 binaries from the CURRENT default-branch code and publishes them
-# under the supplied version (the app code on main matches the released tag of
-# the same version, so this is equivalent to publishing that release to npm).
+# Downloads the already-released tarballs for the given tag (gh release download)
+# and republishes them to npm under the supplied version — no rebuild, since the
+# binaries were already built and released by the `release` workflow.
 # Use when a release's npm job needs to be (re)run, or when npm was added/renamed
 # after a release was already cut.
 on:
@@ -29,8 +29,10 @@ jobs:
         with:
           node-version: 20
           registry-url: "https://registry.npmjs.org"
-      - run: bun install --frozen-lockfile
-      - run: ./scripts/build-binaries.sh
+      - name: Download the released binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "v${{ inputs.version }}" --pattern 'ryuzi-*.tar.gz' -D out/
       - name: Stamp version + assemble packages
         run: |
           bun scripts/npm/set-version.ts "${{ inputs.version }}"

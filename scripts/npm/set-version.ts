@@ -14,7 +14,6 @@ const platformNames = [
   "ryuzi-linux-arm64-musl",
   "ryuzi-darwin-x64",
   "ryuzi-darwin-arm64",
-  "ryuzi-win32-x64",
 ];
 
 for (const name of platformNames) {
