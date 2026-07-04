@@ -174,8 +174,12 @@ export function SessionView() {
         {nav.bottomOpen && <BottomTerminalDrawer sessionPk={session.sessionPk} projectName={projectName} />}
       </div>
 
-      {/* Right panel */}
-      {nav.rightOpen && <RightPanel sessionPk={session.sessionPk} branch={session.branch ?? null} running={running} />}
+      {/* Right panel — keyed by session so switching sessions remounts it: per-session
+          review/file state resets and in-flight gitDiff responses from the previous
+          session land on an unmounted component instead of clobbering the new diff. */}
+      {nav.rightOpen && (
+        <RightPanel key={session.sessionPk} sessionPk={session.sessionPk} branch={session.branch ?? null} running={running} />
+      )}
     </div>
   );
 }
