@@ -124,28 +124,30 @@ Settings live in a local SQLite database at `~/.local/share/ryuzi/ryuzi.sqlite`.
 
 > **First time?** See [docs/development/setup.md](docs/development/setup.md) for the full toolchain setup on macOS, Linux, and Windows (Rust + MSVC + Windows SDK are needed for the Cockpit desktop app).
 
-This is a Bun workspaces monorepo. From the repo root:
+This is a Bun workspaces monorepo (Cockpit desktop app + shared UI) wrapping a Cargo workspace (the `ryuzi` CLI + core engine — the product). From the repo root:
 
 ```bash
-bun install          # link workspaces
-bun run ryuzi ...    # run the ryuzi CLI from source
-bun test             # run all package tests
-bun run typecheck    # tsc --noEmit across the repo
-bun run lint         # biome ci .
-bun run format       # biome check --write .
+bun install                     # link workspaces (Cockpit, shared UI)
+cargo run -p ryuzi-cli -- ...   # run the ryuzi CLI from source (or: make cli ARGS="...")
+bun test                        # run Cockpit/UI/script package tests
+cargo test -p ryuzi-core -p ryuzi-cli   # run Rust tests
+bun run typecheck               # tsc --noEmit across the Bun workspaces
+bun run lint                    # biome ci .
+bun run format                  # biome check --write . && cargo fmt
 ```
 
 ### Layout
 
 ```
+crates/
+  core/              # ryuzi-core — engine: control plane, store, providers, agents, gateways, observability
+  cli/               # ryuzi-cli — the ryuzi CLI (the product)
 apps/
-  cli/               # @ryuzi/cli — the ryuzi CLI + ink TUI (thin app over @ryuzi/core)
+  cockpit/           # @ryuzi/cockpit — Tauri desktop app (thin UI over ryuzi-core)
   mission-control/   # @ryuzi/mission-control — web app (planned)
-  ide/               # @ryuzi/ide — desktop app (planned)
   mobile/            # @ryuzi/mobile — mobile app (planned)
 packages/
-  core/              # @ryuzi/core — engine: control plane, store, providers, agents, gateways, observability
-  protocol/          # @ryuzi/protocol — shared contracts: domain models, events, ControlPlane API
+  ui/                # @ryuzi/ui — shared UI components (Cockpit)
 ```
 
 ## Roadmap
