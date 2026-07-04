@@ -1,6 +1,14 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, type CatalogEntry, type ConnectionInfo, type TestResult, type Result, type CmdError } from "./bindings";
+import {
+  commands,
+  type CatalogEntry,
+  type ConnectionInfo,
+  type ManualStartInfo,
+  type TestResult,
+  type Result,
+  type CmdError,
+} from "./bindings";
 
 // Providers tab: catalog + credentialed provider connections.
 
@@ -22,6 +30,17 @@ type ConnectionsState = {
   remove: (id: string) => Promise<void>;
   move: (id: string, dir: number) => Promise<void>;
   test: (id: string) => Promise<TestResult | null>;
+  connectOauth: (provider: string, label: string) => Promise<boolean>;
+  beginOauthManual: (provider: string) => Promise<ManualStartInfo | null>;
+  completeOauthManual: (
+    provider: string,
+    label: string,
+    verifier: string,
+    state: string,
+    pasted: string,
+    redirectUri: string,
+  ) => Promise<boolean>;
+  addFree: (provider: string, label: string) => Promise<boolean>;
 };
 
 function apply(set: (p: Partial<ConnectionsState>) => void, res: Result<ConnectionInfo[], CmdError>, action: string): boolean {
@@ -56,4 +75,14 @@ export const useConnections = create<ConnectionsState>((set) => ({
     toast.error(`Test failed: ${res.error.message}`);
     return null;
   },
+  connectOauth: async (provider, label) => apply(set, await commands.connectOauth(provider, label), "Connect"),
+  beginOauthManual: async (provider) => {
+    const res = await commands.beginOauthManual(provider);
+    if (res.status === "ok") return res.data;
+    toast.error(`Connect failed: ${res.error.message}`);
+    return null;
+  },
+  completeOauthManual: async (provider, label, verifier, state, pasted, redirectUri) =>
+    apply(set, await commands.completeOauthManual(provider, label, verifier, state, pasted, redirectUri), "Connect"),
+  addFree: async (provider, label) => apply(set, await commands.addFreeConnection(provider, label), "Add connection"),
 }));

@@ -6,7 +6,7 @@ import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
 import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { Chip } from "@/components/common/bits";
+import { Chip, Pill } from "@/components/common/bits";
 import { UsageChart } from "@/components/common/UsageChart";
 
 const field = "h-9 rounded-md border border-input bg-background px-3 font-sans text-[12.5px] text-foreground";
@@ -14,7 +14,7 @@ const modelsField = "min-h-[96px] w-full resize-y rounded-md border border-input
 
 export function ConnectionDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { connections, loaded, hydrate, update, remove, test } = useConnections();
+  const { connections, loaded, hydrate, update, remove, test, connectOauth } = useConnections();
   const usage = useUsage((s) => s.byConnection[id]);
   const loadUsage = useUsage((s) => s.loadConnection);
   const [label, setLabel] = useState("");
@@ -24,6 +24,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
   const [initFor, setInitFor] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -89,6 +90,15 @@ export function ConnectionDetailView({ id }: { id: string }) {
     nav.navigate({ kind: "models" });
   };
 
+  const needsRelogin = conn.authType === "oauth" && conn.needsRelogin;
+
+  const reconnect = async () => {
+    setReconnecting(true);
+    const ok = await connectOauth(conn.provider, conn.label || conn.providerName);
+    setReconnecting(false);
+    if (ok) toast.success(`Reconnected ${conn.providerName}`);
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[860px]">
@@ -97,8 +107,19 @@ export function ConnectionDetailView({ id }: { id: string }) {
         <DetailHeader
           chip={<Chip initial={conn.initial} color={conn.color} size={44} />}
           title={conn.label || conn.providerName}
+          titleExtra={needsRelogin ? <Pill variant="warn">Needs re-login</Pill> : undefined}
           sub={conn.providerName}
         >
+          {needsRelogin && (
+            <button
+              type="button"
+              onClick={() => void reconnect()}
+              disabled={reconnecting}
+              className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border-none bg-primary px-3 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85 disabled:opacity-50"
+            >
+              {reconnecting ? "Reconnecting…" : "Reconnect"}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => void runTest()}

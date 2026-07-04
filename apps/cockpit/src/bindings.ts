@@ -690,7 +690,12 @@ export type ConnectionInfo = { id: string; provider: string; providerName: strin
 /**
  * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
  */
-keyMasked: string | null }
+keyMasked: string | null; 
+/**
+ * OAuth connections only: true once refresh has failed terminally and
+ * the user needs to reconnect via the browser/paste flow again.
+ */
+needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */

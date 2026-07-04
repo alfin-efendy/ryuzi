@@ -1,24 +1,36 @@
 import { useState } from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Loader2 } from "lucide-react";
 import { useConnections } from "@/store-connections";
-import type { CatalogEntry } from "@/bindings";
+import type { CatalogEntry, ManualStartInfo } from "@/bindings";
 import { Chip, Pill } from "@/components/common/bits";
 import { Modal } from "./Modal";
 
 const cancelBtn =
   "cursor-pointer rounded-md border border-border bg-transparent font-sans text-[12.5px] font-medium text-foreground hover:bg-accent";
 const field = "h-9 rounded-md border border-input bg-background px-3 font-sans text-[12.5px] text-foreground";
+const primaryBtn =
+  "flex h-9 w-full cursor-pointer items-center justify-center gap-2 rounded-md border-none bg-primary font-sans text-[13px] font-medium text-primary-foreground hover:opacity-85 disabled:opacity-50";
+const secondaryBtn =
+  "flex h-9 w-full cursor-pointer items-center justify-center gap-2 rounded-md border border-border bg-transparent font-sans text-[13px] font-medium text-foreground hover:bg-accent disabled:opacity-50";
 
-// Two-step flow: pick a provider from the catalog, then supply its API key.
-// Only "api_key" category entries are wired up in this milestone — oauth/free
-// entries are shown greyed out with a "Coming soon" badge.
+// "kiro" is a Free-category catalog entry that isn't wired up yet (it needs a
+// base URL the free-add flow doesn't collect) — keep it greyed "Coming soon".
+const NOT_YET_WIRED = new Set(["kiro"]);
+
+type OauthStep = "form" | "waiting-browser" | "manual";
+
+// Multi-step flow: pick a provider from the catalog, then walk its connect
+// path — API key form, OAuth browser/paste, or a direct Free add.
 export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { catalog, add } = useConnections();
+  const { catalog, add, connectOauth, beginOauthManual, completeOauthManual, addFree } = useConnections();
   const [picked, setPicked] = useState<CatalogEntry | null>(null);
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [saving, setSaving] = useState(false);
+  const [oauthStep, setOauthStep] = useState<OauthStep>("form");
+  const [manualInfo, setManualInfo] = useState<ManualStartInfo | null>(null);
+  const [pasted, setPasted] = useState("");
   if (!open) return null;
 
   const reset = () => {
@@ -26,6 +38,9 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
     setLabel("");
     setApiKey("");
     setBaseUrl("");
+    setOauthStep("form");
+    setManualInfo(null);
+    setPasted("");
   };
   const close = () => {
     reset();
@@ -42,15 +57,59 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
     if (ok) close();
   };
 
+  const submitFree = async () => {
+    if (!picked || saving) return;
+    setSaving(true);
+    const ok = await addFree(picked.id, label.trim() || picked.name);
+    setSaving(false);
+    if (ok) close();
+  };
+
+  const connectBrowser = async () => {
+    if (!picked || saving) return;
+    setSaving(true);
+    setOauthStep("waiting-browser");
+    const ok = await connectOauth(picked.id, label.trim() || picked.name);
+    setSaving(false);
+    if (ok) close();
+    else setOauthStep("form");
+  };
+
+  const startManual = async () => {
+    if (!picked || saving) return;
+    setSaving(true);
+    const info = await beginOauthManual(picked.id);
+    setSaving(false);
+    if (info) {
+      setManualInfo(info);
+      setOauthStep("manual");
+    }
+  };
+
+  const submitManual = async () => {
+    if (!picked || !manualInfo || saving || pasted.trim().length === 0) return;
+    setSaving(true);
+    const ok = await completeOauthManual(
+      picked.id,
+      label.trim() || picked.name,
+      manualInfo.verifier,
+      manualInfo.state,
+      pasted.trim(),
+      manualInfo.redirectUri,
+    );
+    setSaving(false);
+    if (ok) close();
+  };
+
   return (
     <Modal onClose={close} width={480}>
       {picked === null ? (
         <>
           <div className="text-[15px] font-semibold tracking-[-0.01em]">Add connection</div>
-          <p className="mb-4 mt-1 text-[12.5px] text-muted-foreground">Pick a provider to connect with an API key.</p>
+          <p className="mb-4 mt-1 text-[12.5px] text-muted-foreground">Pick a provider to connect.</p>
           <div className="grid grid-cols-2 gap-2">
             {catalog.map((ci) => {
-              const disabled = ci.category !== "api_key";
+              const disabled = NOT_YET_WIRED.has(ci.id);
               return (
                 <button
                   key={ci.id}
@@ -68,7 +127,13 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
                       {disabled && <Pill>Coming soon</Pill>}
                     </span>
                     <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-muted-foreground">
-                      {ci.format === "anthropic" ? "Anthropic-compatible" : "OpenAI-compatible"}
+                      {ci.category === "oauth"
+                        ? "Sign in with browser"
+                        : ci.category === "free"
+                          ? "No credentials needed"
+                          : ci.format === "anthropic"
+                            ? "Anthropic-compatible"
+                            : "OpenAI-compatible"}
                     </span>
                   </span>
                 </button>
@@ -91,32 +156,103 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
             </div>
           </div>
 
-          <div className="mt-3.5 flex flex-col gap-3">
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-semibold">Label</span>
-              <input className={field} value={label} onChange={(e) => setLabel(e.target.value)} placeholder={picked.name} />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-semibold">API key</span>
-              <input type="password" className={field} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-semibold">
-                {picked.requiresBaseUrl ? "Base URL" : "Base URL override"}
-                {!picked.requiresBaseUrl && <span className="font-normal text-muted-foreground"> — optional</span>}
-              </span>
-              <input className={field} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://host/v1" />
-            </label>
-          </div>
+          {picked.category === "api_key" && (
+            <>
+              <div className="mt-3.5 flex flex-col gap-3">
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-xs font-semibold">Label</span>
+                  <input className={field} value={label} onChange={(e) => setLabel(e.target.value)} placeholder={picked.name} />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-xs font-semibold">API key</span>
+                  <input type="password" className={field} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-xs font-semibold">
+                    {picked.requiresBaseUrl ? "Base URL" : "Base URL override"}
+                    {!picked.requiresBaseUrl && <span className="font-normal text-muted-foreground"> — optional</span>}
+                  </span>
+                  <input className={field} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://host/v1" />
+                </label>
+              </div>
 
-          <button
-            type="button"
-            onClick={() => void submit()}
-            disabled={saving || baseUrlMissing}
-            className="mt-3.5 flex h-9 w-full cursor-pointer items-center justify-center gap-2 rounded-md border-none bg-primary font-sans text-[13px] font-medium text-primary-foreground hover:opacity-85 disabled:opacity-50"
-          >
-            {saving ? "Adding…" : `Add ${picked.name}`}
-          </button>
+              <button type="button" onClick={() => void submit()} disabled={saving || baseUrlMissing} className={`${primaryBtn} mt-3.5`}>
+                {saving ? "Adding…" : `Add ${picked.name}`}
+              </button>
+            </>
+          )}
+
+          {picked.category === "free" && (
+            <>
+              <div className="mt-3.5 flex flex-col gap-3">
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-xs font-semibold">Label</span>
+                  <input className={field} value={label} onChange={(e) => setLabel(e.target.value)} placeholder={picked.name} />
+                </label>
+              </div>
+              <p className="mt-2 text-[11.5px] text-muted-foreground">No credentials required — this connects immediately.</p>
+
+              <button type="button" onClick={() => void submitFree()} disabled={saving} className={`${primaryBtn} mt-2`}>
+                {saving ? "Adding…" : `Add ${picked.name}`}
+              </button>
+            </>
+          )}
+
+          {picked.category === "oauth" && (
+            <>
+              {oauthStep !== "manual" && (
+                <div className="mt-3.5 flex flex-col gap-3">
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-xs font-semibold">Label</span>
+                    <input className={field} value={label} onChange={(e) => setLabel(e.target.value)} placeholder={picked.name} />
+                  </label>
+                </div>
+              )}
+
+              {oauthStep === "form" && (
+                <>
+                  <button type="button" onClick={() => void connectBrowser()} disabled={saving} className={`${primaryBtn} mt-3.5`}>
+                    Connect with browser
+                  </button>
+                  <button type="button" onClick={() => void startManual()} disabled={saving} className={`${secondaryBtn} mt-2`}>
+                    {saving ? "Opening…" : "Paste code instead"}
+                  </button>
+                </>
+              )}
+
+              {oauthStep === "waiting-browser" && (
+                <div className="mt-3.5 flex items-center gap-2 rounded-md border border-border px-3 py-2.5 text-[12.5px] text-muted-foreground">
+                  <Loader2 aria-hidden size={13} strokeWidth={2} className="shrink-0 animate-spin" />
+                  Waiting for your browser… complete the login, then return here.
+                </div>
+              )}
+
+              {oauthStep === "manual" && (
+                <div className="mt-3.5 flex flex-col gap-3">
+                  <p className="text-[12.5px] text-muted-foreground">
+                    We opened your browser to sign in to {picked.name}. Paste the code or redirect URL it gave you below.
+                  </p>
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-xs font-semibold">Code or redirect URL</span>
+                    <textarea
+                      className={`${field} min-h-[72px] resize-y py-2`}
+                      value={pasted}
+                      onChange={(e) => setPasted(e.target.value)}
+                      placeholder="Paste here"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void submitManual()}
+                    disabled={saving || pasted.trim().length === 0}
+                    className={primaryBtn}
+                  >
+                    {saving ? "Connecting…" : "Submit"}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
 
           <div className="mt-4 flex items-center gap-2">
             <button

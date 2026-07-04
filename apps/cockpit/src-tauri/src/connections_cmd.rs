@@ -41,6 +41,9 @@ pub struct ConnectionInfo {
     pub models: Vec<String>,
     /// e.g. "sk-…3fk9" — full key never leaves the backend after creation.
     pub key_masked: Option<String>,
+    /// OAuth connections only: true once refresh has failed terminally and
+    /// the user needs to reconnect via the browser/paste flow again.
+    pub needs_relogin: bool,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -101,6 +104,7 @@ fn to_info(row: &ConnectionRow) -> ConnectionInfo {
             .map(|d| connections::effective_models(d, row))
             .unwrap_or_default(),
         key_masked: row.data.api_key.as_deref().map(mask),
+        needs_relogin: row.data.needs_relogin.unwrap_or(false),
     }
 }
 
