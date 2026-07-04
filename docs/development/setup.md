@@ -220,3 +220,5 @@ The **Windows SDK** is not installed. Open the VS Installer → Modify → Indiv
 ### WebKitGTK not found (Linux)
 
 Run the system package install step again with `sudo apt install libwebkit2gtk-4.1-dev`.
+
+<!-- ci filter probe: docs-only (throwaway) -->
