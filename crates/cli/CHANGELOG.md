@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/alfin-efendy/ryuzi/compare/v0.3.0...v0.4.0) (2026-07-04)
+
+
+### Features
+
+* rewrite CLI to Rust on the cockpit stack (Spec 4A–4D-b) ([#28](https://github.com/alfin-efendy/ryuzi/issues/28)) ([a9231bd](https://github.com/alfin-efendy/ryuzi/commit/a9231bd2a865f816431869d7da3f80dbf2b0e7ac))
+
 ## [0.3.0](https://github.com/alfin-efendy/ryuzi/compare/v0.2.0...v0.3.0) (2026-07-02)
 
 
