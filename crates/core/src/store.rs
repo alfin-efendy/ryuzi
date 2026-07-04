@@ -212,6 +212,34 @@ fn migrations() -> Migrations<'static> {
             );\
             CREATE INDEX idx_gateway_events ON gateway_events(gateway_id, at);",
         ),
+        // Models & Runtime batch (design: docs/design/2026-07-04-models-runtime-design.md):
+        // provider connections carry real credentials; endpoint_keys gate the
+        // local router endpoint. Keys are plaintext by design (config-apply
+        // must re-read them; OS-keychain encryption is future work).
+        M::up(
+            "CREATE TABLE provider_connections (\
+                id TEXT PRIMARY KEY,\
+                provider TEXT NOT NULL,\
+                auth_type TEXT NOT NULL DEFAULT 'api_key',\
+                label TEXT NOT NULL DEFAULT '',\
+                priority INTEGER NOT NULL DEFAULT 0,\
+                enabled INTEGER NOT NULL DEFAULT 1,\
+                data TEXT NOT NULL DEFAULT '{}',\
+                created_at INTEGER,\
+                updated_at INTEGER\
+            );\
+            CREATE TABLE endpoint_keys (\
+                id TEXT PRIMARY KEY,\
+                name TEXT NOT NULL DEFAULT '',\
+                key TEXT NOT NULL UNIQUE,\
+                created_at INTEGER,\
+                last_used_at INTEGER\
+            );",
+        ),
+        // Legacy providers/accounts (label + transcript-estimated quota only,
+        // no credentials) superseded by provider_connections — approved
+        // destructive drop, spec §4.2.
+        M::up("DROP TABLE providers; DROP TABLE provider_accounts;"),
     ])
 }
 

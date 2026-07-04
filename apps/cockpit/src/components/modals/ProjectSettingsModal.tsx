@@ -2,7 +2,7 @@ import { ChevronDown, FolderOpen } from "lucide-react";
 import { useState } from "react";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
-import { defaultAgentOf, useAgents } from "@/store-agents";
+import { defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { MenuItem, MenuPanel } from "@/components/common/MenuPanel";
 import { StatusDot } from "@/components/common/bits";
 import { Modal } from "./Modal";
@@ -14,11 +14,11 @@ export function ProjectSettingsModal() {
   const projectId = useNav((s) => s.projectSettingsFor);
   const close = useNav((s) => s.setProjectSettingsFor);
   const project = useStore((s) => s.projects.find((p) => p.projectId === projectId));
-  const { agents, setDefault } = useAgents();
+  const { runtimes, setDefault } = useRuntimes();
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   if (!projectId || !project) return null;
-  const defaultAgent = defaultAgentOf(agents);
-  const pickable = agents.filter((a) => a.enabled && a.binaryPath);
+  const defaultAgent = defaultRuntimeOf(runtimes);
+  const pickable = runtimes.filter((a) => a.enabled && a.binaryPath);
   return (
     <Modal onClose={() => close(null)} width={460}>
       <div className="mb-1 flex items-center gap-2.5">

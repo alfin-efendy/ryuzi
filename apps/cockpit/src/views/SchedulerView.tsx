@@ -1,6 +1,6 @@
 import { ChevronRight, Clock, Folder, Plus } from "lucide-react";
 import { useEffect } from "react";
-import { agentById, useAgents } from "@/store-agents";
+import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { formatNextRun, formatStarted, useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
@@ -13,7 +13,7 @@ const RUN_COLORS: Record<string, string> = { success: "#22C55E", failed: "#EF444
 export function SchedulerView() {
   const { jobs, loaded, hydrate, toggle } = useScheduler();
   const { gateways, loaded: gwLoaded, hydrate: hydrateGw } = useGateways();
-  const agents = useAgents((s) => s.agents);
+  const runtimes = useRuntimes((s) => s.runtimes);
   const nav = useNav();
 
   useEffect(() => {
@@ -81,7 +81,7 @@ export function SchedulerView() {
                 </div>
                 {groupJobs.map((j) => {
                   const open = () => nav.navigate({ kind: "jobDetail", id: j.id });
-                  const agent = agentById(agents, j.agent);
+                  const agent = runtimeById(runtimes, j.agent);
                   return (
                     <Card key={j.id} className="flex items-center gap-3.5 px-[18px] py-[15px]">
                       <button

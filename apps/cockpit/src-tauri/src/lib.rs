@@ -1,14 +1,15 @@
 mod accent;
-mod agents_cmd;
 mod apps_cmd;
 mod backdrop;
 mod commands;
+mod connections_cmd;
+mod endpoint_cmd;
 mod error;
 mod events;
 mod fsview_cmd;
 mod gateways_cmd;
-mod providers_cmd;
 mod registry_cmd;
+mod runtimes_cmd;
 mod scheduler_cmd;
 mod term;
 
@@ -176,25 +177,21 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::get_setting,
             commands::set_setting,
             commands::update_project,
-            agents_cmd::list_agents,
-            agents_cmd::refresh_agents,
-            agents_cmd::update_agent,
-            agents_cmd::set_agent_tier,
-            agents_cmd::set_default_agent,
+            runtimes_cmd::list_runtimes,
+            runtimes_cmd::refresh_runtimes,
+            runtimes_cmd::update_runtime_config,
+            runtimes_cmd::update_runtime,
+            runtimes_cmd::set_runtime_tier,
+            runtimes_cmd::set_default_runtime,
+            runtimes_cmd::runtime_config_status,
+            runtimes_cmd::apply_runtime_config,
+            runtimes_cmd::reset_runtime_config,
             gateways_cmd::list_gateways,
             gateways_cmd::probe_gateways,
             gateways_cmd::add_gateway,
             gateways_cmd::remove_gateway,
             gateways_cmd::update_gateway,
             gateways_cmd::gateway_events,
-            providers_cmd::list_providers,
-            providers_cmd::add_provider,
-            providers_cmd::remove_provider,
-            providers_cmd::update_provider,
-            providers_cmd::add_provider_account,
-            providers_cmd::remove_provider_account,
-            providers_cmd::set_active_account,
-            providers_cmd::move_provider_account,
             scheduler_cmd::list_jobs,
             scheduler_cmd::create_job,
             scheduler_cmd::update_job,
@@ -221,6 +218,20 @@ fn make_builder() -> Builder<tauri::Wry> {
             term::term_close,
             term::term_close_session,
             accent::system_accent_color,
+            endpoint_cmd::endpoint_status,
+            endpoint_cmd::start_endpoint,
+            endpoint_cmd::stop_endpoint,
+            endpoint_cmd::set_endpoint_config,
+            endpoint_cmd::list_endpoint_keys,
+            endpoint_cmd::create_endpoint_key,
+            endpoint_cmd::revoke_endpoint_key,
+            connections_cmd::list_provider_catalog,
+            connections_cmd::list_connections,
+            connections_cmd::add_connection,
+            connections_cmd::update_connection,
+            connections_cmd::remove_connection,
+            connections_cmd::move_connection,
+            connections_cmd::test_connection,
         ])
         .events(collect_events![
             events::CoreEventMsg,
@@ -273,8 +284,30 @@ pub fn run() {
             // The scheduler loop fires enabled jobs for real (30s tick). Runs
             // on the tauri async runtime — setup() has no ambient tokio context.
             tauri::async_runtime::spawn(ryuzi_core::scheduler::run_loop(cp.clone()));
+            // Capture clones BEFORE app.manage(cp) moves the Arc away.
+            let cp2 = cp.clone();
             // Make Arc<ControlPlane> available to all Tauri commands.
             app.manage(cp);
+            // Local router endpoint server (Models → Endpoint).
+            let router_srv = std::sync::Arc::new(
+                ryuzi_core::llm_router::server::RouterServer::new(cp2.store().clone()),
+            );
+            app.manage(router_srv.clone());
+            let cp3 = cp2.clone();
+            tauri::async_runtime::spawn(async move {
+                let auto = cp3
+                    .store()
+                    .get_setting("endpoint_autostart")
+                    .await
+                    .ok()
+                    .flatten();
+                if auto.as_deref() == Some("1") {
+                    let port = endpoint_cmd::configured_port(&cp3).await;
+                    if let Err(e) = router_srv.start(port).await {
+                        eprintln!("[ryuzi] endpoint autostart failed: {e}");
+                    }
+                }
+            });
             // UI terminal registry (session shells over portable-pty).
             app.manage(std::sync::Arc::new(term::UiTerms::default()));
             // Apply the OS backdrop (mica/vibrancy) at runtime and record what

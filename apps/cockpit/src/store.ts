@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { toast } from "sonner";
 import { commands, events, type Project, type Session, type CoreEvent, type Message } from "./bindings";
 import { basename } from "./lib/paths";
+import { useRuntimes } from "./store-runtimes";
 import type { Row } from "./lib/transcript";
 
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
@@ -247,10 +248,13 @@ export const useStore = create<State>((set, get) => ({
   init: async () => {
     await get().refresh();
     await events.coreEventMsg.listen((e) => {
-      get().applyCoreEvent(e.payload.event);
+      const event = e.payload.event;
+      get().applyCoreEvent(event);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
-      if (e.payload.event.kind === "sessionCreated") void get().refresh();
+      if (event.kind === "sessionCreated") void get().refresh();
+      else if (event.kind === "runtimeUpdateLog") useRuntimes.getState().onUpdateLog(event.runtime_id, event.line);
+      else if (event.kind === "runtimeUpdateDone") useRuntimes.getState().onUpdateDone(event.runtime_id, event.ok, event.message);
     });
   },
 }));

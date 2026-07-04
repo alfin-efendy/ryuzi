@@ -7,7 +7,7 @@ import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { commands } from "@/bindings";
 import { SEARCH_COMMANDS } from "@/constants";
-import { agentById, defaultAgentOf, useAgents } from "@/store-agents";
+import { runtimeById, defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { projectLabel, sessionTitle } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
 import { useClickOutside } from "@/components/common/MenuPanel";
@@ -46,8 +46,8 @@ export function TitleBar() {
   const nav = useNav();
   const { goBack, goForward, toggleSidebar, searchQuery, setSearchQuery } = nav;
   const { projects, sessions, transcripts, setFocused } = useStore();
-  const agents = useAgents((s) => s.agents);
-  const sessionAgent = agentById(agents, nav.composerAgent) ?? defaultAgentOf(agents);
+  const runtimes = useRuntimes((s) => s.runtimes);
+  const sessionAgent = runtimeById(runtimes, nav.composerAgent) ?? defaultRuntimeOf(runtimes);
   const ui = useUi();
   const searchRef = useRef<HTMLInputElement>(null);
   const [searchFocused, setSearchFocused] = useState(false);
@@ -133,7 +133,7 @@ export function TitleBar() {
     const target: Record<string, View> = {
       "new-session": { kind: "home" },
       gateways: { kind: "gateways" },
-      providers: { kind: "providers" },
+      models: { kind: "models" },
       scheduler: { kind: "jobNew" },
       settings: { kind: "settings" },
     };

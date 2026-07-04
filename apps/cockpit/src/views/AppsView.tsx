@@ -5,7 +5,7 @@ import { Segmented } from "@/components/common/Segmented";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import type { AppInfo } from "@/bindings";
 import { agentAllowed, useApps } from "@/store-apps";
-import { useAgents } from "@/store-agents";
+import { useRuntimes } from "@/store-runtimes";
 import { useGateways } from "@/store-gateways";
 import { AddAppModal } from "@/components/modals/AddAppModal";
 import { useNav } from "@/store-nav";
@@ -22,7 +22,7 @@ function appStatus(app: AppInfo): { color: string; label: string } {
 export function AppsView() {
   const nav = useNav();
   const { apps, loaded, hydrate, toggleAgent } = useApps();
-  const agents = useAgents((s) => s.agents);
+  const runtimes = useRuntimes((s) => s.runtimes);
   const gateways = useGateways((s) => s.gateways);
   const [tab, setTab] = useState<"installed" | "access">("installed");
   const [addOpen, setAddOpen] = useState(false);
@@ -129,10 +129,10 @@ export function AppsView() {
             <Card>
               <div
                 className="grid items-center border-b border-border px-[18px] py-2.5"
-                style={{ gridTemplateColumns: matrixGrid(agents.length) }}
+                style={{ gridTemplateColumns: matrixGrid(runtimes.length) }}
               >
                 <span className="text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">App</span>
-                {agents.map((a) => (
+                {runtimes.map((a) => (
                   <span key={a.id} className="flex items-center justify-center gap-1.5 text-[11.5px] font-semibold">
                     <StatusDot color={a.color} />
                     {a.name.split(" ")[0]}
@@ -143,13 +143,13 @@ export function AppsView() {
                 <div
                   key={app.id}
                   className="grid items-center border-b border-border px-[18px] py-[9px] last:border-b-0"
-                  style={{ gridTemplateColumns: matrixGrid(agents.length) }}
+                  style={{ gridTemplateColumns: matrixGrid(runtimes.length) }}
                 >
                   <span className="flex min-w-0 items-center gap-2.5">
                     <Chip initial={app.initial} color={app.color} size={26} mono />
                     <span className="overflow-hidden text-ellipsis whitespace-nowrap text-[13px] font-medium">{app.name}</span>
                   </span>
-                  {agents.map((a) => {
+                  {runtimes.map((a) => {
                     const on = agentAllowed(app, a.id);
                     return (
                       <span key={a.id} className="flex justify-center">
