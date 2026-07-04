@@ -14,6 +14,7 @@ export function FileViewer({ path }: { path: string }) {
 
   useEffect(() => {
     let cancelled = false;
+    setContent("");
     setError(null);
     setLang(null);
     commands.readFile(path).then((res) => {
