@@ -265,7 +265,7 @@ impl SidecarManager {
 /// building release binaries.
 pub fn embedded_manifest() -> SidecarManifest {
     serde_json::from_str(include_str!("../sidecar.manifest.json"))
-        .expect("sidecar.manifest.json is validated at build time")
+        .expect("embedded sidecar.manifest.json must parse; the release workflow gates this via cargo test -p ryuzi-core sidecar after injecting the release manifest")
 }
 
 /// The production resolver both hosts use: embedded manifest, this build's

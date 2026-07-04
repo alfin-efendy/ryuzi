@@ -32,10 +32,13 @@ jobs:
       - name: Download the released binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download "v${{ inputs.version }}" --pattern 'ryuzi-*.tar.gz' -D out/
+          VERSION: ${{ inputs.version }}
+        run: gh release download "v${VERSION}" --pattern 'ryuzi-*.tar.gz' -D out/
       - name: Stamp version + assemble packages
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          bun scripts/npm/set-version.ts "${{ inputs.version }}"
+          bun scripts/npm/set-version.ts "${VERSION}"
           ./scripts/npm/assemble.sh
       - name: Publish platform packages first
         run: |

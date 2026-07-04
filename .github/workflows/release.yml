@@ -70,11 +70,19 @@ jobs:
           name: sidecar-manifest
           path: /tmp/sidecar
       - run: cp /tmp/sidecar/manifest.json crates/core/sidecar.manifest.json
+      - name: Validate the injected manifest parses (same serde path the binary uses)
+        run: cargo test -p ryuzi-core sidecar
+      # The step above deliberately overwrites the TRACKED crates/core/sidecar.manifest.json,
+      # which leaves the git tree dirty. `goreleaser release --clean` (without --skip=validate)
+      # refuses to run against a dirty tree AND cross-checks the current commit's tag, but this
+      # job only ever runs on the release-please merge commit, so we lose little by skipping
+      # that validation — the manifest correctness itself is already gated by the cargo test
+      # step above, which exercises the exact serde path the released binaries use.
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean
+          args: release --clean --skip=validate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
