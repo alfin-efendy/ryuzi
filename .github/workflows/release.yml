@@ -12,6 +12,8 @@ jobs:
     outputs:
       release_created: ${{ steps.rp.outputs['crates/cli--release_created'] }}
       tag_name: ${{ steps.rp.outputs['crates/cli--tag_name'] }}
+      cockpit_release_created: ${{ steps.rp.outputs['apps/cockpit/src-tauri--release_created'] }}
+      cockpit_tag_name: ${{ steps.rp.outputs['apps/cockpit/src-tauri--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: rp
@@ -179,3 +181,13 @@ jobs:
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  cockpit:
+    needs: release-please
+    if: needs.release-please.outputs.cockpit_release_created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/cockpit-release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.cockpit_tag_name }}
+    secrets: inherit
