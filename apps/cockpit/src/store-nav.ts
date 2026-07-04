@@ -22,7 +22,7 @@ export type View =
   | { kind: "gatewayDetail"; id: string }
   | { kind: "settings" };
 
-export type RightTab = "review" | "term" | "file";
+export type RightTab = "review" | "file";
 
 export type NavHistory = { back: View[]; current: View; forward: View[] };
 
@@ -51,12 +51,45 @@ function readBool(key: string, fallback: boolean): boolean {
   return v === null ? fallback : v === "1";
 }
 
+const KEY_RIGHT_OPEN = "cockpit.nav.rightOpen";
+const KEY_RIGHT_TAB = "cockpit.nav.rightTab";
+const KEY_RIGHT_WIDTH = "cockpit.nav.rightWidth";
+const KEY_BOTTOM_OPEN = "cockpit.nav.bottomOpen";
+const KEY_BOTTOM_HEIGHT = "cockpit.nav.bottomHeight";
+
+export const RIGHT_WIDTH = { min: 320, def: 560, maxFrac: 0.8 };
+export const BOTTOM_HEIGHT = { min: 120, def: 240, maxFrac: 0.6 };
+
+/** Clamp a panel size to [min, viewport*maxFrac]. */
+export function clampPanelSize(px: number, viewport: number, b: { min: number; maxFrac: number }): number {
+  const max = Math.max(b.min, Math.round(viewport * b.maxFrac));
+  return Math.min(Math.max(Math.round(px), b.min), max);
+}
+
+/** Legacy persisted values ("term") and garbage collapse to "review". */
+export function sanitizeRightTab(raw: string | null): RightTab {
+  return raw === "file" ? "file" : "review";
+}
+
+function readInt(key: string, fallback: number): number {
+  if (typeof localStorage === "undefined") return fallback;
+  const n = Number(localStorage.getItem(key));
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function persist(key: string, value: string): void {
+  if (typeof localStorage !== "undefined") localStorage.setItem(key, value);
+}
+
 type NavState = {
   history: NavHistory;
   sidebarOpen: boolean;
   bottomOpen: boolean;
   rightOpen: boolean;
   rightTab: RightTab;
+  rightWidth: number;
+  bottomHeight: number;
+  rightMaximized: boolean;
   searchQuery: string;
   composerAgent: AgentId;
   composerBranch: string;
@@ -70,6 +103,9 @@ type NavState = {
   toggleRight: () => void;
   setRightOpen: (open: boolean) => void;
   setRightTab: (tab: RightTab) => void;
+  setRightWidth: (px: number) => void;
+  setBottomHeight: (px: number) => void;
+  setRightMaximized: (v: boolean) => void;
   setSearchQuery: (q: string) => void;
   setComposerAgent: (a: AgentId) => void;
   setComposerBranch: (b: string) => void;
@@ -79,9 +115,12 @@ type NavState = {
 export const useNav = create<NavState>((set, get) => ({
   history: { back: [], current: { kind: "home" }, forward: [] },
   sidebarOpen: readBool(KEY_SIDEBAR, true),
-  bottomOpen: false,
-  rightOpen: false,
-  rightTab: "review",
+  bottomOpen: readBool(KEY_BOTTOM_OPEN, false),
+  rightOpen: readBool(KEY_RIGHT_OPEN, false),
+  rightTab: sanitizeRightTab(typeof localStorage !== "undefined" ? localStorage.getItem(KEY_RIGHT_TAB) : null),
+  rightWidth: readInt(KEY_RIGHT_WIDTH, RIGHT_WIDTH.def),
+  bottomHeight: readInt(KEY_BOTTOM_HEIGHT, BOTTOM_HEIGHT.def),
+  rightMaximized: false,
   searchQuery: "",
   composerAgent: "claude",
   composerBranch: "main",
@@ -98,10 +137,35 @@ export const useNav = create<NavState>((set, get) => ({
       if (typeof localStorage !== "undefined") localStorage.setItem(KEY_SIDEBAR, v ? "1" : "0");
       return { sidebarOpen: v };
     }),
-  toggleBottom: () => set((s) => ({ bottomOpen: !s.bottomOpen })),
-  toggleRight: () => set((s) => ({ rightOpen: !s.rightOpen })),
-  setRightOpen: (open) => set({ rightOpen: open }),
-  setRightTab: (tab) => set({ rightTab: tab }),
+  toggleBottom: () =>
+    set((s) => {
+      const v = !s.bottomOpen;
+      persist(KEY_BOTTOM_OPEN, v ? "1" : "0");
+      return { bottomOpen: v };
+    }),
+  toggleRight: () =>
+    set((s) => {
+      const v = !s.rightOpen;
+      persist(KEY_RIGHT_OPEN, v ? "1" : "0");
+      return { rightOpen: v, rightMaximized: v ? s.rightMaximized : false };
+    }),
+  setRightOpen: (open) => {
+    persist(KEY_RIGHT_OPEN, open ? "1" : "0");
+    set((s) => ({ rightOpen: open, rightMaximized: open ? s.rightMaximized : false }));
+  },
+  setRightTab: (tab) => {
+    persist(KEY_RIGHT_TAB, tab);
+    set({ rightTab: tab });
+  },
+  setRightWidth: (px) => {
+    persist(KEY_RIGHT_WIDTH, String(px));
+    set({ rightWidth: px });
+  },
+  setBottomHeight: (px) => {
+    persist(KEY_BOTTOM_HEIGHT, String(px));
+    set({ bottomHeight: px });
+  },
+  setRightMaximized: (v) => set({ rightMaximized: v }),
   setSearchQuery: (q) => set({ searchQuery: q }),
   setComposerAgent: (a) => set({ composerAgent: a }),
   setComposerBranch: (b) => set({ composerBranch: b }),

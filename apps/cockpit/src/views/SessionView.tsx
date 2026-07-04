@@ -101,7 +101,6 @@ export function SessionView() {
 
   const rightTabs: { id: RightTab; label: string; icon: typeof SquareCheck }[] = [
     { id: "review", label: "Review", icon: SquareCheck },
-    { id: "term", label: `Terminal · ${projectName}`, icon: SquareTerminal },
     { id: "file", label: activeFileTab ? activeFileTab.title : "Files", icon: FileText },
   ];
 
@@ -272,9 +271,6 @@ export function SessionView() {
                 </button>
               );
             })}
-            <button type="button" title="New tab" className={`${toolBtn} h-7 w-7`}>
-              <Plus aria-hidden size={14} strokeWidth={2} />
-            </button>
             <div className="flex-1" />
             <button type="button" title="Expand" className={`${toolBtn} h-7 w-7`}>
               <Maximize2 aria-hidden size={13} strokeWidth={2} />
@@ -332,9 +328,6 @@ export function SessionView() {
               </div>
             </>
           )}
-
-          {/* Terminal tab — real shell in the session worktree */}
-          {nav.rightTab === "term" && <TerminalPane sessionPk={session.sessionPk} className="flex-1" />}
 
           {/* File tab — wired to the real readFile IPC via dock tabs */}
           {nav.rightTab === "file" && (
