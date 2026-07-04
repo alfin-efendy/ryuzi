@@ -89,6 +89,33 @@ fn initial_of(name: &str) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+/// Parse `KEY=VALUE` lines into pairs. Lines without a `=` (including blank
+/// lines) are dropped, keys and values are whitespace-trimmed, and the value
+/// keeps any further `=` characters.
+fn parse_env_lines(lines: &[String]) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            line.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Classify how the app authenticates: any env var means "env", with the
+/// detail listing variable names only (never values); no env vars means
+/// "none" with no detail.
+fn derive_auth(env: &[(String, String)]) -> (&'static str, Option<String>) {
+    let auth_kind = if env.is_empty() { "none" } else { "env" };
+    let auth_detail = (!env.is_empty()).then(|| {
+        env.iter()
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    (auth_kind, auth_detail)
+}
+
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
     let agent_ids: Vec<&str> = ryuzi_core::runtimes::CATALOG.iter().map(|d| d.id).collect();
     let mut out = Vec::new();
@@ -200,21 +227,8 @@ pub async fn add_app(cp: State<'_, Arc<ControlPlane>>, input: AddAppInput) -> R<
             message: "app needs a name".into(),
         });
     }
-    let env: Vec<(String, String)> = input
-        .env
-        .iter()
-        .filter_map(|line| {
-            line.split_once('=')
-                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        })
-        .collect();
-    let auth_kind = if env.is_empty() { "none" } else { "env" };
-    let auth_detail = (!env.is_empty()).then(|| {
-        env.iter()
-            .map(|(k, _)| k.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    });
+    let env = parse_env_lines(&input.env);
+    let (auth_kind, auth_detail) = derive_auth(&env);
     mcp::upsert_server(
         cp.store(),
         McpServerRow {
@@ -299,4 +313,69 @@ pub async fn toggle_app_agent(
 ) -> R<Vec<AppInfo>> {
     mcp::set_agent_access(cp.store(), &id, &agent_id, allowed).await?;
     Ok(assemble(&cp).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn env_lines_skip_blanks_and_lines_without_equals() {
+        let parsed = parse_env_lines(&lines(&["FOO=bar", "", "no-separator", "BAZ=qux"]));
+        assert_eq!(
+            parsed,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_lines_trim_key_and_value() {
+        let parsed = parse_env_lines(&lines(&[" API_KEY = secret value "]));
+        assert_eq!(
+            parsed,
+            vec![("API_KEY".to_string(), "secret value".to_string())]
+        );
+    }
+
+    #[test]
+    fn env_lines_split_on_first_equals_only() {
+        let parsed = parse_env_lines(&lines(&["TOKEN=abc=def"]));
+        assert_eq!(parsed, vec![("TOKEN".to_string(), "abc=def".to_string())]);
+    }
+
+    #[test]
+    fn no_env_means_no_auth() {
+        assert_eq!(derive_auth(&[]), ("none", None));
+    }
+
+    #[test]
+    fn env_auth_lists_variable_names_only() {
+        let env = vec![
+            ("API_KEY".to_string(), "secret".to_string()),
+            ("ORG".to_string(), "acme".to_string()),
+        ];
+        assert_eq!(derive_auth(&env), ("env", Some("API_KEY, ORG".to_string())));
+    }
+
+    #[test]
+    fn slugify_lowercases_and_dashes_non_alphanumerics() {
+        assert_eq!(slugify("My App!"), "my-app");
+        assert_eq!(slugify("sentry"), "sentry");
+        assert_eq!(slugify("a  b"), "a-b");
+        assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn initial_is_uppercased_first_char_or_placeholder() {
+        assert_eq!(initial_of("ryuzi"), "R");
+        assert_eq!(initial_of("42nd"), "4");
+        assert_eq!(initial_of(""), "?");
+    }
 }

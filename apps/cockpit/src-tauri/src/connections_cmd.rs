@@ -237,6 +237,30 @@ pub async fn move_connection(
     Ok(assemble(&cp).await?)
 }
 
+/// Map the probe response to the user-facing verdict: 2xx passes, 401/403
+/// blames the API key, any other status is surfaced as-is, and a transport
+/// failure (`Err` carries its display text) reads as network trouble.
+fn probe_outcome(resp: Result<reqwest::StatusCode, String>) -> TestResult {
+    match resp {
+        Ok(s) if s.is_success() => TestResult {
+            ok: true,
+            message: "Connection OK".into(),
+        },
+        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => TestResult {
+            ok: false,
+            message: "Rejected: the API key looks invalid for this provider.".into(),
+        },
+        Ok(s) => TestResult {
+            ok: false,
+            message: format!("Upstream returned HTTP {s}"),
+        },
+        Err(e) => TestResult {
+            ok: false,
+            message: format!("Network error: {e}"),
+        },
+    }
+}
+
 /// Hit the upstream's model-list (openai) / a 1-token message (anthropic)
 /// to distinguish bad key (401/403) from network trouble.
 #[tauri::command]
@@ -281,22 +305,52 @@ pub async fn test_connection(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<
             .send()
             .await,
     };
-    Ok(match resp {
-        Ok(r) if r.status().is_success() => TestResult {
-            ok: true,
-            message: "Connection OK".into(),
-        },
-        Ok(r) if r.status().as_u16() == 401 || r.status().as_u16() == 403 => TestResult {
-            ok: false,
-            message: "Rejected: the API key looks invalid for this provider.".into(),
-        },
-        Ok(r) => TestResult {
-            ok: false,
-            message: format!("Upstream returned HTTP {}", r.status()),
-        },
-        Err(e) => TestResult {
-            ok: false,
-            message: format!("Network error: {e}"),
-        },
-    })
+    Ok(probe_outcome(
+        resp.map(|r| r.status()).map_err(|e| e.to_string()),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(code: u16) -> reqwest::StatusCode {
+        reqwest::StatusCode::from_u16(code).unwrap()
+    }
+
+    #[test]
+    fn success_status_reports_ok() {
+        let r = probe_outcome(Ok(status(200)));
+        assert!(r.ok);
+        assert_eq!(r.message, "Connection OK");
+    }
+
+    #[test]
+    fn auth_failures_blame_the_key() {
+        for code in [401, 403] {
+            let r = probe_outcome(Ok(status(code)));
+            assert!(!r.ok);
+            assert_eq!(
+                r.message,
+                "Rejected: the API key looks invalid for this provider."
+            );
+        }
+    }
+
+    #[test]
+    fn other_statuses_are_surfaced() {
+        let r = probe_outcome(Ok(status(500)));
+        assert!(!r.ok);
+        assert_eq!(
+            r.message,
+            "Upstream returned HTTP 500 Internal Server Error"
+        );
+    }
+
+    #[test]
+    fn transport_failure_reads_as_network_error() {
+        let r = probe_outcome(Err("connection refused".into()));
+        assert!(!r.ok);
+        assert_eq!(r.message, "Network error: connection refused");
+    }
 }
