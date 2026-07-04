@@ -1,7 +1,6 @@
 //! `DashboardState` — pure, terminal-free state machine for the main app
 //! view: tab navigation, the sessions list/detail, and inline config editing
-//! with provider (gateway/runtime) toggles. Rust port of the retired
-//! TypeScript `apps/router/src/cli/ui/{app,tabs/sessions,tabs/config}.tsx`.
+//! with provider (gateway/runtime) toggles. Rendering lives in `render.rs`.
 
 use ryuzi_core::settings::ConfigField;
 
@@ -12,7 +11,7 @@ pub const TABS: [&str; 4] = ["Status", "Daemon", "Sessions", "Config"];
 
 /// One row of the Config tab's flattened row list. Headers are never
 /// selectable; `config_cursor` walks only the `Field`/`ToggleGateway`/
-/// `ToggleRuntime` rows (TS `buildRows`/`selectable`).
+/// `ToggleRuntime` rows.
 pub enum ConfigRow {
     Header(String),
     Field(&'static ConfigField),
@@ -77,8 +76,8 @@ impl DashboardState {
         self.config_cursor = clamp_cursor(self.config_cursor, selectable_len);
     }
 
-    /// Reset per-tab view state when switching tabs (TS remount parity).
-    /// Clears sessions_cursor, detail, config_cursor, and config_error.
+    /// Reset per-tab view state when switching tabs, so every tab is entered
+    /// fresh. Clears sessions_cursor, detail, config_cursor, and config_error.
     /// Leaves `editing` alone (it's guaranteed None since global keys are gated).
     fn reset_tab_state(&mut self) {
         self.sessions_cursor = 0;
@@ -103,8 +102,7 @@ impl DashboardState {
     }
 
     /// Global keybinds, active only while nothing is being edited. Returns
-    /// `true` if `key` was consumed (TS: the single `useInput` in `app.tsx`,
-    /// active only while `!editing`).
+    /// `true` if `key` was consumed.
     async fn handle_global_key(&mut self, key: Key, controller: &AppController) -> bool {
         match key {
             Key::Char('q') => self.exit = true,
@@ -139,9 +137,8 @@ impl DashboardState {
     }
 
     /// While `editing.is_some()`, every key is text input for the draft
-    /// except Enter (submit) and Esc (cancel) — TS parity with
-    /// `ink-text-input`'s `useInput` swallowing all input while active, so
-    /// even `q` types into the draft instead of quitting.
+    /// except Enter (submit) and Esc (cancel) — edit mode swallows all other
+    /// input, so even `q` types into the draft instead of quitting.
     async fn handle_editing_key(&mut self, key: Key, controller: &AppController) {
         match key {
             Key::Char(c) => {
@@ -169,8 +166,8 @@ impl DashboardState {
     }
 
     /// Validates and persists the current draft against the field under the
-    /// cursor. On error the draft and edit mode are kept (TS parity: the
-    /// `TextInput` stays mounted and shows the message). On success,
+    /// cursor. On error the draft and edit mode are kept — the input stays
+    /// live showing the message, so the user can fix the value. On success,
     /// `config_rows` is rebuilt immediately rather than waiting for the next
     /// tick.
     async fn submit_edit(&mut self, controller: &AppController) {
@@ -193,8 +190,8 @@ impl DashboardState {
     }
 
     /// Up/Down wrap over `sessions`; Enter opens the detail view; Esc closes
-    /// it. While a detail is open, only Esc is handled (TS: `useInput`
-    /// short-circuits to just the escape check when `open`).
+    /// it. While a detail is open, only Esc is handled — every other key is
+    /// ignored until the detail closes.
     fn handle_sessions_key(&mut self, key: Key) {
         if self.detail.is_some() {
             if key == Key::Esc {
@@ -270,7 +267,7 @@ impl DashboardState {
         }
     }
 
-    /// `toggleProvider` (TS): flips `id` in the corresponding enabled-CSV. A
+    /// Flips `id` in the corresponding enabled-CSV setting. A
     /// runtime toggle also keeps `default_runtime` valid: empty set -> `""`,
     /// else the first remaining member if the current default fell out.
     /// Returns whether the toggle was actually persisted (i.e. the CSV write
@@ -361,10 +358,10 @@ fn toggle_id(ids: &mut Vec<String>, id: &str) {
     }
 }
 
-/// TS `buildRows`: `Header("General")` + general fields, then per *enabled*
-/// gateway/runtime that has fields a `Header(label)` + its fields, then
-/// `Header("Providers")` + a toggle row for every catalog gateway/runtime
-/// (enabled or not).
+/// Builds the Config tab's row list: `Header("General")` + general fields,
+/// then per *enabled* gateway/runtime that has fields a `Header(label)` +
+/// its fields, then `Header("Providers")` + a toggle row for every catalog
+/// gateway/runtime (enabled or not).
 async fn build_config_rows(controller: &AppController) -> Vec<ConfigRow> {
     let mut rows = vec![ConfigRow::Header("General".to_string())];
     for f in controller.general_fields() {

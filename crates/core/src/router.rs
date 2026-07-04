@@ -1,11 +1,11 @@
-//! Router: both halves of TS `packages/core/src/core/router.ts`'s `Router`
-//! class, ported to two kinds of methods on one struct.
+//! Router: both routing directions as two kinds of methods on one struct.
 //!
 //! - Outbound: consumes `CoreEvent`s off a broadcast channel and renders them
-//!   onto every gateway surface bound to the originating session. Deliberate
-//!   delta from TS: TS serializes renders per-session via promise chains,
-//!   while this router processes the broadcast stream on a single task (see
-//!   task-3 report). Render errors are swallowed in both, matching TS parity.
+//!   onto every gateway surface bound to the originating session. Renders
+//!   are serialized by processing the broadcast stream on a single task
+//!   (deliberate divergence from the original TS implementation, which
+//!   serialized per-session via promise chains). Render errors are
+//!   swallowed: a failed post to one surface must never take down the loop.
 //! - Inbound (Task 4): `on_connect`/`on_start`/`on_reply`/`on_end`/`on_stop`
 //!   — the gateway-facing entry points a Discord (or other) connector calls
 //!   to drive the `/connect` provisioning flow and route messages to
@@ -47,8 +47,9 @@ struct SessionRenderState {
     status_refs: HashMap<String, MessageRef>,
 }
 
-/// Options for [`Router::on_connect`]; mirrors TS `onConnect`'s inline opts
-/// argument (`{ name?, gitUrl?, settings?, actorRoleIds? }`).
+/// Options for [`Router::on_connect`]: an optional project name, an
+/// optional git URL to clone, provisioning settings, and the actor's role
+/// ids (for the permission-mode gate).
 #[derive(Debug, Clone, Default)]
 pub struct ConnectOpts {
     pub name: Option<String>,
@@ -97,7 +98,7 @@ impl Router {
     }
 
     /// Provision (or bind) a project for `gateway_id`'s workspace — the
-    /// Discord `/connect` flow. TS parity: `Router.onConnect`.
+    /// Discord `/connect` flow.
     pub async fn on_connect(
         &self,
         gateway_id: &str,
@@ -109,12 +110,11 @@ impl Router {
             .get(gateway_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown gateway: {gateway_id}"))?;
-        // TS parity note (deliberate divergence, documented): TS's
-        // `opts.name ?? (...)` only falls through to `gitUrl` when `name` is
-        // `null`/`undefined`, so a bare `Some("")` there throws immediately
-        // without even trying `gitUrl`. Here we additionally treat an empty
-        // (or whitespace-only) `name` as absent and fall through to
-        // `gitUrl`'s derived basename — either way, an empty/whitespace
+        // Deliberate divergence from the original TS implementation (which
+        // only fell through to `git_url` when `name` was entirely absent,
+        // rejecting a bare empty string immediately): here an empty or
+        // whitespace-only `name` is also treated as absent and falls through
+        // to `git_url`'s derived basename. Either way, an empty/whitespace
         // result below is rejected BEFORE `create_workspace` is ever called,
         // so no gateway workspace is orphaned trying to bind to a project
         // that will fail to provision.
@@ -165,10 +165,10 @@ impl Router {
 
     /// Route an inbound "start" trigger for a connected gateway workspace.
     /// Silently no-ops if the workspace isn't bound to a project (nothing to
-    /// route to — the user hasn't `/connect`ed yet). TS parity: `Router.onStart`.
+    /// route to — the user hasn't `/connect`ed yet).
     ///
-    /// Rust delta (documented, intentional): TS passes the gateway `surface`
-    /// INTO `startSession` so the session is bound to it atomically. Rust's
+    /// Deliberate divergence from the original TS implementation (which
+    /// bound the gateway surface atomically inside session start):
     /// `start_session` doesn't take a surface, so this calls
     /// `store.add_surface` right AFTER `start_session` returns instead. A
     /// `status`/`text` event racing ahead of that `add_surface` call would
@@ -216,7 +216,7 @@ impl Router {
 
     /// Continue the session bound to `conversation_id`. Silently no-ops if
     /// no session is bound (e.g. the conversation was never started, or has
-    /// already ended). TS parity: `Router.onReply`.
+    /// already ended).
     pub async fn on_reply(
         &self,
         gateway_id: &str,
@@ -237,7 +237,7 @@ impl Router {
             .await
     }
 
-    /// End the session bound to `conversation_id`, if any. TS parity: `Router.onEnd`.
+    /// End the session bound to `conversation_id`; no-op if none is bound.
     pub async fn on_end(&self, gateway_id: &str, conversation_id: &str) -> anyhow::Result<()> {
         if let Some(session) = self
             .store
@@ -249,7 +249,7 @@ impl Router {
         Ok(())
     }
 
-    /// Stop the session bound to `conversation_id`, if any. TS parity: `Router.onStop`.
+    /// Stop the session bound to `conversation_id`; no-op if none is bound.
     pub async fn on_stop(&self, gateway_id: &str, conversation_id: &str) -> anyhow::Result<()> {
         if let Some(session) = self
             .store
@@ -263,7 +263,7 @@ impl Router {
 
     /// Consume the broadcast until it closes (all senders dropped). Intended
     /// to be spawned with `tokio::spawn`. Single-task serialization: render
-    /// errors are swallowed (TS parity).
+    /// errors are swallowed so one failed post can never stop the loop.
     pub async fn run(mut self, mut rx: broadcast::Receiver<CoreEvent>) {
         loop {
             match rx.recv().await {
@@ -368,7 +368,7 @@ impl Router {
         self.state.remove(session_pk);
     }
 
-    /// TS `renderNotice`: post the text as a result chunk to every surface.
+    /// Post the notice text as a result chunk to every surface.
     async fn render_notice(&mut self, session_pk: &str, text: &str) {
         let surfaces = self.store.surfaces(session_pk).await.unwrap_or_default();
         for surface in surfaces {

@@ -1,7 +1,6 @@
 //! Daemon composition root: wires `Store` → settings → telemetry → harness
 //! registries → `ControlPlane` → gateways → the outbound `Router` → the
-//! approval fan-out, mirroring the retired TypeScript daemon's boot sequence
-//! (`packages/daemon/src/main.ts`).
+//! approval fan-out.
 //!
 //! [`build_daemon`] is the single entry point; [`Daemon::start`]/`stop` drive
 //! the lifecycle. The approval fan-out — the piece that finally consumes
@@ -98,8 +97,8 @@ impl Daemon {
     /// gateway 0..N-1 a second time.
     ///
     /// This task is deliberately left UNTRACKED (unlike `router_handle` /
-    /// `fanout_handle`): it mirrors the retired TS daemon's boot sequence,
-    /// which does not await or hold onto its reconcile call either. A
+    /// `fanout_handle`): boot does not await or hold onto its reconcile
+    /// call. A
     /// resume it kicks off is its own independent `spawn_prompt` background
     /// turn (tracked/owned by `ControlPlane`, not by `Daemon`), so there is
     /// nothing here for `stop()` to meaningfully cancel — this handle only
@@ -125,7 +124,8 @@ impl Daemon {
         Ok(())
     }
 
-    /// Idempotent teardown: stop every gateway (errors swallowed — TS parity),
+    /// Idempotent teardown: stop every gateway (errors swallowed so one
+    /// failing gateway can't block the rest of the shutdown),
     /// abort the router and approval fan-out broadcast-consumer loops (which
     /// also aborts any in-flight per-approval races the fan-out spawned —
     /// see `spawn_approval_fanout`), then flush telemetry. A second call is
@@ -187,7 +187,7 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
     None
 }
 
-/// Build order (TS daemon parity):
+/// Build order (each stage depends on the previous one):
 /// `Store::open` → settings → telemetry select → `Registries` (installs
 /// `ClaudeCodeIntegration` iff `enabled_runtimes` contains `"claude-code"`,
 /// then `opts.extra_harness_factories`) → `ControlPlane::new_with_telemetry`

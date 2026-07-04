@@ -1,5 +1,5 @@
-//! Port of `packages/core/src/update/install-method.ts`. Only the install.sh
-//! path (`{home}/.local/bin/ryuzi`) is self-applicable — every other method is
+//! Detects how this binary was installed. Only the install.sh path
+//! (`{home}/.local/bin/ryuzi`) is self-applicable — every other method is
 //! owned by a package manager (or is dev/docker) and must be notify-only so
 //! the daemon never clobbers a package manager's binary.
 #[derive(Debug, Clone, Copy, PartialEq)]

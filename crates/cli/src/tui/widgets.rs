@@ -1,6 +1,5 @@
 //! Small stateless rendering helpers shared by `render.rs`'s wizard/dashboard
-//! draw functions. Rust port of the retired TypeScript `components/{panel,
-//! status-bar,tab-bar,status-dot}.tsx`.
+//! draw functions: panel, status dot, tab bar, and status bar.
 
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding};
@@ -8,10 +7,10 @@ use ratatui::widgets::{Block, Borders, Padding};
 use super::dashboard::TABS;
 use super::theme::{self, Tone};
 
-/// A bordered block with an uppercased title, styled by `focus` (TS parity:
-/// `Panel`'s `title.toUpperCase()`). Pass an empty `title` to omit the title
-/// line entirely — the options overlay uses this to dodge the uppercasing
-/// and render "Options" as body content instead (TS does the same dodge).
+/// A bordered block with an uppercased title, styled by `focus`. Pass an
+/// empty `title` to omit the title line entirely — the options overlay uses
+/// this to dodge the uppercasing and render "Options" as body content
+/// instead.
 pub fn panel(title: &str, focus: bool) -> Block<'static> {
     let border_style = theme::tone(if focus { Tone::Signature } else { Tone::Border });
     let mut block = Block::default()
@@ -26,7 +25,7 @@ pub fn panel(title: &str, focus: bool) -> Block<'static> {
     block
 }
 
-/// `{dot|dot_off} {label}` — TS `StatusDot`, colored ok/dim by `on`.
+/// Status dot: `{dot|dot_off} {label}`, colored ok/dim by `on`.
 pub fn status_dot(on: bool, label: &str) -> Span<'static> {
     let sym = theme::symbols();
     let dot = if on { sym.dot } else { sym.dot_off };
@@ -38,8 +37,8 @@ pub fn status_dot(on: bool, label: &str) -> Span<'static> {
     Span::styled(text, theme::tone(if on { Tone::Ok } else { Tone::Dim }))
 }
 
-/// `1 Status  2 Daemon  3 Sessions  4 Config` — TS `TabBar` (active bold +
-/// signature, others dim; two-space gaps from TS's `marginRight={2}`).
+/// Tab bar: `1 Status  2 Daemon  3 Sessions  4 Config` — active tab bold +
+/// signature color, others dim; two-space gaps between tabs.
 pub fn tab_bar(active: usize) -> Line<'static> {
     let mut spans = Vec::new();
     for (i, name) in TABS.iter().enumerate() {
@@ -56,8 +55,8 @@ pub fn tab_bar(active: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Joins `(key, label)` hints with `  ·  ` — TS `StatusBar` + `KeyHint`
-/// (bold signature key, dim label).
+/// Status bar: joins `(key, label)` hints with `  ·  ` — bold signature
+/// key, dim label.
 pub fn status_bar(hints: &[(String, String)]) -> Line<'static> {
     let mut spans = Vec::new();
     for (i, (key, label)) in hints.iter().enumerate() {

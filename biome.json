@@ -39,8 +39,8 @@
         "useConst": "off"
       },
       "correctness": {
-        "noUnusedImports": "off",
-        "noUnusedVariables": "off",
+        "noUnusedImports": "error",
+        "noUnusedVariables": "error",
         "useYield": "off"
       },
       "suspicious": {
@@ -53,5 +53,11 @@
   },
   "javascript": {
     "formatter": { "quoteStyle": "double", "semicolons": "always" }
-  }
+  },
+  "overrides": [
+    {
+      "includes": ["apps/cockpit/src-tauri/tauri.conf.json", ".release-please-manifest.json"],
+      "formatter": { "enabled": false }
+    }
+  ]
 }

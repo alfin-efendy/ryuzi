@@ -1,5 +1,6 @@
-//! Stage a canary binary downloaded from GitHub releases, verified by checksum.
-//! Port of `apps/cli/src/cli/update-stage.ts` with injectable host (tar/write).
+//! Stage a canary binary downloaded from GitHub releases, verified by
+//! checksum, with an injectable host for the tar-extract and file-write
+//! effects so staging is fully testable.
 
 use super::asset::{asset_name, asset_url, checksums_url, verify_checksum, Platform};
 use super::check::UpdateHttp;
@@ -27,7 +28,8 @@ pub struct StageResult {
 }
 
 /// BLOCKING — call via spawn_blocking. Never panics; every failure returns
-/// StageResult{ok:false, error:Some(..)} (TS parity: the big try/catch).
+/// StageResult{ok:false, error:Some(..)} so callers always get a result to
+/// report instead of an unwound stack.
 pub fn stage_canary(
     opts: &StageOpts,
     platform: Platform,

@@ -1,8 +1,4 @@
 //! Settings schema, provider catalog, and validated settings store facade.
-//!
-//! Transcribed verbatim from the retired TypeScript
-//! `packages/core/src/config/{schema,required,store}.ts` and
-//! `packages/core/src/providers/{types,catalog,gateways/discord,runtimes/claude-code}.ts`.
 
 pub mod catalog;
 pub mod fields;
@@ -16,9 +12,8 @@ pub use store::{csv, validate_setting, SettingsStore};
 /// Expand a leading `~` / `~/` to `$HOME`. `~` is a shell-ism; Rust path ops
 /// and git do NOT expand it, so a stored path like `workdir_root: ~/repos`
 /// must be expanded before use or it becomes a literal `~` directory and
-/// breaks worktree/cwd resolution. Mirrors the retired TypeScript
-/// `packages/core/src/config/paths.ts`'s `expandHome`; moved here (from
-/// `crates/cli/src/run_cmd.rs`) so `ControlPlane` can share it too.
+/// breaks worktree/cwd resolution. Lives here (rather than in the CLI) so
+/// `ControlPlane` can share it too.
 pub fn expand_home(dir: &str) -> std::path::PathBuf {
     if let Some(rest) = dir.strip_prefix('~') {
         if let Some(home) = std::env::var_os("HOME") {

@@ -26,8 +26,7 @@ pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {
             (deps.out)(&meta::help_text());
             0
         }
-        // TTY gate (deliberate delta from the retired TS CLI, which never
-        // gated): a bare `ryuzi` on a real terminal launches the TUI
+        // TTY gate: a bare `ryuzi` on a real terminal launches the TUI
         // (wizard first-run, else dashboard); piped/non-interactive stdout
         // (scripts, CI, the `cli.rs` no-args test which runs through
         // `assert_cmd`'s captured pipe) keeps printing help and exits 0, so

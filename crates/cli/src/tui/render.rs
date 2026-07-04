@@ -1,6 +1,5 @@
 //! Pure, synchronous ratatui rendering for the wizard and dashboard state
-//! machines. Rust port of the retired TypeScript `wizard.tsx` + `app.tsx` +
-//! `tabs/{status,daemon,sessions,config}.tsx`.
+//! machines.
 //!
 //! `draw_wizard`/`draw_dashboard` never touch the controller or do I/O —
 //! every bit of async-fetched display data (daemon state, log tail, env
@@ -31,7 +30,7 @@ pub struct RenderCtx {
     pub daemon: DaemonState,
     /// Last 8 non-empty `daemon.log` lines.
     pub logs_tail: Vec<String>,
-    /// `(git, claude)` — TS `checkEnv()`.
+    /// Environment probe results: `(git, claude)` binaries.
     pub env: (Detected, Detected),
     pub missing: Vec<&'static str>,
     pub enabled_gateways: Vec<String>,
@@ -120,9 +119,8 @@ pub fn draw_wizard(frame: &mut Frame, state: &WizardState, _ctx: &RenderCtx) {
     }
 }
 
-/// `{caret|"  "}[x] {label} — {description}  {right}` per row (TS
-/// `MultiSelectList`); `right` (runtime detect string) only on the runtimes
-/// list.
+/// Multi-select list: `{caret|"  "}[x] {label} — {description}  {right}`
+/// per row; `right` (runtime detect string) only on the runtimes list.
 #[allow(clippy::too_many_arguments)]
 fn draw_wizard_list(
     frame: &mut Frame,
@@ -477,14 +475,14 @@ fn draw_config_tab(frame: &mut Frame, area: Rect, state: &DashboardState, ctx: &
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // The retired TS `padEnd(22)` assumed every label fit in 22 columns; it
-    // doesn't — "Default permission mode" (23), "Attachment allowed hosts"
-    // (24), "Attachment allowed extensions" (29), and a few `Auto-update
-    // ...` labels all overflow it, which ran the value straight into the
-    // label with no gap (e.g. "Default permission modedefault"). Deviate
-    // from the TS constant deliberately: size the label column to the
-    // longest label actually present this render (+2 for a gap), with 22
-    // as the floor so short label sets keep the original layout.
+    // A fixed 22-column label pad would assume every label fits in 22
+    // columns; it doesn't — "Default permission mode" (23), "Attachment
+    // allowed hosts" (24), "Attachment allowed extensions" (29), and a few
+    // `Auto-update ...` labels all overflow it, which would run the value
+    // straight into the label with no gap (e.g. "Default permission
+    // modedefault"). Instead, size the label column to the longest label
+    // actually present this render (+2 for a gap), with 22 as the floor so
+    // short label sets keep the compact layout.
     let label_col_width = state
         .config_rows
         .iter()
@@ -633,6 +631,8 @@ fn draw_options_overlay(frame: &mut Frame, area: Rect) {
 // Shared helpers
 // ---------------------------------------------------------------------
 
+/// The brand identity for CLI text surfaces per `assets/brand/README.md`:
+/// the glyph `r` in the signature tone followed by the bold `ryuzi` name.
 fn brand_line(suffix: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled("r", theme::tone_bold(Tone::Signature)),
@@ -655,7 +655,7 @@ fn short_pk(pk: &str) -> String {
     pk.chars().take(8).collect()
 }
 
-/// `hh:mm:ss` uptime since `started_at` (ms), `—` when `None` — TS `uptime`.
+/// `hh:mm:ss` uptime since `started_at` (ms), `—` when `None`.
 fn uptime(started_at: Option<i64>) -> String {
     let Some(started_at) = started_at else {
         return "—".to_string();
@@ -669,7 +669,8 @@ fn uptime(started_at: Option<i64>) -> String {
     )
 }
 
-/// `Tab switch  ·  ... ·  ? options  ·  q quit` — TS `hintsFor`.
+/// Per-tab key hints for the status bar:
+/// `Tab switch  ·  ... ·  ? options  ·  q quit`.
 fn hints_for(active: usize, daemon_running: bool) -> Vec<(String, String)> {
     let mut hints = vec![("Tab".to_string(), "switch".to_string())];
     match active {

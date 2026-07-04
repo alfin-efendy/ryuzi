@@ -1,0 +1,3 @@
+[test]
+# DOM globals for React component tests (see scripts/test/happydom.ts).
+preload = ["./scripts/test/happydom.ts"]

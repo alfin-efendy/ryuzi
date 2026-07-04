@@ -118,7 +118,7 @@ async fn run_session(
         }
     };
     let project = match existing {
-        Some(p) => p, // TS parity: flags on an existing project row are silently ignored
+        Some(p) => p, // flags on an existing project row are silently ignored — stored settings win
         None => {
             let name = workdir
                 .file_name()

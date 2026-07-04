@@ -1,10 +1,10 @@
-//! `WizardState` — pure, terminal-free port of the retired TypeScript
-//! `wizard.tsx` (+ `multi-select-list.tsx`'s cursor semantics).
+//! `WizardState` — the first-run wizard as a pure, terminal-free state
+//! machine (rendering lives in `render.rs`).
 //!
 //! Three phases: pick gateways, pick runtimes, then fill in any still-missing
 //! required settings. Persistence is eager — each list phase's Enter writes
 //! straight through `AppController` before advancing, so quitting mid-fields
-//! still leaves the gateway/runtime choice saved (TS parity).
+//! still leaves the gateway/runtime choice saved.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,8 +22,8 @@ pub enum WizardPhase {
 
 pub struct WizardState {
     pub phase: WizardPhase,
-    /// Resets to 0 on every phase change (TS: each list is a fresh
-    /// component mount, so its cursor state starts over).
+    /// Resets to 0 on every phase change — each list starts with the
+    /// cursor on its first row.
     pub cursor: usize,
     pub gw_sel: Vec<String>,
     pub rt_sel: Vec<String>,
@@ -40,8 +40,8 @@ pub struct WizardState {
 
 impl WizardState {
     /// Pre-checks `gw_sel`/`rt_sel` from the persisted `enabled_*` settings
-    /// and eagerly detects every catalog runtime (detection is synchronous
-    /// in Rust, unlike the TS `useEffect`).
+    /// and eagerly detects every catalog runtime up front (detection is
+    /// synchronous, so results are complete before the first render).
     pub async fn new(controller: &AppController) -> Self {
         let gw_sel = controller.enabled_gateways().await;
         let rt_sel = controller.enabled_runtimes().await;
@@ -180,8 +180,8 @@ impl WizardState {
         }
     }
 
-    /// Esc is a no-op here (TS: `useInput` is inactive during the fields
-    /// phase, so escape never reaches `exit()`).
+    /// Esc is deliberately a no-op here — the fields phase can only be left
+    /// by completing it (Ctrl+C remains the universal exit).
     async fn handle_fields(&mut self, key: Key, controller: &AppController) {
         match key {
             Key::Char(c) => self.draft.push(c),
@@ -217,9 +217,9 @@ fn toggle(sel: &mut Vec<String>, id: &str) {
     }
 }
 
-/// TS `orderFields`: re-order missing fields so provider fields (gateway
-/// then runtime, in that relative order) come before global fields,
-/// preserving each group's original relative order.
+/// Re-order missing fields so provider fields (gateway then runtime, in
+/// that relative order) come before global fields, preserving each group's
+/// original relative order.
 async fn order_fields(
     controller: &AppController,
     missing: &[&'static ConfigField],
@@ -317,7 +317,7 @@ mod tests {
             w.error.as_deref(),
             Some("default_perm_mode must be one of: default, acceptEdits, bypassPermissions")
         );
-        assert_eq!(w.draft, "bogus"); // draft NOT cleared on error (TS parity)
+        assert_eq!(w.draft, "bogus"); // draft intentionally kept on error so the user can fix it
         w.handle(Key::Esc, &c).await;
         assert!(!w.exit && !w.done); // Esc is a no-op in fields phase
     }

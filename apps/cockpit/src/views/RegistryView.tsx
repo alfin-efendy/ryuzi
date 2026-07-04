@@ -1,8 +1,8 @@
 import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { Check, CircleAlert, Search } from "lucide-react";
 import { toast } from "sonner";
+import { Button, Input, SettingsCard as Card } from "@ryuzi/ui";
 import { commands, type RegistryEntry } from "@/bindings";
-import { Card } from "@/components/common/Card";
 import { BackButton } from "@/components/common/DetailHeader";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { useApps } from "@/store-apps";
@@ -92,12 +92,12 @@ export function RegistryView() {
 
         <div className="mb-3 flex h-[34px] w-full max-w-[380px] items-center gap-2 rounded-md border border-input bg-background px-3 text-muted-foreground">
           <Search aria-hidden size={13} strokeWidth={2} className="shrink-0" />
-          <input
+          <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search the registry"
             aria-label="Search the registry"
-            className="min-w-0 flex-1 border-none bg-transparent font-sans text-[13px] text-foreground outline-none"
+            className="h-auto min-w-0 flex-1 border-none bg-transparent p-0 text-foreground focus-visible:ring-0 dark:bg-transparent"
           />
         </div>
 
@@ -105,18 +105,15 @@ export function RegistryView() {
           {QUICK_SEARCHES.map((c) => {
             const sel = c === quick;
             return (
-              <button
+              <Button
                 key={c}
-                type="button"
+                variant={sel ? "default" : "outline"}
+                size="xs"
                 onClick={() => setQuick(c)}
-                className={`h-[26px] cursor-pointer rounded-full border px-3 font-sans text-xs font-medium capitalize ${
-                  sel
-                    ? "border-transparent bg-primary text-primary-foreground"
-                    : "border-border bg-transparent text-muted-foreground hover:bg-accent"
-                }`}
+                className="rounded-full px-3 capitalize"
               >
                 {c}
-              </button>
+              </Button>
             );
           })}
         </div>
@@ -153,14 +150,9 @@ export function RegistryView() {
               );
             } else {
               action = (
-                <button
-                  type="button"
-                  onClick={() => void install(rg)}
-                  disabled={!rg.installTarget}
-                  className="h-[27px] cursor-pointer rounded-md border-none bg-primary px-[13px] font-sans text-xs font-medium text-primary-foreground hover:opacity-85 disabled:cursor-default disabled:opacity-45"
-                >
+                <Button size="sm" onClick={() => void install(rg)} disabled={!rg.installTarget}>
                   Install
-                </button>
+                </Button>
               );
             }
             return (
@@ -189,16 +181,16 @@ export function RegistryView() {
         {loading && <div className="py-6 text-center text-[13px] text-muted-foreground">Searching…</div>}
         {!loading && nextCursor && (
           <div className="mt-4 flex justify-center">
-            <button
-              type="button"
+            <Button
+              variant="outline"
               onClick={() => {
                 const q = quick === "All" ? query : query.trim() ? `${quick} ${query}` : quick;
                 void runSearch(q, nextCursor);
               }}
-              className="h-8 cursor-pointer rounded-md border border-border bg-transparent px-4 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
+              className="px-4"
             >
               Load more
-            </button>
+            </Button>
           </div>
         )}
       </div>

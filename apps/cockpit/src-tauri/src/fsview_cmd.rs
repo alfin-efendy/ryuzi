@@ -79,6 +79,28 @@ pub struct WorktreeState {
     pub unmerged_commits: u32,
 }
 
+/// Classify the worktree at `wt`: a directory that isn't a git repo (e.g. an
+/// emptied leftover dir) reports clean; otherwise uncommitted work marks it
+/// dirty, and commits reachable only from the session branch are counted (no
+/// branch, or a failed count, means none).
+async fn worktree_state_at(wt: &str, branch: Option<&str>) -> anyhow::Result<WorktreeState> {
+    if !std::path::Path::new(wt).join(".git").exists() {
+        return Ok(WorktreeState {
+            dirty: false,
+            unmerged_commits: 0,
+        });
+    }
+    let dirty = fsview::is_dirty(wt).await?;
+    let unmerged_commits = match branch {
+        Some(branch) => fsview::unmerged_commit_count(wt, branch).await.unwrap_or(0),
+        None => 0,
+    };
+    Ok(WorktreeState {
+        dirty,
+        unmerged_commits,
+    })
+}
+
 /// What the session's OWN worktree would lose on teardown — the archive flow
 /// asks before discarding either kind of work. Sessions whose worktree is
 /// gone (or isn't a repo, e.g. an emptied leftover dir) report clean —
@@ -97,25 +119,13 @@ pub async fn worktree_dirty(
         .ok_or_else(|| CmdError {
             message: format!("unknown session: {session_pk}"),
         })?;
-    let clean = WorktreeState {
-        dirty: false,
-        unmerged_commits: 0,
-    };
     let Some(wt) = session.worktree_path.as_deref() else {
-        return Ok(clean);
+        return Ok(WorktreeState {
+            dirty: false,
+            unmerged_commits: 0,
+        });
     };
-    if !std::path::Path::new(wt).join(".git").exists() {
-        return Ok(clean);
-    }
-    let dirty = fsview::is_dirty(wt).await?;
-    let unmerged_commits = match session.branch.as_deref() {
-        Some(branch) => fsview::unmerged_commit_count(wt, branch).await.unwrap_or(0),
-        None => 0,
-    };
-    Ok(WorktreeState {
-        dirty,
-        unmerged_commits,
-    })
+    Ok(worktree_state_at(wt, session.branch.as_deref()).await?)
 }
 
 #[tauri::command]
@@ -146,4 +156,77 @@ pub async fn search_files(
             message: e.to_string(),
         })?;
     Ok(hits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    /// Empty, unique scratch directory (recreated on reruns of the same pid).
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ryuzi-fsview-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Run git isolated from the developer's global/system config so commits
+    /// need no signing keys or hooks.
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=test", "-c", "user.email=test@test"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[tokio::test]
+    async fn non_repo_directory_reports_clean() {
+        let dir = fresh_dir("nonrepo");
+        let st = worktree_state_at(dir.to_str().unwrap(), Some("sess"))
+            .await
+            .unwrap();
+        assert!(!st.dirty);
+        assert_eq!(st.unmerged_commits, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn uncommitted_work_marks_dirty() {
+        let dir = fresh_dir("dirty");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("scratch.txt"), "wip").unwrap();
+        let st = worktree_state_at(dir.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(st.dirty);
+        assert_eq!(st.unmerged_commits, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn commit_only_on_session_branch_counts_as_unmerged() {
+        let dir = fresh_dir("unmerged");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "base").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+        git(&dir, &["checkout", "-q", "-b", "sess"]);
+        std::fs::write(dir.join("b.txt"), "session work").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "session work"]);
+        let st = worktree_state_at(dir.to_str().unwrap(), Some("sess"))
+            .await
+            .unwrap();
+        assert!(!st.dirty);
+        assert_eq!(st.unmerged_commits, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

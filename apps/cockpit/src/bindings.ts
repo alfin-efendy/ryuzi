@@ -717,7 +717,7 @@ needsRelogin: boolean }
 export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
- * surface of a session. TS parity: `{ kind: "notice", session_pk, text }`.
+ * surface of a session.
  */
 { kind: "notice"; session_pk: string; text: string } | { kind: "sessionEnded"; session_pk: string } | 
 /**

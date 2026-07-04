@@ -81,6 +81,11 @@ fn resolve_cron(input: &JobInput) -> Result<String, CmdError> {
     Ok(cron)
 }
 
+/// Wall-clock duration of a run; a run that hasn't finished has none yet.
+fn run_duration_ms(started_at: i64, finished_at: Option<i64>) -> Option<i64> {
+    finished_at.map(|f| f - started_at)
+}
+
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<JobInfo>> {
     let projects = cp.list_projects().await?;
     let now = ryuzi_core::paths::now_ms();
@@ -118,7 +123,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<JobInfo>> {
                     id: r.id,
                     status: r.status,
                     started_at_ms: r.started_at,
-                    duration_ms: r.finished_at.map(|f| f - r.started_at),
+                    duration_ms: run_duration_ms(r.started_at, r.finished_at),
                     add_lines: r.add_lines,
                     del_lines: r.del_lines,
                     note: r.note,
@@ -252,4 +257,62 @@ pub async fn run_job_now(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<
 #[specta::specta]
 pub fn parse_natural_schedule(text: String) -> Option<String> {
     scheduler::natural_to_cron(&text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(mode: &str, natural: &str, cron: &str) -> JobInput {
+        JobInput {
+            name: "job".into(),
+            mode: mode.into(),
+            natural: natural.into(),
+            cron: cron.into(),
+            project_id: "p1".into(),
+            branch: "main".into(),
+            agent: "agent".into(),
+            gateway: "local".into(),
+            prompt: "do it".into(),
+            notify_success: false,
+            notify_fail: false,
+        }
+    }
+
+    #[test]
+    fn natural_mode_translates_english_and_ignores_the_cron_field() {
+        let cron = resolve_cron(&input("natural", "every day at 2am", "9 9 9 9 9")).unwrap();
+        assert_eq!(cron, "0 2 * * *");
+    }
+
+    #[test]
+    fn unparseable_natural_text_suggests_alternatives() {
+        let err = resolve_cron(&input("natural", "whenever it rains", "")).unwrap_err();
+        assert_eq!(
+            err.message,
+            "couldn't parse \"whenever it rains\" — try e.g. \"every day at 2am\", \"every monday at 9am\", \"every 6 hours\", or switch to cron mode"
+        );
+    }
+
+    #[test]
+    fn cron_mode_trims_and_keeps_the_expression() {
+        let cron = resolve_cron(&input("cron", "ignored", "  0 2 * * *  ")).unwrap();
+        assert_eq!(cron, "0 2 * * *");
+    }
+
+    #[test]
+    fn cron_mode_rejects_invalid_expressions() {
+        let err = resolve_cron(&input("cron", "", "not a cron")).unwrap_err();
+        assert_eq!(err.message, "invalid cron expression: not a cron");
+    }
+
+    #[test]
+    fn duration_is_finish_minus_start() {
+        assert_eq!(run_duration_ms(1_000, Some(4_500)), Some(3_500));
+    }
+
+    #[test]
+    fn unfinished_run_has_no_duration() {
+        assert_eq!(run_duration_ms(1_000, None), None);
+    }
 }

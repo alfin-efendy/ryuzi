@@ -7,15 +7,18 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tokio-util = { version = "0.7", features = ["compat"] }
-futures = "0.3"
+futures.workspace = true
 agent-client-protocol = { version = "1.0", features = ["unstable"] }
 agent-client-protocol-schema = { version = "1.1", features = ["unstable"] }
-specta = { version = "2.0.0-rc.22", features = ["derive", "serde_json"] }
+specta = { workspace = true, features = ["derive", "serde_json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 deadpool-sqlite = { version = "0.8", features = ["rt_tokio_1"] }
 rusqlite_migration = "1.2"
@@ -24,20 +27,20 @@ rusqlite_migration = "1.2"
 # dead weight and the main obstacle to zigbuild cross-compilation.
 git2 = { version = "0.21", default-features = false }
 uuid = { version = "1", features = ["v4"] }
-dirs = "5"
-anyhow = "1"
-async-trait = "0.1"
+dirs.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
 tracing = "0.1"
-portable-pty = "0.8"
+portable-pty.workspace = true
 ureq = "2"
 sha2 = "0.10"
 base64 = "0.22"
 url = "2"
 sysinfo = "0.33"
 croner = "2"
-chrono = "0.4"
+chrono.workspace = true
 axum = "0.8"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { workspace = true, default-features = true, features = ["json", "stream"] }
 bytes = "1"
 tokio-stream = "0.1"
 toml_edit = "0.22"
@@ -50,8 +53,8 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
-serial_test = "3"
+tempfile.workspace = true
+serial_test.workspace = true
 
 [features]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]

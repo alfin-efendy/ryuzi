@@ -1,7 +1,8 @@
-//! Port of `packages/core/src/update/asset.ts` with the NEW (design §10)
-//! asset-naming scheme: `ryuzi-{version}-{target-triple}.tar.gz`. The break
-//! from the TS `ryuzi_{v}_{goos}_{goarch}` scheme is deliberate — in-field TS
-//! self-updaters match assets by name, find nothing, and stay silent.
+//! Release-asset naming, URLs, and checksum verification. The asset-naming
+//! scheme is `ryuzi-{version}-{target-triple}.tar.gz` — a deliberate break
+//! from the legacy `ryuzi_{v}_{goos}_{goarch}` scheme, so still-deployed
+//! legacy self-updaters match assets by name, find nothing, and stay silent
+//! instead of installing an incompatible binary.
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,9 +60,10 @@ pub fn verify_checksum(bytes: &[u8], name: &str, checksums_text: &str) -> bool {
     false
 }
 
-/// Compile-time-informed platform detect. Deliberate delta from TS (which
-/// sniffed `/etc/alpine-release`): `cfg!(target_env = "musl")` — the binary
-/// knows its own linkage, and a self-update must fetch the same flavor.
+/// Compile-time-informed platform detect: musl-ness comes from
+/// `cfg!(target_env = "musl")`, not runtime sniffing (e.g. checking for
+/// `/etc/alpine-release`) — the binary knows its own linkage, and a
+/// self-update must fetch the same flavor.
 pub fn detect_platform() -> Option<Platform> {
     let p = Platform {
         os: match std::env::consts::OS {
@@ -119,7 +121,7 @@ mod tests {
             .as_deref(),
             Some("ryuzi-0.3.0-aarch64-apple-darwin.tar.gz")
         );
-        // the old TS goos/goarch scheme must be impossible to produce
+        // the legacy goos/goarch scheme must be impossible to produce
         assert!(asset_name("0.3.0", LINUX_GNU)
             .unwrap()
             .contains("x86_64-unknown-linux-gnu"));

@@ -141,6 +141,28 @@ html.dark[data-backdrop] {
   backdrop-filter: blur(16px) saturate(140%);
 }
 
+/* Acrylic surface recipes: one full-window glass layer behind a transparent
+   title bar + sidebar, a floating main content card, and flat panel tints
+   inside it (the glass layer already blurs). */
+@utility acrylic-chrome {
+  background: color-mix(in oklab, var(--sidebar) 55%, transparent);
+  -webkit-backdrop-filter: blur(32px) saturate(160%);
+  backdrop-filter: blur(32px) saturate(160%);
+}
+@utility acrylic-main {
+  background: color-mix(in oklab, var(--background) 62%, transparent);
+  -webkit-backdrop-filter: blur(40px) saturate(150%);
+  backdrop-filter: blur(40px) saturate(150%);
+}
+@utility acrylic-panel {
+  background: color-mix(in oklab, var(--surface) 55%, transparent);
+}
+@utility acrylic-card {
+  background: color-mix(in oklab, var(--card) 82%, transparent);
+  -webkit-backdrop-filter: blur(24px);
+  backdrop-filter: blur(24px);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

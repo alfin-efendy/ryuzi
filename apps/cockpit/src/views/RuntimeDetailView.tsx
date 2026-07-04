@@ -1,13 +1,24 @@
+import {
+  Button,
+  Input,
+  MenuPanel,
+  MenuPanelItem as MenuItem,
+  MenuPanelSeparator as MenuSeparator,
+  NativeSelect,
+  Segmented,
+  SettingsCard as Card,
+  SettingsCardHeader as CardHeader,
+  SettingsCardHint as CardHint,
+  SettingsCardRow as CardRow,
+  SettingsCardTitle as CardTitle,
+  Switch,
+} from "@ryuzi/ui";
 import { AlertTriangle, Copy, Layers, Loader2, MonitorUp, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { commands, type RuntimeConfigStatusInfo } from "@/bindings";
 import { Chip, Pill } from "@/components/common/bits";
-import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { MenuItem, MenuPanel, MenuSeparator } from "@/components/common/MenuPanel";
-import { Segmented } from "@/components/common/Segmented";
-import { Switch } from "@/components/common/Switch";
 import { PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { agentAllowed, useApps } from "@/store-apps";
@@ -17,7 +28,7 @@ import { useNav } from "@/store-nav";
 
 const WARN = "#F59E0B";
 
-// A single "<label> <select>" row for the endpoint-config card's model
+// A single label + NativeSelect row for the endpoint-config card's model
 // pickers — options come from the enabled connections' models.
 function ModelSelectRow({
   label,
@@ -33,18 +44,14 @@ function ModelSelectRow({
   return (
     <div className="flex items-center gap-2.5 px-[18px] py-[7px]">
       <span className="w-[100px] shrink-0 text-[12.5px] font-medium text-muted-foreground">{label}</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-xs text-foreground"
-      >
+      <NativeSelect value={value} onChange={(e) => onChange(e.target.value)} className="min-w-0 flex-1">
         <option value="">— pick a model —</option>
         {options.map((m) => (
           <option key={m} value={m}>
             {m}
           </option>
         ))}
-      </select>
+      </NativeSelect>
     </div>
   );
 }
@@ -136,13 +143,9 @@ export function RuntimeDetailView({ id }: { id: string }) {
           sub={installed ? `${agent.connection} · ${agent.binaryPath}` : `${agent.connection} · not installed`}
         >
           {!isDefault && agent.enabled && installed && (
-            <button
-              type="button"
-              onClick={() => void setDefault(agent.id)}
-              className="h-8 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
-            >
+            <Button variant="outline" onClick={() => void setDefault(agent.id)}>
               Make default
-            </button>
+            </Button>
           )}
           <Switch
             on={agent.enabled && installed}
@@ -166,30 +169,25 @@ export function RuntimeDetailView({ id }: { id: string }) {
               )}
             </div>
             <div className="flex shrink-0 flex-col items-stretch gap-1.5">
-              <button
-                type="button"
-                disabled={isUpdating}
-                onClick={() => void beginUpdate(agent.id)}
-                className="flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-60"
-              >
+              <Button disabled={isUpdating} onClick={() => void beginUpdate(agent.id)}>
                 {isUpdating ? (
-                  <Loader2 aria-hidden size={12} strokeWidth={2} className="animate-spin" />
+                  <Loader2 aria-hidden size={12} strokeWidth={2} className="size-3 animate-spin" />
                 ) : (
-                  <MonitorUp aria-hidden size={12} strokeWidth={2} />
+                  <MonitorUp aria-hidden size={12} strokeWidth={2} className="size-3" />
                 )}
                 {isUpdating ? "Updating…" : "Update now"}
-              </button>
-              <button
-                type="button"
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
                 onClick={() => {
                   void navigator.clipboard.writeText(updateCmd);
                   toast.success("Update command copied");
                 }}
-                className="flex h-[26px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md border border-border bg-transparent px-3 font-sans text-[11.5px] font-medium text-foreground hover:bg-accent"
               >
-                <Copy aria-hidden size={11} strokeWidth={2} />
+                <Copy aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
                 Copy command
-              </button>
+              </Button>
             </div>
           </Card>
         )}
@@ -215,27 +213,24 @@ export function RuntimeDetailView({ id }: { id: string }) {
                 {tier.value !== null ? (
                   <>
                     <span className="min-w-0 flex-1 truncate font-mono text-xs">{tier.value}</span>
-                    <button
-                      type="button"
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
                       title="Clear"
                       aria-label={`Clear ${tier.label} model`}
                       onClick={() => void setTier(agent.id, tier.id, null)}
-                      className="flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-sm border-none bg-transparent p-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                      className="text-muted-foreground"
                     >
                       <X aria-hidden size={12} strokeWidth={2} />
-                    </button>
+                    </Button>
                   </>
                 ) : (
                   <span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">Not set</span>
                 )}
               </div>
-              <button
-                type="button"
-                onClick={() => setOpenTierMenu((v) => (v === tier.id ? null : tier.id))}
-                className="h-8 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3 font-sans text-xs font-medium text-foreground hover:bg-accent"
-              >
+              <Button variant="outline" onClick={() => setOpenTierMenu((v) => (v === tier.id ? null : tier.id))}>
                 Select model
-              </button>
+              </Button>
               {openTierMenu === tier.id && (
                 <MenuPanel onClose={() => setOpenTierMenu(null)} className="right-[18px] top-[42px] w-[240px]">
                   {agent.models.length === 0 && (
@@ -287,13 +282,13 @@ export function RuntimeDetailView({ id }: { id: string }) {
           </CardRow>
           <CardRow>
             <span className="w-[110px] shrink-0 text-[13px] font-medium">CLI flags</span>
-            <input
+            <Input
               defaultValue={agent.flags}
               onBlur={(e) => {
                 if (e.target.value !== agent.flags) void update(agent.id, { flags: e.target.value });
               }}
               placeholder="No extra flags"
-              className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-xs text-foreground"
+              className="flex-1 font-mono text-xs md:text-xs"
             />
           </CardRow>
           <CardRow>
@@ -344,22 +339,13 @@ export function RuntimeDetailView({ id }: { id: string }) {
               </div>
               <div className="flex items-center justify-end gap-2 border-t border-border px-[18px] py-3">
                 {cfg?.configured && (
-                  <button
-                    type="button"
-                    onClick={() => void resetConfig()}
-                    className="h-8 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
-                  >
+                  <Button variant="outline" onClick={() => void resetConfig()}>
                     Reset
-                  </button>
+                  </Button>
                 )}
-                <button
-                  type="button"
-                  disabled={endpointBlocked || noModels}
-                  onClick={() => void applyConfig()}
-                  className="h-8 shrink-0 cursor-pointer rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-50"
-                >
+                <Button disabled={endpointBlocked || noModels} onClick={() => void applyConfig()}>
                   Apply
-                </button>
+                </Button>
               </div>
             </>
           )}
@@ -400,14 +386,9 @@ export function RuntimeDetailView({ id }: { id: string }) {
                 : "not installed"}
             </span>
             <span className="flex-1" />
-            <button
-              type="button"
-              onClick={() => void refresh()}
-              disabled={refreshing}
-              className="h-[27px] shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-[11px] font-sans text-xs font-medium text-foreground hover:bg-accent disabled:opacity-50"
-            >
+            <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={refreshing}>
               {refreshing ? "Checking…" : "Check for updates"}
-            </button>
+            </Button>
           </CardHeader>
           <div className="px-[18px] py-3 text-[12.5px] text-muted-foreground">
             {agent.npmPackage ? (

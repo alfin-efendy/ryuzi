@@ -1,9 +1,16 @@
 import { RefreshCw } from "lucide-react";
 import { useEffect } from "react";
-import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
+import {
+  Button,
+  Segmented,
+  SettingsCard as Card,
+  SettingsCardHeader as CardHeader,
+  SettingsCardHint as CardHint,
+  SettingsCardRow as CardRow,
+  SettingsCardTitle as CardTitle,
+  Switch,
+} from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { Segmented } from "@/components/common/Segmented";
-import { Switch } from "@/components/common/Switch";
 import { Chip, StatusDot } from "@/components/common/bits";
 import { agentAllowed, appById, useApps } from "@/store-apps";
 import { useRuntimes } from "@/store-runtimes";
@@ -48,25 +55,19 @@ export function AppDetailView({ id }: { id: string }) {
             <StatusDot color={status.color} />
             {status.label}
           </span>
-          <button
-            type="button"
-            onClick={() => void probe(app.id)}
-            disabled={isProbing}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent disabled:opacity-50"
-          >
-            <RefreshCw aria-hidden size={13} strokeWidth={2} className={isProbing ? "animate-spin" : ""} />
+          <Button variant="outline" onClick={() => void probe(app.id)} disabled={isProbing}>
+            <RefreshCw aria-hidden size={13} strokeWidth={2} className={isProbing ? "size-[13px] animate-spin" : "size-[13px]"} />
             {isProbing ? "Connecting…" : "Reconnect"}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="destructive"
             onClick={() => {
               void remove(app.id);
               goApps();
             }}
-            className="h-8 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-destructive hover:bg-accent"
           >
             Uninstall
-          </button>
+          </Button>
         </DetailHeader>
 
         {app.status === "error" && app.statusDetail && (
@@ -116,19 +117,18 @@ export function AppDetailView({ id }: { id: string }) {
               {gateways.map((w) => {
                 const sel = app.scopeGateways.includes(w.id);
                 return (
-                  <button
+                  <Button
                     key={w.id}
-                    type="button"
+                    variant={sel ? "default" : "outline"}
+                    size="sm"
                     onClick={() =>
                       void setScope(app.id, app.scope, sel ? app.scopeGateways.filter((x) => x !== w.id) : [...app.scopeGateways, w.id])
                     }
-                    className={`flex h-7 cursor-pointer items-center gap-[7px] rounded-full border px-[11px] font-sans text-xs font-medium ${
-                      sel ? "border-transparent bg-primary text-primary-foreground" : "border-border bg-transparent text-muted-foreground"
-                    }`}
+                    className="rounded-full"
                   >
                     <span className="font-mono text-[9.5px] font-semibold opacity-75">{w.badge}</span>
                     {w.name}
-                  </button>
+                  </Button>
                 );
               })}
             </div>

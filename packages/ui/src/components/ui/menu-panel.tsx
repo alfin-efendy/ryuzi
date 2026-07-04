@@ -1,8 +1,9 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { Check } from "lucide-react";
-import { cn } from "@ryuzi/ui";
 
-export function useClickOutside(onClose: () => void) {
+import { cn } from "../../lib/utils";
+
+function useClickOutside(onClose: () => void) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -25,7 +26,9 @@ type MenuPanelProps = {
 };
 
 // Absolutely-positioned popover panel; the parent supplies position classes.
-export function MenuPanel({ onClose, className, children }: MenuPanelProps) {
+// Statically placed counterpart to the anchored Menu — use Menu when a
+// trigger-anchored dropdown fits; use MenuPanel inside custom containers.
+function MenuPanel({ onClose, className, children }: MenuPanelProps) {
   const ref = useClickOutside(onClose);
   return (
     <div
@@ -37,20 +40,20 @@ export function MenuPanel({ onClose, className, children }: MenuPanelProps) {
   );
 }
 
-export function MenuSectionLabel({ children }: { children: ReactNode }) {
+function MenuPanelSection({ children }: { children: ReactNode }) {
   return (
     <div className="px-2.5 pb-[5px] pt-[7px] text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">{children}</div>
   );
 }
 
-type MenuItemProps = {
+type MenuPanelItemProps = {
   onClick?: () => void;
   selected?: boolean;
   className?: string;
   children: ReactNode;
 };
 
-export function MenuItem({ onClick, selected, className, children }: MenuItemProps) {
+function MenuPanelItem({ onClick, selected, className, children }: MenuPanelItemProps) {
   return (
     <button
       type="button"
@@ -66,6 +69,8 @@ export function MenuItem({ onClick, selected, className, children }: MenuItemPro
   );
 }
 
-export function MenuSeparator() {
+function MenuPanelSeparator() {
   return <div className="my-1 border-t border-border" />;
 }
+
+export { MenuPanel, MenuPanelSection, MenuPanelItem, MenuPanelSeparator, useClickOutside };

@@ -5,8 +5,8 @@ import { formatLastSeen, useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
 import type { GatewayInfo } from "@/bindings";
+import { Button, SettingsCard as Card } from "@ryuzi/ui";
 import { AddGatewayModal } from "@/components/modals/AddGatewayModal";
-import { Card } from "@/components/common/Card";
 import { QuotaTrack, StatusDot } from "@/components/common/bits";
 
 function plural(n: number, word: string): string {
@@ -23,10 +23,10 @@ function GatewayCard({ g }: { g: GatewayInfo }) {
 
   return (
     <Card>
-      <button
-        type="button"
+      <Button
+        variant="ghost"
         onClick={() => nav.navigate({ kind: "gatewayDetail", id: g.id })}
-        className="flex w-full cursor-pointer items-center gap-3 border-none bg-transparent px-[18px] py-3.5 text-left font-sans"
+        className="h-auto w-full justify-start gap-3 whitespace-normal rounded-none px-[18px] py-3.5 text-left font-normal"
       >
         <span className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-md bg-muted font-mono text-[10.5px] font-semibold text-muted-foreground">
           {g.badge}
@@ -36,7 +36,7 @@ function GatewayCard({ g }: { g: GatewayInfo }) {
             <span className="text-sm font-semibold text-foreground">{g.name}</span>
           </span>
           <span className="mt-0.5 block text-xs text-muted-foreground">{g.metaLine}</span>
-          <span className="mt-0.5 block text-[11.5px] text-muted-foreground">
+          <span className="mt-0.5 block text-xs text-muted-foreground">
             {g.id === "local" ? plural(sessionCount, "session") : `daemon ${g.daemonVersion}`}
           </span>
         </span>
@@ -44,8 +44,8 @@ function GatewayCard({ g }: { g: GatewayInfo }) {
           <StatusDot color={statusColor} size={7} />
           {online ? "Connected" : "Offline"}
         </span>
-        <ChevronRight aria-hidden size={14} strokeWidth={2} className="shrink-0 text-muted-foreground" />
-      </button>
+        <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5 shrink-0 text-muted-foreground" />
+      </Button>
       {online && g.resources.length > 0 && (
         <div className="grid grid-cols-3 gap-[18px] px-[18px] pb-3.5">
           {g.resources.map((r) => (
@@ -83,23 +83,14 @@ export function GatewaysView() {
               Machines that run your projects, sessions, agents and apps. Cockpit talks to a daemon on each one.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => void probe()}
-            disabled={probing}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent disabled:opacity-50"
-          >
-            <RefreshCw aria-hidden size={13} strokeWidth={2} className={probing ? "animate-spin" : ""} />
+          <Button variant="outline" onClick={() => void probe()} disabled={probing} className="shrink-0">
+            <RefreshCw aria-hidden size={13} strokeWidth={2} className={probing ? "size-[13px] animate-spin" : "size-[13px]"} />
             {probing ? "Probing…" : "Probe"}
-          </button>
-          <button
-            type="button"
-            onClick={() => setAddOpen(true)}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-primary px-3 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-90"
-          >
-            <Plus aria-hidden size={14} strokeWidth={2} />
+          </Button>
+          <Button onClick={() => setAddOpen(true)} className="shrink-0">
+            <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             Connect gateway
-          </button>
+          </Button>
         </div>
 
         <div className="flex flex-col gap-3">

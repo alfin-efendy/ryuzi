@@ -64,6 +64,31 @@ fn humanize_uptime(secs: u64) -> String {
     }
 }
 
+/// CPU usage expressed as cores-in-use, plus memory and disk usage as rounded
+/// whole percentages. A zero-sized total (a snapshot can fail to size a
+/// resource) reports 0% instead of dividing by zero.
+fn resource_percentages(
+    cpu_pct: u32,
+    cores: usize,
+    mem_used_gb: f64,
+    mem_total_gb: f64,
+    disk_used_gb: f64,
+    disk_total_gb: f64,
+) -> (f64, u32, u32) {
+    let used_cores = (cpu_pct as f64 / 100.0) * cores as f64;
+    let mem_pct = if mem_total_gb > 0.0 {
+        (mem_used_gb / mem_total_gb * 100.0).round() as u32
+    } else {
+        0
+    };
+    let disk_pct = if disk_total_gb > 0.0 {
+        (disk_used_gb / disk_total_gb * 100.0).round() as u32
+    } else {
+        0
+    };
+    (used_cores, mem_pct, disk_pct)
+}
+
 async fn ensure_local_row(cp: &ControlPlane) -> anyhow::Result<GatewayRow> {
     if let Some(row) = gateways::get_row(cp.store(), "local").await? {
         return Ok(row);
@@ -110,17 +135,14 @@ async fn assemble(cp: &ControlPlane, probe: bool) -> anyhow::Result<Vec<GatewayI
     // --- Local host: live telemetry ------------------------------------
     let snap = tokio::task::spawn_blocking(gateways::local_snapshot).await?;
     set_last_seen(cp, "local").await;
-    let used_cores = (snap.cpu_pct as f64 / 100.0) * snap.cores as f64;
-    let mem_pct = if snap.mem_total_gb > 0.0 {
-        (snap.mem_used_gb / snap.mem_total_gb * 100.0).round() as u32
-    } else {
-        0
-    };
-    let disk_pct = if snap.disk_total_gb > 0.0 {
-        (snap.disk_used_gb / snap.disk_total_gb * 100.0).round() as u32
-    } else {
-        0
-    };
+    let (used_cores, mem_pct, disk_pct) = resource_percentages(
+        snap.cpu_pct,
+        snap.cores,
+        snap.mem_used_gb,
+        snap.mem_total_gb,
+        snap.disk_used_gb,
+        snap.disk_total_gb,
+    );
     let is_windows = cfg!(windows);
     out.push(GatewayInfo {
         id: "local".into(),
@@ -373,4 +395,51 @@ pub async fn gateway_events(
             text: e.text,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uptime_under_an_hour_shows_minutes() {
+        assert_eq!(humanize_uptime(59), "0m");
+        assert_eq!(humanize_uptime(300), "5m");
+        assert_eq!(humanize_uptime(3_599), "59m");
+    }
+
+    #[test]
+    fn uptime_under_a_day_shows_hours_and_minutes() {
+        assert_eq!(humanize_uptime(3_600), "1h 0m");
+        assert_eq!(humanize_uptime(5 * 3_600 + 42 * 60), "5h 42m");
+    }
+
+    #[test]
+    fn uptime_over_a_day_shows_days_and_hours() {
+        assert_eq!(humanize_uptime(86_400), "1d 0h");
+        assert_eq!(humanize_uptime(2 * 86_400 + 3 * 3_600 + 59 * 60), "2d 3h");
+    }
+
+    #[test]
+    fn percentages_from_used_and_total() {
+        let (cores, mem, disk) = resource_percentages(50, 8, 8.0, 16.0, 100.0, 200.0);
+        assert_eq!(cores, 4.0);
+        assert_eq!(mem, 50);
+        assert_eq!(disk, 50);
+    }
+
+    #[test]
+    fn percentages_round_to_nearest() {
+        let (_, mem, disk) = resource_percentages(0, 4, 1.0, 3.0, 2.0, 3.0);
+        assert_eq!(mem, 33);
+        assert_eq!(disk, 67);
+    }
+
+    #[test]
+    fn zero_totals_report_zero_percent() {
+        let (cores, mem, disk) = resource_percentages(25, 4, 8.0, 0.0, 100.0, 0.0);
+        assert_eq!(cores, 1.0);
+        assert_eq!(mem, 0);
+        assert_eq!(disk, 0);
+    }
 }

@@ -1,6 +1,6 @@
 //! Data-only provider catalog: gateway/runtime descriptors and their
-//! provider-specific `ConfigField`s, transcribed verbatim from the retired
-//! TypeScript `packages/core/src/providers/{catalog,gateways/discord,runtimes/claude-code}.ts`.
+//! provider-specific `ConfigField`s. Field keys are user-visible contracts —
+//! settings stored under these keys must keep resolving across releases.
 
 use crate::settings::fields::{ConfigField, BASE, GLOBAL_FIELDS};
 

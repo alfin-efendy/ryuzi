@@ -1,6 +1,6 @@
-//! Port of `packages/core/src/update/version.ts` — strict semver with the
-//! same prerelease-comparison rules; unparseable input compares Equal so a
-//! bad tag can never claim an update.
+//! Strict semver parsing and comparison, including the semver-spec
+//! prerelease rules; unparseable input compares Equal so a bad tag can
+//! never claim an update.
 use std::cmp::Ordering;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,8 +58,8 @@ pub fn parse_version(input: &str) -> Option<SemVer> {
     })
 }
 
-/// TS `cmpPrerelease`: no-prerelease ranks above prerelease; numeric
-/// identifiers rank below alphanumeric; element-wise, then by length.
+/// Semver prerelease ordering: no-prerelease ranks above prerelease;
+/// numeric identifiers rank below alphanumeric; element-wise, then by length.
 fn cmp_prerelease(a: &[String], b: &[String]) -> Ordering {
     match (a.is_empty(), b.is_empty()) {
         (true, true) => return Ordering::Equal,

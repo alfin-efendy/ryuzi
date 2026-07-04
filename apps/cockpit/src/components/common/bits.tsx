@@ -1,5 +1,5 @@
 import type { CSSProperties, ReactNode } from "react";
-import { cn } from "@ryuzi/ui";
+import { Button, cn } from "@ryuzi/ui";
 
 // Tinted initial avatar used for providers, agents and apps.
 export function Chip({
@@ -32,9 +32,9 @@ export function Chip({
   );
   if (onClick) {
     return (
-      <button type="button" onClick={onClick} className={cn(classes, "cursor-pointer border-none")} style={style}>
+      <Button variant="ghost" onClick={onClick} className={cn(classes, "h-auto cursor-pointer border-none p-0")} style={style}>
         {initial}
-      </button>
+      </Button>
     );
   }
   return (

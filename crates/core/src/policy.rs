@@ -63,7 +63,7 @@ pub fn tool_summary(name: &str, input: &serde_json::Value) -> String {
 /// Whether a clicker may approve a tool. The session starter always may. If
 /// NO approver roles are configured, only the starter may approve
 /// (safe-by-default). Otherwise the clicker must hold one of the approver
-/// roles. Ported from TS `canApprove` (`core/permissions.ts`).
+/// roles.
 pub fn can_approve(
     clicker_role_ids: &[String],
     approver_role_ids: &[String],
@@ -82,7 +82,7 @@ pub fn can_approve(
 
 /// Whether a user holds an admin role. If NO admin roles are configured,
 /// everyone is treated as admin — opposite default from `can_approve`, and
-/// preserves the zero-config single-user UX. Ported from TS `isAdmin`.
+/// preserves the zero-config single-user UX.
 pub fn is_admin(user_role_ids: &[String], admin_role_ids: &[String]) -> bool {
     if admin_role_ids.is_empty() {
         return true;
@@ -92,8 +92,7 @@ pub fn is_admin(user_role_ids: &[String], admin_role_ids: &[String]) -> bool {
 
 /// Clamp a privileged permission mode for non-admins. Only `BypassPermissions`
 /// is gated (it disables all tool approval). Returns the effective mode and
-/// whether it was downgraded, so the caller can warn the user. Ported from TS
-/// `gatePermMode`.
+/// whether it was downgraded, so the caller can warn the user.
 pub fn gate_perm_mode(requested: PermMode, is_admin_user: bool) -> (PermMode, bool) {
     if !is_admin_user && requested == PermMode::BypassPermissions {
         return (PermMode::Default, true);
@@ -102,18 +101,16 @@ pub fn gate_perm_mode(requested: PermMode, is_admin_user: bool) -> (PermMode, bo
 }
 
 /// Split a comma-separated role-id setting into a trimmed, non-empty list.
-/// Identical semantics to [`crate::settings::csv`] — ported from TS
-/// `parseRoleIds`, which itself matches the settings CSV parser.
+/// Identical semantics to [`crate::settings::csv`], to which it delegates.
 pub fn parse_role_ids(raw: Option<&str>) -> Vec<String> {
     crate::settings::csv(raw)
 }
 
 /// Summarize a tool call for display: `Bash` truncates its command to 80
 /// chars, others fall back to a `file_path`/`path`/`pattern` string input, or
-/// the bare tool name. Ported from TS `summarizeTool`; delegates to
-/// [`tool_summary`] above, which already implements identical behavior (kept
-/// as a distinct name for parity with the TS port surface named in the task
-/// brief).
+/// the bare tool name. Delegates to [`tool_summary`] above, which implements
+/// identical behavior (kept as a distinct public name for callers that know
+/// the policy surface by this name).
 pub fn summarize_tool(tool_name: &str, input: &serde_json::Value) -> String {
     tool_summary(tool_name, input)
 }

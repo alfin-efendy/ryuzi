@@ -3,12 +3,10 @@ import { useState } from "react";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
-import { MenuItem, MenuPanel } from "@/components/common/MenuPanel";
 import { StatusDot } from "@/components/common/bits";
-import { Modal } from "./Modal";
+import { Button, MenuPanel, MenuPanelItem as MenuItem, Modal, ModalFooter } from "@ryuzi/ui";
 
 const field = "flex h-[34px] items-center rounded-md border border-input bg-background px-3 text-[13px]";
-const btn = "h-8 cursor-pointer rounded-md border border-border bg-transparent px-3.5 font-sans text-[12.5px] font-medium hover:bg-accent";
 
 export function ProjectSettingsModal() {
   const projectId = useNav((s) => s.projectSettingsFor);
@@ -43,16 +41,12 @@ export function ProjectSettingsModal() {
           </div>
           <div className="relative flex flex-1 flex-col gap-1.5">
             <span className="text-xs font-semibold">Default agent</span>
-            <button
-              type="button"
-              onClick={() => setAgentMenuOpen((v) => !v)}
-              className={`${field} w-full cursor-pointer gap-2 border-input bg-background text-left font-sans text-[12.5px] hover:bg-accent`}
-            >
+            <Button variant="outline" onClick={() => setAgentMenuOpen((v) => !v)} className="w-full justify-start gap-2 text-left">
               {defaultAgent?.name ?? "None detected"}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="ml-auto text-muted-foreground" />
-            </button>
+              <ChevronDown aria-hidden size={11} strokeWidth={2} className="ml-auto size-[11px] text-muted-foreground" />
+            </Button>
             {agentMenuOpen && (
-              <MenuPanel onClose={() => setAgentMenuOpen(false)} className="right-0 top-[62px] z-50 w-[220px]">
+              <MenuPanel onClose={() => setAgentMenuOpen(false)} className="right-0 top-[60px] z-50 w-[220px]">
                 {pickable.length === 0 && <div className="px-3 py-2 text-[12px] text-muted-foreground">No agents detected.</div>}
                 {pickable.map((a) => (
                   <MenuItem
@@ -73,16 +67,9 @@ export function ProjectSettingsModal() {
         </div>
       </div>
 
-      <div className="mt-[22px] flex items-center gap-2">
-        <div className="flex-1" />
-        <button
-          type="button"
-          className="h-8 cursor-pointer rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85"
-          onClick={() => close(null)}
-        >
-          Done
-        </button>
-      </div>
+      <ModalFooter>
+        <Button onClick={() => close(null)}>Done</Button>
+      </ModalFooter>
     </Modal>
   );
 }

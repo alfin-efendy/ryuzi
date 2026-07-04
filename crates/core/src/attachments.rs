@@ -1,7 +1,7 @@
 //! Discord (or other gateway) message attachments: capped, filtered download
 //! into `.harness-attachments/{session_pk}`, plus the manifest text appended
-//! to the agent prompt. Ports `packages/core/src/core/attachments.ts`
-//! byte-for-byte (skip-reason strings, manifest strings, check order).
+//! to the agent prompt. Skip-reason strings, manifest strings, and check
+//! order are exact contracts covered by this module's tests.
 //!
 //! ControlPlane wiring (dest dir under the session's attachment root, config
 //! from settings) is a separate task — this module is the pure primitive.

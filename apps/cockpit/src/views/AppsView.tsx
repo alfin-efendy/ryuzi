@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { Check, Minus, Plus, Store } from "lucide-react";
-import { Card } from "@/components/common/Card";
-import { Segmented } from "@/components/common/Segmented";
+import { Button, Segmented, SettingsCard as Card } from "@ryuzi/ui";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import type { AppInfo } from "@/bindings";
 import { agentAllowed, useApps } from "@/store-apps";
@@ -47,22 +46,14 @@ export function AppsView() {
               Tools and MCP servers your agents can call — attached to every session they're allowed in.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => setAddOpen(true)}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
-          >
-            <Plus aria-hidden size={14} strokeWidth={2} />
+          <Button variant="outline" onClick={() => setAddOpen(true)}>
+            <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             Add app
-          </button>
-          <button
-            type="button"
-            onClick={() => nav.navigate({ kind: "registry" })}
-            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border-none bg-primary px-3 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-90"
-          >
-            <Store aria-hidden size={14} strokeWidth={2} />
+          </Button>
+          <Button onClick={() => nav.navigate({ kind: "registry" })}>
+            <Store aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             Browse registry
-          </button>
+          </Button>
         </div>
 
         <div className="mb-4">
@@ -89,11 +80,7 @@ export function AppsView() {
               const open = () => nav.navigate({ kind: "appDetail", id: app.id });
               return (
                 <Card key={app.id} className="flex flex-col gap-3 px-[18px] py-4">
-                  <button
-                    type="button"
-                    onClick={open}
-                    className="flex cursor-pointer items-center gap-3 border-none bg-transparent p-0 text-left font-sans text-foreground"
-                  >
+                  <Button variant="ghost" onClick={open} className="h-auto w-full justify-start gap-3 p-0 text-left">
                     <Chip initial={app.initial} color={app.color} size={38} mono />
                     <span className="min-w-0 flex-1">
                       <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-sm font-semibold">{app.name}</span>
@@ -105,18 +92,14 @@ export function AppsView() {
                       <StatusDot color={status.color} />
                       {status.label}
                     </span>
-                  </button>
+                  </Button>
                   <p className="m-0 text-[12.5px] leading-[1.5] text-muted-foreground">{app.desc || "No description."}</p>
                   <div className="flex items-center gap-2 pt-0.5">
                     <Pill variant="mono">{scopeLabel(app)}</Pill>
                     <span className="flex-1" />
-                    <button
-                      type="button"
-                      onClick={open}
-                      className="h-[27px] cursor-pointer rounded-md border border-border bg-transparent px-[11px] font-sans text-xs font-medium text-foreground hover:bg-accent"
-                    >
+                    <Button variant="outline" size="sm" onClick={open}>
                       Configure
-                    </button>
+                    </Button>
                   </div>
                 </Card>
               );
@@ -153,18 +136,19 @@ export function AppsView() {
                     const on = agentAllowed(app, a.id);
                     return (
                       <span key={a.id} className="flex justify-center">
-                        <button
-                          type="button"
+                        <Button
+                          variant="outline"
+                          size="icon-sm"
                           aria-label={`${on ? "Block" : "Allow"} ${app.name} for ${a.name}`}
                           onClick={() => void toggleAgent(app.id, a.id, !on)}
-                          className="flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-sm border border-border bg-transparent p-0 text-muted-foreground hover:bg-accent"
+                          className="text-muted-foreground"
                         >
                           {on ? (
-                            <Check aria-hidden size={13} strokeWidth={2.5} style={{ color: "#22C55E" }} />
+                            <Check aria-hidden size={13} strokeWidth={2.5} className="size-[13px]" style={{ color: "#22C55E" }} />
                           ) : (
-                            <Minus aria-hidden size={11} strokeWidth={2} />
+                            <Minus aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
                           )}
-                        </button>
+                        </Button>
                       </span>
                     );
                   })}

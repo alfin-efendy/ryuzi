@@ -1,18 +1,20 @@
 import { useMemo, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FolderOpen, GitBranch, Mic, Plus } from "lucide-react";
+import {
+  Button,
+  MenuPanel,
+  MenuPanelItem as MenuItem,
+  MenuPanelSection as MenuSectionLabel,
+  MenuPanelSeparator as MenuSeparator,
+  Textarea,
+} from "@ryuzi/ui";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { HOME_SUGGESTIONS } from "@/constants";
 import { runtimeById, defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { projectLabel } from "@/lib/sidebar";
 import { AgentMenu } from "@/components/common/AgentMenu";
-import { MenuItem, MenuPanel, MenuSectionLabel, MenuSeparator } from "@/components/common/MenuPanel";
 import { StatusDot } from "@/components/common/bits";
-
-const roundBtn =
-  "flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-full border-none bg-transparent text-muted-foreground hover:bg-accent";
-const chipBtn =
-  "flex h-7 cursor-pointer items-center gap-[7px] rounded-md border-none bg-transparent px-2.5 font-sans text-[12.5px] hover:bg-accent";
 
 export function HomeView() {
   const { projects, sessions, selectedProjectId, selectProject, start, addProject } = useStore();
@@ -46,7 +48,7 @@ export function HomeView() {
       </h1>
       <div className="w-full max-w-[720px]">
         <div className="acrylic-card relative rounded-2xl border border-border shadow-sm">
-          <textarea
+          <Textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
@@ -57,63 +59,51 @@ export function HomeView() {
             }}
             placeholder="Do anything"
             rows={2}
-            className="box-border w-full resize-none border-none bg-transparent px-[18px] pb-1 pt-4 font-sans text-[14.5px] leading-normal text-foreground"
+            className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-[18px] pb-1 pt-4 text-[14.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[14.5px] dark:bg-transparent"
           />
           <div className="relative flex items-center gap-1.5 px-3 pb-3 pt-2">
-            <button type="button" title="Attach" className={roundBtn}>
+            <Button variant="ghost" size="icon-sm" title="Attach" className="rounded-full text-muted-foreground">
               <Plus aria-hidden size={16} strokeWidth={2} />
-            </button>
-            <button
-              type="button"
-              className="flex h-[30px] cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2 font-sans text-[12.5px] font-medium hover:bg-accent"
-              style={{ color: "#E8703A" }}
-            >
-              <CircleAlert aria-hidden size={13} strokeWidth={2} />
+            </Button>
+            <Button variant="ghost" className="font-medium" style={{ color: "#E8703A" }}>
+              <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
               Full access
-              <ChevronDown aria-hidden size={12} strokeWidth={2} />
-            </button>
+              <ChevronDown aria-hidden size={12} strokeWidth={2} className="size-3" />
+            </Button>
             <div className="flex-1" />
-            <button
-              type="button"
-              onClick={() => setAgentMenuOpen((v) => !v)}
-              className="flex h-[30px] cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2 font-sans text-[12.5px] font-semibold text-foreground hover:bg-accent"
-            >
+            <Button variant="ghost" onClick={() => setAgentMenuOpen((v) => !v)} className="font-semibold">
               <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
               {agent?.model || agent?.name || "No agent"}
               <span className="font-normal text-muted-foreground">{agent?.name ?? "install one"}</span>
-              <ChevronDown aria-hidden size={12} strokeWidth={2} />
-            </button>
-            <button type="button" title="Voice" className={roundBtn}>
-              <Mic aria-hidden size={14} strokeWidth={2} />
-            </button>
-            <button
-              type="button"
-              onClick={() => void send()}
-              title="Start session"
-              className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full border-none bg-primary text-primary-foreground hover:opacity-85"
-            >
-              <ArrowUp aria-hidden size={15} strokeWidth={2.2} />
-            </button>
+              <ChevronDown aria-hidden size={12} strokeWidth={2} className="size-3" />
+            </Button>
+            <Button variant="ghost" size="icon-sm" title="Voice" className="rounded-full text-muted-foreground">
+              <Mic aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+            </Button>
+            <Button size="icon" title="Start session" onClick={() => void send()} className="rounded-full">
+              <ArrowUp aria-hidden size={15} strokeWidth={2.2} className="size-[15px]" />
+            </Button>
 
             {agentMenuOpen && <AgentMenu value={nav.composerAgent} onPick={nav.setComposerAgent} onClose={() => setAgentMenuOpen(false)} />}
           </div>
 
           {/* Context chips */}
           <div className="relative flex items-center gap-1.5 border-t border-border px-3 py-2">
-            <button type="button" onClick={() => setProjectMenuOpen((v) => !v)} className={`${chipBtn} font-semibold text-foreground`}>
-              <FolderOpen aria-hidden size={13} strokeWidth={2} />
+            <Button variant="ghost" size="sm" onClick={() => setProjectMenuOpen((v) => !v)} className="gap-[7px] font-semibold">
+              <FolderOpen aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
               {project ? projectLabel(project) : "No project"}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} />
-            </button>
-            <button
-              type="button"
+              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={() => setBranchMenuOpen((v) => !v)}
-              className={`${chipBtn} font-medium text-muted-foreground hover:text-accent-foreground`}
+              className="gap-[7px] font-medium text-muted-foreground"
             >
-              <GitBranch aria-hidden size={13} strokeWidth={2} />
+              <GitBranch aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
               {nav.composerBranch}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} />
-            </button>
+              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+            </Button>
 
             {projectMenuOpen && (
               <MenuPanel onClose={() => setProjectMenuOpen(false)} className="left-3 top-[42px] z-50 w-60">
@@ -170,14 +160,9 @@ export function HomeView() {
 
         <div className="mt-4 flex flex-wrap justify-center gap-2">
           {HOME_SUGGESTIONS.map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => setDraft(s)}
-              className="cursor-pointer rounded-full border border-border bg-transparent px-3 py-1.5 font-sans text-[12.5px] text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-            >
+            <Button key={s} variant="outline" onClick={() => setDraft(s)} className="rounded-full px-3 text-muted-foreground">
               {s}
-            </button>
+            </Button>
           ))}
         </div>
       </div>
