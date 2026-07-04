@@ -83,7 +83,7 @@ impl Router {
     /// calls (`on_connect`/`on_start`) are immediately visible to outbound
     /// rendering (`run`), even across two `Router` instances (see module doc).
     pub fn new(cp: Arc<ControlPlane>, gateways: Vec<Arc<dyn Gateway>>) -> Self {
-        let store = cp.store();
+        let store = cp.store().clone();
         let gateways = gateways
             .into_iter()
             .map(|g| (g.id().to_string(), g))
@@ -311,7 +311,9 @@ impl Router {
             CoreEvent::SessionEnded { session_pk } => {
                 self.state.remove(&session_pk);
             }
-            CoreEvent::SessionCreated { .. } | CoreEvent::ApprovalRequested { .. } => {}
+            CoreEvent::SessionCreated { .. }
+            | CoreEvent::ApprovalRequested { .. }
+            | CoreEvent::JobRunChanged { .. } => {}
         }
     }
 
@@ -521,7 +523,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         let cp = ControlPlane::new(store, crate::integration::Registries::new()).await;
-        let store_ref = cp.store();
+        let store_ref = cp.store().clone();
         (cp, store_ref)
     }
 
@@ -883,7 +885,7 @@ mod tests {
         let mut regs = crate::integration::Registries::new();
         regs.harness.register("claude-code", harness);
         let cp = ControlPlane::new(store, regs).await;
-        let store_ref = cp.store();
+        let store_ref = cp.store().clone();
         crate::settings::SettingsStore::new(store_ref.clone())
             .set("workdir_root", root.to_str().unwrap())
             .await

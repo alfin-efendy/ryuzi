@@ -88,6 +88,130 @@ fn migrations() -> Migrations<'static> {
             ALTER TABLE sessions ADD COLUMN started_by TEXT;\
             ALTER TABLE sessions ADD COLUMN resume_attempts INTEGER NOT NULL DEFAULT 0;",
         ),
+        // Live-backends batch: settings KV + agents/providers/scheduler/mcp/gateways
+        // domain tables (design: docs/design/2026-07-03-cockpit-live-backends-design.md).
+        M::up(
+            "CREATE TABLE agents (\
+                id TEXT PRIMARY KEY,\
+                enabled INTEGER NOT NULL DEFAULT 0,\
+                model TEXT,\
+                perm_mode TEXT NOT NULL DEFAULT 'ask',\
+                flags TEXT NOT NULL DEFAULT ''\
+            );\
+            CREATE TABLE agent_tiers (\
+                agent_id TEXT NOT NULL,\
+                tier_id TEXT NOT NULL,\
+                value TEXT,\
+                combo INTEGER NOT NULL DEFAULT 0,\
+                PRIMARY KEY (agent_id, tier_id)\
+            );\
+            CREATE TABLE providers (\
+                id TEXT PRIMARY KEY,\
+                name TEXT NOT NULL,\
+                kind TEXT NOT NULL DEFAULT '',\
+                color TEXT NOT NULL DEFAULT '#8B8B8B',\
+                enabled INTEGER NOT NULL DEFAULT 1,\
+                strategy TEXT NOT NULL DEFAULT 'priority',\
+                fail_auto INTEGER NOT NULL DEFAULT 0,\
+                threshold INTEGER NOT NULL DEFAULT 95,\
+                return_to_primary INTEGER NOT NULL DEFAULT 1,\
+                created_at INTEGER\
+            );\
+            CREATE TABLE provider_accounts (\
+                id TEXT PRIMARY KEY,\
+                provider_id TEXT NOT NULL,\
+                label TEXT NOT NULL,\
+                email TEXT NOT NULL DEFAULT '',\
+                plan TEXT NOT NULL DEFAULT '',\
+                sort INTEGER NOT NULL DEFAULT 0,\
+                active INTEGER NOT NULL DEFAULT 0,\
+                session_limit_tokens INTEGER,\
+                weekly_limit_tokens INTEGER\
+            );\
+            CREATE TABLE jobs (\
+                id TEXT PRIMARY KEY,\
+                name TEXT NOT NULL,\
+                cron TEXT NOT NULL,\
+                mode TEXT NOT NULL DEFAULT 'cron',\
+                natural_text TEXT NOT NULL DEFAULT '',\
+                project_id TEXT NOT NULL,\
+                branch TEXT NOT NULL DEFAULT 'main',\
+                agent TEXT NOT NULL DEFAULT 'claude',\
+                gateway TEXT NOT NULL DEFAULT 'local',\
+                enabled INTEGER NOT NULL DEFAULT 1,\
+                prompt TEXT NOT NULL,\
+                notify_success INTEGER NOT NULL DEFAULT 0,\
+                notify_fail INTEGER NOT NULL DEFAULT 1,\
+                created_at INTEGER\
+            );\
+            CREATE TABLE job_runs (\
+                id TEXT PRIMARY KEY,\
+                job_id TEXT NOT NULL,\
+                status TEXT NOT NULL DEFAULT 'running',\
+                started_at INTEGER NOT NULL,\
+                finished_at INTEGER,\
+                session_pk TEXT,\
+                error TEXT,\
+                add_lines INTEGER,\
+                del_lines INTEGER,\
+                note TEXT,\
+                log TEXT\
+            );\
+            CREATE INDEX idx_job_runs_job ON job_runs(job_id, started_at);\
+            CREATE TABLE mcp_servers (\
+                id TEXT PRIMARY KEY,\
+                name TEXT NOT NULL,\
+                kind TEXT NOT NULL DEFAULT 'MCP server',\
+                color TEXT NOT NULL DEFAULT '#8B8B8B',\
+                description TEXT NOT NULL DEFAULT '',\
+                transport TEXT NOT NULL DEFAULT 'stdio',\
+                command TEXT,\
+                args TEXT NOT NULL DEFAULT '[]',\
+                env TEXT NOT NULL DEFAULT '{}',\
+                url TEXT,\
+                scope TEXT NOT NULL DEFAULT 'global',\
+                scope_gateways TEXT NOT NULL DEFAULT '[]',\
+                version TEXT,\
+                publisher TEXT,\
+                status TEXT NOT NULL DEFAULT 'unknown',\
+                status_detail TEXT,\
+                auth_kind TEXT NOT NULL DEFAULT 'none',\
+                auth_detail TEXT,\
+                created_at INTEGER\
+            );\
+            CREATE TABLE mcp_tools (\
+                server_id TEXT NOT NULL,\
+                name TEXT NOT NULL,\
+                description TEXT NOT NULL DEFAULT '',\
+                perm TEXT NOT NULL DEFAULT 'ask',\
+                PRIMARY KEY (server_id, name)\
+            );\
+            CREATE TABLE mcp_agent_access (\
+                server_id TEXT NOT NULL,\
+                agent_id TEXT NOT NULL,\
+                allowed INTEGER NOT NULL DEFAULT 1,\
+                PRIMARY KEY (server_id, agent_id)\
+            );\
+            CREATE TABLE gateways (\
+                id TEXT PRIMARY KEY,\
+                name TEXT NOT NULL,\
+                kind TEXT NOT NULL,\
+                host TEXT,\
+                port INTEGER,\
+                username TEXT,\
+                fs_mode TEXT NOT NULL DEFAULT 'projects',\
+                paths TEXT NOT NULL DEFAULT '[]',\
+                created_at INTEGER\
+            );\
+            CREATE TABLE gateway_events (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                gateway_id TEXT NOT NULL,\
+                at INTEGER NOT NULL,\
+                level TEXT NOT NULL DEFAULT 'info',\
+                text TEXT NOT NULL\
+            );\
+            CREATE INDEX idx_gateway_events ON gateway_events(gateway_id, at);",
+        ),
     ])
 }
 
@@ -137,6 +261,70 @@ impl Store {
         .await
         .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
         Ok(Store { pool })
+    }
+
+    /// Run a closure against a pooled connection. Domain modules (agents,
+    /// providers, scheduler, mcp, gateways) keep their SQL next to their logic
+    /// instead of ballooning this file with one accessor per query.
+    pub async fn with_conn<T, F>(&self, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.pool.get().await?;
+        let out = conn
+            .interact(f)
+            .await
+            .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
+        Ok(out)
+    }
+
+    pub async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let key = key.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let key = key.to_string();
+        let value = value.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO settings(key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Update the user-editable project settings and return the fresh row.
+    pub async fn update_project(
+        &self,
+        id: &str,
+        model: Option<String>,
+        perm_mode: PermMode,
+        harness: &str,
+    ) -> anyhow::Result<Option<Project>> {
+        let id_owned = id.to_string();
+        let harness = harness.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE projects SET model=?2, perm_mode=?3, harness=?4 WHERE project_id=?1",
+                params![id_owned, model, perm_mode.as_str(), harness],
+            )
+            .map(|_| ())
+        })
+        .await?;
+        self.get_project(id).await
     }
 
     pub async fn insert_project(&self, p: Project) -> anyhow::Result<()> {
@@ -364,6 +552,20 @@ impl Store {
         .await
         .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
         Ok(())
+    }
+
+    /// Forget a torn-down worktree: the path and branch are gone from disk, so
+    /// later cold-resumes must fall back to the project workdir.
+    pub async fn clear_session_worktree(&self, pk: &str) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET worktree_path=NULL, branch=NULL WHERE session_pk=?1",
+                params![pk],
+            )
+            .map(|_| ())
+        })
+        .await
     }
 
     pub async fn update_agent_session_id(
@@ -930,6 +1132,63 @@ mod tests {
                 .as_deref(),
             Some("rejectAlways")
         );
+    }
+
+    #[tokio::test]
+    async fn settings_kv_upserts_and_reads_back() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store.get_setting("default_agent").await.unwrap().is_none());
+        store.set_setting("default_agent", "claude").await.unwrap();
+        assert_eq!(
+            store.get_setting("default_agent").await.unwrap().as_deref(),
+            Some("claude")
+        );
+        store.set_setting("default_agent", "codex").await.unwrap();
+        assert_eq!(
+            store.get_setting("default_agent").await.unwrap().as_deref(),
+            Some("codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_project_persists_settings() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_project(sample_project()).await.unwrap();
+
+        let updated = store
+            .update_project(
+                "p1",
+                Some("claude-opus-4-5".into()),
+                PermMode::AcceptEdits,
+                "claude-code",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.model.as_deref(), Some("claude-opus-4-5"));
+        assert_eq!(updated.perm_mode, PermMode::AcceptEdits);
+
+        // Unknown project → Ok(None), not an error.
+        assert!(store
+            .update_project("missing", None, PermMode::Default, "claude-code")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_session_worktree_forgets_path_and_branch() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_project(sample_project()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+
+        store.clear_session_worktree("s1").await.unwrap();
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.worktree_path, None);
+        assert_eq!(got.branch, None);
     }
 
     #[tokio::test]

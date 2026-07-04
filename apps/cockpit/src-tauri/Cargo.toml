@@ -3,6 +3,8 @@ name = "ryuzi-cockpit"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
+# `cargo run` (tauri dev) must pick the app, not the gen-bindings helper bin.
+default-run = "ryuzi-cockpit"
 
 [lib]
 name = "ryuzi_cockpit_lib"
@@ -16,7 +18,10 @@ ryuzi-core = { path = "../../../crates/core" }
 tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+portable-pty = "0.8"
 specta = { version = "2.0.0-rc.22", features = ["derive"] }
 tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }
 specta-typescript = "0.0.9"

@@ -501,7 +501,7 @@ mod tests {
         let store = Store::open(&path).await.unwrap();
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), Registries::new(), telemetry).await;
-        let store = cp.store();
+        let store = cp.store().clone();
         (cp, store, guard)
     }
 
@@ -888,7 +888,7 @@ mod tests {
             Arc::new(NoopTelemetry),
         )
         .await;
-        let store = cp.store();
+        let store = cp.store().clone();
 
         let gw_a = FakeGateway::new("gw-a", GwBehavior::Allow);
         let stops_a = gw_a.stops.clone();
@@ -1035,7 +1035,7 @@ mod tests {
             .register("claude-code", Arc::new(PermFakeHarnessFactory));
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
-        let store = cp.store();
+        let store = cp.store().clone();
 
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -1168,7 +1168,7 @@ mod tests {
         );
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
-        let store = cp.store();
+        let store = cp.store().clone();
         seed_project(&store, "p1").await;
         let now = crate::paths::now_ms();
         store
@@ -1225,7 +1225,7 @@ mod tests {
             Arc::new(NoopTelemetry),
         )
         .await;
-        let store = cp.store();
+        let store = cp.store().clone();
 
         let gw = FakeGateway::new("discord", GwBehavior::Allow);
         let stops = gw.stops.clone();

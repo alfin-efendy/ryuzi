@@ -95,6 +95,8 @@ pub(crate) struct ClientLoopArgs {
     resume: Option<String>,
     perm_mode: crate::domain::PermMode,
     work_dir: std::path::PathBuf,
+    /// MCP servers to attach at session/new (and session/load on resume).
+    mcp_servers: Vec<crate::domain::McpServerSpec>,
 }
 
 /// The `connect_with` driver: run the lifecycle handshake, signal readiness,
@@ -113,7 +115,10 @@ async fn run_client_loop(
         resume,
         perm_mode,
         work_dir,
+        mcp_servers,
     } = args;
+    let acp_mcp_servers: Vec<agent_client_protocol_schema::v1::McpServer> =
+        mcp_servers.iter().map(crate::mcp::to_acp).collect();
 
     let sink_for_handler = sink.clone();
     let sink_for_write = sink.clone();
@@ -181,6 +186,29 @@ async fn run_client_loop(
                         .clone()
                         .unwrap_or_else(|| "unknown".to_string());
                     let summary = tool.clone();
+
+                    // MCP tool permissions from the Apps screen take precedence:
+                    // allow → silent, deny → silent reject, ask → prompt.
+                    match crate::mcp::tool_perm_for_title(&store_for_perm, &tool)
+                        .await
+                        .as_deref()
+                    {
+                        Some("allow") => {
+                            let response = crate::harness::acp::permission::map_response(
+                                &request,
+                                crate::domain::ApprovalDecision::AllowOnce,
+                            );
+                            return responder.respond(response);
+                        }
+                        Some("deny") => {
+                            let response = crate::harness::acp::permission::map_response(
+                                &request,
+                                crate::domain::ApprovalDecision::RejectOnce,
+                            );
+                            return responder.respond(response);
+                        }
+                        _ => {}
+                    }
 
                     // Consult the per-project tool policy before prompting.
                     let project_policy = store_for_perm
@@ -430,7 +458,7 @@ async fn run_client_loop(
                             supports_load,
                             sid.clone(),
                             work_dir.clone(),
-                            vec![],
+                            acp_mcp_servers.clone(),
                         )
                         .await
                         .map_err(|err| {
@@ -447,13 +475,20 @@ async fn run_client_loop(
                             &cx,
                             work_dir.clone(),
                             perm_mode,
+                            acp_mcp_servers.clone(),
                             &mut ready_tx_opt,
                         )
                         .await?
                     }
                 } else {
-                    fresh_session_propagating(&cx, work_dir.clone(), perm_mode, &mut ready_tx_opt)
-                        .await?
+                    fresh_session_propagating(
+                        &cx,
+                        work_dir.clone(),
+                        perm_mode,
+                        acp_mcp_servers.clone(),
+                        &mut ready_tx_opt,
+                    )
+                    .await?
                 };
 
                 // Signal readiness back to start_session.
@@ -508,9 +543,10 @@ async fn fresh_session_propagating(
     cx: &ConnectionTo<agent_client_protocol::Agent>,
     work_dir: std::path::PathBuf,
     perm_mode: crate::domain::PermMode,
+    mcp_servers: Vec<agent_client_protocol_schema::v1::McpServer>,
     ready_tx_opt: &mut Option<oneshot::Sender<anyhow::Result<Ready>>>,
 ) -> Result<SessionId, agent_client_protocol::Error> {
-    let session_resp = crate::harness::acp::lifecycle::new_session(cx, work_dir, vec![])
+    let session_resp = crate::harness::acp::lifecycle::new_session(cx, work_dir, mcp_servers)
         .await
         .map_err(|err| {
             let msg = format!("ACP session/new failed: {err}");
@@ -686,6 +722,7 @@ impl Harness for AcpHarness {
             resume: ctx.resume.clone(),
             perm_mode: ctx.perm_mode,
             work_dir: ctx.work_dir.clone(),
+            mcp_servers: ctx.mcp_servers.clone(),
         };
 
         let runner = (self.runner_factory)(&self.descriptor);

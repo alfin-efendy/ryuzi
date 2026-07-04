@@ -256,6 +256,12 @@ pub enum CoreEvent {
     SessionEnded {
         session_pk: String,
     },
+    /// A scheduled job run started or finished (status: running|success|failed).
+    JobRunChanged {
+        job_id: String,
+        run_id: String,
+        status: String,
+    },
 }
 
 #[cfg(test)]

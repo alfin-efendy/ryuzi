@@ -1,0 +1,288 @@
+import { Plus, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
+import { useEffect } from "react";
+import { toast } from "sonner";
+import { GW_FS_MODES, quotaColor, type GatewayFsMode } from "@/constants";
+import { eventColor, formatLastSeen, gatewayById, useGateways } from "@/store-gateways";
+import { useNav } from "@/store-nav";
+import { useStore } from "@/store";
+import { commands } from "@/bindings";
+import { statusMeta } from "@/lib/status";
+import { sessionTitle } from "@/lib/sidebar";
+import { Card, CardHeader, CardHint, CardTitle } from "@/components/common/Card";
+import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
+import { Segmented } from "@/components/common/Segmented";
+import { QuotaTrack, StatusDot } from "@/components/common/bits";
+
+const smallBtn =
+  "h-[26px] shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-2.5 font-sans text-[11.5px] font-medium text-foreground hover:bg-accent";
+const runRow =
+  "flex w-full cursor-pointer items-center gap-2.5 border-none bg-transparent px-[18px] py-2 text-left font-sans hover:bg-accent";
+const sectionLabel = "px-[18px] pb-1 pt-2.5 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground";
+
+function HealthRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center gap-2 border-b border-border px-[18px] py-2.5 last:border-b-0">
+      <span className="flex-1 text-[12.5px] text-muted-foreground">{label}</span>
+      <span className="font-mono text-xs">{value}</span>
+    </div>
+  );
+}
+
+export function GatewayDetailView({ id }: { id: string }) {
+  const nav = useNav();
+  const { gateways, eventsById, probing, probe, remove, updateFs, loadEvents } = useGateways();
+  const sessions = useStore((s) => s.sessions);
+  const setFocused = useStore((s) => s.setFocused);
+
+  const g = gatewayById(gateways, id);
+  const events = eventsById[id] ?? [];
+
+  useEffect(() => {
+    void loadEvents(id);
+  }, [id, loadEvents]);
+
+  if (!g) {
+    return <div className="flex flex-1 items-center justify-center text-[13px] text-muted-foreground">Gateway not found.</div>;
+  }
+
+  const online = g.status === "connected";
+  const statusColor = online ? "#22C55E" : "var(--muted-foreground)";
+  const fsDesc = GW_FS_MODES.find((m) => m.id === g.fsMode)?.desc;
+
+  // Real sessions all run on the local gateway until the remote daemon ships.
+  const gwSessions = id === "local" ? sessions.filter((s) => s.status !== "ended") : [];
+
+  const addFolder = async () => {
+    const dir = await commands.pickDirectory();
+    if (dir && !g.paths.includes(dir)) void updateFs(g.id, g.fsMode, [...g.paths, dir]);
+  };
+
+  const copyLog = () => {
+    const text = events.map((e) => `[${new Date(e.at).toLocaleTimeString()}] ${e.text}`).join("\n");
+    void navigator.clipboard.writeText(text);
+    toast.success("Log copied");
+  };
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
+      <div className="mx-auto max-w-[760px]">
+        <BackButton label="Gateways" onClick={() => nav.navigate({ kind: "gateways" })} />
+
+        <DetailHeader
+          chip={
+            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-muted font-mono text-xs font-semibold text-muted-foreground">
+              {g.badge}
+            </span>
+          }
+          title={g.name}
+          sub={g.detail}
+        >
+          <span className="flex shrink-0 items-center gap-1.5 text-xs" style={{ color: statusColor }}>
+            <StatusDot color={statusColor} size={8} pulse={online} />
+            {online ? "Connected" : "Offline"}
+          </span>
+          <button
+            type="button"
+            onClick={() => void probe()}
+            disabled={probing}
+            className="flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent disabled:opacity-50"
+          >
+            <RefreshCw aria-hidden size={13} strokeWidth={2} className={probing ? "animate-spin" : ""} />
+            {probing ? "Probing…" : "Probe now"}
+          </button>
+          {g.kind === "ssh" && (
+            <button
+              type="button"
+              onClick={() => {
+                void remove(g.id);
+                nav.navigate({ kind: "gateways" });
+              }}
+              title="Remove gateway"
+              className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md border border-border bg-transparent text-destructive hover:bg-accent"
+            >
+              <Trash2 aria-hidden size={13} strokeWidth={2} />
+            </button>
+          )}
+        </DetailHeader>
+
+        {!online && (
+          <Card className="mb-3">
+            <div className="flex items-start gap-3 px-[18px] py-3.5">
+              <TriangleAlert aria-hidden size={16} strokeWidth={2} className="mt-px shrink-0" style={{ color: "#EF4444" }} />
+              <div className="min-w-0 flex-1">
+                <div className="text-[13.5px] font-semibold">Offline — last seen {formatLastSeen(g.lastSeenMs)}</div>
+                <div className="mt-[3px] text-[12.5px] leading-[1.55] text-muted-foreground">
+                  {g.kind === "ssh"
+                    ? "The TCP probe couldn't reach the host. Check the address, port, and firewall, then probe again."
+                    : "The distro isn't running. Start it and probe again."}
+                </div>
+              </div>
+            </div>
+          </Card>
+        )}
+
+        <div className="mb-3 grid grid-cols-2 items-start gap-3">
+          <Card>
+            <CardHeader>
+              <CardTitle>Health</CardTitle>
+            </CardHeader>
+            <HealthRow label="Latency" value={g.latency ?? "—"} />
+            <HealthRow label="Uptime" value={g.uptime ?? "—"} />
+            <HealthRow label="Cockpit daemon" value={g.daemonVersion} />
+            <HealthRow label="Last seen" value={formatLastSeen(g.lastSeenMs)} />
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Resources</CardTitle>
+            </CardHeader>
+            {online && g.resources.length > 0 ? (
+              <div className="flex flex-col gap-3.5 px-[18px] py-3.5">
+                {g.resources.map((r) => {
+                  const color = quotaColor(r.pct);
+                  return (
+                    <div key={r.label} className="flex flex-col gap-[5px]">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-xs font-medium">{r.label}</span>
+                        <span className="font-mono text-[10.5px] text-muted-foreground">{r.sub}</span>
+                        <span className="flex-1" />
+                        <span className="font-mono text-[11.5px]" style={{ color }}>
+                          {r.pct}%
+                        </span>
+                      </div>
+                      <QuotaTrack pct={r.pct} color={color} height={5} />
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+                {online ? "Telemetry arrives with the remote daemon." : "No telemetry while offline."}
+              </div>
+            )}
+          </Card>
+        </div>
+
+        <Card className="mb-3">
+          <CardHeader>
+            <CardTitle>Running on this gateway</CardTitle>
+          </CardHeader>
+          {gwSessions.length === 0 && (
+            <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+              {id === "local" ? "Nothing runs here yet. Start a session from Home." : "Remote sessions arrive with the gateway daemon."}
+            </div>
+          )}
+          {gwSessions.length > 0 && (
+            <>
+              <div className={sectionLabel}>Sessions · {gwSessions.length}</div>
+              {gwSessions.map((s) => {
+                const m = statusMeta(s.status);
+                return (
+                  <button
+                    key={s.sessionPk}
+                    type="button"
+                    onClick={() => {
+                      setFocused(s.sessionPk);
+                      nav.navigate({ kind: "session" });
+                    }}
+                    className={runRow}
+                  >
+                    <StatusDot color={m.color} size={7} pulse={m.pulse} />
+                    <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-foreground">{sessionTitle(s)}</span>
+                    <span className="shrink-0 text-[11.5px] text-muted-foreground">Claude Code</span>
+                  </button>
+                );
+              })}
+            </>
+          )}
+        </Card>
+
+        <Card className="mb-3">
+          <CardHeader>
+            <CardTitle>Security</CardTitle>
+          </CardHeader>
+          <div className="flex items-center gap-2.5 border-b border-border px-[18px] py-[11px]">
+            <span className="w-[120px] shrink-0 text-[12.5px] font-medium">Host fingerprint</span>
+            {g.fingerprint ? (
+              <>
+                <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">{g.fingerprint}</span>
+                <button
+                  type="button"
+                  onClick={() => g.fingerprint && void navigator.clipboard.writeText(g.fingerprint)}
+                  className={smallBtn}
+                >
+                  Copy
+                </button>
+              </>
+            ) : (
+              <span className="flex-1 text-xs text-muted-foreground">
+                {g.kind === "ssh" ? "Recorded on first daemon handshake." : "Local machine — no host key needed."}
+              </span>
+            )}
+          </div>
+          <div className="flex flex-col gap-2 px-[18px] py-3">
+            <div className="flex items-center gap-3">
+              <span className="flex-1 text-[12.5px] font-medium">Filesystem access</span>
+              <Segmented
+                options={GW_FS_MODES.map((m) => ({ id: m.id, label: m.label }))}
+                value={g.fsMode as GatewayFsMode}
+                onChange={(m) => void updateFs(g.id, m, g.paths)}
+              />
+            </div>
+            <div className="text-right text-[11.5px] text-muted-foreground">{fsDesc}</div>
+            {g.fsMode === "projects" && (
+              <div className="flex flex-wrap gap-1.5">
+                {g.paths.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    title="Remove folder"
+                    onClick={() =>
+                      void updateFs(
+                        g.id,
+                        g.fsMode,
+                        g.paths.filter((x) => x !== p),
+                      )
+                    }
+                    className="flex h-[26px] cursor-pointer items-center rounded-full border border-border bg-transparent px-2.5 font-mono text-[11px] text-foreground hover:bg-accent"
+                  >
+                    {p}
+                  </button>
+                ))}
+                {g.kind === "local" && (
+                  <button
+                    type="button"
+                    onClick={() => void addFolder()}
+                    className="flex h-[26px] cursor-pointer items-center gap-[5px] rounded-full border border-dashed border-border bg-transparent px-2.5 font-sans text-[11.5px] text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                  >
+                    <Plus aria-hidden size={10} strokeWidth={2} />
+                    Add folder
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Log</CardTitle>
+            <CardHint>Daemon events, most recent last</CardHint>
+            <span className="flex-1" />
+            <button type="button" onClick={copyLog} className={smallBtn}>
+              Copy
+            </button>
+          </CardHeader>
+          <div className="overflow-x-auto bg-code px-[18px] py-3 font-mono text-[11.5px] leading-[1.75] text-code-foreground">
+            {events.length === 0 && <div className="text-muted-foreground">No events recorded yet.</div>}
+            {events.map((e, i) => (
+              <div key={`${e.at}-${i}`} className="whitespace-pre-wrap" style={{ color: eventColor(e.level) }}>
+                [{new Date(e.at).toLocaleTimeString()}] {e.text}
+              </div>
+            ))}
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
