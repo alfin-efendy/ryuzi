@@ -47,6 +47,10 @@
   --code-foreground: var(--surface-foreground);
   --code-highlight: oklch(0.96 0 0);
   --code-number: oklch(0.56 0 0);
+  --diff-add-bg: oklch(0.723 0.219 149 / 0.12);
+  --diff-add-fg: oklch(0.55 0.17 149);
+  --diff-del-bg: oklch(0.637 0.237 25 / 0.12);
+  --diff-del-fg: oklch(0.55 0.21 25);
 }
 body {
   margin: 0;
@@ -92,6 +96,8 @@ body {
   --code-foreground: var(--surface-foreground);
   --code-highlight: oklch(0.27 0 0);
   --code-number: oklch(0.72 0 0);
+  --diff-add-fg: oklch(0.723 0.219 149);
+  --diff-del-fg: oklch(0.68 0.2 25);
 }
 
 /* Translucent surfaces over an OS backdrop (mica on Windows 11, vibrancy on
