@@ -82,11 +82,26 @@ fn write_json(path: &Path, v: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn obj<'a>(v: &'a mut Value, key: &str) -> &'a mut Map<String, Value> {
-    if !v[key].is_object() {
-        v[key] = json!({});
+/// Shape-checked access to a document's top-level object. Errors (never
+/// panics) when the root is any other JSON type. A literal `null` root is
+/// rejected too — `read_json` already maps missing/empty files to `{}`, so a
+/// file containing `null` was written by something else on purpose; erroring
+/// is safer and simpler to reason about than silently replacing it.
+fn root_object<'a>(v: &'a mut Value, path: &Path) -> anyhow::Result<&'a mut Map<String, Value>> {
+    v.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("refusing to modify {}: top-level JSON is not an object", path.display())
+    })
+}
+
+fn obj<'a>(v: &'a mut Value, key: &str, path: &Path) -> anyhow::Result<&'a mut Map<String, Value>> {
+    let root = root_object(v, path)?;
+    if !root.get(key).map(Value::is_object).unwrap_or(false) {
+        root.insert(key.to_string(), json!({}));
     }
-    v[key].as_object_mut().unwrap()
+    Ok(root
+        .get_mut(key)
+        .and_then(Value::as_object_mut)
+        .expect("key was just ensured to be an object"))
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +138,7 @@ pub fn claude_status(home: &Path) -> anyhow::Result<ConfigStatus> {
 pub fn claude_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> anyhow::Result<()> {
     let path = claude_path(home);
     let mut v = read_json(&path)?;
-    let env = obj(&mut v, "env");
+    let env = obj(&mut v, "env", &path)?;
     env.insert("ANTHROPIC_BASE_URL".into(), json!(ep.base_url));
     env.insert("ANTHROPIC_AUTH_TOKEN".into(), json!(ep.api_key));
     if let Some(x) = &m.opus {
@@ -144,16 +159,21 @@ pub fn claude_reset(home: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut v = read_json(&path)?;
-    if v["env"].is_object() {
-        let env = v["env"].as_object_mut().unwrap();
+    let root = root_object(&mut v, &path)?;
+    let mut changed = false;
+    if let Some(env) = root.get_mut("env").and_then(Value::as_object_mut) {
         for k in CLAUDE_ENV_KEYS {
-            env.remove(*k);
+            changed |= env.remove(*k).is_some();
         }
         if env.is_empty() {
-            v.as_object_mut().unwrap().remove("env");
+            root.remove("env");
+            changed = true;
         }
     }
-    write_json(&path, &v)
+    if changed {
+        write_json(&path, &v)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +207,13 @@ pub fn codex_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> anyhow
     } else {
         toml_edit::DocumentMut::new()
     };
+    // auth.json: OPENAI_API_KEY so codex sends our key to the ryuzi provider.
+    // Parse + shape-check it BEFORE writing config.toml so a corrupt auth.json
+    // can never leave config.toml half-applied.
+    let auth_path = home.join(".codex").join("auth.json");
+    let mut auth = read_json(&auth_path)?;
+    root_object(&mut auth, &auth_path)?.insert("OPENAI_API_KEY".into(), json!(ep.api_key));
+
     doc["model"] = toml_edit::value(m.model.clone());
     doc["model_provider"] = toml_edit::value("ryuzi");
     let mut tbl = toml_edit::Table::new();
@@ -203,17 +230,22 @@ pub fn codex_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> anyhow
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, doc.to_string())?;
-
-    // auth.json: OPENAI_API_KEY so codex sends our key to the ryuzi provider.
-    let auth_path = home.join(".codex").join("auth.json");
-    let mut auth = read_json(&auth_path)?;
-    auth.as_object_mut()
-        .unwrap()
-        .insert("OPENAI_API_KEY".into(), json!(ep.api_key));
     write_json(&auth_path, &auth)
 }
 
 pub fn codex_reset(home: &Path) -> anyhow::Result<()> {
+    // Parse ALL inputs before performing any write: a corrupt auth.json must
+    // not leave config.toml reset while auth.json still holds our key.
+    let auth_path = home.join(".codex").join("auth.json");
+    let mut auth_pending: Option<Value> = None;
+    if auth_path.exists() {
+        let mut auth = read_json(&auth_path)?;
+        let is_ours = auth["OPENAI_API_KEY"].as_str().map(|k| k.starts_with("ryz-")).unwrap_or(false);
+        if is_ours {
+            root_object(&mut auth, &auth_path)?.remove("OPENAI_API_KEY");
+            auth_pending = Some(auth);
+        }
+    }
     let path = codex_cfg_path(home);
     if path.exists() {
         let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)?
@@ -231,14 +263,8 @@ pub fn codex_reset(home: &Path) -> anyhow::Result<()> {
         }
         std::fs::write(&path, doc.to_string())?;
     }
-    let auth_path = home.join(".codex").join("auth.json");
-    if auth_path.exists() {
-        let mut auth = read_json(&auth_path)?;
-        let is_ours = auth["OPENAI_API_KEY"].as_str().map(|k| k.starts_with("ryz-")).unwrap_or(false);
-        if is_ours {
-            auth.as_object_mut().unwrap().remove("OPENAI_API_KEY");
-            write_json(&auth_path, &auth)?;
-        }
+    if let Some(auth) = auth_pending {
+        write_json(&auth_path, &auth)?;
     }
     Ok(())
 }
@@ -272,7 +298,7 @@ pub fn opencode_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> any
     if models.is_empty() {
         models.insert(m.model.clone(), json!({}));
     }
-    obj(&mut v, "provider").insert(
+    obj(&mut v, "provider", &path)?.insert(
         "ryuzi".into(),
         json!({
             "npm": "@ai-sdk/openai-compatible",
@@ -281,9 +307,7 @@ pub fn opencode_apply(home: &Path, ep: &EndpointInfo, m: &RuntimeMapping) -> any
             "models": models,
         }),
     );
-    v.as_object_mut()
-        .unwrap()
-        .insert("model".into(), json!(format!("ryuzi/{}", m.model)));
+    root_object(&mut v, &path)?.insert("model".into(), json!(format!("ryuzi/{}", m.model)));
     write_json(&path, &v)
 }
 
@@ -293,18 +317,24 @@ pub fn opencode_reset(home: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut v = read_json(&path)?;
-    if v["provider"].is_object() {
-        let p = v["provider"].as_object_mut().unwrap();
-        p.remove("ryuzi");
+    let root = root_object(&mut v, &path)?;
+    let mut changed = false;
+    if let Some(p) = root.get_mut("provider").and_then(Value::as_object_mut) {
+        changed |= p.remove("ryuzi").is_some();
         if p.is_empty() {
-            v.as_object_mut().unwrap().remove("provider");
+            root.remove("provider");
+            changed = true;
         }
     }
-    let ours = v["model"].as_str().map(|s| s.starts_with("ryuzi/")).unwrap_or(false);
+    let ours = root.get("model").and_then(Value::as_str).map(|s| s.starts_with("ryuzi/")).unwrap_or(false);
     if ours {
-        v.as_object_mut().unwrap().remove("model");
+        root.remove("model");
+        changed = true;
     }
-    write_json(&path, &v)
+    if changed {
+        write_json(&path, &v)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -432,5 +462,97 @@ mod tests {
         assert!(v["provider"].get("ryuzi").is_none());
         assert!(v.get("model").is_none());
         let _ = json!(null); // keep serde_json::json import used
+    }
+
+    // -- Finding 1: codex two-file non-atomicity -----------------------------
+
+    #[test]
+    fn codex_apply_refuses_when_auth_json_corrupt() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = home.path().join(".codex/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        let cfg_text = "# user comment\nsandbox_mode = \"workspace-write\"\n";
+        std::fs::write(&cfg, cfg_text).unwrap();
+        let auth = home.path().join(".codex/auth.json");
+        std::fs::write(&auth, "{ not json").unwrap();
+
+        assert!(codex_apply(home.path(), &ep(), &mapping()).is_err());
+
+        // Neither file was touched: config.toml must not be mutated ahead of
+        // the (failing) auth.json validation.
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), cfg_text);
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn codex_reset_refuses_when_auth_json_corrupt() {
+        let home = tempfile::tempdir().unwrap();
+        // Set up a previously-applied config.toml + valid auth.json first.
+        codex_apply(home.path(), &ep(), &mapping()).unwrap();
+        let cfg = home.path().join(".codex/config.toml");
+        let auth = home.path().join(".codex/auth.json");
+        let cfg_before = std::fs::read_to_string(&cfg).unwrap();
+        // Now corrupt auth.json out from under it.
+        std::fs::write(&auth, "{ not json").unwrap();
+
+        assert!(codex_reset(home.path()).is_err());
+
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), cfg_before);
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), "{ not json");
+    }
+
+    // -- Finding 2: panic on valid-but-non-object JSON root ------------------
+
+    #[test]
+    fn claude_apply_refuses_non_object_root() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[]").unwrap();
+
+        assert!(claude_apply(home.path(), &ep(), &mapping()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+    }
+
+    #[test]
+    fn opencode_apply_refuses_non_object_root() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "\"x\"").unwrap();
+
+        assert!(opencode_apply(home.path(), &ep(), &mapping()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "\"x\"");
+    }
+
+    #[test]
+    fn codex_apply_refuses_null_auth_json() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = home.path().join(".codex/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        let cfg_text = "# user comment\nsandbox_mode = \"workspace-write\"\n";
+        std::fs::write(&cfg, cfg_text).unwrap();
+        let auth = home.path().join(".codex/auth.json");
+        std::fs::write(&auth, "null").unwrap();
+
+        assert!(codex_apply(home.path(), &ep(), &mapping()).is_err());
+
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), cfg_text);
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), "null");
+    }
+
+    // -- Minor: no-op reset must not rewrite/reformat JSON --------------------
+
+    #[test]
+    fn claude_reset_is_noop_when_nothing_to_remove() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let compact = r#"{"a": 1}"#;
+        std::fs::write(&path, compact).unwrap();
+
+        claude_reset(home.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), compact);
     }
 }
