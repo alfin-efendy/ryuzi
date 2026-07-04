@@ -1,4 +1,4 @@
-//! `AppController` — Rust port of the retired TypeScript TUI `AppController`.
+//! `AppController` — the TUI's single behavior facade.
 //!
 //! Owns the entire behavior surface behind the ratatui TUI (Tasks 5-7):
 //! validated settings via `SettingsStore`, the provider catalog, daemon.json
@@ -62,7 +62,7 @@ impl AppController {
     // ---- settings surface ----
 
     /// The persisted or schema-default value; any store error is treated as
-    /// "unset" (TS parity: `get` never throws).
+    /// "unset" — `get` never fails, so render code needs no error path.
     pub async fn get(&self, key: &str) -> Option<String> {
         self.settings.get(key).await.ok().flatten()
     }
@@ -122,12 +122,14 @@ impl AppController {
         self.get("default_runtime").await.unwrap_or_default()
     }
 
-    /// Empty slice stores `""` (join of nothing) — TS parity.
+    /// Empty slice stores `""` (join of nothing) — "none enabled" is an
+    /// empty string, not a missing key.
     pub async fn set_enabled_gateways(&self, ids: &[String]) -> anyhow::Result<()> {
         self.settings.set("enabled_gateways", &ids.join(",")).await
     }
 
-    /// Empty slice stores `""` (join of nothing) — TS parity.
+    /// Empty slice stores `""` (join of nothing) — "none enabled" is an
+    /// empty string, not a missing key.
     pub async fn set_enabled_runtimes(&self, ids: &[String]) -> anyhow::Result<()> {
         self.settings.set("enabled_runtimes", &ids.join(",")).await
     }
@@ -163,7 +165,7 @@ impl AppController {
 
     /// Reads `daemon.json` and derives the running/starting/error state.
     /// Side effect: a stale, non-error status file whose pid is dead is
-    /// cleared (TS parity — error files persist so the message stays visible).
+    /// cleared — error files persist so the message stays visible.
     pub fn daemon(&self) -> DaemonState {
         let s = read_status(&self.deps.data_dir);
         let st = derive_state(s.as_ref(), &is_alive);
@@ -263,7 +265,7 @@ impl AppController {
     }
 
     /// Running -> stop; otherwise -> start (which itself no-ops while
-    /// starting — TS parity).
+    /// starting, so a repeated toggle can't spawn a second daemon).
     pub async fn toggle_daemon(&self) -> anyhow::Result<()> {
         if self.daemon().running {
             self.stop_daemon();

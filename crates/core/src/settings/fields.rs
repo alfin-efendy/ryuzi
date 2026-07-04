@@ -1,5 +1,6 @@
-//! ConfigField schema: the 22 global settings fields, transcribed verbatim
-//! from the retired TypeScript `packages/core/src/config/schema.ts`.
+//! ConfigField schema: the 22 global settings fields. Keys, labels, help
+//! text, and defaults are user-visible contracts — settings stored under
+//! these keys must keep resolving across releases.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldType {
@@ -37,8 +38,7 @@ pub const BASE: ConfigField = ConfigField {
     default: None,
 };
 
-/// The 22 global settings fields, transcribed verbatim from
-/// `packages/core/src/config/schema.ts:4-103`.
+/// The 22 global settings fields.
 pub static GLOBAL_FIELDS: &[ConfigField] = &[
     ConfigField {
         key: "workdir_root",

@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Validate a proposed `(key, value)` setting update against the schema.
-/// Returns `None` if valid, or `Some(exact TS error string)` otherwise.
+/// Returns `None` if valid, or `Some(error message)` otherwise — the exact
+/// message strings are a user-visible contract covered by tests.
 pub fn validate_setting(key: &str, value: &str) -> Option<String> {
     let Some(field) = find_field(key) else {
         return Some(format!("unknown setting: {key}"));
@@ -70,10 +71,10 @@ impl SettingsStore {
         Ok(self.store.list_settings().await?.into_iter().collect())
     }
 
-    /// Keys of required fields with no persisted value, in TS
-    /// `requiredMissingFields` order: required globals first (declaration
-    /// order), then required fields of each enabled gateway (declaration
-    /// order), then required fields of each enabled runtime.
+    /// Keys of required fields with no persisted value, in a stable order:
+    /// required globals first (declaration order), then required fields of
+    /// each enabled gateway (declaration order), then required fields of
+    /// each enabled runtime — the order the wizard prompts in.
     pub async fn missing_required(&self) -> anyhow::Result<Vec<&'static str>> {
         use crate::settings::catalog::CATALOG;
         use crate::settings::fields::GLOBAL_FIELDS;

@@ -1,6 +1,5 @@
-//! Port of `apps/cli/src/cli/update-handoff.ts` — the `update.json` file the
-//! old daemon (applier) and the canary use to hand a deployment over. Wire
-//! format is frozen; see the wire_format test.
+//! The `update.json` file the old daemon (applier) and the canary use to
+//! hand a deployment over. Wire format is frozen; see the wire_format test.
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

@@ -7,10 +7,9 @@ use std::sync::Arc;
 pub mod discord;
 
 /// A reference to a previously-posted message a gateway can edit later (e.g.
-/// a status line updated in place). Mirrors the TS `MessageRef`
-/// (`packages/core/src/gateways/types.ts`), which keeps the originating
-/// `Surface` rather than a bare channel id — this struct does the same (see
-/// task-3 report for the naming check against TS).
+/// a status line updated in place). Keeps the originating `Surface` rather
+/// than a bare channel id, so an edit can be routed back through the same
+/// gateway/conversation that posted it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MessageRef {
     pub surface: Surface,
@@ -19,9 +18,8 @@ pub struct MessageRef {
 
 /// A channel/surface driver: creates workspaces/conversations, renders
 /// outbound core output (status/result/error), and asks for tool approval.
-/// Ported from the retired TS `Gateway` interface
-/// (`packages/core/src/gateways/types.ts`). Inbound methods (start listening
-/// for messages, dispatch to sessions) are added per-gateway in 4D-b.
+/// Inbound handling (start listening for messages, dispatch to sessions) is
+/// implemented per-gateway rather than on this trait.
 #[async_trait]
 pub trait Gateway: Send + Sync {
     /// Stable identifier this gateway is registered under (matches `Surface.gateway`).

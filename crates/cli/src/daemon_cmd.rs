@@ -5,10 +5,9 @@
 //! `[canary_path, "__daemon", "--canary"]` — never invoked directly by a
 //! user, and deliberately absent from `--help`.
 //!
-//! Port of the retired TypeScript `runDaemon` / `startWithTimeout` /
-//! `makeShutdown` (`apps/cli/src/cli/daemon-process.ts`) and `runCanary`
-//! (`apps/cli/src/cli/update-canary.ts`), including the `UpdateManager` /
-//! production apply+canary hosts this task wires in.
+//! Owns the daemon process lifecycle: timed connect, reentrancy-guarded
+//! shutdown on SIGTERM/SIGINT, the canary probe/promote flow, and the
+//! production `UpdateManager` / apply+canary host wiring.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -31,7 +30,8 @@ use ryuzi_core::AcpAdapterDescriptor;
 
 use crate::dispatch::Deps;
 
-/// TS parity: `daemon-process.ts`'s `CONNECT_TIMEOUT_MS`.
+/// How long the daemon gets to build and start before the process gives up
+/// and exits with a "timed out connecting" error.
 const CONNECT_TIMEOUT_MS: u64 = 30_000;
 
 pub fn cmd_daemon(args: &[String], deps: &mut Deps) -> u8 {
@@ -51,10 +51,10 @@ pub(crate) fn is_canary(args: &[String]) -> bool {
     args.iter().any(|a| a == "--canary")
 }
 
-/// Race an arbitrary future against a `ms`-millisecond deadline — port of TS
-/// `startWithTimeout(daemon, ms)`. Generic over the future's success type
-/// (rather than tied to `Daemon`) so it's unit-testable in isolation; the
-/// production call site races `build_daemon(...).and_then(Daemon::start)`.
+/// Race an arbitrary future against a `ms`-millisecond deadline. Generic
+/// over the future's success type (rather than tied to `Daemon`) so it's
+/// unit-testable in isolation; the production call site races
+/// `build_daemon(...).and_then(Daemon::start)`.
 pub(crate) async fn start_with_timeout<T, F>(fut: F, ms: u64) -> anyhow::Result<T>
 where
     F: Future<Output = anyhow::Result<T>>,
@@ -65,11 +65,10 @@ where
     }
 }
 
-/// Reentrancy-guarded shutdown — port of TS `makeShutdown`: at most once,
-/// await `stop` (best-effort; any error is swallowed, mirroring the TS
-/// try/catch around `daemon.stop()`), clear `dir`'s status file, then call
-/// `exit(0)`. Generic over `stop`/`exit` so it's unit-testable without a real
-/// `Daemon` or a real `std::process::exit`.
+/// Reentrancy-guarded shutdown: at most once, await `stop` (best-effort;
+/// any error is swallowed so the shutdown always completes), clear `dir`'s
+/// status file, then call `exit(0)`. Generic over `stop`/`exit` so it's
+/// unit-testable without a real `Daemon` or a real `std::process::exit`.
 pub(crate) async fn shutdown_once<S, E>(dir: &Path, stopping: &AtomicBool, stop: S, exit: E)
 where
     S: Future<Output = anyhow::Result<()>>,
@@ -174,22 +173,19 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
     let updater = build_updater(Arc::clone(&daemon), dir.clone());
     updater.start();
 
-    // Deliberate delta from TS runDaemon (which registered handlers before connect): a signal during
+    // Signal handlers are deliberately installed only AFTER connect succeeds: a signal during
     // the connect window falls back to default kill; the stale "connecting" file is benign — derive_state
     // treats a dead pid as stopped.
     install_signal_handlers(dir, Arc::clone(&daemon), Some(updater));
 
-    // Block until a signal handler calls `std::process::exit` from within
-    // `shutdown_once` — mirrors TS `runDaemon`'s
-    // `await new Promise<never>(() => {})`.
+    // Block forever: the process only exits via a signal handler calling
+    // `std::process::exit` from within `shutdown_once`.
     std::future::pending::<()>().await;
     unreachable!("shutdown_once exits the process before this future can resolve")
 }
 
-/// `build_daemon` then `Daemon::start` — the "connecting" phase TS's
-/// `startWithTimeout(daemon, ms)` wraps. Unlike TS's synchronous
-/// `buildDaemon`, both steps are async in Rust, so both are raced against
-/// the single 30s deadline together.
+/// `build_daemon` then `Daemon::start` — the "connecting" phase. Both steps
+/// are async, so both are raced against the single 30s deadline together.
 ///
 /// Review note: `Daemon::start` already rolls back any gateway it managed to
 /// start before hitting the one that failed, and aborts the router/fan-out
@@ -235,8 +231,7 @@ fn build_updater(daemon: Arc<Daemon>, dir: PathBuf) -> Arc<UpdateManager> {
     })
 }
 
-/// Production `ApplyHook` — port of `daemon-process.ts`'s
-/// `productionApplyUpdate` closure. Stages a canary binary, spawns it,
+/// Production `ApplyHook`: stages a canary binary, spawns it,
 /// drains/swaps/hands over (or rolls back) via [`apply_update`], then
 /// respawns or exits per [`handle_apply_outcome`].
 struct ProdApplyHook {
@@ -291,8 +286,8 @@ impl ApplyHook for ProdApplyHook {
         // `std::process::exit` for the Promoted/RolledBack outcomes, and
         // `process::exit` runs no destructors, so `tmp`'s Drop (staging dir
         // removal) would never fire if left to run at end-of-scope. Drop it
-        // here instead, mirroring TS's `finally { rmSync(tmpDir) }` which ran
-        // BEFORE `handleApplyOutcome`.
+        // here instead, so the staging dir is always cleaned up before the
+        // process can exit.
         drop(tmp);
         match result {
             Ok(outcome) => handle_apply_outcome(
@@ -408,7 +403,7 @@ impl ApplierHost for ProdApplierHost {
     }
 }
 
-/// `{install_path}.bak` — TS `${installPath}.bak`.
+/// The rollback backup path for the live binary: `{install_path}.bak`.
 fn bak_path(install_path: &Path) -> PathBuf {
     let mut s = install_path.as_os_str().to_owned();
     s.push(".bak");
@@ -417,8 +412,8 @@ fn bak_path(install_path: &Path) -> PathBuf {
 
 /// Env for the spawned canary: the version it must claim, and a promote-wait
 /// that outlives the applier's ENTIRE post-health window (drain + watchdog).
-/// TS never set the timeout, so a >60s drain guaranteed a canary "promote
-/// timeout" → disruptive swap→rollback cycle (4E handoff item).
+/// A shorter wait would let a long (>60s) drain outlive the canary's promote
+/// window, guaranteeing a "promote timeout" → disruptive swap→rollback cycle.
 pub(crate) fn canary_spawn_env(version: &str, wait_ms: u64) -> Vec<(String, String)> {
     vec![
         ("RYUZI_CANARY_TARGET".to_string(), version.to_string()),
@@ -427,7 +422,8 @@ pub(crate) fn canary_spawn_env(version: &str, wait_ms: u64) -> Vec<(String, Stri
 }
 
 /// A failed apply AFTER the drain latch was set must not leave a zombie
-/// "Running" daemon that rejects every turn (4E known gap; TS crashed here).
+/// "Running" daemon that rejects every turn — record an Error status so the
+/// failure is visible instead of a silently wedged daemon.
 fn write_update_failure_status(dir: &Path, message: &str) {
     let _ = write_status(
         dir,
@@ -471,10 +467,10 @@ pub(crate) fn spawn_detached(
     Ok(child.id())
 }
 
-/// Port of `update-canary.ts`'s `runCanary`: probe this binary's DB on the
-/// target version, wait for the applier's `promote` handoff signal, then
-/// either become the live daemon (promoted) or exit 1 (failed) so the
-/// applier's watchdog rolls back.
+/// The canary entry point: probe this binary's DB on the target version,
+/// wait for the applier's `promote` handoff signal, then either become the
+/// live daemon (promoted) or exit 1 (failed) so the applier's watchdog
+/// rolls back.
 async fn run_canary(deps: &mut Deps) -> u8 {
     let dir: PathBuf = deps
         .db_path
@@ -498,7 +494,7 @@ async fn run_canary(deps: &mut Deps) -> u8 {
         return 1;
     }
     // Promoted → become the live daemon: reuse run_daemon's signal handling
-    // and block. NOTE (TS parity): the promoted canary runs WITHOUT its own
+    // and block. NOTE: the promoted canary runs WITHOUT its own
     // UpdateManager until the next restart.
     let daemon = host
         .daemon
@@ -565,7 +561,7 @@ impl CanaryHost for ProdCanaryHost {
 }
 
 /// Installs SIGTERM/SIGINT handlers that drive [`shutdown_once`]: stop the
-/// updater first (if any — TS `makeShutdown`/`runDaemon` shutdown order),
+/// updater first (if any — so no update tick can race the teardown),
 /// then best-effort `daemon.stop()`, clear `dir`'s status file,
 /// `std::process::exit(0)`. Both signals share one reentrancy guard and one
 /// `Daemon`/`UpdateManager` handle so whichever fires first wins and the

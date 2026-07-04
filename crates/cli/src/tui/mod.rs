@@ -49,9 +49,9 @@ enum Mode {
     Dashboard,
 }
 
-/// TS parity: the wizard runs first-run, the dashboard once settings are
-/// complete (`is_configured`); re-checked on every `AppController::new` (the
-/// wizard pre-checks whichever gateways/runtimes are already enabled).
+/// The wizard runs first-run, the dashboard once settings are complete
+/// (`is_configured`); re-checked on every `AppController::new` (the wizard
+/// pre-checks whichever gateways/runtimes are already enabled).
 async fn initial_mode(controller: &AppController) -> Mode {
     if controller.is_configured().await {
         Mode::Dashboard
@@ -144,8 +144,8 @@ fn restore_terminal() {
 /// `map_key_event` before the mode-specific state machines ever see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoopAction {
-    /// Ctrl+C (any phase): end `ui_loop` immediately, TS parity with ink's
-    /// `exitOnCtrlC: true`.
+    /// Ctrl+C (any phase): end `ui_loop` immediately — the user must always
+    /// have an exit, even mid-wizard.
     Quit,
     /// Maps to a state-machine `Key`.
     Key(Key),
@@ -186,11 +186,11 @@ pub(crate) fn map_key_event(ev: &KeyEvent) -> LoopAction {
 
 /// Immediate-mode redraw loop: mode starts as wizard/dashboard per
 /// `initial_mode`, redraws after every key press and every 1s tick (crossterm
-/// `EventStream` + `tokio::select!` — this replaces TS's `EventEmitter`).
+/// `EventStream` + `tokio::select!`).
 /// Only `KeyEventKind::Press` is handled (crossterm on some platforms also
 /// reports Release/Repeat). Every key event is mapped via `map_key_event`
 /// before either state machine sees it: Ctrl+C ends the loop immediately
-/// from any phase (mirroring the retired TS ink `exitOnCtrlC: true`), and any
+/// from any phase (the user must always have an exit), and any
 /// other ctrl combo is swallowed rather than leaking into a wizard/dashboard
 /// draft as a plain character. A completed wizard hands off to a freshly
 /// loaded `DashboardState`; either machine's `exit` ends the loop with code 0.

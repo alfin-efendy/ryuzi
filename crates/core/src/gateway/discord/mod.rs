@@ -1,13 +1,12 @@
 //! The Discord gateway's pure logic (this module — no `serenity`, no feature
 //! gate, unconditionally compiled): a hexagonal `DiscordPort` trait,
-//! slash-command JSON defs, and message/interaction routing. Ports
-//! `packages/core/src/gateways/discord/index.ts` and `commands.ts`
-//! byte-for-byte where TS has a concrete counterpart (reply strings,
-//! stripMentions, command shapes); everything else (the port trait shape,
-//! the reply-callback plumbing) is a Rust-native design translating the
-//! same behavior. The real `serenity`-backed `DiscordPort` lives in
-//! [`serenity_port`] (Task 6), behind the `discord` feature — see that
-//! module's doc for the Step 0 API-validation gate findings.
+//! slash-command JSON defs, and message/interaction routing. User-visible
+//! surfaces (reply strings, mention stripping, command shapes) are exact
+//! contracts covered by this module's tests; the port trait shape and the
+//! reply-callback plumbing are internal design choices. The real
+//! `serenity`-backed `DiscordPort` lives in [`serenity_port`] (Task 6),
+//! behind the `discord` feature — see that module's doc for the Step 0
+//! API-validation gate findings.
 //!
 //! **Delegated decision — reply callback shape:** the brief allowed swapping
 //! the `dyn Fn(String) -> BoxFuture<'static, ()>` reply closure for an
@@ -15,7 +14,7 @@
 //! didn't: `handle_interaction`/`InboundHandlers::on_interaction` take
 //! `reply: &(dyn Fn(String) -> BoxFuture<'static, ()> + Sync)` (the `futures`
 //! crate is already a `ryuzi-core` dependency), matching the brief's primary
-//! sketch and the TS `(text: string) => Promise<void>` shape closely.
+//! sketch: an async "send this text back" callback.
 //!
 //! **Delegated decision — constructor shape (Task 5, superseded by Task 6):**
 //! Task 5 landed `DiscordGateway::new(port, router: Arc<Router>) ->
@@ -44,11 +43,9 @@
 //! directly on `DiscordGateway` — `Gateway::start` needs to hand
 //! `DiscordPort::connect` an `Arc<dyn InboundHandlers>`, but `start(&self)`
 //! only has `&self`, not `Arc<Self>`. Since routing logic never touches
-//! `self.port` (only `self.router`/the gateway id — verified against the TS
-//! source, which never references `this.port` in `handleMessage`/
-//! `handleInteraction` either), splitting it into its own cheaply-`Arc`-cloneable
-//! struct sidesteps the "no `Arc<Self>` from `&self`" problem entirely,
-//! without a self-referential `Weak<Self>` field.
+//! `self.port` (only `self.router`/the gateway id), splitting it into its
+//! own cheaply-`Arc`-cloneable struct sidesteps the "no `Arc<Self>` from
+//! `&self`" problem entirely, without a self-referential `Weak<Self>` field.
 //!
 //! **Delegated decision — where the `discord` feature gate lives:** the
 //! brief's daemon-wiring sketch reads `#[cfg(feature = "discord")]` in
@@ -105,8 +102,8 @@ pub fn factory_entries() -> Vec<(String, Arc<dyn GatewayFactory>)> {
 /// registered under in a `Router`'s gateway map.
 const GATEWAY_ID: &str = "discord";
 
-/// An inbound Discord message, already normalized by the (Task 6) connector.
-/// TS parity: `InboundMessage`.
+/// An inbound Discord message, already normalized by the connector: ids as
+/// plain strings, bot-author and bot-mention flags precomputed.
 #[derive(Debug, Clone)]
 pub struct InboundMessage {
     pub channel_id: String,
@@ -118,9 +115,9 @@ pub struct InboundMessage {
     pub attachments: Vec<AttachmentRef>,
 }
 
-/// An inbound Discord slash-command interaction. TS parity: `InboundInteraction`
-/// (`roleIds?: string[]` becomes a plain `Vec<String>`, defaulting to empty
-/// rather than `Option` — simpler on the Rust side, same effective semantics).
+/// An inbound Discord slash-command interaction. `role_ids` is a plain
+/// `Vec<String>` that defaults to empty when the member has no roles — no
+/// `Option` wrapper, since "absent" and "no roles" mean the same thing here.
 #[derive(Debug, Clone)]
 pub struct InboundInteraction {
     pub name: String,
@@ -130,8 +127,9 @@ pub struct InboundInteraction {
     pub role_ids: Vec<String>,
 }
 
-/// The approval request shape handed to `DiscordPort::request_approval` —
-/// TS parity: the inline object type in `DiscordPort.requestApproval`.
+/// The approval request shape handed to `DiscordPort::request_approval`:
+/// everything a connector needs to render the approve/deny prompt and
+/// enforce the approver-role gate and timeout.
 #[derive(Debug, Clone)]
 pub struct PortApprovalRequest {
     pub request_id: String,
@@ -142,12 +140,12 @@ pub struct PortApprovalRequest {
     pub timeout_ms: u64,
 }
 
-/// The hexagonal boundary to the real Discord connection (Task 6:
-/// `serenity`-backed; here, only `FakePort` test doubles exist). TS parity:
-/// `DiscordPort` — `botUserId()` is intentionally dropped (nothing in this
-/// task's routing logic needs the bot's own user id; `InboundMessage.mentions_bot`
-/// is already precomputed by the caller), and `disconnect` is non-optional
-/// (TS's `disconnect?()` — every real implementation needs one anyway).
+/// The hexagonal boundary to the real Discord connection (production:
+/// `serenity`-backed [`serenity_port`]; in this module's tests, `FakePort`
+/// doubles). There is deliberately no `bot_user_id()` accessor — routing
+/// never needs the bot's own user id because `InboundMessage.mentions_bot`
+/// is precomputed by the caller — and `disconnect` is mandatory: every real
+/// implementation needs one anyway.
 #[async_trait]
 pub trait DiscordPort: Send + Sync {
     async fn connect(&self, handlers: Arc<dyn InboundHandlers>) -> anyhow::Result<()>;
@@ -170,8 +168,8 @@ pub trait DiscordPort: Send + Sync {
 
 /// Handed to `DiscordPort::connect` so a real connector can dispatch inbound
 /// Discord events back into gateway routing. Implemented internally (by
-/// `InboundRouting`, wrapped by `DiscordGateway`) — TS parity: the inline
-/// `{ onMessage, onInteraction }` object passed to `DiscordPort.connect`.
+/// `InboundRouting`, wrapped by `DiscordGateway`); connectors only call it,
+/// never implement it.
 #[async_trait]
 pub trait InboundHandlers: Send + Sync {
     async fn on_message(&self, e: InboundMessage);
@@ -182,13 +180,13 @@ pub trait InboundHandlers: Send + Sync {
     );
 }
 
+/// Removes user mentions from message content, then trims the result.
 /// `<@!?\d+>` hand-rolled (no `regex` dependency in `ryuzi-core`): a literal
 /// `<@`, an optional `!`, one-or-more ASCII digits, then `>`. Operates on
-/// `char`s (not bytes) so it's correct on non-ASCII content, matching JS
-/// `\d`'s ASCII-only semantics via `char::is_ascii_digit`. A **role** mention
-/// (`<@&id>`) has `&` where a digit or `!` is required, so it never matches
-/// and is left untouched — only the trailing `.trim()` (matching TS's
-/// `.replace(...).trim()`) can affect it. TS parity: `stripMentions`.
+/// `char`s (not bytes) so it's correct on non-ASCII content; only ASCII
+/// digits count (via `char::is_ascii_digit`). A **role** mention (`<@&id>`)
+/// has `&` where a digit or `!` is required, so it never matches and is left
+/// untouched — only the final trim can affect it.
 fn strip_mentions(content: &str) -> String {
     let chars: Vec<char> = content.chars().collect();
     let n = chars.len();
@@ -234,8 +232,11 @@ impl InboundRouting {
         self.router.read().unwrap().clone()
     }
 
-    /// TS parity: `DiscordGateway.handleMessage` — plus the Task 6 "router
-    /// not set yet" guard (dropped with a warning; see the module doc).
+    /// Routes an inbound message: bot authors are ignored; a thread message
+    /// with content or attachments becomes a reply into the session bound to
+    /// that thread; a channel message that mentions the bot starts a new
+    /// turn (mentions stripped first). Events arriving before `set_router`
+    /// are dropped with a warning (see the module doc).
     async fn handle_message(&self, e: InboundMessage) {
         let Some(router) = self.router() else {
             eprintln!("[discord] dropping inbound message: router not set yet");
@@ -280,9 +281,10 @@ impl InboundRouting {
         }
     }
 
-    /// TS parity: `DiscordGateway.handleInteraction`, including the
-    /// try/catch-as-error-reply wrapper — plus the Task 6 "router not set
-    /// yet" guard (dropped with a warning; see the module doc).
+    /// Routes a slash-command interaction (`/connect`, `/end`, `/stop`,
+    /// `/status`) and replies with the outcome. Any error is caught and sent
+    /// back as an `❌ {err}` reply instead of propagating. Events arriving
+    /// before `set_router` are dropped with a warning (see the module doc).
     async fn handle_interaction(
         &self,
         e: InboundInteraction,
@@ -353,7 +355,7 @@ impl InboundHandlers for InboundRouting {
 
 /// The Discord `Gateway` implementation: renders core output over a
 /// `DiscordPort` and routes inbound messages/interactions through a
-/// `Router`. TS parity: `DiscordGateway`.
+/// `Router`.
 pub struct DiscordGateway {
     port: Arc<dyn DiscordPort>,
     inbound: Arc<InboundRouting>,
@@ -372,12 +374,14 @@ impl DiscordGateway {
         })
     }
 
-    /// Directly callable, mirroring the TS test surface (`gw.handleMessage(...)`).
+    /// Directly callable so tests can inject inbound messages without a
+    /// connected port.
     pub async fn handle_message(&self, e: InboundMessage) {
         self.inbound.handle_message(e).await;
     }
 
-    /// Directly callable, mirroring the TS test surface (`gw.handleInteraction(...)`).
+    /// Directly callable so tests can inject interactions without a
+    /// connected port.
     pub async fn handle_interaction(
         &self,
         e: InboundInteraction,
@@ -478,8 +482,8 @@ impl Gateway for DiscordGateway {
 }
 
 /// Plain Discord application-command JSON (a valid REST body; no `serenity`
-/// import). TS parity: `commands.ts`'s `buildCommands` — `STRING = 3`
-/// (`ApplicationCommandOptionType.String`) is inlined as the literal `3`.
+/// import). Option `"type": 3` is Discord's
+/// `ApplicationCommandOptionType.String`, inlined as the literal `3`.
 pub fn build_commands() -> serde_json::Value {
     serde_json::json!([
         {
@@ -594,8 +598,8 @@ mod tests {
     // ---------- FakePort ----------
 
     /// Records every call as `verb:args` and hands back incrementing
-    /// `chan-N`/`thread-N`/`msg-N` ids — TS parity: `discord-gateway.test.ts`'s
-    /// `FakePort`.
+    /// `chan-N`/`thread-N`/`msg-N` ids so tests can assert exact call
+    /// sequences.
     struct FakePort {
         calls: Mutex<Vec<String>>,
         connected: AtomicBool,
@@ -783,18 +787,17 @@ mod tests {
 
     // ---------- Tests 2, 3, 6: message/interaction routing over a real Router ----------
     //
-    // `Router` (unlike `DiscordPort`) is a concrete, DB-backed type (Task 4),
-    // not an injectable interface — so unlike the TS `fakeRouter()`, these
-    // tests can't just record a `calls: string[]` array. Instead they wire a
-    // real `Router` to a real `ControlPlane`/`Store` (tempdir-backed, exactly
-    // `router.rs`'s own inbound-Router test pattern) with a `FakeGateway`
-    // registered under "discord" — DELIBERATELY NOT the `DiscordGateway`
-    // under test itself, decoupling "what DiscordGateway does with its own
-    // FakePort" from "what Router does with ITS registered gateway when
-    // DiscordGateway's routing calls into it". Router-side effects (a
-    // `FakeGateway.create_workspace`/`create_conversation` call, a bound
-    // project/session showing up in the `Store`) stand in for the TS test's
-    // recorded `onConnect`/`onStart`/`onReply` calls.
+    // `Router` (unlike `DiscordPort`) is a concrete, DB-backed type, not an
+    // injectable interface — so these tests can't just swap in a recording
+    // router stub. Instead they wire a real `Router` to a real
+    // `ControlPlane`/`Store` (tempdir-backed, exactly `router.rs`'s own
+    // inbound-Router test pattern) with a `FakeGateway` registered under
+    // "discord" — DELIBERATELY NOT the `DiscordGateway` under test itself,
+    // decoupling "what DiscordGateway does with its own FakePort" from "what
+    // Router does with ITS registered gateway when DiscordGateway's routing
+    // calls into it". Router-side effects (a `FakeGateway.create_workspace`/
+    // `create_conversation` call, a bound project/session showing up in the
+    // `Store`) are the observable outcomes these tests assert on.
 
     struct StateDirGuard {
         _dir: tempfile::TempDir,
@@ -856,10 +859,9 @@ mod tests {
     }
 
     /// A recording `Gateway` registered under "discord" in the test `Router`
-    /// — separate from the `DiscordGateway` under test. TS parity role:
-    /// stands in for `discord-gateway.test.ts`'s `fakeRouter()`, but at the
-    /// `Router`'s OWN collaborator boundary rather than as a `Router`
-    /// replacement (see the block comment above).
+    /// — separate from the `DiscordGateway` under test. It observes the
+    /// `Router`'s OWN collaborator boundary rather than replacing the
+    /// `Router` itself (see the block comment above).
     struct FakeGateway {
         calls: Mutex<Vec<String>>,
         n: AtomicU64,

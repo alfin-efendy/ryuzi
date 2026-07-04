@@ -3,9 +3,7 @@
 //! flat, dotted-key config `serde_json::Value`
 //! (`{"discord.token", "discord.app_id", "discord.guild_id"}` — matches
 //! `build_daemon`'s catalog-driven gateway config, `settings::catalog::CATALOG`'s
-//! `DISCORD_FIELDS`). Byte-exact behavioral spec: LIVE TS
-//! `packages/core/src/gateways/discord/client-port.ts`'s `DiscordClientPort`
-//! (+ `registerCommands`).
+//! `DISCORD_FIELDS`).
 //!
 //! **Step 0 API-validation gate (recorded):** `serenity = "0.12"` resolved to
 //! `0.12.5`, `default-features = false, features = ["client", "gateway",
@@ -35,31 +33,28 @@
 //!   synchronous builder — `.build()`/a separate `.start()`-only step
 //!   doesn't exist; matches the brief's "future" framing.
 //! - `ChannelId`/`GuildId` expose `send_message`/`edit_message`/`create_thread`/`create_channel`
-//!   directly (each just forwards to the builder's `execute`) — no need to
-//!   fetch a `Channel`/`GuildChannel` object first the way the TS port does
-//!   (discord.js requires a fetched `Channel` object; serenity's REST
-//!   builders work off bare ids). Deviation (disclosed): this means this
-//!   port's `edit_message`/`send_message`/`create_thread`/`create_text_channel`
-//!   let a missing-channel HTTP error propagate as an `anyhow::Error`
-//!   instead of TS's silent `if (!channel) return;` — only `request_approval`
-//!   has an explicit, brief-mandated "missing channel" tuple return, so only
-//!   that method does an explicit existence check first.
+//!   directly (each just forwards to the builder's `execute`) — serenity's
+//!   REST builders work off bare ids, so no `Channel`/`GuildChannel` object
+//!   is fetched first. Deliberate divergence from the original TS
+//!   implementation (which silently no-opped when a channel lookup came
+//!   back empty): this port's
+//!   `edit_message`/`send_message`/`create_thread`/`create_text_channel`
+//!   let a missing-channel HTTP error propagate as an `anyhow::Error` —
+//!   only `request_approval` has an explicit "missing channel" tuple
+//!   return, so only that method does an explicit existence check first.
 //! - `EventHandler::{ready, message, interaction_create}` take `(&self, ctx:
 //!   Context, ..data)` (macro-generated; default no-op bodies, so only the
 //!   three actually used are overridden here).
 //! - `ComponentInteraction{member: Option<Member>, user: User, data.custom_id}` —
 //!   matches; `Member.roles: Vec<RoleId>`.
 //! - `ComponentInteractionCollector::new(&shard).message_id(id).timeout(dur).stream()`
-//!   returns a `Stream` (not a callback-based collector like TS's
-//!   `createMessageComponentCollector`) that ends when the timeout elapses —
-//!   consumed via a `.next().await` loop instead of TS's `collector.on("collect",
-//!   ..)`/`.on("end", ..)` pair; behaviorally equivalent (see
-//!   `SerenityDiscordPort::request_approval`'s doc).
+//!   returns a `Stream` (not a callback-based collector) that ends when the
+//!   timeout elapses — consumed via a `.next().await` loop (see
+//!   `SerenityDiscordPort::request_approval`'s doc for the loop semantics).
 //!
 //! **Disclosed design choice — `is_thread` needs an HTTP round-trip per
-//! inbound message:** TS's `msg.channel.isThread()` is free because
-//! discord.js already maintains a channel cache. This port's minimal feature
-//! set omits `cache` (not in the brief's starting list), so there is no local
+//! inbound message:** this port's minimal feature set omits serenity's
+//! `cache` (not in the brief's starting list), so there is no local
 //! channel-type cache to consult; `message()` calls `ctx.http.get_channel(..)`
 //! and checks the returned `GuildChannel.kind` against the three thread
 //! `ChannelType`s. This trades one extra REST call per inbound message
@@ -119,9 +114,9 @@ fn message_id_from_str(s: &str) -> Option<MessageId> {
         .map(MessageId::new)
 }
 
-/// `build_commands()` → `Vec<CreateCommand>`. TS parity: `registerCommands`'s
-/// `body: buildCommands()` payload, rebuilt through serenity's typed
-/// builders instead of a raw JSON body.
+/// Converts `build_commands()`'s JSON command defs into serenity's typed
+/// `CreateCommand` builders — the same registration payload, just built
+/// through builders instead of posted as a raw JSON body.
 fn commands_from_json(defs: &serde_json::Value) -> Vec<CreateCommand> {
     defs.as_array()
         .into_iter()
@@ -170,9 +165,8 @@ struct ConnectedState {
     bot_user_id: UserId,
 }
 
-/// The `serenity::client::EventHandler` that turns gateway events into
-/// [`InboundHandlers`] calls. TS parity: the `this.client.on(Events.MessageCreate,
-/// ..)` / `Events.InteractionCreate` listeners in `DiscordClientPort.connect`.
+/// The `serenity::client::EventHandler` that turns gateway events (ready,
+/// message create, interaction create) into [`InboundHandlers`] calls.
 struct Handler {
     handlers: Arc<dyn InboundHandlers>,
     connected: Arc<Mutex<Option<ConnectedState>>>,
@@ -181,14 +175,12 @@ struct Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-    /// TS parity: the `Events.ClientReady` half of `connect`'s `new
-    /// Promise<void>((resolve) => { this.client.once(Events.ClientReady, ()
-    /// => resolve()); ... })`. Also stashes the `ShardMessenger` + this
-    /// bot's own user id for later use (`request_approval`'s collector,
-    /// `message`'s `mentions_bot`) — TS gets both from `this.client`
-    /// directly since discord.js keeps the live client around; serenity's
-    /// `Client::start` takes ownership, so this is captured off the one
-    /// `Context` a handler receives instead.
+    /// Fires `connect`'s ready-gate (the one-shot `ready_tx`), so `connect`
+    /// only resolves once the gateway is actually live. Also stashes the
+    /// `ShardMessenger` + this bot's own user id for later use
+    /// (`request_approval`'s collector, `message`'s `mentions_bot`) —
+    /// serenity's `Client::start` takes ownership of the client, so these
+    /// are captured off the one `Context` a handler receives.
     async fn ready(&self, ctx: Context, data_about_bot: Ready) {
         *self.connected.lock().unwrap() = Some(ConnectedState {
             shard: ctx.shard.clone(),
@@ -199,7 +191,8 @@ impl EventHandler for Handler {
         }
     }
 
-    /// TS parity: `Events.MessageCreate` → `handlers.onMessage(..)`.
+    /// Normalizes a gateway message-create event into an [`InboundMessage`]
+    /// and forwards it to `handlers.on_message`.
     async fn message(&self, ctx: Context, new_message: Message) {
         let bot_user_id = self
             .connected
@@ -209,9 +202,8 @@ impl EventHandler for Handler {
             .map(|c| c.bot_user_id);
         let mentions_bot =
             bot_user_id.is_some_and(|id| new_message.mentions.iter().any(|u| u.id == id));
-        // See the module doc: no `cache` feature, so this is an explicit
-        // fetch-and-inspect rather than a free cache lookup (TS:
-        // `msg.channel.isThread()`).
+        // See the module doc: no `cache` feature, so thread detection is an
+        // explicit fetch-and-inspect rather than a free cache lookup.
         let is_thread = match ctx.http.get_channel(new_message.channel_id).await {
             Ok(Channel::Guild(gc)) => matches!(
                 gc.kind,
@@ -242,9 +234,10 @@ impl EventHandler for Handler {
             .await;
     }
 
-    /// TS parity: `Events.InteractionCreate` → (chat-input commands only) →
-    /// `interaction.deferReply({flags: Ephemeral})` → `handlers.onInteraction(..)`
-    /// with a `reply` closure that `interaction.editReply(text)`s.
+    /// Handles chat-input command interactions only: defers with an
+    /// ephemeral response first (buying time for routing), then forwards to
+    /// `handlers.on_interaction` with a `reply` closure that edits that
+    /// deferred response.
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         let Interaction::Command(cmd) = interaction else {
             return;
@@ -301,8 +294,7 @@ impl EventHandler for Handler {
 
 /// The real Discord connector: a `serenity` `Client` (gateway, spawned on
 /// its own task) + a persistent `Http` (used for every REST call, including
-/// command registration — see the module doc's `Http::new` note). TS
-/// parity: `DiscordClientPort`.
+/// command registration — see the module doc's `Http::new` note).
 pub struct SerenityDiscordPort {
     token: String,
     guild_id: GuildId,
@@ -334,9 +326,9 @@ impl SerenityDiscordPort {
 
 #[async_trait]
 impl DiscordPort for SerenityDiscordPort {
-    /// TS parity: `connect` — `registerCommands` (guild application
-    /// commands, via `Http` + `GuildId::set_commands`) BEFORE the gateway
-    /// login, then resolves once `ready` fires.
+    /// Registers the guild application commands (via `Http` +
+    /// `GuildId::set_commands`) BEFORE the gateway login, then resolves
+    /// once `ready` fires.
     async fn connect(&self, handlers: Arc<dyn InboundHandlers>) -> anyhow::Result<()> {
         let commands = commands_from_json(&build_commands());
         self.guild_id
@@ -425,21 +417,18 @@ impl DiscordPort for SerenityDiscordPort {
         Ok(())
     }
 
-    /// TS parity: `requestApproval` — send the two buttons, then collect
-    /// component interactions against a total timeout. Rust/serenity shape:
-    /// TS's callback-based `collector.on("collect", ..)`/`.on("end", ..)`
-    /// pair becomes a `Stream::next()` loop (`ComponentInteractionCollector`
-    /// is a `Stream`, not an event emitter) — `stream.next() == None` is the
-    /// `"end"` case (timeout elapsed with no settled decision); each `Some`
-    /// item is one `"collect"` event. Because this loop processes items
-    /// strictly one at a time (unlike JS's single-threaded-but-reentrant
-    /// event dispatch), there's no need for TS's `settled` guard flag —
-    /// returning ends the loop and drops the stream (which unregisters the
-    /// collector), so no later item can ever be processed after a decision.
-    /// The decision is computed and ready to return BEFORE the (fallible,
-    /// swallowed-error) `UpdateMessage` edit, matching the brief's "decision
-    /// locked before the edit" requirement — just via straight-line
-    /// sequencing rather than TS's resolve-before-await-the-edit ordering.
+    /// Sends the Approve/Deny buttons, then collects component interactions
+    /// against a total timeout via a `Stream::next()` loop
+    /// (`ComponentInteractionCollector` is a `Stream`, not an event
+    /// emitter) — `stream.next() == None` means the timeout elapsed with no
+    /// settled decision; each `Some` item is one button click. The loop
+    /// processes items strictly one at a time, so no "already settled"
+    /// guard flag is needed — returning ends the loop and drops the stream
+    /// (which unregisters the collector), so no later item can ever be
+    /// processed after a decision. The decision is computed and ready to
+    /// return BEFORE the (fallible, swallowed-error) `UpdateMessage` edit —
+    /// straight-line sequencing guarantees the decision is locked before
+    /// the edit can fail.
     async fn request_approval(
         &self,
         conversation_id: &str,
@@ -512,9 +501,8 @@ impl DiscordPort for SerenityDiscordPort {
             } else if interaction.data.custom_id.ends_with(":deny") {
                 false
             } else {
-                // Unexpected customId — ignore (fail-closed; a timeout
-                // denies if nothing valid ever arrives). TS parity: `if
-                // (decision === null) return;` inside the collect handler.
+                // Unexpected custom_id — ignore (fail-closed; a timeout
+                // denies if nothing valid ever arrives).
                 continue;
             };
 
@@ -539,10 +527,8 @@ impl DiscordPort for SerenityDiscordPort {
 }
 
 /// Builds a [`SerenityDiscordPort`]-backed [`DiscordGateway`] from a flat,
-/// dotted-key config object. TS parity: the production `DiscordClientPort`
-/// construction site (`apps/daemon`'s gateway wiring) — no direct TS
-/// factory-object counterpart exists (TS's provider catalog wires gateways
-/// imperatively), so this shape is Rust-native, matching `GatewayFactory`.
+/// dotted-key config object — the `GatewayFactory` entry that plugs Discord
+/// into `build_daemon`'s catalog-driven gateway wiring.
 #[derive(Default)]
 pub struct DiscordGatewayFactory;
 

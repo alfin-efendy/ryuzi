@@ -3,8 +3,6 @@
 //! either self-applies (install.sh installs, in `auto` mode, when an
 //! `ApplyHook` is wired up) or broadcasts a `Notice` to live sessions via a
 //! `NotifyTarget` (`ControlPlane` in production).
-//!
-//! Port of `apps/cli/src/cli/update-manager.ts` (Spec 4 slice 5, task 8).
 
 use crate::domain::{CoreEvent, Session, SessionStatus};
 use crate::settings::SettingsStore;
@@ -13,12 +11,13 @@ use crate::update::install_method::{detect_install_method, InstallInfo, InstallM
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
-/// TS parity: `update-manager.ts`'s literal `"alfin-efendy/ryuzi"` fallback.
+/// GitHub repo checked for releases when settings don't override it.
 pub const DEFAULT_REPO: &str = "alfin-efendy/ryuzi";
-/// TS parity: `update-manager.ts`'s literal `"21600000"` fallback (6h).
+/// Default interval between update checks: 6 hours, in milliseconds.
 pub const DEFAULT_CHECK_INTERVAL_MS: u64 = 21_600_000;
 
-/// TS parity: `update-manager.ts`'s `Mode` union (`"auto" | "notify" | "off"`).
+/// Update behavior selected in settings: `auto` self-applies, `notify` only
+/// broadcasts a notice to live sessions, `off` disables checks entirely.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UpdateMode {
     Auto,
@@ -26,17 +25,17 @@ pub enum UpdateMode {
     Off,
 }
 
-/// The slice of `ControlPlane` the `UpdateManager` needs — TS parity:
-/// `update-manager.ts`'s `NotifyTarget` interface (`ControlPlane` satisfies
-/// it; see `impl NotifyTarget for ControlPlane` in `control.rs`).
+/// The slice of `ControlPlane` the `UpdateManager` needs: enumerate live
+/// sessions and emit events. `ControlPlane` satisfies it (see
+/// `impl NotifyTarget for ControlPlane`), and tests can substitute a fake.
 #[async_trait::async_trait]
 pub trait NotifyTarget: Send + Sync {
     async fn list_sessions(&self) -> Vec<Session>;
     fn emit(&self, e: CoreEvent);
 }
 
-/// Info handed to an `ApplyHook` for a self-applicable install — TS parity:
-/// `update-manager.ts`'s inline `{ repo, tag, version }` `applyUpdate` arg.
+/// Info handed to an `ApplyHook` for a self-applicable install: which repo
+/// and release tag to download, and the version string being installed.
 #[derive(Debug, Clone)]
 pub struct ApplyInfo {
     pub repo: String,
@@ -44,13 +43,15 @@ pub struct ApplyInfo {
     pub version: String,
 }
 
-/// Injectable self-apply implementation — TS parity: `UpdateManagerDeps.applyUpdate`.
+/// Injectable self-apply implementation, so tests and non-self-updating
+/// builds can run the manager without touching the real binary.
 #[async_trait::async_trait]
 pub trait ApplyHook: Send + Sync {
     async fn apply(&self, info: ApplyInfo);
 }
 
-/// Constructor dependencies — TS parity: `update-manager.ts`'s `UpdateManagerDeps`.
+/// Constructor dependencies — everything the manager needs is injected so
+/// checks, notifications, and self-apply can all be faked in tests.
 pub struct UpdateManagerDeps {
     pub cp: Arc<dyn NotifyTarget>,
     pub settings: SettingsStore,
@@ -65,10 +66,9 @@ pub struct UpdateManagerDeps {
     pub apply_update: Option<Arc<dyn ApplyHook>>,
 }
 
-/// Orchestrates periodic update checks. TS parity: `update-manager.ts`'s
-/// `UpdateManager` class (its `setInterval`-based `makeTimer` seam has no
-/// Rust equivalent — `start`/`stop` drive a real `tokio::spawn`ed task
-/// instead, tracked by `timer`).
+/// Orchestrates periodic update checks. `start`/`stop` drive a real
+/// `tokio::spawn`ed interval task, tracked by `timer`; `tick` can also be
+/// called directly for an on-demand check.
 pub struct UpdateManager {
     deps: UpdateManagerDeps,
     timer: Mutex<Option<JoinHandle<()>>>,
@@ -195,13 +195,12 @@ impl UpdateManager {
     }
 
     /// Initial tick on boot, then a real interval loop — no-op (arms no
-    /// timer) if `mode()` is `off` at start-up time. TS parity:
-    /// `update-manager.ts`'s `start()`.
+    /// timer) if `mode()` is `off` at start-up time.
     pub fn start(self: &Arc<Self>) {
         let me = Arc::clone(self);
         let handle = tokio::spawn(async move {
             if me.mode().await == UpdateMode::Off {
-                return; // TS: off-mode arms no timer
+                return; // off mode arms no timer
             }
             me.tick().await; // initial check on boot
             let ms = me.check_interval_ms().await.max(1);
@@ -215,7 +214,7 @@ impl UpdateManager {
         *self.timer.lock().unwrap() = Some(handle);
     }
 
-    /// Aborts the timer task. TS parity: `update-manager.ts`'s `stop()`.
+    /// Aborts the timer task; safe to call when no timer is armed.
     pub fn stop(&self) {
         if let Some(h) = self.timer.lock().unwrap().take() {
             h.abort();
@@ -223,7 +222,8 @@ impl UpdateManager {
     }
 }
 
-/// TS parity: `update-manager.ts`'s module-private `upgradeHint`.
+/// Human-readable upgrade command for the detected install method, appended
+/// to update notices so users know exactly what to run.
 pub fn upgrade_hint(install: &InstallInfo) -> String {
     match install.method {
         InstallMethod::Brew => "run `brew upgrade ryuzi` to update.".into(),
@@ -355,8 +355,8 @@ mod tests {
     #[tokio::test]
     async fn blank_auto_update_repo_falls_back_to_the_default_repo() {
         // Needs a retained handle to the fake HTTP's `seen` log, so this one
-        // is built by hand rather than via `rig` (mirrors the TS test's own
-        // inline `fetchImpl`, which likewise bypasses the `mgr()` helper).
+        // is built by hand rather than via `rig` (which doesn't expose the
+        // HTTP fake it wires in).
         let (settings, _db) = settings().await;
         let target = Arc::new(FakeTarget {
             sessions: vec![
