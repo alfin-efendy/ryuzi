@@ -141,19 +141,3 @@ reason = "rustls-webpki 0.102 parent-pinned (per dependabot security_update_not_
 [[IgnoredVulns]]
 id = "GHSA-xgp8-3hg3-c2mh"
 reason = "rustls-webpki 0.102 parent-pinned (per dependabot security_update_not_possible); CRL checking never enabled by ryuzi. Tracked in #40."
-
-[[IgnoredVulns]]
-id = "GHSA-67mh-4wv8-2f99"
-reason = "esbuild pulled in transitively via vite; dev-time tooling only (vite dev server/build). Tracked in #40."
-
-[[IgnoredVulns]]
-id = "GHSA-4w7w-66w2-5vf9"
-reason = "vite 5.4.21 dev-time tooling only (vite dev server/build); vite major upgrade is its own PR. Tracked in #40."
-
-[[IgnoredVulns]]
-id = "GHSA-fx2h-pf6j-xcff"
-reason = "vite 5.4.21 dev-time tooling only (vite dev server/build); vite major upgrade is its own PR. Tracked in #40."
-
-[[IgnoredVulns]]
-id = "GHSA-v6wh-96g9-6wx3"
-reason = "vite 5.4.21 dev-time tooling only (vite dev server/build); vite major upgrade is its own PR. Tracked in #40."
