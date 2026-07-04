@@ -45,3 +45,30 @@ describe("nav history", () => {
     expect(h2.current).toEqual(detail);
   });
 });
+
+import { sanitizeRightTab, clampPanelSize, readClampedPanelSize, RIGHT_WIDTH, BOTTOM_HEIGHT } from "./store-nav";
+
+test("sanitizeRightTab keeps valid tabs and maps legacy/unknown to review", () => {
+  expect(sanitizeRightTab("file")).toBe("file");
+  expect(sanitizeRightTab("review")).toBe("review");
+  expect(sanitizeRightTab("term")).toBe("review"); // legacy persisted value
+  expect(sanitizeRightTab(null)).toBe("review");
+});
+
+test("clampPanelSize clamps to min and viewport fraction", () => {
+  expect(clampPanelSize(100, 1600, RIGHT_WIDTH)).toBe(320);
+  expect(clampPanelSize(560, 1600, RIGHT_WIDTH)).toBe(560);
+  expect(clampPanelSize(5000, 1600, RIGHT_WIDTH)).toBe(1280); // 80% of 1600
+  expect(clampPanelSize(50, 900, BOTTOM_HEIGHT)).toBe(120);
+  expect(clampPanelSize(1000, 900, BOTTOM_HEIGHT)).toBe(540); // 60% of 900
+});
+
+test("readClampedPanelSize parses, defaults, and clamps a persisted size to the viewport", () => {
+  expect(readClampedPanelSize("560", 1600, RIGHT_WIDTH)).toBe(560); // stored & in range
+  expect(readClampedPanelSize("5000", 1600, RIGHT_WIDTH)).toBe(1280); // saved on a bigger monitor → shrunk
+  expect(readClampedPanelSize("100", 1600, RIGHT_WIDTH)).toBe(320); // below min → min
+  expect(readClampedPanelSize(null, 1600, RIGHT_WIDTH)).toBe(RIGHT_WIDTH.def); // nothing persisted
+  expect(readClampedPanelSize("garbage", 1600, RIGHT_WIDTH)).toBe(RIGHT_WIDTH.def); // invalid → default
+  expect(readClampedPanelSize("0", 1600, RIGHT_WIDTH)).toBe(RIGHT_WIDTH.def); // non-positive → default
+  expect(readClampedPanelSize("2000", 900, BOTTOM_HEIGHT)).toBe(540); // 60% of 900
+});

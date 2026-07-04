@@ -24,3 +24,10 @@ export function fileBadge(path: string): string {
   if (!ext) return "FILE";
   return BADGES[ext] ?? ext.slice(0, 4).toUpperCase();
 }
+
+/** Join a workdir and a repo-relative posix path using the workdir's separator. */
+export function joinPath(workdir: string, rel: string): string {
+  const sep = workdir.includes("\\") ? "\\" : "/";
+  const base = workdir.replace(/[\\/]+$/, "");
+  return `${base}${sep}${rel.split("/").filter(Boolean).join(sep)}`;
+}
