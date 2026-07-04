@@ -23,15 +23,41 @@ Gateway-agnostic **control plane** for running agent harnesses (starting with Cl
 
 Check your environment any time with `ryuzi doctor`.
 
-## Quick start
+## Install
 
-Install the CLI:
+### CLI (macOS / Linux)
 
-```bash
-npm i -g ryuzi       # global install
-# or try it without installing:
-bunx ryuzi --help
+```sh
+curl -fsSL https://raw.githubusercontent.com/alfin-efendy/ryuzi/main/install.sh | sh
 ```
+
+Or via a package manager:
+
+```sh
+npm install -g ryuzi        # or: bun add -g ryuzi
+brew install alfin-efendy/ryuzi/ryuzi
+```
+
+The CLI daemon is unix-only. On Windows, use the Cockpit desktop app below,
+or install the CLI inside WSL with the same curl command.
+
+### Cockpit (desktop app)
+
+Download the installer for your platform from the latest
+[`cockpit-v*` release](https://github.com/alfin-efendy/ryuzi/releases):
+
+| Platform | File |
+| --- | --- |
+| Windows (x64 / arm64) | `*-setup.exe` |
+| macOS (Intel + Apple Silicon) | universal `.dmg` |
+| Linux (deb/rpm, x64 / arm64) | `.deb` / `.rpm` |
+
+Installers are currently unsigned: on macOS run
+`xattr -d com.apple.quarantine /Applications/ryuzi.app` after installing;
+on Windows click through the SmartScreen prompt. Verify downloads against
+`cockpit-checksums.txt` on the release.
+
+## Quick start
 
 Verify your environment:
 
