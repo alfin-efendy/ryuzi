@@ -15,12 +15,12 @@ import {
   Textarea,
 } from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { Chip } from "@/components/common/bits";
+import { Chip, Pill } from "@/components/common/bits";
 import { UsageChart } from "@/components/common/UsageChart";
 
 export function ConnectionDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { connections, loaded, hydrate, update, remove, test } = useConnections();
+  const { connections, loaded, hydrate, update, remove, test, reconnectOauth } = useConnections();
   const usage = useUsage((s) => s.byConnection[id]);
   const loadUsage = useUsage((s) => s.loadConnection);
   const [label, setLabel] = useState("");
@@ -30,6 +30,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
   const [initFor, setInitFor] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -95,6 +96,15 @@ export function ConnectionDetailView({ id }: { id: string }) {
     nav.navigate({ kind: "models" });
   };
 
+  const needsRelogin = conn.authType === "oauth" && conn.needsRelogin;
+
+  const reconnect = async () => {
+    setReconnecting(true);
+    const ok = await reconnectOauth(conn.id);
+    setReconnecting(false);
+    if (ok) toast.success(`Reconnected ${conn.providerName}`);
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[860px]">
@@ -103,8 +113,14 @@ export function ConnectionDetailView({ id }: { id: string }) {
         <DetailHeader
           chip={<Chip initial={conn.initial} color={conn.color} size={44} />}
           title={conn.label || conn.providerName}
+          titleExtra={needsRelogin ? <Pill variant="warn">Needs re-login</Pill> : undefined}
           sub={conn.providerName}
         >
+          {needsRelogin && (
+            <Button onClick={() => void reconnect()} disabled={reconnecting} className="shrink-0">
+              {reconnecting ? "Reconnecting…" : "Reconnect"}
+            </Button>
+          )}
           <Button variant="outline" onClick={() => void runTest()} disabled={testing} className="shrink-0">
             {testing ? "Testing…" : "Test"}
           </Button>

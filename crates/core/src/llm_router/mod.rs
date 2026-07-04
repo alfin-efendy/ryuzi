@@ -2,6 +2,7 @@
 //! keys, format translation, and the axum endpoint server.
 pub mod connections;
 pub mod keys;
+pub mod oauth;
 pub mod registry;
 pub mod responses;
 pub mod server;

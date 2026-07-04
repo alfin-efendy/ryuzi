@@ -109,6 +109,7 @@ async fn setup() -> (Arc<Store>, String, u16) {
                 api_key: Some("sk-up".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
+                ..Default::default()
             },
             created_at: 1,
             updated_at: 1,
@@ -147,6 +148,7 @@ async fn setup_with_anthropic() -> (Arc<Store>, String, u16) {
                 api_key: Some("sk-up".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
+                ..Default::default()
             },
             created_at: 1,
             updated_at: 1,
@@ -167,6 +169,7 @@ async fn setup_with_anthropic() -> (Arc<Store>, String, u16) {
                 api_key: Some("sk-up2".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{anthropic_port}/v1")),
                 models_override: Some(vec!["mock-claude".into()]),
+                ..Default::default()
             },
             created_at: 1,
             updated_at: 1,
@@ -492,6 +495,7 @@ async fn anthropic_client_gets_error_frame_when_upstream_truncates() {
                 api_key: Some("k".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
+                ..Default::default()
             },
             created_at: 0,
             updated_at: 0,
@@ -580,6 +584,7 @@ async fn anthropic_client_gets_error_frame_on_clean_eof_before_terminal() {
                 api_key: Some("k".into()),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-model".into()]),
+                ..Default::default()
             },
             created_at: 0,
             updated_at: 0,
@@ -711,4 +716,311 @@ async fn served_request_records_usage() {
             .any(|r| r.connection_id == "c1" && r.requests >= 1),
         "expected a usage_daily row for c1, got {rows:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// F2b: OAuth/free upstream auth + refresh wiring (Task 6)
+// ---------------------------------------------------------------------------
+
+/// Mock Anthropic-format upstream (`POST /v1/messages`) that captures the
+/// request headers + body it received, so the test can assert on the OAuth
+/// headers and the injected Claude-Code system prompt.
+async fn mock_anthropic_oauth_upstream() -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::Mutex<Option<(axum::http::HeaderMap, serde_json::Value)>>>,
+) {
+    use axum::{routing::post, Json, Router};
+    let captured: Arc<std::sync::Mutex<Option<(axum::http::HeaderMap, serde_json::Value)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let captured_for_handler = captured.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(
+            move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    *captured.lock().unwrap() = Some((headers, body));
+                    Json(json!({
+                        "id": "msg_mock", "type": "message", "role": "assistant",
+                        "model": "mock-claude",
+                        "content": [{"type": "text", "text": "hi from claude"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 3, "output_tokens": 2}
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, h, captured)
+}
+
+/// I6a: an anthropic-oauth connection's upstream request carries the OAuth
+/// bearer (from `data.access_token`, never `data.api_key`) + the
+/// `anthropic-beta: oauth-2025-04-20` header, and the outgoing body has the
+/// Claude-Code system prompt injected ahead of the caller's own system text.
+#[tokio::test]
+async fn oauth_anthropic_upstream_receives_bearer_beta_header_and_system_prompt() {
+    let (up_port, _h, captured) = mock_anthropic_oauth_upstream().await;
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+    let now = chrono::Utc::now().timestamp_millis();
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "coauth".into(),
+            provider: "anthropic-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "claude sub".into(),
+            priority: 0,
+            enabled: true,
+            data: connections::ConnectionData {
+                access_token: Some("at-secret-token".into()),
+                refresh_token: Some("rt-secret".into()),
+                // Far enough out that proactive `ensure_fresh` is a no-op —
+                // this test is about header/body shape, not refresh timing.
+                expires_at: Some(now + 30 * 24 * 3600 * 1000),
+                last_refresh_at: Some(now),
+                base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
+                models_override: Some(vec!["mock-claude".into()]),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let key = keys::create_key(&store, "t").await.unwrap();
+    let srv = RouterServer::new(store.clone());
+    let port = srv.start(0).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", &key.key)
+        .json(
+            &json!({"model": "anthropic-oauth/mock-claude", "max_tokens": 32,
+                      "system": "be terse",
+                      "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let response_body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(response_body["content"][0]["text"], "hi from claude");
+
+    let (headers, body) = captured.lock().unwrap().clone().expect("upstream not hit");
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        "Bearer at-secret-token"
+    );
+    assert_eq!(headers.get("anthropic-beta").unwrap(), "oauth-2025-04-20");
+    assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+    assert_eq!(
+        body["system"][0]["text"],
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    );
+    assert_eq!(body["system"][1]["text"], "be terse");
+
+    srv.stop().await;
+}
+
+/// Mock OAuth token endpoint for the reactive-401 test: records how many
+/// times it was hit and always returns a fresh access token. The router's
+/// per-`AppState` `oauth_token_url_override` (set via
+/// `RouterServer::set_oauth_token_url_override`) points the reactive
+/// `force_refresh` call at this instead of the real, static registry token
+/// URL — so this test exercises the ACTUAL network refresh, not a stand-in.
+async fn mock_oauth_token_server() -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicU32>,
+) {
+    use axum::{routing::post, Json, Router};
+    let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let hits_for_handler = hits.clone();
+    let app = Router::new().route(
+        "/token",
+        post(move |Json(_b): Json<serde_json::Value>| {
+            let hits = hits_for_handler.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(json!({
+                    "access_token": "at-refreshed-real",
+                    "refresh_token": "rt-refreshed-real",
+                    "expires_in": 3600
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, h, hits)
+}
+
+/// Mock Anthropic-format upstream for the reactive-401 test: the FIRST call
+/// returns 401 (simulating the upstream rejecting a token that still looks
+/// fresh, e.g. revoked server-side); the SECOND (retried) call returns 200.
+/// Captures the `authorization` header of every call so the test can assert
+/// the retry actually carried the newly-refreshed token, not the stale one.
+async fn mock_anthropic_oauth_upstream_401_then_200_capturing_auth() -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::Mutex<Vec<Option<String>>>>,
+) {
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::{routing::post, Json, Router};
+    let auths: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auths_for_handler = auths.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(
+            move |headers: HeaderMap, Json(_body): Json<serde_json::Value>| {
+                let auths = auths_for_handler.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    let call_index = {
+                        let mut g = auths.lock().unwrap();
+                        g.push(auth);
+                        g.len()
+                    };
+                    if call_index == 1 {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({"error": {"message": "token expired"}})),
+                        )
+                            .into_response();
+                    }
+                    Json(json!({
+                        "id": "msg_retry", "type": "message", "role": "assistant",
+                        "model": "mock-claude",
+                        "content": [{"type": "text", "text": "recovered"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                    .into_response()
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, h, auths)
+}
+
+/// I6b: a 401 from an oauth-target upstream triggers exactly one
+/// refresh-and-retry; the refresh genuinely hits the (mock) token endpoint
+/// even though the connection's `expires_at` looks fresh (the reactive path
+/// must never short-circuit on stale-looking freshness — that's the whole
+/// point of a 401-triggered refresh), the retry succeeds, and the RETRIED
+/// upstream call carries the NEWLY refreshed access token (not the stale
+/// one the first call used).
+#[tokio::test]
+async fn oauth_401_triggers_refresh_and_retries_once() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+    let now = chrono::Utc::now().timestamp_millis();
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "coauth2".into(),
+            provider: "anthropic-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "claude sub".into(),
+            priority: 0,
+            enabled: true,
+            data: connections::ConnectionData {
+                access_token: Some("at-stale".into()),
+                refresh_token: Some("rt-stale".into()),
+                // Far enough out that a naive freshness check (and the
+                // PROACTIVE ensure_fresh path) would call this fresh — this
+                // test is specifically about the REACTIVE 401 path
+                // refreshing unconditionally anyway.
+                expires_at: Some(now + 30 * 24 * 3600 * 1000),
+                last_refresh_at: Some(now),
+                models_override: Some(vec!["mock-claude".into()]),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (token_port, _h_token, token_hits) = mock_oauth_token_server().await;
+    let (up_port, _h_up, captured_auths) =
+        mock_anthropic_oauth_upstream_401_then_200_capturing_auth().await;
+    {
+        let mut conn = connections::get_connection(&store, "coauth2")
+            .await
+            .unwrap()
+            .unwrap();
+        conn.data.base_url_override = Some(format!("http://127.0.0.1:{up_port}/v1"));
+        connections::update_connection(&store, conn).await.unwrap();
+    }
+
+    let key = keys::create_key(&store, "t").await.unwrap();
+    let srv = RouterServer::new(store.clone());
+    srv.set_oauth_token_url_override(Some(format!("http://127.0.0.1:{token_port}/token")));
+    let port = srv.start(0).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", &key.key)
+        .json(
+            &json!({"model": "anthropic-oauth/mock-claude", "max_tokens": 16,
+                      "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "expected the retried call to succeed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "recovered");
+
+    assert!(
+        token_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "expected the reactive refresh to have actually hit the (mock) token endpoint"
+    );
+
+    let auths = captured_auths.lock().unwrap().clone();
+    assert_eq!(
+        auths.len(),
+        2,
+        "expected exactly one retry (two upstream calls total)"
+    );
+    assert_eq!(auths[0].as_deref(), Some("Bearer at-stale"));
+    assert_eq!(
+        auths[1].as_deref(),
+        Some("Bearer at-refreshed-real"),
+        "the retried call must carry the newly refreshed access token"
+    );
+
+    let stored = connections::get_connection(&store, "coauth2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.data.access_token.as_deref(),
+        Some("at-refreshed-real"),
+        "expected the reactive refresh to have updated the stored token"
+    );
+
+    srv.stop().await;
 }

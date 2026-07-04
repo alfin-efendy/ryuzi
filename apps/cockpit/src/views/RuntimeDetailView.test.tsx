@@ -63,6 +63,7 @@ const anthropicConnection: ConnectionInfo = {
   baseUrl: null,
   models: ["claude-sonnet-4"],
   keyMasked: "sk-…3fk9",
+  needsRelogin: false,
 };
 
 const endpointUp: EndpointStatusInfo = { running: true, port: 8787, baseUrl: "http://127.0.0.1:8787", autostart: false };

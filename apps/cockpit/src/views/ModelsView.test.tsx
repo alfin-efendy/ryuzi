@@ -19,6 +19,7 @@ const connection: ConnectionInfo = {
   baseUrl: null,
   models: ["gpt-4.1", "o3"],
   keyMasked: "sk-…3fk9",
+  needsRelogin: false,
 };
 
 const usage: UsageSeries = {

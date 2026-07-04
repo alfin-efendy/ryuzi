@@ -599,6 +599,69 @@ async testConnection(id: string) : Promise<Result<TestResult, CmdError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Drive the full interactive OAuth flow: binds a loopback listener, opens
+ * the provider's authorize URL in the system browser via
+ * `tauri-plugin-opener`, and awaits the callback (up to 5 minutes) before
+ * persisting the resulting connection.
+ */
+async connectOauth(provider: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("connect_oauth", { provider, label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Reconnect an existing `needs_relogin` OAuth connection: drives the same
+ * browser flow as [`connect_oauth`], but updates the connection in place
+ * (same id/priority/label) instead of inserting a new row — otherwise the
+ * stale, dead connection would keep shadowing the fresh one in
+ * `route_model`'s `priority ASC` ordering.
+ */
+async reconnectOauth(connectionId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reconnect_oauth", { connectionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start the manual (paste) OAuth fallback for environments where the
+ * loopback listener can't receive the provider's redirect: opens the
+ * authorize URL and hands back the PKCE material so the UI can show a paste
+ * field, completed later via [`complete_oauth_manual`].
+ */
+async beginOauthManual(provider: string) : Promise<Result<ManualStartInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("begin_oauth_manual", { provider }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async completeOauthManual(provider: string, label: string, verifier: string, state: string, pasted: string, redirectUri: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("complete_oauth_manual", { provider, label, verifier, state, pasted, redirectUri }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Add a `no_auth` connection for a Free-category provider — refuses any
+ * other category (those need the api-key or OAuth flows above).
+ */
+async addFreeConnection(provider: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_free_connection", { provider, label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -642,7 +705,12 @@ export type ConnectionInfo = { id: string; provider: string; providerName: strin
 /**
  * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
  */
-keyMasked: string | null }
+keyMasked: string | null; 
+/**
+ * OAuth connections only: true once refresh has failed terminally and
+ * the user needs to reconnect via the browser/paste flow again.
+ */
+needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
@@ -682,6 +750,7 @@ export type GatewayResourceInfo = { label: string; sub: string; pct: number }
 export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
 export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 /**
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
  */

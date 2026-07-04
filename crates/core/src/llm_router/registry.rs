@@ -43,6 +43,30 @@ pub struct ProviderDescriptor {
     pub models: &'static [&'static str],
     /// True for the generic `custom-*` entries: user must supply a base URL.
     pub requires_base_url: bool,
+    /// Set for OAuth-category providers that can actually run the flow.
+    pub oauth: Option<OAuthConfig>,
+    /// True for free-tier passthrough providers that need no credential
+    /// (distinct from `AuthScheme::None`, which just means "no header sent").
+    pub no_auth: bool,
+}
+
+/// How the OAuth redirect (loopback) listener is bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectMode {
+    /// Random loopback port, path `/callback` (Anthropic).
+    LoopbackRandom,
+    /// Fixed loopback port + path `/auth/callback` (Codex requires 1455).
+    LoopbackFixed(u16),
+}
+
+pub struct OAuthConfig {
+    pub client_id: &'static str,
+    pub authorize_url: &'static str,
+    pub token_url: &'static str,
+    pub scope: &'static str,
+    pub redirect: RedirectMode,
+    pub refresh_lead_ms: i64,
+    pub max_refresh_age_ms: Option<i64>,
 }
 
 use ProviderCategory::*;
@@ -59,6 +83,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::XApiKey,
         models: &["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"],
         requires_base_url: false,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "openai",
@@ -71,6 +97,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &["gpt-5.2", "gpt-5.2-codex", "o5-mini"],
         requires_base_url: false,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "openrouter",
@@ -83,6 +111,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &[],
         requires_base_url: false,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "groq",
@@ -95,6 +125,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &[],
         requires_base_url: false,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "deepseek",
@@ -107,6 +139,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &["deepseek-chat", "deepseek-reasoner"],
         requires_base_url: false,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "mistral",
@@ -119,6 +153,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &[],
         requires_base_url: false,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "xai",
@@ -131,6 +167,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &[],
         requires_base_url: false,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "google",
@@ -143,6 +181,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &["gemini-3.0-pro", "gemini-3.0-flash"],
         requires_base_url: false,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "ollama",
@@ -155,6 +195,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::None,
         models: &[],
         requires_base_url: false,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "custom-openai",
@@ -167,6 +209,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &[],
         requires_base_url: true,
+        oauth: None,
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "custom-anthropic",
@@ -179,6 +223,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::XApiKey,
         models: &[],
         requires_base_url: true,
+        oauth: None,
+        no_auth: false,
     },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
     // Not connectable in F1 (add_connection refuses non-ApiKey categories).
@@ -193,6 +239,16 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &[],
         requires_base_url: false,
+        oauth: Some(OAuthConfig {
+            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            authorize_url: "https://claude.ai/oauth/authorize",
+            token_url: "https://api.anthropic.com/v1/oauth/token",
+            scope: "org:create_api_key user:profile user:inference",
+            redirect: RedirectMode::LoopbackRandom,
+            refresh_lead_ms: 14_400_000,
+            max_refresh_age_ms: None,
+        }),
+        no_auth: false,
     },
     ProviderDescriptor {
         id: "openai-oauth",
@@ -205,6 +261,18 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &[],
         requires_base_url: false,
+        oauth: Some(OAuthConfig {
+            client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+            authorize_url: "https://auth.openai.com/oauth/authorize",
+            token_url: "https://auth.openai.com/oauth/token",
+            scope: "openid profile email offline_access",
+            redirect: RedirectMode::LoopbackFixed(1455),
+            refresh_lead_ms: 432_000_000,
+            max_refresh_age_ms: Some(691_200_000),
+        }),
+        no_auth: false,
+        // NOTE: openai-oauth upstream is chatgpt.com/backend-api/codex/responses
+        // (Responses wire) — applied in server.rs, not via base_url here.
     },
     ProviderDescriptor {
         id: "kiro",
@@ -217,11 +285,31 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         auth: AuthScheme::Bearer,
         models: &[],
         requires_base_url: true,
+        oauth: None,
+        no_auth: false,
+    },
+    ProviderDescriptor {
+        id: "opencode-free",
+        name: "OpenCode (free)",
+        color: "#F5A623",
+        initial: "OC",
+        category: Free,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://opencode.ai/zen/v1"),
+        auth: AuthScheme::None,
+        models: &[],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: true,
     },
 ];
 
 pub fn descriptor(id: &str) -> Option<&'static ProviderDescriptor> {
     CATALOG.iter().find(|d| d.id == id)
+}
+
+pub fn oauth_config(id: &str) -> Option<&'static OAuthConfig> {
+    descriptor(id).and_then(|d| d.oauth.as_ref())
 }
 
 #[cfg(test)]
@@ -272,5 +360,25 @@ mod tests {
             .iter()
             .any(|d| d.category == ProviderCategory::OAuth));
         assert!(CATALOG.iter().any(|d| d.category == ProviderCategory::Free));
+    }
+
+    #[test]
+    fn oauth_providers_have_config_with_verbatim_constants() {
+        let a = oauth_config("anthropic-oauth").unwrap();
+        assert_eq!(a.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+        assert_eq!(a.authorize_url, "https://claude.ai/oauth/authorize");
+        assert!(matches!(a.redirect, RedirectMode::LoopbackRandom));
+        let o = oauth_config("openai-oauth").unwrap();
+        assert_eq!(o.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
+        assert!(matches!(o.redirect, RedirectMode::LoopbackFixed(1455)));
+        assert_eq!(o.max_refresh_age_ms, Some(691_200_000));
+    }
+
+    #[test]
+    fn opencode_free_is_no_auth_free() {
+        let d = descriptor("opencode-free").unwrap();
+        assert_eq!(d.category, ProviderCategory::Free);
+        assert!(d.no_auth);
+        assert_eq!(d.base_url, Some("https://opencode.ai/zen/v1"));
     }
 }
