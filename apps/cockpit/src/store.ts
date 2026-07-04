@@ -166,13 +166,18 @@ export const useStore = create<State>((set, get) => ({
           const res = await commands.listMessages(pk);
           return res.status === "ok" ? res.data : [];
         })();
-    const lines = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind));
+    const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind));
     const maxSeq = rows.reduce((mx, m) => Math.max(mx, m.seq), 0);
-    set((st) => ({
-      transcripts: { ...st.transcripts, [pk]: lines },
-      lastSeq: { ...st.lastSeq, [pk]: maxSeq },
-      loaded: { ...st.loaded, [pk]: true },
-    }));
+    set((st) => {
+      // Rows appended by applyCoreEvent while listMessages was in flight (fresher
+      // than the snapshot, or transient seq-0 error rows) must survive the replace.
+      const liveTail = (st.transcripts[pk] ?? []).filter((r) => r.seq > maxSeq || r.seq === 0);
+      return {
+        transcripts: { ...st.transcripts, [pk]: [...hydrated, ...liveTail] },
+        lastSeq: { ...st.lastSeq, [pk]: Math.max(st.lastSeq[pk] ?? 0, maxSeq) },
+        loaded: { ...st.loaded, [pk]: true },
+      };
+    });
   },
 
   // Selecting a project clears the focused session so the center shows the "start a new session" composer.

@@ -91,8 +91,8 @@ export function Transcript({
     if (el) stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   };
 
-  // Keyed on group count AND tail text length: with coalescing, a growing turn
-  // changes length, not count.
+  // Keyed on group count AND tail growth: with coalescing, a growing turn
+  // changes length (text/thought) or item count (activity clusters), not group count.
   // biome-ignore lint/correctness/useExhaustiveDependencies: scroll pinning reacts to transcript growth, not identity
   useEffect(() => {
     if (stickRef.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });

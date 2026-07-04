@@ -33,7 +33,9 @@ export const Markdown = memo(function Markdown({ text }: { text: string }) {
                 href={href}
                 onClick={(e) => {
                   e.preventDefault();
-                  if (href) void openUrl(href);
+                  if (href && /^https?:/i.test(href)) {
+                    openUrl(href).catch((err) => console.warn("openUrl failed", err));
+                  }
                 }}
               >
                 {children}

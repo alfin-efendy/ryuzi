@@ -188,6 +188,55 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
   expect(useStore.getState().transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3]);
 });
 
+test("hydrateTranscript keeps live rows that arrived during the fetch (and never regresses lastSeq)", async () => {
+  reset();
+  const dbRows = [
+    {
+      sessionPk: "s1",
+      seq: 1,
+      role: "user",
+      blockType: "text",
+      payload: { text: "hi" },
+      toolCallId: null,
+      status: null,
+      toolKind: null,
+      createdAt: 1,
+    },
+    {
+      sessionPk: "s1",
+      seq: 2,
+      role: "assistant",
+      blockType: "text",
+      payload: { text: "yo" },
+      toolCallId: null,
+      status: null,
+      toolKind: null,
+      createdAt: 2,
+    },
+  ];
+  await useStore.getState().hydrateTranscript("s1", async () => {
+    // Simulates events landing while listMessages is in flight.
+    useStore.getState().applyCoreEvent({
+      kind: "message",
+      session_pk: "s1",
+      seq: 3,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "live" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    });
+    useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "transient" });
+    return dbRows;
+  });
+  const st = useStore.getState();
+  expect(st.transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3, 0]);
+  expect(st.transcripts.s1[2].text).toBe("live");
+  expect(st.transcripts.s1[3].blockType).toBe("error");
+  expect(st.lastSeq.s1).toBe(3);
+});
+
 test("transient error events append a seq-0 error row", () => {
   reset();
   useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "spawn failed" });
