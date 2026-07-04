@@ -1,11 +1,11 @@
-//! Agents screen commands: catalog + persisted config + real detection
+//! Runtime screen commands: catalog + persisted config + real detection
 //! snapshots, enriched with the latest released version from npm.
 //!
-//! `list_agents` is fast (reads the persisted snapshot); `refresh_agents`
+//! `list_runtimes` is fast (reads the persisted snapshot); `refresh_runtimes`
 //! re-probes binaries and asks npm, then persists the snapshot in settings.
 
 use crate::error::CmdError;
-use ryuzi_core::agents::{self, AgentConfig};
+use ryuzi_core::runtimes::{self, RuntimeConfig};
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -15,6 +15,7 @@ use tauri::State;
 
 type R<T> = Result<T, CmdError>;
 
+// legacy storage keys — see Task 1 note in the plan
 const SNAPSHOT_KEY: &str = "agents_snapshot";
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -28,7 +29,7 @@ pub struct TierInfo {
 
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentInfo {
+pub struct RuntimeInfo {
     pub id: String,
     pub name: String,
     pub color: String,
@@ -66,9 +67,9 @@ async fn read_snapshots(cp: &ControlPlane) -> std::collections::HashMap<String, 
     raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
-async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AgentInfo>> {
+async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
     let snapshots = read_snapshots(cp).await;
-    let configs = agents::list_configs(cp.store()).await?;
+    let configs = runtimes::list_configs(cp.store()).await?;
     let default_agent = cp
         .store()
         .get_setting("default_agent")
@@ -76,7 +77,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AgentInfo>> {
         .unwrap_or_else(|| "claude".to_string());
 
     let mut out = Vec::new();
-    for desc in agents::CATALOG {
+    for desc in runtimes::CATALOG {
         let snap = snapshots.get(desc.id).cloned().unwrap_or_default();
         let cfg = configs.iter().find(|c| c.id == desc.id);
         let detected = snap.binary_path.is_some();
@@ -88,7 +89,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AgentInfo>> {
             .and_then(|c| c.model.clone())
             .or_else(|| models.first().cloned())
             .unwrap_or_default();
-        let tiers = agents::list_tiers(cp.store(), desc.id)
+        let tiers = runtimes::list_tiers(cp.store(), desc.id)
             .await?
             .into_iter()
             .map(|t| TierInfo {
@@ -98,7 +99,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AgentInfo>> {
                 combo: t.combo,
             })
             .collect();
-        out.push(AgentInfo {
+        out.push(RuntimeInfo {
             id: desc.id.to_string(),
             name: desc.name.to_string(),
             color: desc.color.to_string(),
@@ -138,7 +139,7 @@ async fn npm_latest(pkg: &str) -> Option<String> {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_agents(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<AgentInfo>> {
+pub async fn list_runtimes(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<RuntimeInfo>> {
     Ok(assemble(&cp).await?)
 }
 
@@ -146,16 +147,16 @@ pub async fn list_agents(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<AgentInfo>> 
 /// list for ollama), persist the snapshot, and return the fresh assembly.
 #[tauri::command]
 #[specta::specta]
-pub async fn refresh_agents(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<AgentInfo>> {
+pub async fn refresh_runtimes(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<RuntimeInfo>> {
     let mut snapshots = std::collections::HashMap::new();
-    for desc in agents::CATALOG {
-        let det = agents::detect(desc.binary).await;
+    for desc in runtimes::CATALOG {
+        let det = runtimes::detect(desc.binary).await;
         let latest = match desc.npm_package {
             Some(pkg) => npm_latest(pkg).await,
             None => None,
         };
         let local_models = match (&det.binary_path, desc.id) {
-            (Some(path), "ollama") => agents::ollama_models(path).await,
+            (Some(path), "ollama") => runtimes::ollama_models(path).await,
             _ => vec![],
         };
         snapshots.insert(
@@ -178,17 +179,17 @@ pub async fn refresh_agents(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<AgentInfo
 
 #[tauri::command]
 #[specta::specta]
-pub async fn update_agent(
+pub async fn update_runtime_config(
     cp: State<'_, Arc<ControlPlane>>,
     id: String,
     enabled: bool,
     model: Option<String>,
     perm_mode: String,
     flags: String,
-) -> R<Vec<AgentInfo>> {
-    agents::upsert_config(
+) -> R<Vec<RuntimeInfo>> {
+    runtimes::upsert_config(
         cp.store(),
-        AgentConfig {
+        RuntimeConfig {
             id,
             enabled,
             model,
@@ -202,20 +203,20 @@ pub async fn update_agent(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn set_agent_tier(
+pub async fn set_runtime_tier(
     cp: State<'_, Arc<ControlPlane>>,
     id: String,
     tier_id: String,
     value: Option<String>,
     combo: bool,
-) -> R<Vec<AgentInfo>> {
-    agents::set_tier(cp.store(), &id, &tier_id, value, combo).await?;
+) -> R<Vec<RuntimeInfo>> {
+    runtimes::set_tier(cp.store(), &id, &tier_id, value, combo).await?;
     Ok(assemble(&cp).await?)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn set_default_agent(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<AgentInfo>> {
+pub async fn set_default_runtime(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<RuntimeInfo>> {
     cp.store().set_setting("default_agent", &id).await?;
     Ok(assemble(&cp).await?)
 }

@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-// Agent ids come from the engine's agent catalog (see store-agents).
+// Agent ids come from the engine's agent catalog (see store-runtimes).
 export type AgentId = string;
 
 // View router for the Relay v3 shell. Session focus itself stays in the main
@@ -10,8 +10,8 @@ export type View =
   | { kind: "session" }
   | { kind: "providers" }
   | { kind: "providerDetail"; id: string }
-  | { kind: "agents" }
-  | { kind: "agentDetail"; id: AgentId }
+  | { kind: "runtime" }
+  | { kind: "runtimeDetail"; id: AgentId }
   | { kind: "scheduler" }
   | { kind: "jobDetail"; id: string }
   | { kind: "jobNew" }

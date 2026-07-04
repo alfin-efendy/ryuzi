@@ -1,4 +1,3 @@
-pub mod agents;
 pub mod approval;
 pub mod connector;
 pub mod control;
@@ -13,6 +12,7 @@ pub mod paths;
 pub mod policy;
 pub mod providers;
 pub mod registry;
+pub mod runtimes;
 pub mod scheduler;
 pub mod store;
 pub mod worktree;

@@ -1,6 +1,6 @@
-//! Agents domain: the catalog of CLI coding agents Cockpit can drive, real
-//! binary detection, and the persisted per-agent configuration overlay
-//! (enabled/model/perm-mode/flags/tiers) that feeds session start.
+//! Runtimes domain: the catalog of CLI coding agents (runtimes) Cockpit can
+//! drive, real binary detection, and the persisted per-agent configuration
+//! overlay (enabled/model/perm-mode/flags/tiers) that feeds session start.
 //!
 //! Identity (names, colors, npm packages, model lists) is code; only user
 //! choices and detection snapshots persist.
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Static identity of a supported agent CLI.
-pub struct AgentDescriptor {
+pub struct RuntimeDescriptor {
     pub id: &'static str,
     pub name: &'static str,
     pub color: &'static str,
@@ -28,8 +28,8 @@ pub struct AgentDescriptor {
     pub tiers: &'static [(&'static str, &'static str, Option<&'static str>, bool)],
 }
 
-pub const CATALOG: &[AgentDescriptor] = &[
-    AgentDescriptor {
+pub const CATALOG: &[RuntimeDescriptor] = &[
+    RuntimeDescriptor {
         id: "claude",
         name: "Claude Code",
         color: "#D97757",
@@ -45,7 +45,7 @@ pub const CATALOG: &[AgentDescriptor] = &[
             ("fast", "Fast", Some("claude-haiku-4-5"), false),
         ],
     },
-    AgentDescriptor {
+    RuntimeDescriptor {
         id: "codex",
         name: "OpenAI Codex",
         color: "#0FA47F",
@@ -61,7 +61,7 @@ pub const CATALOG: &[AgentDescriptor] = &[
             ("fast", "Fast", None, false),
         ],
     },
-    AgentDescriptor {
+    RuntimeDescriptor {
         id: "gemini",
         name: "Gemini CLI",
         color: "#4285F4",
@@ -77,7 +77,7 @@ pub const CATALOG: &[AgentDescriptor] = &[
             ("fast", "Fast", Some("gemini-3.0-flash"), false),
         ],
     },
-    AgentDescriptor {
+    RuntimeDescriptor {
         id: "ollama",
         name: "Ollama (local)",
         color: "#8B8B8B",
@@ -95,13 +95,13 @@ pub const CATALOG: &[AgentDescriptor] = &[
     },
 ];
 
-pub fn descriptor(id: &str) -> Option<&'static AgentDescriptor> {
+pub fn descriptor(id: &str) -> Option<&'static RuntimeDescriptor> {
     CATALOG.iter().find(|d| d.id == id)
 }
 
 /// Persisted per-agent user configuration.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AgentConfig {
+pub struct RuntimeConfig {
     pub id: String,
     pub enabled: bool,
     pub model: Option<String>,
@@ -255,14 +255,17 @@ pub fn parse_ollama_list(text: &str) -> Vec<String> {
 // Persistence
 // ---------------------------------------------------------------------------
 
-pub async fn list_configs(store: &Store) -> anyhow::Result<Vec<AgentConfig>> {
+// NOTE: the backing tables keep their legacy names `agents` / `agent_tiers`
+// (and the settings key `default_agent`) — renaming stored identifiers buys
+// nothing and would need a data migration.
+pub async fn list_configs(store: &Store) -> anyhow::Result<Vec<RuntimeConfig>> {
     store
         .with_conn(|c| {
             let mut stmt =
                 c.prepare("SELECT id, enabled, model, perm_mode, flags FROM agents")?;
             let rows = stmt
                 .query_map([], |r| {
-                    Ok(AgentConfig {
+                    Ok(RuntimeConfig {
                         id: r.get(0)?,
                         enabled: r.get::<_, i64>(1)? != 0,
                         model: r.get(2)?,
@@ -276,7 +279,7 @@ pub async fn list_configs(store: &Store) -> anyhow::Result<Vec<AgentConfig>> {
         .await
 }
 
-pub async fn get_config(store: &Store, id: &str) -> anyhow::Result<Option<AgentConfig>> {
+pub async fn get_config(store: &Store, id: &str) -> anyhow::Result<Option<RuntimeConfig>> {
     let id = id.to_string();
     store
         .with_conn(move |c| {
@@ -284,7 +287,7 @@ pub async fn get_config(store: &Store, id: &str) -> anyhow::Result<Option<AgentC
                 "SELECT id, enabled, model, perm_mode, flags FROM agents WHERE id=?1",
                 params![id],
                 |r| {
-                    Ok(AgentConfig {
+                    Ok(RuntimeConfig {
                         id: r.get(0)?,
                         enabled: r.get::<_, i64>(1)? != 0,
                         model: r.get(2)?,
@@ -298,7 +301,7 @@ pub async fn get_config(store: &Store, id: &str) -> anyhow::Result<Option<AgentC
         .await
 }
 
-pub async fn upsert_config(store: &Store, cfg: AgentConfig) -> anyhow::Result<()> {
+pub async fn upsert_config(store: &Store, cfg: RuntimeConfig) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
@@ -462,7 +465,7 @@ mod tests {
         // Agent config upsert round-trips.
         upsert_config(
             &store,
-            AgentConfig {
+            RuntimeConfig {
                 id: "claude".into(),
                 enabled: true,
                 model: Some("claude-sonnet-4-5".into()),
@@ -490,7 +493,7 @@ mod tests {
 
         upsert_config(
             &store,
-            AgentConfig {
+            RuntimeConfig {
                 id: "claude".into(),
                 enabled: true,
                 model: Some("claude-haiku-4-5".into()),

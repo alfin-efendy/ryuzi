@@ -3,15 +3,15 @@ import { ChevronRight, RefreshCw } from "lucide-react";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { Card } from "@/components/common/Card";
 import { Switch } from "@/components/common/Switch";
-import { useAgents } from "@/store-agents";
+import { useRuntimes } from "@/store-runtimes";
 import { useNav } from "@/store-nav";
 
 const SUCCESS = "#22C55E";
 
-// Agents settings list: every CLI agent Cockpit can drive, with real binary
+// Runtime settings list: every CLI agent Cockpit can drive, with real binary
 // detection, default/update badges, enable toggles, and a detail screen path.
-export function AgentsView() {
-  const { agents, refreshing, refresh, update, setDefault } = useAgents();
+export function RuntimeView() {
+  const { runtimes, refreshing, refresh, update, setDefault } = useRuntimes();
   const navigate = useNav((s) => s.navigate);
 
   return (
@@ -19,7 +19,7 @@ export function AgentsView() {
       <div className="mx-auto max-w-[720px]">
         <div className="flex items-start gap-3">
           <div className="min-w-0 flex-1">
-            <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">Agents</h2>
+            <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">Runtime</h2>
             <p className="m-0 mb-5 text-[13px] text-muted-foreground">
               Cockpit is agent-agnostic. Any CLI coding agent can run a session — mix them across projects.
             </p>
@@ -35,7 +35,7 @@ export function AgentsView() {
           </button>
         </div>
         <div className="flex flex-col gap-3">
-          {agents.map((agent) => {
+          {runtimes.map((agent) => {
             const installed = agent.binaryPath !== null;
             const isDefault = agent.isDefault;
             const hasUpdate =
@@ -44,7 +44,7 @@ export function AgentsView() {
               agent.installedVersion !== null &&
               agent.latestVersion !== agent.installedVersion;
             const statusColor = installed ? SUCCESS : "var(--muted-foreground)";
-            const open = () => navigate({ kind: "agentDetail", id: agent.id });
+            const open = () => navigate({ kind: "runtimeDetail", id: agent.id });
             return (
               <Card key={agent.id} className={cn("flex items-center gap-3.5 px-[18px] py-4", isDefault && "border-ring")}>
                 <Chip initial={agent.initial} color={agent.color} size={36} onClick={open} />

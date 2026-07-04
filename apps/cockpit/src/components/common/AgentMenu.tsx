@@ -1,4 +1,4 @@
-import { useAgents } from "@/store-agents";
+import { useRuntimes } from "@/store-runtimes";
 import { MenuItem, MenuPanel, MenuSectionLabel } from "./MenuPanel";
 import { StatusDot } from "./bits";
 
@@ -16,14 +16,14 @@ export function AgentMenu({
   onClose: () => void;
   className?: string;
 }) {
-  const agents = useAgents((s) => s.agents);
-  const visible = agents.filter((a) => a.enabled && a.binaryPath);
+  const runtimes = useRuntimes((s) => s.runtimes);
+  const visible = runtimes.filter((a) => a.enabled && a.binaryPath);
   return (
     <MenuPanel onClose={onClose} className={className ?? "bottom-11 right-[78px] z-40 w-[280px]"}>
       <MenuSectionLabel>Run with</MenuSectionLabel>
       {visible.length === 0 && (
         <div className="px-3 py-2 text-[12px] text-muted-foreground">
-          No agents detected — install a CLI agent (e.g. Claude Code) and refresh in Agents.
+          No agents detected — install a CLI agent (e.g. Claude Code) and refresh in Runtime.
         </div>
       )}
       {visible.map((a) => (

@@ -110,9 +110,9 @@ async updateProject(projectId: string, model: string | null, permMode: PermMode,
     else return { status: "error", error: e  as any };
 }
 },
-async listAgents() : Promise<Result<AgentInfo[], CmdError>> {
+async listRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_agents") };
+    return { status: "ok", data: await TAURI_INVOKE("list_runtimes") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -122,33 +122,33 @@ async listAgents() : Promise<Result<AgentInfo[], CmdError>> {
  * Re-probe every catalog agent (PATH + --version + npm latest + local model
  * list for ollama), persist the snapshot, and return the fresh assembly.
  */
-async refreshAgents() : Promise<Result<AgentInfo[], CmdError>> {
+async refreshRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("refresh_agents") };
+    return { status: "ok", data: await TAURI_INVOKE("refresh_runtimes") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateAgent(id: string, enabled: boolean, model: string | null, permMode: string, flags: string) : Promise<Result<AgentInfo[], CmdError>> {
+async updateRuntimeConfig(id: string, enabled: boolean, model: string | null, permMode: string, flags: string) : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_agent", { id, enabled, model, permMode, flags }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_runtime_config", { id, enabled, model, permMode, flags }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setAgentTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<AgentInfo[], CmdError>> {
+async setRuntimeTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_agent_tier", { id, tierId, value, combo }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_runtime_tier", { id, tierId, value, combo }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setDefaultAgent(id: string) : Promise<Result<AgentInfo[], CmdError>> {
+async setDefaultRuntime(id: string) : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_default_agent", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_default_runtime", { id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -523,11 +523,6 @@ transport: string; command: string | null; args: string[];
  */
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
-export type AgentInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
-/**
- * Whether Cockpit has a session harness for this agent today.
- */
-runnable: boolean }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CmdError = { message: string }
@@ -583,6 +578,11 @@ kind: string;
 installTarget: string | null; website: string | null }
 export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
+export type RuntimeInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
+/**
+ * Whether Cockpit has a session harness for this agent today.
+ */
+runnable: boolean }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TermExitMsg = { id: string }

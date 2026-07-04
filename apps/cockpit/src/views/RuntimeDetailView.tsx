@@ -8,16 +8,16 @@ import { MenuItem, MenuPanel, MenuSeparator } from "@/components/common/MenuPane
 import { Segmented } from "@/components/common/Segmented";
 import { Switch } from "@/components/common/Switch";
 import { PERM_MODES } from "@/constants";
-import { agentById, useAgents } from "@/store-agents";
+import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { agentAllowed, useApps } from "@/store-apps";
 import { useNav } from "@/store-nav";
 
 const WARN = "#F59E0B";
 
-// Agent detail: real detection state, update banner with the actual install
+// Runtime detail: real detection state, update banner with the actual install
 // command, model/permission/flags configuration, and per-tier model routing.
-export function AgentDetailView({ id }: { id: string }) {
-  const { agents, refreshing, refresh, update, setTier, setDefault } = useAgents();
+export function RuntimeDetailView({ id }: { id: string }) {
+  const { runtimes, refreshing, refresh, update, setTier, setDefault } = useRuntimes();
   const { apps, loaded: appsLoaded, hydrate: hydrateApps, toggleAgent: toggleAppAgent } = useApps();
   const navigate = useNav((s) => s.navigate);
   const [openTierMenu, setOpenTierMenu] = useState<string | null>(null);
@@ -26,7 +26,7 @@ export function AgentDetailView({ id }: { id: string }) {
     if (!appsLoaded) void hydrateApps();
   }, [appsLoaded, hydrateApps]);
 
-  const agent = agentById(agents, id);
+  const agent = runtimeById(runtimes, id);
   if (!agent) {
     return <div className="flex min-h-0 flex-1 items-center justify-center text-[13px] text-muted-foreground">Unknown agent.</div>;
   }
@@ -41,7 +41,7 @@ export function AgentDetailView({ id }: { id: string }) {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[720px]">
-        <BackButton label="Agents" onClick={() => navigate({ kind: "agents" })} />
+        <BackButton label="Runtime" onClick={() => navigate({ kind: "runtime" })} />
 
         <DetailHeader
           chip={<Chip initial={agent.initial} color={agent.color} size={44} />}

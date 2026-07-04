@@ -1,5 +1,4 @@
 mod accent;
-mod agents_cmd;
 mod apps_cmd;
 mod backdrop;
 mod commands;
@@ -9,6 +8,7 @@ mod fsview_cmd;
 mod gateways_cmd;
 mod providers_cmd;
 mod registry_cmd;
+mod runtimes_cmd;
 mod scheduler_cmd;
 mod term;
 
@@ -182,11 +182,11 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::get_setting,
             commands::set_setting,
             commands::update_project,
-            agents_cmd::list_agents,
-            agents_cmd::refresh_agents,
-            agents_cmd::update_agent,
-            agents_cmd::set_agent_tier,
-            agents_cmd::set_default_agent,
+            runtimes_cmd::list_runtimes,
+            runtimes_cmd::refresh_runtimes,
+            runtimes_cmd::update_runtime_config,
+            runtimes_cmd::set_runtime_tier,
+            runtimes_cmd::set_default_runtime,
             gateways_cmd::list_gateways,
             gateways_cmd::probe_gateways,
             gateways_cmd::add_gateway,

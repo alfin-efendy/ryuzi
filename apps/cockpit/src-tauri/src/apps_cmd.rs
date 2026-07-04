@@ -87,7 +87,7 @@ fn initial_of(name: &str) -> String {
 }
 
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
-    let agent_ids: Vec<&str> = ryuzi_core::agents::CATALOG.iter().map(|d| d.id).collect();
+    let agent_ids: Vec<&str> = ryuzi_core::runtimes::CATALOG.iter().map(|d| d.id).collect();
     let mut out = Vec::new();
     for row in mcp::list_servers(cp.store()).await? {
         let tools = mcp::list_tools(cp.store(), &row.id)
