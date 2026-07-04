@@ -284,6 +284,7 @@ impl ApplyHook for ProdApplyHook {
             info,
             platform: self.platform,
             tmp_dir: tmp.path().to_path_buf(),
+            canary_wait_ms: cfg.drain_timeout_ms + cfg.canary_timeout_ms,
         };
         let result = apply_update(&cfg, &host).await;
         // Explicit early drop: `handle_apply_outcome` below calls
@@ -307,7 +308,11 @@ impl ApplyHook for ProdApplyHook {
                 |m| println!("{m}"),
             ),
             Err(e) => {
-                println!("update: apply failed mid-swap: {e} (update.json left for inspection)")
+                let msg =
+                    format!("update: apply failed mid-swap: {e} (update.json left for inspection)");
+                println!("{msg}");
+                write_update_failure_status(&self.dir, &msg);
+                std::process::exit(1);
             }
         }
     }
@@ -322,6 +327,7 @@ struct ProdApplierHost {
     info: ApplyInfo,
     platform: ryuzi_core::update::Platform,
     tmp_dir: PathBuf,
+    canary_wait_ms: u64,
 }
 
 #[async_trait::async_trait]
@@ -350,7 +356,7 @@ impl ApplierHost for ProdApplierHost {
             "__daemon".to_string(),
             "--canary".to_string(),
         ];
-        let env = vec![("RYUZI_CANARY_TARGET".to_string(), self.info.version.clone())];
+        let env = canary_spawn_env(&self.info.version, self.canary_wait_ms);
         Ok(spawn_detached(&cmd, &env, &self.dir.join("daemon.log"))? as i32)
     }
     fn read_handoff(&self) -> Option<Handoff> {
@@ -407,6 +413,32 @@ fn bak_path(install_path: &Path) -> PathBuf {
     let mut s = install_path.as_os_str().to_owned();
     s.push(".bak");
     PathBuf::from(s)
+}
+
+/// Env for the spawned canary: the version it must claim, and a promote-wait
+/// that outlives the applier's ENTIRE post-health window (drain + watchdog).
+/// TS never set the timeout, so a >60s drain guaranteed a canary "promote
+/// timeout" → disruptive swap→rollback cycle (4E handoff item).
+pub(crate) fn canary_spawn_env(version: &str, wait_ms: u64) -> Vec<(String, String)> {
+    vec![
+        ("RYUZI_CANARY_TARGET".to_string(), version.to_string()),
+        ("RYUZI_CANARY_TIMEOUT_MS".to_string(), wait_ms.to_string()),
+    ]
+}
+
+/// A failed apply AFTER the drain latch was set must not leave a zombie
+/// "Running" daemon that rejects every turn (4E known gap; TS crashed here).
+fn write_update_failure_status(dir: &Path, message: &str) {
+    let _ = write_status(
+        dir,
+        &DaemonStatusFile {
+            pid: std::process::id() as i32,
+            state: DaemonFileState::Error,
+            started_at: ryuzi_core::paths::now_ms(),
+            last_error: Some(message.to_string()),
+            version: Some(crate::meta::version().to_string()),
+        },
+    );
 }
 
 /// Spawn `cmd` detached: stdin null, stdout/stderr appended to `log_path`,
@@ -704,6 +736,27 @@ mod tests {
             PathBuf::from("/home/me/.local/bin/ryuzi.bak")
         );
         assert_eq!(bak_path(Path::new("ryuzi")), PathBuf::from("ryuzi.bak"));
+    }
+
+    // ---------- canary_spawn_env ----------
+
+    #[test]
+    fn canary_spawn_env_carries_target_and_summed_timeout() {
+        let env = canary_spawn_env("0.4.0", 360_000);
+        assert!(env.contains(&("RYUZI_CANARY_TARGET".to_string(), "0.4.0".to_string())));
+        assert!(env.contains(&("RYUZI_CANARY_TIMEOUT_MS".to_string(), "360000".to_string())));
+    }
+
+    // ---------- write_update_failure_status ----------
+
+    #[test]
+    fn update_failure_status_is_an_error_with_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        write_update_failure_status(dir.path(), "apply failed mid-swap: boom");
+        let s = ryuzi_core::daemon_status::read_status(dir.path()).unwrap();
+        assert_eq!(s.state, ryuzi_core::daemon_status::DaemonFileState::Error);
+        assert_eq!(s.last_error.as_deref(), Some("apply failed mid-swap: boom"));
+        assert_eq!(s.pid, std::process::id() as i32);
     }
 
     // ---------- backup/swap/restore fs semantics ----------
