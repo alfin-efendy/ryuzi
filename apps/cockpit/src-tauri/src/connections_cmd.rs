@@ -1,12 +1,14 @@
 //! Providers tab commands: catalog + credentialed connections CRUD + test.
 use crate::error::CmdError;
 use ryuzi_core::llm_router::connections::{self, ConnectionData, ConnectionRow};
+use ryuzi_core::llm_router::oauth;
 use ryuzi_core::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderCategory};
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::sync::Arc;
 use tauri::State;
+use tauri_plugin_opener::OpenerExt;
 
 type R<T> = Result<T, CmdError>;
 
@@ -46,6 +48,15 @@ pub struct ConnectionInfo {
 pub struct TestResult {
     pub ok: bool,
     pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualStartInfo {
+    pub authorize_url: String,
+    pub verifier: String,
+    pub state: String,
+    pub redirect_uri: String,
 }
 
 /// Mask a secret for display: first 3 + last 4 chars, elided in between.
@@ -300,4 +311,120 @@ pub async fn test_connection(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<
             message: format!("Network error: {e}"),
         },
     })
+}
+
+/// Drive the full interactive OAuth flow: binds a loopback listener, opens
+/// the provider's authorize URL in the system browser via
+/// `tauri-plugin-opener`, and awaits the callback (up to 5 minutes) before
+/// persisting the resulting connection.
+#[tauri::command]
+#[specta::specta]
+pub async fn connect_oauth(
+    cp: State<'_, Arc<ControlPlane>>,
+    app: tauri::AppHandle,
+    provider: String,
+    label: String,
+) -> R<Vec<ConnectionInfo>> {
+    let http = reqwest::Client::new();
+    let app2 = app.clone();
+    oauth::callback::run_flow(
+        cp.store(),
+        &http,
+        &provider,
+        &label,
+        move |url| {
+            let _ = app2.opener().open_url(url.to_string(), None::<&str>);
+        },
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    .map_err(|e| CmdError {
+        message: e.to_string(),
+    })?;
+    Ok(assemble(&cp).await?)
+}
+
+/// Start the manual (paste) OAuth fallback for environments where the
+/// loopback listener can't receive the provider's redirect: opens the
+/// authorize URL and hands back the PKCE material so the UI can show a paste
+/// field, completed later via [`complete_oauth_manual`].
+#[tauri::command]
+#[specta::specta]
+pub async fn begin_oauth_manual(app: tauri::AppHandle, provider: String) -> R<ManualStartInfo> {
+    let m = oauth::callback::begin_manual(&provider).map_err(|e| CmdError {
+        message: e.to_string(),
+    })?;
+    let _ = app.opener().open_url(m.authorize_url.clone(), None::<&str>);
+    Ok(ManualStartInfo {
+        authorize_url: m.authorize_url,
+        verifier: m.verifier,
+        state: m.state,
+        redirect_uri: m.redirect_uri,
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_oauth_manual(
+    cp: State<'_, Arc<ControlPlane>>,
+    provider: String,
+    label: String,
+    verifier: String,
+    state: String,
+    pasted: String,
+    redirect_uri: String,
+) -> R<Vec<ConnectionInfo>> {
+    let http = reqwest::Client::new();
+    oauth::callback::complete_manual(
+        cp.store(),
+        &http,
+        &provider,
+        &label,
+        &verifier,
+        &state,
+        &pasted,
+        &redirect_uri,
+    )
+    .await
+    .map_err(|e| CmdError {
+        message: e.to_string(),
+    })?;
+    Ok(assemble(&cp).await?)
+}
+
+/// Add a `no_auth` connection for a Free-category provider — refuses any
+/// other category (those need the api-key or OAuth flows above).
+#[tauri::command]
+#[specta::specta]
+pub async fn add_free_connection(
+    cp: State<'_, Arc<ControlPlane>>,
+    provider: String,
+    label: String,
+) -> R<Vec<ConnectionInfo>> {
+    let desc = registry::descriptor(&provider).ok_or_else(|| CmdError {
+        message: format!("unknown provider: {provider}"),
+    })?;
+    if desc.category != ProviderCategory::Free {
+        return Err(CmdError {
+            message: format!("{} is not a free provider", desc.name),
+        });
+    }
+    let now = ryuzi_core::paths::now_ms();
+    connections::add_connection(
+        cp.store(),
+        ConnectionRow {
+            id: ryuzi_core::paths::new_id(),
+            provider,
+            auth_type: "free".into(),
+            label,
+            priority: 0,
+            enabled: true,
+            data: ConnectionData::default(),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await?;
+    Ok(assemble(&cp).await?)
 }

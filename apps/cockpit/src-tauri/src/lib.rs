@@ -234,6 +234,10 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::remove_connection,
             connections_cmd::move_connection,
             connections_cmd::test_connection,
+            connections_cmd::connect_oauth,
+            connections_cmd::begin_oauth_manual,
+            connections_cmd::complete_oauth_manual,
+            connections_cmd::add_free_connection,
         ])
         .events(collect_events![
             events::CoreEventMsg,
