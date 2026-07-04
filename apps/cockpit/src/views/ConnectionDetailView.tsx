@@ -14,7 +14,7 @@ const modelsField = "min-h-[96px] w-full resize-y rounded-md border border-input
 
 export function ConnectionDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { connections, loaded, hydrate, update, remove, test, connectOauth } = useConnections();
+  const { connections, loaded, hydrate, update, remove, test, reconnectOauth } = useConnections();
   const usage = useUsage((s) => s.byConnection[id]);
   const loadUsage = useUsage((s) => s.loadConnection);
   const [label, setLabel] = useState("");
@@ -94,7 +94,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
 
   const reconnect = async () => {
     setReconnecting(true);
-    const ok = await connectOauth(conn.provider, conn.label || conn.providerName);
+    const ok = await reconnectOauth(conn.id);
     setReconnecting(false);
     if (ok) toast.success(`Reconnected ${conn.providerName}`);
   };

@@ -148,13 +148,58 @@ fn build_connection_row(provider: &str, label: &str, tokens: OAuthTokens) -> Con
     }
 }
 
+/// Apply freshly-exchanged `tokens` onto an `existing` connection row for a
+/// reconnect: only the credential fields + `needs_relogin` + `updated_at`
+/// change — `id`/`provider`/`auth_type`/`label`/`priority`/`enabled` are
+/// preserved so the row keeps its identity and place in the routing order.
+fn apply_reconnect_tokens(mut existing: ConnectionRow, tokens: OAuthTokens) -> ConnectionRow {
+    existing.data.access_token = Some(tokens.access_token);
+    existing.data.refresh_token = tokens.refresh_token;
+    existing.data.expires_at = Some(tokens.expires_at);
+    existing.data.provider_specific = tokens.provider_specific;
+    existing.data.needs_relogin = Some(false);
+    existing.updated_at = crate::paths::now_ms();
+    existing
+}
+
+/// Persist the token-exchange result: inserts a new connection when
+/// `existing_id` is `None` (the normal Add flow), or updates that connection
+/// in place when `Some` (a Reconnect) so a stale `needs_relogin` row is never
+/// left behind to shadow the fresh one in `route_model`'s priority order.
+async fn persist_tokens(
+    store: &Arc<Store>,
+    provider: &str,
+    label: &str,
+    existing_id: Option<&str>,
+    tokens: OAuthTokens,
+) -> Result<ConnectionRow> {
+    match existing_id {
+        Some(id) => {
+            let existing = connections::get_connection(store, id)
+                .await?
+                .with_context(|| format!("connection `{id}` not found for reconnect"))?;
+            let row = apply_reconnect_tokens(existing, tokens);
+            connections::update_connection(store, row.clone()).await?;
+            Ok(row)
+        }
+        None => {
+            let row = build_connection_row(provider, label, tokens);
+            connections::add_connection(store, row.clone()).await?;
+            Ok(row)
+        }
+    }
+}
+
 /// Run the full interactive OAuth flow against the provider's real,
-/// registered token endpoint.
+/// registered token endpoint. `existing_id` is `None` for a normal Add (a
+/// new connection is inserted) or `Some(id)` for a Reconnect (that
+/// connection's tokens are updated in place — see [`persist_tokens`]).
 pub async fn run_flow<F>(
     store: &Arc<Store>,
     http: &reqwest::Client,
     provider: &str,
     label: &str,
+    existing_id: Option<&str>,
     open_browser: F,
     timeout: Duration,
 ) -> Result<ConnectionRow>
@@ -169,6 +214,7 @@ where
         provider,
         label,
         cfg.token_url,
+        existing_id,
         open_browser,
         timeout,
     )
@@ -177,12 +223,14 @@ where
 
 /// Same as [`run_flow`] but against an explicit `token_url` — the seam tests
 /// use to point the exchange at a mock server.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_flow_with_token_url<F>(
     store: &Arc<Store>,
     http: &reqwest::Client,
     provider: &str,
     label: &str,
     token_url: &str,
+    existing_id: Option<&str>,
     open_browser: F,
     timeout: Duration,
 ) -> Result<ConnectionRow>
@@ -227,9 +275,7 @@ where
     )
     .await?;
 
-    let row = build_connection_row(provider, label, tokens);
-    connections::add_connection(store, row.clone()).await?;
-    Ok(row)
+    persist_tokens(store, provider, label, existing_id, tokens).await
 }
 
 /// State handed back to the caller after starting the manual (paste)
@@ -282,13 +328,16 @@ pub fn begin_manual(provider: &str) -> Result<ManualStart> {
 /// Complete the manual (paste) OAuth fallback: splits the pasted
 /// `code#state` (Anthropic) or bare code, verifies any embedded state
 /// against the one [`begin_manual`] generated, exchanges the code, and
-/// persists the resulting connection.
+/// persists the resulting connection. `existing_id` behaves as in
+/// [`run_flow`] — `Some(id)` updates that connection in place instead of
+/// inserting a new one.
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_manual(
     store: &Arc<Store>,
     http: &reqwest::Client,
     provider: &str,
     label: &str,
+    existing_id: Option<&str>,
     verifier: &str,
     state: &str,
     pasted: &str,
@@ -315,9 +364,7 @@ pub async fn complete_manual(
     )
     .await?;
 
-    let row = build_connection_row(provider, label, tokens);
-    connections::add_connection(store, row.clone()).await?;
-    Ok(row)
+    persist_tokens(store, provider, label, existing_id, tokens).await
 }
 
 #[cfg(test)]

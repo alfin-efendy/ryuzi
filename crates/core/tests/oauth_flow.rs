@@ -52,6 +52,7 @@ async fn run_flow_persists_oauth_connection_when_browser_hits_callback() {
         "anthropic-oauth",
         "Claude sub",
         &format!("http://127.0.0.1:{token_port}/v1/oauth/token"),
+        None,
         move |url| {
             // parse redirect_uri + state out of the authorize URL and hit it
             let u = url::Url::parse(url).unwrap();
@@ -82,6 +83,82 @@ async fn run_flow_persists_oauth_connection_when_browser_hits_callback() {
     let _ = hit;
 }
 
+/// Reconnecting a `needs_relogin` connection must update that SAME row in
+/// place (new tokens, `needs_relogin` cleared) rather than inserting a
+/// second, shadowing row — otherwise the stale row (lower priority / earlier
+/// `created_at`) keeps winning `route_model`'s `ORDER BY priority ASC` and
+/// the "fresh" connection is never actually used.
+#[tokio::test]
+async fn run_flow_with_existing_id_updates_the_same_connection_instead_of_inserting() {
+    let store = mem_store().await;
+    let http = reqwest::Client::new();
+    let token_port = mock_token_server().await;
+
+    // Seed a stale, needs-relogin oauth connection directly (as if it had
+    // been added earlier and its refresh later failed terminally).
+    let stale = connections::ConnectionRow {
+        id: "stale-conn-1".into(),
+        provider: "anthropic-oauth".into(),
+        auth_type: "oauth".into(),
+        label: "Claude sub".into(),
+        priority: 0,
+        enabled: true,
+        data: connections::ConnectionData {
+            access_token: Some("stale-at".into()),
+            refresh_token: Some("stale-rt".into()),
+            expires_at: Some(1),
+            needs_relogin: Some(true),
+            ..Default::default()
+        },
+        created_at: 1,
+        updated_at: 1,
+    };
+    connections::add_connection(&store, stale).await.unwrap();
+    // add_connection ignores row.priority and always assigns the row its own
+    // id, so re-fetch to get the real persisted id.
+    let seeded = connections::list_connections(&store).await.unwrap();
+    assert_eq!(seeded.len(), 1);
+    let stale_id = seeded[0].id.clone();
+
+    let conn = oauth::callback::run_flow_with_token_url(
+        &store,
+        &http,
+        "anthropic-oauth",
+        "Claude sub",
+        &format!("http://127.0.0.1:{token_port}/v1/oauth/token"),
+        Some(&stale_id),
+        move |url| {
+            let u = url::Url::parse(url).unwrap();
+            let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+            let redirect = q["redirect_uri"].clone();
+            let state = q["state"].clone();
+            tokio::spawn(async move {
+                let cb = format!("{redirect}?code=fake-code&state={state}");
+                let _ = reqwest::get(&cb).await;
+            });
+        },
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+
+    // (b) same id — no new row minted.
+    assert_eq!(conn.id, stale_id);
+    // (c) tokens updated to the new values from the mock token server.
+    assert_eq!(conn.data.access_token.as_deref(), Some("at-1"));
+    assert_eq!(conn.data.refresh_token.as_deref(), Some("rt-1"));
+    // (d) needs_relogin cleared.
+    assert_eq!(conn.data.needs_relogin, Some(false));
+
+    // (a) still exactly ONE connection — the reconnect did not insert a
+    // second, shadowing row.
+    let after = connections::list_connections(&store).await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, stale_id);
+    assert_eq!(after[0].data.access_token.as_deref(), Some("at-1"));
+    assert_eq!(after[0].data.needs_relogin, Some(false));
+}
+
 #[tokio::test]
 async fn run_flow_errors_and_persists_nothing_on_state_mismatch() {
     let store = mem_store().await;
@@ -94,6 +171,7 @@ async fn run_flow_errors_and_persists_nothing_on_state_mismatch() {
         "anthropic-oauth",
         "Claude sub",
         &format!("http://127.0.0.1:{token_port}/v1/oauth/token"),
+        None,
         move |url| {
             let u = url::Url::parse(url).unwrap();
             let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
@@ -132,6 +210,7 @@ async fn run_flow_errors_without_panicking_when_callback_is_missing_code() {
         "anthropic-oauth",
         "Claude sub",
         &format!("http://127.0.0.1:{token_port}/v1/oauth/token"),
+        None,
         move |url| {
             let u = url::Url::parse(url).unwrap();
             let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();

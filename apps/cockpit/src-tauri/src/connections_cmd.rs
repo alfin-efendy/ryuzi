@@ -336,6 +336,44 @@ pub async fn connect_oauth(
         &http,
         &provider,
         &label,
+        None,
+        move |url| {
+            let _ = app2.opener().open_url(url.to_string(), None::<&str>);
+        },
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    .map_err(|e| CmdError {
+        message: e.to_string(),
+    })?;
+    Ok(assemble(&cp).await?)
+}
+
+/// Reconnect an existing `needs_relogin` OAuth connection: drives the same
+/// browser flow as [`connect_oauth`], but updates the connection in place
+/// (same id/priority/label) instead of inserting a new row — otherwise the
+/// stale, dead connection would keep shadowing the fresh one in
+/// `route_model`'s `priority ASC` ordering.
+#[tauri::command]
+#[specta::specta]
+pub async fn reconnect_oauth(
+    cp: State<'_, Arc<ControlPlane>>,
+    app: tauri::AppHandle,
+    connection_id: String,
+) -> R<Vec<ConnectionInfo>> {
+    let existing = connections::get_connection(cp.store(), &connection_id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown connection: {connection_id}"),
+        })?;
+    let http = reqwest::Client::new();
+    let app2 = app.clone();
+    oauth::callback::run_flow(
+        cp.store(),
+        &http,
+        &existing.provider,
+        &existing.label,
+        Some(&connection_id),
         move |url| {
             let _ = app2.opener().open_url(url.to_string(), None::<&str>);
         },
@@ -385,6 +423,7 @@ pub async fn complete_oauth_manual(
         &http,
         &provider,
         &label,
+        None,
         &verifier,
         &state,
         &pasted,

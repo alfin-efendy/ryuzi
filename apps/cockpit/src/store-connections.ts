@@ -31,6 +31,7 @@ type ConnectionsState = {
   move: (id: string, dir: number) => Promise<void>;
   test: (id: string) => Promise<TestResult | null>;
   connectOauth: (provider: string, label: string) => Promise<boolean>;
+  reconnectOauth: (connectionId: string) => Promise<boolean>;
   beginOauthManual: (provider: string) => Promise<ManualStartInfo | null>;
   completeOauthManual: (
     provider: string,
@@ -76,6 +77,7 @@ export const useConnections = create<ConnectionsState>((set) => ({
     return null;
   },
   connectOauth: async (provider, label) => apply(set, await commands.connectOauth(provider, label), "Connect"),
+  reconnectOauth: async (connectionId) => apply(set, await commands.reconnectOauth(connectionId), "Reconnect"),
   beginOauthManual: async (provider) => {
     const res = await commands.beginOauthManual(provider);
     if (res.status === "ok") return res.data;

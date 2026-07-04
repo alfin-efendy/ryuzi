@@ -615,6 +615,21 @@ async connectOauth(provider: string, label: string) : Promise<Result<ConnectionI
 }
 },
 /**
+ * Reconnect an existing `needs_relogin` OAuth connection: drives the same
+ * browser flow as [`connect_oauth`], but updates the connection in place
+ * (same id/priority/label) instead of inserting a new row — otherwise the
+ * stale, dead connection would keep shadowing the fresh one in
+ * `route_model`'s `priority ASC` ordering.
+ */
+async reconnectOauth(connectionId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reconnect_oauth", { connectionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Start the manual (paste) OAuth fallback for environments where the
  * loopback listener can't receive the provider's redirect: opens the
  * authorize URL and hands back the PKCE material so the UI can show a paste
