@@ -9,8 +9,9 @@ use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
 /// The base name of the ACP adapter sidecar binary (no target-triple suffix,
-/// no `.exe`).  Must match the `bundle.externalBin` entry in tauri.conf.json
-/// and the filename produced by `scripts/build-acp-sidecar.ts`.
+/// no `.exe`). Used only as the dev/PATH fallback name when the shared
+/// resolver (`ryuzi_core::sidecar::host_manager`) fails to resolve a cached
+/// or downloaded artifact — see `resolve_acp_adapter` below.
 ///
 /// Package: @agentclientprotocol/claude-agent-acp
 /// NOTE: the adapter refuses to start inside a nested Claude Code session, so
@@ -19,33 +20,20 @@ use tauri_specta::{collect_commands, collect_events, Builder};
 /// session is reused; no credentials are managed here.
 const ADAPTER_BIN: &str = "claude-agent-acp";
 
-/// Resolve the ACP adapter command, preferring the Tauri-bundled sidecar.
-///
-/// Resolution order:
-///   1. Bundled sidecar: `<exe_dir>/claude-agent-acp[.exe]` — present in
-///      production (tauri build) and after running build-acp-sidecar.ts.
-///   2. PATH fallback — for `cargo build` / `tauri dev` when the sidecar
-///      binary has not been compiled yet.  A missing PATH entry produces a
-///      clear runtime error on first session start, not at launch.
-fn resolve_acp_adapter_command() -> String {
-    // Tauri places sidecars next to the main executable at runtime.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            // Check platform-specific name: <dir>/claude-agent-acp[.exe]
-            #[cfg(windows)]
-            let candidate = dir.join(format!("{}.exe", ADAPTER_BIN));
-            #[cfg(not(windows))]
-            let candidate = dir.join(ADAPTER_BIN);
-
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
+/// Resolve the ACP adapter via the shared tiered resolver (Spec 4 §4):
+/// RYUZI_ACP_PATH override → cached artifact → download (bun bundle if a
+/// host bun exists, else the standalone binary). First run needs network or
+/// Bun — the same contract as the CLI. On resolver failure we fall back to
+/// the bare adapter name (dev PATH behavior): launch succeeds, and the first
+/// session start fails with a clear spawn error instead.
+fn resolve_acp_adapter() -> (String, Vec<String>) {
+    match ryuzi_core::sidecar::host_manager().resolve() {
+        Ok(r) => (r.command, r.args),
+        Err(e) => {
+            eprintln!("[ryuzi] sidecar resolve failed: {e:#}; falling back to PATH lookup of {ADAPTER_BIN}");
+            (ADAPTER_BIN.to_string(), vec![])
         }
     }
-    // Dev / PATH fallback — allows `cargo build` + `tauri dev` to compile and
-    // launch without the sidecar binary present.  Starting a session without
-    // the sidecar installed will fail with a clear spawn error at runtime.
-    ADAPTER_BIN.to_string()
 }
 
 /// Map Rust's `std::env::consts::{OS, ARCH}` to the npm platform-package
@@ -148,9 +136,10 @@ fn build_registries() -> Registries {
     if let Some(cli) = resolve_claude_code_executable() {
         env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
     }
+    let (command, args) = resolve_acp_adapter();
     let descriptor = AcpAdapterDescriptor {
-        command: resolve_acp_adapter_command(),
-        args: vec![],
+        command,
+        args,
         env,
         // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's running
         // inside a Claude Code session and refuses to start.

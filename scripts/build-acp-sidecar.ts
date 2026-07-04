@@ -1,54 +1,41 @@
 /**
  * Build ACP sidecar artifacts from the `@agentclientprotocol/claude-agent-acp`
- * npm package: the Tauri external-binary consumed by Cockpit, and (new) a
- * universal JS bundle + standalone binaries + manifest consumed by the Rust
- * CLI's sidecar resolver (Spec 4 §4, `ryuzi_core::sidecar`).
- *
- * Tauri v2 `bundle.externalBin` convention (legacy / no-flag mode):
- *   - Config entry: "binaries/claude-agent-acp"
- *   - On-disk name:  "binaries/claude-agent-acp-<rustc-target-triple>[.exe]"
+ * npm package: a universal JS bundle + standalone binaries + manifest,
+ * consumed by the shared sidecar resolver (Spec 4 §4, `ryuzi_core::sidecar`)
+ * used by both the Rust CLI and Cockpit — neither bundles the adapter itself;
+ * the resolver downloads/caches it at runtime.
  *
  * The npm package `@agentclientprotocol/claude-agent-acp` ships a Node/Bun
- * entry-point.  We compile it to a self-contained binary with `bun build
- * --compile` so the bundled app has zero runtime Node/Bun dependency, or —
- * for the CLI sidecar pipeline — bundle it as plain JS (`bun build
- * --target=bun`) to be run with a system `bun` the user already has.
+ * entry-point. We bundle it as plain JS (`bun build --target=bun`) to be run
+ * with a system `bun` the resolver finds on the host, and compile standalone
+ * binaries (`bun build --compile`) for hosts without a matching `bun`.
  *
- * Usage (from workspace root):
- *   bun run scripts/build-acp-sidecar.ts [--target <bun-target>]
- *   bun scripts/build-acp-sidecar.ts --bundle --manifest dist/sidecar/manifest.json [--all-targets] [--install-cache]
+ * Usage (from workspace root; at least one of --bundle/--all-targets/--manifest
+ * is required — invoking with none of them prints this usage and exits
+ * non-zero):
+ *   bun scripts/build-acp-sidecar.ts --bundle --manifest dist/sidecar/manifest.json [--all-targets] [--release-tag <tag>] [--install-cache]
  *
- * --target is a Bun cross-compile target, e.g.:
- *   bun-linux-x64, bun-linux-arm64,
- *   bun-darwin-x64, bun-darwin-arm64,
- *   bun-windows-x64
- *
- * When --target is omitted (legacy mode) the host target is used (most common
- * for local dev / Cockpit CI matrix builds).
- *
- * New flags (CLI sidecar pipeline — providing any of these switches the
- * script into the new pipeline and skips the legacy host-binary compile):
- *   --bundle                 emit the universal JS bundle (no --compile) to
- *                             dist/sidecar/claude-agent-acp-<ver>.js
- *   --all-targets             compile standalone binaries for every supported
- *                             triple into dist/sidecar/
- *   --manifest <path>         write a sidecar manifest JSON (Spec 4 §4)
- *                             describing the bundle + standalone outputs;
- *                             requires --bundle (the manifest always
- *                             describes the universal bundle's sha256)
- *   --release-tag <tag>       the GitHub release tag (vX.Y.Z) hosting the
- *                             manifest's artifacts; embedded into the
- *                             manifest as `release_tag` (Task 4F/4). Defaults
- *                             to "v0.0.0" (dev-only fallback) when omitted.
- *   --install-cache           copy the bundle into
- *                             ~/.local/share/ryuzi/sidecars/acp/<ver>/adapter.js
- *                             (local dev convenience; requires --bundle)
+ * Flags:
+ *   --bundle              emit the universal JS bundle (no --compile) to
+ *                         dist/sidecar/claude-agent-acp-<ver>.js
+ *   --all-targets         compile standalone binaries for every supported
+ *                         triple (see BUN_TO_TRIPLE below) into dist/sidecar/
+ *   --manifest <path>     write a sidecar manifest JSON (Spec 4 §4)
+ *                         describing the bundle + standalone outputs;
+ *                         requires --bundle (the manifest always
+ *                         describes the universal bundle's sha256)
+ *   --release-tag <tag>   the GitHub release tag (vX.Y.Z) hosting the
+ *                         manifest's artifacts; embedded into the
+ *                         manifest as `release_tag` (Task 4F/4). Defaults
+ *                         to "v0.0.0" (dev-only fallback) when omitted.
+ *   --install-cache       copy the bundle into
+ *                         ~/.local/share/ryuzi/sidecars/acp/<ver>/adapter.js
+ *                         (local dev convenience; requires --bundle)
  *
  * PREREQUISITES (handled here):
  *   1. The adapter is installed into an ISOLATED build dir (not the workspace)
  *      so the workspace bun.lock is never mutated (CI --frozen-lockfile stays valid).
- *   2. bun build --compile / --target=bun ... (produces the binary/bundle)
- *   3. Legacy mode renames with target-triple suffix so Tauri finds it.
+ *   2. bun build --target=bun / --compile ... (produces the bundle/binaries)
  *
  * HUMAN/CI STEPS — see spec3b-task-5-report.md for exact commands.
  *
@@ -62,7 +49,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -75,11 +62,9 @@ const __dirname = dirname(__filename);
 
 // This script lives in <repo>/scripts/ — one level up is the repo root.
 const REPO_ROOT = resolve(__dirname, "..");
-const cockpitDir = join(REPO_ROOT, "apps", "cockpit");
-const tauriDir = join(cockpitDir, "src-tauri");
-const binariesDir = join(tauriDir, "binaries");
+const tauriDir = join(REPO_ROOT, "apps", "cockpit", "src-tauri");
 
-/** Output root for the CLI sidecar pipeline (bundle, standalone binaries, manifest). */
+/** Output root for the sidecar pipeline (bundle, standalone binaries, manifest). */
 const DIST = join(REPO_ROOT, "dist", "sidecar");
 
 /**
@@ -102,7 +87,7 @@ const ACP_PACKAGE_VERSIONED = `${ACP_PACKAGE}@${ACP_VERSION}`;
  */
 const MIN_BUN = "1.3.14";
 
-/** Binary name without target-triple suffix (must match tauri.conf.json externalBin entry). */
+/** Binary name without target-triple suffix, used as the asset basename prefix. */
 const BIN_NAME = "claude-agent-acp";
 
 /** Bun cross-compile target -> Rust/Tauri target triple. */
@@ -145,37 +130,6 @@ function sha256File(path: string): string {
   // node:fs readFileSync (not Bun.file()) is deliberate — Bun.file().toString()
   // returns "[object Blob]", not the file's bytes.
   return createHash("sha256").update(readFileSync(path)).digest("hex");
-}
-
-/** Derive the Rust/Tauri target triple for the host (or for a Bun target). */
-function resolveTargetTriple(bunTarget?: string): string {
-  if (bunTarget) {
-    const triple = BUN_TO_TRIPLE[bunTarget];
-    if (!triple) {
-      throw new Error(`Unknown Bun target '${bunTarget}'. Supported: ${Object.keys(BUN_TO_TRIPLE).join(", ")}`);
-    }
-    return triple;
-  }
-
-  // Host triple via rustc
-  const result = spawnSync("rustc", ["--print", "host-tuple"], {
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    // Fallback: derive from process.arch/platform
-    const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
-    const os =
-      process.platform === "linux"
-        ? "unknown-linux-gnu"
-        : process.platform === "darwin"
-          ? "apple-darwin"
-          : process.platform === "win32"
-            ? "pc-windows-msvc"
-            : process.platform;
-    console.warn(`[warn] rustc not found; inferring target triple as ${arch}-${os}`);
-    return `${arch}-${os}`;
-  }
-  return result.stdout.trim();
 }
 
 /**
@@ -273,34 +227,6 @@ function installCacheCopy(bundlePath: string): void {
   console.log(`Installed dev cache: ${dest}`);
 }
 
-/** Legacy / Cockpit mode: compile a self-contained binary into src-tauri/binaries/. */
-function buildHostBinary(entryPoint: string, bunTarget: string | undefined): void {
-  mkdirSync(binariesDir, { recursive: true });
-
-  const targetTriple = resolveTargetTriple(bunTarget);
-  const ext = process.platform === "win32" || bunTarget?.includes("windows") ? ".exe" : "";
-  const finalBin = join(binariesDir, `${BIN_NAME}-${targetTriple}${ext}`);
-  const tmpBin = join(binariesDir, `${BIN_NAME}${ext}`);
-
-  console.log(`\n--- Step 3: bun build --compile ---`);
-  console.log(`Target triple : ${targetTriple}`);
-  console.log(`Output (final): ${finalBin}`);
-
-  // Build flags
-  const buildFlags = ["build", "--compile", "--minify", `--outfile=${tmpBin}`];
-  if (bunTarget) buildFlags.push(`--target=${bunTarget}`);
-  buildFlags.push(entryPoint);
-
-  run("bun", buildFlags, { cwd: cockpitDir });
-
-  // Rename to include target triple (Tauri convention)
-  if (existsSync(finalBin)) rmSync(finalBin);
-  renameSync(tmpBin, finalBin);
-
-  console.log(`\n=== Done: ${finalBin} ===`);
-  console.log("Next: bun run --cwd apps/cockpit tauri build  (or tauri dev for smoke test)");
-}
-
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -314,7 +240,22 @@ function hasFlag(name: string): boolean {
   return args.includes(name);
 }
 
-const bunTarget = flagValue("--target");
+function printUsage(): void {
+  console.log(
+    [
+      "Usage: bun scripts/build-acp-sidecar.ts --bundle --manifest <path> [--all-targets] [--release-tag <tag>] [--install-cache]",
+      "",
+      "At least one of --bundle / --all-targets / --manifest is required.",
+      "",
+      "  --bundle             emit the universal JS bundle to dist/sidecar/",
+      "  --all-targets        compile standalone binaries for every supported triple",
+      "  --manifest <path>    write the sidecar manifest JSON (requires --bundle)",
+      "  --release-tag <tag>  GitHub release tag embedded in the manifest (default v0.0.0)",
+      "  --install-cache      seed the local resolver cache with the bundle (requires --bundle)",
+    ].join("\n"),
+  );
+}
+
 const wantBundle = hasFlag("--bundle");
 const wantAllTargets = hasFlag("--all-targets");
 const manifestPath = flagValue("--manifest");
@@ -322,11 +263,15 @@ const wantInstallCache = hasFlag("--install-cache");
 const releaseTag = flagValue("--release-tag") ?? "v0.0.0";
 const usingSidecarPipeline = wantBundle || wantAllTargets || manifestPath !== undefined;
 
+if (!usingSidecarPipeline) {
+  printUsage();
+  process.exit(1);
+}
+
 console.log("=== build-acp-sidecar ===");
 console.log(`Package       : ${ACP_PACKAGE_VERSIONED}`);
 console.log(`Repo root     : ${REPO_ROOT}`);
 console.log(`Isolated build: ${sidecarBuildDir}`);
-console.log(`Mode          : ${usingSidecarPipeline ? "sidecar pipeline (bundle/standalone/manifest)" : "legacy (Cockpit host binary)"}`);
 
 // 1. Install the package into the isolated build dir (does NOT touch workspace bun.lock)
 console.log("\n--- Step 1: isolated install ---");
@@ -337,44 +282,40 @@ console.log("\n--- Step 2: resolve entry-point ---");
 const entryPoint = resolveAcpEntryPoint();
 console.log(`Entry: ${entryPoint}`);
 
-if (usingSidecarPipeline) {
-  mkdirSync(DIST, { recursive: true });
+mkdirSync(DIST, { recursive: true });
 
-  let bundlePath: string | undefined;
-  if (wantBundle) {
-    console.log("\n--- Universal bundle (bun build --target=bun) ---");
-    bundlePath = buildBundle(entryPoint);
-    console.log(`Bundle: ${bundlePath}`);
-  }
-
-  const binaries: Record<string, string> = {};
-  if (wantAllTargets) {
-    console.log("\n--- Standalone binaries (all targets) ---");
-    for (const [bunTargetKey, triple] of Object.entries(BUN_TO_TRIPLE)) {
-      const ext = bunTargetKey.includes("windows") ? ".exe" : "";
-      const out = join(DIST, `${BIN_NAME}-${ACP_VERSION}-${triple}${ext}`);
-      run("bun", ["build", "--compile", "--minify", `--target=${bunTargetKey}`, `--outfile=${out}`, entryPoint]);
-      binaries[triple] = out;
-    }
-  }
-
-  if (manifestPath !== undefined) {
-    if (!bundlePath) {
-      throw new Error("--manifest requires --bundle (the manifest always describes the universal bundle's sha256)");
-    }
-    console.log("\n--- Manifest ---");
-    writeManifest(manifestPath, bundlePath, binaries, releaseTag);
-    console.log(`Manifest: ${manifestPath}`);
-  }
-
-  if (wantInstallCache) {
-    if (!bundlePath) {
-      throw new Error("--install-cache requires --bundle");
-    }
-    installCacheCopy(bundlePath);
-  }
-
-  console.log("\n=== Done ===");
-} else {
-  buildHostBinary(entryPoint, bunTarget);
+let bundlePath: string | undefined;
+if (wantBundle) {
+  console.log("\n--- Universal bundle (bun build --target=bun) ---");
+  bundlePath = buildBundle(entryPoint);
+  console.log(`Bundle: ${bundlePath}`);
 }
+
+const binaries: Record<string, string> = {};
+if (wantAllTargets) {
+  console.log("\n--- Standalone binaries (all targets) ---");
+  for (const [bunTargetKey, triple] of Object.entries(BUN_TO_TRIPLE)) {
+    const ext = bunTargetKey.includes("windows") ? ".exe" : "";
+    const out = join(DIST, `${BIN_NAME}-${ACP_VERSION}-${triple}${ext}`);
+    run("bun", ["build", "--compile", "--minify", `--target=${bunTargetKey}`, `--outfile=${out}`, entryPoint]);
+    binaries[triple] = out;
+  }
+}
+
+if (manifestPath !== undefined) {
+  if (!bundlePath) {
+    throw new Error("--manifest requires --bundle (the manifest always describes the universal bundle's sha256)");
+  }
+  console.log("\n--- Manifest ---");
+  writeManifest(manifestPath, bundlePath, binaries, releaseTag);
+  console.log(`Manifest: ${manifestPath}`);
+}
+
+if (wantInstallCache) {
+  if (!bundlePath) {
+    throw new Error("--install-cache requires --bundle");
+  }
+  installCacheCopy(bundlePath);
+}
+
+console.log("\n=== Done ===");

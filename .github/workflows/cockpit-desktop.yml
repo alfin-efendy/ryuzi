@@ -8,9 +8,11 @@ name: cockpit-desktop
 #     without merging) — switch to dispatch-only once this lands on main.
 #   - workflow_dispatch (manual, after merge).
 #
-# NOTE: harness-hook is NOT bundled here, so tool *approvals* won't fire in the
-# installed app (gated tools fail closed). connect-project / start-session /
-# streaming all work. macOS builds are UNSIGNED — open via right-click -> Open.
+# NOTE: the ACP adapter sidecar is resolved at runtime by the shared tiered
+# resolver (ryuzi_core::sidecar), not bundled by Tauri. First run needs
+# network access (or a host `bun` >= the pinned min version) to download the
+# cached artifact; set RYUZI_ACP_PATH to override with a local build. macOS
+# builds are UNSIGNED — open via right-click -> Open.
 
 on:
   workflow_dispatch:
@@ -69,13 +71,6 @@ jobs:
 
       - name: Install deps
         run: bun install --frozen-lockfile
-
-      - name: Build ACP sidecar
-        # Compiles @agentclientprotocol/claude-agent-acp to a self-contained
-        # binary with the Tauri target-triple suffix so tauri-action picks it up
-        # from src-tauri/binaries/.  The script installs the package and runs
-        # bun build --compile; see scripts/build-acp-sidecar.ts.
-        run: bun run scripts/build-acp-sidecar.ts
 
       - name: Build Cockpit (tauri build)
         uses: tauri-apps/tauri-action@v1
