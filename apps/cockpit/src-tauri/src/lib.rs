@@ -76,6 +76,7 @@ fn sdk_platform_package(os: &str, arch: &str) -> String {
 ///      for future packaged builds; nothing bundles it yet).
 ///   3. Dev builds only: the SDK platform package inside the sidecar
 ///      isolated build dir produced by scripts/build-acp-sidecar.ts.
+///
 /// Returns None when nothing is found — the adapter then falls back to its
 /// own resolution, which works when it runs un-compiled under bun/node.
 fn resolve_claude_code_executable() -> Option<String> {
