@@ -378,7 +378,10 @@ mod tests {
 
         // And the persisted row kept name + input alongside the output.
         let msgs = store.list_messages(&session_pk).await.unwrap();
-        let tc = msgs.iter().find(|m| m.block_type == "tool_call").expect("tool_call row");
+        let tc = msgs
+            .iter()
+            .find(|m| m.block_type == "tool_call")
+            .expect("tool_call row");
         assert_eq!(tc.payload["name"], "Bash");
         assert_eq!(tc.payload["output"], "output text");
         assert_eq!(tc.tool_kind.as_deref(), Some("execute"));
@@ -395,11 +398,13 @@ mod tests {
         let user = events
             .iter()
             .find_map(|e| match e {
-                CoreEvent::Message { role, block_type, payload, seq, .. }
-                    if role == "user" && block_type == "text" =>
-                {
-                    Some((payload.clone(), *seq))
-                }
+                CoreEvent::Message {
+                    role,
+                    block_type,
+                    payload,
+                    seq,
+                    ..
+                } if role == "user" && block_type == "text" => Some((payload.clone(), *seq)),
                 _ => None,
             })
             .expect("expected a live user-turn Message event");

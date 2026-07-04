@@ -572,9 +572,7 @@ pub async fn drive_load(resume_session_id: &str) -> (std::sync::Arc<crate::store
 /// the mock duplex's I/O stays on the test runtime, and drives the shared
 /// `run_client_loop` over the injected transport.
 /// Like [`run_via_harness_trait_collecting_events`], discarding the events.
-pub async fn run_via_harness_trait(
-    prompt: &str,
-) -> (std::sync::Arc<crate::store::Store>, String) {
+pub async fn run_via_harness_trait(prompt: &str) -> (std::sync::Arc<crate::store::Store>, String) {
     let (store, session_pk, _events) = run_via_harness_trait_collecting_events(prompt).await;
     (store, session_pk)
 }
@@ -588,7 +586,11 @@ pub async fn run_via_harness_trait(
 /// captured and drained after the turn completes.
 pub async fn run_via_harness_trait_collecting_events(
     prompt: &str,
-) -> (std::sync::Arc<crate::store::Store>, String, Vec<crate::domain::CoreEvent>) {
+) -> (
+    std::sync::Arc<crate::store::Store>,
+    String,
+    Vec<crate::domain::CoreEvent>,
+) {
     use std::sync::Arc;
 
     use tokio::sync::broadcast;

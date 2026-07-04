@@ -1078,14 +1078,30 @@ mod tests {
             .unwrap();
 
         // The caller now sends ONLY the update patch; the store merges it.
-        let (seq, merged, kind) = store.update_tool_call("s1", "tc-1", Some("completed"),
-            &serde_json::json!({"output": "file.txt"}))
-            .await.unwrap();
+        let (seq, merged, kind) = store
+            .update_tool_call(
+                "s1",
+                "tc-1",
+                Some("completed"),
+                &serde_json::json!({"output": "file.txt"}),
+            )
+            .await
+            .unwrap();
         assert_eq!(seq, 1, "update_tool_call must return the row's real seq");
-        assert_eq!(merged["name"], "Bash", "merge must preserve the original name");
-        assert_eq!(merged["input"]["command"], "ls", "merge must preserve the original input");
+        assert_eq!(
+            merged["name"], "Bash",
+            "merge must preserve the original name"
+        );
+        assert_eq!(
+            merged["input"]["command"], "ls",
+            "merge must preserve the original input"
+        );
         assert_eq!(merged["output"], "file.txt", "merge must add the output");
-        assert_eq!(kind.as_deref(), Some("execute"), "must return the row's persisted tool_kind");
+        assert_eq!(
+            kind.as_deref(),
+            Some("execute"),
+            "must return the row's persisted tool_kind"
+        );
 
         let rows = store.list_messages("s1").await.unwrap();
         assert_eq!(rows.len(), 1, "update must not insert a new row");
@@ -1094,8 +1110,10 @@ mod tests {
         assert_eq!(rows[0].payload["output"], "file.txt");
 
         // An empty patch (ToolCallDone with no raw_output) must leave payload intact.
-        let (_, merged2, _) = store.update_tool_call("s1", "tc-1", None,
-            &serde_json::json!({})).await.unwrap();
+        let (_, merged2, _) = store
+            .update_tool_call("s1", "tc-1", None, &serde_json::json!({}))
+            .await
+            .unwrap();
         assert_eq!(merged2["name"], "Bash");
         assert_eq!(merged2["output"], "file.txt");
     }
