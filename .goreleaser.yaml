@@ -1,67 +1,48 @@
 version: 2
 project_name: ryuzi
 
-# ---------------------------------------------------------------------------
-# Pre-build hooks
-# ---------------------------------------------------------------------------
-# Note: GoReleaser manages the ryuzi CLI builds (bun --compile).
-# The Cockpit desktop app (Tauri) is NOT built by GoReleaser — it is built by
-# the cockpit-desktop GitHub Actions workflow (.github/workflows/cockpit-desktop.yml).
-# That workflow already runs build-acp-sidecar.ts before tauri-action.
-#
-# The hook below ensures the ACP sidecar binary is compiled for the host
-# platform when running `goreleaser release --snapshot` or similar local runs
-# that also exercise the cockpit build path.
-before:
-  hooks:
-    # Build the claude-agent-acp sidecar for the host target.
-    # NOTE: this hook is only needed for local Tauri desktop builds (tauri dev /
-    # tauri build).  Pure CLI-only goreleaser runs (no Tauri step) still execute
-    # this hook but it is harmless — the binaries/ dir is not consumed by
-    # goreleaser builds.  The Cockpit CI build (cockpit-desktop.yml) runs this
-    # script directly on the matching runner before tauri-action.
-    - bun run scripts/build-acp-sidecar.ts
+# Rust cross-builds via cargo-zigbuild (zig = C toolchain for every target).
+# The release workflow installs zig + cargo-zigbuild and embeds the freshly
+# built sidecar manifest into crates/core BEFORE goreleaser runs; goreleaser
+# itself runs `rustup target add` per declared target.
 
 builds:
-  - id: ryuzi-gnu-other
-    builder: bun
+  - id: ryuzi
+    builder: rust
     binary: ryuzi
-    main: apps/cli/src/cli/index.ts
     targets:
-      - linux-x64
-      - linux-arm64
-      - darwin-x64
-      - darwin-arm64
-      - windows-x64
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
     flags:
-      - --compile
-      - --minify
+      - --release
+      - -p=ryuzi-cli
 
   - id: ryuzi-musl
-    builder: bun
+    builder: rust
     binary: ryuzi
-    main: apps/cli/src/cli/index.ts
     targets:
-      - linux-x64-musl
-      - linux-arm64-musl
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
     flags:
-      - --compile
-      - --minify
+      - --release
+      - -p=ryuzi-cli
 
 archives:
+  # Deliberate cut-over break (design §10): triple-based names that the
+  # in-field TS self-updater can never match, and that MUST agree
+  # byte-for-byte with crates/core/src/update/asset.rs::asset_name.
   - id: default
-    ids: [ryuzi-gnu-other]
+    ids: [ryuzi]
     formats: [tar.gz]
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format_overrides:
-      - goos: windows
-        formats: [zip]
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Target }}"
     files: [README*]
 
   - id: musl
     ids: [ryuzi-musl]
     formats: [tar.gz]
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}_musl"
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Target }}"
     files: [README*]
 
 checksum:
@@ -84,58 +65,13 @@ homebrew_casks:
       name: goreleaserbot
       email: bot@ryuzi.dev
 
-scoops:
-  - name: ryuzi
-    repository:
-      owner: alfin-efendy
-      name: scoop-ryuzi
-      branch: main
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
-    homepage: "https://github.com/alfin-efendy/ryuzi"
-    description: "Gateway-agnostic control plane for agent harnesses (ryuzi CLI)"
-    license: MIT
-    commit_msg_template: "Scoop update for {{ .ProjectName }} version {{ .Tag }}"
+# scoops: REMOVED — the Rust CLI ships no Windows binaries (unix-only daemon).
+# In-field TS scoop installs stay on 0.3.0; their updater no-ops by design.
 
-dockers:
-  - id: amd64
-    ids: [ryuzi-musl]
-    goos: linux
-    goarch: amd64
-    dockerfile: Dockerfile
-    use: buildx
-    image_templates:
-      - "ghcr.io/alfin-efendy/ryuzi:{{ .Version }}-amd64"
-    build_flag_templates:
-      - "--pull"
-      - "--platform=linux/amd64"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.source=https://github.com/alfin-efendy/ryuzi"
-
-  - id: arm64
-    ids: [ryuzi-musl]
-    goos: linux
-    goarch: arm64
-    dockerfile: Dockerfile
-    use: buildx
-    image_templates:
-      - "ghcr.io/alfin-efendy/ryuzi:{{ .Version }}-arm64"
-    build_flag_templates:
-      - "--pull"
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.source=https://github.com/alfin-efendy/ryuzi"
-
-docker_manifests:
-  - name_template: "ghcr.io/alfin-efendy/ryuzi:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/alfin-efendy/ryuzi:{{ .Version }}-amd64"
-      - "ghcr.io/alfin-efendy/ryuzi:{{ .Version }}-arm64"
-  - name_template: "ghcr.io/alfin-efendy/ryuzi:latest"
-    image_templates:
-      - "ghcr.io/alfin-efendy/ryuzi:{{ .Version }}-amd64"
-      - "ghcr.io/alfin-efendy/ryuzi:{{ .Version }}-arm64"
+# dockers/docker_manifests: REMOVED — goreleaser runs on macos-latest (the
+# only host that can link darwin binaries; linux targets cross-compile via
+# zigbuild), where docker is unavailable. Images are built by the dedicated
+# `docker` job in release.yml from the released musl tarballs.
 
 release:
   github:
