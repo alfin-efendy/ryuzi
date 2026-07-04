@@ -49,7 +49,7 @@ export function SessionView() {
   return (
     <div className="flex min-h-0 flex-1">
       {/* Chat column */}
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className={`flex min-h-0 min-w-0 flex-1 flex-col ${nav.rightMaximized && nav.rightOpen ? "hidden" : ""}`}>
         <div className="box-border flex h-[55px] shrink-0 items-center gap-3 border-b border-border px-5">
           <StatusDot color={meta.color} pulse={meta.pulse} size={9} />
           <div className="min-w-0">

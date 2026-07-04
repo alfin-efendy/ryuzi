@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, FileText, Maximize2, Search, SquareCheck, X } from "lucide-react";
+import { ChevronRight, FileText, Maximize2, Minimize2, Search, SquareCheck, X } from "lucide-react";
 import { useUi } from "@/store-ui";
-import { useNav, type RightTab } from "@/store-nav";
+import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav";
 import { commands } from "@/bindings";
 import { diffLineStyle, parseUnifiedDiff, type ReviewFile } from "@/lib/diff";
 import { basename } from "@/lib/paths";
 import { FileViewer } from "@/components/FileViewer";
 import { FileTreePane } from "@/components/FileTreePane";
 import { DiffStat } from "@/components/common/bits";
+import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
 
 const toolBtn =
   "flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground";
@@ -46,6 +47,15 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
     };
   }, [sessionPk, nav.rightOpen, nav.rightTab, running]);
 
+  useEffect(() => {
+    if (!nav.rightMaximized) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") nav.setRightMaximized(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [nav.rightMaximized, nav.setRightMaximized]);
+
   const rightTabs: { id: RightTab; label: string; icon: typeof SquareCheck }[] = [
     { id: "review", label: "Review", icon: SquareCheck },
     { id: "file", label: activeFileTab ? activeFileTab.title : "Files", icon: FileText },
@@ -56,7 +66,17 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
   const reviewDel = reviewFiles.reduce((n, f) => n + f.del, 0);
 
   return (
-    <div className="acrylic-panel flex w-[46%] max-w-[660px] shrink-0 flex-col border-l border-border">
+    <div
+      className={`acrylic-panel relative flex shrink-0 flex-col border-l border-border ${nav.rightMaximized ? "flex-1" : ""}`}
+      style={nav.rightMaximized ? undefined : { width: nav.rightWidth }}
+    >
+      {!nav.rightMaximized && (
+        <PanelResizeHandle
+          direction="x"
+          onDelta={(d) => nav.setRightWidth(clampPanelSize(nav.rightWidth - d, window.innerWidth, RIGHT_WIDTH))}
+          className="absolute inset-y-0 left-0 z-10"
+        />
+      )}
       {/* Tab bar */}
       <div className="box-border flex h-[55px] shrink-0 items-center gap-1 border-b border-border px-2.5">
         {rightTabs.map((t) => {
@@ -77,8 +97,13 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
           );
         })}
         <div className="flex-1" />
-        <button type="button" title="Expand" className={`${toolBtn} h-7 w-7`}>
-          <Maximize2 aria-hidden size={13} strokeWidth={2} />
+        <button
+          type="button"
+          title={nav.rightMaximized ? "Restore panel" : "Expand panel"}
+          onClick={() => nav.setRightMaximized(!nav.rightMaximized)}
+          className={`${toolBtn} h-7 w-7`}
+        >
+          {nav.rightMaximized ? <Minimize2 aria-hidden size={13} strokeWidth={2} /> : <Maximize2 aria-hidden size={13} strokeWidth={2} />}
         </button>
       </div>
 
