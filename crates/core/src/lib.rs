@@ -40,3 +40,4 @@ pub use integration::{Integration, Registries};
 pub use registry::Registry;
 pub use router::{chunk, ConnectOpts, ConnectOutcome, Router};
 pub use store::Store;
+// ci filter probe: rust-only (throwaway)
