@@ -112,3 +112,4 @@ test("active source no longer exposes the old product identity", () => {
   }
   expect(matches).toEqual([]);
 });
+// ci filter probe: ts-only (throwaway)
