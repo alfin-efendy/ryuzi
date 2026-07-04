@@ -93,6 +93,22 @@ pub const CATALOG: &[RuntimeDescriptor] = &[
             ("fast", "Fast", None, false),
         ],
     },
+    RuntimeDescriptor {
+        id: "opencode",
+        name: "OpenCode",
+        color: "#F5A623",
+        initial: "OC",
+        connection: "Multi-provider CLI",
+        binary: "opencode",
+        npm_package: Some("opencode-ai"),
+        models: &[],
+        default_model: "",
+        tiers: &[
+            ("default", "Default", None, false),
+            ("plan", "Plan", None, false),
+            ("fast", "Fast", None, false),
+        ],
+    },
 ];
 
 pub fn descriptor(id: &str) -> Option<&'static RuntimeDescriptor> {
