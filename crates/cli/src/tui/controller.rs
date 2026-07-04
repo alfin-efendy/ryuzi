@@ -243,7 +243,7 @@ impl AppController {
                 f(&cmd, &log_path)?;
             }
             None => {
-                real_spawn_detached(&cmd, &log_path)?;
+                crate::daemon_cmd::spawn_detached(&cmd, &[], &log_path)?;
             }
         }
         Ok(())
@@ -272,30 +272,6 @@ impl AppController {
             self.start_daemon().await
         }
     }
-}
-
-/// Spawn `cmd` detached from the TUI: stdin null, stdout/stderr appended to
-/// `log_path`, and on unix in its own process group so it survives the TUI
-/// process exiting.
-fn real_spawn_detached(cmd: &[String], log_path: &Path) -> std::io::Result<u32> {
-    use std::fs::File;
-    use std::process::{Command, Stdio};
-
-    let stdout = File::options().append(true).create(true).open(log_path)?;
-    let stderr = File::options().append(true).create(true).open(log_path)?;
-    let mut command = Command::new(&cmd[0]);
-    command
-        .args(&cmd[1..])
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let child = command.spawn()?;
-    Ok(child.id())
 }
 
 /// Shared test fixture — reused by Tasks 5-7's view/app tests, not just this
