@@ -69,6 +69,8 @@ pub async fn get_connection(store: &Store, id: &str) -> anyhow::Result<Option<Co
         .await
 }
 
+/// Insert a connection. `row.priority` is IGNORED — the new row is always
+/// appended at the end (MAX(priority)+1); reorder with [`move_connection`].
 pub async fn add_connection(store: &Store, row: ConnectionRow) -> anyhow::Result<()> {
     let data = serde_json::to_string(&row.data)?;
     store
@@ -86,6 +88,10 @@ pub async fn add_connection(store: &Store, row: ConnectionRow) -> anyhow::Result
         .await
 }
 
+/// Update the mutable fields of a connection: `label`, `enabled`, and
+/// `data` (+ `updated_at`). `provider`, `auth_type`, and `priority` are
+/// NOT written — identity is fixed and ordering changes go through
+/// [`move_connection`].
 pub async fn update_connection(store: &Store, row: ConnectionRow) -> anyhow::Result<()> {
     let data = serde_json::to_string(&row.data)?;
     store
