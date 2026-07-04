@@ -115,7 +115,13 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
                         .join("");
                     let mut msg = serde_json::Map::new();
                     msg.insert("role".into(), json!("assistant"));
-                    msg.insert("content".into(), json!(text));
+                    // Tool-only turns (no text) must send content: null, not "",
+                    // to match OpenAI's own tool-call message shape.
+                    if text.is_empty() && !tool_calls.is_empty() {
+                        msg.insert("content".into(), Value::Null);
+                    } else {
+                        msg.insert("content".into(), json!(text));
+                    }
                     if !tool_calls.is_empty() {
                         msg.insert("tool_calls".into(), Value::Array(tool_calls));
                     }
@@ -153,6 +159,7 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
         let mapped = match tc["type"].as_str().unwrap_or("auto") {
             "any" => json!("required"),
             "tool" => json!({"type": "function", "function": {"name": tc["name"]}}),
+            "none" => json!("none"),
             _ => json!("auto"),
         };
         out.insert("tool_choice".into(), mapped);
@@ -180,11 +187,32 @@ pub fn openai_to_anthropic_request(body: &Value) -> anyhow::Result<Value> {
     for m in body["messages"].as_array().cloned().unwrap_or_default() {
         match m["role"].as_str().unwrap_or("user") {
             "system" | "developer" => system_parts.push(as_text(&m["content"])),
-            "tool" => messages.push(json!({"role": "user", "content": [{
-                "type": "tool_result",
-                "tool_use_id": m["tool_call_id"],
-                "content": tool_content_text(&m["content"]),
-            }]})),
+            "tool" => {
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": m["tool_call_id"],
+                    "content": tool_content_text(&m["content"]),
+                });
+                // Anthropic rejects consecutive user turns: merge consecutive
+                // OpenAI tool messages into the same user message's blocks.
+                let can_merge = messages.last().is_some_and(|last| {
+                    last["role"] == "user"
+                        && last["content"].as_array().is_some_and(|arr| {
+                            !arr.is_empty() && arr.iter().all(|b| b["type"] == "tool_result")
+                        })
+                });
+                if can_merge {
+                    if let Some(arr) = messages
+                        .last_mut()
+                        .and_then(|msg| msg.get_mut("content"))
+                        .and_then(|c| c.as_array_mut())
+                    {
+                        arr.push(block);
+                    }
+                } else {
+                    messages.push(json!({"role": "user", "content": [block]}));
+                }
+            }
             "assistant" => {
                 let mut blocks: Vec<Value> = Vec::new();
                 let text = as_text(&m["content"]);
@@ -295,16 +323,19 @@ pub fn openai_to_anthropic_response(resp: &Value) -> Value {
 pub fn anthropic_to_openai_response(resp: &Value) -> Value {
     let mut text = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
-    for (i, b) in resp["content"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+    for b in resp["content"].as_array().cloned().unwrap_or_default().iter() {
         match b["type"].as_str().unwrap_or("") {
             "text" => text.push_str(b["text"].as_str().unwrap_or("")),
-            "tool_use" => tool_calls.push(json!({
-                "index": i, "id": b["id"], "type": "function",
-                "function": {
-                    "name": b["name"],
-                    "arguments": serde_json::to_string(&b["input"]).unwrap_or_else(|_| "{}".into()),
-                }
-            })),
+            "tool_use" => {
+                let index = tool_calls.len();
+                tool_calls.push(json!({
+                    "index": index, "id": b["id"], "type": "function",
+                    "function": {
+                        "name": b["name"],
+                        "arguments": serde_json::to_string(&b["input"]).unwrap_or_else(|_| "{}".into()),
+                    }
+                }));
+            }
             _ => {}
         }
     }
@@ -471,5 +502,71 @@ mod tests {
         assert_eq!(parts[0]["type"], "image_url");
         assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,AAAA");
         assert_eq!(parts[1], json!({"type": "text", "text": "what is this"}));
+    }
+
+    #[test]
+    fn tool_choice_none_maps_to_openai_none() {
+        let req = json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "none"}
+        });
+        let out = anthropic_to_openai_request(&req).unwrap();
+        assert_eq!(out["tool_choice"], json!("none"));
+    }
+
+    #[test]
+    fn anthropic_response_tool_call_indices_are_sequential() {
+        let resp = json!({
+            "id": "msg_1", "model": "m", "type": "message", "role": "assistant",
+            "content": [
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "tu_1", "name": "a", "input": {}},
+                {"type": "tool_use", "id": "tu_2", "name": "b", "input": {}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let out = anthropic_to_openai_response(&resp);
+        let calls = out["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[1]["index"], 1);
+    }
+
+    #[test]
+    fn assistant_tool_only_content_is_null() {
+        let req = json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Jakarta"}}
+                ]}
+            ]
+        });
+        let out = anthropic_to_openai_request(&req).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"], Value::Null);
+        assert_eq!(msgs[0]["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn consecutive_tool_messages_merge_into_one_user_turn() {
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "windy"}
+            ]
+        });
+        let out = openai_to_anthropic_request(&req).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "user");
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["tool_use_id"], "call_1");
+        assert_eq!(blocks[1]["tool_use_id"], "call_2");
     }
 }
