@@ -161,3 +161,31 @@ jobs:
           echo "osv-scanner found vulnerabilities — see the osv-results artifact / PR comment."
           echo "Accepted risks belong in osv-scanner.toml with a reason."
           exit 1
+
+  report:
+    needs: [changes, lint, ts, rust, e2e-cockpit, osv]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true # artifact absent when the osv job was skipped
+        with:
+          name: osv-results
+          path: .
+      - name: Compose the report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash .github/scripts/pr-report.sh > report.md
+      - uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+        with:
+          header: ci-report
+          path: report.md
