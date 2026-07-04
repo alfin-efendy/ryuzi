@@ -1,7 +1,7 @@
 //! The local endpoint server: Anthropic + OpenAI compatible surface on
 //! 127.0.0.1, gated by endpoint keys, routed to provider connections.
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
-use crate::llm_router::{connections, keys, sse::SseParser, translate};
+use crate::llm_router::{connections, keys, oauth, sse::SseParser, translate};
 use crate::store::Store;
 use axum::body::Body;
 use axum::extract::State;
@@ -203,11 +203,43 @@ pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Optio
     Ok(None)
 }
 
+/// Anthropic's Claude-Code-branded system prefix, required by the
+/// anthropic-oauth (Claude subscription) upstream — that's the wire's own
+/// contract for the OAuth token, not a client-visible feature; no other
+/// header/body cloaking is added (spec #2).
+const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Ensure the outgoing Anthropic `system` field begins with the Claude-Code
+/// prefix block: a bare string is wrapped into `[prefix, {type:text,text:the
+/// old string}]`; an array gets the prefix prepended (skipped if already
+/// present); an absent/other value is replaced with `[prefix]`.
+fn inject_claude_system_prompt(body: &mut Value) {
+    let prefix = json!({"type": "text", "text": CLAUDE_CODE_SYSTEM_PROMPT});
+    let current = body.get("system").cloned().unwrap_or(Value::Null);
+    let new_system = match current {
+        Value::String(s) => json!([prefix, {"type": "text", "text": s}]),
+        Value::Array(mut arr) => {
+            if arr.first() != Some(&prefix) {
+                arr.insert(0, prefix);
+            }
+            Value::Array(arr)
+        }
+        _ => json!([prefix]),
+    };
+    body["system"] = new_system;
+}
+
 fn upstream_request(
     state: &AppState,
     target: &RouteTarget,
     body: &Value,
 ) -> anyhow::Result<reqwest::RequestBuilder> {
+    if connections::is_oauth(&target.conn) {
+        return oauth_upstream_request(state, target, body);
+    }
+    if target.desc.no_auth {
+        return free_upstream_request(state, target, body);
+    }
     let base = connections::effective_base_url(target.desc, &target.conn)
         .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
     let path = match target.desc.format {
@@ -226,9 +258,149 @@ fn upstream_request(
     Ok(req)
 }
 
+/// OAuth-authenticated upstream request (anthropic-oauth or openai-oauth).
+/// The credential is ALWAYS `data.access_token` — never `data.api_key`,
+/// which oauth connections don't populate.
+fn oauth_upstream_request(
+    state: &AppState,
+    target: &RouteTarget,
+    body: &Value,
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    let access_token = target.conn.data.access_token.clone().unwrap_or_default();
+    match target.conn.provider.as_str() {
+        "anthropic-oauth" => {
+            // Same base-resolution as the api-key path (honors a per-connection
+            // override, which is how tests point this at a mock upstream) —
+            // in production that's just the descriptor's real Anthropic base.
+            let base = connections::effective_base_url(target.desc, &target.conn)
+                .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
+            let mut anthropic_body = body.clone();
+            inject_claude_system_prompt(&mut anthropic_body);
+            Ok(state
+                .http
+                .post(format!("{base}/messages"))
+                .json(&anthropic_body)
+                .header("authorization", format!("Bearer {access_token}"))
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "oauth-2025-04-20"))
+        }
+        "openai-oauth" => {
+            // Codex's Responses wire is a fixed protocol endpoint, distinct
+            // from the descriptor's placeholder `base_url` (see the NOTE on
+            // the `openai-oauth` catalog entry in registry.rs) — Codex CLI
+            // never talks to anything else, so this isn't override-able.
+            const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
+            let mut req = state
+                .http
+                .post(format!("{CODEX_BASE}/responses"))
+                .json(body)
+                .header("authorization", format!("Bearer {access_token}"))
+                .header("originator", "codex_cli_rs")
+                .header("session_id", uuid::Uuid::new_v4().to_string());
+            if let Some(account_id) = target
+                .conn
+                .data
+                .provider_specific
+                .as_ref()
+                .and_then(|v| v.get("chatgpt_account_id"))
+                .and_then(|v| v.as_str())
+            {
+                req = req.header("chatgpt-account-id", account_id);
+            }
+            Ok(req)
+        }
+        other => Err(anyhow::anyhow!(
+            "no OAuth upstream wiring for provider `{other}`"
+        )),
+    }
+}
+
+/// Free-tier passthrough (opencode-free): no real credential, just the
+/// wire's own placeholder bearer + client-id header.
+fn free_upstream_request(
+    state: &AppState,
+    target: &RouteTarget,
+    body: &Value,
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    let base = connections::effective_base_url(target.desc, &target.conn)
+        .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
+    let path = match target.desc.format {
+        ApiFormat::OpenAi => "/chat/completions",
+        ApiFormat::Anthropic => "/messages",
+    };
+    Ok(state
+        .http
+        .post(format!("{base}{path}"))
+        .json(body)
+        .header("authorization", "Bearer public")
+        .header("x-opencode-client", "desktop"))
+}
+
+/// Build + send the upstream request; on a 401/403 from an OAuth-backed
+/// target, refresh once via `force_refresh` and retry the same request. The
+/// retry is kept only if the refresh itself succeeds — a failed refresh
+/// falls through to the original (failed) response so the caller's normal
+/// error handling still fires. This covers non-stream calls directly and
+/// gives streaming calls a pre-stream retry (called before any response
+/// bytes are read); a 401 that arrives mid-stream is NOT retried.
+async fn send_upstream(
+    state: &AppState,
+    target: &mut RouteTarget,
+    body: &Value,
+) -> anyhow::Result<reqwest::Response> {
+    let resp = upstream_request(state, target, body)?.send().await?;
+    if matches!(resp.status().as_u16(), 401 | 403) && connections::is_oauth(&target.conn) {
+        let refreshed = oauth::refresh::force_refresh(&state.store, &state.http, &mut target.conn)
+            .await
+            .is_ok();
+        if refreshed {
+            return Ok(upstream_request(state, target, body)?.send().await?);
+        }
+    }
+    Ok(resp)
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
+/// openai-oauth (Codex) speaks the Responses wire only — no chat→Responses
+/// request translator exists in F2b (deferred to F3 if ever needed), so a
+/// client routing it through `/v1/messages` or `/v1/chat/completions` gets
+/// pointed at the route that actually works.
+const OPENAI_OAUTH_WRONG_ROUTE_MSG: &str =
+    "the OpenAI (ChatGPT) connection speaks the Responses API — point your tool at /v1/responses";
+
+fn reconnect_message(provider: &str) -> String {
+    format!(
+        "the {provider} connection needs to be reconnected — its login session has expired; reconnect it from Models → Providers"
+    )
+}
+
+/// Refresh `target.conn`'s OAuth token before it's used, proactively. A
+/// terminal refresh failure (no refresh token, or the provider rejected it
+/// for good) sets `needs_relogin`; surface that as a client-format auth
+/// error instead of proceeding with a token we know is dead. Any other
+/// refresh failure (e.g. a transient network hiccup) is swallowed — the
+/// caller proceeds with whatever token it has, and the reactive 401 path in
+/// `send_upstream` gets a second chance at it.
+async fn ensure_fresh_or_reconnect_error(
+    state: &AppState,
+    target: &mut RouteTarget,
+    err: fn(StatusCode, &str) -> Response,
+) -> Option<Response> {
+    if oauth::refresh::ensure_fresh(&state.store, &state.http, &mut target.conn)
+        .await
+        .is_err()
+        && target.conn.data.needs_relogin == Some(true)
+    {
+        return Some(err(
+            StatusCode::UNAUTHORIZED,
+            &reconnect_message(&target.conn.provider),
+        ));
+    }
+    None
+}
 
 /// Client speaks Anthropic. `client_fmt` differs from `handle_chat` only in
 /// error shape + translation direction.
@@ -241,7 +413,7 @@ async fn handle_messages(
         return r;
     }
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let target = match route_model(&state.store, &requested).await {
+    let mut target = match route_model(&state.store, &requested).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return anthropic_error(
@@ -253,13 +425,19 @@ async fn handle_messages(
         }
         Err(e) => return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    if target.conn.provider == "openai-oauth" {
+        return anthropic_error(StatusCode::BAD_REQUEST, OPENAI_OAUTH_WRONG_ROUTE_MSG);
+    }
+    if let Some(r) = ensure_fresh_or_reconnect_error(&state, &mut target, anthropic_error).await {
+        return r;
+    }
     let stream = body["stream"].as_bool().unwrap_or(false);
     body["model"] = json!(target.upstream_model);
 
     match target.desc.format {
         ApiFormat::Anthropic => {
             let started = crate::paths::now_ms();
-            let resp = proxy_passthrough(&state, &target, &body, anthropic_error).await;
+            let resp = proxy_passthrough(&state, &mut target, &body, anthropic_error).await;
             crate::llm_router::usage::record(
                 &state.store,
                 &target.conn.id,
@@ -286,10 +464,10 @@ async fn handle_messages(
                     client_format: "anthropic".to_string(),
                     started: crate::paths::now_ms(),
                 };
-                stream_openai_upstream_to_anthropic(&state, &target, &upstream_body, ctx).await
+                stream_openai_upstream_to_anthropic(&state, &mut target, &upstream_body, ctx).await
             } else {
                 let started = crate::paths::now_ms();
-                match send_json(&state, &target, &upstream_body, anthropic_error).await {
+                match send_json(&state, &mut target, &upstream_body, anthropic_error).await {
                     Ok(v) => {
                         let u = crate::llm_router::usage::usage_from_openai(&v);
                         crate::llm_router::usage::record(
@@ -322,7 +500,7 @@ async fn handle_chat(
         return r;
     }
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let target = match route_model(&state.store, &requested).await {
+    let mut target = match route_model(&state.store, &requested).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return openai_error(
@@ -332,13 +510,19 @@ async fn handle_chat(
         }
         Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    if target.conn.provider == "openai-oauth" {
+        return openai_error(StatusCode::BAD_REQUEST, OPENAI_OAUTH_WRONG_ROUTE_MSG);
+    }
+    if let Some(r) = ensure_fresh_or_reconnect_error(&state, &mut target, openai_error).await {
+        return r;
+    }
     let stream = body["stream"].as_bool().unwrap_or(false);
     body["model"] = json!(target.upstream_model);
 
     match target.desc.format {
         ApiFormat::OpenAi => {
             let started = crate::paths::now_ms();
-            let resp = proxy_passthrough(&state, &target, &body, openai_error).await;
+            let resp = proxy_passthrough(&state, &mut target, &body, openai_error).await;
             crate::llm_router::usage::record(
                 &state.store,
                 &target.conn.id,
@@ -365,10 +549,10 @@ async fn handle_chat(
                     client_format: "openai".to_string(),
                     started: crate::paths::now_ms(),
                 };
-                stream_anthropic_upstream_to_openai(&state, &target, &upstream_body, ctx).await
+                stream_anthropic_upstream_to_openai(&state, &mut target, &upstream_body, ctx).await
             } else {
                 let started = crate::paths::now_ms();
-                match send_json(&state, &target, &upstream_body, openai_error).await {
+                match send_json(&state, &mut target, &upstream_body, openai_error).await {
                     Ok(v) => {
                         let u = crate::llm_router::usage::usage_from_anthropic(&v);
                         crate::llm_router::usage::record(
@@ -403,7 +587,7 @@ async fn handle_responses(
     }
     let mut chat = crate::llm_router::responses::responses_request_to_chat(&body);
     let requested = chat["model"].as_str().unwrap_or("").to_string();
-    let target = match route_model(&state.store, &requested).await {
+    let mut target = match route_model(&state.store, &requested).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return openai_error(
@@ -413,6 +597,34 @@ async fn handle_responses(
         }
         Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    if let Some(r) = ensure_fresh_or_reconnect_error(&state, &mut target, openai_error).await {
+        return r;
+    }
+
+    // Codex (openai-oauth) speaks the Responses wire natively both ways — no
+    // chat translation applies (that's only built for routing/model
+    // resolution above). Pass the client's ORIGINAL Responses body straight
+    // through (only rewriting `model` to the bare upstream id), same-format
+    // proxy style, just like `proxy_passthrough` elsewhere.
+    if target.conn.provider == "openai-oauth" {
+        let mut passthrough_body = body.clone();
+        passthrough_body["model"] = json!(target.upstream_model);
+        let started = crate::paths::now_ms();
+        let resp = proxy_passthrough(&state, &mut target, &passthrough_body, openai_error).await;
+        crate::llm_router::usage::record(
+            &state.store,
+            &target.conn.id,
+            &target.conn.provider,
+            &target.upstream_model,
+            "responses",
+            crate::llm_router::usage::Usage::default(),
+            resp.status().as_u16(),
+            started,
+            None,
+        );
+        return resp;
+    }
+
     let stream = chat["stream"].as_bool().unwrap_or(false);
     chat["model"] = json!(target.upstream_model);
     let started = crate::paths::now_ms();
@@ -427,9 +639,9 @@ async fn handle_responses(
     };
 
     if stream {
-        stream_responses(&state, &target, &upstream_body, started).await
+        stream_responses(&state, &mut target, &upstream_body, started).await
     } else {
-        match send_json(&state, &target, &upstream_body, openai_error).await {
+        match send_json(&state, &mut target, &upstream_body, openai_error).await {
             Ok(v) => {
                 // normalize to OpenAI chat shape first
                 let chat_resp = match target.desc.format {
@@ -507,13 +719,11 @@ async fn handle_count_tokens(
 
 async fn send_json(
     state: &AppState,
-    target: &RouteTarget,
+    target: &mut RouteTarget,
     body: &Value,
     err: fn(StatusCode, &str) -> Response,
 ) -> Result<Value, Response> {
-    let req = upstream_request(state, target, body)
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
-    let resp = req.send().await.map_err(|e| {
+    let resp = send_upstream(state, target, body).await.map_err(|e| {
         err(
             StatusCode::BAD_GATEWAY,
             &format!("upstream {}: {e}", target.conn.provider),
@@ -543,15 +753,11 @@ fn sse_response(body: Body) -> Response {
 /// Same-format streaming (and non-streaming) proxy: forward status + body.
 async fn proxy_passthrough(
     state: &AppState,
-    target: &RouteTarget,
+    target: &mut RouteTarget,
     body: &Value,
     err: fn(StatusCode, &str) -> Response,
 ) -> Response {
-    let req = match upstream_request(state, target, body) {
-        Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
-    let resp = match req.send().await {
+    let resp = match send_upstream(state, target, body).await {
         Ok(r) => r,
         Err(e) => {
             return err(
@@ -723,16 +929,12 @@ fn spawn_anthropic_to_openai_pump(
 /// Client=Anthropic, upstream=OpenAI, stream=true.
 async fn stream_openai_upstream_to_anthropic(
     state: &AppState,
-    target: &RouteTarget,
+    target: &mut RouteTarget,
     upstream_body: &Value,
     ctx: RecordCtx,
 ) -> Response {
     let model = upstream_body["model"].as_str().unwrap_or("").to_string();
-    let req = match upstream_request(state, target, upstream_body) {
-        Ok(r) => r,
-        Err(e) => return anthropic_error(StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
-    let resp = match req.send().await {
+    let resp = match send_upstream(state, target, upstream_body).await {
         Ok(r) => r,
         Err(e) => return anthropic_error(StatusCode::BAD_GATEWAY, &e.to_string()),
     };
@@ -757,15 +959,11 @@ async fn stream_openai_upstream_to_anthropic(
 /// Client=OpenAI, upstream=Anthropic, stream=true.
 async fn stream_anthropic_upstream_to_openai(
     state: &AppState,
-    target: &RouteTarget,
+    target: &mut RouteTarget,
     upstream_body: &Value,
     ctx: RecordCtx,
 ) -> Response {
-    let req = match upstream_request(state, target, upstream_body) {
-        Ok(r) => r,
-        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
-    let resp = match req.send().await {
+    let resp = match send_upstream(state, target, upstream_body).await {
         Ok(r) => r,
         Err(e) => return openai_error(StatusCode::BAD_GATEWAY, &e.to_string()),
     };
@@ -790,15 +988,11 @@ async fn stream_anthropic_upstream_to_openai(
 /// Anthropic format) to OpenAI chat chunks, then encodes Responses SSE.
 async fn stream_responses(
     state: &AppState,
-    target: &RouteTarget,
+    target: &mut RouteTarget,
     upstream_body: &Value,
     started: i64,
 ) -> Response {
-    let req = match upstream_request(state, target, upstream_body) {
-        Ok(r) => r,
-        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
-    let resp = match req.send().await {
+    let resp = match send_upstream(state, target, upstream_body).await {
         Ok(r) => r,
         Err(e) => return openai_error(StatusCode::BAD_GATEWAY, &e.to_string()),
     };
@@ -921,4 +1115,237 @@ fn spawn_responses_pump(
         );
     });
     Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm_router::connections::{ConnectionData, ConnectionRow};
+
+    fn mk_conn(id: &str, provider: &str, auth_type: &str, data: ConnectionData) -> ConnectionRow {
+        ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: auth_type.into(),
+            label: "t".into(),
+            priority: 0,
+            enabled: true,
+            data,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    async fn test_state() -> AppState {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        AppState {
+            store,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    #[test]
+    fn inject_system_prompt_wraps_string_system() {
+        let mut body = json!({"system": "be nice", "messages": []});
+        inject_claude_system_prompt(&mut body);
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2);
+        assert_eq!(sys[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(sys[1]["text"], "be nice");
+    }
+
+    #[test]
+    fn inject_system_prompt_prepends_to_array_system() {
+        let mut body = json!({"system": [{"type": "text", "text": "custom block"}]});
+        inject_claude_system_prompt(&mut body);
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2);
+        assert_eq!(sys[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(sys[1]["text"], "custom block");
+    }
+
+    #[test]
+    fn inject_system_prompt_is_idempotent_when_already_present() {
+        let mut body = json!({"system": [
+            {"type": "text", "text": CLAUDE_CODE_SYSTEM_PROMPT},
+            {"type": "text", "text": "custom block"}
+        ]});
+        inject_claude_system_prompt(&mut body);
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2, "must not duplicate an already-present prefix");
+        assert_eq!(sys[1]["text"], "custom block");
+    }
+
+    #[test]
+    fn inject_system_prompt_sets_when_absent() {
+        let mut body = json!({"messages": []});
+        inject_claude_system_prompt(&mut body);
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+    }
+
+    #[tokio::test]
+    async fn oauth_request_for_anthropic_uses_access_token_and_injects_system_prompt() {
+        let state = test_state().await;
+        let desc = registry::descriptor("anthropic-oauth").unwrap();
+        let conn = mk_conn(
+            "c1",
+            "anthropic-oauth",
+            "oauth",
+            ConnectionData {
+                // Must NOT be read for oauth — access_token is the only
+                // legitimate credential source.
+                api_key: Some("should-not-be-used".into()),
+                access_token: Some("at-secret".into()),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "claude-x".into(),
+        };
+        let body = json!({"model": "claude-x", "system": "be helpful", "messages": []});
+        let req = upstream_request(&state, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(req.url().as_str(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer at-secret"
+        );
+        assert_eq!(
+            req.headers().get("anthropic-beta").unwrap(),
+            "oauth-2025-04-20"
+        );
+        assert_eq!(
+            req.headers().get("anthropic-version").unwrap(),
+            "2023-06-01"
+        );
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(sent["system"][0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(sent["system"][1]["text"], "be helpful");
+    }
+
+    #[tokio::test]
+    async fn oauth_request_for_openai_hits_codex_responses_with_account_and_session_headers() {
+        let state = test_state().await;
+        let desc = registry::descriptor("openai-oauth").unwrap();
+        let conn = mk_conn(
+            "c2",
+            "openai-oauth",
+            "oauth",
+            ConnectionData {
+                access_token: Some("at-codex".into()),
+                provider_specific: Some(json!({"chatgpt_account_id": "acct-1"})),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "gpt-5.2-codex".into(),
+        };
+        let body = json!({"model": "gpt-5.2-codex", "input": "hi"});
+        let req = upstream_request(&state, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer at-codex"
+        );
+        assert_eq!(req.headers().get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(req.headers().get("chatgpt-account-id").unwrap(), "acct-1");
+        assert!(req.headers().get("session_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn oauth_request_for_openai_omits_account_header_when_absent() {
+        let state = test_state().await;
+        let desc = registry::descriptor("openai-oauth").unwrap();
+        let conn = mk_conn(
+            "c3",
+            "openai-oauth",
+            "oauth",
+            ConnectionData {
+                access_token: Some("at-codex".into()),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "gpt-5.2-codex".into(),
+        };
+        let body = json!({"model": "gpt-5.2-codex", "input": "hi"});
+        let req = upstream_request(&state, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(req.headers().get("chatgpt-account-id").is_none());
+    }
+
+    #[tokio::test]
+    async fn free_provider_uses_public_bearer_and_opencode_client_header() {
+        let state = test_state().await;
+        let desc = registry::descriptor("opencode-free").unwrap();
+        let conn = mk_conn("c4", "opencode-free", "none", ConnectionData::default());
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "grok-code".into(),
+        };
+        let body = json!({"model": "grok-code", "messages": []});
+        let req = upstream_request(&state, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://opencode.ai/zen/v1/chat/completions"
+        );
+        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer public");
+        assert_eq!(req.headers().get("x-opencode-client").unwrap(), "desktop");
+    }
+
+    #[tokio::test]
+    async fn api_key_provider_is_unaffected_by_oauth_free_branches() {
+        let state = test_state().await;
+        let desc = registry::descriptor("openai").unwrap();
+        let conn = mk_conn(
+            "c5",
+            "openai",
+            "api_key",
+            ConnectionData {
+                api_key: Some("sk-live".into()),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "gpt-5.2".into(),
+        };
+        let body = json!({"model": "gpt-5.2", "messages": []});
+        let req = upstream_request(&state, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer sk-live"
+        );
+    }
 }
