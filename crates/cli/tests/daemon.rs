@@ -45,6 +45,7 @@ fn daemon_process_reaches_running_then_exits_cleanly_on_sigterm() {
             let settings = SettingsStore::new(Arc::new(store));
             settings.set("enabled_gateways", "").await.unwrap();
             settings.set("enabled_runtimes", "").await.unwrap();
+            settings.set("auto_update", "off").await.unwrap();
         });
     }
 

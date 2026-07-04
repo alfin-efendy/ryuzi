@@ -31,7 +31,7 @@ pub struct SessionRow {
 }
 
 /// Spawns the detached daemon process: `(cmd, log_path) -> pid`. `None` in
-/// `ControllerDeps` means "really spawn one" via `real_spawn_detached`.
+/// `ControllerDeps` means "really spawn one" via `crate::daemon_cmd::spawn_detached`.
 pub type SpawnDaemon = Box<dyn Fn(&[String], &Path) -> std::io::Result<u32> + Send + Sync>;
 /// Sends SIGTERM to a pid. `None` means "really `kill(2)`" via
 /// `ryuzi_core::daemon_status::send_sigterm`.
