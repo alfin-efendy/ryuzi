@@ -1,8 +1,7 @@
-import { type Mode, useTheme } from "@ryuzi/ui";
-import { ChevronDown } from "lucide-react";
-import { useState } from "react";
-import { Card, CardHeader, CardRow, CardTitle } from "@/components/common/Card";
+import { ACCENTS, type Mode, useTheme } from "@ryuzi/ui";
+import { Card, CardRow } from "@/components/common/Card";
 import { Switch } from "@/components/common/Switch";
+import { diffLineStyle, type DiffLine } from "@/lib/diff";
 
 // ——— Theme mode preview cards ———
 
@@ -82,215 +81,83 @@ function ThemeModeCard({ card, selected, onPick }: { card: ModeCard; selected: b
   );
 }
 
-// ——— Diff preview ———
+// ——— Live diff preview ———
+// Sample rows rendered with the real --diff-* tokens and the app font stack,
+// so this previews exactly what the session Review tab renders.
 
-const RED_BG = "color-mix(in oklab, #EF4444 15%, transparent)";
-const GREEN_BG = "color-mix(in oklab, #22C55E 16%, transparent)";
-
-type DiffRow = { no: number; text: string; bg: string; bar: string };
-
-const DIFF_LEFT: DiffRow[] = [
-  { no: 1, text: "const themePreview: ThemeConfig = {", bg: "transparent", bar: "transparent" },
-  { no: 2, text: '  surface: "sidebar",', bg: RED_BG, bar: "#EF4444" },
-  { no: 3, text: '  accent: "#2563eb",', bg: RED_BG, bar: "#EF4444" },
-  { no: 4, text: "  contrast: 42,", bg: RED_BG, bar: "#EF4444" },
-  { no: 5, text: "};", bg: "transparent", bar: "transparent" },
+const PREVIEW_LINES: DiffLine[] = [
+  ["hunk", "", "@@ -1,4 +1,4 @@"],
+  ["ctx", 1, "fn greet(name: &str) -> String {"],
+  ["del", 2, '    format!("Hello {name}")'],
+  ["add", 2, '    format!("Hello, {name}!")'],
+  ["ctx", 3, "}"],
 ];
 
-const DIFF_RIGHT: DiffRow[] = [
-  { no: 1, text: "const themePreview: ThemeConfig = {", bg: "transparent", bar: "transparent" },
-  { no: 2, text: '  surface: "sidebar-elevated",', bg: GREEN_BG, bar: "#22C55E" },
-  { no: 3, text: '  accent: "#0ea5e9",', bg: GREEN_BG, bar: "#22C55E" },
-  { no: 4, text: "  contrast: 68,", bg: GREEN_BG, bar: "#22C55E" },
-  { no: 5, text: "};", bg: "transparent", bar: "transparent" },
-];
-
-function DiffColumn({ rows, className = "" }: { rows: DiffRow[]; className?: string }) {
+function DiffPreview() {
   return (
-    <div className={`min-w-0 flex-1 ${className}`}>
-      {rows.map((r) => (
-        <div key={r.no} className="flex" style={{ background: r.bg }}>
-          <span className="w-[3px] shrink-0" style={{ background: r.bar }} />
-          <span className="w-[34px] shrink-0 select-none pr-3 text-right text-code-number">{r.no}</span>
-          <span className="whitespace-pre pr-3 text-code-foreground">{r.text}</span>
-        </div>
-      ))}
+    <div className="mb-[22px] overflow-hidden rounded-xl border border-border bg-code font-mono text-xs leading-[1.85] shadow-xs">
+      {PREVIEW_LINES.map((l, i) => {
+        const s = diffLineStyle(l);
+        return (
+          <div key={`${i}-${l[2]}`} className="flex" style={{ background: s.bg, color: s.color }}>
+            <span className="w-[34px] shrink-0 select-none pr-3 text-right text-code-number" style={{ background: s.numBg }}>
+              {l[1]}
+            </span>
+            <span className="w-4 shrink-0 select-none" style={{ color: s.signColor }}>
+              {s.sign}
+            </span>
+            <span className="whitespace-pre pr-3">{l[2]}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-// ——— Theme editor cards ———
+// ——— Accent picker ———
 
-type SwatchFieldSpec = {
-  field: string;
-  border: string;
-  circle: string;
-  circleBorder: string;
-  text?: string;
-  hex: string;
-};
-
-type EditorSpec = {
-  title: string;
-  accentHex: string;
-  presetSwatch: { bg: string; border: string; color: string };
-  background: SwatchFieldSpec;
-  foreground: SwatchFieldSpec;
-  initialContrast: number;
-};
-
-const LIGHT_EDITOR: EditorSpec = {
-  title: "Light theme",
-  accentHex: "#339CFF",
-  presetSwatch: { bg: "#fff", border: "var(--border)", color: "#2563eb" },
-  background: { field: "#fff", border: "var(--border)", circle: "#fff", circleBorder: "#d4d4d4", text: "#1A1C1F", hex: "#FFFFFF" },
-  foreground: { field: "var(--muted)", border: "var(--border)", circle: "#1A1C1F", circleBorder: "rgba(0,0,0,0.3)", hex: "#1A1C1F" },
-  initialContrast: 45,
-};
-
-const DARK_EDITOR: EditorSpec = {
-  title: "Dark theme",
-  accentHex: "#0EA5E9",
-  presetSwatch: { bg: "#111318", border: "rgba(255,255,255,0.14)", color: "#339CFF" },
-  background: {
-    field: "#0B0B0C",
-    border: "rgba(255,255,255,0.14)",
-    circle: "#0B0B0C",
-    circleBorder: "rgba(255,255,255,0.3)",
-    text: "#E8E9EC",
-    hex: "#0B0B0C",
-  },
-  foreground: {
-    field: "#17181B",
-    border: "rgba(255,255,255,0.14)",
-    circle: "#E8E9EC",
-    circleBorder: "rgba(255,255,255,0.5)",
-    text: "#E8E9EC",
-    hex: "#E8E9EC",
-  },
-  initialContrast: 68,
-};
-
-function GhostButton({ children }: { children: string }) {
-  return (
-    <button
-      type="button"
-      className="h-[26px] cursor-pointer rounded-sm border-none bg-transparent px-2 font-sans text-[12.5px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-    >
-      {children}
-    </button>
-  );
-}
-
-function SwatchField({ spec }: { spec: SwatchFieldSpec }) {
-  return (
-    <div
-      className="flex h-8 w-[172px] items-center gap-2 rounded-md border px-3"
-      style={{ background: spec.field, borderColor: spec.border }}
-    >
-      <span className="h-3.5 w-3.5 shrink-0 rounded-full border" style={{ background: spec.circle, borderColor: spec.circleBorder }} />
-      <span className="min-w-0 flex-1 font-mono text-[12.5px] font-semibold" style={spec.text ? { color: spec.text } : undefined}>
-        {spec.hex}
-      </span>
-    </div>
-  );
-}
-
-function ThemeEditorCard({ spec }: { spec: EditorSpec }) {
-  const transparency = useTheme((s) => s.transparency);
-  const setTransparency = useTheme((s) => s.setTransparency);
-  const [contrast, setContrast] = useState(spec.initialContrast);
-  const [windowTransparency, setWindowTransparency] = useState(55);
+function AccentRow() {
+  const accent = useTheme((s) => s.accent);
+  const setAccent = useTheme((s) => s.setAccent);
+  const systemAccentHex = useTheme((s) => s.systemAccentHex);
+  const activeKey = typeof accent === "object" ? "" : accent;
+  const customValue = typeof accent === "object" ? accent.custom : "#4f46e5";
 
   return (
-    <Card className="mb-3">
-      <CardHeader className="gap-3">
-        <CardTitle>{spec.title}</CardTitle>
-        <div className="flex-1" />
-        <GhostButton>Import</GhostButton>
-        <GhostButton>Copy theme</GhostButton>
-        <button
-          type="button"
-          className="flex h-[34px] cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2.5 font-sans text-[13px] font-medium text-foreground hover:bg-accent"
-        >
-          <span
-            className="flex h-[22px] w-[22px] items-center justify-center rounded-sm border font-mono text-[10px] font-bold"
-            style={{ background: spec.presetSwatch.bg, borderColor: spec.presetSwatch.border, color: spec.presetSwatch.color }}
-          >
-            Aa
-          </span>
-          Calm
-          <ChevronDown size={12} className="text-muted-foreground" />
-        </button>
-      </CardHeader>
-
-      <CardRow>
-        <span className="flex-1 text-[13px] font-medium">Accent</span>
-        <div className="flex h-8 w-[172px] items-center gap-2 rounded-md pl-3 pr-1" style={{ background: spec.accentHex }}>
-          <span
-            className="h-3.5 w-3.5 shrink-0 rounded-full border"
-            style={{ background: "rgba(255,255,255,0.55)", borderColor: "rgba(255,255,255,0.8)" }}
+    <CardRow>
+      <span className="flex-1 text-[13px] font-medium">Accent</span>
+      <div className="flex flex-wrap items-center gap-2">
+        {ACCENTS.map((a) => (
+          <button
+            key={a.key}
+            type="button"
+            aria-label={a.label}
+            title={a.label}
+            onClick={() => setAccent(a.key)}
+            className={`h-5 w-5 cursor-pointer rounded-full border border-border ${activeKey === a.key ? "ring-2 ring-ring ring-offset-1 ring-offset-card" : ""}`}
+            style={{ background: a.primary || "oklch(0.6 0 0)" }}
           />
-          <span className="min-w-0 flex-1 font-mono text-[12.5px] font-semibold text-white">{spec.accentHex}</span>
-        </div>
-      </CardRow>
-
-      <CardRow>
-        <span className="flex-1 text-[13px] font-medium">Background</span>
-        <SwatchField spec={spec.background} />
-      </CardRow>
-
-      <CardRow>
-        <span className="flex-1 text-[13px] font-medium">Foreground</span>
-        <SwatchField spec={spec.foreground} />
-      </CardRow>
-
-      <CardRow>
-        <span className="flex-1 text-[13px] font-medium">UI font</span>
-        <div className="flex h-8 w-[172px] items-center overflow-hidden rounded-md border border-border bg-muted px-3">
-          <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">-apple-system, BlinkMacSystemFont</span>
-        </div>
-      </CardRow>
-
-      <CardRow>
-        <span className="flex-1 text-[13px] font-medium">Translucent sidebar</span>
-        <Switch on={transparency} onToggle={() => setTransparency(!transparency)} size="lg" label="Translucent sidebar" />
-      </CardRow>
-
-      <CardRow className="gap-4">
-        <span className="shrink-0 text-[13px] font-medium">Contrast</span>
+        ))}
+        {systemAccentHex && (
+          <button
+            type="button"
+            aria-label="System accent"
+            title="Follow the OS accent color"
+            onClick={() => setAccent("system")}
+            className={`h-5 w-5 cursor-pointer rounded-full border border-border ${accent === "system" ? "ring-2 ring-ring ring-offset-1 ring-offset-card" : ""}`}
+            style={{ background: systemAccentHex }}
+          />
+        )}
         <input
-          type="range"
-          min={0}
-          max={100}
-          value={contrast}
-          onChange={(e) => setContrast(Number(e.target.value))}
-          aria-label={`${spec.title} contrast`}
-          className="flex-1 cursor-pointer"
-          style={{ accentColor: "var(--primary)" }}
+          type="color"
+          aria-label="Custom accent"
+          title="Custom accent"
+          value={customValue}
+          onChange={(e) => setAccent({ custom: e.target.value })}
+          className="h-5 w-5 cursor-pointer rounded-full border border-border bg-transparent p-0"
         />
-        <span className="w-7 shrink-0 text-right font-mono text-[12.5px] font-semibold">{contrast}</span>
-      </CardRow>
-
-      <CardRow className="gap-4">
-        <span className="shrink-0 text-[13px] font-medium">Window transparency</span>
-        <input
-          type="range"
-          min={0}
-          max={80}
-          value={windowTransparency}
-          onChange={(e) => {
-            const v = Number(e.target.value);
-            setWindowTransparency(v);
-            setTransparency(v > 0);
-          }}
-          aria-label={`${spec.title} window transparency`}
-          className="flex-1 cursor-pointer"
-          style={{ accentColor: "var(--primary)" }}
-        />
-        <span className="w-7 shrink-0 text-right font-mono text-[12.5px] font-semibold">{windowTransparency}</span>
-      </CardRow>
-    </Card>
+      </div>
+    </CardRow>
   );
 }
 
@@ -299,7 +166,8 @@ function ThemeEditorCard({ spec }: { spec: EditorSpec }) {
 export function SettingsView() {
   const mode = useTheme((s) => s.mode);
   const setMode = useTheme((s) => s.setMode);
-  const [openAtLogin, setOpenAtLogin] = useState(true);
+  const transparency = useTheme((s) => s.transparency);
+  const setTransparency = useTheme((s) => s.setTransparency);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
@@ -315,23 +183,26 @@ export function SettingsView() {
           ))}
         </div>
 
-        <div className="mb-[22px] overflow-hidden rounded-xl border border-border bg-code font-mono text-xs leading-[1.85] shadow-xs">
-          <div className="flex">
-            <DiffColumn rows={DIFF_LEFT} className="border-r border-border" />
-            <DiffColumn rows={DIFF_RIGHT} />
-          </div>
-        </div>
+        <DiffPreview />
 
-        <ThemeEditorCard spec={LIGHT_EDITOR} />
-        <ThemeEditorCard spec={DARK_EDITOR} />
+        <Card className="mb-3">
+          <AccentRow />
+          <CardRow>
+            <span className="flex-1 text-[13px] font-medium">Translucent sidebar</span>
+            <Switch on={transparency} onToggle={() => setTransparency(!transparency)} size="lg" label="Translucent sidebar" />
+          </CardRow>
+        </Card>
+
+        <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">System</div>
 
         <Card>
           <div className="flex items-center gap-3.5 px-[18px] py-4">
             <div className="flex-1">
               <div className="text-[13.5px] font-semibold">Open at login</div>
-              <div className="mt-0.5 text-[12.5px] text-muted-foreground">Resume running sessions when the app starts.</div>
+              <div className="mt-0.5 text-[12.5px] text-muted-foreground">Start Cockpit when you sign in.</div>
             </div>
-            <Switch on={openAtLogin} onToggle={() => setOpenAtLogin(!openAtLogin)} label="Open at login" />
+            {/* Wired to the autostart plugin in the next task. */}
+            <Switch on={false} onToggle={() => {}} label="Open at login" />
           </div>
         </Card>
       </div>
