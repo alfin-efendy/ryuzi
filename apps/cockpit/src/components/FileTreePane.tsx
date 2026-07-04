@@ -1,6 +1,7 @@
 import { ChevronRight, FileText } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { commands } from "@/bindings";
+import { joinPath } from "@/lib/paths";
 import { useUi } from "@/store-ui";
 
 export type Node = { rel: string; name: string; dir: boolean; depth: number; open?: boolean; children?: Node[] };
@@ -77,8 +78,7 @@ export function FileTreePane({ sessionPk, filter, refreshKey }: { sessionPk: str
 
   const openLeaf = (node: Node) => {
     if (!workdir) return;
-    const sep = workdir.includes("\\") ? "\\" : "/";
-    openFile(`${workdir}${sep}${node.rel.split("/").join(sep)}`);
+    openFile(joinPath(workdir, node.rel));
   };
 
   const flatten = (nodes: Node[]): Node[] => nodes.flatMap((n) => (n.open && n.children ? [n, ...flatten(n.children)] : [n]));

@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronRight, FileText, Maximize2, Minimize2, RotateCw, Search, SquareCheck, X } from "lucide-react";
 import { useUi } from "@/store-ui";
 import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav";
 import { commands } from "@/bindings";
 import { diffLineStyle, parseUnifiedDiff, type ReviewFile } from "@/lib/diff";
-import { basename } from "@/lib/paths";
+import { basename, joinPath } from "@/lib/paths";
 import { FileViewer } from "@/components/FileViewer";
 import { FileTreePane } from "@/components/FileTreePane";
 import { DiffStat } from "@/components/common/bits";
@@ -34,27 +34,25 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
     prevRunning.current = running;
   }, [running]);
 
-  // Real diff of the session worktree; refreshed when the Review tab opens
-  // and whenever the running turn finishes (the agent may have edited files).
-  useEffect(() => {
-    if (!sessionPk || !nav.rightOpen || nav.rightTab !== "review" || running) return;
-    let cancelled = false;
+  const fetchDiff = useCallback(() => {
+    if (!sessionPk) return;
     setReviewLoading(true);
     void commands.gitDiff(sessionPk).then((res) => {
-      if (cancelled) return;
       setReviewLoading(false);
       if (res.status === "ok") {
         setReviewFiles(parseUnifiedDiff(res.data));
-        setReviewError(null);
-        setReviewFile(0);
+        setReviewError(null); // selection is clamped at render, no reset needed
       } else {
         setReviewError(res.error.message);
       }
     });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionPk, nav.rightOpen, nav.rightTab, running]);
+  }, [sessionPk]);
+
+  // Auto-fetch when the tab opens and when a running turn finishes.
+  useEffect(() => {
+    if (!nav.rightOpen || nav.rightTab !== "review" || running) return;
+    fetchDiff();
+  }, [nav.rightOpen, nav.rightTab, running, fetchDiff]);
 
   useEffect(() => {
     if (!nav.rightMaximized) return;
@@ -73,6 +71,13 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
   const review = reviewFiles.length > 0 ? reviewFiles[Math.min(reviewFile, reviewFiles.length - 1)] : null;
   const reviewAdd = reviewFiles.reduce((n, f) => n + f.add, 0);
   const reviewDel = reviewFiles.reduce((n, f) => n + f.del, 0);
+
+  const openInFiles = async (f: ReviewFile) => {
+    const res = await commands.sessionWorkdir(sessionPk);
+    if (res.status !== "ok") return;
+    ui.openFile(joinPath(res.data, `${f.dir}${f.name}`));
+    nav.setRightTab("file");
+  };
 
   return (
     <div
@@ -121,46 +126,66 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
         <>
           <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-4 py-2.5">
             <span className="font-mono text-xs text-muted-foreground">main → {branch ?? "worktree"}</span>
+            <button type="button" title="Refresh diff" onClick={fetchDiff} className={`${toolBtn} h-6 w-6`}>
+              <RotateCw aria-hidden size={12} strokeWidth={2} className={reviewLoading ? "animate-spin" : ""} />
+            </button>
             <DiffStat add={reviewAdd} del={reviewDel} className="ml-auto" />
           </div>
-          {reviewFiles.length > 0 && (
-            <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-border px-3 py-2">
+          <div className="flex min-h-0 flex-1">
+            <div className="flex w-[200px] shrink-0 flex-col overflow-y-auto border-r border-border py-1.5">
               {reviewFiles.map((f, i) => (
                 <button
                   key={`${f.dir}${f.name}`}
                   type="button"
+                  title={`${f.dir}${f.name}`}
                   onClick={() => setReviewFile(i)}
-                  className={`flex h-7 cursor-pointer items-center gap-[7px] whitespace-nowrap rounded-md border px-2.5 font-mono text-[11.5px] text-foreground hover:bg-accent ${
-                    i === reviewFile ? "border-border bg-background" : "border-transparent bg-transparent"
+                  className={`flex cursor-pointer items-center gap-2 border-none px-3 py-[5px] text-left font-mono text-[11.5px] text-foreground hover:bg-accent ${
+                    i === reviewFile ? "bg-accent" : "bg-transparent"
                   }`}
                 >
-                  {f.name}
-                  <DiffStat add={f.add} del={f.del} className="text-[11.5px]" />
+                  <span className="min-w-0 flex-1 truncate">{f.name}</span>
+                  <DiffStat add={f.add} del={f.del} className="shrink-0 text-[11px]" />
                 </button>
               ))}
-            </div>
-          )}
-          <div className="min-h-0 flex-1 overflow-auto py-2 font-mono text-xs leading-[1.7]">
-            {reviewError && <div className="px-4 py-3 text-[12.5px] text-destructive">{reviewError}</div>}
-            {!reviewError && !review && (
-              <div className="px-4 py-3 font-sans text-[12.5px] text-muted-foreground">
-                {reviewLoading ? "Reading diff…" : "No changes in the worktree yet."}
-              </div>
-            )}
-            {review?.lines.map((l, i) => {
-              const s = diffLineStyle(l);
-              return (
-                <div key={`${i}-${l[2]}`} className="flex" style={{ background: s.bg, color: s.color }}>
-                  <span className="w-11 shrink-0 select-none pr-3 text-right text-[11px] text-code-number" style={{ background: s.numBg }}>
-                    {l[1]}
-                  </span>
-                  <span className="w-4 shrink-0 select-none" style={{ color: s.signColor }}>
-                    {s.sign}
-                  </span>
-                  <span className="whitespace-pre pr-4">{l[2]}</span>
+              {reviewFiles.length === 0 && (
+                <div className="px-3 py-2 font-sans text-[12px] text-muted-foreground">
+                  {reviewLoading ? "Reading diff…" : "No changes yet."}
                 </div>
-              );
-            })}
+              )}
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto py-2 font-mono text-xs leading-[1.7]">
+              {reviewError && <div className="px-4 py-3 font-sans text-[12.5px] text-destructive">{reviewError}</div>}
+              {!reviewError && review && (
+                <>
+                  <button
+                    type="button"
+                    title="Open in Files tab"
+                    onClick={() => void openInFiles(review)}
+                    className="mb-1 cursor-pointer border-none bg-transparent px-4 font-mono text-[11.5px] font-semibold text-foreground underline-offset-2 hover:underline"
+                  >
+                    {review.dir}
+                    {review.name}
+                  </button>
+                  {review.lines.map((l, i) => {
+                    const s = diffLineStyle(l);
+                    return (
+                      <div key={`${i}-${l[2]}`} className="flex" style={{ background: s.bg, color: s.color }}>
+                        <span
+                          className="w-11 shrink-0 select-none pr-3 text-right text-[11px] text-code-number"
+                          style={{ background: s.numBg }}
+                        >
+                          {l[1]}
+                        </span>
+                        <span className="w-4 shrink-0 select-none" style={{ color: s.signColor }}>
+                          {s.sign}
+                        </span>
+                        <span className="whitespace-pre pr-4">{l[2]}</span>
+                      </div>
+                    );
+                  })}
+                </>
+              )}
+            </div>
           </div>
         </>
       )}
