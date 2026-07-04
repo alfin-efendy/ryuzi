@@ -1620,20 +1620,29 @@ pub async fn run_perm_mock_via_harness(
         let captured = captured_session_pk.clone();
         let hub_for_resolver = hub.clone();
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested {
-                session_pk,
-                request_id,
-                ..
-            }) = approval_rx.recv().await
-            {
-                *captured.lock().await = Some(session_pk);
-                // The bridge calls hub.register(..) right after emitting the
-                // event; retry briefly so we don't race ahead of it.
-                for _ in 0..200 {
-                    if hub_for_resolver.resolve(&request_id, true) {
+            loop {
+                match approval_rx.recv().await {
+                    Ok(CoreEvent::ApprovalRequested {
+                        session_pk,
+                        request_id,
+                        ..
+                    }) => {
+                        *captured.lock().await = Some(session_pk);
+                        // The bridge calls hub.register(..) right after emitting the
+                        // event; retry briefly so we don't race ahead of it.
+                        for _ in 0..200 {
+                            if hub_for_resolver.resolve(&request_id, true) {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    // send_prompt now broadcasts the persisted user turn (and other
+                    // row events) before the approval fires — skip them.
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
