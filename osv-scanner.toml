@@ -5,3 +5,19 @@
 # [[IgnoredVulns]]
 # id = "GHSA-xxxx-xxxx-xxxx"
 # reason = "dev-only dependency; upstream fix tracked in <issue link>"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0002"
+reason = "lru 0.12.x IterMut soundness; lru is pinned to ^0.12 by ratatui 0.29 (CLI TUI). Not upgradable until ratatui bumps; dependabot reports security_update_not_possible. Revisit on ratatui upgrade."
+
+[[IgnoredVulns]]
+id = "GHSA-rhfx-m35p-ff5j"
+reason = "GHSA alias of RUSTSEC-2026-0002 (lru IterMut soundness) — same acceptance."
+
+[[IgnoredVulns]]
+id = "GHSA-82j2-j2ch-gfr8"
+reason = "rustls-webpki <0.103.13 DoS panic on malformed CRL. Only reachable when CRL revocation checking is explicitly enabled, which ryuzi never does. Transitively pinned on main by PR #32 deps; dependabot reports security_update_not_possible. Revisit when the parent unpins."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0104"
+reason = "RUSTSEC alias of GHSA-82j2-j2ch-gfr8 (rustls-webpki CRL DoS panic) — same acceptance."
