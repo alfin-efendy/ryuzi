@@ -57,3 +57,7 @@ skills-lock.json
 
 # Design specs/plans are kept as a local-only artifact (not tracked in origin)
 docs/design/
+
+# playwright output (apps/cockpit e2e)
+apps/cockpit/playwright-report/
+apps/cockpit/test-results/

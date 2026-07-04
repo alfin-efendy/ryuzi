@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p apps/cockpit && tsc --noEmit -p packages/ui",
     "cockpit:dev": "cd apps/cockpit && bun run tauri dev",
     "cockpit:build": "cd apps/cockpit && bun run tauri build",
+    "e2e:cockpit": "bun run --cwd apps/cockpit e2e",
     "lint": "biome ci .",
     "format": "biome check --write ."
   },

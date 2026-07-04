@@ -6,7 +6,10 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "e2e": "bun run build && playwright test",
+    "e2e:ci": "playwright test",
+    "e2e:ui": "bun run build && playwright test --ui"
   },
   "dependencies": {
     "@codemirror/view": "^6.43.4",
@@ -29,6 +32,7 @@
     "zustand": "^4"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@tailwindcss/vite": "^4.3.1",
     "@tauri-apps/cli": "^2",
     "@types/react": "19",
