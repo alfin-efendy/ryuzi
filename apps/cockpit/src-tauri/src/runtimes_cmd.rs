@@ -301,6 +301,11 @@ pub async fn apply_runtime_config(
         .ok_or_else(|| CmdError {
             message: "No endpoint API key exists. Create one in Models → Endpoint first.".into(),
         })?;
+    if mapping.model.trim().is_empty() {
+        return Err(CmdError {
+            message: "No model selected. Add an enabled provider connection in Models → Providers first.".into(),
+        });
+    }
     let ep = EndpointInfo {
         base_url: format!("http://127.0.0.1:{}", st.port),
         api_key: key.key,

@@ -94,6 +94,7 @@ export function RuntimeDetailView({ id }: { id: string }) {
   const permDesc = PERM_MODES.find((m) => m.id === agent.permMode)?.desc ?? "";
 
   const endpointBlocked = !epStatus?.running || epKeys.length === 0;
+  const noModels = modelOptions.length === 0;
 
   const applyConfig = async () => {
     const res = await commands.applyRuntimeConfig(id, {
@@ -300,6 +301,12 @@ export function RuntimeDetailView({ id }: { id: string }) {
                   <span>Start the endpoint server and create an API key in Models → Endpoint before applying.</span>
                 </div>
               )}
+              {noModels && (
+                <div className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]" style={{ borderColor: WARN, color: WARN }}>
+                  <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
+                  <span>Add an enabled provider connection in Models → Providers to pick models.</span>
+                </div>
+              )}
               <div className="flex flex-col gap-1 py-2">
                 {agent.id === "claude" && (
                   <>
@@ -322,7 +329,7 @@ export function RuntimeDetailView({ id }: { id: string }) {
                 )}
                 <button
                   type="button"
-                  disabled={endpointBlocked}
+                  disabled={endpointBlocked || noModels}
                   onClick={() => void applyConfig()}
                   className="h-8 shrink-0 cursor-pointer rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-50"
                 >
