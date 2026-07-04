@@ -155,8 +155,7 @@ pub async fn refresh_at(
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
 
     let error_code = body.get("error").and_then(|v| v.as_str());
-    let is_terminal = matches!(error_code, Some(code) if TERMINAL_ERRORS.contains(&code))
-        || (matches!(status.as_u16(), 400 | 401) && error_code.is_some());
+    let is_terminal = matches!(error_code, Some(code) if TERMINAL_ERRORS.contains(&code));
     if is_terminal {
         conn.data.needs_relogin = Some(true);
         persist(store, conn).await?;
@@ -390,6 +389,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.data.needs_relogin, Some(true));
+    }
+
+    #[tokio::test]
+    async fn force_refresh_does_not_set_needs_relogin_on_non_allowlisted_400_error() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+        let app = Router::new().route(
+            "/token",
+            post(|Json(_b): Json<serde_json::Value>| async move {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"temporarily_unavailable"})),
+                )
+                    .into_response()
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let http = reqwest::Client::new();
+        let now = crate::paths::now_ms();
+        let mut conn = ConnectionRow {
+            id: "c7".into(),
+            provider: "anthropic-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "u".into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                access_token: Some("at-old".into()),
+                refresh_token: Some("rt-old".into()),
+                expires_at: Some(now - 1),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        crate::llm_router::connections::add_connection(&store, conn.clone())
+            .await
+            .unwrap();
+
+        let err = refresh_at(
+            &store,
+            &http,
+            &mut conn,
+            &format!("http://127.0.0.1:{port}/token"),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.to_string().contains("re-login required"));
+        assert_ne!(conn.data.needs_relogin, Some(true));
+        let stored = crate::llm_router::connections::get_connection(&store, "c7")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored.data.needs_relogin, Some(true));
     }
 
     #[tokio::test]
