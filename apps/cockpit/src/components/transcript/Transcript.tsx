@@ -75,7 +75,16 @@ export function Transcript({
 
   const groups = useMemo(() => groupRows(rows), [rows]);
   const tail = groups[groups.length - 1];
-  const tailLen = tail && (tail.type === "agent" || tail.type === "thought") ? tail.markdown.length : 0;
+  // Growth signal for the tail group: coalesced text grows by length, an
+  // activity cluster grows by item count — either must re-pin the scroll.
+  const tailLen =
+    tail === undefined
+      ? 0
+      : tail.type === "agent" || tail.type === "thought"
+        ? tail.markdown.length
+        : tail.type === "activity"
+          ? tail.items.length
+          : 0;
 
   const onScroll = () => {
     const el = scrollRef.current;
