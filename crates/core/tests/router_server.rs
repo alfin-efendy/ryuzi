@@ -439,6 +439,78 @@ async fn large_bodies_are_accepted() {
     assert_eq!(resp.status(), 200);
 }
 
+/// OpenAI-format upstream that emits one delta then abruptly closes the
+/// connection mid-stream (no finish chunk, no [DONE]) — simulates a dropped
+/// upstream. Uses a raw TcpListener so we can hang up deliberately.
+///
+/// The response declares `Transfer-Encoding: chunked` and then closes the
+/// socket WITHOUT sending the terminating `0\r\n\r\n` chunk. Without a
+/// declared framing (no Content-Length / chunked), HTTP/1.1 falls back to
+/// close-delimited bodies, where a closed connection is a *valid* end of
+/// body — hyper wouldn't surface that as a stream error at all. Chunked
+/// framing makes the early close an actual decode error, which is what
+/// `resp.bytes_stream()` needs to yield `Some(Err(_))`.
+async fn mock_truncating_openai_upstream() -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            // Read (and ignore) the request headers+body enough to respond.
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = sock.write_all(head.as_bytes()).await;
+            // one valid chunk carrying a delta, then hang up WITHOUT the
+            // terminating 0-length chunk, a finish chunk, or [DONE].
+            let payload = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"He\"}}]}\n\n";
+            let chunk = format!("{:x}\r\n{payload}\r\n", payload.len());
+            let _ = sock.write_all(chunk.as_bytes()).await;
+            let _ = sock.flush().await;
+            // drop `sock` -> connection reset mid-stream (incomplete chunked body)
+        }
+    });
+    (port, h)
+}
+
+#[tokio::test]
+async fn anthropic_client_gets_error_frame_when_upstream_truncates() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+    let (up_port, _h) = mock_truncating_openai_upstream().await;
+    // custom-openai connection pointing at the truncating mock
+    connections::add_connection(&store, connections::ConnectionRow {
+        id: "c1".into(), provider: "custom-openai".into(), auth_type: "api_key".into(),
+        label: "mock".into(), priority: 0, enabled: true,
+        data: connections::ConnectionData {
+            api_key: Some("k".into()),
+            base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
+            models_override: Some(vec!["mock-model".into()]),
+        },
+        created_at: 0, updated_at: 0,
+    }).await.unwrap();
+    let key = keys::create_key(&store, "t").await.unwrap();
+    let srv = RouterServer::new(store.clone());
+    let port = srv.start(0).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", &key.key)
+        .json(&json!({"model": "custom-openai/mock-model", "max_tokens": 16, "stream": true,
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    // saw the partial content...
+    assert!(body.contains("content_block_delta"));
+    // ...and a terminal ERROR event, NOT a clean message_stop
+    assert!(body.contains("event: error"), "expected error frame, got: {body}");
+    assert!(!body.contains("event: message_stop"), "must not fake a clean finish: {body}");
+
+    srv.stop().await;
+}
+
 #[tokio::test]
 async fn passthrough_streaming_preserves_sse() {
     let (_store, key, port) = setup().await;

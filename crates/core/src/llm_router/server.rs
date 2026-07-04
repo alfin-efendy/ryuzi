@@ -440,7 +440,18 @@ fn spawn_openai_to_anthropic_pump(resp: reqwest::Response, model: String) -> Bod
         let mut parser = SseParser::default();
         let mut tr = translate::OpenAiToAnthropicStream::new(&model);
         let mut stream = resp.bytes_stream();
-        while let Some(Ok(chunk)) = stream.next().await {
+        let mut errored = false;
+        while let Some(item) = stream.next().await {
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => {
+                    for (name, data) in tr.error_frame(&format!("upstream stream interrupted: {e}")) {
+                        let _ = tx.send(Ok(format_sse(&name, &data))).await;
+                    }
+                    errored = true;
+                    break;
+                }
+            };
             for ev in parser.feed(&chunk) {
                 if ev.data == "[DONE]" {
                     continue;
@@ -454,8 +465,10 @@ fn spawn_openai_to_anthropic_pump(resp: reqwest::Response, model: String) -> Bod
                 }
             }
         }
-        for (name, data) in tr.finish() {
-            let _ = tx.send(Ok(format_sse(&name, &data))).await;
+        if !errored {
+            for (name, data) in tr.finish() {
+                let _ = tx.send(Ok(format_sse(&name, &data))).await;
+            }
         }
     });
     Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
@@ -468,7 +481,17 @@ fn spawn_anthropic_to_openai_pump(resp: reqwest::Response) -> Body {
         let mut parser = SseParser::default();
         let mut tr = translate::AnthropicToOpenAiStream::new();
         let mut stream = resp.bytes_stream();
-        while let Some(Ok(chunk)) = stream.next().await {
+        let mut errored = false;
+        while let Some(item) = stream.next().await {
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => {
+                    let err = tr.error_frame(&format!("upstream stream interrupted: {e}"));
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {err}\n\n")))).await;
+                    errored = true;
+                    break;
+                }
+            };
             for ev in parser.feed(&chunk) {
                 let name = ev.event.as_deref().unwrap_or("");
                 if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
@@ -481,7 +504,7 @@ fn spawn_anthropic_to_openai_pump(resp: reqwest::Response) -> Body {
                 }
             }
         }
-        if tr.finish() {
+        if !errored && tr.finish() {
             let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
         }
     });
