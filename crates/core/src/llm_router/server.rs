@@ -29,12 +29,17 @@ struct Inner {
 pub struct RouterServer {
     store: Arc<Store>,
     inner: Mutex<Inner>,
+    oauth_token_url_override: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
     http: reqwest::Client,
+    /// Test-only override for the OAuth token endpoint used by the reactive
+    /// (post-401) refresh path. `None` in production, which uses each
+    /// provider's static `registry::oauth_config` token_url.
+    oauth_token_url_override: Option<String>,
 }
 
 impl RouterServer {
@@ -45,7 +50,18 @@ impl RouterServer {
                 shutdown: None,
                 port: 0,
             }),
+            oauth_token_url_override: Mutex::new(None),
         }
+    }
+
+    /// Test-only seam: point the reactive (post-401) OAuth refresh path at a
+    /// mock token endpoint instead of the real, static registry URL. Must be
+    /// called before [`start`](Self::start) — it's read once when the server
+    /// starts. Never set this in production code; `None` (the default) uses
+    /// each provider's real token endpoint.
+    #[doc(hidden)]
+    pub fn set_oauth_token_url_override(&self, url: Option<String>) {
+        *self.oauth_token_url_override.lock().unwrap() = url;
     }
 
     pub fn status(&self) -> RouterStatus {
@@ -66,6 +82,7 @@ impl RouterServer {
         let state = AppState {
             store: self.store.clone(),
             http: reqwest::Client::new(),
+            oauth_token_url_override: self.oauth_token_url_override.lock().unwrap().clone(),
         };
         let app = Router::new()
             .route("/v1/messages", post(handle_messages))
@@ -350,9 +367,19 @@ async fn send_upstream(
 ) -> anyhow::Result<reqwest::Response> {
     let resp = upstream_request(state, target, body)?.send().await?;
     if matches!(resp.status().as_u16(), 401 | 403) && connections::is_oauth(&target.conn) {
-        let refreshed = oauth::refresh::force_refresh(&state.store, &state.http, &mut target.conn)
+        let refreshed = match &state.oauth_token_url_override {
+            Some(token_url) => oauth::refresh::force_refresh_with_token_url(
+                &state.store,
+                &state.http,
+                &mut target.conn,
+                token_url,
+            )
             .await
-            .is_ok();
+            .is_ok(),
+            None => oauth::refresh::force_refresh(&state.store, &state.http, &mut target.conn)
+                .await
+                .is_ok(),
+        };
         if refreshed {
             return Ok(upstream_request(state, target, body)?.send().await?);
         }
@@ -1142,6 +1169,7 @@ mod tests {
         AppState {
             store,
             http: reqwest::Client::new(),
+            oauth_token_url_override: None,
         }
     }
 

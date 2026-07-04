@@ -83,8 +83,12 @@ pub async fn ensure_fresh(
 }
 
 /// Reactive refresh: unconditional, single-flight refresh — used after a
-/// request comes back 401. On a terminal provider error this marks the
-/// connection `needs_relogin`, persists that, and returns `Err`.
+/// request comes back 401. Unlike [`ensure_fresh`], this ALWAYS performs the
+/// network round-trip, even if the connection's `expires_at`/`last_refresh_at`
+/// make it look fresh: a 401 means the upstream rejected the token (commonly
+/// revoked server-side while still technically unexpired), so re-sending the
+/// same token would just 401 again. On a terminal provider error this marks
+/// the connection `needs_relogin`, persists that, and returns `Err`.
 pub async fn force_refresh(
     store: &Arc<Store>,
     http: &reqwest::Client,
@@ -92,37 +96,71 @@ pub async fn force_refresh(
 ) -> Result<()> {
     let cfg = oauth_config(&conn.provider)
         .ok_or_else(|| anyhow!("no OAuth config for provider `{}`", conn.provider))?;
-    refresh_at(store, http, conn, cfg.token_url).await
+    force_refresh_with_token_url(store, http, conn, cfg.token_url).await
+}
+
+/// Same as [`force_refresh`] but against an explicit `token_url` (so tests —
+/// and the router's per-`AppState` override — can point it at a mock server
+/// instead of the provider's real, static registry endpoint).
+pub async fn force_refresh_with_token_url(
+    store: &Arc<Store>,
+    http: &reqwest::Client,
+    conn: &mut ConnectionRow,
+    token_url: &str,
+) -> Result<()> {
+    refresh_at_impl(store, http, conn, token_url, true).await
 }
 
 /// Single-flight refresh against an explicit `token_url` (so tests can point
 /// this at a mock server). Acquires the per-connection-id lock, re-reads the
 /// connection from the store (another task may have already refreshed it
 /// while we were waiting), and skips the HTTP round-trip if it's fresh now.
+/// This is the PROACTIVE seam — it still honors the freshness short-circuit.
+/// For the reactive (post-401) seam that must never short-circuit, use
+/// [`force_refresh`] / [`force_refresh_with_token_url`].
 pub async fn refresh_at(
     store: &Arc<Store>,
     http: &reqwest::Client,
     conn: &mut ConnectionRow,
     token_url: &str,
 ) -> Result<()> {
+    refresh_at_impl(store, http, conn, token_url, false).await
+}
+
+/// Shared implementation behind [`refresh_at`] (proactive, `force = false`)
+/// and [`force_refresh_with_token_url`] (reactive, `force = true`). When
+/// `force` is true the freshness short-circuit below is skipped, so the
+/// network round-trip always happens.
+async fn refresh_at_impl(
+    store: &Arc<Store>,
+    http: &reqwest::Client,
+    conn: &mut ConnectionRow,
+    token_url: &str,
+    force: bool,
+) -> Result<()> {
     let lock = lock_for(&conn.id);
     let _guard = lock.lock().await;
 
     // Someone else may have refreshed this connection while we waited for
     // the lock — re-read and, if it's fresh now (per the provider's own
-    // policy), just adopt that state instead of hitting the network again.
+    // policy) AND we're not forcing, just adopt that state instead of
+    // hitting the network again. The forced (reactive) path always adopts
+    // the latest persisted state as its refresh base below, but never skips
+    // the network round-trip on freshness alone — a 401 already told us the
+    // "fresh" token was rejected.
     if let Some(latest) = get_connection(store, &conn.id).await? {
         let stale = match oauth_config(&conn.provider) {
             Some(cfg) => needs_refresh(cfg, &latest.data, now_ms()),
             None => true,
         };
-        if !stale {
+        if !force && !stale {
             conn.data = latest.data;
             conn.updated_at = latest.updated_at;
             return Ok(());
         }
         // Adopt the latest persisted state as our refresh base (keeps the
-        // refresh token current even if we're not fresh yet).
+        // refresh token current even if we're not fresh yet, or if we're
+        // forcing regardless of freshness).
         conn.data = latest.data;
         conn.updated_at = latest.updated_at;
     }
@@ -546,5 +584,87 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    /// The reactive (post-401) path must ALWAYS hit the network, even when
+    /// the connection's own `expires_at`/`last_refresh_at` make it look
+    /// fresh — a 401 already told the caller the "fresh" token was rejected
+    /// (e.g. revoked server-side), so re-adopting the same stored token
+    /// without a network round trip would just 401 again on retry.
+    #[tokio::test]
+    async fn force_refresh_hits_network_even_when_token_looks_fresh() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let hit = std::sync::Arc::new(AtomicBool::new(false));
+        let hit_for_handler = hit.clone();
+        let app = Router::new().route(
+            "/token",
+            post(move |Json(_b): Json<serde_json::Value>| {
+                let hit = hit_for_handler.clone();
+                async move {
+                    hit.store(true, Ordering::SeqCst);
+                    Json(serde_json::json!({"access_token":"at-forced-new","refresh_token":"rt-forced-new","expires_in":3600}))
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let http = reqwest::Client::new();
+        let now = crate::paths::now_ms();
+        let mut conn = ConnectionRow {
+            id: "c8".into(),
+            provider: "anthropic-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "forced".into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                access_token: Some("at-fresh".into()),
+                refresh_token: Some("rt-fresh".into()),
+                // FAR in the future -> needs_refresh is false, i.e. the
+                // proactive check would consider this connection fresh.
+                expires_at: Some(now + 30 * 24 * 3600 * 1000),
+                last_refresh_at: Some(now),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        crate::llm_router::connections::add_connection(&store, conn.clone())
+            .await
+            .unwrap();
+
+        // Sanity: this connection genuinely looks fresh under the proactive
+        // policy — the bug this test guards against is force_refresh
+        // re-using that same short-circuit.
+        let cfg = oauth_config(&conn.provider).unwrap();
+        assert!(!needs_refresh(cfg, &conn.data, crate::paths::now_ms()));
+
+        force_refresh_with_token_url(
+            &store,
+            &http,
+            &mut conn,
+            &format!("http://127.0.0.1:{port}/token"),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            hit.load(Ordering::SeqCst),
+            "force_refresh must hit the network even when the token looks fresh"
+        );
+        assert_eq!(conn.data.access_token.as_deref(), Some("at-forced-new"));
+        let stored = crate::llm_router::connections::get_connection(&store, "c8")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.data.access_token.as_deref(), Some("at-forced-new"));
     }
 }
