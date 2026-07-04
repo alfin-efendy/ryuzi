@@ -61,7 +61,15 @@ export const useTerms = create<TermsState>((set, get) => {
     active: {},
 
     open: async (sessionPk) => {
-      const inst = await createTerm(sessionPk);
+      let inst: Awaited<ReturnType<typeof createTerm>>;
+      try {
+        // createTerm can reject if the one-time event-listener registration
+        // fails (see term-cache); the Result branch below stays for open errors.
+        inst = await createTerm(sessionPk);
+      } catch (e) {
+        toast.error(`Terminal failed to open: ${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
       if ("error" in inst) {
         toast.error(`Terminal failed to open: ${inst.error}`);
         return;

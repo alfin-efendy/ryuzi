@@ -33,11 +33,13 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
   const copyOnSelect = useTerms((s) => s.copyOnSelect);
   const setCopyOnSelect = useTerms((s) => s.setCopyOnSelect);
 
-  // First open of the drawer spawns Terminal 1 (StrictMode-safe: the store's
-  // module-level in-flight guard survives dev double-mount).
+  // Spawn Terminal 1 only on mount / session change — not whenever the tab list
+  // empties. ensureOne self-guards on existing tabs + an in-flight open, so this
+  // is StrictMode-safe. Closing the last tab therefore leaves the drawer empty
+  // (see the empty state below) instead of instantly respawning a terminal.
   useEffect(() => {
-    if (tabs.length === 0) void ensureOne(sessionPk);
-  }, [tabs.length, sessionPk, ensureOne]);
+    void ensureOne(sessionPk);
+  }, [sessionPk, ensureOne]);
 
   const active = tabs.find((t) => t.termId === activeId) ?? tabs[0];
   const inst = active ? getTerm(active.termId) : undefined;
@@ -116,7 +118,9 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
       {inst ? (
         <TerminalHost inst={inst} className="flex-1" />
       ) : (
-        <div className="flex flex-1 items-center justify-center font-sans text-[12.5px] text-muted-foreground">Opening terminal…</div>
+        <div className="flex flex-1 items-center justify-center font-sans text-[12.5px] text-muted-foreground">
+          No terminal — press + to open one.
+        </div>
       )}
     </div>
   );

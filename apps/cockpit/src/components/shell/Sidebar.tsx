@@ -86,11 +86,16 @@ export function Sidebar() {
       // Shells opened for this session hold their cwd inside the worktree;
       // kill them first or the directory removal fails on Windows.
       await commands.termCloseSession(s.sessionPk);
-      useTerms.getState().disposeSession(s.sessionPk);
       const ok = await end(s.sessionPk);
       if (!ok) return; // end() already toasted; leave the row visible
       setArchived(s.sessionPk, true);
       if (focusedSessionPk === s.sessionPk) setFocused(null);
+      // Drop the JS-side terminal cache only now — after teardown succeeded and
+      // the drawer has unmounted (setFocused(null)). Emptying the tabs earlier
+      // would let the drawer's auto-spawn open a fresh PTY into the worktree
+      // being removed. termCloseSession already emitted the exit events, so on
+      // the failure path above we intentionally leave the cache alone.
+      useTerms.getState().disposeSession(s.sessionPk);
     } finally {
       setArchivingPk(null);
       setConfirmArchive(null);

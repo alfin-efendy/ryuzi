@@ -71,10 +71,19 @@ export function sanitizeRightTab(raw: string | null): RightTab {
   return raw === "file" ? "file" : "review";
 }
 
-function readInt(key: string, fallback: number): number {
-  if (typeof localStorage === "undefined") return fallback;
-  const n = Number(localStorage.getItem(key));
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+/** Parse a persisted panel size and clamp it to the current viewport. A size
+ *  saved on a large monitor must not exceed a smaller window on the next launch,
+ *  so we clamp on read (not just on resize). Missing/invalid values fall back to
+ *  the default (itself clamped, though the default always fits). Pure — the
+ *  caller supplies the raw string and viewport so it stays unit-testable. */
+export function readClampedPanelSize(raw: string | null, viewport: number, b: { min: number; def: number; maxFrac: number }): number {
+  const n = Number(raw);
+  const px = raw !== null && Number.isFinite(n) && n > 0 ? n : b.def;
+  return clampPanelSize(px, viewport, b);
+}
+
+function readStored(key: string): string | null {
+  return typeof localStorage !== "undefined" ? localStorage.getItem(key) : null;
 }
 
 function persist(key: string, value: string): void {
@@ -118,8 +127,12 @@ export const useNav = create<NavState>((set, get) => ({
   bottomOpen: readBool(KEY_BOTTOM_OPEN, false),
   rightOpen: readBool(KEY_RIGHT_OPEN, false),
   rightTab: sanitizeRightTab(typeof localStorage !== "undefined" ? localStorage.getItem(KEY_RIGHT_TAB) : null),
-  rightWidth: readInt(KEY_RIGHT_WIDTH, RIGHT_WIDTH.def),
-  bottomHeight: readInt(KEY_BOTTOM_HEIGHT, BOTTOM_HEIGHT.def),
+  rightWidth: readClampedPanelSize(readStored(KEY_RIGHT_WIDTH), typeof window !== "undefined" ? window.innerWidth : 1920, RIGHT_WIDTH),
+  bottomHeight: readClampedPanelSize(
+    readStored(KEY_BOTTOM_HEIGHT),
+    typeof window !== "undefined" ? window.innerHeight : 1080,
+    BOTTOM_HEIGHT,
+  ),
   rightMaximized: false,
   searchQuery: "",
   composerAgent: "claude",

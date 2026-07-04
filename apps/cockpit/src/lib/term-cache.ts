@@ -23,7 +23,11 @@ export type TermInstance = {
 const cache = new Map<string, TermInstance>();
 let copyOnSelect = false;
 let onExit: ((termId: string) => void) | null = null;
-let listening = false;
+// The in-flight (or resolved) listener registration. Caching the Promise — not a
+// boolean — means concurrent createTerm calls all await the same registration
+// (no lost first bytes), and a rejected registration resets to null so a later
+// open can retry instead of leaving terminal output dead app-wide.
+let listenersReady: Promise<void> | null = null;
 
 export function setCopyOnSelect(v: boolean): void {
   copyOnSelect = v;
@@ -33,17 +37,27 @@ export function setOnExit(fn: (termId: string) => void): void {
   onExit = fn;
 }
 
-async function ensureListeners(): Promise<void> {
-  if (listening) return;
-  listening = true;
-  await events.termOutputMsg.listen((e) => {
-    cache.get(e.payload.id)?.term.write(e.payload.data);
-  });
-  await events.termExitMsg.listen((e) => {
-    const inst = cache.get(e.payload.id);
-    if (inst) inst.term.write("\r\n\x1b[90m[process exited]\x1b[0m\r\n");
-    onExit?.(e.payload.id);
-  });
+function ensureListeners(): Promise<void> {
+  listenersReady ??= registerListeners();
+  return listenersReady;
+}
+
+async function registerListeners(): Promise<void> {
+  try {
+    await events.termOutputMsg.listen((e) => {
+      cache.get(e.payload.id)?.term.write(e.payload.data);
+    });
+    await events.termExitMsg.listen((e) => {
+      const inst = cache.get(e.payload.id);
+      if (inst) inst.term.write("\r\n\x1b[90m[process exited]\x1b[0m\r\n");
+      onExit?.(e.payload.id);
+    });
+  } catch (err) {
+    // Registration failed — reset so the next createTerm retries. Rethrow so the
+    // caller (store-terms open) can surface the failure to the user.
+    listenersReady = null;
+    throw err;
+  }
 }
 
 export function getTerm(termId: string): TermInstance | undefined {
