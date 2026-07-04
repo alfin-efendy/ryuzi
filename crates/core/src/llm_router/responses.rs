@@ -27,7 +27,9 @@ pub fn responses_request_to_chat(body: &Value) -> Value {
     let mut pending_tool_calls: Vec<Value> = Vec::new();
     let flush_tools = |msgs: &mut Vec<Value>, tc: &mut Vec<Value>| {
         if !tc.is_empty() {
-            msgs.push(json!({"role": "assistant", "content": Value::Null, "tool_calls": tc.clone()}));
+            msgs.push(
+                json!({"role": "assistant", "content": Value::Null, "tool_calls": tc.clone()}),
+            );
             tc.clear();
         }
     };
@@ -42,7 +44,13 @@ pub fn responses_request_to_chat(body: &Value) -> Value {
                 let itype = item["type"]
                     .as_str()
                     .map(|s| s.to_string())
-                    .unwrap_or_else(|| if item.get("role").is_some() { "message".into() } else { String::new() });
+                    .unwrap_or_else(|| {
+                        if item.get("role").is_some() {
+                            "message".into()
+                        } else {
+                            String::new()
+                        }
+                    });
                 match itype.as_str() {
                     "message" => {
                         flush_tools(&mut messages, &mut pending_tool_calls);
@@ -84,10 +92,12 @@ pub fn responses_request_to_chat(body: &Value) -> Value {
         let mapped: Vec<Value> = tools
             .iter()
             .filter(|t| t["name"].is_string())
-            .map(|t| json!({"type": "function", "function": {
-                "name": t["name"], "description": t["description"],
-                "parameters": normalize_params(&t["parameters"]),
-            }}))
+            .map(|t| {
+                json!({"type": "function", "function": {
+                    "name": t["name"], "description": t["description"],
+                    "parameters": normalize_params(&t["parameters"]),
+                }})
+            })
             .collect();
         if !mapped.is_empty() {
             out.insert("tools".into(), Value::Array(mapped));
@@ -177,7 +187,10 @@ mod tests {
         assert_eq!(msgs[0]["role"], "assistant");
         assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(msgs[0]["tool_calls"][0]["function"]["name"], "get_weather");
-        assert_eq!(msgs[1], json!({"role": "tool", "tool_call_id": "call_1", "content": "sunny"}));
+        assert_eq!(
+            msgs[1],
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "sunny"})
+        );
     }
 
     #[test]
@@ -189,7 +202,10 @@ mod tests {
 
         let empty = json!({"model": "m", "input": []});
         let out = responses_request_to_chat(&empty);
-        assert_eq!(out["messages"][0], json!({"role": "user", "content": "..."}));
+        assert_eq!(
+            out["messages"][0],
+            json!({"role": "user", "content": "..."})
+        );
     }
 
     #[test]
@@ -198,7 +214,10 @@ mod tests {
             "tools": [{"type": "function", "name": "f", "description": "d",
                        "parameters": {"type": "object"}}]});
         let out = responses_request_to_chat(&req);
-        assert_eq!(out["tools"][0], json!({"type": "function",
-            "function": {"name": "f", "description": "d", "parameters": {"type": "object"}}}));
+        assert_eq!(
+            out["tools"][0],
+            json!({"type": "function",
+            "function": {"name": "f", "description": "d", "parameters": {"type": "object"}}})
+        );
     }
 }

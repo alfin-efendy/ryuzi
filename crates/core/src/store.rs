@@ -1051,8 +1051,12 @@ impl Store {
             let rows = stmt
                 .query_map(params![since, conn_filter], |r| {
                     Ok(UsageDayRow {
-                        day: r.get(0)?, connection_id: r.get(1)?, model: r.get(2)?,
-                        requests: r.get(3)?, input_tokens: r.get(4)?, output_tokens: r.get(5)?,
+                        day: r.get(0)?,
+                        connection_id: r.get(1)?,
+                        model: r.get(2)?,
+                        requests: r.get(3)?,
+                        input_tokens: r.get(4)?,
+                        output_tokens: r.get(5)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1072,8 +1076,10 @@ impl Store {
             let rows = stmt
                 .query_map(params![day], |r| {
                     Ok(UsageTotalRow {
-                        connection_id: r.get(0)?, requests: r.get(1)?,
-                        input_tokens: r.get(2)?, output_tokens: r.get(3)?,
+                        connection_id: r.get(0)?,
+                        requests: r.get(1)?,
+                        input_tokens: r.get(2)?,
+                        output_tokens: r.get(3)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1637,17 +1643,31 @@ mod tests {
 
         store
             .record_request(UsageRecord {
-                connection_id: "c1".into(), provider: "openai".into(), model: "gpt-x".into(),
-                client_format: "openai".into(), input_tokens: 10, output_tokens: 5,
-                status_code: 200, duration_ms: 42, error: None, ts: base,
+                connection_id: "c1".into(),
+                provider: "openai".into(),
+                model: "gpt-x".into(),
+                client_format: "openai".into(),
+                input_tokens: 10,
+                output_tokens: 5,
+                status_code: 200,
+                duration_ms: 42,
+                error: None,
+                ts: base,
             })
             .await
             .unwrap();
         store
             .record_request(UsageRecord {
-                connection_id: "c1".into(), provider: "openai".into(), model: "gpt-x".into(),
-                client_format: "openai".into(), input_tokens: 7, output_tokens: 3,
-                status_code: 200, duration_ms: 30, error: None, ts: base + 1000,
+                connection_id: "c1".into(),
+                provider: "openai".into(),
+                model: "gpt-x".into(),
+                client_format: "openai".into(),
+                input_tokens: 7,
+                output_tokens: 3,
+                status_code: 200,
+                duration_ms: 30,
+                error: None,
+                ts: base + 1000,
             })
             .await
             .unwrap();
@@ -1673,9 +1693,16 @@ mod tests {
         let old = 1_000_000_000_000_i64;
         store
             .record_request(UsageRecord {
-                connection_id: "c1".into(), provider: "p".into(), model: "m".into(),
-                client_format: "openai".into(), input_tokens: 1, output_tokens: 1,
-                status_code: 200, duration_ms: 1, error: None, ts: old,
+                connection_id: "c1".into(),
+                provider: "p".into(),
+                model: "m".into(),
+                client_format: "openai".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                status_code: 200,
+                duration_ms: 1,
+                error: None,
+                ts: old,
             })
             .await
             .unwrap();

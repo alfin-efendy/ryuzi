@@ -1031,14 +1031,20 @@ mod tests {
         assert_eq!(ev[0].0, "error");
         assert_eq!(ev[0].1["type"], "error");
         assert_eq!(ev[0].1["error"]["type"], "api_error");
-        assert_eq!(ev[0].1["error"]["message"], "upstream stream interrupted: boom");
+        assert_eq!(
+            ev[0].1["error"]["message"],
+            "upstream stream interrupted: boom"
+        );
     }
 
     #[test]
     fn anthropic_to_openai_error_frame_is_openai_shaped() {
         let s = AnthropicToOpenAiStream::new();
         let chunk = s.error_frame("upstream stream interrupted: boom");
-        assert_eq!(chunk["error"]["message"], "upstream stream interrupted: boom");
+        assert_eq!(
+            chunk["error"]["message"],
+            "upstream stream interrupted: boom"
+        );
         assert_eq!(chunk["error"]["type"], "api_error");
     }
 }

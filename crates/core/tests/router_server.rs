@@ -479,16 +479,26 @@ async fn anthropic_client_gets_error_frame_when_upstream_truncates() {
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
     let (up_port, _h) = mock_truncating_openai_upstream().await;
     // custom-openai connection pointing at the truncating mock
-    connections::add_connection(&store, connections::ConnectionRow {
-        id: "c1".into(), provider: "custom-openai".into(), auth_type: "api_key".into(),
-        label: "mock".into(), priority: 0, enabled: true,
-        data: connections::ConnectionData {
-            api_key: Some("k".into()),
-            base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
-            models_override: Some(vec!["mock-model".into()]),
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "c1".into(),
+            provider: "custom-openai".into(),
+            auth_type: "api_key".into(),
+            label: "mock".into(),
+            priority: 0,
+            enabled: true,
+            data: connections::ConnectionData {
+                api_key: Some("k".into()),
+                base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
+                models_override: Some(vec!["mock-model".into()]),
+            },
+            created_at: 0,
+            updated_at: 0,
         },
-        created_at: 0, updated_at: 0,
-    }).await.unwrap();
+    )
+    .await
+    .unwrap();
     let key = keys::create_key(&store, "t").await.unwrap();
     let srv = RouterServer::new(store.clone());
     let port = srv.start(0).await.unwrap();
@@ -497,16 +507,26 @@ async fn anthropic_client_gets_error_frame_when_upstream_truncates() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("x-api-key", &key.key)
-        .json(&json!({"model": "custom-openai/mock-model", "max_tokens": 16, "stream": true,
-                      "messages": [{"role": "user", "content": "hi"}]}))
-        .send().await.unwrap();
+        .json(
+            &json!({"model": "custom-openai/mock-model", "max_tokens": 16, "stream": true,
+                      "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     // saw the partial content...
     assert!(body.contains("content_block_delta"));
     // ...and a terminal ERROR event, NOT a clean message_stop
-    assert!(body.contains("event: error"), "expected error frame, got: {body}");
-    assert!(!body.contains("event: message_stop"), "must not fake a clean finish: {body}");
+    assert!(
+        body.contains("event: error"),
+        "expected error frame, got: {body}"
+    );
+    assert!(
+        !body.contains("event: message_stop"),
+        "must not fake a clean finish: {body}"
+    );
 
     srv.stop().await;
 }
@@ -560,7 +580,8 @@ async fn served_request_records_usage() {
     let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let rows = store.usage_daily(None, &day).await.unwrap();
     assert!(
-        rows.iter().any(|r| r.connection_id == "c1" && r.requests >= 1),
+        rows.iter()
+            .any(|r| r.connection_id == "c1" && r.requests >= 1),
         "expected a usage_daily row for c1, got {rows:?}"
     );
 }

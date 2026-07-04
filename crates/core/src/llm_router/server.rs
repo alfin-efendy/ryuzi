@@ -540,7 +540,8 @@ fn spawn_openai_to_anthropic_pump(
             let chunk = match item {
                 Ok(c) => c,
                 Err(e) => {
-                    for (name, data) in tr.error_frame(&format!("upstream stream interrupted: {e}")) {
+                    for (name, data) in tr.error_frame(&format!("upstream stream interrupted: {e}"))
+                    {
                         let _ = tx.send(Ok(format_sse(&name, &data))).await;
                     }
                     errored = true;
@@ -583,7 +584,11 @@ fn spawn_openai_to_anthropic_pump(
     Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-fn spawn_anthropic_to_openai_pump(resp: reqwest::Response, store: Arc<Store>, ctx: RecordCtx) -> Body {
+fn spawn_anthropic_to_openai_pump(
+    resp: reqwest::Response,
+    store: Arc<Store>,
+    ctx: RecordCtx,
+) -> Body {
     use futures::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -596,7 +601,9 @@ fn spawn_anthropic_to_openai_pump(resp: reqwest::Response, store: Arc<Store>, ct
                 Ok(c) => c,
                 Err(e) => {
                     let err = tr.error_frame(&format!("upstream stream interrupted: {e}"));
-                    let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {err}\n\n")))).await;
+                    let _ = tx
+                        .send(Ok(bytes::Bytes::from(format!("data: {err}\n\n"))))
+                        .await;
                     errored = true;
                     break;
                 }
