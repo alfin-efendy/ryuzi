@@ -487,6 +487,125 @@ async termCloseSession(sessionPk: string) : Promise<Result<null, CmdError>> {
 },
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
+},
+async endpointStatus() : Promise<Result<EndpointStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("endpoint_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async startEndpoint() : Promise<Result<EndpointStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_endpoint") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async stopEndpoint() : Promise<Result<EndpointStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_endpoint") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Persist port + autostart; restart the server when it was running.
+ */
+async setEndpointConfig(port: number, autostart: boolean) : Promise<Result<EndpointStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_endpoint_config", { port, autostart }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listEndpointKeys() : Promise<Result<EndpointKeyInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_endpoint_keys") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createEndpointKey(name: string) : Promise<Result<EndpointKeyInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_endpoint_key", { name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async revokeEndpointKey(id: string) : Promise<Result<EndpointKeyInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("revoke_endpoint_key", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listProviderCatalog() : Promise<Result<CatalogEntry[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_provider_catalog") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listConnections() : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_connections") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addConnection(provider: string, label: string, apiKey: string, baseUrl: string | null) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_connection", { provider, label, apiKey, baseUrl }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateConnection(id: string, label: string, enabled: boolean, apiKey: string | null, baseUrl: string | null, models: string[]) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_connection", { id, label, enabled, apiKey, baseUrl, models }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeConnection(id: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_connection", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async moveConnection(id: string, dir: number) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("move_connection", { id, dir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Hit the upstream's model-list (openai) / a 1-token message (anthropic)
+ * to distinguish bad key (401/403) from network trouble.
+ */
+async testConnection(id: string) : Promise<Result<TestResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("test_connection", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -525,7 +644,13 @@ env: string[]; url: string | null; version: string | null; publisher: string | n
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
+export type CatalogEntry = { id: string; name: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
 export type CmdError = { message: string }
+export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; baseUrl: string | null; models: string[]; 
+/**
+ * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
+ */
+keyMasked: string | null }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
@@ -536,6 +661,8 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 { kind: "jobRunChanged"; job_id: string; run_id: string; status: string }
 export type CoreEventMsg = { event: CoreEvent }
 export type DirEntryInfo = { name: string; dir: boolean }
+export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
+export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string; 
 /**
@@ -591,6 +718,7 @@ export type TermOutputMsg = { id: string;
  * UTF-8 chunk (lossy) of PTY output.
  */
 data: string }
+export type TestResult = { ok: boolean; message: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type ToolInfo = { name: string; desc: string; perm: string }
 export type UsagePoint = { day: string; 

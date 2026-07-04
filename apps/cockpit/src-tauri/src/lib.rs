@@ -2,6 +2,8 @@ mod accent;
 mod apps_cmd;
 mod backdrop;
 mod commands;
+mod connections_cmd;
+mod endpoint_cmd;
 mod error;
 mod events;
 mod fsview_cmd;
@@ -227,6 +229,20 @@ fn make_builder() -> Builder<tauri::Wry> {
             term::term_close,
             term::term_close_session,
             accent::system_accent_color,
+            endpoint_cmd::endpoint_status,
+            endpoint_cmd::start_endpoint,
+            endpoint_cmd::stop_endpoint,
+            endpoint_cmd::set_endpoint_config,
+            endpoint_cmd::list_endpoint_keys,
+            endpoint_cmd::create_endpoint_key,
+            endpoint_cmd::revoke_endpoint_key,
+            connections_cmd::list_provider_catalog,
+            connections_cmd::list_connections,
+            connections_cmd::add_connection,
+            connections_cmd::update_connection,
+            connections_cmd::remove_connection,
+            connections_cmd::move_connection,
+            connections_cmd::test_connection,
         ])
         .events(collect_events![
             events::CoreEventMsg,
@@ -278,8 +294,25 @@ pub fn run() {
             // The scheduler loop fires enabled jobs for real (30s tick). Runs
             // on the tauri async runtime — setup() has no ambient tokio context.
             tauri::async_runtime::spawn(ryuzi_core::scheduler::run_loop(cp.clone()));
+            // Capture clones BEFORE app.manage(cp) moves the Arc away.
+            let cp2 = cp.clone();
             // Make Arc<ControlPlane> available to all Tauri commands.
             app.manage(cp);
+            // Local router endpoint server (Models → Endpoint).
+            let router_srv = std::sync::Arc::new(
+                ryuzi_core::router::server::RouterServer::new(cp2.store().clone()),
+            );
+            app.manage(router_srv.clone());
+            let cp3 = cp2.clone();
+            tauri::async_runtime::spawn(async move {
+                let auto = cp3.store().get_setting("endpoint_autostart").await.ok().flatten();
+                if auto.as_deref() == Some("1") {
+                    let port = endpoint_cmd::configured_port(&cp3).await;
+                    if let Err(e) = router_srv.start(port).await {
+                        eprintln!("[ryuzi] endpoint autostart failed: {e}");
+                    }
+                }
+            });
             // UI terminal registry (session shells over portable-pty).
             app.manage(std::sync::Arc::new(term::UiTerms::default()));
             // Apply the OS backdrop (mica/vibrancy) at runtime and record what
