@@ -4,6 +4,11 @@ Use this file as the root instruction set for the whole monorepo. Prefer the
 nearest nested `AGENTS.md` if one is added later, but keep these root rules in
 force unless a more specific file overrides them.
 
+The product is the Rust CLI (`ryuzi`, built from `crates/cli`) running on the
+Rust engine (`crates/core`). The Cockpit desktop app is a thin Tauri UI over
+the same engine. There is no TypeScript CLI, protocol package, or TS core —
+those were removed when the Rust rewrite shipped.
+
 ## 1. Commands First
 
 Run commands from the repo root unless a command explicitly uses `--cwd` or
@@ -14,17 +19,18 @@ changes directory.
 | Install all dev deps | `bun install` |
 | First-time setup | `make setup` |
 | Toolchain check | `make doctor` |
+| Run the ryuzi CLI from source | `cargo run -p ryuzi-cli -- <args>` or `make cli ARGS="<args>"` |
 | Run Cockpit desktop app | `bun run cockpit:dev` or `make dev` |
 | Build Cockpit desktop app | `bun run cockpit:build` or `make build` |
-| Run current source CLI | `bun run ryuzi -- <args>` |
 | Run JS/TS tests | `bun test` |
-| Run Rust tests | `cargo test` |
+| Run Rust tests | `cargo test -p ryuzi-core -p ryuzi-cli` (or `cargo test` for the whole workspace) |
 | Run all tests | `make test-all` |
 | Type-check TS workspaces | `bun run typecheck` |
-| Lint | `bun run lint` |
+| Lint JS/TS | `bun run lint` |
+| Lint Rust | `cargo clippy -p ryuzi-core -p ryuzi-cli --all-targets -- -D warnings` |
 | Format JS/TS and Rust | `bun run format && cargo fmt` or `make format` |
 | Pre-commit JS gate | `make check` |
-| Build CLI smoke binary | `bun build apps/cli/src/cli/index.ts --compile --target=bun-linux-x64 --outfile dist/ryuzi` |
+| CLI smoke test | `cargo build -p ryuzi-cli && ./target/debug/ryuzi --version && ./target/debug/ryuzi --help` |
 
 Use Bun for JavaScript and TypeScript work:
 
@@ -38,6 +44,7 @@ Use Bun for JavaScript and TypeScript work:
 Rust work uses Cargo:
 
 - Use `cargo test`, `cargo fmt`, and `cargo clippy` when touching Rust crates.
+- Keep clippy clean: CI fails on any warning in `ryuzi-core` and `ryuzi-cli`.
 - Do not replace existing Rust workspace conventions with JS tooling.
 
 ## 2. Reality Check Before Editing
@@ -54,52 +61,57 @@ Before changing code or docs, inspect the real project state:
 5. Preserve unrelated worktree changes. Other agents may be working in the same
    repo or in Ryuzi worktrees.
 
-The Rust CLI rewrite is active work in parallel. If a branch named
-`feat/rust-cli-4*` or similar is available, inspect it before touching CLI
-ownership, packaging, release, or docs. If it is not available locally or on
-`origin`, say that clearly and make the smallest compatible change.
-
 ## 3. Monorepo Map
 
-Ryuzi is a Bun workspaces monorepo plus a Cargo workspace.
+Ryuzi is a Cargo workspace (the product) plus a Bun workspaces monorepo (the
+desktop UI and shared web UI).
 
 | Path | Role | Primary tooling |
 | --- | --- | --- |
-| `apps/cli` | Current TypeScript CLI and Ink TUI | Bun, React, Ink |
+| `crates/core` | `ryuzi-core` — engine: control plane, store (SQLite), gateways (Discord), harness, LLM router, scheduler, settings, telemetry, update, worktrees | Cargo |
+| `crates/cli` | `ryuzi-cli` — the `ryuzi` CLI and ratatui TUI (the product binary) | Cargo |
 | `apps/cockpit` | Tauri desktop app frontend | Bun, Vite, React, Tailwind v4 |
-| `apps/cockpit/src-tauri` | Tauri shell and desktop commands | Cargo, Tauri 2 |
-| `apps/mission-control` | Planned web app | Bun, future `@ryuzi/protocol` client |
-| `apps/mobile` | Planned mobile app | Future mobile stack |
-| `packages/core` | TS control plane, config, store, agents, gateways | Bun |
-| `packages/protocol` | Runtime-free shared contracts | TypeScript only |
-| `packages/ui` | Shared React UI system | React, Tailwind v4, shadcn, lucide |
-| `crates/core` | Rust core library for durable control plane pieces | Cargo |
-| `crates/hook` | `ryuzi-hook` Rust binary | Cargo |
-| `npm/ryuzi` and `npm/platform/*` | Published npm launcher/packages | Bun/npm packaging |
-| `assets/brand` | Brand assets | Do not regenerate casually |
-| `docs` | Project documentation | Markdown |
+| `apps/cockpit/src-tauri` | `ryuzi-cockpit` — Tauri shell and desktop commands, depends on `ryuzi-core` | Cargo, Tauri 2 |
+| `apps/mission-control` | Planned web app (not implemented) | Bun |
+| `apps/mobile` | Planned mobile app (not implemented) | Future mobile stack |
+| `packages/ui` | `@ryuzi/ui` — shared React design system | React, Tailwind v4, shadcn, lucide |
+| `npm/ryuzi` + `npm/platform/*` | npm launcher that spawns the prebuilt Rust binary | Node launcher, npm packaging |
+| `scripts` | Release/packaging helpers (`scripts/npm`) and test helpers | Bun |
+| `assets/brand` | Brand assets (canonical source; see its README) | Do not regenerate casually |
+| `docs` | Project documentation (`docs/development/setup.md`) | Markdown |
 
 Keep dependencies flowing inward:
 
-- Apps can import packages.
-- `packages/core` can import `packages/protocol`.
-- `packages/protocol` must stay runtime-free and portable.
-- `packages/ui` should not depend on app-specific state.
-- Rust crates should expose clean boundaries for Tauri/CLI consumers instead of
-  reaching into TS app internals.
+- `crates/cli` and `apps/cockpit/src-tauri` depend on `crates/core`; the engine
+  never depends on its consumers.
+- `apps/cockpit` imports `packages/ui`; `packages/ui` must not depend on
+  app-specific state.
+- The Cockpit frontend talks to Rust only through the generated bindings
+  (`apps/cockpit/src/bindings.ts`), never by duplicating engine types by hand.
 
 ## 4. Area Rules
 
-### CLI
+### CLI (Rust)
 
-- Current source CLI entrypoint is `apps/cli/src/cli/index.ts`.
-- Run it with `bun run ryuzi -- <args>`.
-- CLI tests live under `apps/cli/test`.
-- Keep terminal UI changes covered by Ink tests where possible.
-- Do not assume the TypeScript CLI remains the long-term source of truth while
-  the Rust CLI rewrite is in flight. Check active branches/worktrees first.
+- Source lives in `crates/cli`; the binary is named `ryuzi`
+  (`crates/cli/src/main.rs`, library in `src/lib.rs`, TUI under `src/tui`).
+- Run it with `cargo run -p ryuzi-cli -- <args>`.
+- Tests are inline `#[cfg(test)]` modules plus integration tests in
+  `crates/cli/tests` (assert_cmd, insta snapshots).
+- The CLI's brand identity is text-only: glyph `r`, name `ryuzi`
+  (see `assets/brand/README.md`).
 - Do not change npm launcher behavior in `npm/ryuzi` or `npm/platform/*`
   without checking packaging and release workflows.
+
+### Engine (crates/core)
+
+- `ryuzi-core` owns runtime behavior: control plane, SQLite store, gateways,
+  harness sessions, LLM router, scheduler, settings, telemetry, updates, and
+  worktrees.
+- Database access goes through `Store::with_conn`; do not hand-roll pool
+  boilerplate at call sites.
+- Prefer adding tests next to the code in `#[cfg(test)]` modules; integration
+  tests live in `crates/core/tests`.
 
 ### Cockpit Desktop
 
@@ -107,27 +119,20 @@ Keep dependencies flowing inward:
   "no Vite" rule here.
 - Frontend entrypoint is `apps/cockpit/src/main.tsx`; app shell is
   `apps/cockpit/src/App.tsx`.
-- Tauri/Rust code lives in `apps/cockpit/src-tauri`.
+- Tauri/Rust code lives in `apps/cockpit/src-tauri`. Keep `#[tauri::command]`
+  functions thin: extract non-trivial logic into pure, unit-tested functions.
 - Use `bun run cockpit:dev` for local desktop development.
 - Use `bun run --cwd apps/cockpit build` for frontend build checks when the
   desktop shell is not needed.
 - Keep generated bindings such as `apps/cockpit/src/bindings.ts` generated; do
   not hand-edit generated files unless explicitly required.
 
-### Core and Protocol
-
-- `packages/protocol` defines contracts: domain models, events, approval types,
-  and `ControlPlaneApi`. Keep it free of Bun, Node, Discord, Tauri, filesystem,
-  and database dependencies.
-- `packages/core` owns runtime behavior: control plane, config, store, agents,
-  gateways, observability, updates, and hooks.
-- Prefer adding tests near existing tests under `packages/core/test` or
-  `packages/protocol/test`.
-- Do not duplicate protocol shapes inside apps. Import from `@ryuzi/protocol`.
-
 ### UI and Design System
 
-- Reuse `@ryuzi/ui` components before creating app-local primitives.
+- Use `@ryuzi/ui` primitives — `Button`, `Input`, `Textarea`, `NativeSelect`,
+  `FormField`, `Modal`, `ModalFooter`, `SettingsCard`, `MenuPanel`,
+  `Segmented`, `Switch`, and friends. Do not write raw `<button>`, `<input>`,
+  `<textarea>`, or `<select>` elements in Cockpit views or components.
 - Shared UI lives in `packages/ui/src`; Cockpit-specific composition lives in
   `apps/cockpit/src/components` and `apps/cockpit/src/views`.
 - Use lucide icons for icon buttons and controls when available.
@@ -140,12 +145,14 @@ Keep dependencies flowing inward:
 - Maintain stable dimensions for sidebars, title bars, toolbars, panels, tabs,
   counters, and list rows so dynamic content does not shift layout.
 
-### Rust
+### Rust Workspace
 
-- Cargo workspace members are declared in root `Cargo.toml`.
-- `crates/core` is the Rust library boundary.
-- `crates/hook` builds the `ryuzi-hook` binary.
-- `apps/cockpit/src-tauri` depends on `ryuzi-core`.
+- Cargo workspace members are `crates/core`, `crates/cli`, and
+  `apps/cockpit/src-tauri` (declared in root `Cargo.toml`).
+- Shared dependencies and lint levels live in `[workspace.dependencies]` and
+  `[workspace.lints]` in the root `Cargo.toml`; members opt in with
+  `workspace = true`. Add new shared deps there, not per-crate.
+- Formatting is governed by `rustfmt.toml`; editor defaults by `.editorconfig`.
 - Keep async/runtime choices consistent with existing `tokio` usage.
 - Run `cargo fmt` and targeted `cargo test -p <package>` when possible.
 
@@ -156,17 +163,21 @@ Choose the smallest meaningful verification set for the files you touched:
 | Change | Minimum verification |
 | --- | --- |
 | Pure docs | Review rendered Markdown mentally; no test required |
-| TS utility or protocol types | `bun test <path-or-pattern>` and `bun run typecheck` if types changed |
-| `packages/core` runtime behavior | Targeted `bun test packages/core/test/...` |
-| CLI behavior | Targeted `bun test apps/cli/test/...` plus `bun run ryuzi -- --help` when relevant |
+| Engine (`crates/core`) | `cargo test -p ryuzi-core` and `cargo fmt` |
+| CLI (`crates/cli`) | `cargo test -p ryuzi-cli` plus `cargo run -p ryuzi-cli -- --help` when relevant |
+| Tauri commands (`src-tauri`) | `cargo test -p ryuzi-cockpit` |
 | Cockpit React UI | Targeted `bun test apps/cockpit/src/...` plus `bun run --cwd apps/cockpit build` for broad UI changes |
-| Shared UI | `bun test packages/ui` if applicable and `bun run typecheck` |
-| Rust crate code | `cargo test -p <crate>` and `cargo fmt` |
+| Shared UI (`packages/ui`) | `bun test packages/ui` and `bun run typecheck` |
 | Cross-stack Tauri change | `bun run cockpit:build` or explain why it was not run |
-| Release or npm packaging | Check `.github/workflows/*`, `scripts/npm/*`, `npm/*`, and run a smoke build |
+| Release or npm packaging | Check `.github/workflows/*`, `scripts/npm/*`, `npm/*`, and run the CLI smoke test |
 
-CI uses Bun 1.3.14, `bun install --frozen-lockfile`, `bun run typecheck`,
-`bun test`, `bunx biome ci .`, and a Bun compile smoke test for the CLI.
+CI (`.github/workflows/ci.yml`) uses Bun 1.3.14 with
+`bun install --frozen-lockfile`, then: `bunx biome ci .` + `shellcheck
+install.sh`; `bun run typecheck` + `bun test`; `cargo fmt --check`,
+`cargo clippy -p ryuzi-core -p ryuzi-cli --all-targets -- -D warnings`,
+`cargo test -p ryuzi-core -p ryuzi-cli`, and a build + `--version`/`--help`
+smoke of the `ryuzi` binary; Playwright e2e for Cockpit; and an osv-scanner
+pass over both lockfiles.
 
 ## 6. Good and Bad Examples
 
@@ -175,9 +186,10 @@ CI uses Bun 1.3.14, `bun install --frozen-lockfile`, `bun run typecheck`,
 Good:
 
 ```sh
-bun test packages/core/test/config.test.ts
-bun run typecheck
 cargo test -p ryuzi-core
+cargo run -p ryuzi-cli -- --help
+bun test apps/cockpit/src/store.test.ts
+bun run typecheck
 ```
 
 Bad:
@@ -185,7 +197,8 @@ Bad:
 ```sh
 npm test
 npx biome ci .
-node apps/cli/src/cli/index.ts
+node scripts/anything.js
+bun run ryuzi   # no such script — the CLI is the Rust binary, not a Bun app
 ```
 
 ### Branch Claims
@@ -194,8 +207,8 @@ Good:
 
 ```sh
 git fetch --all --prune
-git branch --all --list "*rust-cli*"
-git show-ref | rg "rust|cli"
+git branch --all --list "*feature*"
+git show-ref | rg "feature"
 ```
 
 Then report exactly what exists.
@@ -203,7 +216,7 @@ Then report exactly what exists.
 Bad:
 
 ```text
-I found feat/rust-cli-4 and it changes the CLI.
+I found feat/some-branch and it changes the CLI.
 ```
 
 when the branch is not present in refs.
@@ -213,7 +226,7 @@ when the branch is not present in refs.
 Good:
 
 ```tsx
-import { Button } from "@ryuzi/ui";
+import { Button, FormField, Input } from "@ryuzi/ui";
 import { Settings } from "lucide-react";
 ```
 
@@ -222,48 +235,40 @@ Use existing shell, sidebar, modal, segmented control, and token patterns.
 Bad:
 
 ```tsx
-<div className="rounded-3xl bg-purple-600 p-8">New dashboard</div>
+<button className="h-8 cursor-pointer rounded-md bg-primary px-3.5 text-[12.5px]">
+  Save
+</button>
 ```
 
-This ignores the desktop design system and creates a one-off surface.
+Raw elements with hand-rolled Tailwind clusters duplicate the design system.
 
-### Protocol
+### Rust/TS Boundary
 
 Good:
 
 ```ts
-import type { CoreEvent } from "@ryuzi/protocol";
+import { commands } from "@/bindings";
 ```
+
+Expose a small `#[tauri::command]` in `src-tauri`, regenerate the bindings,
+and call it through the generated `commands` object.
 
 Bad:
 
 ```ts
-type CoreEvent = { type: string; payload: any };
+type SessionInfo = { id: string; status: string };
 ```
 
-Duplicated contracts drift and cause router/client mismatches.
-
-### Rust and TS Boundaries
-
-Good:
-
-```text
-Expose a small Rust command/API, then call it from Tauri or the CLI wrapper.
-```
-
-Bad:
-
-```text
-Have Rust code depend on app-specific TS file layout or generated frontend
-state.
-```
+Hand-duplicated engine shapes drift from the Rust types and cause
+frontend/backend mismatches.
 
 ## 7. Anti-Hallucination Rules
 
 - Do not invent package scripts. Read `package.json` first.
-- Do not invent Rust crates. Read `Cargo.toml` first.
-- Do not assume planned apps are implemented just because their workspace
-  folders exist.
+- Do not invent Rust crates. The workspace has exactly three members; read
+  `Cargo.toml` first.
+- Do not assume planned apps (`apps/mission-control`, `apps/mobile`) are
+  implemented just because their workspace folders exist.
 - Do not assume Discord, Claude Code, Tauri sidecars, or update flows work
   without checking the relevant tests and docs.
 - Do not hand-edit lockfiles unless dependency changes require it.
@@ -278,7 +283,8 @@ state.
 - Keep changes scoped to the requested area.
 - Preserve unrelated user or agent changes in the worktree.
 - Prefer structured parsers/APIs over ad hoc string manipulation.
-- Add comments only when they explain non-obvious behavior.
+- Add comments only when they explain non-obvious behavior; write them as
+  standalone documentation, not as references to code that no longer exists.
 - Keep public contracts and user-visible behavior covered by tests.
 - For large migrations, update docs and command examples in the same change.
 
@@ -287,8 +293,10 @@ state.
 - Release automation lives in `.github/workflows`, `release-please-config.json`,
   `.release-please-manifest.json`, `scripts/npm`, `npm/ryuzi`, and
   `npm/platform/*`.
-- The npm package exposes the `ryuzi` CLI. Packaging changes must preserve
-  `ryuzi --help`, `ryuzi --version`, and install smoke behavior.
+- The npm package `ryuzi` is a launcher: it resolves the matching
+  `npm/platform/ryuzi-*` package and spawns the prebuilt Rust binary. Packaging
+  changes must preserve `ryuzi --help`, `ryuzi --version`, and install smoke
+  behavior.
 - Cockpit desktop artifacts are built by the `cockpit-desktop` workflow with
   Tauri on Linux, macOS, and Windows.
 

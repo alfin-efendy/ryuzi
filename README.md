@@ -173,6 +173,11 @@ apps/
   mobile/            # @ryuzi/mobile — mobile app (planned)
 packages/
   ui/                # @ryuzi/ui — shared UI components (Cockpit)
+npm/
+  ryuzi/             # npm launcher package — resolves and spawns the prebuilt Rust binary
+  platform/          # per-platform binary packages (ryuzi-linux-x64, ryuzi-darwin-arm64, …)
+assets/
+  brand/             # canonical brand assets (wordmark, mark, favicon)
 ```
 
 ## Roadmap
