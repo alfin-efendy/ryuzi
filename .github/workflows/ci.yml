@@ -222,3 +222,24 @@ jobs:
           elif [ -n "$existing" ]; then
             gh issue close "$existing" --repo "$REPO" --comment "Green again: $RUN_URL"
           fi
+
+  # The single branch-protection gate. Matrix jobs report "ts (ubuntu-latest)"
+  # when they run but bare "ts" when skipped via `if:` — so per-matrix names
+  # can never be required without wedging path-filtered PRs. This job always
+  # reports under one stable name and fails iff any needed job failed or was
+  # cancelled (skipped = fine by design).
+  ci-ok:
+    needs: [changes, lint, ts, rust, e2e-cockpit, osv]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any needed job failed or was cancelled
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          bad=$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")' <<<"$NEEDS_JSON")
+          if [ -n "$bad" ]; then
+            echo "failed/cancelled: $bad"
+            exit 1
+          fi
+          echo "all gated jobs green or intentionally skipped"

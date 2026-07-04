@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { basename, fileBadge } from "./paths";
+import { joinPath } from "./paths";
 
 describe("basename", () => {
   test("posix paths", () => {
@@ -28,4 +29,14 @@ describe("fileBadge", () => {
   test("no extension", () => {
     expect(fileBadge("/a/Makefile")).toBe("FILE");
   });
+});
+
+test("joinPath uses the workdir's separator", () => {
+  expect(joinPath("C:\\work\\proj", "src/lib/a.ts")).toBe("C:\\work\\proj\\src\\lib\\a.ts");
+  expect(joinPath("/home/u/proj", "src/lib/a.ts")).toBe("/home/u/proj/src/lib/a.ts");
+});
+
+test("joinPath tolerates trailing separators and empty segments", () => {
+  expect(joinPath("C:\\work\\proj\\", "a.ts")).toBe("C:\\work\\proj\\a.ts");
+  expect(joinPath("/home/u/proj/", "dir//b.ts")).toBe("/home/u/proj/dir/b.ts");
 });

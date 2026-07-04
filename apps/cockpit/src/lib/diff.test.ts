@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseUnifiedDiff } from "./diff";
+import { diffLineStyle, parseUnifiedDiff } from "./diff";
 
 const SAMPLE = `diff --git a/src/app.ts b/src/app.ts
 index 111..222 100644
@@ -49,4 +49,15 @@ describe("parseUnifiedDiff", () => {
   test("empty diff yields no files", () => {
     expect(parseUnifiedDiff("")).toEqual([]);
   });
+});
+
+test("diffLineStyle maps add/del to theme tokens, not hardcoded colors", () => {
+  const add = diffLineStyle(["add", 1, "x"]);
+  expect(add.bg).toBe("var(--diff-add-bg)");
+  expect(add.signColor).toBe("var(--diff-add-fg)");
+  const del = diffLineStyle(["del", 1, "x"]);
+  expect(del.bg).toBe("var(--diff-del-bg)");
+  expect(del.signColor).toBe("var(--diff-del-fg)");
+  expect(diffLineStyle(["hunk", "", "@@"]).sign).toBe("⇅");
+  expect(diffLineStyle(["ctx", 1, "x"]).bg).toBe("transparent");
 });

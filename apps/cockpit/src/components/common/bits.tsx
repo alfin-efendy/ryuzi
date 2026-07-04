@@ -97,7 +97,7 @@ export function QuotaTrack({ pct, color, height = 4 }: { pct: number; color: str
 export function DiffStat({ add, del, className }: { add: number; del: number; className?: string }) {
   return (
     <span className={cn("font-mono text-xs font-medium", className)}>
-      <span style={{ color: "#22C55E" }}>+{add}</span> <span style={{ color: "#EF4444" }}>−{del}</span>
+      <span style={{ color: "var(--diff-add-fg)" }}>+{add}</span> <span style={{ color: "var(--diff-del-fg)" }}>−{del}</span>
     </span>
   );
 }
