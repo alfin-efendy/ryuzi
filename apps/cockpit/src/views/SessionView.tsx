@@ -20,7 +20,7 @@ import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type RightTab } from "@/store-nav";
 import { commands } from "@/bindings";
-import { parseUnifiedDiff, type DiffLine, type ReviewFile } from "@/lib/diff";
+import { diffLineStyle, parseUnifiedDiff, type ReviewFile } from "@/lib/diff";
 import { runtimeById, defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { basename } from "@/lib/paths";
@@ -36,17 +36,6 @@ import { Transcript } from "@/components/transcript/Transcript";
 
 const toolBtn =
   "flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-md border-none bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground";
-
-function diffLineStyle(l: DiffLine): { bg: string; numBg: string; sign: string; signColor: string; color: string } {
-  const [type] = l;
-  if (type === "hunk")
-    return { bg: "var(--muted)", numBg: "transparent", sign: "⇅", signColor: "var(--muted-foreground)", color: "var(--muted-foreground)" };
-  if (type === "add")
-    return { bg: "rgba(34,197,94,0.12)", numBg: "rgba(34,197,94,0.14)", sign: "+", signColor: "#22C55E", color: "var(--foreground)" };
-  if (type === "del")
-    return { bg: "rgba(239,68,68,0.12)", numBg: "rgba(239,68,68,0.14)", sign: "−", signColor: "#EF4444", color: "var(--foreground)" };
-  return { bg: "transparent", numBg: "transparent", sign: "", signColor: "transparent", color: "var(--code-foreground)" };
-}
 
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects } = useStore();
