@@ -208,7 +208,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EVENT: ${{ github.event_name }}
         run: |
-          failed=$(jq -r 'to_entries[] | select(.value.result == "failure") | .key' <<<"$NEEDS_JSON" | paste -sd ", " -)
+          failed=$(jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")' <<<"$NEEDS_JSON")
           existing=$(gh issue list --repo "$REPO" --label ci-failure --state open --json number --jq '.[0].number // empty')
           if [ -n "$failed" ]; then
             title="CI failure on ${EVENT}: ${failed}"
