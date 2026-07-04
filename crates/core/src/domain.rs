@@ -248,7 +248,7 @@ pub enum CoreEvent {
         message: String,
     },
     /// Out-of-band announcement (e.g. "update available") rendered to every
-    /// surface of a session. TS parity: `{ kind: "notice", sessionPk, text }`.
+    /// surface of a session. TS parity: `{ kind: "notice", session_pk, text }`.
     Notice {
         session_pk: String,
         text: String,

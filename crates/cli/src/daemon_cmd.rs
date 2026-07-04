@@ -249,9 +249,11 @@ struct ProdApplyHook {
 impl ApplyHook for ProdApplyHook {
     async fn apply(&self, info: ApplyInfo) {
         let Ok(install_path) = std::env::current_exe() else {
+            println!("update: cannot resolve current executable; skipping update");
             return;
         };
         let Ok(tmp) = tempfile::tempdir() else {
+            println!("update: cannot create staging tempdir; skipping update");
             return;
         };
         let settings = SettingsStore::new(self.daemon.store.clone());
@@ -283,7 +285,15 @@ impl ApplyHook for ProdApplyHook {
             platform: self.platform,
             tmp_dir: tmp.path().to_path_buf(),
         };
-        match apply_update(&cfg, &host).await {
+        let result = apply_update(&cfg, &host).await;
+        // Explicit early drop: `handle_apply_outcome` below calls
+        // `std::process::exit` for the Promoted/RolledBack outcomes, and
+        // `process::exit` runs no destructors, so `tmp`'s Drop (staging dir
+        // removal) would never fire if left to run at end-of-scope. Drop it
+        // here instead, mirroring TS's `finally { rmSync(tmpDir) }` which ran
+        // BEFORE `handleApplyOutcome`.
+        drop(tmp);
+        match result {
             Ok(outcome) => handle_apply_outcome(
                 outcome,
                 || {
@@ -300,7 +310,6 @@ impl ApplyHook for ProdApplyHook {
                 println!("update: apply failed mid-swap: {e} (update.json left for inspection)")
             }
         }
-        // `tmp` drops here → staging dir removed (TS rmSync in finally)
     }
 }
 
