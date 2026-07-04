@@ -5,6 +5,8 @@
 //! re-probes binaries and asks npm, then persists the snapshot in settings.
 
 use crate::error::CmdError;
+use ryuzi_core::router::{keys, server::RouterServer};
+use ryuzi_core::runtime_config::{self, ConfigStatus, EndpointInfo, RuntimeMapping};
 use ryuzi_core::runtimes::{self, RuntimeConfig};
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
@@ -219,4 +221,120 @@ pub async fn set_runtime_tier(
 pub async fn set_default_runtime(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<RuntimeInfo>> {
     cp.store().set_setting("default_agent", &id).await?;
     Ok(assemble(&cp).await?)
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint config apply/reset (spec §5) — write/remove the local router's
+// base URL + key into native CLI-tool configs (claude/codex/opencode only).
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeConfigStatusInfo {
+    pub config_path: String,
+    pub exists: bool,
+    pub configured: bool,
+    /// False for runtimes without an F1 handler (gemini, ollama).
+    pub supported: bool,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeMappingArg {
+    pub model: String,
+    pub opus: Option<String>,
+    pub sonnet: Option<String>,
+    pub haiku: Option<String>,
+    pub models: Vec<String>,
+}
+
+fn home() -> Result<std::path::PathBuf, CmdError> {
+    dirs::home_dir().ok_or_else(|| CmdError { message: "cannot resolve home directory".into() })
+}
+
+fn status_of(id: &str, home: &std::path::Path) -> Result<RuntimeConfigStatusInfo, CmdError> {
+    let st: Option<ConfigStatus> = match id {
+        "claude" => Some(runtime_config::claude_status(home).map_err(err)?),
+        "codex" => Some(runtime_config::codex_status(home).map_err(err)?),
+        "opencode" => Some(runtime_config::opencode_status(home).map_err(err)?),
+        _ => None,
+    };
+    Ok(match st {
+        Some(s) => RuntimeConfigStatusInfo {
+            config_path: s.config_path, exists: s.exists, configured: s.configured, supported: true,
+        },
+        None => RuntimeConfigStatusInfo {
+            config_path: String::new(), exists: false, configured: false, supported: false,
+        },
+    })
+}
+
+fn err(e: anyhow::Error) -> CmdError {
+    CmdError { message: e.to_string() }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn runtime_config_status(id: String) -> Result<RuntimeConfigStatusInfo, CmdError> {
+    status_of(&id, &home()?)
+}
+
+/// Guard (spec §5): refuse to write configs that point at a dead endpoint —
+/// the server must be running and at least one endpoint key must exist.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_runtime_config(
+    cp: State<'_, Arc<ControlPlane>>,
+    srv: State<'_, Arc<RouterServer>>,
+    id: String,
+    mapping: RuntimeMappingArg,
+) -> Result<RuntimeConfigStatusInfo, CmdError> {
+    let st = srv.status();
+    if !st.running {
+        return Err(CmdError {
+            message: "The endpoint server is not running. Start it in Models → Endpoint first.".into(),
+        });
+    }
+    let key = keys::first_key(cp.store())
+        .await
+        .map_err(err)?
+        .ok_or_else(|| CmdError {
+            message: "No endpoint API key exists. Create one in Models → Endpoint first.".into(),
+        })?;
+    let ep = EndpointInfo {
+        base_url: format!("http://127.0.0.1:{}", st.port),
+        api_key: key.key,
+    };
+    let m = RuntimeMapping {
+        model: mapping.model,
+        opus: mapping.opus,
+        sonnet: mapping.sonnet,
+        haiku: mapping.haiku,
+        models: mapping.models,
+    };
+    let home = home()?;
+    match id.as_str() {
+        "claude" => runtime_config::claude_apply(&home, &ep, &m).map_err(err)?,
+        "codex" => runtime_config::codex_apply(&home, &ep, &m).map_err(err)?,
+        "opencode" => runtime_config::opencode_apply(&home, &ep, &m).map_err(err)?,
+        other => {
+            return Err(CmdError { message: format!("config apply is not supported for '{other}' yet") })
+        }
+    }
+    status_of(&id, &home)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_runtime_config(id: String) -> Result<RuntimeConfigStatusInfo, CmdError> {
+    let home = home()?;
+    match id.as_str() {
+        "claude" => runtime_config::claude_reset(&home).map_err(err)?,
+        "codex" => runtime_config::codex_reset(&home).map_err(err)?,
+        "opencode" => runtime_config::opencode_reset(&home).map_err(err)?,
+        other => {
+            return Err(CmdError { message: format!("config apply is not supported for '{other}' yet") })
+        }
+    }
+    status_of(&id, &home)
 }

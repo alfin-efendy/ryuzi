@@ -154,6 +154,34 @@ async setDefaultRuntime(id: string) : Promise<Result<RuntimeInfo[], CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+async runtimeConfigStatus(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("runtime_config_status", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Guard (spec §5): refuse to write configs that point at a dead endpoint —
+ * the server must be running and at least one endpoint key must exist.
+ */
+async applyRuntimeConfig(id: string, mapping: RuntimeMappingArg) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("apply_runtime_config", { id, mapping }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async resetRuntimeConfig(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reset_runtime_config", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listGateways() : Promise<Result<GatewayInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_gateways") };
@@ -633,11 +661,17 @@ kind: string;
 installTarget: string | null; website: string | null }
 export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
+export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
+/**
+ * False for runtimes without an F1 handler (gemini, ollama).
+ */
+supported: boolean }
 export type RuntimeInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
 /**
  * Whether Cockpit has a session harness for this agent today.
  */
 runnable: boolean }
+export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; createdAt: number | null; lastActive: number | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TermExitMsg = { id: string }

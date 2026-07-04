@@ -1,6 +1,7 @@
-import { Copy, Layers, MonitorUp, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { AlertTriangle, Copy, Layers, MonitorUp, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
+import { commands, type RuntimeConfigStatusInfo } from "@/bindings";
 import { Chip, Pill } from "@/components/common/bits";
 import { Card, CardHeader, CardHint, CardRow, CardTitle } from "@/components/common/Card";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
@@ -10,9 +11,43 @@ import { Switch } from "@/components/common/Switch";
 import { PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { agentAllowed, useApps } from "@/store-apps";
+import { useConnections } from "@/store-connections";
+import { useEndpoint } from "@/store-endpoint";
 import { useNav } from "@/store-nav";
 
 const WARN = "#F59E0B";
+
+// A single "<label> <select>" row for the endpoint-config card's model
+// pickers — options come from the enabled connections' models.
+function ModelSelectRow({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2.5 px-[18px] py-[7px]">
+      <span className="w-[100px] shrink-0 text-[12.5px] font-medium text-muted-foreground">{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-xs text-foreground"
+      >
+        <option value="">— pick a model —</option>
+        {options.map((m) => (
+          <option key={m} value={m}>
+            {m}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
 
 // Runtime detail: real detection state, update banner with the actual install
 // command, model/permission/flags configuration, and per-tier model routing.
@@ -22,9 +57,29 @@ export function RuntimeDetailView({ id }: { id: string }) {
   const navigate = useNav((s) => s.navigate);
   const [openTierMenu, setOpenTierMenu] = useState<string | null>(null);
 
+  // Endpoint-config card (spec §5): apply/reset native CLI configs pointed at
+  // Ryuzi's local router, guarded on the server being up + a key existing.
+  const [cfg, setCfg] = useState<RuntimeConfigStatusInfo | null>(null);
+  const { status: epStatus, keys: epKeys } = useEndpoint();
+  const { connections } = useConnections();
+  const modelOptions = useMemo(
+    () => connections.filter((c) => c.enabled).flatMap((c) => c.models.map((m) => `${c.provider}/${m}`)),
+    [connections],
+  );
+  const [model, setModel] = useState("");
+  const [opus, setOpus] = useState("");
+  const [sonnet, setSonnet] = useState("");
+  const [haiku, setHaiku] = useState("");
+
   useEffect(() => {
     if (!appsLoaded) void hydrateApps();
   }, [appsLoaded, hydrateApps]);
+
+  useEffect(() => {
+    void commands.runtimeConfigStatus(id).then((r) => r.status === "ok" && setCfg(r.data));
+    void useEndpoint.getState().hydrate();
+    void useConnections.getState().hydrate();
+  }, [id]);
 
   const agent = runtimeById(runtimes, id);
   if (!agent) {
@@ -37,6 +92,35 @@ export function RuntimeDetailView({ id }: { id: string }) {
     installed && agent.latestVersion !== null && agent.installedVersion !== null && agent.latestVersion !== agent.installedVersion;
   const updateCmd = agent.npmPackage ? `npm install -g ${agent.npmPackage}` : null;
   const permDesc = PERM_MODES.find((m) => m.id === agent.permMode)?.desc ?? "";
+
+  const endpointBlocked = !epStatus?.running || epKeys.length === 0;
+
+  const applyConfig = async () => {
+    const res = await commands.applyRuntimeConfig(id, {
+      model: model || modelOptions[0] || "",
+      opus: id === "claude" ? opus || null : null,
+      sonnet: id === "claude" ? sonnet || null : null,
+      haiku: id === "claude" ? haiku || null : null,
+      models: modelOptions,
+    });
+    if (res.status === "ok") {
+      setCfg(res.data);
+      toast.success("Config applied");
+    } else {
+      toast.error(res.error.message);
+    }
+  };
+
+  const resetConfig = async () => {
+    if (!window.confirm("Remove Ryuzi settings from this runtime's config?")) return;
+    const res = await commands.resetRuntimeConfig(id);
+    if (res.status === "ok") {
+      setCfg(res.data);
+      toast.success("Ryuzi config removed");
+    } else {
+      toast.error(res.error.message);
+    }
+  };
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
@@ -194,6 +278,59 @@ export function RuntimeDetailView({ id }: { id: string }) {
             <span className="w-[110px] shrink-0 text-[13px] font-medium">Binary</span>
             <span className="flex-1 truncate font-mono text-xs text-muted-foreground">{agent.binaryPath ?? "not found on PATH"}</span>
           </CardRow>
+        </Card>
+
+        <Card className="mb-3">
+          <CardHeader>
+            <CardTitle>Endpoint config</CardTitle>
+            <Pill variant={cfg?.configured ? "primary" : "secondary"}>{cfg?.configured ? "Configured" : "Not configured"}</Pill>
+          </CardHeader>
+          {cfg?.configPath && (
+            <div className="px-[18px] pb-1 pt-3 font-mono text-[11px] text-muted-foreground">{cfg.configPath}</div>
+          )}
+          {cfg && !cfg.supported ? (
+            <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+              Config apply for this runtime is coming in a later phase.
+            </div>
+          ) : (
+            <>
+              {endpointBlocked && (
+                <div className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]" style={{ borderColor: WARN, color: WARN }}>
+                  <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
+                  <span>Start the endpoint server and create an API key in Models → Endpoint before applying.</span>
+                </div>
+              )}
+              <div className="flex flex-col gap-1 py-2">
+                {agent.id === "claude" && (
+                  <>
+                    <ModelSelectRow label="Opus" value={opus} options={modelOptions} onChange={setOpus} />
+                    <ModelSelectRow label="Sonnet" value={sonnet} options={modelOptions} onChange={setSonnet} />
+                    <ModelSelectRow label="Haiku" value={haiku} options={modelOptions} onChange={setHaiku} />
+                  </>
+                )}
+                <ModelSelectRow label="Default model" value={model} options={modelOptions} onChange={setModel} />
+              </div>
+              <div className="flex items-center justify-end gap-2 border-t border-border px-[18px] py-3">
+                {cfg?.configured && (
+                  <button
+                    type="button"
+                    onClick={() => void resetConfig()}
+                    className="h-8 shrink-0 cursor-pointer rounded-md border border-border bg-transparent px-3 font-sans text-[12.5px] font-medium text-foreground hover:bg-accent"
+                  >
+                    Reset
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={endpointBlocked}
+                  onClick={() => void applyConfig()}
+                  className="h-8 shrink-0 cursor-pointer rounded-md border-none bg-primary px-3.5 font-sans text-[12.5px] font-medium text-primary-foreground hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Apply
+                </button>
+              </div>
+            </>
+          )}
         </Card>
 
         <Card className="mb-3">

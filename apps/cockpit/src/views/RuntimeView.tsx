@@ -1,5 +1,7 @@
 import { cn } from "@ryuzi/ui";
 import { ChevronRight, RefreshCw } from "lucide-react";
+import { useEffect, useState } from "react";
+import { commands } from "@/bindings";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { Card } from "@/components/common/Card";
 import { Switch } from "@/components/common/Switch";
@@ -13,6 +15,18 @@ const SUCCESS = "#22C55E";
 export function RuntimeView() {
   const { runtimes, refreshing, refresh, update, setDefault } = useRuntimes();
   const navigate = useNav((s) => s.navigate);
+  const [configured, setConfigured] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (runtimes.length === 0) return;
+    void Promise.all(runtimes.map((r) => commands.runtimeConfigStatus(r.id))).then((results) => {
+      const next: Record<string, boolean> = {};
+      results.forEach((res, i) => {
+        if (res.status === "ok") next[runtimes[i].id] = res.data.configured;
+      });
+      setConfigured(next);
+    });
+  }, [runtimes]);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
@@ -57,6 +71,7 @@ export function RuntimeView() {
                     <span className="text-sm font-semibold text-foreground">{agent.name}</span>
                     {isDefault && <Pill variant="primary">Default</Pill>}
                     {hasUpdate && <Pill variant="warn">Update {agent.latestVersion}</Pill>}
+                    {configured[agent.id] && <Pill variant="mono">Routed via Ryuzi</Pill>}
                   </span>
                   <span className="mt-0.5 block text-[12.5px] text-muted-foreground">
                     {installed ? `${agent.model || agent.connection} · ${agent.connection}` : "Not installed"}
