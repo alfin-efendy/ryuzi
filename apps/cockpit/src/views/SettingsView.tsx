@@ -1,4 +1,7 @@
 import { ACCENTS, type Mode, useTheme } from "@ryuzi/ui";
+import { useEffect, useState } from "react";
+import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
+import { toast } from "sonner";
 import { Card, CardRow } from "@/components/common/Card";
 import { Switch } from "@/components/common/Switch";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
@@ -169,6 +172,31 @@ export function SettingsView() {
   const transparency = useTheme((s) => s.transparency);
   const setTransparency = useTheme((s) => s.setTransparency);
 
+  const [openAtLogin, setOpenAtLogin] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    isEnabled()
+      .then((v) => {
+        if (!cancelled) setOpenAtLogin(v);
+      })
+      .catch(() => {
+        if (!cancelled) setOpenAtLogin(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const toggleOpenAtLogin = () => {
+    if (openAtLogin === null) return; // still loading
+    const next = !openAtLogin;
+    setOpenAtLogin(next);
+    void (next ? enable() : disable()).catch((e) => {
+      setOpenAtLogin(!next); // revert to the real state
+      toast.error(`Open at login failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
       <div className="mx-auto max-w-[640px]">
@@ -201,8 +229,7 @@ export function SettingsView() {
               <div className="text-[13.5px] font-semibold">Open at login</div>
               <div className="mt-0.5 text-[12.5px] text-muted-foreground">Start Cockpit when you sign in.</div>
             </div>
-            {/* Wired to the autostart plugin in the next task. */}
-            <Switch on={false} onToggle={() => {}} label="Open at login" />
+            <Switch on={openAtLogin === true} onToggle={toggleOpenAtLogin} label="Open at login" />
           </div>
         </Card>
       </div>
