@@ -15,21 +15,13 @@ const row = (partial: Partial<Row>): Row => ({
 });
 
 test("consecutive assistant text chunks coalesce into one markdown group, joined with ''", () => {
-  const groups = groupRows([
-    row({ seq: 1, text: "Hello **wor" }),
-    row({ seq: 2, text: "ld**" }),
-    row({ seq: 3, text: "!" }),
-  ]);
+  const groups = groupRows([row({ seq: 1, text: "Hello **wor" }), row({ seq: 2, text: "ld**" }), row({ seq: 3, text: "!" })]);
   expect(groups).toHaveLength(1);
   expect(groups[0]).toEqual({ type: "agent", key: "s1", markdown: "Hello **world**!" });
 });
 
 test("whitespace-only chunks are kept inside a run but never form a group alone", () => {
-  const groups = groupRows([
-    row({ seq: 1, text: "para one" }),
-    row({ seq: 2, text: "\n\n" }),
-    row({ seq: 3, text: "para two" }),
-  ]);
+  const groups = groupRows([row({ seq: 1, text: "para one" }), row({ seq: 2, text: "\n\n" }), row({ seq: 3, text: "para two" })]);
   expect(groups).toHaveLength(1);
   if (groups[0].type !== "agent") throw new Error("expected agent group");
   expect(groups[0].markdown).toBe("para one\n\npara two");
@@ -59,7 +51,15 @@ test("a user row breaks an agent run; blank user rows are dropped", () => {
 
 test("consecutive tool_call/status rows cluster into one activity group", () => {
   const groups = groupRows([
-    row({ seq: 1, blockType: "tool_call", toolCallId: "t1", toolName: "Bash", toolKind: "execute", toolStatus: "completed", toolOutput: "ok" }),
+    row({
+      seq: 1,
+      blockType: "tool_call",
+      toolCallId: "t1",
+      toolName: "Bash",
+      toolKind: "execute",
+      toolStatus: "completed",
+      toolOutput: "ok",
+    }),
     row({ seq: 2, role: "system", blockType: "status", text: "wrote a.txt" }),
     row({ seq: 3, role: "system", blockType: "status", text: "  " }),
     row({ seq: 4, blockType: "tool_call", toolCallId: "t2", toolName: null, toolKind: null, toolStatus: "pending" }),
