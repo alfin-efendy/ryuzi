@@ -3,5 +3,6 @@
 pub mod connections;
 pub mod keys;
 pub mod registry;
+pub mod server;
 pub mod sse;
 pub mod translate;
