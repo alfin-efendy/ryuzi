@@ -108,7 +108,8 @@ jobs:
       - name: Checksums + upload to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
         run: |
           cd assets
           sha256sum -- * > cockpit-checksums.txt
-          gh release upload "${{ inputs.tag }}" --repo "${{ github.repository }}" --clobber -- *
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber -- *

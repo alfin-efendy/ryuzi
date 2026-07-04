@@ -194,7 +194,7 @@ jobs:
   # issue so macOS-only or nightly-only breakage cannot pass silently.
   watchdog:
     needs: [changes, lint, ts, rust, e2e-cockpit, osv]
-    if: always() && github.event_name != 'pull_request'
+    if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read

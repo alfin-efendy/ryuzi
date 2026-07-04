@@ -35,8 +35,10 @@ Or via a package manager:
 
 ```sh
 npm install -g ryuzi        # or: bun add -g ryuzi
-brew install alfin-efendy/ryuzi/ryuzi
 ```
+
+> Homebrew (`brew install alfin-efendy/ryuzi/ryuzi`) becomes available once the
+> first Rust CLI release publishes the tap.
 
 The CLI daemon is unix-only. On Windows, use the Cockpit desktop app below,
 or install the CLI inside WSL with the same curl command.
