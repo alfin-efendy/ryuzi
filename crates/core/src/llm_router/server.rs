@@ -71,6 +71,7 @@ impl RouterServer {
             .route("/v1/messages", post(handle_messages))
             .route("/v1/messages/count_tokens", post(handle_count_tokens))
             .route("/v1/chat/completions", post(handle_chat))
+            .route("/v1/responses", post(handle_responses))
             .route("/v1/models", get(handle_models))
             // Agent conversations with inline images exceed axum's 2 MB default.
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -390,6 +391,73 @@ async fn handle_chat(
     }
 }
 
+/// Client speaks the OpenAI Responses API. Translated to internal chat, routed
+/// like /v1/chat/completions, and re-encoded as Responses.
+async fn handle_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers, openai_error).await {
+        return r;
+    }
+    let mut chat = crate::llm_router::responses::responses_request_to_chat(&body);
+    let requested = chat["model"].as_str().unwrap_or("").to_string();
+    let target = match route_model(&state.store, &requested).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return openai_error(
+                StatusCode::NOT_FOUND,
+                &format!("no enabled connection serves model '{requested}'"),
+            )
+        }
+        Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let stream = chat["stream"].as_bool().unwrap_or(false);
+    chat["model"] = json!(target.upstream_model);
+    let started = crate::paths::now_ms();
+
+    // Normalize the upstream response to OpenAI chat shape, then encode Responses.
+    let upstream_body = match target.desc.format {
+        ApiFormat::OpenAi => chat.clone(),
+        ApiFormat::Anthropic => match translate::openai_to_anthropic_request(&chat) {
+            Ok(b) => b,
+            Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
+        },
+    };
+
+    if stream {
+        stream_responses(&state, &target, &upstream_body, started).await
+    } else {
+        match send_json(&state, &target, &upstream_body, openai_error).await {
+            Ok(v) => {
+                // normalize to OpenAI chat shape first
+                let chat_resp = match target.desc.format {
+                    ApiFormat::OpenAi => v,
+                    ApiFormat::Anthropic => translate::anthropic_to_openai_response(&v),
+                };
+                let u = crate::llm_router::usage::usage_from_openai(&chat_resp);
+                crate::llm_router::usage::record(
+                    &state.store,
+                    &target.conn.id,
+                    &target.conn.provider,
+                    &target.upstream_model,
+                    "responses",
+                    u,
+                    200,
+                    started,
+                    None,
+                );
+                Json(crate::llm_router::responses::chat_response_to_responses(
+                    &chat_resp,
+                ))
+                .into_response()
+            }
+            Err(r) => r,
+        }
+    }
+}
+
 async fn handle_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers, openai_error).await {
         return r;
@@ -705,4 +773,119 @@ async fn stream_anthropic_upstream_to_openai(
         state.store.clone(),
         ctx,
     ))
+}
+
+/// Client=Responses, stream=true. Normalizes the upstream response (OpenAI or
+/// Anthropic format) to OpenAI chat chunks, then encodes Responses SSE.
+async fn stream_responses(
+    state: &AppState,
+    target: &RouteTarget,
+    upstream_body: &Value,
+    started: i64,
+) -> Response {
+    let req = match upstream_request(state, target, upstream_body) {
+        Ok(r) => r,
+        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    if !resp.status().is_success() {
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let v: Value = resp.json().await.unwrap_or(json!({}));
+        let msg = v["error"]["message"]
+            .as_str()
+            .unwrap_or("upstream error")
+            .to_string();
+        return openai_error(status, &format!("[{}] {msg}", target.conn.provider));
+    }
+    let anthropic_upstream = matches!(target.desc.format, ApiFormat::Anthropic);
+    let store = state.store.clone();
+    let ctx = RecordCtx {
+        conn_id: target.conn.id.clone(),
+        provider: target.conn.provider.clone(),
+        model: target.upstream_model.clone(),
+        client_format: "responses".into(),
+        started,
+    };
+    sse_response(spawn_responses_pump(resp, anthropic_upstream, store, ctx))
+}
+
+/// Pumps an upstream SSE response through Responses encoding. For an
+/// Anthropic-format upstream, the Anthropic events are first normalized to
+/// OpenAI chat chunks via `AnthropicToOpenAiStream`, then fed into
+/// `ResponsesStreamState`; an OpenAI-format upstream's chunks are fed
+/// directly.
+fn spawn_responses_pump(
+    resp: reqwest::Response,
+    anthropic_upstream: bool,
+    store: Arc<Store>,
+    ctx: RecordCtx,
+) -> Body {
+    use futures::StreamExt;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let mut parser = SseParser::default();
+        let mut anth = translate::AnthropicToOpenAiStream::new();
+        let mut rs = crate::llm_router::responses::ResponsesStreamState::new();
+        let mut stream = resp.bytes_stream();
+        let mut errored = false;
+        while let Some(item) = stream.next().await {
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => {
+                    let (name, data) = rs.error_frame(&format!("upstream stream interrupted: {e}"));
+                    let _ = tx.send(Ok(format_sse(&name, &data))).await;
+                    errored = true;
+                    break;
+                }
+            };
+            for ev in parser.feed(&chunk) {
+                // Get OpenAI chunk(s): direct for openai upstream, translated for anthropic.
+                let oai_chunks: Vec<Value> = if anthropic_upstream {
+                    let name = ev.event.as_deref().unwrap_or("");
+                    serde_json::from_str::<Value>(&ev.data)
+                        .ok()
+                        .map(|v| anth.feed(name, &v))
+                        .unwrap_or_default()
+                } else if ev.data == "[DONE]" {
+                    Vec::new()
+                } else {
+                    serde_json::from_str::<Value>(&ev.data)
+                        .ok()
+                        .into_iter()
+                        .collect()
+                };
+                for oai in oai_chunks {
+                    for (name, data) in rs.feed(&oai) {
+                        if tx.send(Ok(format_sse(&name, &data))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if !errored {
+            for (name, data) in rs.finish() {
+                let _ = tx.send(Ok(format_sse(&name, &data))).await;
+            }
+        }
+        // usage: for openai upstream we didn't accumulate; record zero-token row
+        // with status (F2a keeps Responses usage best-effort — the completed
+        // event's usage plumbing is a follow-up).
+        crate::llm_router::usage::record(
+            &store,
+            &ctx.conn_id,
+            &ctx.provider,
+            &ctx.model,
+            &ctx.client_format,
+            crate::llm_router::usage::Usage::default(),
+            if errored { 502 } else { 200 },
+            ctx.started,
+            errored.then(|| "stream interrupted".to_string()),
+        );
+    });
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }

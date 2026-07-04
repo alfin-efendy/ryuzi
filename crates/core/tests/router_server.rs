@@ -560,6 +560,45 @@ async fn passthrough_streaming_preserves_sse() {
     assert!(body.contains("data: [DONE]"), "body: {body}");
 }
 
+#[tokio::test]
+async fn responses_endpoint_non_stream_round_trips() {
+    let (_store, key, port) = setup().await; // custom-openai -> openai mock, key
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .header("authorization", format!("Bearer {key}"))
+        .json(&json!({"model": "custom-openai/mock-model",
+                      "input": [{"type": "message", "role": "user",
+                                 "content": [{"type": "input_text", "text": "hi"}]}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hello from mock");
+}
+
+#[tokio::test]
+async fn responses_endpoint_streams_sse() {
+    let (_store, key, port) = setup().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .header("authorization", format!("Bearer {key}"))
+        .json(&json!({"model": "custom-openai/mock-model", "stream": true,
+                      "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("response.created"));
+    assert!(body.contains("response.output_text.delta"));
+    assert!(body.contains("response.completed"));
+}
+
 /// A served (passthrough) request writes a usage_daily row: validates the
 /// recording seam end to end, even though passthrough itself can't observe
 /// upstream token counts (zero tokens + status 200 is the intended shape).
