@@ -22,6 +22,12 @@ pub struct ArtifactSpec {
 pub struct SidecarManifest {
     pub version: String,
     pub min_bun: String,
+    /// The GitHub release tag (`vX.Y.Z`) that hosts the artifacts named in
+    /// `bundle`/`standalone`. Required — no serde default — because the
+    /// manifest is host-controlled: the release pipeline overwrites this
+    /// file with the real tag before building release binaries, so a
+    /// missing tag would silently resolve against the wrong release.
+    pub release_tag: String,
     pub bundle: ArtifactSpec,
     pub standalone: std::collections::HashMap<String, ArtifactSpec>,
 }
@@ -254,6 +260,32 @@ impl SidecarManager {
     }
 }
 
+/// The manifest pinned into this build. Hosts (CLI + cockpit) share it; the
+/// release pipeline overwrites this file (with the real tag + shas) before
+/// building release binaries.
+pub fn embedded_manifest() -> SidecarManifest {
+    serde_json::from_str(include_str!("../sidecar.manifest.json"))
+        .expect("sidecar.manifest.json is validated at build time")
+}
+
+/// The production resolver both hosts use: embedded manifest, this build's
+/// target triple, the shared cache dir, RYUZI_ACP_PATH override, bun probe.
+pub fn host_manager() -> SidecarManager {
+    let manifest = embedded_manifest();
+    let release_tag = manifest.release_tag.clone();
+    SidecarManager::new(
+        SidecarConfig {
+            manifest,
+            cache_dir: crate::paths::state_dir().join("sidecars"),
+            target: env!("RYUZI_TARGET").to_string(),
+            release_tag,
+            override_path: std::env::var_os("RYUZI_ACP_PATH").map(std::path::PathBuf::from),
+            bun_probe: default_bun_probe,
+        },
+        Box::new(HttpFetcher),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +309,7 @@ mod tests {
         SidecarManifest {
             version: "0.55.0".into(),
             min_bun: "1.3.14".into(),
+            release_tag: "v0.3.0".into(),
             bundle: ArtifactSpec {
                 asset: "claude-agent-acp-0.55.0.js".into(),
                 sha256: bundle_sha.into(),
@@ -416,6 +449,18 @@ mod tests {
 
         assert!(!stale.exists(), "stale partial must be swept");
         assert!(vdir.join("adapter.js").exists());
+    }
+
+    #[test]
+    fn embedded_manifest_parses_and_names_a_release_tag() {
+        let m = embedded_manifest();
+        assert!(
+            m.release_tag.starts_with('v'),
+            "release_tag must be a vX.Y.Z tag: {}",
+            m.release_tag
+        );
+        assert!(!m.bundle.asset.is_empty());
+        assert!(!m.min_bun.is_empty());
     }
 
     #[test]

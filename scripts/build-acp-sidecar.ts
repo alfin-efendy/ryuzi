@@ -36,6 +36,10 @@
  *                             describing the bundle + standalone outputs;
  *                             requires --bundle (the manifest always
  *                             describes the universal bundle's sha256)
+ *   --release-tag <tag>       the GitHub release tag (vX.Y.Z) hosting the
+ *                             manifest's artifacts; embedded into the
+ *                             manifest as `release_tag` (Task 4F/4). Defaults
+ *                             to "v0.0.0" (dev-only fallback) when omitted.
  *   --install-cache           copy the bundle into
  *                             ~/.local/share/ryuzi/sidecars/acp/<ver>/adapter.js
  *                             (local dev convenience; requires --bundle)
@@ -237,10 +241,11 @@ function buildBundle(entry: string): string {
 }
 
 /** Write the sidecar manifest JSON (Spec 4 §4) matching `SidecarManifest`. */
-function writeManifest(path: string, bundlePath: string, binaries: Record<string, string>): void {
+function writeManifest(path: string, bundlePath: string, binaries: Record<string, string>, releaseTag: string): void {
   const manifest = {
     version: ACP_VERSION,
     min_bun: MIN_BUN,
+    release_tag: releaseTag,
     bundle: { asset: basename(bundlePath), sha256: sha256File(bundlePath) },
     standalone: Object.fromEntries(Object.entries(binaries).map(([triple, p]) => [triple, { asset: basename(p), sha256: sha256File(p) }])),
   };
@@ -314,6 +319,7 @@ const wantBundle = hasFlag("--bundle");
 const wantAllTargets = hasFlag("--all-targets");
 const manifestPath = flagValue("--manifest");
 const wantInstallCache = hasFlag("--install-cache");
+const releaseTag = flagValue("--release-tag") ?? "v0.0.0";
 const usingSidecarPipeline = wantBundle || wantAllTargets || manifestPath !== undefined;
 
 console.log("=== build-acp-sidecar ===");
@@ -357,7 +363,7 @@ if (usingSidecarPipeline) {
       throw new Error("--manifest requires --bundle (the manifest always describes the universal bundle's sha256)");
     }
     console.log("\n--- Manifest ---");
-    writeManifest(manifestPath, bundlePath, binaries);
+    writeManifest(manifestPath, bundlePath, binaries, releaseTag);
     console.log(`Manifest: ${manifestPath}`);
   }
 
