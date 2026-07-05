@@ -208,13 +208,15 @@ fn write_key_file(path: &Path, key_bytes: &[u8; 32]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn cipher() -> SecretCipher {
+    // Fixed-key helper. Renamed off `cipher` so it can't silently shadow the
+    // module-scope `pub fn cipher()` global accessor via `use super::*`.
+    fn test_cipher() -> SecretCipher {
         SecretCipher::from_key([7u8; 32])
     }
 
     #[test]
     fn roundtrip_and_sentinel() {
-        let c = cipher();
+        let c = test_cipher();
         let enc = c.encrypt("sk-secret");
         assert!(enc.starts_with("enc:v1:"), "got {enc}");
         assert_ne!(enc, "sk-secret");
@@ -223,7 +225,7 @@ mod tests {
 
     #[test]
     fn nonce_is_fresh_each_call() {
-        let c = cipher();
+        let c = test_cipher();
         assert_ne!(
             c.encrypt("x"),
             c.encrypt("x"),
@@ -233,23 +235,23 @@ mod tests {
 
     #[test]
     fn plaintext_passes_through() {
-        let c = cipher();
+        let c = test_cipher();
         assert_eq!(c.decrypt("sk-legacy-plain").unwrap(), "sk-legacy-plain");
         assert_eq!(c.decrypt("").unwrap(), "");
     }
 
     #[test]
     fn tamper_and_wrong_key_fail() {
-        let enc = cipher().encrypt("secret");
+        let enc = test_cipher().encrypt("secret");
         assert!(SecretCipher::from_key([9u8; 32]).decrypt(&enc).is_err());
         let mut bad = enc.clone();
         bad.push('A'); // corrupt the base64 tail
-        assert!(cipher().decrypt(&bad).is_err());
+        assert!(test_cipher().decrypt(&bad).is_err());
     }
 
     #[test]
     fn unknown_enc_version_errors_not_passthrough() {
-        assert!(cipher().decrypt("enc:v2:whatever").is_err());
+        assert!(test_cipher().decrypt("enc:v2:whatever").is_err());
     }
 
     #[test]
@@ -291,17 +293,43 @@ mod tests {
     }
 
     #[test]
-    fn load_never_panics() {
-        // Exercises the real keychain-or-fallback state machine. CI has no
-        // keychain, so this must degrade to a fallback status, not panic.
-        let (_cipher, _status) = load();
+    fn file_fallback_never_panics_on_any_input() {
+        // The file-fallback seam must be panic-safe for the three shapes it
+        // can meet on disk: absent, wrong-length (corrupt), and valid. This
+        // is the hermetic proxy for `load()`'s infallibility — we exercise it
+        // through the injected temp-path seam ONLY, never the real `load()`
+        // or the global accessors, so `cargo test` never touches the OS
+        // keychain or the production state dir.
+        //
+        // (a) fresh path — nothing on disk yet.
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.key");
+        let (c, status) = load_from_file(&fresh);
+        assert_eq!(status, KeychainStatus::FileFallback);
+        assert_eq!(c.decrypt(&c.encrypt("a")).unwrap(), "a");
+
+        // (b) wrong-length file — must be treated as corrupt and regenerated,
+        // not panic. 10 bytes ≠ 32.
+        let short = dir.path().join("short.key");
+        std::fs::write(&short, [1u8; 10]).unwrap();
+        let (c, status) = load_from_file(&short);
+        assert_eq!(status, KeychainStatus::FileFallback);
+        assert_eq!(std::fs::read(&short).unwrap().len(), 32); // regenerated
+        assert_eq!(c.decrypt(&c.encrypt("b")).unwrap(), "b");
+
+        // (c) exactly 32 bytes already present — reused as-is.
+        let exact = dir.path().join("exact.key");
+        std::fs::write(&exact, [2u8; 32]).unwrap();
+        let (c, status) = load_from_file(&exact);
+        assert_eq!(status, KeychainStatus::FileFallback);
+        assert_eq!(std::fs::read(&exact).unwrap(), [2u8; 32]); // untouched
+        assert_eq!(c.decrypt(&c.encrypt("c")).unwrap(), "c");
     }
 
-    #[test]
-    fn cipher_and_keychain_status_agree_after_first_touch() {
-        // Touching either global accessor must initialize both consistently,
-        // regardless of which one is called first.
-        let _ = cipher();
-        let _status = keychain_status();
-    }
+    // The global-accessor ordering (STATUS.set happens inside
+    // CIPHER.get_or_init's closure, and keychain_status() forces cipher()
+    // first) was verified by inspection; it is deliberately NOT unit-tested,
+    // because `cipher()`/`keychain_status()`/`load()` touch the real OS
+    // keychain and the production state dir, which a `cargo test` run must
+    // never mutate.
 }
