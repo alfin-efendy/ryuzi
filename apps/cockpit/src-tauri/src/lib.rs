@@ -175,6 +175,7 @@ fn build_registries() -> Registries {
     }));
 
     ryuzi_core::plugins::install_builtins(&mut registries);
+    ryuzi_core::plugins::load_user_plugins(&mut registries);
     registries
 }
 

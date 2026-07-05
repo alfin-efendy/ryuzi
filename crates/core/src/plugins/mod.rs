@@ -20,6 +20,7 @@
 //! [`install_builtins`] adds all of them in one call.
 
 pub mod builtin;
+pub mod declarative;
 pub mod host;
 pub mod providers;
 pub mod runtimes_meta;
@@ -42,6 +43,149 @@ pub fn install_builtins(regs: &mut Registries) {
     }
     for plugin in runtimes_meta::cli_agent_plugins() {
         regs.add_plugin(plugin);
+    }
+}
+
+/// Discover and register user-authored plugins from
+/// `~/.config/ryuzi/plugins/*/ryuzi-plugin.toml`. Call after
+/// [`install_builtins`] so a user manifest can never shadow a built-in
+/// (`Registries::add_plugin` keeps the first registration for a given id —
+/// see `host`'s module doc).
+///
+/// A missing config directory is not an error (most installs have none). A
+/// plugin directory that fails to parse or fails manifest validation is
+/// logged via `tracing::warn!` and skipped — never panics, and never stops
+/// the rest of the scan.
+pub fn load_user_plugins(regs: &mut Registries) {
+    let Some(home) = dirs::home_dir() else {
+        tracing::warn!("could not resolve home directory — skipping user plugin discovery");
+        return;
+    };
+    load_user_plugins_from(regs, &home.join(".config/ryuzi/plugins"));
+}
+
+/// The scan behind [`load_user_plugins`], factored out so tests can pass a
+/// tempdir instead of the real config directory.
+pub(crate) fn load_user_plugins_from(regs: &mut Registries, base: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return; // no user plugin directory — nothing to do
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let manifest_path = dir.join("ryuzi-plugin.toml");
+        let text = match std::fs::read_to_string(&manifest_path) {
+            Ok(text) => text,
+            Err(_) => continue, // no manifest in this directory — not a plugin
+        };
+        let manifest = match ryuzi_plugin_sdk::PluginManifest::from_toml(&text) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping user plugin at {}: invalid manifest: {e}",
+                    manifest_path.display()
+                );
+                continue;
+            }
+        };
+        match declarative::declarative_plugin(manifest, PluginSource::User(dir.clone())) {
+            Ok(plugin) => regs.add_plugin(plugin),
+            Err(e) => {
+                tracing::warn!("skipping user plugin at {}: {e}", manifest_path.display());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod load_user_plugins_tests {
+    use super::*;
+
+    const VALID_MANIFEST: &str = r#"
+contract = 1
+id = "acme-user"
+name = "Acme User Plugin"
+
+[[mcp]]
+name = "svc"
+transport = "stdio"
+command = "acme-mcp"
+"#;
+
+    fn write_manifest(base: &std::path::Path, plugin_dir: &str, toml_str: &str) {
+        let dir = base.join(plugin_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ryuzi-plugin.toml"), toml_str).unwrap();
+    }
+
+    #[test]
+    fn valid_user_manifest_registers_a_connector_capable_plugin_with_user_source() {
+        let base = tempfile::tempdir().unwrap();
+        write_manifest(base.path(), "acme", VALID_MANIFEST);
+
+        let mut regs = Registries::new();
+        load_user_plugins_from(&mut regs, base.path());
+
+        let plugin = regs
+            .plugins
+            .get("acme-user")
+            .expect("valid user manifest should register a plugin");
+        assert!(
+            plugin.connector.is_some(),
+            "manifest has an [[mcp]] entry, so it should be connector-capable"
+        );
+        assert_eq!(
+            plugin.source,
+            PluginSource::User(base.path().join("acme")),
+            "source should record the manifest's own directory"
+        );
+    }
+
+    #[test]
+    fn broken_toml_is_skipped_without_panicking_and_other_plugins_still_load() {
+        let base = tempfile::tempdir().unwrap();
+        write_manifest(base.path(), "broken", "this is not valid toml {{{");
+        write_manifest(base.path(), "acme", VALID_MANIFEST);
+
+        let mut regs = Registries::new();
+        load_user_plugins_from(&mut regs, base.path());
+
+        assert!(
+            regs.plugins.get("acme-user").is_some(),
+            "the well-formed sibling manifest should still load"
+        );
+        assert_eq!(
+            regs.plugins.list().len(),
+            1,
+            "the broken manifest must not register anything"
+        );
+    }
+
+    #[test]
+    fn manifest_id_colliding_with_a_builtin_is_skipped_by_add_plugin() {
+        let base = tempfile::tempdir().unwrap();
+        write_manifest(
+            base.path(),
+            "fake-anthropic",
+            r#"
+contract = 1
+id = "anthropic"
+name = "Fake Anthropic"
+"#,
+        );
+
+        let mut regs = Registries::new();
+        install_builtins(&mut regs); // registers the real "anthropic" provider plugin
+        load_user_plugins_from(&mut regs, base.path());
+
+        let plugin = regs.plugins.get("anthropic").unwrap();
+        assert_eq!(
+            plugin.source,
+            PluginSource::Builtin,
+            "first registration (the builtin) must win over the colliding user plugin"
+        );
     }
 }
 
