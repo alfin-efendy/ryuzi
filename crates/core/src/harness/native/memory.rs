@@ -270,11 +270,15 @@ mod tests {
     fn add_then_load_roundtrips_with_delimiter() {
         let dir = tempfile::tempdir().unwrap();
         let m = store_in(dir.path());
-        m.add(MemoryScope::Global, "user prefers bun over npm").unwrap();
+        m.add(MemoryScope::Global, "user prefers bun over npm")
+            .unwrap();
         m.add(MemoryScope::Global, "repo uses tabs").unwrap();
         assert_eq!(
             m.load(MemoryScope::Global),
-            vec!["user prefers bun over npm".to_string(), "repo uses tabs".to_string()]
+            vec![
+                "user prefers bun over npm".to_string(),
+                "repo uses tabs".to_string()
+            ]
         );
         // On-disk format uses the § delimiter.
         let raw = std::fs::read_to_string(dir.path().join("MEMORY.md")).unwrap();
@@ -287,7 +291,8 @@ mod tests {
         let m = store_in(dir.path());
         m.add(MemoryScope::Global, "alpha fact").unwrap();
         m.add(MemoryScope::Global, "beta fact").unwrap();
-        m.replace(MemoryScope::Global, "alpha", "alpha fact v2").unwrap();
+        m.replace(MemoryScope::Global, "alpha", "alpha fact v2")
+            .unwrap();
         assert_eq!(m.load(MemoryScope::Global)[0], "alpha fact v2");
         m.remove(MemoryScope::Global, "beta").unwrap();
         assert_eq!(m.load(MemoryScope::Global).len(), 1);
@@ -299,7 +304,10 @@ mod tests {
         let m = store_in(dir.path());
         m.add(MemoryScope::Global, "fact about cats").unwrap();
         m.add(MemoryScope::Global, "fact about dogs").unwrap();
-        let err = m.remove(MemoryScope::Global, "fact").unwrap_err().to_string();
+        let err = m
+            .remove(MemoryScope::Global, "fact")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("2 entries"), "{err}");
         assert!(err.contains("cats") && err.contains("dogs"), "{err}");
     }
@@ -309,7 +317,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = store_in(dir.path());
         m.add(MemoryScope::Global, "something").unwrap();
-        let err = m.replace(MemoryScope::Global, "nope", "x").unwrap_err().to_string();
+        let err = m
+            .replace(MemoryScope::Global, "nope", "x")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no entry contains"), "{err}");
     }
 
@@ -336,7 +347,10 @@ mod tests {
         m.add(MemoryScope::Global, "global fact").unwrap();
         m.add(MemoryScope::Project, "project fact").unwrap();
         let snap = m.snapshot().unwrap();
-        assert!(snap.contains("# Persistent memory (global) [0% full — 11/6000 chars]"), "{snap}");
+        assert!(
+            snap.contains("# Persistent memory (global) [0% full — 11/6000 chars]"),
+            "{snap}"
+        );
         assert!(snap.contains("# Persistent memory (project)"), "{snap}");
         assert!(snap.contains("global fact") && snap.contains("project fact"));
     }

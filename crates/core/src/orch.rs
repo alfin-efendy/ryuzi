@@ -158,10 +158,7 @@ fn check_acyclic(tasks: &[PlannedTask]) -> anyhow::Result<()> {
     let mut unmet: Vec<usize> = tasks.iter().map(|t| t.parents.len()).collect();
     let mut done = vec![false; n];
     let mut processed = 0;
-    loop {
-        let Some(next) = (0..n).find(|&i| !done[i] && unmet[i] == 0) else {
-            break;
-        };
+    while let Some(next) = (0..n).find(|&i| !done[i] && unmet[i] == 0) {
         done[next] = true;
         processed += 1;
         for (i, t) in tasks.iter().enumerate() {
@@ -469,13 +466,10 @@ pub async fn roots_ready_to_judge(store: &Store) -> anyhow::Result<Vec<OrchTask>
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .await
-        .map_err(Into::into)
 }
 
 /// `waiting` roots with terminally-failed children, plus a failure digest.
-pub async fn roots_with_failed_children(
-    store: &Store,
-) -> anyhow::Result<Vec<(OrchTask, String)>> {
+pub async fn roots_with_failed_children(store: &Store) -> anyhow::Result<Vec<(OrchTask, String)>> {
     let roots: Vec<OrchTask> = store
         .with_conn(|c| {
             let mut stmt = c.prepare(&format!(
@@ -766,8 +760,7 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
     {
         Ok(s) => s,
         Err(e) => {
-            let _ = finish_task(store, &t.id, "running", "failed", None, Some(e.to_string()))
-                .await;
+            let _ = finish_task(store, &t.id, "running", "failed", None, Some(e.to_string())).await;
             emit_changed(cp, &t.id, t.root_id.clone(), "failed");
             return;
         }
@@ -816,7 +809,12 @@ async fn start_judge(cp: &Arc<ControlPlane>, root: OrchTask) {
     };
     let rx = cp.subscribe();
     let session = match cp
-        .start_session(&root.project_id, &judge_prompt(&root, &children), "orchestrator", &[])
+        .start_session(
+            &root.project_id,
+            &judge_prompt(&root, &children),
+            "orchestrator",
+            &[],
+        )
         .await
     {
         Ok(s) => s,
@@ -836,9 +834,7 @@ async fn start_judge(cp: &Arc<ControlPlane>, root: OrchTask) {
                     crate::scheduler::final_assistant_text(cp2.store(), &session_pk).await;
                 finish_task(cp2.store(), &root_id, "judging", "done", verdict, None).await
             }
-            Err(e) => {
-                finish_task(cp2.store(), &root_id, "judging", "failed", None, Some(e)).await
-            }
+            Err(e) => finish_task(cp2.store(), &root_id, "judging", "failed", None, Some(e)).await,
         };
         if changed.unwrap_or(false) {
             let status = get_task(cp2.store(), &root_id)
@@ -1005,7 +1001,9 @@ mod tests {
     async fn promotion_follows_dependencies() {
         let s = store().await;
         let root = insert_root(&s, "p1", "the goal", "waiting").await.unwrap();
-        let ids = insert_children(&s, &root, "p1", &plan_ab_c()).await.unwrap();
+        let ids = insert_children(&s, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap();
 
         // First pass: only the dep-free children promote.
         let promoted = promote_ready(&s).await.unwrap();
@@ -1015,9 +1013,11 @@ mod tests {
         // Finish a — c still gated by b.
         let claimed = claim_ready(&s, 10).await.unwrap();
         assert_eq!(claimed.len(), 2);
-        assert!(finish_task(&s, &ids[0], "running", "done", Some("a done".into()), None)
-            .await
-            .unwrap());
+        assert!(
+            finish_task(&s, &ids[0], "running", "done", Some("a done".into()), None)
+                .await
+                .unwrap()
+        );
         assert!(promote_ready(&s).await.unwrap().is_empty());
 
         // Finish b — now c promotes.
@@ -1056,7 +1056,9 @@ mod tests {
     async fn judge_readiness_and_failure_digest() {
         let s = store().await;
         let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
-        let ids = insert_children(&s, &root, "p1", &plan_ab_c()).await.unwrap();
+        let ids = insert_children(&s, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap();
         assert!(roots_ready_to_judge(&s).await.unwrap().is_empty());
 
         promote_ready(&s).await.unwrap();
@@ -1112,7 +1114,9 @@ mod tests {
     async fn cancel_tree_spares_finished_children_and_guards_races() {
         let s = store().await;
         let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
-        let ids = insert_children(&s, &root, "p1", &plan_ab_c()).await.unwrap();
+        let ids = insert_children(&s, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap();
         promote_ready(&s).await.unwrap();
         claim_ready(&s, 10).await.unwrap();
         finish_task(&s, &ids[0], "running", "done", Some("kept".into()), None)
@@ -1348,7 +1352,11 @@ mod tests {
 
         let failed = drive_until(&cp, &root, "failed", 10_000).await;
         assert!(
-            failed.error.as_deref().unwrap_or("").contains("subtasks failed"),
+            failed
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("subtasks failed"),
             "{:?}",
             failed.error
         );
@@ -1374,7 +1382,9 @@ mod tests {
     async fn retry_requeues_only_failed_tasks() {
         let s = store().await;
         let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
-        let ids = insert_children(&s, &root, "p1", &plan_ab_c()).await.unwrap();
+        let ids = insert_children(&s, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap();
         promote_ready(&s).await.unwrap();
         claim_ready(&s, 10).await.unwrap();
         finish_task(&s, &ids[0], "running", "failed", None, Some("x".into()))

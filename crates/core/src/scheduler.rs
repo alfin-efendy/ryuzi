@@ -617,7 +617,7 @@ pub async fn execute_job_with(
             note,
         )
         .await;
-if status != "success" || notify {
+        if status != "success" || notify {
             let level = if status == "success" {
                 "success"
             } else {

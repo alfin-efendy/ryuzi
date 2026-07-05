@@ -185,13 +185,10 @@ mod tests {
     use crate::detect::Detected;
     use ryuzi_core::sidecar::SidecarStatus;
 
-    fn fake_deps(
-        db: &std::path::Path,
-    ) -> (
-        crate::dispatch::Deps,
-        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
-        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
-    ) {
+    /// Captured stdout/stderr lines from a fake `Deps`.
+    type Sink = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+    fn fake_deps(db: &std::path::Path) -> (crate::dispatch::Deps, Sink, Sink) {
         let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let err = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let (out2, err2) = (out.clone(), err.clone());
@@ -243,9 +240,16 @@ mod tests {
         seed_project(tmp.path());
         let (mut deps, out, _err) = fake_deps(tmp.path());
 
-        let code = cmd_orch(&args(&["submit", "--project", "p1", "fix", "the", "bug"]), &mut deps);
+        let code = cmd_orch(
+            &args(&["submit", "--project", "p1", "fix", "the", "bug"]),
+            &mut deps,
+        );
         assert_eq!(code, 0);
-        assert!(out.borrow()[0].starts_with("queued ot-"), "{:?}", out.borrow());
+        assert!(
+            out.borrow()[0].starts_with("queued ot-"),
+            "{:?}",
+            out.borrow()
+        );
 
         let code = cmd_orch(&args(&["list"]), &mut deps);
         assert_eq!(code, 0);
@@ -265,7 +269,10 @@ mod tests {
             1
         );
         assert!(err.borrow().last().unwrap().contains("unknown project"));
-        assert_eq!(cmd_orch(&args(&["submit", "--project", "p1"]), &mut deps), 1);
+        assert_eq!(
+            cmd_orch(&args(&["submit", "--project", "p1"]), &mut deps),
+            1
+        );
     }
 
     #[test]

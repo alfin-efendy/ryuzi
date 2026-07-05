@@ -494,7 +494,16 @@ impl RunnerSpawner {
         {
             return result(SubtaskStatus::Error, e.to_string());
         }
-        match drive(&child_deps, &child, &mut ledger, &cancel, child_spawn, false).await {
+        match drive(
+            &child_deps,
+            &child,
+            &mut ledger,
+            &cancel,
+            child_spawn,
+            false,
+        )
+        .await
+        {
             Ok(text) if cancel.is_cancelled() => {
                 result(SubtaskStatus::Interrupted, cap_report(&text))
             }
@@ -1139,7 +1148,7 @@ mod tests {
 
     #[test]
     fn cap_report_truncates_head_and_tail_with_marker() {
-        let long: String = std::iter::repeat('x').take(40_000).collect();
+        let long = "x".repeat(40_000);
         let capped = cap_report(&long);
         assert!(capped.chars().count() < MAX_SUBTASK_REPORT_CHARS + 100);
         assert!(capped.contains("chars elided"));
@@ -1169,8 +1178,16 @@ mod tests {
     #[tokio::test]
     async fn run_many_serial_is_ordered_and_deterministic() {
         let dir = tempfile::tempdir().unwrap();
-        let child_a = vec![text_delta("report A"), message_delta("end_turn"), message_stop()];
-        let child_b = vec![text_delta("report B"), message_delta("end_turn"), message_stop()];
+        let child_a = vec![
+            text_delta("report A"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let child_b = vec![
+            text_delta("report B"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
         let llm = Arc::new(ScriptedLlm::new(vec![child_a, child_b]));
         let deps = deps_at(dir.path(), llm).await;
         // Serialize children so the scripted turns map deterministically.
@@ -1207,7 +1224,13 @@ mod tests {
         use crate::llm_router::client::AnthropicEvent;
         let dir = tempfile::tempdir().unwrap();
         let turns: Vec<Vec<AnthropicEvent>> = (0..3)
-            .map(|_| vec![text_delta("done"), message_delta("end_turn"), message_stop()])
+            .map(|_| {
+                vec![
+                    text_delta("done"),
+                    message_delta("end_turn"),
+                    message_stop(),
+                ]
+            })
             .collect();
         let llm = Arc::new(ScriptedLlm::new(turns));
         let deps = deps_at(dir.path(), llm).await;
@@ -1234,7 +1257,11 @@ mod tests {
     #[tokio::test]
     async fn run_many_isolates_individual_failures() {
         let dir = tempfile::tempdir().unwrap();
-        let child = vec![text_delta("fine"), message_delta("end_turn"), message_stop()];
+        let child = vec![
+            text_delta("fine"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
         let llm = Arc::new(ScriptedLlm::new(vec![child]));
         let deps = deps_at(dir.path(), llm).await;
         let spawner = RunnerSpawner {
@@ -1309,7 +1336,10 @@ mod tests {
         ];
         let orch_1 = vec![
             tool_use_start(0, "c2", "task"),
-            input_json_delta(0, "{\"subagent_type\":\"explore\",\"prompt\":\"look around\"}"),
+            input_json_delta(
+                0,
+                "{\"subagent_type\":\"explore\",\"prompt\":\"look around\"}",
+            ),
             message_delta("tool_use"),
             message_stop(),
         ];
@@ -1323,12 +1353,19 @@ mod tests {
             message_delta("end_turn"),
             message_stop(),
         ];
-        let parent_end = vec![text_delta("done"), message_delta("end_turn"), message_stop()];
+        let parent_end = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
         let llm = Arc::new(RecordingLlm::new(vec![
             parent, orch_1, explore, orch_2, parent_end,
         ]));
         let deps = deps_at(dir.path(), llm.clone()).await;
-        deps.store.set_setting("max_spawn_depth", "2").await.unwrap();
+        deps.store
+            .set_setting("max_spawn_depth", "2")
+            .await
+            .unwrap();
 
         run_turn(
             &deps,
@@ -1341,19 +1378,22 @@ mod tests {
         .await
         .unwrap();
 
-        let bodies = llm.bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 5, "orchestrator's delegation really ran");
-        // The orchestrator child carries the capability block and the task tool.
-        let orch_sys = bodies[1]["system"].as_str().unwrap();
-        assert!(orch_sys.contains("spawn depth 1 of 2"), "{orch_sys}");
-        let orch_tools: Vec<&str> = bodies[1]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-        assert!(orch_tools.contains(&"task"));
-        assert!(!orch_tools.contains(&"memory"), "memory stays blocked");
+        {
+            let bodies = llm.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 5, "orchestrator's delegation really ran");
+            // The orchestrator child carries the capability block + task tool.
+            let orch_sys = bodies[1]["system"].as_str().unwrap();
+            assert!(orch_sys.contains("spawn depth 1 of 2"), "{orch_sys}");
+            let orch_tools: Vec<&str> = bodies[1]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t["name"].as_str())
+                .collect();
+            assert!(orch_tools.contains(&"task"));
+            assert!(!orch_tools.contains(&"memory"), "memory stays blocked");
+            // Guard dropped before the awaits below (clippy: await_holding_lock).
+        }
         // The grandchild explore ran and fed the orchestrator's synthesis.
         let task_row_out = deps
             .store
@@ -1430,7 +1470,10 @@ mod tests {
         let msgs = serde_json::to_string(&bodies[2]["messages"]).unwrap();
         assert!(msgs.contains("not permitted"), "{msgs}");
         // And its system prompt has no capability block.
-        assert!(!bodies[1]["system"].as_str().unwrap().contains("spawn depth"));
+        assert!(!bodies[1]["system"]
+            .as_str()
+            .unwrap()
+            .contains("spawn depth"));
     }
 
     #[tokio::test]
@@ -1445,13 +1488,22 @@ mod tests {
             message_delta("tool_use"),
             message_stop(),
         ];
-        let sub = vec![text_delta("found"), message_delta("end_turn"), message_stop()];
-        let parent_end = vec![text_delta("done"), message_delta("end_turn"), message_stop()];
+        let sub = vec![
+            text_delta("found"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let parent_end = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
         let llm = Arc::new(RecordingLlm::new(vec![parent, sub, parent_end]));
         let mut deps = deps_at(dir.path(), llm.clone()).await;
         let memdir = tempfile::tempdir().unwrap();
         let mem = MemoryStore::new(memdir.path().join("MEMORY.md"), None);
-        mem.add(MemoryScope::Global, "remember: the repo uses bun").unwrap();
+        mem.add(MemoryScope::Global, "remember: the repo uses bun")
+            .unwrap();
         deps.memory = Some(Arc::new(mem));
 
         run_turn(

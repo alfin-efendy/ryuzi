@@ -203,9 +203,16 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.for_model);
-        assert!(out.for_model.contains("global: 1 entries"), "{}", out.for_model);
+        assert!(
+            out.for_model.contains("global: 1 entries"),
+            "{}",
+            out.for_model
+        );
         let mem = ctx.memory.as_ref().unwrap();
-        assert_eq!(mem.load(MemoryScope::Global), vec!["prefers bun".to_string()]);
+        assert_eq!(
+            mem.load(MemoryScope::Global),
+            vec!["prefers bun".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -220,9 +227,15 @@ mod tests {
             assert!(!out.is_error, "{}", out.for_model);
         }
         let mem = ctx.memory.as_ref().unwrap();
-        assert_eq!(mem.load(MemoryScope::Project), vec!["uses vite + tauri".to_string()]);
+        assert_eq!(
+            mem.load(MemoryScope::Project),
+            vec!["uses vite + tauri".to_string()]
+        );
         let out = MemoryTool
-            .execute(&ctx, json!({"action": "remove", "scope": "project", "match": "tauri"}))
+            .execute(
+                &ctx,
+                json!({"action": "remove", "scope": "project", "match": "tauri"}),
+            )
             .await
             .unwrap();
         assert!(!out.is_error);
@@ -258,7 +271,11 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
-        assert!(out.for_model.contains("must not be empty"), "{}", out.for_model);
+        assert!(
+            out.for_model.contains("must not be empty"),
+            "{}",
+            out.for_model
+        );
     }
 
     #[tokio::test]
@@ -266,7 +283,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ctx_at(dir.path()).await; // memory: None
         let out = MemoryTool
-            .execute(&ctx, json!({"action": "add", "scope": "global", "text": "x"}))
+            .execute(
+                &ctx,
+                json!({"action": "add", "scope": "global", "text": "x"}),
+            )
             .await
             .unwrap();
         assert!(out.is_error);
