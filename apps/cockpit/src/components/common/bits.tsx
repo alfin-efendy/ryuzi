@@ -1,5 +1,37 @@
 import type { CSSProperties, ReactNode } from "react";
-import { Button, cn } from "@ryuzi/ui";
+import type { LucideIcon } from "lucide-react";
+import { Badge, Button, cn } from "@ryuzi/ui";
+
+// Muted icon avatar — the `Chip` sibling for rows identified by a lucide icon
+// rather than a colored initial (plugin manifests only ever carry an icon
+// name, never a brand color). Shared by the plugin detail header and the
+// catalog tab's cards so both draw the exact same box.
+export function IconChip({ icon: Icon, size = 36, className }: { icon: LucideIcon; size?: number; className?: string }) {
+  return (
+    <span
+      className={cn(
+        "flex shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground",
+        size >= 44 && "rounded-lg",
+        className,
+      )}
+      style={{ width: size, height: size }}
+    >
+      <Icon aria-hidden size={Math.round(size * 0.46)} strokeWidth={1.75} />
+    </span>
+  );
+}
+
+// One status Badge for a plugin: verified catalog/user entries read
+// "Verified", entries the manifest itself flags as docs-only/at-risk read
+// "Experimental" (and never get an enable toggle alongside it — see the
+// plugin detail header and catalog tab), everything else is a community/
+// user-authored plugin. Shared so the detail view and the catalog tab never
+// disagree on which badge a given plugin gets.
+export function PluginStatusBadge({ verified, experimental }: { verified: boolean; experimental: boolean }) {
+  if (experimental) return <Badge variant="outline">Experimental</Badge>;
+  if (verified) return <Badge>Verified</Badge>;
+  return <Badge variant="secondary">Community</Badge>;
+}
 
 // Tinted initial avatar used for providers, agents and apps.
 export function Chip({

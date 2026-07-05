@@ -1,5 +1,5 @@
 import { test, expect, spyOn } from "bun:test";
-import { usePlugins, sidebarPlugins } from "./store-plugins";
+import { usePlugins, sidebarPlugins, catalogPlugins } from "./store-plugins";
 import { commands, type PluginInfo } from "./bindings";
 
 function reset() {
@@ -100,4 +100,9 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
 test("sidebarPlugins keeps only enabled catalog/user plugins, hiding builtins and disabled ones", () => {
   const result = sidebarPlugins([builtin, github, userPlugin, disabledCatalog]);
   expect(result.map((p) => p.id)).toEqual(["github", "acme"]);
+});
+
+test("catalogPlugins keeps every catalog/user plugin regardless of enabled state, hiding builtins", () => {
+  const result = catalogPlugins([builtin, github, userPlugin, disabledCatalog]);
+  expect(result.map((p) => p.id)).toEqual(["github", "acme", "linear"]);
 });

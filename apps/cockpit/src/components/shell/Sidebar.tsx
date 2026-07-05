@@ -6,28 +6,17 @@ import {
   CalendarClock,
   ChevronRight,
   ChevronsUpDown,
-  Cloud,
-  Cpu,
-  Database,
   Folder,
   FolderOpen,
   FolderPlus,
-  Globe,
   Grip,
-  Key,
   LayoutGrid,
   ListFilter,
-  Mail,
-  MessageCircle,
   Pencil,
   Pin,
   Plus,
-  Puzzle,
-  Search,
   Server,
   Settings,
-  Terminal,
-  Webhook,
 } from "lucide-react";
 import {
   Button,
@@ -47,6 +36,7 @@ import { useTerms } from "@/store-terms";
 import { commands, type Session } from "@/bindings";
 import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
+import { pluginIcon } from "@/lib/plugin-icons";
 import { StatusDot } from "@/components/common/bits";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
@@ -57,30 +47,6 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
   { label: "Apps", icon: LayoutGrid, view: { kind: "apps" }, group: ["apps", "appDetail", "registry"] },
   { label: "Settings", icon: Settings, view: { kind: "settings" }, group: ["settings"] },
 ];
-
-// Explicit manifest-icon → lucide map (no `import *` — keeps the bundle from
-// pulling in the whole icon set). Manifests are freeform strings; anything
-// outside this small known set — including the canonical `icon = "github"`
-// example from the plugin-sdk docs, since lucide-react dropped brand/logo
-// icons — falls through to the universal `Puzzle` fallback.
-const PLUGIN_ICONS: Record<string, typeof Puzzle> = {
-  "message-circle": MessageCircle,
-  terminal: Terminal,
-  cpu: Cpu,
-  globe: Globe,
-  database: Database,
-  search: Search,
-  cloud: Cloud,
-  server: Server,
-  webhook: Webhook,
-  key: Key,
-  mail: Mail,
-  bot: Bot,
-};
-
-function pluginIcon(icon: string | null): typeof Puzzle {
-  return (icon && PLUGIN_ICONS[icon]) || Puzzle;
-}
 
 // Layout-only overrides for the tiny ghost icon Buttons in tree rows.
 const iconBtn = "shrink-0 rounded-sm text-muted-foreground";

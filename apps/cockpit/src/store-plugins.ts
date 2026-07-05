@@ -49,3 +49,13 @@ export function pluginById(plugins: PluginInfo[], id: string): PluginInfo | unde
 export function sidebarPlugins(plugins: PluginInfo[]): PluginInfo[] {
   return plugins.filter((p) => p.enabled && (p.source === "catalog" || p.source === "user"));
 }
+
+/**
+ * Plugins the Apps → Catalog tab lists: every catalog or user-authored entry,
+ * enabled or not (unlike `sidebarPlugins`, which only surfaces the ones
+ * already enabled). Core builtins (native, claude-code, discord, providers)
+ * keep their own dedicated screens instead of a catalog row.
+ */
+export function catalogPlugins(plugins: PluginInfo[]): PluginInfo[] {
+  return plugins.filter((p) => p.source === "catalog" || p.source === "user");
+}
