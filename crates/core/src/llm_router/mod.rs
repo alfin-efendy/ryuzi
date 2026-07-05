@@ -3,6 +3,7 @@
 pub mod aws_stream;
 pub mod connections;
 pub mod keys;
+pub mod kiro;
 pub mod oauth;
 pub mod registry;
 pub mod responses;
