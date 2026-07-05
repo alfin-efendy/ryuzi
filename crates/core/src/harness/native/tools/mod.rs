@@ -50,12 +50,51 @@ impl Default for OutputCaps {
     }
 }
 
-/// Spawns a sub-agent for the `task` tool. Implemented by the runner; `None`
-/// inside a sub-agent's own `ToolCtx` (sub-agents cannot nest further).
+/// One delegated subtask in a `task` batch.
+#[derive(Debug, Clone)]
+pub struct SubtaskSpec {
+    pub agent_type: String,
+    pub prompt: String,
+}
+
+/// How one delegated subtask ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtaskStatus {
+    Completed,
+    Error,
+    Interrupted,
+}
+
+impl SubtaskStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubtaskStatus::Completed => "completed",
+            SubtaskStatus::Error => "error",
+            SubtaskStatus::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// Outcome of one delegated subtask, ordered by `index` within its batch.
+#[derive(Debug, Clone)]
+pub struct SubtaskResult {
+    pub index: usize,
+    pub agent_type: String,
+    pub status: SubtaskStatus,
+    pub report: String,
+}
+
+/// Spawns sub-agents for the `task` tool. Implemented by the runner; `None`
+/// inside a sub-agent's own `ToolCtx` unless that agent may delegate.
 #[async_trait]
 pub trait SubagentSpawner: Send + Sync {
     /// Run `agent_type` on `prompt` to completion and return its final text.
     async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String>;
+    /// Run a batch of subtasks concurrently (bounded by the
+    /// `max_concurrent_runs` setting) and return one result per spec, ordered
+    /// by index. Individual failures land in their entry — the batch itself
+    /// never fails.
+    async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult>;
     /// Names of agents that may be spawned (for the tool description/errors).
     fn available(&self) -> Vec<String>;
 }

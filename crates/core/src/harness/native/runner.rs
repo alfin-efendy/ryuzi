@@ -7,7 +7,9 @@ use super::commands::CommandRegistry;
 use super::ledger::Ledger;
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
-use super::tools::{OutputCaps, SubagentSpawner, ToolCtx, ToolRegistry};
+use super::tools::{
+    OutputCaps, SubagentSpawner, SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
+};
 use super::{context, NATIVE_ID};
 use crate::approval::ApprovalHub;
 use crate::domain::{CoreEvent, NewMessage, PermMode};
@@ -336,30 +338,160 @@ async fn drive(
     Ok(final_text)
 }
 
-/// A [`SubagentSpawner`] backed by the runner: runs a sub-agent in an ephemeral
-/// (unpersisted-history) sub-loop and returns its final text.
+/// Tools delegated children may never use regardless of filters. `task` is
+/// re-armed for delegator agents (the orchestrator role); `memory` never is —
+/// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`.
+const SUBAGENT_BLOCKLIST: &[&str] = &["task", "memory"];
+/// Cap on one delegated child's model-visible report (protects the parent's
+/// context from runaway child output).
+const MAX_SUBTASK_REPORT_CHARS: usize = 16_000;
+
+/// Truncate an oversized child report, keeping 75% head / 25% tail.
+fn cap_report(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= MAX_SUBTASK_REPORT_CHARS {
+        return s.to_string();
+    }
+    let head_n = MAX_SUBTASK_REPORT_CHARS * 3 / 4;
+    let tail_n = MAX_SUBTASK_REPORT_CHARS - head_n;
+    let head: String = s.chars().take(head_n).collect();
+    let tail: String = s.chars().skip(n - tail_n).collect();
+    format!("{head}\n[… {} chars elided …]\n{tail}", n - head_n - tail_n)
+}
+
+/// The tool filter a delegated child actually runs with: the intersection of
+/// the parent's and the child agent's filters over the registry's tool names,
+/// minus the delegation blocklist.
+fn effective_child_filter(
+    parent: &super::agents::ToolFilter,
+    child: &super::agents::ToolFilter,
+    names: &[String],
+    blocklist: &[&str],
+) -> super::agents::ToolFilter {
+    super::agents::ToolFilter::Only(
+        names
+            .iter()
+            .filter(|n| parent.allows(n) && child.allows(n) && !blocklist.contains(&n.as_str()))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// A [`SubagentSpawner`] backed by the runner: runs sub-agents in ephemeral
+/// (unpersisted-history) sub-loops and returns their final texts.
 struct RunnerSpawner {
     deps: RunnerDeps,
     cancel: CancellationToken,
 }
 
+impl RunnerSpawner {
+    /// The `max_concurrent_runs` setting (default 3, floor 1).
+    async fn concurrency(&self) -> usize {
+        self.deps
+            .store
+            .get_setting("max_concurrent_runs")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3)
+            .max(1)
+    }
+
+    /// Run one delegated child to completion; failures become the result's
+    /// status, never a panic or batch abort.
+    async fn run_child(
+        &self,
+        index: usize,
+        spec: SubtaskSpec,
+        cancel: CancellationToken,
+    ) -> SubtaskResult {
+        let result = |status, report| SubtaskResult {
+            index,
+            agent_type: spec.agent_type.clone(),
+            status,
+            report,
+        };
+        let Some(agent) = self
+            .deps
+            .agents
+            .get(&spec.agent_type)
+            .filter(|a| a.mode.is_subagent())
+        else {
+            return result(
+                SubtaskStatus::Error,
+                format!(
+                    "unknown sub-agent `{}` (available: {})",
+                    spec.agent_type,
+                    self.available().join(", ")
+                ),
+            );
+        };
+        let mut child = agent;
+        child.tools = effective_child_filter(
+            &self.deps.agent.tools,
+            &child.tools,
+            &self.deps.tools.names(),
+            SUBAGENT_BLOCKLIST,
+        );
+        // No display rows, no memory access; history is ephemeral.
+        let mut child_deps = self.deps.clone();
+        child_deps.memory = None;
+        let mut ledger = Ledger::ephemeral(&self.deps.session_pk);
+        if let Err(e) = ledger
+            .append_user(json!([{ "type": "text", "text": spec.prompt }]))
+            .await
+        {
+            return result(SubtaskStatus::Error, e.to_string());
+        }
+        match drive(&child_deps, &child, &mut ledger, &cancel, None, false).await {
+            Ok(text) if cancel.is_cancelled() => {
+                result(SubtaskStatus::Interrupted, cap_report(&text))
+            }
+            Ok(text) => result(SubtaskStatus::Completed, cap_report(&text)),
+            Err(e) => result(SubtaskStatus::Error, e.to_string()),
+        }
+    }
+}
+
 #[async_trait]
 impl SubagentSpawner for RunnerSpawner {
     async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String> {
-        let agent = self
-            .deps
-            .agents
-            .get(agent_type)
-            .filter(|a| a.mode.is_subagent())
-            .ok_or_else(|| anyhow::anyhow!("unknown sub-agent `{agent_type}`"))?;
-        let mut ledger = Ledger::ephemeral(&self.deps.session_pk);
-        ledger
-            .append_user(json!([{ "type": "text", "text": prompt }]))
-            .await?;
-        // No nested spawner (depth 1), no display rows, no memory access.
-        let mut child_deps = self.deps.clone();
-        child_deps.memory = None;
-        drive(&child_deps, &agent, &mut ledger, &self.cancel, None, false).await
+        let mut results = self
+            .run_many(vec![SubtaskSpec {
+                agent_type: agent_type.to_string(),
+                prompt: prompt.to_string(),
+            }])
+            .await;
+        let r = results.pop().expect("one result for one spec");
+        match r.status {
+            SubtaskStatus::Completed => Ok(r.report),
+            SubtaskStatus::Interrupted => anyhow::bail!("interrupted"),
+            SubtaskStatus::Error => anyhow::bail!("{}", r.report),
+        }
+    }
+
+    async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult> {
+        let sem = Arc::new(tokio::sync::Semaphore::new(self.concurrency().await));
+        let futures = specs.into_iter().enumerate().map(|(index, spec)| {
+            let sem = sem.clone();
+            let cancel = self.cancel.child_token();
+            async move {
+                let _permit = sem.acquire().await;
+                if cancel.is_cancelled() {
+                    return SubtaskResult {
+                        index,
+                        agent_type: spec.agent_type,
+                        status: SubtaskStatus::Interrupted,
+                        report: "interrupted before start".into(),
+                    };
+                }
+                self.run_child(index, spec, cancel).await
+            }
+        });
+        let mut results = futures::future::join_all(futures).await;
+        results.sort_by_key(|r| r.index);
+        results
     }
 
     fn available(&self) -> Vec<String> {
@@ -953,6 +1085,154 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.block_type == "text" && m.payload["text"] == "all set"));
+    }
+
+    #[test]
+    fn cap_report_truncates_head_and_tail_with_marker() {
+        let long: String = std::iter::repeat('x').take(40_000).collect();
+        let capped = cap_report(&long);
+        assert!(capped.chars().count() < MAX_SUBTASK_REPORT_CHARS + 100);
+        assert!(capped.contains("chars elided"));
+        // Small reports pass through unchanged.
+        assert_eq!(cap_report("short"), "short");
+    }
+
+    #[test]
+    fn effective_child_filter_intersects_and_blocks() {
+        use super::super::agents::ToolFilter;
+        let names: Vec<String> = ["read", "bash", "task", "memory", "grep"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parent = ToolFilter::Only(vec!["read".into(), "task".into(), "bash".into()]);
+        let eff = effective_child_filter(&parent, &ToolFilter::All, &names, SUBAGENT_BLOCKLIST);
+        assert!(eff.allows("read") && eff.allows("bash"));
+        assert!(!eff.allows("task"), "blocklist wins over parent allow");
+        assert!(!eff.allows("memory"));
+        assert!(!eff.allows("grep"), "parent filter constrains the child");
+        // All ∩ All − blocklist keeps everything else.
+        let eff = effective_child_filter(&ToolFilter::All, &ToolFilter::All, &names, &["memory"]);
+        assert!(eff.allows("task") && eff.allows("read"));
+        assert!(!eff.allows("memory"));
+    }
+
+    #[tokio::test]
+    async fn run_many_serial_is_ordered_and_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_a = vec![text_delta("report A"), message_delta("end_turn"), message_stop()];
+        let child_b = vec![text_delta("report B"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(ScriptedLlm::new(vec![child_a, child_b]));
+        let deps = deps_at(dir.path(), llm).await;
+        // Serialize children so the scripted turns map deterministically.
+        deps.store
+            .set_setting("max_concurrent_runs", "1")
+            .await
+            .unwrap();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+        };
+        let results = spawner
+            .run_many(vec![
+                SubtaskSpec {
+                    agent_type: "explore".into(),
+                    prompt: "first".into(),
+                },
+                SubtaskSpec {
+                    agent_type: "explore".into(),
+                    prompt: "second".into(),
+                },
+            ])
+            .await;
+        assert_eq!(results.len(), 2);
+        assert_eq!((results[0].index, results[1].index), (0, 1));
+        assert!(results.iter().all(|r| r.status == SubtaskStatus::Completed));
+        assert_eq!(results[0].report, "report A");
+        assert_eq!(results[1].report, "report B");
+    }
+
+    #[tokio::test]
+    async fn run_many_concurrent_batch_completes_all() {
+        use crate::llm_router::client::AnthropicEvent;
+        let dir = tempfile::tempdir().unwrap();
+        let turns: Vec<Vec<AnthropicEvent>> = (0..3)
+            .map(|_| vec![text_delta("done"), message_delta("end_turn"), message_stop()])
+            .collect();
+        let llm = Arc::new(ScriptedLlm::new(turns));
+        let deps = deps_at(dir.path(), llm).await;
+        let spawner = RunnerSpawner {
+            deps,
+            cancel: CancellationToken::new(),
+        };
+        let specs = (0..3)
+            .map(|i| SubtaskSpec {
+                agent_type: "explore".into(),
+                prompt: format!("job {i}"),
+            })
+            .collect();
+        let results = spawner.run_many(specs).await;
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.status == SubtaskStatus::Completed));
+        assert_eq!(
+            results.iter().map(|r| r.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_many_isolates_individual_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = vec![text_delta("fine"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(ScriptedLlm::new(vec![child]));
+        let deps = deps_at(dir.path(), llm).await;
+        let spawner = RunnerSpawner {
+            deps,
+            cancel: CancellationToken::new(),
+        };
+        let results = spawner
+            .run_many(vec![
+                SubtaskSpec {
+                    agent_type: "no-such-agent".into(),
+                    prompt: "x".into(),
+                },
+                SubtaskSpec {
+                    agent_type: "explore".into(),
+                    prompt: "y".into(),
+                },
+            ])
+            .await;
+        assert_eq!(results[0].status, SubtaskStatus::Error);
+        assert!(results[0].report.contains("unknown sub-agent"));
+        assert!(results[0].report.contains("explore"), "lists available");
+        assert_eq!(results[1].status, SubtaskStatus::Completed);
+        assert_eq!(results[1].report, "fine");
+    }
+
+    #[tokio::test]
+    async fn run_many_precancelled_yields_interrupted_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        // No scripted turns: a model call would error the test.
+        let llm = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let spawner = RunnerSpawner { deps, cancel };
+        let results = spawner
+            .run_many(vec![
+                SubtaskSpec {
+                    agent_type: "explore".into(),
+                    prompt: "a".into(),
+                },
+                SubtaskSpec {
+                    agent_type: "explore".into(),
+                    prompt: "b".into(),
+                },
+            ])
+            .await;
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|r| r.status == SubtaskStatus::Interrupted));
     }
 
     #[tokio::test]
