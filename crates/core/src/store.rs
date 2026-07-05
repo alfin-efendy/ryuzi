@@ -345,7 +345,14 @@ where
 {
     let conn = pool.get().await?;
     let out = conn
-        .interact(f)
+        .interact(move |c| {
+            // Pooled connections + WAL still return SQLITE_BUSY immediately on
+            // write contention (e.g. a request's read racing a detached
+            // usage-record / prune write). A busy_timeout makes them wait
+            // instead of erroring — otherwise concurrent load surfaces as a 500.
+            let _ = c.busy_timeout(std::time::Duration::from_secs(5));
+            f(c)
+        })
         .await
         .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
     Ok(out)
