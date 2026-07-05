@@ -1,0 +1,28 @@
+---
+source: crates/cli/src/tui/render.rs
+assertion_line: 765
+expression: text
+---
+
+ r ryuzi
+ 1 Status  2 Daemon  3 Sessions  4 Config
+
+ ╭CONFIG──────────────────────────────────────────────────────────────────────╮
+ │ GENERAL                                                                    │
+ │ › Workdir root                     (unset)                                 │
+ │  Parent directory where project repos live  (e.g. /home/you/repos)         │
+ │   Default model                    (unset)                                 │
+ │   Default effort                   medium                                  │
+ │   Default permission mode          default                                 │
+ │   Admin role IDs                   (unset)                                 │
+ │   Approver role IDs                (unset)                                 │
+ │   OTel endpoint                    (unset)                                 │
+ │   Max concurrent runs              3                                       │
+ │   Max sub-agent spawn depth        1                                       │
+ │   Approval timeout (ms)            300000                                  │
+ │   Attachment max bytes             26214400                                │
+ │   Attachment max count             10                                      │
+ │   Attachment allowed extensions    (unset)                                 │
+ │ ↑↓ select · Enter edit · Space toggle provider · Esc cancel                │
+ ╰────────────────────────────────────────────────────────────────────────────╯
+ Tab switch  ·  ↑↓ select  ·  Enter edit  ·  ? options  ·  q quit

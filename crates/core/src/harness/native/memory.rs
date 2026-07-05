@@ -41,6 +41,19 @@ impl MemoryScope {
     }
 }
 
+/// Serializes read-modify-write cycles across the concurrent sessions of
+/// this process (parallel sessions and their tools share the same global
+/// file). Not a cross-process lock: hand edits and CLI writes can still race
+/// the daemon, but the atomic tempfile persist keeps the file well-formed.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the process-wide memory write lock (poison-tolerant). Hold it for a
+/// full load -> mutate -> save cycle; every path in this module is sync, so
+/// it is never held across an await.
+pub fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// File-backed persistent memory. Every operation re-reads the file, so
 /// concurrent hand-edits are picked up naturally and no drift guard is needed
 /// (unlike hermes, which holds a session-long in-memory snapshot).
@@ -109,18 +122,21 @@ impl MemoryStore {
     }
 
     pub fn add(&self, scope: MemoryScope, text: &str) -> anyhow::Result<()> {
+        let _guard = write_lock();
         let mut entries = self.load(scope);
         add_entry(&mut entries, text)?;
         self.save(scope, &entries)
     }
 
     pub fn replace(&self, scope: MemoryScope, matcher: &str, text: &str) -> anyhow::Result<()> {
+        let _guard = write_lock();
         let mut entries = self.load(scope);
         replace_entry(&mut entries, matcher, text)?;
         self.save(scope, &entries)
     }
 
     pub fn remove(&self, scope: MemoryScope, matcher: &str) -> anyhow::Result<()> {
+        let _guard = write_lock();
         let mut entries = self.load(scope);
         remove_entry(&mut entries, matcher)?;
         self.save(scope, &entries)

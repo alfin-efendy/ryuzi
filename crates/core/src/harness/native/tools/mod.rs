@@ -88,8 +88,6 @@ pub struct SubtaskResult {
 /// inside a sub-agent's own `ToolCtx` unless that agent may delegate.
 #[async_trait]
 pub trait SubagentSpawner: Send + Sync {
-    /// Run `agent_type` on `prompt` to completion and return its final text.
-    async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String>;
     /// Run a batch of subtasks concurrently (bounded by the
     /// `max_concurrent_runs` setting) and return one result per spec, ordered
     /// by index. Individual failures land in their entry — the batch itself
@@ -97,6 +95,25 @@ pub trait SubagentSpawner: Send + Sync {
     async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult>;
     /// Names of agents that may be spawned (for the tool description/errors).
     fn available(&self) -> Vec<String>;
+
+    /// Run one `agent_type` on `prompt` to completion and return its final
+    /// text — the single-task view over [`Self::run_many`].
+    async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String> {
+        let mut results = self
+            .run_many(vec![SubtaskSpec {
+                agent_type: agent_type.to_string(),
+                prompt: prompt.to_string(),
+            }])
+            .await;
+        let r = results
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("spawner returned no result"))?;
+        match r.status {
+            SubtaskStatus::Completed => Ok(r.report),
+            SubtaskStatus::Interrupted => anyhow::bail!("interrupted"),
+            SubtaskStatus::Error => anyhow::bail!("{}", r.report),
+        }
+    }
 }
 
 /// Everything a tool needs to run one call.

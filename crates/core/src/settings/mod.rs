@@ -9,6 +9,20 @@ pub use catalog::{GatewayDescriptor, ProviderCatalog, RuntimeDescriptor};
 pub use fields::{ConfigField, FieldType, GLOBAL_FIELDS};
 pub use store::{csv, validate_setting, SettingsStore};
 
+/// Read a numeric setting from the KV store with a default and a floor of 1.
+/// The one shared reader for capacity-style settings (`max_concurrent_runs`,
+/// `max_spawn_depth`) so their parse/default/floor behavior cannot drift.
+pub async fn usize_setting(store: &crate::store::Store, key: &str, default: usize) -> usize {
+    store
+        .get_setting(key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
 /// Expand a leading `~` / `~/` to `$HOME`. `~` is a shell-ism; Rust path ops
 /// and git do NOT expand it, so a stored path like `workdir_root: ~/repos`
 /// must be expanded before use or it becomes a literal `~` directory and

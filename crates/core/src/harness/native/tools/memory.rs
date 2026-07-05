@@ -128,7 +128,11 @@ impl Tool for MemoryTool {
 
         // Stage: load each touched scope once, apply every op in order, and
         // validate budgets — only then persist, so a failing op means nothing
-        // was written (all-or-nothing batches).
+        // was written (all-or-nothing batches). The whole read-modify-write
+        // cycle runs under the process-wide memory lock so a concurrent
+        // session cannot interleave a write between our load and save (this
+        // block is fully synchronous — the guard never crosses an await).
+        let _guard = mem::write_lock();
         let mut staged: BTreeMap<&'static str, (mem::MemoryScope, Vec<String>)> = BTreeMap::new();
         for op in &ops {
             staged

@@ -25,31 +25,22 @@ const USAGE: &str = "usage: ryuzi orch <submit|list|cancel|retry> ...\n  \
 async fn orch_inner(args: &[String], deps: &mut Deps) -> u8 {
     match args.first().map(String::as_str) {
         Some("submit") => {
-            let rest = &args[1..];
+            // Split off the one `--project <id>` flag pair by position; the
+            // remaining tokens are the goal verbatim (which may legitimately
+            // contain the literal string `--project`).
+            let mut rest: Vec<String> = args[1..].to_vec();
             let project = match rest.iter().position(|a| a == "--project") {
-                Some(i) => match rest.get(i + 1) {
-                    Some(p) => p.clone(),
-                    None => {
-                        (deps.err)("usage: ryuzi orch submit --project <id> <goal...>");
-                        return 1;
-                    }
-                },
-                None => {
+                Some(i) if i + 1 < rest.len() => {
+                    let p = rest[i + 1].clone();
+                    rest.drain(i..=i + 1);
+                    p
+                }
+                _ => {
                     (deps.err)("usage: ryuzi orch submit --project <id> <goal...>");
                     return 1;
                 }
             };
-            let goal: Vec<String> = rest
-                .iter()
-                .enumerate()
-                .filter(|(i, a)| {
-                    let is_flag = *a == "--project";
-                    let is_flag_value = *i > 0 && rest[*i - 1] == "--project";
-                    !is_flag && !is_flag_value
-                })
-                .map(|(_, a)| a.clone())
-                .collect();
-            let goal = goal.join(" ");
+            let goal = rest.join(" ");
             if goal.trim().is_empty() {
                 (deps.err)("usage: ryuzi orch submit --project <id> <goal...>");
                 return 1;
@@ -61,32 +52,18 @@ async fn orch_inner(args: &[String], deps: &mut Deps) -> u8 {
                     return 1;
                 }
             };
-            if matches!(store.get_project(&project).await, Ok(None)) {
-                (deps.err)(&format!("✗ unknown project: {project}"));
-                return 1;
-            }
-            let title: String = goal.chars().take(80).collect();
-            let root = match orch::insert_root(&store, &project, &goal, "waiting").await {
-                Ok(r) => r,
+            match orch::queue_goal(&store, &project, &goal).await {
+                Ok(root) => {
+                    (deps.out)(&format!(
+                        "queued {root} — a running daemon (Cockpit or `ryuzi serve`) will pick it up"
+                    ));
+                    0
+                }
                 Err(e) => {
                     (deps.err)(&format!("✗ {e}"));
-                    return 1;
+                    1
                 }
-            };
-            let plan = vec![orch::PlannedTask {
-                title,
-                body: goal.clone(),
-                agent: "build".into(),
-                parents: vec![],
-            }];
-            if let Err(e) = orch::insert_children(&store, &root, &project, &plan).await {
-                (deps.err)(&format!("✗ {e}"));
-                return 1;
             }
-            (deps.out)(&format!(
-                "queued {root} — a running daemon (Cockpit or `ryuzi serve`) will pick it up"
-            ));
-            0
         }
         Some("list") => {
             let store = match crate::db::open_store(deps).await {

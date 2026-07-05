@@ -101,9 +101,9 @@ pub static GLOBAL_FIELDS: &[ConfigField] = &[
         key: "max_spawn_depth",
         label: "Max sub-agent spawn depth",
         field_type: FieldType::Int,
-        default: Some("1"),
-        help: "How deep sub-agents may spawn further sub-agents (1 = flat; \
-               delegating agents need `delegate: true`)",
+        default: Some("2"),
+        help: "How deep sub-agents may spawn further sub-agents (2 lets a \
+               delegating agent like `orchestrator` fan out; 1 = flat)",
         ..BASE
     },
     ConfigField {

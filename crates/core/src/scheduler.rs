@@ -418,9 +418,10 @@ pub enum PreCheckOutcome {
 }
 
 /// Run a job's `pre_check` command (60s cap; `cmd /C` on Windows, `sh -c`
-/// elsewhere). Empty stdout, non-zero exit, spawn failure, or timeout skips
-/// the fire.
-pub async fn run_pre_check(cmd: &str) -> PreCheckOutcome {
+/// elsewhere) in `workdir` (the job's project checkout) so repo-relative
+/// checks evaluate against the right tree. Empty stdout, non-zero exit,
+/// spawn failure, or timeout skips the fire.
+pub async fn run_pre_check(cmd: &str, workdir: Option<&str>) -> PreCheckOutcome {
     let mut c = if cfg!(windows) {
         let mut c = tokio::process::Command::new("cmd");
         c.args(["/C", cmd]);
@@ -430,6 +431,12 @@ pub async fn run_pre_check(cmd: &str) -> PreCheckOutcome {
         c.args(["-c", cmd]);
         c
     };
+    if let Some(dir) = workdir {
+        c.current_dir(dir);
+    }
+    // A timed-out future is dropped: without kill_on_drop the child would
+    // keep running detached (the spawn convention everywhere else in core).
+    c.kill_on_drop(true);
     match tokio::time::timeout(Duration::from_secs(60), c.output()).await {
         Err(_) => PreCheckOutcome::Skip("pre-check timed out after 60s".into()),
         Ok(Err(e)) => PreCheckOutcome::Skip(format!("pre-check failed to spawn: {e}")),
@@ -472,18 +479,29 @@ pub async fn diff_totals(workdir: &str) -> Option<(i64, i64)> {
     Some((add, del))
 }
 
-/// Execute `job` now: create the run row, start the agent session, and close
-/// the run when the session's first turn completes. Returns the run id.
+/// Execute `job` now (a MANUAL run: no scheduled-run header, so the agent is
+/// not taught the [SILENT] convention and a user-triggered run always
+/// notifies): create the run row, start the agent session, and close the run
+/// when the session's first turn completes. Returns the run id.
 pub async fn execute_job(cp: &Arc<ControlPlane>, job: &JobRow) -> anyhow::Result<String> {
-    execute_job_with(cp, job, None).await
+    run_job(cp, job, job.prompt.clone()).await
 }
 
-/// [`execute_job`] with optional pre-check output appended to the prompt.
-pub async fn execute_job_with(
+/// Execute a SCHEDULED fire: the prompt gains the [`SCHED_HEADER`] silence
+/// convention plus any wake-gate pre-check output.
+pub async fn execute_job_scheduled(
     cp: &Arc<ControlPlane>,
     job: &JobRow,
     pre_check_output: Option<String>,
 ) -> anyhow::Result<String> {
+    let mut prompt = format!("{SCHED_HEADER}\n\n{}", job.prompt);
+    if let Some(out) = &pre_check_output {
+        prompt.push_str(&format!("\n\nPre-check output:\n{out}"));
+    }
+    run_job(cp, job, prompt).await
+}
+
+async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow::Result<String> {
     let store = cp.store().clone();
     let run_id = format!("r-{}", &crate::paths::new_id()[..8]);
     let started = crate::paths::now_ms();
@@ -514,10 +532,6 @@ pub async fn execute_job_with(
 
     // Subscribe BEFORE starting so a fast turn can't slip past the listener.
     let mut rx = cp.subscribe();
-    let mut prompt = format!("{SCHED_HEADER}\n\n{}", job.prompt);
-    if let Some(out) = &pre_check_output {
-        prompt.push_str(&format!("\n\nPre-check output:\n{out}"));
-    }
     let session = match cp
         .start_session(&job.project_id, &prompt, "scheduler", &[])
         .await
@@ -714,20 +728,33 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
             continue;
         }
         let _ = store.set_setting(&key, &now.to_string()).await;
-        // Wake gate: a configured pre-check must produce output, or the fire
-        // is skipped entirely (no session, no run row).
-        let pre = if job.pre_check.trim().is_empty() {
-            None
-        } else {
-            match run_pre_check(&job.pre_check).await {
-                PreCheckOutcome::Skip(reason) => {
-                    tracing::debug!("scheduler: job {} skipped ({reason})", job.id);
-                    continue;
+        // Fire on a detached task: a slow/hung pre-check (up to 60s) must not
+        // stall the other due jobs or the next liveness stamp. The anchor is
+        // already advanced, so this fire cannot double-run.
+        let cp2 = cp.clone();
+        tokio::spawn(async move {
+            // Wake gate: a configured pre-check must produce output, or the
+            // fire is skipped entirely (no session, no run row).
+            let pre = if job.pre_check.trim().is_empty() {
+                None
+            } else {
+                let workdir = cp2
+                    .store()
+                    .get_project(&job.project_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|p| p.workdir);
+                match run_pre_check(&job.pre_check, workdir.as_deref()).await {
+                    PreCheckOutcome::Skip(reason) => {
+                        tracing::debug!("scheduler: job {} skipped ({reason})", job.id);
+                        return;
+                    }
+                    PreCheckOutcome::Wake(out) => Some(out),
                 }
-                PreCheckOutcome::Wake(out) => Some(out),
-            }
-        };
-        let _ = execute_job_with(cp, &job, pre).await;
+            };
+            let _ = execute_job_scheduled(&cp2, &job, pre).await;
+        });
     }
 }
 
@@ -800,19 +827,31 @@ mod tests {
     #[tokio::test]
     async fn pre_check_gates_on_output_and_exit() {
         assert_eq!(
-            run_pre_check("echo hi").await,
+            run_pre_check("echo hi", None).await,
             PreCheckOutcome::Wake("hi".into())
         );
         assert!(matches!(
-            run_pre_check("exit 1").await,
+            run_pre_check("exit 1", None).await,
             PreCheckOutcome::Skip(_)
         ));
         // Succeeds but prints nothing: still a skip.
         let quiet = if cfg!(windows) { "rem quiet" } else { "true" };
         assert!(matches!(
-            run_pre_check(quiet).await,
+            run_pre_check(quiet, None).await,
             PreCheckOutcome::Skip(_)
         ));
+        // The command runs in the given workdir.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("flag.txt"), "x").unwrap();
+        let list = if cfg!(windows) {
+            "dir /b flag.txt"
+        } else {
+            "ls flag.txt"
+        };
+        assert_eq!(
+            run_pre_check(list, Some(&dir.path().to_string_lossy())).await,
+            PreCheckOutcome::Wake("flag.txt".into())
+        );
     }
 
     #[tokio::test]

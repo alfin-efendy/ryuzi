@@ -47,9 +47,11 @@ async fn run_serve(port: u16, deps: &mut Deps) -> u8 {
         }
     };
     let cp = ControlPlane::new(store, registries).await;
-    // Background loops: cron jobs (30s tick) and the orch task dispatcher
-    // (5s tick) run in every daemon host, Cockpit included.
-    ryuzi_core::scheduler::spawn_runner(cp.clone());
+    // The orch dispatcher runs here so `ryuzi orch submit` works headless.
+    // (Its SQL claim transactions are safe if Cockpit's dispatcher is also
+    // running.) The cron scheduler stays Cockpit-only: its last-fired
+    // read-check-write anchor is NOT cross-process safe, so a second host
+    // could double-fire jobs.
     ryuzi_core::orch::spawn_runner(cp.clone());
     let bound = match serve::serve(cp, port).await {
         Ok(p) => p,

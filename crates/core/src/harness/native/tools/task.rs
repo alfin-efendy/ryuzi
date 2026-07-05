@@ -14,9 +14,16 @@ use serde_json::{json, Value};
 
 pub struct Task;
 
-/// Parse the batch form into specs. `None` when `tasks` is absent.
+/// Parse the batch form into specs. `None` when `tasks` is absent; a present
+/// but non-array `tasks` is an explicit error (silently degrading to the
+/// single form would mask a malformed batch).
 fn parse_batch(input: &Value) -> Option<anyhow::Result<Vec<SubtaskSpec>>> {
-    let tasks = input.get("tasks")?.as_array()?;
+    let raw = input.get("tasks")?;
+    let Some(tasks) = raw.as_array() else {
+        return Some(Err(anyhow::anyhow!(
+            "task: `tasks` must be an array of {{subagent_type, prompt}} objects"
+        )));
+    };
     if tasks.is_empty() {
         return Some(Err(anyhow::anyhow!("task: `tasks` must not be empty")));
     }
@@ -169,12 +176,6 @@ mod tests {
 
     #[async_trait]
     impl SubagentSpawner for EchoSpawner {
-        async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String> {
-            if agent_type == "bad" {
-                anyhow::bail!("boom");
-            }
-            Ok(format!("echo: {prompt}"))
-        }
         async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult> {
             specs
                 .into_iter()

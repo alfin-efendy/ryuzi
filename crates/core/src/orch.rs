@@ -318,6 +318,8 @@ pub async fn get_task(store: &Store, id: &str) -> anyhow::Result<Option<OrchTask
 }
 
 /// Flip `todo` children whose dependencies are all `done` to `ready`.
+/// Only children of a live (`waiting`) root promote — once a root fails or is
+/// cancelled, its remaining subtasks must never spawn sessions.
 /// Returns the promoted ids.
 pub async fn promote_ready(store: &Store) -> anyhow::Result<Vec<String>> {
     store
@@ -325,7 +327,10 @@ pub async fn promote_ready(store: &Store) -> anyhow::Result<Vec<String>> {
             let tx = c.transaction()?;
             let promoted: Vec<String> = {
                 let mut stmt = tx.prepare(
-                    "SELECT id FROM orch_tasks t WHERE t.status='todo' AND NOT EXISTS (\
+                    "SELECT id FROM orch_tasks t WHERE t.status='todo' AND EXISTS (\
+                        SELECT 1 FROM orch_tasks r \
+                        WHERE r.id = t.root_id AND r.status = 'waiting') \
+                     AND NOT EXISTS (\
                         SELECT 1 FROM orch_task_deps d \
                         JOIN orch_tasks p ON p.id = d.dep_id \
                         WHERE d.task_id = t.id AND p.status != 'done')",
@@ -346,7 +351,8 @@ pub async fn promote_ready(store: &Store) -> anyhow::Result<Vec<String>> {
 }
 
 /// Claim up to `cap - currently_running` `ready` tasks as `running`, oldest
-/// first. Returns the claimed rows.
+/// first. The live-root guard is re-checked here so tasks promoted before
+/// their root died are parked, not launched. Returns the claimed rows.
 pub async fn claim_ready(store: &Store, cap: usize) -> anyhow::Result<Vec<OrchTask>> {
     store
         .with_conn(move |c| {
@@ -359,8 +365,10 @@ pub async fn claim_ready(store: &Store, cap: usize) -> anyhow::Result<Vec<OrchTa
             let slots = (cap as i64 - running).max(0);
             let claimed: Vec<OrchTask> = {
                 let mut stmt = tx.prepare(&format!(
-                    "SELECT {ORCH_COLS} FROM orch_tasks WHERE status='ready' \
-                     ORDER BY created_at LIMIT ?1"
+                    "SELECT {ORCH_COLS} FROM orch_tasks t WHERE t.status='ready' \
+                     AND EXISTS (SELECT 1 FROM orch_tasks r \
+                        WHERE r.id = t.root_id AND r.status = 'waiting') \
+                     ORDER BY t.created_at LIMIT ?1"
                 ))?;
                 let rows = stmt.query_map(params![slots], task_from)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -435,17 +443,82 @@ pub async fn cancel_tree(store: &Store, id: &str) -> anyhow::Result<u32> {
         .await
 }
 
-/// Re-queue a `failed` task as `todo`, clearing its previous outcome.
+/// Re-queue failed work. For a failed child: the child goes back to `todo`
+/// AND its failed root is revived to `waiting` (the dispatcher fails a root
+/// within one tick of any child failing, so without the revival a retried
+/// child's result could never be judged). For a failed root: every
+/// failed/cancelled child re-queues and the root returns to `waiting`; a
+/// childless failed root (decomposition failure) cannot be retried —
+/// re-submit the goal instead. Roots never become `todo`: `todo` rows are
+/// claimed as worker sessions, and a root must only ever run as a judge.
 pub async fn retry_task(store: &Store, id: &str) -> anyhow::Result<bool> {
     let id = id.to_string();
     store
         .with_conn(move |c| {
-            let n = c.execute(
-                "UPDATE orch_tasks SET status='todo', error=NULL, result=NULL, \
-                 session_pk=NULL, finished_at=NULL WHERE id=?1 AND status='failed'",
-                params![id],
-            )?;
-            Ok(n > 0)
+            let tx = c.transaction()?;
+            let row: Option<(Option<String>, String)> = tx
+                .query_row(
+                    "SELECT root_id, status FROM orch_tasks WHERE id=?1",
+                    params![&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((root_id, status)) = row else {
+                return Ok(false);
+            };
+            if status != "failed" {
+                return Ok(false);
+            }
+            let changed = match root_id {
+                // A failed child: re-queue it, re-queue siblings that were
+                // cancelled as collateral when the root failed, and revive
+                // the root itself.
+                Some(root) => {
+                    tx.execute(
+                        "UPDATE orch_tasks SET status='todo', error=NULL, result=NULL, \
+                         session_pk=NULL, finished_at=NULL WHERE id=?1",
+                        params![&id],
+                    )?;
+                    tx.execute(
+                        "UPDATE orch_tasks SET status='todo', error=NULL, result=NULL, \
+                         session_pk=NULL, finished_at=NULL \
+                         WHERE root_id=?1 AND status='cancelled'",
+                        params![&root],
+                    )?;
+                    tx.execute(
+                        "UPDATE orch_tasks SET status='waiting', error=NULL, \
+                         finished_at=NULL WHERE id=?1 AND status='failed'",
+                        params![root],
+                    )?;
+                    true
+                }
+                // A failed root: re-queue its failed/cancelled children.
+                None => {
+                    let children: i64 = tx.query_row(
+                        "SELECT count(*) FROM orch_tasks WHERE root_id=?1",
+                        params![&id],
+                        |r| r.get(0),
+                    )?;
+                    if children == 0 {
+                        false // decomposition failure — nothing to re-run
+                    } else {
+                        tx.execute(
+                            "UPDATE orch_tasks SET status='todo', error=NULL, result=NULL, \
+                             session_pk=NULL, finished_at=NULL \
+                             WHERE root_id=?1 AND status IN ('failed','cancelled')",
+                            params![&id],
+                        )?;
+                        tx.execute(
+                            "UPDATE orch_tasks SET status='waiting', error=NULL, \
+                             finished_at=NULL WHERE id=?1",
+                            params![&id],
+                        )?;
+                        true
+                    }
+                }
+            };
+            tx.commit()?;
+            Ok(changed)
         })
         .await
 }
@@ -573,19 +646,7 @@ pub async fn submit(
         anyhow::bail!("unknown project: {project_id}");
     }
     if !decompose {
-        let title: String = goal.chars().take(80).collect();
-        return submit_with_plan(
-            cp,
-            project_id,
-            goal,
-            vec![PlannedTask {
-                title,
-                body: goal.to_string(),
-                agent: "build".into(),
-                parents: vec![],
-            }],
-        )
-        .await;
+        return submit_with_plan(cp, project_id, goal, single_task_plan(goal)).await;
     }
     let root = insert_root(cp.store(), project_id, goal, "decomposing").await?;
     emit_changed(cp, &root, None, "decomposing");
@@ -602,10 +663,39 @@ pub async fn submit(
             Err(e) => Err(e),
         };
         if let Err(e) = attached {
-            let _ = fail_root(cp2.store(), &root2, &e.to_string()).await;
-            emit_changed(&cp2, &root2, None, "failed");
+            // No-op (and no event) when the root was cancelled mid-planning.
+            if fail_root(cp2.store(), &root2, &e.to_string())
+                .await
+                .unwrap_or(false)
+            {
+                emit_changed(&cp2, &root2, None, "failed");
+            }
         }
     });
+    Ok(root)
+}
+
+/// The trivial one-task plan used when decomposition is off (shared with the
+/// CLI's store-only submit path).
+pub fn single_task_plan(goal: &str) -> Vec<PlannedTask> {
+    vec![PlannedTask {
+        title: goal.chars().take(80).collect(),
+        body: goal.to_string(),
+        agent: "build".into(),
+        parents: vec![],
+    }]
+}
+
+/// Store-only goal submission (no events, no ControlPlane): validate the
+/// project, insert a `waiting` root plus the single-task plan. Used by the
+/// CLI, whose daemonless process has no event bus; a running daemon host's
+/// dispatcher picks the rows up on its next tick.
+pub async fn queue_goal(store: &Store, project_id: &str, goal: &str) -> anyhow::Result<String> {
+    if store.get_project(project_id).await?.is_none() {
+        anyhow::bail!("unknown project: {project_id}");
+    }
+    let root = insert_root(store, project_id, goal, "waiting").await?;
+    insert_children(store, &root, project_id, &single_task_plan(goal)).await?;
     Ok(root)
 }
 
@@ -627,14 +717,54 @@ pub async fn submit_with_plan(
 }
 
 /// Attach an LLM-produced plan to a `decomposing` root and release it.
+/// Children insert and the root flips to `waiting` in ONE transaction guarded
+/// by the root still being `decomposing` — a goal cancelled mid-planning gets
+/// no children at all (nothing for the dispatcher to orphan-run).
 async fn attach_plan(
     cp: &Arc<ControlPlane>,
     root: &str,
     project_id: &str,
     plan: &[PlannedTask],
 ) -> anyhow::Result<()> {
-    let ids = insert_children(cp.store(), root, project_id, plan).await?;
-    if !set_status(cp.store(), root, "decomposing", "waiting").await? {
+    let ids: Vec<String> = plan.iter().map(|_| new_task_id()).collect();
+    let (root_s, project_id_s, plan_v, ids2, now) = (
+        root.to_string(),
+        project_id.to_string(),
+        plan.to_vec(),
+        ids.clone(),
+        crate::paths::now_ms(),
+    );
+    let attached = cp
+        .store()
+        .with_conn(move |c| {
+            let tx = c.transaction()?;
+            let released = tx.execute(
+                "UPDATE orch_tasks SET status='waiting' \
+                 WHERE id=?1 AND status='decomposing'",
+                params![&root_s],
+            )?;
+            if released == 0 {
+                // Cancelled (or otherwise moved) while planning: insert nothing.
+                return Ok(false);
+            }
+            for (i, t) in plan_v.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO orch_tasks(id,root_id,project_id,title,body,agent,status,created_at) \
+                     VALUES (?1,?2,?3,?4,?5,?6,'todo',?7)",
+                    params![ids2[i], root_s, project_id_s, t.title, t.body, t.agent, now + i as i64],
+                )?;
+                for &p in &t.parents {
+                    tx.execute(
+                        "INSERT INTO orch_task_deps(task_id, dep_id) VALUES (?1, ?2)",
+                        params![ids2[i], ids2[p]],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+        .await?;
+    if !attached {
         anyhow::bail!("root {root} left `decomposing` while planning (cancelled?)");
     }
     emit_changed(cp, root, None, "waiting");
@@ -686,14 +816,7 @@ const SESSION_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// The `max_concurrent_runs` setting (default 3, floor 1).
 async fn max_concurrent(store: &Store) -> usize {
-    store
-        .get_setting("max_concurrent_runs")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(3)
-        .max(1)
+    crate::settings::usize_setting(store, "max_concurrent_runs", 3).await
 }
 
 /// Spawn the dispatcher loop on the host's runtime (Tauri's setup hook has no
@@ -737,6 +860,15 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
                 .unwrap_or(false)
             {
                 emit_changed(cp, &root.id, None, "failed");
+                // Park the dead goal's queued siblings (the live-root guards
+                // in promote/claim also stop them; this records the outcome).
+                match cancel_tree(store, &root.id).await {
+                    Ok(n) if n > 0 => {
+                        tracing::debug!("orch: cancelled {n} sibling(s) of failed root {}", root.id)
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("orch: sibling cancel failed: {e}"),
+                }
             }
         }
     }
@@ -774,7 +906,7 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
         session.session_pk.clone(),
     );
     tokio::spawn(async move {
-        let outcome = watch_session(rx, &session_pk).await;
+        let outcome = watch_session(cp2.store(), rx, &session_pk).await;
         let (status, result, error) = match outcome {
             Ok(()) => {
                 let report = crate::scheduler::final_assistant_text(cp2.store(), &session_pk).await;
@@ -827,7 +959,7 @@ async fn start_judge(cp: &Arc<ControlPlane>, root: OrchTask) {
     let _ = set_task_session(store, &root.id, &session.session_pk).await;
     let (cp2, root_id, session_pk) = (cp.clone(), root.id.clone(), session.session_pk.clone());
     tokio::spawn(async move {
-        let outcome = watch_session(rx, &session_pk).await;
+        let outcome = watch_session(cp2.store(), rx, &session_pk).await;
         let changed = match outcome {
             Ok(()) => {
                 let verdict =
@@ -872,8 +1004,11 @@ fn judge_prompt(root: &OrchTask, children: &[OrchTask]) -> String {
 }
 
 /// Wait for the session's terminal event on the broadcast bus (the
-/// scheduler's watcher shape, 2h deadline).
+/// scheduler's watcher shape, 2h deadline). A lagged receiver may have missed
+/// the terminal event entirely, so on `Lagged` the session row is consulted:
+/// a session no longer `Running` finished while we weren't looking.
 async fn watch_session(
+    store: &Store,
     mut rx: broadcast::Receiver<CoreEvent>,
     session_pk: &str,
 ) -> Result<(), String> {
@@ -886,7 +1021,14 @@ async fn watch_session(
                 message,
             })) if pk == session_pk => return Err(message),
             Ok(Ok(_)) => continue,
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                if let Ok(Some(session)) = store.get_session(session_pk).await {
+                    if session.status != crate::domain::SessionStatus::Running {
+                        return Ok(()); // terminal event was among the drops
+                    }
+                }
+                continue;
+            }
             Ok(Err(_)) => return Err("event bus closed".into()),
             Err(_) => return Err("timed out after 2h".into()),
         }
@@ -1376,6 +1518,92 @@ mod tests {
         assert_eq!(children[0].body, "just do it");
         // Unknown projects are rejected up front.
         assert!(submit(&cp, "nope", "x", false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dead_roots_park_their_remaining_children() {
+        let s = store().await;
+        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        insert_children(&s, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap();
+        // Root dies before anything was promoted.
+        assert!(fail_root(&s, &root, "boom").await.unwrap());
+        assert!(promote_ready(&s).await.unwrap().is_empty(), "no promotion");
+        assert!(claim_ready(&s, 10).await.unwrap().is_empty(), "no claims");
+    }
+
+    #[tokio::test]
+    async fn retry_child_revives_failed_root_and_cancelled_siblings() {
+        let s = store().await;
+        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let ids = insert_children(&s, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap();
+        promote_ready(&s).await.unwrap();
+        claim_ready(&s, 10).await.unwrap();
+        finish_task(&s, &ids[0], "running", "failed", None, Some("x".into()))
+            .await
+            .unwrap();
+        // The dispatcher's failure pass: root fails, siblings park.
+        assert!(fail_root(&s, &root, "subtasks failed: x").await.unwrap());
+        cancel_tree(&s, &root).await.unwrap();
+
+        assert!(retry_task(&s, &ids[0]).await.unwrap());
+        let root_row = get_task(&s, &root).await.unwrap().unwrap();
+        assert_eq!(root_row.status, "waiting", "root revived");
+        assert!(root_row.error.is_none());
+        for id in &ids {
+            assert_eq!(get_task(&s, id).await.unwrap().unwrap().status, "todo");
+        }
+        // The revived tree promotes again.
+        assert_eq!(promote_ready(&s).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_root_requeues_failed_children_but_not_childless_roots() {
+        let s = store().await;
+        // Childless failed root (decomposition failure): nothing to re-run.
+        let bare = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        fail_root(&s, &bare, "no plan").await.unwrap();
+        assert!(!retry_task(&s, &bare).await.unwrap());
+
+        // Root with failed children: everything re-queues.
+        let root = insert_root(&s, "p1", "goal2", "waiting").await.unwrap();
+        let ids = insert_children(&s, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap();
+        promote_ready(&s).await.unwrap();
+        claim_ready(&s, 10).await.unwrap();
+        finish_task(&s, &ids[0], "running", "failed", None, Some("x".into()))
+            .await
+            .unwrap();
+        fail_root(&s, &root, "subtasks failed").await.unwrap();
+        cancel_tree(&s, &root).await.unwrap();
+        assert!(retry_task(&s, &root).await.unwrap());
+        assert_eq!(
+            get_task(&s, &root).await.unwrap().unwrap().status,
+            "waiting"
+        );
+        assert_eq!(get_task(&s, &ids[0]).await.unwrap().unwrap().status, "todo");
+    }
+
+    #[tokio::test]
+    async fn attach_plan_inserts_nothing_for_a_cancelled_root() {
+        let (cp, _repo) = cp_with_project().await;
+        let root = insert_root(cp.store(), "p1", "goal", "decomposing")
+            .await
+            .unwrap();
+        // Cancelled while the (simulated) LLM planning was in flight.
+        cancel_tree(cp.store(), &root).await.unwrap();
+        let err = attach_plan(&cp, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        let tasks = list_tasks(cp.store(), Some(&root)).await.unwrap();
+        assert_eq!(tasks.len(), 1, "no orphaned children were inserted");
+        assert_eq!(tasks[0].status, "cancelled");
     }
 
     #[tokio::test]

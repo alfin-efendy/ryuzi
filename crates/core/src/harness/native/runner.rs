@@ -378,16 +378,10 @@ fn effective_child_filter(
     )
 }
 
-/// The `max_spawn_depth` setting (default 1 = flat delegation).
-async fn max_spawn_depth(store: &Arc<Store>) -> u8 {
-    store
-        .get_setting("max_spawn_depth")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u8>().ok())
-        .unwrap_or(1)
-        .max(1)
+/// The `max_spawn_depth` setting (default 2: a delegating sub-agent like the
+/// builtin `orchestrator` can itself delegate one level; its children cannot).
+async fn max_spawn_depth(store: &Store) -> u8 {
+    crate::settings::usize_setting(store, "max_spawn_depth", 2).await as u8
 }
 
 /// A [`SubagentSpawner`] backed by the runner: runs sub-agents in ephemeral
@@ -402,15 +396,7 @@ struct RunnerSpawner {
 impl RunnerSpawner {
     /// The `max_concurrent_runs` setting (default 3, floor 1).
     async fn concurrency(&self) -> usize {
-        self.deps
-            .store
-            .get_setting("max_concurrent_runs")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(3)
-            .max(1)
+        crate::settings::usize_setting(&self.deps.store, "max_concurrent_runs", 3).await
     }
 
     /// Run one delegated child to completion; failures become the result's
@@ -515,21 +501,6 @@ impl RunnerSpawner {
 
 #[async_trait]
 impl SubagentSpawner for RunnerSpawner {
-    async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String> {
-        let mut results = self
-            .run_many(vec![SubtaskSpec {
-                agent_type: agent_type.to_string(),
-                prompt: prompt.to_string(),
-            }])
-            .await;
-        let r = results.pop().expect("one result for one spec");
-        match r.status {
-            SubtaskStatus::Completed => Ok(r.report),
-            SubtaskStatus::Interrupted => anyhow::bail!("interrupted"),
-            SubtaskStatus::Error => anyhow::bail!("{}", r.report),
-        }
-    }
-
     async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult> {
         let sem = Arc::new(tokio::sync::Semaphore::new(self.concurrency().await));
         let futures = specs.into_iter().enumerate().map(|(index, spec)| {
@@ -1320,7 +1291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestrator_child_delegates_when_depth_allows() {
+    async fn orchestrator_child_delegates_at_default_depth() {
         use testutil::RecordingLlm;
         let dir = tempfile::tempdir().unwrap();
         // parent → task(orchestrator) → orchestrator → task(explore) →
@@ -1361,11 +1332,9 @@ mod tests {
         let llm = Arc::new(RecordingLlm::new(vec![
             parent, orch_1, explore, orch_2, parent_end,
         ]));
+        // max_spawn_depth unset: the default (2) must let the builtin
+        // orchestrator delegate out of the box.
         let deps = deps_at(dir.path(), llm.clone()).await;
-        deps.store
-            .set_setting("max_spawn_depth", "2")
-            .await
-            .unwrap();
 
         run_turn(
             &deps,
@@ -1411,7 +1380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestrator_child_cannot_delegate_at_default_depth() {
+    async fn orchestrator_child_cannot_delegate_when_depth_is_flat() {
         use testutil::RecordingLlm;
         let dir = tempfile::tempdir().unwrap();
         let parent = vec![
@@ -1443,7 +1412,11 @@ mod tests {
             parent_end,
         ]));
         let deps = deps_at(dir.path(), llm.clone()).await;
-        // max_spawn_depth unset → default 1 → flat delegation only.
+        // Explicit flat delegation: the orchestrator child may not re-spawn.
+        deps.store
+            .set_setting("max_spawn_depth", "1")
+            .await
+            .unwrap();
 
         run_turn(
             &deps,
