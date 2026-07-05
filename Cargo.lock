@@ -4339,6 +4339,7 @@ dependencies = [
  "predicates",
  "ratatui",
  "ryuzi-core",
+ "ryuzi-plugin-sdk",
  "serde_json",
  "serial_test",
  "tempfile",
