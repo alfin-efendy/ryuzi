@@ -10,6 +10,7 @@
 //!
 //! See `docs/design/2026-07-05-native-agent-runtime-design.md`.
 
+pub mod permission;
 pub mod tools;
-// context, ledger, llm, permission, runner, and the NativeHarness itself are
-// added in later slices of the Phase 1 plan.
+// context, ledger, llm, runner, and the NativeHarness itself are added in
+// later slices of the Phase 1 plan.
