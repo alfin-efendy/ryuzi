@@ -3,6 +3,7 @@
 //! Ported from 9router (MIT, (c) 2024-2026 decolua and contributors) —
 //! flows from src/lib/oauth/* and open-sse/services/tokenRefresh/*.
 pub mod callback;
+pub mod device;
 pub mod flow;
 pub mod pkce;
 pub mod refresh;
