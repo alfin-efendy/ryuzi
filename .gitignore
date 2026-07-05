@@ -64,3 +64,6 @@ docs/design/
 # playwright output (apps/cockpit e2e)
 apps/cockpit/playwright-report/
 apps/cockpit/test-results/
+
+# insta pending-snapshot artifacts (accepted .snap files are committed)
+*.snap.new
