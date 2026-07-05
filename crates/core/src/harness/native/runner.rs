@@ -179,6 +179,15 @@ async fn drive(
         if cancel.is_cancelled() {
             return Ok(final_text);
         }
+        // Compact the in-memory history if it has grown past the token budget.
+        super::compaction::maybe_compact(
+            &deps.llm,
+            &model,
+            ledger,
+            super::compaction::MAX_CONTEXT_TOKENS,
+            super::compaction::KEEP_RECENT_USER_TURNS,
+        )
+        .await;
         let body = json!({
             "model": model,
             "system": system,

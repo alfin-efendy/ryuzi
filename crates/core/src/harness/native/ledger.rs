@@ -75,6 +75,44 @@ impl Ledger {
     pub fn is_empty(&self) -> bool {
         self.turns.is_empty()
     }
+
+    /// Number of turns (messages) currently projected.
+    pub fn len(&self) -> usize {
+        self.turns.len()
+    }
+
+    /// Compact the in-memory projection: replace `turns[0..=boundary]` with a
+    /// single user message carrying `summary` plus the boundary turn's own
+    /// text, keeping every turn after `boundary`. This bounds the request size
+    /// while leaving the durable `provider_turns` history untouched (a resume
+    /// reloads the full history and re-compacts as needed). The boundary must
+    /// be a real user-text turn so the resulting history stays provider-valid
+    /// (user, assistant, …).
+    pub fn compact_at(&mut self, boundary: usize, summary: &str) {
+        if boundary >= self.turns.len() {
+            return;
+        }
+        let boundary_text = self.turns[boundary]["content"]
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .find_map(|b| b.get("text").and_then(|t| t.as_str()))
+            })
+            .unwrap_or_default()
+            .to_string();
+        let merged = json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "[Summary of earlier conversation]\n{summary}\n\n[Continuing request]\n{boundary_text}"
+                )
+            }]
+        });
+        let rest: Vec<Value> = self.turns.split_off(boundary + 1);
+        self.turns = vec![merged];
+        self.turns.extend(rest);
+    }
 }
 
 #[cfg(test)]

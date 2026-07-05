@@ -12,6 +12,7 @@
 
 pub mod agents;
 pub mod commands;
+pub mod compaction;
 pub mod context;
 pub mod ledger;
 pub mod llm;
