@@ -323,8 +323,16 @@ impl ControlPlane {
             })?;
         let harness = factory.create()?;
 
-        // Attach the Apps screen's enabled MCP servers to the session for real.
-        let mcp_servers = crate::mcp::servers_for_session(&self.store, "claude")
+        // Attach the Apps screen's enabled MCP servers to the session. The MCP
+        // per-agent allowlist is keyed by runtime id, which differs from the
+        // harness id: the claude-code harness maps to the "claude" runtime;
+        // other harnesses (e.g. "native") use their own id.
+        let mcp_agent_id = if project.harness == "claude-code" {
+            "claude"
+        } else {
+            project.harness.as_str()
+        };
+        let mcp_servers = crate::mcp::servers_for_session(&self.store, mcp_agent_id)
             .await
             .unwrap_or_default();
         let ctx = SessionCtx {

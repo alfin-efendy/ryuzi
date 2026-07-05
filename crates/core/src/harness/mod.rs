@@ -5,6 +5,7 @@ use crate::store::Store;
 use async_trait::async_trait;
 
 pub mod acp;
+pub mod native;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;

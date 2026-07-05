@@ -146,10 +146,15 @@ impl AppController {
             .collect()
     }
 
-    /// `claude-code` -> the injected `detect_claude`; any other id -> not found.
+    /// `claude-code` -> the injected `detect_claude`; `native` is always
+    /// available (in-process, no external binary); any other id -> not found.
     pub fn detect_runtime(&self, id: &str) -> Detected {
         match id {
             "claude-code" => (self.deps.detect_claude)(),
+            "native" => Detected {
+                found: true,
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            },
             _ => Detected {
                 found: false,
                 version: None,

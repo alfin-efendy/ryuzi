@@ -860,18 +860,61 @@ impl HarnessFactory for AcpHarnessFactory {
     }
 }
 
+/// Builds [`AcpHarness`] instances from a descriptor resolved on FIRST session
+/// start rather than at registration. Hosts register the `claude-code` harness
+/// unconditionally at startup without paying for — or requiring — the sidecar
+/// resolve (which may download); a setup that only ever starts `native`
+/// sessions never touches the resolver.
+pub struct LazyAcpHarnessFactory {
+    resolver: Box<dyn Fn() -> anyhow::Result<AcpAdapterDescriptor> + Send + Sync>,
+    /// Successful resolution, memoized. Failures are deliberately NOT cached:
+    /// a later session start retries the resolver (e.g. the host regained
+    /// network and the download can now succeed). The mutex also serializes
+    /// concurrent first-starts so the resolver runs at most once at a time.
+    resolved: std::sync::Mutex<Option<AcpAdapterDescriptor>>,
+}
+
+impl HarnessFactory for LazyAcpHarnessFactory {
+    fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+        let mut cache = self.resolved.lock().expect("resolver mutex poisoned");
+        let descriptor = match cache.as_ref() {
+            Some(d) => d.clone(),
+            None => {
+                let d = (self.resolver)()?;
+                *cache = Some(d.clone());
+                d
+            }
+        };
+        Ok(Arc::new(AcpHarness::new(descriptor)))
+    }
+}
+
 /// The `claude-code` integration: plugs into the harness axis only, producing an
 /// [`AcpHarnessFactory`] over a host-injected [`AcpAdapterDescriptor`]. The
 /// descriptor's `command` is supplied by the host (Task 5 wires the bundled
 /// sidecar path; tests inject a stub descriptor).
 pub struct ClaudeCodeIntegration {
-    factory: Arc<AcpHarnessFactory>,
+    factory: Arc<dyn HarnessFactory>,
 }
 
 impl ClaudeCodeIntegration {
     pub fn new(descriptor: AcpAdapterDescriptor) -> Self {
         Self {
             factory: Arc::new(AcpHarnessFactory::new(descriptor)),
+        }
+    }
+
+    /// Defer adapter resolution to the first `claude-code` session start (see
+    /// [`LazyAcpHarnessFactory`]). Use this from hosts whose startup path must
+    /// not block on — or fail with — the sidecar resolve.
+    pub fn with_resolver(
+        resolver: impl Fn() -> anyhow::Result<AcpAdapterDescriptor> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            factory: Arc::new(LazyAcpHarnessFactory {
+                resolver: Box::new(resolver),
+                resolved: std::sync::Mutex::new(None),
+            }),
         }
     }
 }
@@ -916,6 +959,58 @@ mod tests {
     async fn factory_creates_a_harness() {
         let factory = AcpHarnessFactory::new(AcpAdapterDescriptor::default());
         let _harness = factory.create().unwrap();
+    }
+
+    #[tokio::test]
+    async fn with_resolver_defers_resolution_to_first_create_and_memoizes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let integ = ClaudeCodeIntegration::with_resolver(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(AcpAdapterDescriptor::default())
+        });
+
+        // Installing into registries must not touch the resolver — that is the
+        // whole point: hosts register the harness at startup without paying
+        // for (or requiring) the sidecar resolve/download.
+        let mut registries = crate::integration::Registries::new();
+        registries.install(&integ);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let factory = registries.harness.get("claude-code").unwrap();
+        let _harness = factory.create().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A second session start reuses the resolved descriptor.
+        let _harness = factory.create().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn with_resolver_surfaces_errors_at_create_and_retries_next_time() {
+        use crate::integration::Integration as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let integ = ClaudeCodeIntegration::with_resolver(move || {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("offline");
+            }
+            Ok(AcpAdapterDescriptor::default())
+        });
+
+        let factory = integ.harness().unwrap();
+        // First session start fails with the resolver's error…
+        let err = factory.create().err().expect("first create should fail");
+        assert!(err.to_string().contains("offline"), "got: {err:#}");
+        // …but a failure is not memoized: the next start retries and succeeds.
+        let _harness = factory.create().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

@@ -30,6 +30,26 @@ pub struct RuntimeDescriptor {
 
 pub const CATALOG: &[RuntimeDescriptor] = &[
     RuntimeDescriptor {
+        id: "native",
+        name: "Native (ryuzi)",
+        color: "#7C5CFF",
+        initial: "R",
+        connection: "In-process · your model providers",
+        // No external binary: the native runtime runs in-process. Marked
+        // always-available in `runtimes_cmd::assemble`.
+        binary: "ryuzi",
+        npm_package: None,
+        // Models come from the configured provider connections (Models screen),
+        // not a fixed catalog list.
+        models: &[],
+        default_model: "",
+        tiers: &[
+            ("default", "Default", None, false),
+            ("plan", "Plan", None, false),
+            ("fast", "Fast", None, false),
+        ],
+    },
+    RuntimeDescriptor {
         id: "claude",
         name: "Claude Code",
         color: "#D97757",

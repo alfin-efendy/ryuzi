@@ -82,6 +82,17 @@ impl Integration for FakeIntegration {
     }
 }
 
+// A fake registered under `native`, so `--harness native` resolves to it.
+struct FakeNativeIntegration;
+impl Integration for FakeNativeIntegration {
+    fn id(&self) -> &str {
+        "native"
+    }
+    fn harness(&self) -> Option<Arc<dyn HarnessFactory>> {
+        Some(Arc::new(FakeFactory))
+    }
+}
+
 fn git_repo_fixture(dir: &Path) {
     let run = |args: &[&str]| {
         assert!(std::process::Command::new("git")
@@ -130,6 +141,7 @@ fn deps_with_fake(
         build_registries: Box::new(|| {
             let mut r = Registries::new();
             r.install(&FakeIntegration);
+            r.install(&FakeNativeIntegration);
             Ok(r)
         }),
     }
@@ -164,6 +176,126 @@ fn run_happy_path_prints_text_and_done() {
 
 #[test]
 #[serial]
+fn run_with_harness_native_routes_to_native_harness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut deps = deps_with_fake(&tmp.path().join("ryuzi.sqlite"), out.clone(), errs.clone());
+
+    let args: Vec<String> = [
+        "run",
+        "--harness",
+        "native",
+        "--dir",
+        repo.to_str().unwrap(),
+        "--prompt",
+        "hello",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+
+    // The project was created with harness=native and resolved to the
+    // native-registered fake (which prints "all done"); an unknown harness
+    // would have produced a "unknown harness 'native'" error instead.
+    let out = out.lock().unwrap();
+    assert!(out.iter().any(|l| l == "all done"), "stdout: {out:?}");
+    assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
+}
+
+#[test]
+#[serial]
+fn run_rejects_unknown_harness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut deps = deps_with_fake(&tmp.path().join("ryuzi.sqlite"), out.clone(), errs.clone());
+    let code = ryuzi_cli::dispatch::run_cli(
+        vec![
+            "run".into(),
+            "--harness".into(),
+            "bogus".into(),
+            "--dir".into(),
+            "/tmp".into(),
+            "--prompt".into(),
+            "x".into(),
+        ],
+        &mut deps,
+    );
+    assert_eq!(code, 1);
+    assert!(errs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("--harness must be one of")));
+}
+
+#[test]
+#[serial]
+fn explicit_harness_updates_an_existing_project() {
+    // Regression: a project first connected as claude-code, then run with
+    // `--harness native`, must switch to native (not fail with "unknown
+    // harness 'claude-code'"). Registries here have ONLY the native fake, so a
+    // stale claude-code harness would error — proving the update happened.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+    let db = tmp.path().join("ryuzi.sqlite");
+
+    // First run: no --harness → project created with the claude-code default.
+    // deps_with_fake registers both fakes so this first run succeeds.
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut deps = deps_with_fake(&db, out.clone(), errs.clone());
+    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(ryuzi_cli::dispatch::run_cli(args, &mut deps), 0);
+
+    // Second run: --harness native, with ONLY the native harness registered.
+    let out2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut deps2 = deps_with_fake(&db, out2.clone(), errs2.clone());
+    deps2.build_registries = Box::new(|| {
+        let mut r = Registries::new();
+        r.install(&FakeNativeIntegration); // claude-code intentionally absent
+        Ok(r)
+    });
+    let args2: Vec<String> = [
+        "run",
+        "--harness",
+        "native",
+        "--dir",
+        repo.to_str().unwrap(),
+        "--prompt",
+        "again",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args2, &mut deps2);
+    assert_eq!(
+        code,
+        0,
+        "should switch the existing project to native; errs: {:?}",
+        errs2.lock().unwrap()
+    );
+    assert!(out2.lock().unwrap().iter().any(|l| l == "all done"));
+}
+
+#[test]
+#[serial]
 fn run_usage_and_mode_validation() {
     let tmp = tempfile::tempdir().unwrap();
     let out = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -176,7 +308,7 @@ fn run_usage_and_mode_validation() {
     assert_eq!(
         errs.lock().unwrap().last().map(String::as_str),
         Some(
-            "usage: ryuzi run --dir <git-repo> --prompt <text> [--model x] [--effort y] [--mode m]"
+            "usage: ryuzi run --dir <git-repo> --prompt <text> [--harness native|claude-code] [--model x] [--effort y] [--mode m]"
         )
     );
 

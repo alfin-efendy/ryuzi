@@ -19,6 +19,7 @@ pub mod router;
 pub mod runtime_config;
 pub mod runtimes;
 pub mod scheduler;
+pub mod serve;
 pub mod settings;
 pub mod sidecar;
 pub mod store;

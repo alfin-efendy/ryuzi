@@ -4,7 +4,7 @@ import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { StatusDot } from "@/components/common/bits";
-import { Button, MenuPanel, MenuPanelItem as MenuItem, Modal, ModalFooter } from "@ryuzi/ui";
+import { Button, MenuPanel, MenuPanelItem as MenuItem, Modal, ModalFooter, NativeSelect } from "@ryuzi/ui";
 
 const field = "flex h-[34px] items-center rounded-md border border-input bg-background px-3 text-[13px]";
 
@@ -12,6 +12,7 @@ export function ProjectSettingsModal() {
   const projectId = useNav((s) => s.projectSettingsFor);
   const close = useNav((s) => s.setProjectSettingsFor);
   const project = useStore((s) => s.projects.find((p) => p.projectId === projectId));
+  const setProjectHarness = useStore((s) => s.setProjectHarness);
   const { runtimes, setDefault } = useRuntimes();
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   if (!projectId || !project) return null;
@@ -37,7 +38,14 @@ export function ProjectSettingsModal() {
         <div className="flex gap-3">
           <div className="flex flex-1 flex-col gap-1.5">
             <span className="text-xs font-semibold">Harness</span>
-            <div className={`${field} font-mono text-xs text-muted-foreground`}>{project.harness}</div>
+            <NativeSelect
+              value={project.harness}
+              onChange={(e) => void setProjectHarness(project.projectId, e.target.value)}
+              className="h-[34px]"
+            >
+              <option value="native">Native (ryuzi)</option>
+              <option value="claude-code">Claude Code</option>
+            </NativeSelect>
           </div>
           <div className="relative flex flex-1 flex-col gap-1.5">
             <span className="text-xs font-semibold">Default agent</span>

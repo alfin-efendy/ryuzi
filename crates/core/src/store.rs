@@ -1,4 +1,7 @@
-use crate::domain::{Message, NewMessage, PermMode, Project, Session, SessionStatus, Surface};
+use crate::domain::{
+    Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionStatus,
+    Surface,
+};
 use crate::paths::now_ms;
 use deadpool_sqlite::{Config, Pool, Runtime};
 use rusqlite::{params, OptionalExtension, Row};
@@ -271,6 +274,30 @@ fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (day, connection_id, model)\
             );",
         ),
+        // Native agent runtime (design: docs/design/2026-07-05-native-agent-runtime-design.md).
+        // provider_turns = the model-faithful Anthropic-format message ledger
+        // (one row per user/assistant turn) used to replay history on resume;
+        // separate from the display-oriented `messages` table. todos = the
+        // native `todowrite` tool's per-session task list.
+        M::up(
+            "CREATE TABLE provider_turns (\
+                session_pk TEXT NOT NULL,\
+                seq INTEGER NOT NULL,\
+                role TEXT NOT NULL,\
+                payload TEXT NOT NULL,\
+                created_at INTEGER NOT NULL,\
+                PRIMARY KEY (session_pk, seq)\
+            );\
+            CREATE INDEX idx_provider_turns_session ON provider_turns(session_pk, seq);\
+            CREATE TABLE todos (\
+                session_pk TEXT NOT NULL,\
+                pos INTEGER NOT NULL,\
+                content TEXT NOT NULL,\
+                status TEXT NOT NULL,\
+                created_at INTEGER NOT NULL,\
+                PRIMARY KEY (session_pk, pos)\
+            );",
+        ),
     ])
 }
 
@@ -519,6 +546,20 @@ impl Store {
         .await
     }
 
+    /// Set a session's title (used by the native runtime's title generation).
+    pub async fn set_session_title(&self, pk: &str, title: &str) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let title = title.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET title=?2 WHERE session_pk=?1",
+                params![pk, title],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
     /// List sessions in a given status, oldest-first — used by `reconcile` on
     /// daemon boot to find sessions a dead process left in `Running`.
     pub async fn list_sessions_by_status(
@@ -713,6 +754,70 @@ impl Store {
                         status: r.get(6)?,
                         tool_kind: r.get(7)?,
                         created_at: r.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    }
+
+    /// Append one message to the native runtime's provider-turn ledger,
+    /// assigning `seq` atomically per session (same idiom as `insert_message`).
+    /// Returns the assigned seq.
+    pub async fn insert_provider_turn(&self, t: NewProviderTurn) -> anyhow::Result<i64> {
+        let payload = serde_json::to_string(&t.payload)?;
+        let created = now_ms();
+        self.with_conn(move |c| {
+            c.query_row(
+                "INSERT INTO provider_turns(session_pk,seq,role,payload,created_at) \
+                 SELECT ?1, COALESCE(MAX(seq),0)+1, ?2, ?3, ?4 \
+                 FROM provider_turns WHERE session_pk=?1 \
+                 RETURNING seq",
+                params![t.session_pk, t.role, payload, created],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .await
+    }
+
+    /// List a session's native todo items in order (content, status).
+    pub async fn list_todos(&self, session_pk: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Vec<(String, String)>> {
+            let mut stmt =
+                c.prepare("SELECT content, status FROM todos WHERE session_pk=?1 ORDER BY pos")?;
+            let rows = stmt
+                .query_map(params![session_pk], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Load a session's provider-turn ledger in order, for resume/replay.
+    pub async fn list_provider_turns(&self, session_pk: &str) -> anyhow::Result<Vec<ProviderTurn>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Vec<ProviderTurn>> {
+            let mut stmt = c.prepare(
+                "SELECT session_pk,seq,role,payload,created_at \
+                 FROM provider_turns WHERE session_pk=?1 ORDER BY seq",
+            )?;
+            let items = stmt
+                .query_map(params![session_pk], |r| {
+                    let payload: String = r.get(3)?;
+                    Ok(ProviderTurn {
+                        session_pk: r.get(0)?,
+                        seq: r.get(1)?,
+                        role: r.get(2)?,
+                        payload: serde_json::from_str(&payload).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
+                        created_at: r.get(4)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1165,6 +1270,67 @@ mod tests {
             last_active: Some(1),
             resume_attempts: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn migration_10_creates_provider_turns_and_todos() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // Both native-runtime tables exist and are empty on a fresh DB.
+        let counts = store
+            .with_conn(|c| {
+                let pt: i64 =
+                    c.query_row("SELECT count(*) FROM provider_turns", [], |r| r.get(0))?;
+                let td: i64 = c.query_row("SELECT count(*) FROM todos", [], |r| r.get(0))?;
+                Ok((pt, td))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn provider_turns_get_monotonic_seq_and_list_in_order() {
+        use crate::domain::NewProviderTurn;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        let s1 = store
+            .insert_provider_turn(NewProviderTurn::new(
+                "sess",
+                "user",
+                serde_json::json!([{"type": "text", "text": "hi"}]),
+            ))
+            .await
+            .unwrap();
+        let s2 = store
+            .insert_provider_turn(NewProviderTurn::new(
+                "sess",
+                "assistant",
+                serde_json::json!([{"type": "text", "text": "hello"}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!((s1, s2), (1, 2));
+
+        // A different session numbers independently from 1.
+        let other = store
+            .insert_provider_turn(NewProviderTurn::new("other", "user", serde_json::json!([])))
+            .await
+            .unwrap();
+        assert_eq!(other, 1);
+
+        let turns = store.list_provider_turns("sess").await.unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].seq, 1);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].payload[0]["text"], "hi");
+        assert_eq!(turns[1].role, "assistant");
+        assert!(store
+            .list_provider_turns("nobody")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

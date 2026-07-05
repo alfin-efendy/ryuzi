@@ -126,6 +126,9 @@ impl StageHost for TarStageHost {
             let perms = Permissions::from_mode(mode);
             std::fs::set_permissions(path, perms)?;
         }
+        // Windows has no POSIX file mode, so `mode` is unused there.
+        #[cfg(not(unix))]
+        let _ = mode;
         Ok(())
     }
 }

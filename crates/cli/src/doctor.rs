@@ -41,16 +41,31 @@ async fn doctor_inner(deps: &mut Deps) -> u8 {
             "n/a"
         }
     ));
-    let missing: Vec<&'static str> = match crate::db::open_store(deps).await {
+    let (missing, claude_required): (Vec<&'static str>, bool) = match crate::db::open_store(deps)
+        .await
+    {
         Ok(store) => {
             let settings = ryuzi_core::settings::SettingsStore::new(std::sync::Arc::new(store));
-            match settings.missing_required().await {
+            let missing = match settings.missing_required().await {
                 Ok(m) => m,
                 Err(e) => {
                     (deps.err)(&format!("✗ {e}"));
                     return 1;
                 }
-            }
+            };
+            // The `claude` binary is only required when the claude-code
+            // harness is enabled. A native-only setup passes without it.
+            // (An empty setting means the default seed, which is claude-code.)
+            let enabled = ryuzi_core::settings::csv(
+                settings
+                    .get("enabled_runtimes")
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            );
+            let claude_required = enabled.is_empty() || enabled.iter().any(|r| r == "claude-code");
+            (missing, claude_required)
         }
         Err(e) => {
             (deps.err)(&format!("✗ {e}"));
@@ -87,7 +102,7 @@ async fn doctor_inner(deps: &mut Deps) -> u8 {
     };
     (deps.out)(&format!("acp:    {acp_line}"));
     // The acp line never affects the exit code.
-    let ok = git.found && claude.found && missing.is_empty();
+    let ok = git.found && (!claude_required || claude.found) && missing.is_empty();
     (deps.out)(&format!(
         "doctor: {}",
         if ok {

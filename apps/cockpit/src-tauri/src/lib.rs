@@ -8,9 +8,11 @@ mod error;
 mod events;
 mod fsview_cmd;
 mod gateways_cmd;
+mod native_cmd;
 mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
+mod session_io;
 mod term;
 
 use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
@@ -31,10 +33,12 @@ const ADAPTER_BIN: &str = "claude-agent-acp";
 
 /// Resolve the ACP adapter via the shared tiered resolver (Spec 4 §4):
 /// RYUZI_ACP_PATH override → cached artifact → download (bun bundle if a
-/// host bun exists, else the standalone binary). First run needs network or
-/// Bun — the same contract as the CLI. On resolver failure we fall back to
-/// the bare adapter name (dev PATH behavior): launch succeeds, and the first
-/// session start fails with a clear spawn error instead.
+/// host bun exists, else the standalone binary). First resolve needs network
+/// or Bun — the same contract as the CLI. Runs lazily on the first
+/// `claude-code` session start (never at app launch — see
+/// [`build_registries`]). On resolver failure we fall back to the bare
+/// adapter name (dev PATH behavior): the session start then fails with a
+/// clear spawn error instead.
 fn resolve_acp_adapter() -> (String, Vec<String>) {
     match ryuzi_core::sidecar::host_manager().resolve() {
         Ok(r) => (r.command, r.args),
@@ -135,27 +139,38 @@ fn resolve_claude_code_executable() -> Option<String> {
     None
 }
 
-/// Build the extension registries and install the `claude-agent-acp` harness
-/// integration with the resolved adapter path.
+/// Build the extension registries: the in-process `native` harness (needs no
+/// external binary) plus the `claude-agent-acp` harness with a LAZY adapter
+/// resolver.
+///
+/// Registration performs no sidecar I/O: the resolver (which may download the
+/// adapter on first run) only executes when a `claude-code` session actually
+/// starts. App launch therefore never blocks on the resolve, and a setup that
+/// only runs the `native` harness never touches the resolver at all.
 ///
 /// `env_remove: ["CLAUDECODE"]` is required: the adapter checks for this
 /// variable to detect a nested Claude Code session and refuses to start.
 fn build_registries() -> Registries {
-    let mut env = Vec::new();
-    if let Some(cli) = resolve_claude_code_executable() {
-        env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
-    }
-    let (command, args) = resolve_acp_adapter();
-    let descriptor = AcpAdapterDescriptor {
-        command,
-        args,
-        env,
-        // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's running
-        // inside a Claude Code session and refuses to start.
-        env_remove: vec!["CLAUDECODE".to_string()],
-    };
     let mut registries = Registries::new();
-    registries.install(&ClaudeCodeIntegration::new(descriptor));
+    // The native runtime needs no external binary — register it unconditionally
+    // so projects with `harness = "native"` work in the desktop app.
+    registries.install(&ryuzi_core::harness::native::NativeIntegration::new());
+
+    registries.install(&ClaudeCodeIntegration::with_resolver(|| {
+        let mut env = Vec::new();
+        if let Some(cli) = resolve_claude_code_executable() {
+            env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
+        }
+        let (command, args) = resolve_acp_adapter();
+        Ok(AcpAdapterDescriptor {
+            command,
+            args,
+            env,
+            // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's
+            // running inside a Claude Code session and refuses to start.
+            env_remove: vec!["CLAUDECODE".to_string()],
+        })
+    }));
     registries
 }
 
@@ -247,6 +262,12 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::begin_oauth_manual,
             connections_cmd::complete_oauth_manual,
             connections_cmd::add_free_connection,
+            native_cmd::native_agents,
+            native_cmd::native_commands,
+            native_cmd::session_todos,
+            session_io::export_session,
+            session_io::import_session,
+            session_io::share_session,
             connections_cmd::start_kiro_device_flow,
             connections_cmd::await_kiro_device_flow,
             connections_cmd::import_kiro_token,
@@ -382,6 +403,17 @@ mod tests {
     fn export_bindings_test() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
         export_bindings(&out);
+    }
+
+    /// Registration must be hermetic: both harnesses appear in the registry
+    /// without any sidecar resolve (this test would touch the network under
+    /// the old eager resolution — laziness is what makes it runnable at all).
+    #[test]
+    fn build_registries_registers_both_harnesses_without_sidecar_io() {
+        let registries = build_registries();
+        let names = registries.harness.names();
+        assert!(names.iter().any(|n| n == "native"), "got: {names:?}");
+        assert!(names.iter().any(|n| n == "claude-code"), "got: {names:?}");
     }
 
     #[test]
