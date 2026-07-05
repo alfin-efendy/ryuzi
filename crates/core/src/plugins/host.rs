@@ -647,4 +647,59 @@ mod tests {
 
         assert!(host.enabled_skill_dirs(&settings).await.is_empty());
     }
+
+    #[tokio::test]
+    async fn plugin_leaf_skill_dir_loads_into_skill_registry() {
+        use crate::harness::native::skills::SkillRegistry;
+
+        let (store, settings, _tmp) = open_settings().await;
+        let plugin_base = tempfile::tempdir().unwrap();
+        // Create a leaf skill directory (SKILL.md directly inside).
+        let skill_dir = plugin_base.path().join("task7fix-skills");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: github-triage\ndescription: Triage GitHub issues\n---\nLabel and assign issues.",
+        )
+        .unwrap();
+
+        // Create a user plugin that bundles this leaf skill dir.
+        let plugin = CorePlugin {
+            manifest: PluginManifest {
+                skills: vec![ryuzi_plugin_sdk::SkillDef {
+                    name: "github-triage".into(),
+                    description: "Triage GitHub issues".into(),
+                    path: "task7fix-skills".into(),
+                }],
+                ..manifest("task7fix-plugin")
+            },
+            harness: None,
+            gateway: None,
+            connector: Some(Arc::new(FakeConnector)),
+            source: PluginSource::User(plugin_base.path().to_path_buf()),
+        };
+
+        let mut host = PluginHost::new();
+        host.add(plugin);
+
+        // Enable the plugin.
+        store
+            .set_setting_raw("plugin.task7fix-plugin.enabled", "true")
+            .await
+            .unwrap();
+
+        // Get enabled skill dirs and load skills.
+        let dirs = host.enabled_skill_dirs(&settings).await;
+        assert_eq!(dirs.len(), 1);
+
+        let worktree = tempfile::tempdir().unwrap();
+        let registry = SkillRegistry::load_with(worktree.path(), &dirs);
+
+        // The skill must be discovered.
+        let skill = registry
+            .get("github-triage")
+            .expect("leaf skill dir must be discovered");
+        assert_eq!(skill.description, "Triage GitHub issues");
+        assert!(skill.body.contains("Label and assign"));
+    }
 }
