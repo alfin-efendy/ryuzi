@@ -4351,11 +4351,13 @@ name = "ryuzi-cockpit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "dirs 5.0.1",
  "portable-pty",
  "reqwest 0.12.28",
  "ryuzi-core",
+ "ryuzi-plugin-sdk",
  "serde",
  "serde_json",
  "specta",

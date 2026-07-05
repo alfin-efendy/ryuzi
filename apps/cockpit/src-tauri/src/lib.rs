@@ -9,6 +9,7 @@ mod events;
 mod fsview_cmd;
 mod gateways_cmd;
 mod native_cmd;
+mod plugins_cmd;
 mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
@@ -262,6 +263,11 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_agents,
             native_cmd::native_commands,
             native_cmd::session_todos,
+            plugins_cmd::list_plugins,
+            plugins_cmd::plugin_detail,
+            plugins_cmd::set_plugin_enabled,
+            plugins_cmd::set_plugin_setting,
+            plugins_cmd::plugin_models,
             session_io::export_session,
             session_io::import_session,
             session_io::share_session,

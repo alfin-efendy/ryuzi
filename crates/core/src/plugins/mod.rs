@@ -25,6 +25,8 @@ pub mod host;
 pub mod providers;
 pub mod runtimes_meta;
 
+use crate::settings::{csv, SettingsStore};
+
 pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Add every generated manifest-only builtin — every model provider
@@ -96,6 +98,326 @@ pub(crate) fn load_user_plugins_from(regs: &mut Registries, base: &std::path::Pa
                 tracing::warn!("skipping user plugin at {}: {e}", manifest_path.display());
             }
         }
+    }
+}
+
+/// Toggle `id`'s enablement — the single source of truth shared by `ryuzi
+/// plugins enable/disable` (`crates/cli/src/plugins_cmd.rs`) and the Cockpit
+/// `set_plugin_enabled` command, so the write side can never drift from
+/// [`PluginHost::is_enabled`]'s read side:
+/// - unknown id → an error (`"unknown plugin: {id}"`)
+/// - harness-capable → add/remove `id` in the `enabled_runtimes` CSV setting
+/// - gateway-capable → add/remove `id` in the `enabled_gateways` CSV setting
+/// - everything else (manifest-only or connector-only) → set
+///   `plugin.<id>.enabled` to `"true"`/`"false"`
+pub async fn toggle_enabled(
+    host: &PluginHost,
+    settings: &SettingsStore,
+    id: &str,
+    enable: bool,
+) -> anyhow::Result<()> {
+    let Some(plugin) = host.get(id) else {
+        anyhow::bail!("unknown plugin: {id}");
+    };
+    if plugin.harness.is_some() {
+        return toggle_csv(settings, "enabled_runtimes", id, enable).await;
+    }
+    if plugin.gateway.is_some() {
+        return toggle_csv(settings, "enabled_gateways", id, enable).await;
+    }
+    settings
+        .set(
+            &format!("plugin.{id}.enabled"),
+            if enable { "true" } else { "false" },
+        )
+        .await
+}
+
+/// Add (or remove) `id` in a CSV settings value, preserving the existing
+/// entries' order and never introducing a duplicate.
+async fn toggle_csv(
+    settings: &SettingsStore,
+    key: &str,
+    id: &str,
+    enable: bool,
+) -> anyhow::Result<()> {
+    let mut values = csv(settings.get(key).await?.as_deref());
+    if enable {
+        if !values.iter().any(|v| v == id) {
+            values.push(id.to_string());
+        }
+    } else {
+        values.retain(|v| v != id);
+    }
+    settings.set(key, &values.join(",")).await
+}
+
+#[cfg(test)]
+mod toggle_enabled_tests {
+    use super::*;
+    use crate::connector::{Connector, ConnectorCtx};
+    use crate::domain::{ApprovalDecision, ApprovalRequest, McpServerSpec, Surface};
+    use crate::gateway::{Gateway, GatewayFactory, MessageRef};
+    use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
+    use crate::store::Store;
+    use async_trait::async_trait;
+    use ryuzi_plugin_sdk::PluginManifest;
+    use std::sync::Arc;
+
+    // ---- minimal fakes, self-contained to this test module (mirrors host.rs's tests) ----
+
+    struct FakeHarness;
+    #[async_trait]
+    impl Harness for FakeHarness {
+        async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            anyhow::bail!("not needed in this test")
+        }
+    }
+    struct FakeHarnessFactory;
+    impl HarnessFactory for FakeHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Ok(Arc::new(FakeHarness))
+        }
+    }
+
+    struct FakeGateway;
+    #[async_trait]
+    impl Gateway for FakeGateway {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        async fn start(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
+            Ok(format!("ws-{name}"))
+        }
+        async fn create_conversation(
+            &self,
+            _workspace_id: &str,
+            _title: &str,
+        ) -> anyhow::Result<String> {
+            Ok("conv".to_string())
+        }
+        async fn post_status(&self, surface: &Surface, _text: &str) -> anyhow::Result<MessageRef> {
+            Ok(MessageRef {
+                surface: surface.clone(),
+                message_id: "m1".to_string(),
+            })
+        }
+        async fn edit_status(&self, _msg: &MessageRef, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_result(&self, _surface: &Surface, _chunks: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_error(&self, _surface: &Surface, _message: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval(
+            &self,
+            _s: &Surface,
+            _r: &ApprovalRequest,
+        ) -> anyhow::Result<ApprovalDecision> {
+            Ok(ApprovalDecision::Cancel)
+        }
+    }
+    struct FakeGatewayFactory;
+    impl GatewayFactory for FakeGatewayFactory {
+        fn create(&self, _c: &serde_json::Value) -> anyhow::Result<Arc<dyn Gateway>> {
+            Ok(Arc::new(FakeGateway))
+        }
+    }
+
+    struct FakeConnector;
+    #[async_trait]
+    impl Connector for FakeConnector {
+        async fn mcp_servers(&self, _ctx: &ConnectorCtx) -> anyhow::Result<Vec<McpServerSpec>> {
+            Ok(vec![])
+        }
+    }
+
+    fn manifest(id: &str) -> PluginManifest {
+        PluginManifest {
+            contract: 1,
+            id: id.to_string(),
+            name: id.to_string(),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            mcp: vec![],
+            skills: vec![],
+            menu: None,
+            provider: None,
+            runtime: None,
+        }
+    }
+
+    fn harness_only(id: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: manifest(id),
+            harness: Some(Arc::new(FakeHarnessFactory)),
+            gateway: None,
+            connector: None,
+            source: PluginSource::Builtin,
+        }
+    }
+
+    fn gateway_only(id: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: manifest(id),
+            harness: None,
+            gateway: Some(Arc::new(FakeGatewayFactory)),
+            connector: None,
+            source: PluginSource::Builtin,
+        }
+    }
+
+    fn manifest_only(id: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: manifest(id),
+            harness: None,
+            gateway: None,
+            connector: None,
+            source: PluginSource::Builtin,
+        }
+    }
+
+    fn connector_only(id: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: manifest(id),
+            harness: None,
+            gateway: None,
+            connector: Some(Arc::new(FakeConnector)),
+            source: PluginSource::Builtin,
+        }
+    }
+
+    async fn open_settings() -> (SettingsStore, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        (SettingsStore::new(store), tmp)
+    }
+
+    #[tokio::test]
+    async fn unknown_id_errors() {
+        let (settings, _tmp) = open_settings().await;
+        let host = PluginHost::new();
+        let err = toggle_enabled(&host, &settings, "nope", true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "unknown plugin: nope");
+    }
+
+    #[tokio::test]
+    async fn harness_capable_toggles_enabled_runtimes_csv_without_duplicating() {
+        let (settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        // Deliberately not "claude-code" — a fresh store seeds
+        // `enabled_runtimes = "claude-code"`, which would defeat the "off by
+        // default" half of this test.
+        host.add(harness_only("native"));
+
+        toggle_enabled(&host, &settings, "native", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.get("enabled_runtimes").await.unwrap().as_deref(),
+            Some("claude-code,native")
+        );
+        // enabling again must not duplicate the entry
+        toggle_enabled(&host, &settings, "native", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.get("enabled_runtimes").await.unwrap().as_deref(),
+            Some("claude-code,native")
+        );
+        toggle_enabled(&host, &settings, "native", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.get("enabled_runtimes").await.unwrap().as_deref(),
+            Some("claude-code")
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_capable_toggles_enabled_gateways_csv() {
+        let (settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        // Deliberately not "discord" — a fresh store seeds
+        // `enabled_gateways = "discord"`, which would defeat the "off by
+        // default" half of this test.
+        host.add(gateway_only("slack"));
+
+        toggle_enabled(&host, &settings, "slack", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.get("enabled_gateways").await.unwrap().as_deref(),
+            Some("discord,slack")
+        );
+        toggle_enabled(&host, &settings, "slack", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.get("enabled_gateways").await.unwrap().as_deref(),
+            Some("discord")
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_only_and_connector_only_toggle_plugin_enabled_flag() {
+        let (settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        host.add(manifest_only("anthropic-toggle-test"));
+        host.add(connector_only("acme-toggle-test"));
+
+        toggle_enabled(&host, &settings, "anthropic-toggle-test", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings
+                .get("plugin.anthropic-toggle-test.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+
+        toggle_enabled(&host, &settings, "acme-toggle-test", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings
+                .get("plugin.acme-toggle-test.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        toggle_enabled(&host, &settings, "acme-toggle-test", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings
+                .get("plugin.acme-toggle-test.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
     }
 }
 

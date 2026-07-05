@@ -1,16 +1,17 @@
 //! `ryuzi plugins` — list, inspect, enable, and disable installed plugins.
 //! Thin: parse → act → print via `deps.out`/`deps.err`, mirroring
 //! `config_cmd.rs`. Every plugin comes from `deps.build_registries`'s
-//! `Registries.plugins` (a [`ryuzi_core::PluginHost`]); enable/disable writes
-//! through [`ryuzi_core::settings::SettingsStore`] using the same
-//! enablement rules `PluginHost::is_enabled` reads back (see that method's
-//! doc): harness-capable plugins toggle the `enabled_runtimes` CSV,
+//! `Registries.plugins` (a [`ryuzi_core::PluginHost`]); enable/disable
+//! delegates to [`ryuzi_core::plugins::toggle_enabled`], the single source of
+//! truth shared with the Cockpit `set_plugin_enabled` command, which mirrors
+//! the enablement rules `PluginHost::is_enabled` reads back (see that
+//! method's doc): harness-capable plugins toggle the `enabled_runtimes` CSV,
 //! gateway-capable toggle `enabled_gateways`, and everything else toggles its
 //! own `plugin.<id>.enabled` flag.
 
 use std::sync::Arc;
 
-use ryuzi_core::settings::{csv, SettingsStore};
+use ryuzi_core::settings::SettingsStore;
 
 use crate::dispatch::Deps;
 
@@ -240,10 +241,6 @@ async fn cmd_set_enabled(id: &str, enable: bool, deps: &mut Deps) -> u8 {
             return 1;
         }
     };
-    let Some(plugin) = registries.plugins.get(id) else {
-        (deps.err)(&format!("unknown plugin: {id}"));
-        return 1;
-    };
     let settings = match open_settings(deps).await {
         Ok(s) => s,
         Err(e) => {
@@ -252,20 +249,10 @@ async fn cmd_set_enabled(id: &str, enable: bool, deps: &mut Deps) -> u8 {
         }
     };
 
-    let result = if plugin.harness.is_some() {
-        toggle_csv(&settings, "enabled_runtimes", id, enable).await
-    } else if plugin.gateway.is_some() {
-        toggle_csv(&settings, "enabled_gateways", id, enable).await
-    } else {
-        settings
-            .set(
-                &format!("plugin.{id}.enabled"),
-                if enable { "true" } else { "false" },
-            )
-            .await
-    };
-
-    match result {
+    // Single source of truth for the CSV/flag toggle rules shared with the
+    // Cockpit `set_plugin_enabled` command — see `ryuzi_core::plugins::
+    // toggle_enabled`'s doc for the harness/gateway/flag priority order.
+    match ryuzi_core::plugins::toggle_enabled(&registries.plugins, &settings, id, enable).await {
         Ok(()) => {
             (deps.out)(&format!(
                 "{} {id}",
@@ -278,25 +265,6 @@ async fn cmd_set_enabled(id: &str, enable: bool, deps: &mut Deps) -> u8 {
             1
         }
     }
-}
-
-/// Add (or remove) `id` in a CSV settings value, preserving the existing
-/// entries' order and never introducing a duplicate.
-async fn toggle_csv(
-    settings: &SettingsStore,
-    key: &str,
-    id: &str,
-    enable: bool,
-) -> anyhow::Result<()> {
-    let mut values = csv(settings.get(key).await?.as_deref());
-    if enable {
-        if !values.iter().any(|v| v == id) {
-            values.push(id.to_string());
-        }
-    } else {
-        values.retain(|v| v != id);
-    }
-    settings.set(key, &values.join(",")).await
 }
 
 async fn open_settings(deps: &mut Deps) -> anyhow::Result<SettingsStore> {
