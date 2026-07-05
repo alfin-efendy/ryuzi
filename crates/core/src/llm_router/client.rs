@@ -91,6 +91,25 @@ pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Optio
     Ok(None)
 }
 
+/// The first model of the highest-priority enabled connection, as a
+/// `provider/model` id — used as a fallback when no model is configured.
+/// `None` if no enabled connection offers any model.
+pub async fn default_model(store: &Store) -> Option<String> {
+    let conns = connections::list_connections(store).await.ok()?;
+    for conn in conns.into_iter().filter(|c| c.enabled) {
+        let Some(desc) = registry::descriptor(&conn.provider) else {
+            continue;
+        };
+        if let Some(model) = connections::effective_models(desc, &conn)
+            .into_iter()
+            .next()
+        {
+            return Some(format!("{}/{}", conn.provider, model));
+        }
+    }
+    None
+}
+
 /// Anthropic's Claude-Code-branded system prefix, required by the
 /// anthropic-oauth (Claude subscription) upstream — that's the wire's own
 /// contract for the OAuth token, not a client-visible feature; no other

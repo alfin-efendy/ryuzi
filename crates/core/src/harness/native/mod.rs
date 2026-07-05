@@ -89,6 +89,12 @@ async fn connect_mcp_tools(
 impl Harness for NativeHarness {
     async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
         let llm = self.llm_factory.create(ctx.store.clone());
+        // Fall back to the first enabled connection's model when the project
+        // pins none, so a native run "just works" without an explicit --model.
+        let model = match ctx.model {
+            Some(m) if !m.is_empty() => Some(m),
+            _ => crate::llm_router::client::default_model(&ctx.store).await,
+        };
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
@@ -102,7 +108,7 @@ impl Harness for NativeHarness {
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 work_dir: ctx.work_dir,
-                model: ctx.model,
+                model,
                 perm_mode: ctx.perm_mode,
                 project_policy: None,
                 store: ctx.store,
