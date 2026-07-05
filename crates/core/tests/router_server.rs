@@ -760,7 +760,7 @@ async fn mock_anthropic_oauth_upstream() -> (
 
 /// I6a: an anthropic-oauth connection's upstream request carries the OAuth
 /// bearer (from `data.access_token`, never `data.api_key`) + the
-/// `anthropic-beta: oauth-2025-04-20` header, and the outgoing body has the
+/// `anthropic-beta` OAuth/Claude-Code header, and the outgoing body has the
 /// Claude-Code system prompt injected ahead of the caller's own system text.
 #[tokio::test]
 async fn oauth_anthropic_upstream_receives_bearer_beta_header_and_system_prompt() {
@@ -820,7 +820,9 @@ async fn oauth_anthropic_upstream_receives_bearer_beta_header_and_system_prompt(
         headers.get("authorization").unwrap(),
         "Bearer at-secret-token"
     );
-    assert_eq!(headers.get("anthropic-beta").unwrap(), "oauth-2025-04-20");
+    let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    assert!(beta.contains("claude-code-20250219"));
+    assert!(beta.contains("oauth-2025-04-20"));
     assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
     assert_eq!(
         body["system"][0]["text"],

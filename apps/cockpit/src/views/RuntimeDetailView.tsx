@@ -24,6 +24,7 @@ import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { agentAllowed, useApps } from "@/store-apps";
 import { useConnections } from "@/store-connections";
 import { useEndpoint } from "@/store-endpoint";
+import { useModelRoutes } from "@/store-model-routes";
 import { useNav } from "@/store-nav";
 
 const WARN = "#F59E0B";
@@ -69,10 +70,12 @@ export function RuntimeDetailView({ id }: { id: string }) {
   const [cfg, setCfg] = useState<RuntimeConfigStatusInfo | null>(null);
   const { status: epStatus, keys: epKeys } = useEndpoint();
   const { connections } = useConnections();
-  const modelOptions = useMemo(
-    () => connections.filter((c) => c.enabled).flatMap((c) => c.models.map((m) => `${c.provider}/${m}`)),
-    [connections],
-  );
+  const { routes } = useModelRoutes();
+  const modelOptions = useMemo(() => {
+    const routeModels = routes.filter((r) => r.enabled && r.targets.length > 0).map((r) => r.name);
+    const providerModels = connections.filter((c) => c.enabled).flatMap((c) => c.models.map((m) => `${c.provider}/${m}`));
+    return Array.from(new Set([...routeModels, ...providerModels]));
+  }, [connections, routes]);
   const [model, setModel] = useState("");
   const [opus, setOpus] = useState("");
   const [sonnet, setSonnet] = useState("");
@@ -86,6 +89,7 @@ export function RuntimeDetailView({ id }: { id: string }) {
     void commands.runtimeConfigStatus(id).then((r) => r.status === "ok" && setCfg(r.data));
     void useEndpoint.getState().hydrate();
     void useConnections.getState().hydrate();
+    void useModelRoutes.getState().hydrate();
   }, [id]);
 
   const agent = runtimeById(runtimes, id);

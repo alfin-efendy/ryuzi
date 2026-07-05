@@ -1,16 +1,24 @@
 //! Providers tab commands: catalog + credentialed connections CRUD + test.
 use crate::error::CmdError;
+use crate::events::OauthAuthorizeUrlMsg;
 use ryuzi_core::llm_router::connections::{self, ConnectionData, ConnectionRow};
+use ryuzi_core::llm_router::models;
 use ryuzi_core::llm_router::oauth;
+use ryuzi_core::llm_router::quota::{self, CodexResetCreditResult, ProviderQuotaInfo};
 use ryuzi_core::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderCategory};
+use ryuzi_core::llm_router::routes::{
+    self, ModelRouteInfo, ModelRouteStrategy, ProviderAccountRouteInfo,
+};
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use specta::Type;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
+use tauri_specta::Event as _;
 
 type R<T> = Result<T, CmdError>;
 
@@ -149,6 +157,34 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<ConnectionInfo>> {
         .collect())
 }
 
+async fn refresh_models_best_effort(cp: &ControlPlane, row: &mut ConnectionRow) {
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    else {
+        return;
+    };
+    let _ = models::refresh_connection_models(cp.store(), &http, row).await;
+}
+
+fn quota_http_client() -> R<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })
+}
+
+fn provider_http_client() -> R<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })
+}
+
 /// Pick out the ids of OTHER kiro connections that are dead
 /// (`needs_relogin == Some(true)`) and should be cleared once a fresh kiro
 /// connection (`keep_id`) has been persisted. Split out from
@@ -241,30 +277,28 @@ pub async fn add_connection(
         });
     }
     let now = ryuzi_core::paths::now_ms();
-    connections::add_connection(
-        cp.store(),
-        ConnectionRow {
-            id: ryuzi_core::paths::new_id(),
-            provider,
-            auth_type: "api_key".into(),
-            label,
-            priority: 0, // add_connection assigns MAX+1
-            enabled: true,
-            data: ConnectionData {
-                api_key: if api_key.is_empty() {
-                    None
-                } else {
-                    Some(api_key)
-                },
-                base_url_override: base_url.filter(|s| !s.is_empty()),
-                models_override: None,
-                ..Default::default()
+    let mut row = ConnectionRow {
+        id: ryuzi_core::paths::new_id(),
+        provider,
+        auth_type: "api_key".into(),
+        label,
+        priority: 0, // add_connection assigns MAX+1
+        enabled: true,
+        data: ConnectionData {
+            api_key: if api_key.is_empty() {
+                None
+            } else {
+                Some(api_key)
             },
-            created_at: now,
-            updated_at: now,
+            base_url_override: base_url.filter(|s| !s.is_empty()),
+            models_override: None,
+            ..Default::default()
         },
-    )
-    .await?;
+        created_at: now,
+        updated_at: now,
+    };
+    connections::add_connection(cp.store(), row.clone()).await?;
+    refresh_models_best_effort(&cp, &mut row).await;
     Ok(assemble(&cp).await?)
 }
 
@@ -299,7 +333,10 @@ pub async fn update_connection(
         Some(models)
     };
     row.updated_at = ryuzi_core::paths::now_ms();
-    connections::update_connection(cp.store(), row).await?;
+    connections::update_connection(cp.store(), row.clone()).await?;
+    if row.data.models_override.is_none() {
+        refresh_models_best_effort(&cp, &mut row).await;
+    }
     Ok(assemble(&cp).await?)
 }
 
@@ -348,12 +385,175 @@ fn probe_outcome(resp: Result<reqwest::StatusCode, String>) -> TestResult {
     }
 }
 
-/// Hit the upstream's model-list (openai) / a 1-token message (anthropic)
-/// to distinguish bad key (401/403) from network trouble.
+fn model_probe_body(format: ApiFormat, model: &str) -> Value {
+    match format {
+        ApiFormat::OpenAi => json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "stream": false
+        }),
+        ApiFormat::Anthropic => json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "stream": false
+        }),
+    }
+}
+
+fn model_probe_outcome(model: &str, resp: Result<reqwest::StatusCode, String>) -> TestResult {
+    match resp {
+        Ok(s) if s.is_success() => TestResult {
+            ok: true,
+            message: format!("Model {model} OK"),
+        },
+        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => TestResult {
+            ok: false,
+            message: format!("Model {model} was rejected by provider credentials."),
+        },
+        Ok(s) => TestResult {
+            ok: false,
+            message: format!("Model {model} returned HTTP {s}"),
+        },
+        Err(e) => TestResult {
+            ok: false,
+            message: format!("Model {model} network error: {e}"),
+        },
+    }
+}
+
+fn chatgpt_account_id(row: &ConnectionRow) -> Option<&str> {
+    let data = row.data.provider_specific.as_ref()?;
+    data.get("chatgpt_account_id")
+        .or_else(|| data.get("chatgptAccountId"))
+        .or_else(|| data.get("accountId"))
+        .or_else(|| data.get("workspaceId"))
+        .and_then(Value::as_str)
+}
+
+fn codex_probe_model(model: &str) -> String {
+    let mut upstream = model.strip_suffix("-review").unwrap_or(model).to_string();
+    for effort in ["xhigh", "high", "medium", "low", "none"] {
+        let suffix = format!("-{effort}");
+        if upstream.ends_with(&suffix) {
+            upstream.truncate(upstream.len() - suffix.len());
+            break;
+        }
+    }
+    upstream
+}
+
+fn build_model_probe_request(
+    http: &reqwest::Client,
+    desc: &registry::ProviderDescriptor,
+    row: &ConnectionRow,
+    model: &str,
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    if row.provider == "openai-oauth" {
+        let token = row.data.access_token.clone().unwrap_or_default();
+        let mut req = http
+            .post("https://chatgpt.com/backend-api/codex/responses")
+            .json(&json!({
+                "model": codex_probe_model(model),
+                "input": "ping",
+                "stream": false,
+                "store": false
+            }))
+            .header("authorization", format!("Bearer {token}"))
+            .header("originator", "codex_cli_rs")
+            .header("session_id", ryuzi_core::paths::new_id());
+        if let Some(account_id) = chatgpt_account_id(row) {
+            req = req.header("chatgpt-account-id", account_id);
+        }
+        return Ok(req);
+    }
+
+    let base = connections::effective_base_url(desc, row)
+        .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", row.id))?;
+    let body = model_probe_body(desc.format, model);
+
+    if row.provider == "anthropic-oauth" {
+        let token = row.data.access_token.clone().unwrap_or_default();
+        return Ok(http
+            .post(format!("{base}/messages?beta=true"))
+            .json(&body)
+            .header("authorization", format!("Bearer {token}"))
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", models::ANTHROPIC_OAUTH_BETA)
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("user-agent", "claude-cli/2.1.92 (external, sdk-cli)")
+            .header("x-app", "cli"));
+    }
+
+    let path = match desc.format {
+        ApiFormat::OpenAi => "/chat/completions",
+        ApiFormat::Anthropic => "/messages",
+    };
+    let mut req = http.post(format!("{base}{path}")).json(&body);
+    if desc.no_auth {
+        if row.provider == "opencode-free" {
+            req = req
+                .header("authorization", "Bearer public")
+                .header("x-opencode-client", "desktop");
+        }
+        return Ok(req);
+    }
+
+    let key = row.data.api_key.clone().unwrap_or_default();
+    match desc.auth {
+        AuthScheme::XApiKey => Ok(req
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")),
+        AuthScheme::Bearer => Ok(req.header("authorization", format!("Bearer {key}"))),
+        AuthScheme::None => Ok(req),
+    }
+}
+
+async fn test_model_once(
+    http: &reqwest::Client,
+    desc: &registry::ProviderDescriptor,
+    row: &ConnectionRow,
+    model: &str,
+) -> anyhow::Result<reqwest::StatusCode> {
+    Ok(build_model_probe_request(http, desc, row, model)?
+        .send()
+        .await?
+        .status())
+}
+
+async fn test_model_status(
+    store: &Arc<ryuzi_core::Store>,
+    http: &reqwest::Client,
+    desc: &registry::ProviderDescriptor,
+    row: &mut ConnectionRow,
+    model: &str,
+) -> anyhow::Result<reqwest::StatusCode> {
+    if connections::is_oauth(row) {
+        if let Err(err) = oauth::refresh::ensure_fresh(store, http, row).await {
+            if row.data.needs_relogin == Some(true) {
+                return Err(err);
+            }
+        }
+    }
+
+    let status = test_model_once(http, desc, row, model).await?;
+    if connections::is_oauth(row)
+        && matches!(status.as_u16(), 401 | 403)
+        && row.data.refresh_token.is_some()
+    {
+        oauth::refresh::force_refresh(store, http, row).await?;
+        return test_model_once(http, desc, row, model).await;
+    }
+    Ok(status)
+}
+
+/// Hit the upstream's model-list endpoint to distinguish bad credentials
+/// (401/403) from network trouble, and persist the discovered model ids.
 #[tauri::command]
 #[specta::specta]
 pub async fn test_connection(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<TestResult> {
-    let row = connections::get_connection(cp.store(), &id)
+    let mut row = connections::get_connection(cp.store(), &id)
         .await?
         .ok_or_else(|| CmdError {
             message: format!("unknown connection: {id}"),
@@ -361,40 +561,133 @@ pub async fn test_connection(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<
     let desc = registry::descriptor(&row.provider).ok_or_else(|| CmdError {
         message: format!("unknown provider: {}", row.provider),
     })?;
-    let Some(base) = connections::effective_base_url(desc, &row) else {
-        return Ok(TestResult {
-            ok: false,
-            message: "no base URL configured".into(),
-        });
-    };
-    let key = row.data.api_key.clone().unwrap_or_default();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| CmdError {
             message: e.to_string(),
         })?;
-    let resp = match desc.format {
-        ApiFormat::OpenAi => {
-            let mut r = client.get(format!("{base}/models"));
-            if desc.auth == AuthScheme::Bearer {
-                r = r.header("authorization", format!("Bearer {key}"));
+    let result = match models::fetch_connection_models(cp.store(), &client, desc, &mut row).await {
+        Ok((status, discovered)) => {
+            if status.is_success() {
+                if !discovered.is_empty() {
+                    row.data.models_override = Some(discovered);
+                    row.updated_at = ryuzi_core::paths::now_ms();
+                    let _ = connections::update_connection(cp.store(), row).await;
+                }
             }
-            r.send().await
+            probe_outcome(Ok(status))
         }
-        ApiFormat::Anthropic => client
-            .post(format!("{base}/messages"))
-            .header("x-api-key", &key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&serde_json::json!({"model": desc.models.first().copied().unwrap_or("claude-haiku-4-5"),
-                                       "max_tokens": 1,
-                                       "messages": [{"role": "user", "content": "ping"}]}))
-            .send()
-            .await,
+        Err(e) => probe_outcome(Err(e.to_string())),
     };
-    Ok(probe_outcome(
-        resp.map(|r| r.status()).map_err(|e| e.to_string()),
-    ))
+    Ok(result)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn test_connection_model(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+    model: String,
+) -> R<TestResult> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Ok(TestResult {
+            ok: false,
+            message: "Model id is empty".into(),
+        });
+    }
+    let mut row = connections::get_connection(cp.store(), &id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown connection: {id}"),
+        })?;
+    let desc = registry::descriptor(&row.provider).ok_or_else(|| CmdError {
+        message: format!("unknown provider: {}", row.provider),
+    })?;
+    let client = provider_http_client()?;
+    let result = test_model_status(cp.store(), &client, desc, &mut row, &model)
+        .await
+        .map_or_else(
+            |e| model_probe_outcome(&model, Err(e.to_string())),
+            |status| model_probe_outcome(&model, Ok(status)),
+        );
+    Ok(result)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn connection_provider_quota(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+) -> R<ProviderQuotaInfo> {
+    let mut row = connections::get_connection(cp.store(), &id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown connection: {id}"),
+        })?;
+    let http = quota_http_client()?;
+    Ok(quota::fetch_provider_quota(cp.store(), &http, &mut row).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_codex_credit(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+) -> R<CodexResetCreditResult> {
+    let mut row = connections::get_connection(cp.store(), &id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown connection: {id}"),
+        })?;
+    let http = quota_http_client()?;
+    Ok(quota::consume_codex_reset_credit(cp.store(), &http, &mut row).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_model_routes(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<ModelRouteInfo>> {
+    Ok(routes::list_model_routes(cp.store()).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_model_route(
+    cp: State<'_, Arc<ControlPlane>>,
+    route: ModelRouteInfo,
+) -> R<Vec<ModelRouteInfo>> {
+    routes::save_model_route(cp.store(), route).await?;
+    Ok(routes::list_model_routes(cp.store()).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_model_route(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+) -> R<Vec<ModelRouteInfo>> {
+    routes::delete_model_route(cp.store(), &id).await?;
+    Ok(routes::list_model_routes(cp.store()).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn provider_account_route(
+    cp: State<'_, Arc<ControlPlane>>,
+    provider: String,
+) -> R<ProviderAccountRouteInfo> {
+    Ok(routes::provider_account_route(cp.store(), &provider).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_provider_account_route(
+    cp: State<'_, Arc<ControlPlane>>,
+    provider: String,
+    strategy: ModelRouteStrategy,
+) -> R<ProviderAccountRouteInfo> {
+    Ok(routes::save_provider_account_route(cp.store(), &provider, strategy).await?)
 }
 
 #[cfg(test)]
@@ -439,6 +732,30 @@ mod tests {
         let r = probe_outcome(Err("connection refused".into()));
         assert!(!r.ok);
         assert_eq!(r.message, "Network error: connection refused");
+    }
+
+    #[test]
+    fn model_probe_body_matches_provider_format() {
+        let openai = model_probe_body(ApiFormat::OpenAi, "gpt-test");
+        assert_eq!(openai["model"], "gpt-test");
+        assert_eq!(openai["messages"][0]["content"], "ping");
+        assert_eq!(openai["max_tokens"], 1);
+
+        let anthropic = model_probe_body(ApiFormat::Anthropic, "claude-test");
+        assert_eq!(anthropic["model"], "claude-test");
+        assert_eq!(anthropic["messages"][0]["content"], "ping");
+        assert_eq!(anthropic["max_tokens"], 1);
+    }
+
+    #[test]
+    fn model_probe_outcome_mentions_model_id() {
+        let r = model_probe_outcome("gpt-test", Ok(status(200)));
+        assert!(r.ok);
+        assert_eq!(r.message, "Model gpt-test OK");
+
+        let r = model_probe_outcome("gpt-test", Ok(status(404)));
+        assert!(!r.ok);
+        assert_eq!(r.message, "Model gpt-test returned HTTP 404 Not Found");
     }
 
     /// A kiro device-flow connection must persist the registered AWS SSO-OIDC
@@ -544,13 +861,19 @@ pub async fn connect_oauth(
 ) -> R<Vec<ConnectionInfo>> {
     let http = reqwest::Client::new();
     let app2 = app.clone();
-    oauth::callback::run_flow(
+    let provider_for_event = provider.clone();
+    let mut row = oauth::callback::run_flow(
         cp.store(),
         &http,
         &provider,
         &label,
         None,
         move |url| {
+            let _ = OauthAuthorizeUrlMsg {
+                provider: provider_for_event,
+                authorize_url: url.to_string(),
+            }
+            .emit(&app2);
             let _ = app2.opener().open_url(url.to_string(), None::<&str>);
         },
         std::time::Duration::from_secs(300),
@@ -559,6 +882,7 @@ pub async fn connect_oauth(
     .map_err(|e| CmdError {
         message: e.to_string(),
     })?;
+    refresh_models_best_effort(&cp, &mut row).await;
     Ok(assemble(&cp).await?)
 }
 
@@ -581,13 +905,19 @@ pub async fn reconnect_oauth(
         })?;
     let http = reqwest::Client::new();
     let app2 = app.clone();
-    oauth::callback::run_flow(
+    let provider_for_event = existing.provider.clone();
+    let mut row = oauth::callback::run_flow(
         cp.store(),
         &http,
         &existing.provider,
         &existing.label,
         Some(&connection_id),
         move |url| {
+            let _ = OauthAuthorizeUrlMsg {
+                provider: provider_for_event,
+                authorize_url: url.to_string(),
+            }
+            .emit(&app2);
             let _ = app2.opener().open_url(url.to_string(), None::<&str>);
         },
         std::time::Duration::from_secs(300),
@@ -596,6 +926,7 @@ pub async fn reconnect_oauth(
     .map_err(|e| CmdError {
         message: e.to_string(),
     })?;
+    refresh_models_best_effort(&cp, &mut row).await;
     Ok(assemble(&cp).await?)
 }
 
@@ -631,7 +962,7 @@ pub async fn complete_oauth_manual(
     redirect_uri: String,
 ) -> R<Vec<ConnectionInfo>> {
     let http = reqwest::Client::new();
-    oauth::callback::complete_manual(
+    let mut row = oauth::callback::complete_manual(
         cp.store(),
         &http,
         &provider,
@@ -646,6 +977,7 @@ pub async fn complete_oauth_manual(
     .map_err(|e| CmdError {
         message: e.to_string(),
     })?;
+    refresh_models_best_effort(&cp, &mut row).await;
     Ok(assemble(&cp).await?)
 }
 
@@ -675,21 +1007,19 @@ pub async fn add_free_connection(
         });
     }
     let now = ryuzi_core::paths::now_ms();
-    connections::add_connection(
-        cp.store(),
-        ConnectionRow {
-            id: ryuzi_core::paths::new_id(),
-            provider,
-            auth_type: "free".into(),
-            label,
-            priority: 0,
-            enabled: true,
-            data: ConnectionData::default(),
-            created_at: now,
-            updated_at: now,
-        },
-    )
-    .await?;
+    let mut row = ConnectionRow {
+        id: ryuzi_core::paths::new_id(),
+        provider,
+        auth_type: "free".into(),
+        label,
+        priority: 0,
+        enabled: true,
+        data: ConnectionData::default(),
+        created_at: now,
+        updated_at: now,
+    };
+    connections::add_connection(cp.store(), row.clone()).await?;
+    refresh_models_best_effort(&cp, &mut row).await;
     Ok(assemble(&cp).await?)
 }
 

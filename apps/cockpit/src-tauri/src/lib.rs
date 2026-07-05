@@ -234,6 +234,14 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::remove_connection,
             connections_cmd::move_connection,
             connections_cmd::test_connection,
+            connections_cmd::test_connection_model,
+            connections_cmd::connection_provider_quota,
+            connections_cmd::reset_codex_credit,
+            connections_cmd::list_model_routes,
+            connections_cmd::save_model_route,
+            connections_cmd::delete_model_route,
+            connections_cmd::provider_account_route,
+            connections_cmd::set_provider_account_route,
             connections_cmd::connect_oauth,
             connections_cmd::reconnect_oauth,
             connections_cmd::begin_oauth_manual,
@@ -245,6 +253,7 @@ fn make_builder() -> Builder<tauri::Wry> {
         ])
         .events(collect_events![
             events::CoreEventMsg,
+            events::OauthAuthorizeUrlMsg,
             accent::AccentChangedMsg,
             term::TermOutputMsg,
             term::TermExitMsg

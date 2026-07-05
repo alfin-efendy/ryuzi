@@ -61,7 +61,7 @@ const anthropicConnection: ConnectionInfo = {
   priority: 0,
   enabled: true,
   baseUrl: null,
-  models: ["claude-sonnet-4"],
+  models: ["claude-sonnet-4", "claude-sonnet-4"],
   keyMasked: "sk-…3fk9",
   needsRelogin: false,
 };
@@ -98,6 +98,7 @@ mock.module("@/bindings", () => ({
     listEndpointKeys: () => ok([endpointKey]),
     listProviderCatalog: () => ok([]),
     listConnections: () => ok([anthropicConnection]),
+    listModelRoutes: () => ok([]),
     listApps: () => ok([githubApp]),
     listRuntimes: () => ok([claudeRuntime]),
     refreshRuntimes: () => ok([claudeRuntime]),
@@ -109,6 +110,7 @@ const { useRuntimes } = await import("@/store-runtimes");
 const { useApps } = await import("@/store-apps");
 const { useEndpoint } = await import("@/store-endpoint");
 const { useConnections } = await import("@/store-connections");
+const { useModelRoutes } = await import("@/store-model-routes");
 
 beforeEach(() => {
   runtimeConfigStatus.mockClear();
@@ -117,6 +119,7 @@ beforeEach(() => {
   useApps.setState({ apps: [githubApp], loaded: true, probing: null });
   useEndpoint.setState({ status: null, keys: [], loaded: false });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
+  useModelRoutes.setState({ routes: [], loaded: false });
 });
 
 // Reset the shared zustand singletons on the way out too: the view's mount
@@ -128,6 +131,7 @@ afterEach(() => {
   useApps.setState({ apps: [], loaded: false, probing: null });
   useEndpoint.setState({ status: null, keys: [], loaded: false });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
+  useModelRoutes.setState({ routes: [], loaded: false });
 });
 
 // Render and flush the mount-effect hydrates (config status, endpoint,

@@ -1,14 +1,16 @@
-import { useEffect, useState } from "react";
-import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Copy, Plus } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronRight, Copy, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useEndpoint } from "@/store-endpoint";
 import { useConnections } from "@/store-connections";
+import { useModelRoutes } from "@/store-model-routes";
 import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
-import type { ConnectionInfo } from "@/bindings";
+import type { CatalogEntry, ConnectionInfo, ModelRouteInfo, ModelRouteStrategy } from "@/bindings";
 import {
   Button,
   Input,
+  NativeSelect,
   Segmented,
   SettingsCard as Card,
   SettingsCardHeader as CardHeader,
@@ -17,11 +19,79 @@ import {
   SettingsCardTitle as CardTitle,
   Switch,
 } from "@ryuzi/ui";
-import { Chip, StatusDot } from "@/components/common/bits";
+import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
+import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
 
-type Tab = "endpoint" | "connections";
+type Tab = "providers" | "route" | "endpoint";
+
+type ProviderRowInfo = {
+  id: string;
+  name: string;
+  color: string;
+  initial: string;
+  category: string;
+  accounts: ConnectionInfo[];
+  catalogModels: number;
+  modelCount: number;
+};
+
+type TargetOption = {
+  key: string;
+  connectionId: string;
+  model: string;
+  providerName: string;
+  accountLabel: string;
+  enabled: boolean;
+};
+
+function accountLabel(count: number): string {
+  return count === 0 ? "No accounts" : `${count} account${count === 1 ? "" : "s"}`;
+}
+
+function modelLabel(count: number, catalog = false): string {
+  return `${count} ${catalog ? "catalog " : ""}model${count === 1 ? "" : "s"}`;
+}
+
+function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[]): ProviderRowInfo[] {
+  const rows = new Map<string, ProviderRowInfo>();
+  for (const entry of catalog) {
+    rows.set(entry.id, {
+      id: entry.id,
+      name: entry.name,
+      color: entry.color,
+      initial: entry.initial,
+      category: entry.category,
+      accounts: [],
+      catalogModels: entry.models.length,
+      modelCount: entry.models.length,
+    });
+  }
+  for (const conn of connections) {
+    const existing =
+      rows.get(conn.provider) ??
+      ({
+        id: conn.provider,
+        name: conn.providerName,
+        color: conn.color,
+        initial: conn.initial,
+        category: conn.authType,
+        accounts: [],
+        catalogModels: 0,
+        modelCount: 0,
+      } satisfies ProviderRowInfo);
+    existing.accounts.push(conn);
+    const models = new Set(existing.accounts.flatMap((account) => account.models));
+    existing.modelCount = models.size || existing.catalogModels;
+    rows.set(conn.provider, existing);
+  }
+  return Array.from(rows.values()).sort((a, b) => {
+    if (a.accounts.length === 0 && b.accounts.length > 0) return 1;
+    if (a.accounts.length > 0 && b.accounts.length === 0) return -1;
+    return a.name.localeCompare(b.name);
+  });
+}
 
 // Matches the warning-banner convention used elsewhere (e.g. RuntimeDetailView's
 // endpoint/no-models banners): a bordered row tinted amber for a mild warning,
@@ -197,120 +267,363 @@ function EndpointTab() {
   );
 }
 
-function ConnectionRow({ conn, index, count }: { conn: ConnectionInfo; index: number; count: number }) {
+function ProviderRow({ row }: { row: ProviderRowInfo }) {
   const nav = useNav();
-  const update = useConnections((s) => s.update);
-  const move = useConnections((s) => s.move);
-  const test = useConnections((s) => s.test);
-  const [testing, setTesting] = useState(false);
-
-  const open = () => nav.navigate({ kind: "connectionDetail", id: conn.id });
-
-  const runTest = async () => {
-    setTesting(true);
-    const result = await test(conn.id);
-    setTesting(false);
-    if (result) {
-      if (result.ok) toast.success(result.message);
-      else toast.error(result.message);
-    }
-  };
+  const open = () => nav.navigate({ kind: "providerDetail", provider: row.id });
+  const activeCount = row.accounts.filter((account) => account.enabled).length;
+  const modelText = modelLabel(row.modelCount, row.accounts.length === 0);
 
   return (
-    <div className="flex items-center gap-3 border-b border-border px-[18px] py-3.5 last:border-b-0">
-      <div className="flex shrink-0 flex-col items-center gap-px">
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          title="Move up"
-          onClick={() => void move(conn.id, -1)}
-          className={`h-[15px] w-5 text-muted-foreground hover:bg-transparent hover:text-foreground dark:hover:bg-transparent ${index === 0 ? "invisible" : ""}`}
-        >
-          <ChevronUp aria-hidden size={11} strokeWidth={2.5} className="size-[11px]" />
-        </Button>
-        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-muted font-mono text-[10.5px] font-semibold text-muted-foreground">
-          {index + 1}
+    <Button
+      variant="ghost"
+      aria-label={`${row.name} ${accountLabel(row.accounts.length)} ${modelText}`}
+      onClick={open}
+      className="h-auto w-full justify-start gap-3 rounded-none border-b border-border px-[18px] py-3.5 text-left last:border-b-0"
+    >
+      <Chip initial={row.initial} color={row.color} size={34} />
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+          {row.name}
+          {activeCount > 0 && <Pill variant="primary">{activeCount} active</Pill>}
         </span>
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          title="Move down"
-          onClick={() => void move(conn.id, 1)}
-          className={`h-[15px] w-5 text-muted-foreground hover:bg-transparent hover:text-foreground dark:hover:bg-transparent ${index === count - 1 ? "invisible" : ""}`}
-        >
-          <ChevronDown aria-hidden size={11} strokeWidth={2.5} className="size-[11px]" />
-        </Button>
-      </div>
-      <Chip initial={conn.initial} color={conn.color} size={34} onClick={open} />
-      <Button
-        variant="ghost"
-        onClick={open}
-        className="h-auto min-w-0 flex-1 flex-col items-start gap-0 whitespace-normal p-0 text-left font-normal"
-      >
-        <span className="block text-sm font-semibold text-foreground">{conn.label || conn.providerName}</span>
-        <span className="block text-xs text-muted-foreground">
-          {conn.providerName} · {conn.keyMasked ?? "no key"} · {conn.models.length} model{conn.models.length === 1 ? "" : "s"}
+        <span className="block text-xs font-normal text-muted-foreground">
+          {accountLabel(row.accounts.length)} · {modelText}
+          {row.accounts.length === 0 ? ` · ${row.category.replace("_", " ")}` : ""}
         </span>
-      </Button>
-      <Switch
-        on={conn.enabled}
-        onToggle={() =>
-          void update(conn.id, {
-            label: conn.label,
-            enabled: !conn.enabled,
-            apiKey: null,
-            baseUrl: conn.baseUrl,
-            models: conn.models,
-          })
-        }
-        label="Enabled"
-      />
-      <Button variant="outline" size="sm" onClick={() => void runTest()} disabled={testing}>
-        {testing ? "Testing…" : "Test"}
-      </Button>
-      <Button variant="ghost" size="icon-sm" title="Details" onClick={open} className="text-muted-foreground">
-        <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5" />
-      </Button>
-    </div>
+      </span>
+      <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5 text-muted-foreground" />
+    </Button>
   );
 }
 
 function ProvidersTab({ onAdd }: { onAdd: () => void }) {
-  const { connections, loaded } = useConnections();
+  const { catalog, connections, loaded } = useConnections();
+  const rows = useMemo(() => buildProviderRows(catalog, connections), [catalog, connections]);
 
   return (
     <div className="flex flex-col gap-3">
-      {connections.length > 0 && (
+      {loaded && (
+        <div className="flex justify-end">
+          <Button onClick={onAdd}>
+            <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+            Add connection
+          </Button>
+        </div>
+      )}
+      {rows.length > 0 && (
         <Card>
-          {connections.map((c, i) => (
-            <ConnectionRow key={c.id} conn={c} index={i} count={connections.length} />
+          {rows.map((row) => (
+            <ProviderRow key={row.id} row={row} />
           ))}
         </Card>
       )}
-      {loaded && connections.length === 0 && (
-        <div className="py-8 text-center text-[13px] text-muted-foreground">
-          No connections yet. Add a provider connection to route models through Ryuzi.
+      {loaded && rows.length === 0 && (
+        <div className="py-8 text-center text-[13px] text-muted-foreground">No providers in the catalog yet.</div>
+      )}
+    </div>
+  );
+}
+
+function strategyLabel(strategy: ModelRouteStrategy): string {
+  return strategy === "round-robin" ? "Round robin" : "By order";
+}
+
+function routeTargetOptions(connections: ConnectionInfo[]): TargetOption[] {
+  return connections.flatMap((conn) =>
+    conn.models.map((model) => ({
+      key: `${conn.id}::${model}`,
+      connectionId: conn.id,
+      model,
+      providerName: conn.providerName,
+      accountLabel: conn.label || conn.providerName,
+      enabled: conn.enabled,
+    })),
+  );
+}
+
+function newRoute(targets: TargetOption[]): ModelRouteInfo {
+  const first = targets[0];
+  return {
+    id: "",
+    name: "",
+    enabled: true,
+    strategy: "fallback",
+    targets: first ? [{ connectionId: first.connectionId, model: first.model }] : [],
+    createdAt: 0,
+    updatedAt: 0,
+  };
+}
+
+function targetKey(target: { connectionId: string; model: string }): string {
+  return `${target.connectionId}::${target.model}`;
+}
+
+function RouteForm({
+  value,
+  targetOptions,
+  saving,
+  onCancel,
+  onSave,
+}: {
+  value: ModelRouteInfo;
+  targetOptions: TargetOption[];
+  saving: boolean;
+  onCancel: () => void;
+  onSave: (route: ModelRouteInfo) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+
+  useEffect(() => {
+    setDraft(value);
+  }, [value]);
+
+  const setTarget = (index: number, key: string) => {
+    const option = targetOptions.find((target) => target.key === key);
+    if (!option) return;
+    setDraft((current) => ({
+      ...current,
+      targets: current.targets.map((target, i) => (i === index ? { connectionId: option.connectionId, model: option.model } : target)),
+    }));
+  };
+
+  const addTarget = () => {
+    const option = targetOptions[0];
+    if (!option) return;
+    setDraft((current) => ({
+      ...current,
+      targets: [...current.targets, { connectionId: option.connectionId, model: option.model }],
+    }));
+  };
+
+  const removeTarget = (index: number) => {
+    setDraft((current) => ({ ...current, targets: current.targets.filter((_, i) => i !== index) }));
+  };
+  const moveTarget = (index: number, dir: -1 | 1) => {
+    setDraft((current) => {
+      const nextIndex = index + dir;
+      if (nextIndex < 0 || nextIndex >= current.targets.length) return current;
+      const targets = [...current.targets];
+      [targets[index], targets[nextIndex]] = [targets[nextIndex], targets[index]];
+      return { ...current, targets };
+    });
+  };
+
+  const canSave = draft.name.trim().length > 0 && draft.targets.length > 0 && targetOptions.length > 0;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{draft.id ? "Edit route" : "New route"}</CardTitle>
+        <CardHint>Expose a combo-style model id backed by ordered targets</CardHint>
+      </CardHeader>
+      <CardRow>
+        <span className="w-24 shrink-0 text-[13px] font-medium">Model id</span>
+        <Input
+          value={draft.name}
+          onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
+          placeholder="smart"
+          className="flex-1 font-mono"
+        />
+      </CardRow>
+      <CardRow>
+        <span className="w-24 shrink-0 text-[13px] font-medium">Strategy</span>
+        <NativeSelect
+          value={draft.strategy}
+          onChange={(event) => setDraft((current) => ({ ...current, strategy: event.target.value as ModelRouteStrategy }))}
+          className="max-w-[180px]"
+        >
+          <option value="fallback">By order</option>
+          <option value="round-robin">Round robin</option>
+        </NativeSelect>
+        <span className="min-w-0 flex-1 text-xs text-muted-foreground">Fallback and capability auto-switch are automatic.</span>
+      </CardRow>
+      <div className="border-b border-border px-[18px] py-3">
+        <div className="mb-2 text-[13px] font-medium">Targets</div>
+        <div className="flex flex-col gap-2">
+          {draft.targets.map((target, index) => (
+            <div key={`${index}-${targetKey(target)}`} className="flex items-center gap-2">
+              <NativeSelect value={targetKey(target)} onChange={(event) => setTarget(index, event.target.value)} className="min-w-0 flex-1">
+                {targetOptions.map((option) => (
+                  <option key={option.key} value={option.key}>
+                    {option.providerName} / {option.model} ({option.accountLabel}
+                    {option.enabled ? "" : ", disabled"})
+                  </option>
+                ))}
+              </NativeSelect>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                title="Move target up"
+                onClick={() => moveTarget(index, -1)}
+                disabled={index === 0}
+                className="text-muted-foreground"
+              >
+                <ArrowUp aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                title="Move target down"
+                onClick={() => moveTarget(index, 1)}
+                disabled={index === draft.targets.length - 1}
+                className="text-muted-foreground"
+              >
+                <ArrowDown aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                title="Remove target"
+                onClick={() => removeTarget(index)}
+                disabled={draft.targets.length === 1}
+                className="text-muted-foreground"
+              >
+                <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+              </Button>
+            </div>
+          ))}
+        </div>
+        <Button variant="outline" size="sm" onClick={addTarget} disabled={targetOptions.length === 0} className="mt-2">
+          <Plus aria-hidden size={13} strokeWidth={2} className="size-3.5" />
+          Add target
+        </Button>
+      </div>
+      <div className="flex justify-end gap-2 px-[18px] py-3">
+        <Button variant="ghost" onClick={onCancel} className="text-muted-foreground">
+          Cancel
+        </Button>
+        <Button onClick={() => onSave(draft)} disabled={!canSave || saving}>
+          {saving ? "Saving…" : "Save route"}
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
+function RouteTargetPill({ target, connections }: { target: { connectionId: string; model: string }; connections: ConnectionInfo[] }) {
+  const conn = connections.find((c) => c.id === target.connectionId);
+  return (
+    <span className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-md bg-muted px-2 py-1 font-mono text-[11.5px] text-muted-foreground">
+      <span className="truncate">
+        {conn?.providerName ?? "Missing"} / {target.model}
+      </span>
+      {conn && conn.label !== conn.providerName && <span className="truncate text-[10.5px] opacity-75">({conn.label})</span>}
+      <ModelCapabilityIcons model={target.model} compact />
+    </span>
+  );
+}
+
+function RouteCard({
+  route,
+  connections,
+  onEdit,
+  onDelete,
+}: {
+  route: ModelRouteInfo;
+  connections: ConnectionInfo[];
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const copyName = () => {
+    void navigator.clipboard.writeText(route.name);
+    toast.success("Copied");
+  };
+
+  return (
+    <Card>
+      <div className="flex items-start gap-3 px-[18px] py-3.5">
+        <Chip initial="R" color="#0EA5E9" size={34} mono />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <span className="truncate font-mono text-sm font-semibold text-foreground">{route.name}</span>
+            <Pill variant={route.enabled ? "primary" : "secondary"}>{route.enabled ? "Enabled" : "Disabled"}</Pill>
+            <span className="text-xs text-muted-foreground">{strategyLabel(route.strategy)}</span>
+          </div>
+          <div className="mt-2 flex min-w-0 flex-wrap gap-1.5">
+            {route.targets.map((target, index) => (
+              <RouteTargetPill key={`${route.id}-${index}-${targetKey(target)}`} target={target} connections={connections} />
+            ))}
+          </div>
+        </div>
+        <Button variant="ghost" size="icon-sm" title="Copy model id" onClick={copyName} className="text-muted-foreground">
+          <Copy aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+        </Button>
+        <Button variant="outline" size="sm" onClick={onEdit}>
+          Edit
+        </Button>
+        <Button variant="ghost" size="icon-sm" title="Delete route" onClick={onDelete} className="text-destructive hover:text-destructive">
+          <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
+function RouteTab() {
+  const { routes, loaded, hydrate, save, remove } = useModelRoutes();
+  const connections = useConnections((s) => s.connections);
+  const [editing, setEditing] = useState<ModelRouteInfo | null>(null);
+  const [saving, setSaving] = useState(false);
+  const targets = useMemo(() => routeTargetOptions(connections), [connections]);
+
+  useEffect(() => {
+    if (!loaded) void hydrate();
+  }, [loaded, hydrate]);
+
+  const beginNew = () => setEditing(newRoute(targets));
+  const saveRoute = async (route: ModelRouteInfo) => {
+    setSaving(true);
+    const ok = await save(route);
+    setSaving(false);
+    if (ok) setEditing(null);
+  };
+  const deleteRoute = async (route: ModelRouteInfo) => {
+    if (!window.confirm(`Delete route "${route.name}"?`)) return;
+    await remove(route.id);
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      {editing ? (
+        <RouteForm
+          value={editing}
+          targetOptions={targets}
+          saving={saving}
+          onCancel={() => setEditing(null)}
+          onSave={(route) => void saveRoute(route)}
+        />
+      ) : (
+        <div className="flex justify-end">
+          <Button onClick={beginNew} disabled={targets.length === 0}>
+            <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+            New route
+          </Button>
         </div>
       )}
-      {loaded && (
-        <Button
-          variant="ghost"
-          onClick={onAdd}
-          className="h-auto w-full justify-start gap-3 rounded-xl border-dashed border-border px-[18px] py-[15px] text-muted-foreground"
-        >
-          <Plus aria-hidden size={16} strokeWidth={2} />
-          Add connection
-        </Button>
+      {routes.map((route) => (
+        <RouteCard
+          key={route.id}
+          route={route}
+          connections={connections}
+          onEdit={() => setEditing(route)}
+          onDelete={() => void deleteRoute(route)}
+        />
+      ))}
+      {loaded && routes.length === 0 && !editing && (
+        <div className="py-8 text-center text-[13px] text-muted-foreground">
+          No routes yet. Create a route alias to expose a combo-style model.
+        </div>
       )}
     </div>
   );
 }
 
 export function ModelsView() {
-  const [tab, setTab] = useState<Tab>("endpoint");
+  const [tab, setTab] = useState<Tab>("providers");
   const [addOpen, setAddOpen] = useState(false);
   const { loaded: endpointLoaded, hydrate: hydrateEndpoint } = useEndpoint();
   const { loaded: connectionsLoaded, hydrate: hydrateConnections } = useConnections();
+  const { loaded: routesLoaded, hydrate: hydrateRoutes } = useModelRoutes();
 
   useEffect(() => {
     if (!endpointLoaded) void hydrateEndpoint();
@@ -318,6 +631,9 @@ export function ModelsView() {
   useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
   }, [connectionsLoaded, hydrateConnections]);
+  useEffect(() => {
+    if (!routesLoaded) void hydrateRoutes();
+  }, [routesLoaded, hydrateRoutes]);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
@@ -329,15 +645,18 @@ export function ModelsView() {
           </div>
           <Segmented
             options={[
+              { id: "providers", label: "Providers" },
+              { id: "route", label: "Route" },
               { id: "endpoint", label: "Endpoint" },
-              { id: "connections", label: "Providers" },
             ]}
             value={tab}
             onChange={setTab}
           />
         </div>
 
-        {tab === "endpoint" ? <EndpointTab /> : <ProvidersTab onAdd={() => setAddOpen(true)} />}
+        {tab === "providers" && <ProvidersTab onAdd={() => setAddOpen(true)} />}
+        {tab === "route" && <RouteTab />}
+        {tab === "endpoint" && <EndpointTab />}
       </div>
       <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} />
     </div>
