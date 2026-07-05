@@ -7,5 +7,6 @@ pub mod doctor;
 pub mod meta;
 pub mod paint;
 pub mod run_cmd;
+pub mod serve_cmd;
 pub mod sidecar_host;
 pub mod tui;

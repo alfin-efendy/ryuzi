@@ -18,6 +18,7 @@ pub fn help_text() -> String {
         "  doctor             check your environment (git, claude, settings)",
         "  run                one-shot session:",
         "                     ryuzi run --dir <repo> --prompt <text> [--harness native|claude-code] [--model x] [--effort y] [--mode m]",
+        "  serve              run the HTTP surface (GET /health,/sessions,/events; POST /sessions/:pk/prompt) [--port N]",
     ]
     .join("\n")
 }

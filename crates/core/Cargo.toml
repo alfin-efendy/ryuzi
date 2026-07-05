@@ -42,7 +42,7 @@ chrono.workspace = true
 axum = "0.8"
 reqwest = { workspace = true, default-features = true, features = ["json", "stream"] }
 bytes = "1"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 # Native agent runtime (harness/native): file-name globbing, gitignore-aware
 # walking, ripgrep-style content search, and edit diffs.
 globset.workspace = true
