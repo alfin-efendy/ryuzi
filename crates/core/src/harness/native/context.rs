@@ -52,6 +52,11 @@ pub fn assemble_system(work_dir: &Path) -> String {
         push_if_present(&mut sections, &dir.join("CLAUDE.md"));
     }
 
+    // Available skills (names + descriptions only; bodies load via the tool).
+    if let Some(guidance) = super::skills::SkillRegistry::load(work_dir).guidance() {
+        sections.push(guidance);
+    }
+
     sections.join("\n\n")
 }
 

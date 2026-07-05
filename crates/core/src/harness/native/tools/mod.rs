@@ -24,6 +24,7 @@ pub mod grep;
 pub mod ls;
 pub mod mcp;
 pub mod read;
+pub mod skill;
 pub mod task;
 pub mod todo;
 pub mod webfetch;
@@ -162,6 +163,7 @@ impl ToolRegistry {
             Arc::new(todo::TodoRead),
             Arc::new(webfetch::WebFetch),
             Arc::new(websearch::WebSearch),
+            Arc::new(skill::SkillTool),
             Arc::new(task::Task),
         ];
         let mut tools = BTreeMap::new();
@@ -318,12 +320,13 @@ mod tests {
             "todoread",
             "webfetch",
             "websearch",
+            "skill",
             "task",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 12);
+        assert_eq!(defs.len(), 13);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

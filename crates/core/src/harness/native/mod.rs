@@ -20,6 +20,7 @@ pub mod llm;
 pub mod mcp_client;
 pub mod permission;
 pub mod runner;
+pub mod skills;
 pub mod tools;
 
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
