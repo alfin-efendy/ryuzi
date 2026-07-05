@@ -298,6 +298,36 @@ fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (session_pk, pos)\
             );",
         ),
+        // Orchestration & heartbeat hardening
+        // (design: docs/design/2026-07-05-native-orchestration-memory-design.md).
+        // jobs.pre_check = optional wake-gate command run before a scheduled
+        // job wakes the agent (empty stdout / non-zero exit skips the fire).
+        // orch_tasks/orch_task_deps = the auto-decomposition task graph the
+        // orch dispatcher drives (roots have root_id NULL; deps gate
+        // todo→ready promotion).
+        M::up(
+            "ALTER TABLE jobs ADD COLUMN pre_check TEXT NOT NULL DEFAULT '';\
+            CREATE TABLE orch_tasks (\
+                id TEXT PRIMARY KEY,\
+                root_id TEXT,\
+                project_id TEXT NOT NULL,\
+                title TEXT NOT NULL,\
+                body TEXT NOT NULL,\
+                agent TEXT NOT NULL DEFAULT '',\
+                status TEXT NOT NULL DEFAULT 'todo',\
+                session_pk TEXT,\
+                result TEXT,\
+                error TEXT,\
+                created_at INTEGER,\
+                finished_at INTEGER\
+            );\
+            CREATE INDEX idx_orch_tasks_root ON orch_tasks(root_id, status);\
+            CREATE TABLE orch_task_deps (\
+                task_id TEXT NOT NULL,\
+                dep_id TEXT NOT NULL,\
+                PRIMARY KEY (task_id, dep_id)\
+            );",
+        ),
     ])
 }
 
@@ -1287,6 +1317,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn migration_11_adds_pre_check_and_orch_task_graph() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .with_conn(|c| {
+                // jobs.pre_check exists with an empty default.
+                let has_pre_check: bool = c
+                    .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='pre_check'")?
+                    .exists([])?;
+                assert!(has_pre_check, "jobs.pre_check column");
+                // orch task graph roundtrips.
+                c.execute(
+                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, created_at) \
+                     VALUES ('t1', NULL, 'p1', 'root goal', 'do it', 1)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, created_at) \
+                     VALUES ('t2', 't1', 'p1', 'child', 'step one', 2)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO orch_task_deps(task_id, dep_id) VALUES ('t2', 't1')",
+                    [],
+                )?;
+                let status: String =
+                    c.query_row("SELECT status FROM orch_tasks WHERE id='t2'", [], |r| {
+                        r.get(0)
+                    })?;
+                assert_eq!(status, "todo", "default status");
+                let deps: i64 =
+                    c.query_row("SELECT count(*) FROM orch_task_deps", [], |r| r.get(0))?;
+                assert_eq!(deps, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
