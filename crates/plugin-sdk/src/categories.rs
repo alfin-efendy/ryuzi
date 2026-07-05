@@ -26,3 +26,30 @@ pub const KNOWN: &[&str] = &[
     "deploy",
     "communication",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn known_has_exactly_eighteen_entries() {
+        assert_eq!(KNOWN.len(), 18);
+    }
+
+    #[test]
+    fn known_has_no_duplicates() {
+        let unique: HashSet<&&str> = KNOWN.iter().collect();
+        assert_eq!(unique.len(), KNOWN.len());
+    }
+
+    #[test]
+    fn known_entries_are_kebab_case() {
+        for category in KNOWN {
+            assert!(
+                category.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                "category {category:?} is not kebab-case"
+            );
+        }
+    }
+}
