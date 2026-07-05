@@ -98,7 +98,50 @@ pub async fn run_turn(
         cancel: cancel.clone(),
     });
     drive(deps, &agent, &mut ledger, &cancel, Some(spawn), true).await?;
+
+    // 4. Best-effort: give a fresh session a generated title.
+    maybe_generate_title(deps, &prompt.display).await;
     Ok(())
+}
+
+/// If this session has no title yet, generate a terse one from the first
+/// prompt via a short non-streaming model call. Best-effort: any failure is
+/// swallowed so it never affects the turn's outcome.
+async fn maybe_generate_title(deps: &RunnerDeps, first_prompt: &str) {
+    match deps.store.get_session(&deps.session_pk).await {
+        Ok(Some(session)) if session.title.is_none() => {}
+        _ => return, // no session row, or already titled
+    }
+    let model = deps.model.clone().unwrap_or_default();
+    if model.is_empty() {
+        return;
+    }
+    let body = json!({
+        "model": model,
+        "max_tokens": 32,
+        "system": "Generate a terse 3-6 word title (no quotes, no trailing punctuation) \
+                   for a coding session that begins with the user's request. \
+                   Reply with ONLY the title.",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": first_prompt}]}],
+        "stream": true,
+    });
+    let Ok(mut rx) = deps.llm.stream(body).await else {
+        return;
+    };
+    let mut title = String::new();
+    while let Some(item) = rx.recv().await {
+        if let Ok(ev) = item {
+            if let Some(MessageStreamEvent::TextDelta { text, .. }) =
+                MessageStreamEvent::from_event(&ev)
+            {
+                title.push_str(&text);
+            }
+        }
+    }
+    let title: String = title.trim().trim_matches('"').chars().take(80).collect();
+    if !title.is_empty() {
+        let _ = deps.store.set_session_title(&deps.session_pk, &title).await;
+    }
 }
 
 /// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
@@ -835,6 +878,71 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.block_type == "text" && m.payload["text"] == "all set"));
+    }
+
+    #[tokio::test]
+    async fn generates_a_title_for_a_fresh_session() {
+        use crate::domain::{Project, Session, SessionStatus};
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 0: the actual reply. Turn 1: the title generation.
+        let main = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let title = vec![
+            text_delta("Fix the "),
+            text_delta("login bug"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![main, title]));
+        let deps = deps_at(dir.path(), llm).await;
+        // A session row must exist (and be untitled) for title generation.
+        deps.store
+            .insert_project(Project {
+                project_id: "p".into(),
+                name: "p".into(),
+                workdir: dir.path().to_string_lossy().into(),
+                source: None,
+                harness: "native".into(),
+                model: None,
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: Some(0),
+            })
+            .await
+            .unwrap();
+        deps.store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: "p".into(),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Running,
+                started_by: None,
+                created_at: Some(0),
+                last_active: Some(0),
+                resume_attempts: 0,
+            })
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                agent: "fix login".into(),
+                display: "fix login".into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let session = deps.store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(session.title.as_deref(), Some("Fix the login bug"));
     }
 
     #[tokio::test]

@@ -530,6 +530,20 @@ impl Store {
         .await
     }
 
+    /// Set a session's title (used by the native runtime's title generation).
+    pub async fn set_session_title(&self, pk: &str, title: &str) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let title = title.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET title=?2 WHERE session_pk=?1",
+                params![pk, title],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
     /// List sessions in a given status, oldest-first — used by `reconcile` on
     /// daemon boot to find sessions a dead process left in `Running`.
     pub async fn list_sessions_by_status(
