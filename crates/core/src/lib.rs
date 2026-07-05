@@ -11,6 +11,7 @@ pub mod gateways;
 pub mod harness;
 pub mod llm_router;
 pub mod mcp;
+pub mod orch;
 pub mod paths;
 pub mod plugins;
 pub mod policy;

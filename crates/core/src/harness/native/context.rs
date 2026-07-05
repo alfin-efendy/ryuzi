@@ -22,11 +22,17 @@ for new files or full rewrites.
 - When the task is complete, stop and summarize what you did. Do not ask for \
 confirmation to proceed with reversible work.";
 
-/// Assemble the system prompt for a session rooted at `work_dir`. `extra_skill_dirs`
-/// (plugin-bundled skill directories — see
+/// Assemble the system prompt for a session rooted at `work_dir`.
+/// `extra_skill_dirs` (plugin-bundled skill directories — see
 /// `crate::plugins::PluginHost::enabled_skill_dirs`) are folded into the
-/// discovered skill set alongside the worktree/global ones.
-pub fn assemble_system(work_dir: &Path, extra_skill_dirs: &[std::path::PathBuf]) -> String {
+/// discovered skill set alongside the worktree/global ones. `memory` is the
+/// persistent-memory snapshot to inject (primary agents on the assembled
+/// prompt only — agents with custom prompts and sub-agents run memoryless).
+pub fn assemble_system(
+    work_dir: &Path,
+    extra_skill_dirs: &[std::path::PathBuf],
+    memory: Option<&str>,
+) -> String {
     let mut sections: Vec<String> = vec![BASE_PROMPT.to_string()];
 
     // Environment facts.
@@ -55,6 +61,15 @@ pub fn assemble_system(work_dir: &Path, extra_skill_dirs: &[std::path::PathBuf])
         push_if_present(&mut sections, &dir.join("CLAUDE.md"));
     }
 
+    // Persistent memory snapshot (before skills so remembered conventions
+    // precede tooling hints).
+    if let Some(mem) = memory {
+        let mem = mem.trim();
+        if !mem.is_empty() {
+            sections.push(mem.to_string());
+        }
+    }
+
     // Available skills (names + descriptions only; bodies load via the tool).
     if let Some(guidance) =
         super::skills::SkillRegistry::load_with(work_dir, extra_skill_dirs).guidance()
@@ -81,7 +96,7 @@ mod tests {
     #[test]
     fn includes_base_prompt_and_environment() {
         let dir = tempfile::tempdir().unwrap();
-        let sys = assemble_system(dir.path(), &[]);
+        let sys = assemble_system(dir.path(), &[], None);
         assert!(sys.contains("You are ryuzi"));
         assert!(sys.contains("Working directory"));
         assert!(sys.contains(&dir.path().display().to_string()));
@@ -91,8 +106,23 @@ mod tests {
     fn includes_project_agents_md() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "Follow the house style.").unwrap();
-        let sys = assemble_system(dir.path(), &[]);
+        let sys = assemble_system(dir.path(), &[], None);
         assert!(sys.contains("Follow the house style."));
         assert!(sys.contains("Instructions from"));
+    }
+
+    #[test]
+    fn injects_memory_snapshot_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = assemble_system(
+            dir.path(),
+            &[],
+            Some("# Persistent memory (global) [1% full — 11/6000 chars]\nglobal fact"),
+        );
+        assert!(sys.contains("# Persistent memory (global)"));
+        assert!(sys.contains("global fact"));
+        // Empty snapshots add nothing.
+        let sys = assemble_system(dir.path(), &[], Some("   "));
+        assert!(!sys.contains("Persistent memory"));
     }
 }

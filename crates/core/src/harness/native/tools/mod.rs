@@ -24,6 +24,7 @@ pub mod grep;
 pub mod ls;
 pub mod lsp;
 pub mod mcp;
+pub mod memory;
 pub mod read;
 pub mod revert;
 pub mod skill;
@@ -49,14 +50,70 @@ impl Default for OutputCaps {
     }
 }
 
-/// Spawns a sub-agent for the `task` tool. Implemented by the runner; `None`
-/// inside a sub-agent's own `ToolCtx` (sub-agents cannot nest further).
+/// One delegated subtask in a `task` batch.
+#[derive(Debug, Clone)]
+pub struct SubtaskSpec {
+    pub agent_type: String,
+    pub prompt: String,
+}
+
+/// How one delegated subtask ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtaskStatus {
+    Completed,
+    Error,
+    Interrupted,
+}
+
+impl SubtaskStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubtaskStatus::Completed => "completed",
+            SubtaskStatus::Error => "error",
+            SubtaskStatus::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// Outcome of one delegated subtask, ordered by `index` within its batch.
+#[derive(Debug, Clone)]
+pub struct SubtaskResult {
+    pub index: usize,
+    pub agent_type: String,
+    pub status: SubtaskStatus,
+    pub report: String,
+}
+
+/// Spawns sub-agents for the `task` tool. Implemented by the runner; `None`
+/// inside a sub-agent's own `ToolCtx` unless that agent may delegate.
 #[async_trait]
 pub trait SubagentSpawner: Send + Sync {
-    /// Run `agent_type` on `prompt` to completion and return its final text.
-    async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String>;
+    /// Run a batch of subtasks concurrently (bounded by the
+    /// `max_concurrent_runs` setting) and return one result per spec, ordered
+    /// by index. Individual failures land in their entry — the batch itself
+    /// never fails.
+    async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult>;
     /// Names of agents that may be spawned (for the tool description/errors).
     fn available(&self) -> Vec<String>;
+
+    /// Run one `agent_type` on `prompt` to completion and return its final
+    /// text — the single-task view over [`Self::run_many`].
+    async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String> {
+        let mut results = self
+            .run_many(vec![SubtaskSpec {
+                agent_type: agent_type.to_string(),
+                prompt: prompt.to_string(),
+            }])
+            .await;
+        let r = results
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("spawner returned no result"))?;
+        match r.status {
+            SubtaskStatus::Completed => Ok(r.report),
+            SubtaskStatus::Interrupted => anyhow::bail!("interrupted"),
+            SubtaskStatus::Error => anyhow::bail!("{}", r.report),
+        }
+    }
 }
 
 /// Everything a tool needs to run one call.
@@ -73,6 +130,8 @@ pub struct ToolCtx {
     pub caps: OutputCaps,
     /// Sub-agent spawner for the `task` tool; `None` disables spawning.
     pub spawn: Option<Arc<dyn SubagentSpawner>>,
+    /// Persistent memory for the `memory` tool; `None` for sub-agents.
+    pub memory: Option<Arc<crate::harness::native::memory::MemoryStore>>,
     /// Stack of worktree snapshot SHAs for the `revert` tool (most recent last).
     pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
@@ -172,6 +231,7 @@ impl ToolRegistry {
             Arc::new(webfetch::WebFetch),
             Arc::new(websearch::WebSearch),
             Arc::new(skill::SkillTool),
+            Arc::new(memory::MemoryTool),
             Arc::new(revert::Revert),
             Arc::new(lsp::Lsp),
             Arc::new(task::Task),
@@ -270,6 +330,7 @@ pub(crate) mod testutil {
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),
             spawn: None,
+            memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
@@ -333,6 +394,7 @@ mod tests {
             "webfetch",
             "websearch",
             "skill",
+            "memory",
             "revert",
             "lsp",
             "task",
@@ -340,7 +402,7 @@ mod tests {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 15);
+        assert_eq!(defs.len(), 16);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

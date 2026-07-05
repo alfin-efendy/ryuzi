@@ -1,5 +1,6 @@
 ---
 source: crates/cli/src/tui/render.rs
+assertion_line: 765
 expression: text
 ---
 
@@ -17,7 +18,7 @@ expression: text
  │   Approver role IDs                (unset)                                 │
  │   OTel endpoint                    (unset)                                 │
  │   Max concurrent runs              3                                       │
- │   Max sub-agent spawn depth        2                                       │
+ │   Max sub-agent spawn depth        1                                       │
  │   Approval timeout (ms)            300000                                  │
  │   Attachment max bytes             26214400                                │
  │   Attachment max count             10                                      │

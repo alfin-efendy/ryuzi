@@ -71,11 +71,24 @@ pub struct Agent {
     /// Custom system prompt; `None` uses the runtime's assembled prompt.
     pub prompt: Option<String>,
     pub tools: ToolFilter,
+    /// Whether this agent, when spawned as a sub-agent, may itself delegate
+    /// via the `task` tool (subject to the `max_spawn_depth` setting).
+    /// Frontmatter key: `delegate: true`.
+    pub can_delegate: bool,
     /// Built-in agents cannot be removed by config.
     pub builtin: bool,
 }
 
 const READ_ONLY_TOOLS: &[&str] = &["read", "ls", "glob", "grep", "webfetch", "todoread"];
+
+const ORCHESTRATOR_PROMPT: &str = "\
+You are an orchestrator sub-agent. Break the given goal into 2-6 \
+self-contained subtasks and run them with the `task` tool — use the batch \
+form (`tasks: [...]`) for independent subtasks so they run in parallel, and \
+sequential single calls when one subtask feeds the next. Sub-agents cannot \
+see your conversation, so every prompt must carry all needed context. Do small \
+connective work yourself instead of delegating it. Finish with one \
+synthesized report of what was done, found, or failed.";
 
 fn builtin_agents() -> Vec<Agent> {
     vec![
@@ -85,6 +98,7 @@ fn builtin_agents() -> Vec<Agent> {
             mode: AgentMode::Primary,
             prompt: None,
             tools: ToolFilter::All,
+            can_delegate: false,
             builtin: true,
         },
         Agent {
@@ -99,6 +113,7 @@ fn builtin_agents() -> Vec<Agent> {
                     .into(),
             ),
             tools: ToolFilter::Only(READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect()),
+            can_delegate: false,
             builtin: true,
         },
         Agent {
@@ -107,6 +122,7 @@ fn builtin_agents() -> Vec<Agent> {
             mode: AgentMode::Subagent,
             prompt: None,
             tools: ToolFilter::All,
+            can_delegate: false,
             builtin: true,
         },
         Agent {
@@ -124,6 +140,17 @@ fn builtin_agents() -> Vec<Agent> {
                     .map(|s| s.to_string())
                     .collect(),
             ),
+            can_delegate: false,
+            builtin: true,
+        },
+        Agent {
+            name: "orchestrator".into(),
+            description: "Coordinator sub-agent: decomposes a wide goal and runs task batches."
+                .into(),
+            mode: AgentMode::Subagent,
+            prompt: Some(ORCHESTRATOR_PROMPT.into()),
+            tools: ToolFilter::All,
+            can_delegate: true,
             builtin: true,
         },
     ]
@@ -213,16 +240,19 @@ fn read_agent_dir(dir: &Path) -> Vec<Agent> {
 }
 
 /// Parse a `--- key: value ---` frontmatter block plus a markdown body into an
-/// [`Agent`]. Recognized keys: `description`, `mode`, `tools` (comma list).
+/// [`Agent`]. Recognized keys: `description`, `mode`, `tools` (comma list),
+/// `delegate` (true|false).
 fn parse_agent_markdown(name: &str, text: &str) -> Agent {
     let (frontmatter, body) = split_frontmatter(text);
     let mut description = format!("Custom agent `{name}`");
     let mut mode = AgentMode::All;
     let mut tools = ToolFilter::All;
+    let mut can_delegate = false;
     for (key, value) in frontmatter {
         match key.as_str() {
             "description" => description = value,
             "mode" => mode = AgentMode::parse(&value),
+            "delegate" => can_delegate = value.trim().eq_ignore_ascii_case("true"),
             "tools" => {
                 let list: Vec<String> = value
                     .split(',')
@@ -243,6 +273,7 @@ fn parse_agent_markdown(name: &str, text: &str) -> Agent {
         mode,
         prompt: (!prompt.is_empty()).then(|| prompt.to_string()),
         tools,
+        can_delegate,
         builtin: false,
     }
 }
@@ -310,7 +341,34 @@ mod tests {
         assert!(a.tools.allows("read") && a.tools.allows("write"));
         assert!(!a.tools.allows("bash"));
         assert_eq!(a.prompt.as_deref(), Some("You write documentation."));
+        assert!(!a.can_delegate, "delegate defaults to false");
         assert!(!a.builtin);
+    }
+
+    #[test]
+    fn parse_delegate_frontmatter_flag() {
+        let a = parse_agent_markdown(
+            "lead",
+            "---\nmode: subagent\ndelegate: true\n---\nCoordinate the team.",
+        );
+        assert!(a.can_delegate);
+        let a = parse_agent_markdown("lead2", "---\ndelegate: nope\n---\nx");
+        assert!(!a.can_delegate);
+    }
+
+    #[test]
+    fn orchestrator_builtin_is_a_delegating_subagent() {
+        let reg = AgentRegistry::builtin();
+        let orch = reg.get("orchestrator").unwrap();
+        assert!(orch.mode.is_subagent());
+        assert!(!orch.mode.is_primary());
+        assert!(orch.can_delegate);
+        assert!(orch.tools.allows("task") && orch.tools.allows("bash"));
+        assert!(orch.prompt.as_deref().unwrap().contains("batch form"));
+        // No other builtin delegates.
+        for name in ["build", "plan", "general", "explore"] {
+            assert!(!reg.get(name).unwrap().can_delegate, "{name}");
+        }
     }
 
     #[test]

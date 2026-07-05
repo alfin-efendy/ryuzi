@@ -570,10 +570,10 @@ impl CanaryHost for ProdCanaryHost {
 /// `Daemon`/`UpdateManager` handle so whichever fires first wins and the
 /// other is a no-op.
 ///
-/// Unix-only: `tokio::signal::unix` does not exist on Windows, and this
-/// unconditional `use` broke `cargo check --workspace` on Windows dev
-/// machines. The daemon itself is unix-only (see README), so the Windows
-/// variant is a compile-shim no-op, not a feature.
+/// Unix-only: `tokio::signal::unix` does not exist on Windows, and an
+/// unconditional `use` used to break `cargo check --workspace` on Windows
+/// dev machines. The non-unix variant below drives the same teardown from
+/// `ctrl_c` instead.
 #[cfg(unix)]
 fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
     use tokio::signal::unix::{signal, SignalKind};
@@ -623,14 +623,28 @@ fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Ar
     });
 }
 
-/// Windows compile-shim: no SIGTERM/SIGINT to install (the daemon is
-/// unix-only; on Windows only `cargo check/test --workspace` reaches this).
+/// Non-unix (Windows): there is no SIGTERM; Ctrl-C / console-close both
+/// surface through `tokio::signal::ctrl_c`, driving the same
+/// [`shutdown_once`] teardown so a native Windows daemon still cleans up.
 #[cfg(not(unix))]
-fn install_signal_handlers(
-    _dir: PathBuf,
-    _daemon: Arc<Daemon>,
-    _updater: Option<Arc<UpdateManager>>,
-) {
+fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
+    let stopping = Arc::new(AtomicBool::new(false));
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_once(
+            &dir,
+            &stopping,
+            async {
+                if let Some(u) = &updater {
+                    u.stop();
+                }
+                daemon.stop().await;
+                Ok(())
+            },
+            |c| std::process::exit(c),
+        )
+        .await;
+    });
 }
 
 #[cfg(test)]

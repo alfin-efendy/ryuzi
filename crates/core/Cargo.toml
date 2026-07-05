@@ -61,6 +61,8 @@ grep-matcher.workspace = true
 grep-regex.workspace = true
 regex.workspace = true
 similar.workspace = true
+# Persistent memory (harness/native/memory): atomic file replacement.
+tempfile.workspace = true
 toml_edit = "0.22"
 opentelemetry = { version = "0.32.0", features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace", "metrics"], optional = true }
@@ -71,7 +73,6 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 libc = "0.2"
 
 [dev-dependencies]
-tempfile.workspace = true
 serial_test.workspace = true
 
 [features]

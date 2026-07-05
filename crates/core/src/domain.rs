@@ -306,6 +306,13 @@ pub enum CoreEvent {
         run_id: String,
         status: String,
     },
+    /// An orchestrated task changed status (todo|ready|running|done|failed|
+    /// cancelled; roots also decomposing|waiting|judging).
+    OrchTaskChanged {
+        task_id: String,
+        root_id: Option<String>,
+        status: String,
+    },
     /// A runtime npm install/update produced an output line.
     RuntimeUpdateLog {
         runtime_id: String,

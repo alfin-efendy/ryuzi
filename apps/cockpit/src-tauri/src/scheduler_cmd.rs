@@ -163,6 +163,8 @@ pub async fn create_job(cp: State<'_, Arc<ControlPlane>>, input: JobInput) -> R<
             prompt: input.prompt,
             notify_success: input.notify_success,
             notify_fail: input.notify_fail,
+            // Wake-gate editing lands with the scheduler panel rework.
+            pre_check: String::new(),
         },
     )
     .await?;
@@ -198,6 +200,7 @@ pub async fn update_job(
             prompt: input.prompt,
             notify_success: input.notify_success,
             notify_fail: input.notify_fail,
+            pre_check: existing.pre_check.clone(),
         },
     )
     .await?;

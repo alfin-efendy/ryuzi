@@ -298,8 +298,12 @@ fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (session_pk, pos)\
             );",
         ),
-        // Orchestration task graph. Keep this migration idempotent because some
-        // dev DBs already reached user_version 11 from a newer cockpit build.
+        // Orchestration task graph (design:
+        // docs/design/2026-07-05-native-orchestration-memory-design.md):
+        // the auto-decomposition graph the orch dispatcher drives (roots have
+        // root_id NULL; deps gate todo→ready promotion). Keep this migration
+        // idempotent because some dev DBs already reached user_version 11
+        // from a newer cockpit build.
         M::up(
             "CREATE TABLE IF NOT EXISTS orch_tasks (\
                 id TEXT PRIMARY KEY,\
@@ -322,6 +326,24 @@ fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (task_id, dep_id)\
             );",
         ),
+        // Heartbeat hardening: jobs.pre_check = optional wake-gate command
+        // run before a scheduled job wakes the agent (empty stdout /
+        // non-zero exit skips the fire). Hook-guarded (SQLite has no ADD
+        // COLUMN IF NOT EXISTS) because some dev DBs gained this column at
+        // user_version 11 from a pre-merge build — same story as the
+        // idempotent orch migration above.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let exists = tx
+                .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='pre_check'")?
+                .exists([])?;
+            if !exists {
+                tx.execute(
+                    "ALTER TABLE jobs ADD COLUMN pre_check TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -1314,20 +1336,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_11_creates_orchestration_tables() {
+    async fn migrations_11_12_add_orch_task_graph_and_pre_check() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
-        let counts = store
+        store
             .with_conn(|c| {
-                let tasks: i64 =
-                    c.query_row("SELECT count(*) FROM orch_tasks", [], |r| r.get(0))?;
+                // Migration 12: jobs.pre_check exists with an empty default.
+                let has_pre_check: bool = c
+                    .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='pre_check'")?
+                    .exists([])?;
+                assert!(has_pre_check, "jobs.pre_check column");
+                // Migration 11: the orch task graph roundtrips.
+                c.execute(
+                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, created_at) \
+                     VALUES ('t1', NULL, 'p1', 'root goal', 'do it', 1)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, created_at) \
+                     VALUES ('t2', 't1', 'p1', 'child', 'step one', 2)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO orch_task_deps(task_id, dep_id) VALUES ('t2', 't1')",
+                    [],
+                )?;
+                let status: String =
+                    c.query_row("SELECT status FROM orch_tasks WHERE id='t2'", [], |r| {
+                        r.get(0)
+                    })?;
+                assert_eq!(status, "todo", "default status");
                 let deps: i64 =
                     c.query_row("SELECT count(*) FROM orch_task_deps", [], |r| r.get(0))?;
-                Ok((tasks, deps))
+                assert_eq!(deps, 1);
+                Ok(())
             })
             .await
             .unwrap();
-        assert_eq!(counts, (0, 0));
     }
 
     #[tokio::test]
