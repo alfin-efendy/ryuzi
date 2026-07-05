@@ -6,17 +6,28 @@ import {
   CalendarClock,
   ChevronRight,
   ChevronsUpDown,
+  Cloud,
+  Cpu,
+  Database,
   Folder,
   FolderOpen,
   FolderPlus,
+  Globe,
   Grip,
+  Key,
   LayoutGrid,
   ListFilter,
+  Mail,
+  MessageCircle,
   Pencil,
   Pin,
   Plus,
+  Puzzle,
+  Search,
   Server,
   Settings,
+  Terminal,
+  Webhook,
 } from "lucide-react";
 import {
   Button,
@@ -31,6 +42,7 @@ import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
+import { usePlugins, sidebarPlugins } from "@/store-plugins";
 import { useTerms } from "@/store-terms";
 import { commands, type Session } from "@/bindings";
 import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
@@ -45,6 +57,30 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
   { label: "Apps", icon: LayoutGrid, view: { kind: "apps" }, group: ["apps", "appDetail", "registry"] },
   { label: "Settings", icon: Settings, view: { kind: "settings" }, group: ["settings"] },
 ];
+
+// Explicit manifest-icon → lucide map (no `import *` — keeps the bundle from
+// pulling in the whole icon set). Manifests are freeform strings; anything
+// outside this small known set — including the canonical `icon = "github"`
+// example from the plugin-sdk docs, since lucide-react dropped brand/logo
+// icons — falls through to the universal `Puzzle` fallback.
+const PLUGIN_ICONS: Record<string, typeof Puzzle> = {
+  "message-circle": MessageCircle,
+  terminal: Terminal,
+  cpu: Cpu,
+  globe: Globe,
+  database: Database,
+  search: Search,
+  cloud: Cloud,
+  server: Server,
+  webhook: Webhook,
+  key: Key,
+  mail: Mail,
+  bot: Bot,
+};
+
+function pluginIcon(icon: string | null): typeof Puzzle {
+  return (icon && PLUGIN_ICONS[icon]) || Puzzle;
+}
 
 // Layout-only overrides for the tiny ghost icon Buttons in tree rows.
 const iconBtn = "shrink-0 rounded-sm text-muted-foreground";
@@ -140,6 +176,12 @@ export function Sidebar() {
     if (!gatewaysLoaded) void hydrateGateways();
   }, [gatewaysLoaded, hydrateGateways]);
 
+  const { plugins, loaded: pluginsLoaded, load: loadPlugins } = usePlugins();
+  useEffect(() => {
+    if (!pluginsLoaded) void loadPlugins();
+  }, [pluginsLoaded, loadPlugins]);
+  const menuPlugins = sidebarPlugins(plugins);
+
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [showArchived, setShowArchived] = useState<Record<string, boolean>>({});
   const [archivedGlobal, setArchivedGlobal] = useState(false);
@@ -181,6 +223,31 @@ export function Sidebar() {
           );
         })}
       </div>
+
+      {/* Plugin-driven menu section — enabled catalog/user integrations only;
+          core builtins live in the fixed NAV list above. Hidden entirely
+          when no plugin qualifies so it never reserves empty space. */}
+      {menuPlugins.length > 0 && (
+        <div className="box-border flex w-[260px] flex-col gap-[2px] px-2.5 pb-1">
+          <div className="px-2.5 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Plugins</div>
+          {menuPlugins.map((plugin) => {
+            const active = view.kind === "pluginDetail" && view.id === plugin.id;
+            const Icon = pluginIcon(plugin.icon);
+            return (
+              <Button
+                key={plugin.id}
+                type="button"
+                variant="ghost"
+                onClick={() => nav.navigate({ kind: "pluginDetail", id: plugin.id })}
+                className={`h-auto w-full justify-start gap-2.5 rounded-md py-[7px] text-left text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground dark:hover:bg-sidebar-accent ${active ? "bg-sidebar-accent" : ""}`}
+              >
+                <Icon aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+                <span className="min-w-0 flex-1 truncate">{plugin.name}</span>
+              </Button>
+            );
+          })}
+        </div>
+      )}
 
       {/* Projects header */}
       <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-5 pr-3">

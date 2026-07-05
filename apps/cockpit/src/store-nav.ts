@@ -20,6 +20,7 @@ export type View =
   | { kind: "registry" }
   | { kind: "gateways" }
   | { kind: "gatewayDetail"; id: string }
+  | { kind: "pluginDetail"; id: string }
   | { kind: "settings" };
 
 export type RightTab = "review" | "file";
