@@ -373,10 +373,11 @@ impl ControlPlane {
     /// connector-capable plugin (`registries.plugins`). A DB-configured
     /// server (already in `mcp_servers`) wins over a plugin server with the
     /// same name — the plugin's entry is dropped rather than overriding it.
-    /// A connector that fails to enable or fails to resolve its servers
-    /// (e.g. missing auth) is logged via `tracing::warn!` and skipped: a
-    /// broken plugin integration must never prevent a session from
-    /// starting.
+    /// A connector that fails to enable, fails `ensure_auth` (e.g. missing
+    /// credential — logged with its friendly, secret-free message), or
+    /// fails to resolve its servers is logged via `tracing::warn!` and
+    /// skipped: a broken plugin integration must never prevent a session
+    /// from starting.
     async fn attach_plugin_mcp_servers(
         &self,
         project_id: &str,
@@ -404,6 +405,10 @@ impl ControlPlane {
                 work_dir: work_dir.to_path_buf(),
                 settings: settings.clone(),
             };
+            if let Err(e) = connector.ensure_auth(&ctx).await {
+                tracing::warn!(plugin = %id, "plugin connector not ready: {e}");
+                continue;
+            }
             match connector.mcp_servers(&ctx).await {
                 Ok(specs) => {
                     for spec in specs {

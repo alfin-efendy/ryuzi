@@ -102,7 +102,7 @@ async fn events(
 
 /// `GET /plugins` — every installed plugin as a compact summary (identity,
 /// categories, verification/experimental flags, computed capabilities, and
-/// current enablement). See [`plugin_summary`] and [`capabilities`].
+/// current enablement). See [`plugin_summary`] and [`CorePlugin::capabilities`].
 async fn list_plugins(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse {
     let settings = SettingsStore::new(cp.store().clone());
     let mut entries = Vec::new();
@@ -161,29 +161,8 @@ fn plugin_summary(plugin: &CorePlugin, enabled: bool) -> Value {
         "verified": m.verified,
         "experimental": m.experimental,
         "enabled": enabled,
-        "capabilities": capabilities(plugin),
+        "capabilities": plugin.capabilities(),
     })
-}
-
-/// Which of the four extension axes `plugin` advertises. `runtime` counts
-/// both a live `HarnessFactory` (native/claude-code) AND a manifest-only
-/// `RuntimeMeta` (a CLI-agent catalog entry with no in-process factory), per
-/// the same distinction `runtimes_meta` draws between the two.
-fn capabilities(plugin: &CorePlugin) -> Vec<&'static str> {
-    let mut caps = Vec::new();
-    if plugin.manifest.provider.is_some() {
-        caps.push("provider");
-    }
-    if plugin.harness.is_some() || plugin.manifest.runtime.is_some() {
-        caps.push("runtime");
-    }
-    if plugin.gateway.is_some() {
-        caps.push("gateway");
-    }
-    if plugin.connector.is_some() {
-        caps.push("connector");
-    }
-    caps
 }
 
 fn source_label(source: &PluginSource) -> &'static str {

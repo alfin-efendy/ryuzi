@@ -300,16 +300,17 @@ checks:
    `honcho`'s `plugin.honcho.user` header (`X-Honcho-User-Name`) or
    `datadog`'s `plugin.datadog.app_key` (`DD-APPLICATION-KEY`).
 
-**Current caveat:** `ensure_auth` is exercised by `crates/core/src/plugins/
-declarative.rs`'s own tests, but session attach
-(`control::lifecycle::attach_plugin_mcp_servers`) does **not** call it —
-it only calls `is_enabled` and then `mcp_servers()` directly. If a
-credential is missing, `mcp_servers()` itself fails (an unresolved `${auth}`
-placeholder), and that failure is caught and logged via `tracing::warn!`,
-silently skipping that plugin's servers for the session — nothing
-surfaces to the CLI or Cockpit UI mid-session. Check `ryuzi plugins info
-<id>`'s `auth:`/`setting:` lines (or the Cockpit plugin detail screen)
-*before* enabling a plugin, rather than relying on a session-time error.
+Session attach (`control::lifecycle::attach_plugin_mcp_servers`) calls
+`ensure_auth` for every enabled, connector-capable plugin *before*
+`mcp_servers()`. If `ensure_auth` fails (e.g. a missing credential), its
+friendly, secret-free message is logged via `tracing::warn!` and that
+plugin's servers are skipped for the session — a broken or unconfigured
+plugin integration never fails session start, and the log message names
+the plugin and what to configure, not just an unresolved-placeholder
+parse error. Nothing surfaces to the CLI or Cockpit UI mid-session beyond
+that log line, so check `ryuzi plugins info <id>`'s `auth:`/`setting:`
+lines (or the Cockpit plugin detail screen) *before* enabling a plugin,
+rather than relying on a session-time warning.
 
 ---
 

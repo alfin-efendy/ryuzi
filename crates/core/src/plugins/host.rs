@@ -127,6 +127,35 @@ pub struct CorePlugin {
     pub source: PluginSource,
 }
 
+impl CorePlugin {
+    /// Which of the four extension axes this plugin advertises. `runtime`
+    /// counts both a live `HarnessFactory` (native/claude-code) AND a
+    /// manifest-only `RuntimeMeta` (a CLI-agent catalog entry with no
+    /// in-process factory) — the same distinction `runtimes_meta` draws
+    /// between the two.
+    ///
+    /// Single source of truth for `ryuzi_core::serve`'s `GET /plugins`
+    /// endpoint, the Cockpit `list_plugins`/`plugin_detail` commands, and
+    /// `ryuzi plugins info` — all three call this instead of re-deriving the
+    /// convention themselves.
+    pub fn capabilities(&self) -> Vec<&'static str> {
+        let mut caps = Vec::new();
+        if self.manifest.provider.is_some() {
+            caps.push("provider");
+        }
+        if self.harness.is_some() || self.manifest.runtime.is_some() {
+            caps.push("runtime");
+        }
+        if self.gateway.is_some() {
+            caps.push("gateway");
+        }
+        if self.connector.is_some() {
+            caps.push("connector");
+        }
+        caps
+    }
+}
+
 /// Every installed plugin, keyed by `manifest.id`, kept in insertion order.
 #[derive(Default)]
 pub struct PluginHost {

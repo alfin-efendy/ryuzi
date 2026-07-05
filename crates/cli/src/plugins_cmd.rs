@@ -134,19 +134,7 @@ async fn cmd_info(id: &str, deps: &mut Deps) -> u8 {
         status_label(m.verified, m.experimental)
     ));
 
-    let mut capabilities = Vec::new();
-    if plugin.harness.is_some() {
-        capabilities.push("runtime");
-    }
-    if plugin.gateway.is_some() {
-        capabilities.push("gateway");
-    }
-    if plugin.connector.is_some() {
-        capabilities.push("connector");
-    }
-    if m.provider.is_some() {
-        capabilities.push("provider");
-    }
+    let capabilities = plugin.capabilities();
     (deps.out)(&format!(
         "capabilities: {}",
         if capabilities.is_empty() {

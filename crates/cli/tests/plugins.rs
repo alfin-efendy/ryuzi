@@ -143,6 +143,25 @@ fn info_anthropic_prints_categories_and_models_meta() {
 }
 
 #[test]
+fn info_claude_reports_runtime_capability_for_manifest_only_cli_agent() {
+    // Regression test: `claude` is a cli-agent plugin with a manifest-only
+    // `[runtime]` block and no live `HarnessFactory` (see
+    // `plugins::runtimes_meta::cli_agent_plugins`). `capabilities` must
+    // report `runtime` for it via `CorePlugin::capabilities`, the same
+    // helper `ryuzi_core::serve` and Cockpit's `plugins_cmd` use — not
+    // `manifest-only`, which only checked `plugin.harness` and missed the
+    // manifest-only `runtime` meta.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("t.sqlite");
+    let (code, out, _) = run(&db, &["plugins", "info", "claude"]);
+    assert_eq!(code, 0);
+
+    let text = out.join("\n");
+    assert!(text.contains("id: claude"));
+    assert!(text.contains("capabilities: runtime"));
+}
+
+#[test]
 fn enable_then_disable_connector_only_plugin_flips_setting() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("t.sqlite");

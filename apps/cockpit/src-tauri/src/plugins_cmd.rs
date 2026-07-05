@@ -94,27 +94,6 @@ pub struct PluginDetail {
     pub publisher: String,
 }
 
-/// Which of the four extension axes `plugin` advertises. `runtime` counts
-/// both a live `HarnessFactory` (native/claude-code) AND a manifest-only
-/// `RuntimeMeta` (a CLI-agent catalog entry with no in-process factory) —
-/// mirrors `ryuzi_core::serve`'s `capabilities` helper.
-fn capabilities(plugin: &CorePlugin) -> Vec<String> {
-    let mut caps = Vec::new();
-    if plugin.manifest.provider.is_some() {
-        caps.push("provider".to_string());
-    }
-    if plugin.harness.is_some() || plugin.manifest.runtime.is_some() {
-        caps.push("runtime".to_string());
-    }
-    if plugin.gateway.is_some() {
-        caps.push("gateway".to_string());
-    }
-    if plugin.connector.is_some() {
-        caps.push("connector".to_string());
-    }
-    caps
-}
-
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
@@ -135,7 +114,11 @@ fn plugin_info(plugin: &CorePlugin, enabled: bool) -> PluginInfo {
         experimental: m.experimental,
         enabled,
         source: source_label(&plugin.source).to_string(),
-        capabilities: capabilities(plugin),
+        capabilities: plugin
+            .capabilities()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -506,53 +489,42 @@ mod tests {
 
     #[test]
     fn capabilities_provider_from_manifest() {
-        assert_eq!(
-            capabilities(&provider_only("p")),
-            vec!["provider".to_string()]
-        );
+        assert_eq!(provider_only("p").capabilities(), vec!["provider"]);
     }
 
     #[test]
     fn capabilities_runtime_from_live_harness() {
-        assert_eq!(
-            capabilities(&harness_only("h")),
-            vec!["runtime".to_string()]
-        );
+        assert_eq!(harness_only("h").capabilities(), vec!["runtime"]);
     }
 
     #[test]
     fn capabilities_runtime_from_manifest_only_runtime_meta() {
         assert_eq!(
-            capabilities(&manifest_only_with_runtime_meta("r")),
-            vec!["runtime".to_string()]
+            manifest_only_with_runtime_meta("r").capabilities(),
+            vec!["runtime"]
         );
     }
 
     #[test]
     fn capabilities_gateway_from_live_gateway() {
-        assert_eq!(
-            capabilities(&gateway_only("g")),
-            vec!["gateway".to_string()]
-        );
+        assert_eq!(gateway_only("g").capabilities(), vec!["gateway"]);
     }
 
     #[test]
     fn capabilities_connector_from_live_connector() {
-        assert_eq!(
-            capabilities(&connector_only("c")),
-            vec!["connector".to_string()]
-        );
+        assert_eq!(connector_only("c").capabilities(), vec!["connector"]);
     }
 
     #[test]
     fn capabilities_empty_for_manifest_only_plugin() {
-        assert!(capabilities(&CorePlugin {
+        assert!(CorePlugin {
             manifest: manifest("m"),
             harness: None,
             gateway: None,
             connector: None,
             source: PluginSource::Builtin,
-        })
+        }
+        .capabilities()
         .is_empty());
     }
 
