@@ -239,6 +239,63 @@ fn run_rejects_unknown_harness() {
 
 #[test]
 #[serial]
+fn explicit_harness_updates_an_existing_project() {
+    // Regression: a project first connected as claude-code, then run with
+    // `--harness native`, must switch to native (not fail with "unknown
+    // harness 'claude-code'"). Registries here have ONLY the native fake, so a
+    // stale claude-code harness would error — proving the update happened.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+    let db = tmp.path().join("ryuzi.sqlite");
+
+    // First run: no --harness → project created with the claude-code default.
+    // deps_with_fake registers both fakes so this first run succeeds.
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut deps = deps_with_fake(&db, out.clone(), errs.clone());
+    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(ryuzi_cli::dispatch::run_cli(args, &mut deps), 0);
+
+    // Second run: --harness native, with ONLY the native harness registered.
+    let out2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut deps2 = deps_with_fake(&db, out2.clone(), errs2.clone());
+    deps2.build_registries = Box::new(|| {
+        let mut r = Registries::new();
+        r.install(&FakeNativeIntegration); // claude-code intentionally absent
+        Ok(r)
+    });
+    let args2: Vec<String> = [
+        "run",
+        "--harness",
+        "native",
+        "--dir",
+        repo.to_str().unwrap(),
+        "--prompt",
+        "again",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args2, &mut deps2);
+    assert_eq!(
+        code,
+        0,
+        "should switch the existing project to native; errs: {:?}",
+        errs2.lock().unwrap()
+    );
+    assert!(out2.lock().unwrap().iter().any(|l| l == "all done"));
+}
+
+#[test]
+#[serial]
 fn run_usage_and_mode_validation() {
     let tmp = tempfile::tempdir().unwrap();
     let out = Arc::new(std::sync::Mutex::new(Vec::new()));

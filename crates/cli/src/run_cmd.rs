@@ -69,13 +69,17 @@ pub fn cmd_run(args: &[String], deps: &mut Deps) -> u8 {
         },
     };
     let (model, effort) = (get("model"), get("effort"));
-    let harness = get("harness").unwrap_or_else(|| "claude-code".to_string());
-    if !HARNESSES.contains(&harness.as_str()) {
-        (deps.err)(&format!(
-            "--harness must be one of: {}",
-            HARNESSES.join(", ")
-        ));
-        return 1;
+    // `--harness` is optional: `None` means "use the project default / stored
+    // value"; `Some` is an explicit choice honored for new AND existing projects.
+    let harness = get("harness");
+    if let Some(h) = &harness {
+        if !HARNESSES.contains(&h.as_str()) {
+            (deps.err)(&format!(
+                "--harness must be one of: {}",
+                HARNESSES.join(", ")
+            ));
+            return 1;
+        }
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -83,7 +87,13 @@ pub fn cmd_run(args: &[String], deps: &mut Deps) -> u8 {
         .build()
         .expect("tokio runtime");
     rt.block_on(run_session(
-        &dir, &prompt, model, effort, mode, &harness, deps,
+        &dir,
+        &prompt,
+        model,
+        effort,
+        mode,
+        harness.as_deref(),
+        deps,
     ))
 }
 
@@ -94,7 +104,7 @@ async fn run_session(
     model: Option<String>,
     effort: Option<String>,
     mode: Option<PermMode>,
-    harness: &str,
+    harness: Option<&str>,
     deps: &mut Deps,
 ) -> u8 {
     let workdir = match std::fs::canonicalize(expand_home(dir)) {
@@ -132,14 +142,38 @@ async fn run_session(
         }
     };
     let project = match existing {
-        Some(p) => p, // flags on an existing project row are silently ignored — stored settings win
+        // Existing project: model/effort/mode stay as stored, but an explicit
+        // `--harness` that differs is honored (updated) — otherwise passing
+        // `--harness native` on a project first connected as claude-code would
+        // silently fail with "unknown harness 'claude-code'".
+        Some(p) => match harness {
+            Some(h) if h != p.harness => {
+                match cp
+                    .store()
+                    .update_project(&p.project_id, p.model.clone(), p.perm_mode, h)
+                    .await
+                {
+                    Ok(Some(updated)) => updated,
+                    Ok(None) => p,
+                    Err(e) => {
+                        (deps.err)(&format!("✗ {e}"));
+                        return 1;
+                    }
+                }
+            }
+            _ => p,
+        },
         None => {
             let name = workdir
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| workdir_str.clone());
             let p = match cp
-                .connect_project_with_harness(Path::new(&workdir), &name, harness)
+                .connect_project_with_harness(
+                    Path::new(&workdir),
+                    &name,
+                    harness.unwrap_or("claude-code"),
+                )
                 .await
             {
                 Ok(p) => p,
