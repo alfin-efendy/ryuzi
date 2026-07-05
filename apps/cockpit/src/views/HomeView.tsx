@@ -36,6 +36,7 @@ export function HomeView() {
   const stopVoice = useRef<(() => void) | null>(null);
 
   const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
+  const projectId = project?.projectId;
   const runtimes = useRuntimes((s) => s.runtimes);
   const agent = chatRuntimeOf(runtimes, nav.composerAgent);
   const requestRuntimeId = agent?.id ?? (nav.composerAgent === "native" || nav.composerAgent === "claude" ? nav.composerAgent : null);
@@ -43,8 +44,8 @@ export function HomeView() {
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
 
   useEffect(() => {
-    if (project && requestRuntimeId === "native") void loadCommands(project.projectId);
-  }, [project?.projectId, requestRuntimeId, loadCommands]);
+    if (projectId && requestRuntimeId === "native") void loadCommands(projectId);
+  }, [projectId, requestRuntimeId, loadCommands]);
 
   const branches = useMemo(() => {
     const fromSessions = sessions.filter((s) => s.projectId === project?.projectId && s.branch).map((s) => s.branch as string);
@@ -61,15 +62,16 @@ export function HomeView() {
     return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
   }, [requestRuntimeId, nativeCommands, slashQuery]);
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
+  const contextQueryText = contextQuery?.query ?? null;
 
   useEffect(() => {
-    if (!project || contextQuery === null) {
+    if (!projectId || contextQueryText === null) {
       setContextHits([]);
       return;
     }
     let cancelled = false;
     const t = setTimeout(() => {
-      void commands.searchFiles(project.projectId, contextQuery.query).then((res) => {
+      void commands.searchFiles(projectId, contextQueryText).then((res) => {
         if (!cancelled) setContextHits(res.status === "ok" ? res.data.slice(0, 6) : []);
       });
     }, 120);
@@ -77,7 +79,7 @@ export function HomeView() {
       cancelled = true;
       clearTimeout(t);
     };
-  }, [project?.projectId, contextQuery?.query]);
+  }, [projectId, contextQueryText]);
 
   const attachFiles = async () => {
     const picked = await commands.pickFiles();
@@ -173,7 +175,13 @@ export function HomeView() {
             </MenuPanel>
           )}
           <div className="relative flex items-center gap-1.5 px-3 pb-3 pt-2">
-            <Button variant="ghost" size="icon-sm" title="Attach" onClick={() => void attachFiles()} className="rounded-full text-muted-foreground">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              title="Attach"
+              onClick={() => void attachFiles()}
+              className="rounded-full text-muted-foreground"
+            >
               <Paperclip aria-hidden size={16} strokeWidth={2} />
             </Button>
             <Button variant="ghost" className="font-medium" style={{ color: "#E8703A" }}>

@@ -34,6 +34,7 @@ export function SessionView() {
   const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
   const runtimes = useRuntimes((s) => s.runtimes);
   const project = projects.find((p) => p.projectId === session?.projectId);
+  const projectId = project?.projectId;
   const runtimeId = project?.harness === "claude-code" ? "claude" : project?.harness;
   const agent = chatRuntimeOf(runtimes, runtimeId);
   const isNativeSession = runtimeId === "native";
@@ -42,8 +43,8 @@ export function SessionView() {
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
 
   useEffect(() => {
-    if (project && isNativeSession) void loadCommands(project.projectId);
-  }, [project?.projectId, isNativeSession, loadCommands]);
+    if (projectId && isNativeSession) void loadCommands(projectId);
+  }, [projectId, isNativeSession, loadCommands]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
@@ -55,15 +56,16 @@ export function SessionView() {
     return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
   }, [isNativeSession, nativeCommands, slashQuery]);
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
+  const contextQueryText = contextQuery?.query ?? null;
 
   useEffect(() => {
-    if (!project || contextQuery === null) {
+    if (!projectId || contextQueryText === null) {
       setContextHits([]);
       return;
     }
     let cancelled = false;
     const t = setTimeout(() => {
-      void commands.searchFiles(project.projectId, contextQuery.query).then((res) => {
+      void commands.searchFiles(projectId, contextQueryText).then((res) => {
         if (!cancelled) setContextHits(res.status === "ok" ? res.data.slice(0, 6) : []);
       });
     }, 120);
@@ -71,7 +73,7 @@ export function SessionView() {
       cancelled = true;
       clearTimeout(t);
     };
-  }, [project?.projectId, contextQuery?.query]);
+  }, [projectId, contextQueryText]);
 
   if (!session) {
     return (
@@ -217,7 +219,13 @@ export function SessionView() {
               </MenuPanel>
             )}
             <div className="relative flex items-center gap-1.5 px-2.5 pb-2.5 pt-1.5">
-              <Button variant="ghost" size="icon-sm" title="Attach" onClick={() => void attachFiles()} className="rounded-full text-muted-foreground">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                title="Attach"
+                onClick={() => void attachFiles()}
+                className="rounded-full text-muted-foreground"
+              >
                 <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
               </Button>
               <Button variant="ghost" size="sm" className="font-medium" style={{ color: "#E8703A" }}>

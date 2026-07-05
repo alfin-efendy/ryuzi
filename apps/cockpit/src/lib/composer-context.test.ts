@@ -9,8 +9,6 @@ test("detects the active @ context query at the end of the draft", () => {
 });
 
 test("replaces the active @ token with the selected project path", () => {
-  expect(replaceActiveContextToken("review @src/vi", "src/views/HomeView.tsx")).toBe(
-    "review @src/views/HomeView.tsx ",
-  );
+  expect(replaceActiveContextToken("review @src/vi", "src/views/HomeView.tsx")).toBe("review @src/views/HomeView.tsx ");
   expect(replaceActiveContextToken("@", "README.md")).toBe("@README.md ");
 });
