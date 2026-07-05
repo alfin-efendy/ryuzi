@@ -7,6 +7,7 @@ pub mod kiro;
 pub mod oauth;
 pub mod registry;
 pub mod responses;
+pub mod secrets;
 pub mod server;
 pub mod sse;
 pub mod translate;

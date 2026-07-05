@@ -290,6 +290,11 @@ pub fn run() {
                 let store = Store::open(&ryuzi_core::paths::db_path())
                     .await
                     .expect("open ryuzi db");
+                // One-time (idempotent) upgrade of any legacy plaintext
+                // secrets to encrypted-at-rest; see
+                // `llm_router::secrets::init_and_sweep`'s doc for the
+                // atomicity/idempotency/degraded-state contract.
+                ryuzi_core::llm_router::secrets::init_and_sweep(&store).await;
                 let registries = build_registries();
                 ControlPlane::new(store, registries).await
             });

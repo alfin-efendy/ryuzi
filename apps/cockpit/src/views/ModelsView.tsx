@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, ChevronUp, Copy, Plus } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Copy, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { useEndpoint } from "@/store-endpoint";
 import { useConnections } from "@/store-connections";
@@ -19,8 +19,15 @@ import {
 } from "@ryuzi/ui";
 import { Chip, StatusDot } from "@/components/common/bits";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
+import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
 
 type Tab = "endpoint" | "connections";
+
+// Matches the warning-banner convention used elsewhere (e.g. RuntimeDetailView's
+// endpoint/no-models banners): a bordered row tinted amber for a mild warning,
+// red for a stronger one.
+const WARN = "#F59E0B";
+const DANGER = "#EF4444";
 
 function EndpointTab() {
   const { status, keys, start, stop, setConfig, createKey, revokeKey } = useEndpoint();
@@ -85,8 +92,22 @@ function EndpointTab() {
     await revokeKey(id);
   };
 
+  const keychainStatus = status?.keychainStatus;
+
   return (
     <div className="flex flex-col gap-3">
+      {keychainStatus && keychainStatus !== "ok" && (
+        <div
+          className="flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]"
+          style={{
+            borderColor: keychainStatus === "unavailable" ? DANGER : WARN,
+            color: keychainStatus === "unavailable" ? DANGER : WARN,
+          }}
+        >
+          <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
+          <span>{keychainStatus === "unavailable" ? KEYCHAIN_UNAVAILABLE_WARNING : KEYCHAIN_FILE_FALLBACK_WARNING}</span>
+        </div>
+      )}
       <Card>
         <div className="flex items-center gap-3 border-b border-border px-[18px] py-3.5">
           <StatusDot color={status?.running ? "#22C55E" : "var(--muted-foreground)"} pulse={!!status?.running} size={8} />

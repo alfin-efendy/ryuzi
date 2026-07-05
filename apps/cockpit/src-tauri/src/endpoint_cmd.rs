@@ -1,6 +1,7 @@
 //! Endpoint tab commands: server lifecycle, port/autostart settings, keys.
 use crate::error::CmdError;
 use ryuzi_core::llm_router::keys;
+use ryuzi_core::llm_router::secrets::{self, KeychainStatus};
 use ryuzi_core::llm_router::server::{RouterServer, DEFAULT_PORT};
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ pub struct EndpointStatusInfo {
     pub port: u16,
     pub base_url: String,
     pub autostart: bool,
+    pub keychain_status: KeychainStatus,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -59,6 +61,7 @@ async fn status_info(cp: &ControlPlane, srv: &RouterServer) -> EndpointStatusInf
         port,
         base_url: format!("http://127.0.0.1:{port}/v1"),
         autostart,
+        keychain_status: secrets::keychain_status(),
     }
 }
 

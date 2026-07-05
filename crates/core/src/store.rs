@@ -214,8 +214,10 @@ fn migrations() -> Migrations<'static> {
         ),
         // Models & Runtime batch (design: docs/design/2026-07-04-models-runtime-design.md):
         // provider connections carry real credentials; endpoint_keys gate the
-        // local router endpoint. Keys are plaintext by design (config-apply
-        // must re-read them; OS-keychain encryption is future work).
+        // local router endpoint. Secret columns/fields are encrypted at rest
+        // by secrets::SecretCipher (value-level `enc:` sentinel, no schema
+        // change); config-apply still re-reads the literal key because
+        // row_to_key decrypts on read.
         M::up(
             "CREATE TABLE provider_connections (\
                 id TEXT PRIMARY KEY,\
