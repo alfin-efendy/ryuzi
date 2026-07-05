@@ -1,6 +1,7 @@
 //! Provider connections: a provider + credential + priority row the router
 //! can route requests through. Secrets live in the `data` JSON blob.
 use crate::llm_router::registry::ProviderDescriptor;
+use crate::llm_router::secrets;
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,8 @@ const COLS: &str = "id,provider,auth_type,label,priority,enabled,data,created_at
 
 fn row_to_conn(r: &Row) -> rusqlite::Result<ConnectionRow> {
     let raw: String = r.get(6)?;
+    let mut data: ConnectionData = serde_json::from_str(&raw).unwrap_or_default();
+    secrets::decrypt_conn_data(&mut data);
     Ok(ConnectionRow {
         id: r.get(0)?,
         provider: r.get(1)?,
@@ -44,7 +47,7 @@ fn row_to_conn(r: &Row) -> rusqlite::Result<ConnectionRow> {
         label: r.get(3)?,
         priority: r.get(4)?,
         enabled: r.get::<_, i64>(5)? != 0,
-        data: serde_json::from_str(&raw).unwrap_or_default(),
+        data,
         created_at: r.get(7)?,
         updated_at: r.get(8)?,
     })
@@ -81,7 +84,9 @@ pub async fn get_connection(store: &Store, id: &str) -> anyhow::Result<Option<Co
 /// Insert a connection. `row.priority` is IGNORED — the new row is always
 /// appended at the end (MAX(priority)+1); reorder with [`move_connection`].
 pub async fn add_connection(store: &Store, row: ConnectionRow) -> anyhow::Result<()> {
-    let data = serde_json::to_string(&row.data)?;
+    let mut d = row.data.clone();
+    secrets::encrypt_conn_data(&mut d);
+    let data = serde_json::to_string(&d)?;
     store
         .with_conn(move |c| {
             c.execute(
@@ -102,7 +107,9 @@ pub async fn add_connection(store: &Store, row: ConnectionRow) -> anyhow::Result
 /// NOT written — identity is fixed and ordering changes go through
 /// [`move_connection`].
 pub async fn update_connection(store: &Store, row: ConnectionRow) -> anyhow::Result<()> {
-    let data = serde_json::to_string(&row.data)?;
+    let mut d = row.data.clone();
+    secrets::encrypt_conn_data(&mut d);
+    let data = serde_json::to_string(&d)?;
     store
         .with_conn(move |c| {
             c.execute(
@@ -330,6 +337,59 @@ mod tests {
         assert!(is_oauth(&r));
         r.auth_type = "api_key".into();
         assert!(!is_oauth(&r));
+    }
+
+    #[tokio::test]
+    async fn at_rest_data_is_ciphertext() {
+        let store = mem_store().await;
+        add_connection(&store, row("c1", "openai", 0))
+            .await
+            .unwrap();
+        let raw: String = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT data FROM provider_connections WHERE id=?1",
+                    params!["c1"],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            !raw.contains("sk-test"),
+            "raw data must not contain plaintext secret: {raw}"
+        );
+        assert!(
+            raw.contains("enc:v1:"),
+            "raw data must contain encrypted marker: {raw}"
+        );
+
+        // Decrypt-on-read is transparent: the row still reads back as plaintext.
+        let list = list_connections(&store).await.unwrap();
+        assert_eq!(list[0].data.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn encrypt_conn_data_is_idempotent() {
+        let mut d = ConnectionData {
+            api_key: Some("sk-test".into()),
+            provider_specific: Some(serde_json::json!({"clientSecret": "shh"})),
+            ..Default::default()
+        };
+        secrets::encrypt_conn_data(&mut d);
+        let once = d.clone();
+        secrets::encrypt_conn_data(&mut d);
+        assert_eq!(
+            d, once,
+            "re-encrypting an already-encrypted row must be a no-op"
+        );
+
+        secrets::decrypt_conn_data(&mut d);
+        assert_eq!(d.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            d.provider_specific,
+            Some(serde_json::json!({"clientSecret": "shh"}))
+        );
     }
 
     #[test]

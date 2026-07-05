@@ -103,6 +103,83 @@ fn fallback_path() -> PathBuf {
     crate::paths::state_dir().join("secret.key")
 }
 
+/// Encrypt a single secret value with the process-global cipher.
+pub fn encrypt_field(plain: &str) -> String {
+    cipher().encrypt(plain)
+}
+
+/// Decrypt a single secret value with the process-global cipher. Legacy
+/// (non-`enc:`-prefixed) plaintext passes through unchanged.
+pub fn decrypt_field(s: &str) -> anyhow::Result<String> {
+    cipher().decrypt(s)
+}
+
+/// Encrypt every secret field of a [`ConnectionData`] in place: `api_key`,
+/// `access_token`, `refresh_token` (each individually), and `provider_specific`
+/// (serialized whole, since the Kiro `clientSecret` is nested inside it).
+/// Idempotent — a value that is already `enc:`-prefixed (or already an
+/// encrypted `provider_specific` string) is left untouched, so re-saving an
+/// already-encrypted row never double-encrypts.
+pub fn encrypt_conn_data(d: &mut crate::llm_router::connections::ConnectionData) {
+    for v in [&mut d.api_key, &mut d.access_token, &mut d.refresh_token]
+        .into_iter()
+        .flatten()
+    {
+        if !v.starts_with("enc:") {
+            *v = encrypt_field(v);
+        }
+    }
+    if let Some(v) = &d.provider_specific {
+        let already_encrypted = matches!(v, serde_json::Value::String(s) if s.starts_with("enc:"));
+        if !already_encrypted {
+            if let Ok(json) = serde_json::to_string(v) {
+                d.provider_specific = Some(serde_json::Value::String(encrypt_field(&json)));
+            }
+        }
+    }
+}
+
+/// Reverse of [`encrypt_conn_data`]: decrypt every secret field in place.
+///
+/// **Decrypt-error handling:** if decryption fails (wrong/lost key, or a
+/// corrupt value), the ciphertext is left in place — never blanked and never
+/// a panic — and `needs_relogin` is set so the row is flagged for the user to
+/// re-authenticate (Task 5 refines the locked/lost-key UX further). A
+/// non-string `provider_specific` (legacy plaintext object) is left as-is.
+pub fn decrypt_conn_data(d: &mut crate::llm_router::connections::ConnectionData) {
+    let mut decrypt_failed = false;
+    for v in [&mut d.api_key, &mut d.access_token, &mut d.refresh_token]
+        .into_iter()
+        .flatten()
+    {
+        match decrypt_field(v) {
+            Ok(plain) => *v = plain,
+            Err(err) => {
+                tracing::warn!("failed to decrypt connection secret field: {err}");
+                decrypt_failed = true;
+            }
+        }
+    }
+    if decrypt_failed {
+        d.needs_relogin = Some(true);
+    }
+    if let Some(serde_json::Value::String(s)) = &d.provider_specific {
+        match decrypt_field(s) {
+            Ok(plain) => match serde_json::from_str::<serde_json::Value>(&plain) {
+                Ok(v) => d.provider_specific = Some(v),
+                Err(err) => {
+                    tracing::warn!("failed to parse decrypted provider_specific json: {err}");
+                    d.needs_relogin = Some(true);
+                }
+            },
+            Err(err) => {
+                tracing::warn!("failed to decrypt connection provider_specific: {err}");
+                d.needs_relogin = Some(true);
+            }
+        }
+    }
+}
+
 fn generate_key_bytes() -> [u8; 32] {
     let key = Key::<XChaCha20Poly1305>::generate();
     key.as_slice()
