@@ -44,16 +44,17 @@ const oauthProvider: CatalogEntry = {
   models: [],
 };
 
-// `kiro` is the one catalog entry the modal keeps greyed "Coming soon" (it
-// needs a base URL the free-add flow doesn't collect).
+// `kiro` is the one catalog entry with a "device" category — a free provider
+// that signs in via AWS SSO-OIDC device-code flow (or an import from an
+// already-logged-in Kiro IDE) instead of the plain free direct-add.
 const kiroProvider: CatalogEntry = {
   id: "kiro",
   name: "Kiro",
   color: "#7c3aed",
   initial: "K",
-  category: "free",
+  category: "device",
   format: "openai",
-  requiresBaseUrl: true,
+  requiresBaseUrl: false,
   models: [],
 };
 
@@ -70,7 +71,7 @@ test("renders nothing while closed", () => {
   expect(screen.queryByText("Add connection")).toBeNull();
 });
 
-test("picker step lists catalog providers; oauth is connectable, only unwired entries greyed", () => {
+test("picker step lists catalog providers, all connectable, with per-category subtitles", () => {
   render(<AddConnectionModal open onClose={() => {}} />);
   expect(screen.getByText("Add connection")).toBeTruthy();
   expect(screen.getByText("Pick a provider to connect.")).toBeTruthy();
@@ -78,14 +79,25 @@ test("picker step lists catalog providers; oauth is connectable, only unwired en
   const apiKey = screen.getByRole("button", { name: /Anthropic/ }) as HTMLButtonElement;
   expect(apiKey.disabled).toBe(false);
 
-  // OAuth entries are now connectable (browser/paste flow), not "Coming soon".
+  // OAuth entries are connectable (browser/paste flow), not "Coming soon".
   const oauth = screen.getByRole("button", { name: /OAuth Provider/ }) as HTMLButtonElement;
   expect(oauth.disabled).toBe(false);
 
-  // Only the not-yet-wired entry (kiro) stays greyed.
-  const comingSoon = screen.getByRole("button", { name: /Kiro/ }) as HTMLButtonElement;
-  expect(comingSoon.disabled).toBe(true);
-  expect(screen.getByText("Coming soon")).toBeTruthy();
+  // Device-flow entries (kiro) are connectable too, with a distinct subtitle.
+  const kiro = screen.getByRole("button", { name: /Kiro/ }) as HTMLButtonElement;
+  expect(kiro.disabled).toBe(false);
+  expect(screen.getByText("Free — sign in required")).toBeTruthy();
+  expect(screen.queryByText("Coming soon")).toBeNull();
+});
+
+test("picking kiro shows the device sign-in and import actions, not the free direct-add", () => {
+  render(<AddConnectionModal open onClose={() => {}} />);
+  fireEvent.click(screen.getByRole("button", { name: /Kiro/ }));
+
+  expect(screen.getByLabelText("Label")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Sign in with Kiro" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Import from Kiro IDE" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Add Kiro" })).toBeNull();
 });
 
 test("Cancel closes without adding a connection", () => {

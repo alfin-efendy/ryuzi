@@ -1,20 +1,30 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, Loader2 } from "lucide-react";
+import { ArrowLeft, Copy, Loader2 } from "lucide-react";
+import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
-import type { CatalogEntry, ManualStartInfo } from "@/bindings";
-import { Chip, Pill } from "@/components/common/bits";
+import type { CatalogEntry, DeviceFlowInfo, ManualStartInfo } from "@/bindings";
+import { Chip } from "@/components/common/bits";
 import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
-
-// "kiro" is a Free-category catalog entry that isn't wired up yet (it needs a
-// base URL the free-add flow doesn't collect) — keep it greyed "Coming soon".
-const NOT_YET_WIRED = new Set(["kiro"]);
+import {
+  KIRO_DEVICE_CODE_HINT,
+  KIRO_IMPORT_ACTION,
+  KIRO_IMPORT_HINT,
+  KIRO_IMPORT_SUCCESS,
+  KIRO_PICKER_SUBTITLE,
+  KIRO_SIGNIN_ACTION,
+  KIRO_SIGNIN_SUBTITLE,
+  KIRO_WAITING_HINT,
+} from "@/constants";
 
 type OauthStep = "form" | "waiting-browser" | "manual";
+type DeviceStep = "form" | "waiting";
 
 // Multi-step flow: pick a provider from the catalog, then walk its connect
-// path — API key form, OAuth browser/paste, or a direct Free add.
+// path — API key form, OAuth browser/paste, device sign-in/import, or a
+// direct Free add.
 export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { catalog, add, connectOauth, beginOauthManual, completeOauthManual, addFree } = useConnections();
+  const { catalog, add, connectOauth, beginOauthManual, completeOauthManual, addFree, startKiroDevice, awaitKiroDevice, importKiro } =
+    useConnections();
   const [picked, setPicked] = useState<CatalogEntry | null>(null);
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -23,6 +33,8 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
   const [oauthStep, setOauthStep] = useState<OauthStep>("form");
   const [manualInfo, setManualInfo] = useState<ManualStartInfo | null>(null);
   const [pasted, setPasted] = useState("");
+  const [deviceStep, setDeviceStep] = useState<DeviceStep>("form");
+  const [deviceInfo, setDeviceInfo] = useState<DeviceFlowInfo | null>(null);
 
   // Tracks the "currently picked" provider even inside async closures that
   // captured an earlier `picked` value — lets in-flight requests detect that
@@ -43,6 +55,8 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
     setOauthStep("form");
     setManualInfo(null);
     setPasted("");
+    setDeviceStep("form");
+    setDeviceInfo(null);
   };
   const close = () => {
     reset();
@@ -113,6 +127,44 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
     if (ok) close();
   };
 
+  const startDevice = async () => {
+    if (!picked || saving) return;
+    const target = picked;
+    setSaving(true);
+    const info = await startKiroDevice();
+    if (pickedRef.current?.id !== target.id) return;
+    if (!info) {
+      setSaving(false);
+      return;
+    }
+    setDeviceInfo(info);
+    setDeviceStep("waiting");
+    const ok = await awaitKiroDevice(label.trim() || target.name, info.flowId);
+    if (pickedRef.current?.id !== target.id) return;
+    setSaving(false);
+    if (ok) close();
+    else setDeviceStep("form");
+  };
+
+  const importFromIde = async () => {
+    if (!picked || saving) return;
+    const target = picked;
+    setSaving(true);
+    const ok = await importKiro(label.trim() || target.name);
+    if (pickedRef.current?.id !== target.id) return;
+    setSaving(false);
+    if (ok) {
+      toast.success(KIRO_IMPORT_SUCCESS);
+      close();
+    }
+  };
+
+  const copyDeviceCode = () => {
+    if (!deviceInfo) return;
+    void navigator.clipboard.writeText(deviceInfo.userCode);
+    toast.success("Copied");
+  };
+
   return (
     <Modal onClose={close} width={480}>
       {picked === null ? (
@@ -121,10 +173,12 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
           <p className="mb-4 mt-1 text-[12.5px] text-muted-foreground">Pick a provider to connect.</p>
           <div className="grid grid-cols-2 gap-2">
             {catalog.map((ci) => {
-              // `saving` means an oauth/api-key/free request is in flight for the
-              // currently picked provider — block switching providers mid-flight
-              // so a late-resolving promise can't apply to the wrong pick.
-              const disabled = NOT_YET_WIRED.has(ci.id) || saving;
+              // `saving` means a request is in flight for the currently picked
+              // provider — block switching providers mid-flight so a
+              // late-resolving promise can't apply to the wrong pick (the
+              // catalog grid itself is only shown while nothing is picked, so
+              // this never actually renders while `saving` is true).
+              const disabled = saving;
               return (
                 <Button
                   key={ci.id}
@@ -135,18 +189,17 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
                 >
                   <Chip initial={ci.initial} color={ci.color} size={32} />
                   <span className="min-w-0 flex-1">
-                    <span className="flex items-center gap-1.5 font-semibold">
-                      {ci.name}
-                      {disabled && <Pill>Coming soon</Pill>}
-                    </span>
+                    <span className="flex items-center gap-1.5 font-semibold">{ci.name}</span>
                     <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11px] font-normal text-muted-foreground">
-                      {ci.category === "oauth"
-                        ? "Sign in with browser"
-                        : ci.category === "free"
-                          ? "No credentials needed"
-                          : ci.format === "anthropic"
-                            ? "Anthropic-compatible"
-                            : "OpenAI-compatible"}
+                      {ci.category === "device"
+                        ? KIRO_PICKER_SUBTITLE
+                        : ci.category === "oauth"
+                          ? "Sign in with browser"
+                          : ci.category === "free"
+                            ? "No credentials needed"
+                            : ci.format === "anthropic"
+                              ? "Anthropic-compatible"
+                              : "OpenAI-compatible"}
                     </span>
                   </span>
                 </Button>
@@ -252,6 +305,44 @@ export function AddConnectionModal({ open, onClose }: { open: boolean; onClose: 
                   <Button size="lg" onClick={() => void submitManual()} disabled={saving || pasted.trim().length === 0} className="w-full">
                     {saving ? "Connecting…" : "Submit"}
                   </Button>
+                </div>
+              )}
+            </>
+          )}
+
+          {picked.category === "device" && (
+            <>
+              {deviceStep === "form" && (
+                <>
+                  <div className="mt-3.5 flex flex-col gap-3">
+                    <FormField label="Label">
+                      <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder={picked.name} />
+                    </FormField>
+                  </div>
+                  <p className="mt-2 text-[11.5px] text-muted-foreground">{KIRO_SIGNIN_SUBTITLE}</p>
+                  <Button size="lg" onClick={() => void startDevice()} disabled={saving} className="mt-2 w-full">
+                    {saving ? "Opening…" : KIRO_SIGNIN_ACTION}
+                  </Button>
+                  <Button size="lg" variant="outline" onClick={() => void importFromIde()} disabled={saving} className="mt-2 w-full">
+                    {saving ? "Importing…" : KIRO_IMPORT_ACTION}
+                  </Button>
+                  <p className="mt-2 text-[11.5px] text-muted-foreground">{KIRO_IMPORT_HINT}</p>
+                </>
+              )}
+
+              {deviceStep === "waiting" && deviceInfo && (
+                <div className="mt-3.5 flex flex-col items-center gap-3 rounded-md border border-border px-4 py-4 text-center">
+                  <p className="text-[12.5px] text-muted-foreground">{KIRO_DEVICE_CODE_HINT}</p>
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-mono text-lg font-semibold tracking-[0.08em]">{deviceInfo.userCode}</span>
+                    <Button variant="ghost" size="icon-sm" title="Copy code" onClick={copyDeviceCode} className="text-muted-foreground">
+                      <Copy aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                    </Button>
+                  </div>
+                  <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+                    <Loader2 aria-hidden size={13} strokeWidth={2} className="shrink-0 animate-spin" />
+                    {KIRO_WAITING_HINT}
+                  </div>
                 </div>
               )}
             </>
