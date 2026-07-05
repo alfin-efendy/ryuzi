@@ -1161,6 +1161,16 @@ impl KiroToOpenAiStream {
         out
     }
 
+    /// Terminal chunk carries the accumulated `metricsEvent` token counts as
+    /// an OpenAI-shaped `usage` field (`prompt_tokens`/`completion_tokens`) —
+    /// the same convention a real OpenAI-compatible upstream uses on its own
+    /// final streamed chunk (see `stream_options.include_usage` in
+    /// `translate::anthropic_to_openai_request`). Without this, the
+    /// downstream `OpenAiToAnthropicStream`/`ResponsesStreamState` encoders
+    /// (which read `chunk["usage"]`) would have no way to learn kiro's real
+    /// token counts and the client-visible terminal event (Anthropic's
+    /// `message_delta.usage`) would always read zero, even though kiro
+    /// reported real numbers via `metricsEvent` before `messageStopEvent`.
     fn terminal_chunk(&mut self) -> Vec<Value> {
         if self.finished {
             return vec![];
@@ -1171,7 +1181,12 @@ impl KiroToOpenAiStream {
         } else {
             "stop"
         };
-        vec![self.chunk(json!({}), Some(finish))]
+        let mut v = self.chunk(json!({}), Some(finish));
+        v["usage"] = json!({
+            "prompt_tokens": self.input_tokens,
+            "completion_tokens": self.output_tokens,
+        });
+        vec![v]
     }
 
     /// Emit the terminal chunk if the upstream connection closed (client

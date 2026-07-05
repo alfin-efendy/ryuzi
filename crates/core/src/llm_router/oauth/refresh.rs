@@ -183,7 +183,7 @@ async fn refresh_at_impl(
     }
 
     if conn.provider == "kiro" {
-        return refresh_kiro(store, http, conn).await;
+        return refresh_kiro(store, http, conn, token_url).await;
     }
 
     let refresh_token = match conn.data.refresh_token.clone() {
@@ -264,21 +264,33 @@ async fn persist(store: &Arc<Store>, conn: &mut ConnectionRow) -> Result<()> {
 /// `provider_specific`), or the kiro.dev social endpoint otherwise
 /// (google/github/imported — no client creds). A connection with no refresh
 /// token on file (api_key auth) has nothing to refresh, so this is a no-op.
-/// Delegates to [`refresh_kiro_at`] with the production URLs; tests override
-/// both to point at mock servers.
+/// Delegates to [`refresh_kiro_at`] with the production URLs, UNLESS
+/// `token_url_override` is non-empty — the router's per-`AppState`
+/// `oauth_token_url_override` test seam (threaded through
+/// `force_refresh_with_token_url` -> `refresh_at_impl`), which points BOTH
+/// the AWS and social refresh URLs at the same mock endpoint so a 403-retry
+/// test can drive the real refresh code path. Production always calls this
+/// with an empty string (kiro has no `OAuthConfig`, so `ensure_fresh`/
+/// `force_refresh` resolve an empty default token_url for it), so real
+/// traffic is unaffected.
 async fn refresh_kiro(
     store: &Arc<Store>,
     http: &reqwest::Client,
     conn: &mut ConnectionRow,
+    token_url_override: &str,
 ) -> Result<()> {
-    refresh_kiro_at(
-        store,
-        http,
-        conn,
-        "https://oidc.us-east-1.amazonaws.com/token",
-        "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
-    )
-    .await
+    if token_url_override.is_empty() {
+        refresh_kiro_at(
+            store,
+            http,
+            conn,
+            "https://oidc.us-east-1.amazonaws.com/token",
+            "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
+        )
+        .await
+    } else {
+        refresh_kiro_at(store, http, conn, token_url_override, token_url_override).await
+    }
 }
 
 /// Same as [`refresh_kiro`] but against explicit AWS/social token URLs (so
