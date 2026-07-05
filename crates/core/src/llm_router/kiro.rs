@@ -24,6 +24,7 @@
 //! `body.max_tokens || 32000` (anthropic) / hardcoded `32000` (openai) —
 //! matches 9router's known behavior, not "fixed" here.
 
+use crate::llm_router::aws_stream;
 use crate::llm_router::connections::{self, ConnectionData};
 use serde_json::{json, Value};
 
@@ -948,6 +949,262 @@ pub fn openai_request_to_kiro(
     payload
 }
 
+// ---------------------------------------------------------------------------
+// Response stream: AWS event-stream frames -> OpenAI chat.completion.chunk
+// ---------------------------------------------------------------------------
+
+/// Kiro (CodeWhisperer) streaming response -> OpenAI `chat.completion.chunk`
+/// values. Ported from 9router's `KiroExecutor.transformEventStreamToSSE`
+/// (open-sse/executors/kiro.js) — one state machine per stream instance, fed
+/// AWS event-stream frames (already parsed by [`crate::llm_router::aws_stream`])
+/// one at a time via [`Self::feed`], terminated by [`Self::finish`] (client
+/// EOF with no terminal frame seen) or a `messageStopEvent` frame (normal
+/// completion) — whichever comes first; both paths go through the same
+/// `finished`-guarded terminal chunk so at most one is ever emitted.
+pub struct KiroToOpenAiStream {
+    id: String,
+    model: String,
+    /// `toolUseId` -> OpenAI tool_call index, assigned in first-seen order.
+    seen_tool_ids: std::collections::HashMap<String, usize>,
+    next_tool_index: usize,
+    /// Counter for the rare case a `toolUseEvent` omits `toolUseId`.
+    anon_tool_counter: usize,
+    /// Persists ACROSS frames: a `<thinking>` span can open in one frame and
+    /// close in a later one.
+    in_thinking: bool,
+    has_reasoning_content: bool,
+    has_tool_calls: bool,
+    emitted_role: bool,
+    finished: bool,
+    input_tokens: i64,
+    output_tokens: i64,
+}
+
+impl KiroToOpenAiStream {
+    pub fn new(model: &str) -> Self {
+        Self {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            model: model.to_string(),
+            seen_tool_ids: Default::default(),
+            next_tool_index: 0,
+            anon_tool_counter: 0,
+            in_thinking: false,
+            has_reasoning_content: false,
+            has_tool_calls: false,
+            emitted_role: false,
+            finished: false,
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    }
+
+    fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> Value {
+        json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }]
+        })
+    }
+
+    /// Build a chunk from `delta`, tagging `role: "assistant"` onto it if
+    /// this is the very first delta the stream has produced.
+    fn emit(&mut self, delta: Value) -> Value {
+        let delta = if self.emitted_role {
+            delta
+        } else {
+            self.emitted_role = true;
+            let mut obj = delta.as_object().cloned().unwrap_or_default();
+            obj.insert("role".to_string(), json!("assistant"));
+            Value::Object(obj)
+        };
+        self.chunk(delta, None)
+    }
+
+    /// Strip literal `<thinking>...</thinking>` spans from `content`,
+    /// carrying the open/close state across frames — a span can open in one
+    /// frame and close in a later one. Mirrors 9router's leaked-thinking-tag
+    /// guard (Kiro's Claude models can leak these into the content stream;
+    /// the real reasoning is routed separately via `reasoningContentEvent`).
+    fn strip_thinking(&mut self, content: &str) -> String {
+        if self.in_thinking {
+            if let Some(pos) = content.find("</thinking>") {
+                self.in_thinking = false;
+                let after = &content[pos + "</thinking>".len()..];
+                strip_one_leading_newline(after)
+            } else {
+                String::new() // drop entirely while inside the thinking block
+            }
+        } else if let Some(open) = content.find("<thinking>") {
+            self.in_thinking = true;
+            if let Some(close) = content.find("</thinking>") {
+                self.in_thinking = false;
+                let before = &content[..open];
+                let after = &content[close + "</thinking>".len()..];
+                format!("{before}{}", strip_one_leading_newline(after))
+            } else {
+                content[..open].to_string()
+            }
+        } else {
+            content.to_string()
+        }
+    }
+
+    /// Route one parsed AWS event-stream frame; returns zero or more OpenAI
+    /// chunks (most frame types produce exactly one, several produce none).
+    pub fn feed(&mut self, frame: &aws_stream::AwsFrame) -> Vec<Value> {
+        let mut out = Vec::new();
+        let payload = &frame.payload;
+        match frame.event_type.as_deref().unwrap_or("") {
+            "assistantResponseEvent" => {
+                if let Some(raw) = payload["content"].as_str().filter(|s| !s.is_empty()) {
+                    let content = self.strip_thinking(raw);
+                    if content.is_empty() && self.has_reasoning_content {
+                        // Stripped a whole thinking span to nothing and the
+                        // reasoning it carried was already surfaced via
+                        // reasoningContentEvent — skip the empty chunk.
+                    } else {
+                        out.push(self.emit(json!({"content": content})));
+                    }
+                }
+            }
+            "reasoningContentEvent" => {
+                let reasoning = payload.get("reasoningContentEvent").unwrap_or(payload);
+                let text = match reasoning {
+                    Value::String(s) => s.clone(),
+                    other => other["text"]
+                        .as_str()
+                        .or_else(|| other["content"].as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                };
+                if !text.is_empty() {
+                    self.has_reasoning_content = true;
+                    out.push(self.emit(json!({"reasoning_content": text})));
+                }
+            }
+            "codeEvent" => {
+                if let Some(text) = payload["content"].as_str() {
+                    out.push(self.emit(json!({"content": text})));
+                }
+            }
+            "toolUseEvent" => {
+                if !payload.is_null() {
+                    self.has_tool_calls = true;
+                    let items: Vec<&Value> = match payload.as_array() {
+                        Some(arr) => arr.iter().collect(),
+                        None => vec![payload],
+                    };
+                    for item in items {
+                        let tool_call_id = match item["toolUseId"].as_str() {
+                            Some(id) => id.to_string(),
+                            None => {
+                                let id = format!("call_{}", self.anon_tool_counter);
+                                self.anon_tool_counter += 1;
+                                id
+                            }
+                        };
+                        let is_new = !self.seen_tool_ids.contains_key(&tool_call_id);
+                        let index = if is_new {
+                            let idx = self.next_tool_index;
+                            self.next_tool_index += 1;
+                            self.seen_tool_ids.insert(tool_call_id.clone(), idx);
+                            idx
+                        } else {
+                            self.seen_tool_ids[&tool_call_id]
+                        };
+                        if is_new {
+                            let name = item["name"].as_str().unwrap_or("");
+                            out.push(self.emit(json!({"tool_calls": [{
+                                "index": index, "id": tool_call_id, "type": "function",
+                                "function": {"name": name, "arguments": ""}
+                            }]})));
+                        }
+                        let args = match item.get("input") {
+                            Some(Value::String(s)) => Some(s.clone()),
+                            Some(v) if v.is_object() => {
+                                Some(serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+                            }
+                            _ => None,
+                        };
+                        if let Some(args) = args {
+                            out.push(self.chunk(
+                                json!({"tool_calls": [{
+                                    "index": index, "function": {"arguments": args}
+                                }]}),
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
+            "metricsEvent" => {
+                let metrics = payload.get("metricsEvent").unwrap_or(payload);
+                let input = metrics["inputTokens"].as_i64().unwrap_or(0);
+                let output = metrics["outputTokens"].as_i64().unwrap_or(0);
+                // Matches 9router: only overwrite once real numbers show up,
+                // so a metricsEvent with neither field present is a no-op.
+                if input > 0 || output > 0 {
+                    self.input_tokens = input;
+                    self.output_tokens = output;
+                }
+            }
+            "messageStopEvent" => out.extend(self.terminal_chunk()),
+            // contextUsageEvent / meteringEvent: bookkeeping only upstream,
+            // no client chunk here. Unknown event types: ignore.
+            _ => {}
+        }
+        out
+    }
+
+    fn terminal_chunk(&mut self) -> Vec<Value> {
+        if self.finished {
+            return vec![];
+        }
+        self.finished = true;
+        let finish = if self.has_tool_calls {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        vec![self.chunk(json!({}), Some(finish))]
+    }
+
+    /// Emit the terminal chunk if the upstream connection closed (client
+    /// EOF) without ever sending a `messageStopEvent` frame; a no-op if one
+    /// was already emitted.
+    pub fn finish(&mut self) -> Vec<Value> {
+        self.terminal_chunk()
+    }
+
+    /// True once the terminal chunk has been emitted (via a `messageStopEvent`
+    /// frame or a `finish()` call).
+    pub fn saw_terminal(&self) -> bool {
+        self.finished
+    }
+
+    /// Accumulated (input, output) token counts from the upstream
+    /// `metricsEvent` frame(s) seen so far.
+    pub fn usage(&self) -> (i64, i64) {
+        (self.input_tokens, self.output_tokens)
+    }
+
+    /// Terminal error chunk in OpenAI shape — IDENTICAL to
+    /// `translate::AnthropicToOpenAiStream::error_frame`. Emit this INSTEAD
+    /// of `finish()` when the upstream stream errored mid-flight.
+    pub fn error_frame(&self, message: &str) -> Value {
+        json!({"error": {"message": message, "type": "api_error"}})
+    }
+}
+
+fn strip_one_leading_newline(s: &str) -> String {
+    s.strip_prefix('\n').unwrap_or(s).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1227,5 +1484,151 @@ mod tests {
             history[1]["assistantResponseMessage"]["content"],
             "first reply"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // KiroToOpenAiStream (response side)
+    // -----------------------------------------------------------------
+
+    fn frame(event_type: &str, payload: Value) -> aws_stream::AwsFrame {
+        aws_stream::AwsFrame {
+            event_type: Some(event_type.to_string()),
+            payload,
+        }
+    }
+
+    #[test]
+    fn text_then_stop() {
+        let mut s = KiroToOpenAiStream::new("claude-sonnet-4.5");
+        let mut out = s.feed(&frame(
+            "assistantResponseEvent",
+            json!({ "content": "Hello" }),
+        ));
+        out.extend(s.feed(&frame("messageStopEvent", Value::Null)));
+        let joined: String = out
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(joined, "Hello");
+        assert!(s.saw_terminal());
+        assert_eq!(out.last().unwrap()["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn tool_call_fragments_accumulate() {
+        let mut s = KiroToOpenAiStream::new("m");
+        let mut out = s.feed(&frame(
+            "toolUseEvent",
+            json!({ "toolUseId": "t1", "name": "get_weather", "input": "" }),
+        ));
+        out.extend(s.feed(&frame(
+            "toolUseEvent",
+            json!({ "toolUseId": "t1", "input": "{\"city\":" }),
+        )));
+        out.extend(s.feed(&frame(
+            "toolUseEvent",
+            json!({ "toolUseId": "t1", "input": "\"Paris\"}" }),
+        )));
+        out.extend(s.feed(&frame("messageStopEvent", Value::Null)));
+        let start = out
+            .iter()
+            .find(|c| c["choices"][0]["delta"]["tool_calls"][0]["id"] == "t1")
+            .unwrap();
+        assert_eq!(
+            start["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        let args: String = out
+            .iter()
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .collect();
+        assert_eq!(args, "{\"city\":\"Paris\"}");
+        assert_eq!(
+            out.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+    }
+
+    #[test]
+    fn strips_leaked_thinking_spans() {
+        let mut s = KiroToOpenAiStream::new("m");
+        let out = s.feed(&frame(
+            "assistantResponseEvent",
+            json!({ "content": "A<thinking>secret</thinking>B" }),
+        ));
+        let joined: String = out
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(joined, "AB");
+    }
+
+    #[test]
+    fn thinking_span_split_across_frames_drops_enclosed_text() {
+        let mut s = KiroToOpenAiStream::new("m");
+        let mut out = s.feed(&frame(
+            "assistantResponseEvent",
+            json!({ "content": "before<thinking>" }),
+        ));
+        out.extend(s.feed(&frame(
+            "assistantResponseEvent",
+            json!({ "content": "secret</thinking>after" }),
+        )));
+        let joined: String = out
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(joined, "beforeafter");
+    }
+
+    #[test]
+    fn metrics_event_populates_usage() {
+        let mut s = KiroToOpenAiStream::new("m");
+        assert_eq!(s.usage(), (0, 0));
+        s.feed(&frame(
+            "metricsEvent",
+            json!({ "inputTokens": 42, "outputTokens": 7 }),
+        ));
+        assert_eq!(s.usage(), (42, 7));
+    }
+
+    #[test]
+    fn finish_without_message_stop_emits_exactly_one_terminal() {
+        let mut s = KiroToOpenAiStream::new("m");
+        s.feed(&frame("assistantResponseEvent", json!({ "content": "hi" })));
+        assert!(!s.saw_terminal());
+        let first = s.finish();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["choices"][0]["finish_reason"], "stop");
+        assert!(s.saw_terminal());
+        let second = s.finish();
+        assert!(
+            second.is_empty(),
+            "finish() must not double-emit a terminal chunk"
+        );
+    }
+
+    #[test]
+    fn error_frame_matches_anthropic_to_openai_shape() {
+        let s = KiroToOpenAiStream::new("m");
+        let err = s.error_frame("upstream stream interrupted: boom");
+        let expected = crate::llm_router::translate::AnthropicToOpenAiStream::new()
+            .error_frame("upstream stream interrupted: boom");
+        assert_eq!(err, expected);
+    }
+
+    #[test]
+    fn first_delta_carries_role_regardless_of_frame_type() {
+        let mut s = KiroToOpenAiStream::new("m");
+        let out = s.feed(&frame(
+            "toolUseEvent",
+            json!({ "toolUseId": "t1", "name": "get_weather", "input": {} }),
+        ));
+        assert_eq!(out[0]["choices"][0]["delta"]["role"], "assistant");
+        // subsequent deltas do not repeat role.
+        let more = s.feed(&frame("assistantResponseEvent", json!({ "content": "hi" })));
+        assert!(more[0]["choices"][0]["delta"].get("role").is_none());
     }
 }
