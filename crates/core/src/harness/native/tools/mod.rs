@@ -27,6 +27,7 @@ pub mod read;
 pub mod task;
 pub mod todo;
 pub mod webfetch;
+pub mod websearch;
 pub mod write;
 
 /// Bound on a single tool's model-visible output.
@@ -160,6 +161,7 @@ impl ToolRegistry {
             Arc::new(todo::TodoWrite),
             Arc::new(todo::TodoRead),
             Arc::new(webfetch::WebFetch),
+            Arc::new(websearch::WebSearch),
             Arc::new(task::Task),
         ];
         let mut tools = BTreeMap::new();
@@ -315,12 +317,13 @@ mod tests {
             "todowrite",
             "todoread",
             "webfetch",
+            "websearch",
             "task",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 11);
+        assert_eq!(defs.len(), 12);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));
