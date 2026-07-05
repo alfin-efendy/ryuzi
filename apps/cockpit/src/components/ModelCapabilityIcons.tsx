@@ -52,6 +52,7 @@ export function ModelCapabilityIcons({ model, compact = false }: { model: string
         return (
           <span
             key={cap}
+            role="img"
             title={META[cap].label}
             aria-label={META[cap].label}
             className="inline-flex size-5 items-center justify-center rounded-md border border-border bg-background text-muted-foreground"

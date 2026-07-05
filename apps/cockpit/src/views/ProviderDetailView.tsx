@@ -148,7 +148,8 @@ function ProviderModelsCard({ connections, catalogModels }: { connections: Conne
   }, [catalogModels, connections]);
 
   const runModelTest = async (model: string) => {
-    const conn = connections.find((item) => item.enabled && item.models.includes(model)) ?? connections.find((item) => item.models.includes(model));
+    const conn =
+      connections.find((item) => item.enabled && item.models.includes(model)) ?? connections.find((item) => item.models.includes(model));
     if (!conn) return;
     setTestingModel(model);
     const result = await commands.testConnectionModel(conn.id, model);
@@ -214,6 +215,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
   const providerConnections = useMemo(() => connections.filter((c) => c.provider === provider), [connections, provider]);
   const providerConnectionIds = providerConnections.map((conn) => conn.id).join("|");
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on providerConnectionIds so usage reloads only when the set of connection ids changes, not on every providerConnections re-derive
   useEffect(() => {
     for (const conn of providerConnections) {
       void loadUsage(conn.id);
@@ -227,6 +229,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
   const initial = catalogEntry?.initial ?? fallback?.initial ?? "?";
   const catalogModels = catalogEntry?.models ?? [];
   const activeCount = providerConnections.filter((c) => c.enabled).length;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on providerConnectionIds so usage re-aggregates only when the set of connection ids changes
   const usage = useMemo(
     () => aggregateUsage(providerConnections.map((conn) => usageByConnection[conn.id])),
     [providerConnectionIds, providerConnections, usageByConnection],
@@ -269,7 +272,9 @@ export function ProviderDetailView({ provider }: { provider: string }) {
         <Card>
           <CardHeader className="flex-wrap">
             <CardTitle>Accounts</CardTitle>
-            <CardHint>{providerConnections.length > 0 ? `${activeCount} active · ${strategyText(accountStrategy)}` : "No accounts connected"}</CardHint>
+            <CardHint>
+              {providerConnections.length > 0 ? `${activeCount} active · ${strategyText(accountStrategy)}` : "No accounts connected"}
+            </CardHint>
             <div className="ml-auto flex items-center gap-2">
               <span className="text-xs font-medium text-muted-foreground">Account routing</span>
               <NativeSelect
