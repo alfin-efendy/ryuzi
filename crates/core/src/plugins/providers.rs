@@ -128,7 +128,11 @@ pub async fn list_models(store: &Store, id: &str) -> anyhow::Result<Vec<String>>
         return Ok(vec![]);
     };
     let conns = connections::list_connections(store).await?;
-    for conn in conns.iter().filter(|c| c.provider == id) {
+    for conn in conns
+        .iter()
+        .filter(|c| c.provider == id)
+        .filter(|c| c.enabled)
+    {
         if conn
             .data
             .models_override
@@ -173,6 +177,7 @@ mod tests {
             .find(|p| p.manifest.id == "anthropic")
             .expect("anthropic plugin");
 
+        assert!(plugin.manifest.warnings().is_empty());
         assert_eq!(plugin.manifest.contract, CONTRACT_VERSION);
         assert_eq!(plugin.manifest.name, "Anthropic");
         assert_eq!(plugin.manifest.publisher, "ryuzi");
@@ -276,5 +281,40 @@ mod tests {
         let store = mem_store().await;
         let models = list_models(&store, "nope").await.unwrap();
         assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_models_skips_disabled_connection_override() {
+        let store = mem_store().await;
+        add_connection(
+            &store,
+            ConnectionRow {
+                id: "c1".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "disabled".into(),
+                priority: 0,
+                enabled: false,
+                data: ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    models_override: Some(vec!["custom-model".into()]),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let models = list_models(&store, "anthropic").await.unwrap();
+        assert_eq!(
+            models,
+            vec![
+                "claude-opus-4-5".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "claude-haiku-4-5".to_string(),
+            ]
+        );
     }
 }

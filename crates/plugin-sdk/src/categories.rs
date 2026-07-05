@@ -8,6 +8,9 @@
 /// via `crate::manifest::PluginManifest::warnings()`.
 pub const KNOWN: &[&str] = &[
     "model-provider",
+    "api-key",
+    "oauth",
+    "free",
     "runtime",
     "cli-agent",
     "chat-gateway",
@@ -33,8 +36,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn known_has_exactly_eighteen_entries() {
-        assert_eq!(KNOWN.len(), 18);
+    fn known_has_exactly_twenty_one_entries() {
+        assert_eq!(KNOWN.len(), 21);
     }
 
     #[test]
