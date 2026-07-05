@@ -48,3 +48,36 @@ test("a failed command leaves the cache untouched", async () => {
   expect(useNative.getState().commandsByProject.p1).toBeUndefined();
   spy.mockRestore();
 });
+
+test("exportSession returns the JSON payload", async () => {
+  reset();
+  const spy = spyOn(commands, "exportSession").mockResolvedValue({ status: "ok", data: '{"version":1}' });
+  const out = await useNative.getState().exportSession("s1");
+  expect(spy).toHaveBeenCalledWith("s1");
+  expect(out).toBe('{"version":1}');
+  spy.mockRestore();
+});
+
+test("importSession reports success", async () => {
+  reset();
+  const spy = spyOn(commands, "importSession").mockResolvedValue({
+    status: "ok",
+    data: {
+      sessionPk: "new",
+      projectId: "p1",
+      agentSessionId: null,
+      worktreePath: null,
+      branch: null,
+      title: "Imported",
+      status: "ended",
+      startedBy: "import",
+      createdAt: 0,
+      lastActive: 0,
+      resumeAttempts: 0,
+    },
+  });
+  const ok = await useNative.getState().importSession("p1", '{"version":1}');
+  expect(spy).toHaveBeenCalledWith("p1", '{"version":1}');
+  expect(ok).toBe(true);
+  spy.mockRestore();
+});

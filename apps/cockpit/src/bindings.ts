@@ -695,6 +695,28 @@ async sessionTodos(sessionPk: string) : Promise<Result<TodoItem[], CmdError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Export a session as a pretty JSON string.
+ */
+async exportSession(sessionPk: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("export_session", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Import a previously exported session JSON as a new archived session.
+ */
+async importSession(projectId: string, data: string) : Promise<Result<Session, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("import_session", { projectId, data }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 

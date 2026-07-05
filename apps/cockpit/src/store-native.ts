@@ -11,6 +11,8 @@ type NativeState = {
   loadAgents: (projectId: string) => Promise<void>;
   loadCommands: (projectId: string) => Promise<void>;
   loadTodos: (sessionPk: string) => Promise<void>;
+  exportSession: (sessionPk: string) => Promise<string | null>;
+  importSession: (projectId: string, data: string) => Promise<boolean>;
 };
 
 export const useNative = create<NativeState>((set) => ({
@@ -37,5 +39,17 @@ export const useNative = create<NativeState>((set) => ({
     if (res.status === "ok") {
       set((s) => ({ todosBySession: { ...s.todosBySession, [sessionPk]: res.data } }));
     }
+  },
+
+  // Returns the session's portable JSON, or null on failure.
+  exportSession: async (sessionPk) => {
+    const res = await commands.exportSession(sessionPk);
+    return res.status === "ok" ? res.data : null;
+  },
+
+  // Imports a previously exported session JSON under a project.
+  importSession: async (projectId, data) => {
+    const res = await commands.importSession(projectId, data);
+    return res.status === "ok";
   },
 }));

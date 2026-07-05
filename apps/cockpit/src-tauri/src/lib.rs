@@ -12,6 +12,7 @@ mod native_cmd;
 mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
+mod session_io;
 mod term;
 
 use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
@@ -243,6 +244,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_agents,
             native_cmd::native_commands,
             native_cmd::session_todos,
+            session_io::export_session,
+            session_io::import_session,
         ])
         .events(collect_events![
             events::CoreEventMsg,

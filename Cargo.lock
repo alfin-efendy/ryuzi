@@ -4365,6 +4365,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tauri-specta",
+ "tempfile",
  "tokio",
  "windows 0.62.2",
  "windows-version",
