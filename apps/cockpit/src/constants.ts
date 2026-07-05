@@ -49,3 +49,9 @@ export const KIRO_WAITING_HINT = "Waiting for you to finish signing in…";
 export const KIRO_IMPORT_ACTION = "Import from Kiro IDE";
 export const KIRO_IMPORT_HINT = "Already signed in to the Kiro IDE on this machine? Import that sign-in instead of starting a new one.";
 export const KIRO_IMPORT_SUCCESS = "Imported your Kiro sign-in";
+
+// Keychain-status warning banner (Endpoint tab). Secrets are always encrypted
+// at rest; these two strings are honest about *where* the master key that
+// protects them lives when it isn't the OS keychain.
+export const KEYCHAIN_FILE_FALLBACK_WARNING = "Secrets are stored in a local file, not the OS keychain.";
+export const KEYCHAIN_UNAVAILABLE_WARNING = "Secrets are stored unencrypted — no OS keychain available.";

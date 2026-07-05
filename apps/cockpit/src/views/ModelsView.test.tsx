@@ -2,7 +2,13 @@ import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, UsageSeries } from "@/bindings";
 
-const status: EndpointStatusInfo = { running: true, port: 8899, baseUrl: "http://127.0.0.1:8899/v1", autostart: false };
+const status: EndpointStatusInfo = {
+  running: true,
+  port: 8899,
+  baseUrl: "http://127.0.0.1:8899/v1",
+  autostart: false,
+  keychainStatus: "ok",
+};
 
 const keys: EndpointKeyInfo[] = [{ id: "k1", name: "VS Code", key: "rz-live-abc123", createdAt: 1751500800000, lastUsedAt: null }];
 
@@ -104,6 +110,29 @@ test("switching to the Providers tab shows connections instead of endpoint setti
   expect(screen.getByRole("button", { name: "Test" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Add connection" })).toBeTruthy();
   expect(screen.queryByText("Running on http://127.0.0.1:8899/v1")).toBeNull();
+});
+
+test("warns when secrets fall back to a local file instead of the OS keychain", async () => {
+  useEndpoint.setState({ status: { ...status, keychainStatus: "fileFallback" }, keys, loaded: true });
+  render(<ModelsView />);
+
+  await screen.findByText("Secrets are stored in a local file, not the OS keychain.");
+  expect(screen.queryByText("Secrets are stored unencrypted — no OS keychain available.")).toBeNull();
+});
+
+test("warns more strongly when no keychain or file fallback is available", async () => {
+  useEndpoint.setState({ status: { ...status, keychainStatus: "unavailable" }, keys, loaded: true });
+  render(<ModelsView />);
+
+  await screen.findByText("Secrets are stored unencrypted — no OS keychain available.");
+});
+
+test("shows no keychain warning when the master key is in the OS keychain", async () => {
+  render(<ModelsView />);
+
+  await screen.findByText("Running on http://127.0.0.1:8899/v1");
+  expect(screen.queryByText("Secrets are stored in a local file, not the OS keychain.")).toBeNull();
+  expect(screen.queryByText("Secrets are stored unencrypted — no OS keychain available.")).toBeNull();
 });
 
 test("shows empty states for API keys and connections", async () => {

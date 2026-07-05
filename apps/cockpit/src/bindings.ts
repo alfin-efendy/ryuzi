@@ -787,7 +787,7 @@ export type CoreEventMsg = { event: CoreEvent }
 export type DeviceFlowInfo = { flowId: string; userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number; interval: number }
 export type DirEntryInfo = { name: string; dir: boolean }
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
-export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean }
+export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string; 
 /**
@@ -802,6 +802,28 @@ export type GatewayResourceInfo = { label: string; sub: string; pct: number }
 export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
 export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+/**
+ * Where the process's master key actually came from. Surfaced to the UI
+ * (via a later task's DTO mapping) so users know whether their secrets are
+ * protected by the OS keychain or a weaker fallback.
+ */
+export type KeychainStatus = 
+/**
+ * Master key is stored in (and was read from, or freshly provisioned
+ * into) the OS keychain.
+ */
+"ok" | 
+/**
+ * The OS keychain is unavailable (headless/locked/no D-Bus session), so
+ * the master key lives in a permission-restricted file instead.
+ */
+"fileFallback" | 
+/**
+ * Neither the keychain nor the fallback file could be used reliably;
+ * an ephemeral in-memory key is in play and secrets will not survive a
+ * restart, or a previously stored key was corrupt and was replaced.
+ */
+"unavailable"
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 /**
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
