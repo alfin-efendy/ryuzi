@@ -4,7 +4,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ryuzi_core::domain::NewMessage;
 use ryuzi_core::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
-use ryuzi_core::integration::Integration;
 use ryuzi_core::{CoreEvent, Registries};
 use serial_test::serial;
 
@@ -72,27 +71,6 @@ impl HarnessFactory for FakeFactory {
     }
 }
 
-struct FakeIntegration;
-impl Integration for FakeIntegration {
-    fn id(&self) -> &str {
-        "claude-code"
-    } // registry id must match connect_project's hardcoded harness
-    fn harness(&self) -> Option<Arc<dyn HarnessFactory>> {
-        Some(Arc::new(FakeFactory))
-    }
-}
-
-// A fake registered under `native`, so `--harness native` resolves to it.
-struct FakeNativeIntegration;
-impl Integration for FakeNativeIntegration {
-    fn id(&self) -> &str {
-        "native"
-    }
-    fn harness(&self) -> Option<Arc<dyn HarnessFactory>> {
-        Some(Arc::new(FakeFactory))
-    }
-}
-
 fn git_repo_fixture(dir: &Path) {
     let run = |args: &[&str]| {
         assert!(std::process::Command::new("git")
@@ -140,8 +118,10 @@ fn deps_with_fake(
         sidecar_status: Box::new(|| ryuzi_core::sidecar::SidecarStatus::CachedStandalone),
         build_registries: Box::new(|| {
             let mut r = Registries::new();
-            r.install(&FakeIntegration);
-            r.install(&FakeNativeIntegration);
+            // registry id must match connect_project's hardcoded harness
+            r.harness.register("claude-code", Arc::new(FakeFactory));
+            // so `--harness native` resolves to the same fake.
+            r.harness.register("native", Arc::new(FakeFactory));
             Ok(r)
         }),
     }
@@ -269,7 +249,7 @@ fn explicit_harness_updates_an_existing_project() {
     let mut deps2 = deps_with_fake(&db, out2.clone(), errs2.clone());
     deps2.build_registries = Box::new(|| {
         let mut r = Registries::new();
-        r.install(&FakeNativeIntegration); // claude-code intentionally absent
+        r.harness.register("native", Arc::new(FakeFactory)); // claude-code intentionally absent
         Ok(r)
     });
     let args2: Vec<String> = [
@@ -369,16 +349,6 @@ impl HarnessFactory for BlockingFactory {
     }
 }
 
-struct BlockingIntegration;
-impl Integration for BlockingIntegration {
-    fn id(&self) -> &str {
-        "claude-code"
-    }
-    fn harness(&self) -> Option<Arc<dyn HarnessFactory>> {
-        Some(Arc::new(BlockingFactory))
-    }
-}
-
 #[test]
 #[serial]
 fn run_exits_when_session_demoted_even_without_terminal_event() {
@@ -395,7 +365,7 @@ fn run_exits_when_session_demoted_even_without_terminal_event() {
     let mut deps = deps_with_fake(&db, out.clone(), errs.clone());
     deps.build_registries = Box::new(|| {
         let mut r = Registries::new();
-        r.install(&BlockingIntegration);
+        r.harness.register("claude-code", Arc::new(BlockingFactory));
         Ok(r)
     });
 

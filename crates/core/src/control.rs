@@ -2,7 +2,7 @@ use crate::approval::ApprovalHub;
 use crate::attachments::{AttachmentFetcher, UreqFetcher};
 use crate::domain::{CoreEvent, Message, PermMode, Project, Session};
 use crate::harness::HarnessSession;
-use crate::integration::Registries;
+use crate::plugins::Registries;
 use crate::store::Store;
 use crate::telemetry::{NoopTelemetry, Telemetry};
 use std::collections::HashMap;

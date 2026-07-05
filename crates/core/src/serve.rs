@@ -107,7 +107,7 @@ fn err(e: &anyhow::Error) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integration::Registries;
+    use crate::plugins::Registries;
 
     async fn test_cp() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();

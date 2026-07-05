@@ -27,8 +27,9 @@ pub mod snapshot;
 pub mod tools;
 
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
-use crate::integration::Integration;
+use crate::plugins::{CorePlugin, PluginSource};
 use async_trait::async_trait;
+use ryuzi_plugin_sdk::PluginManifest;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -203,38 +204,42 @@ impl HarnessFactory for NativeHarnessFactory {
     }
 }
 
-/// The `native` integration: plugs into the harness axis only.
-pub struct NativeIntegration {
-    factory: Arc<NativeHarnessFactory>,
+/// The `native` built-in plugin: harness-only, no external binary — the
+/// native runtime runs the agentic loop in-process (see the module doc).
+pub fn native_plugin() -> CorePlugin {
+    native_plugin_with_llm_factory(Arc::new(llm::RouterLlmStreamFactory))
 }
 
-impl NativeIntegration {
-    pub fn new() -> Self {
-        NativeIntegration {
-            factory: Arc::new(NativeHarnessFactory::new()),
-        }
-    }
-
-    /// Construct with a custom LLM stream factory (used by tests).
-    pub fn with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory>) -> Self {
-        NativeIntegration {
-            factory: Arc::new(NativeHarnessFactory::with_llm_factory(llm_factory)),
-        }
-    }
-}
-
-impl Default for NativeIntegration {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Integration for NativeIntegration {
-    fn id(&self) -> &str {
-        NATIVE_ID
-    }
-    fn harness(&self) -> Option<Arc<dyn HarnessFactory>> {
-        Some(self.factory.clone())
+/// Construct with a custom LLM stream factory (used by tests, mirroring the
+/// old `NativeIntegration::with_llm_factory` seam).
+pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory>) -> CorePlugin {
+    CorePlugin {
+        manifest: PluginManifest {
+            contract: 1,
+            id: NATIVE_ID.to_string(),
+            name: "Native (ryuzi)".to_string(),
+            version: "0.0.0".to_string(),
+            publisher: "ryuzi".to_string(),
+            description: "Ryuzi's built-in agent runtime — runs the loop and tools in-process, using your configured model providers".to_string(),
+            homepage: None,
+            icon: Some("cpu".to_string()),
+            categories: vec!["runtime".to_string()],
+            verified: true,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            mcp: vec![],
+            skills: vec![],
+            menu: None,
+            provider: None,
+            runtime: None,
+        },
+        harness: Some(Arc::new(NativeHarnessFactory::with_llm_factory(
+            llm_factory,
+        ))),
+        gateway: None,
+        connector: None,
+        source: PluginSource::Builtin,
     }
 }
 
@@ -274,11 +279,26 @@ mod tests {
     }
 
     #[test]
-    fn native_integration_registers_under_native_id() {
-        let mut regs = crate::integration::Registries::new();
-        regs.install(&NativeIntegration::new());
+    fn native_plugin_registers_under_native_id() {
+        let mut regs = crate::plugins::Registries::new();
+        regs.add_plugin(native_plugin());
         assert!(regs.harness.get("native").is_some());
         assert!(regs.gateway.get("native").is_none());
+    }
+
+    #[test]
+    fn native_plugin_manifest_has_expected_identity() {
+        let plugin = native_plugin();
+        assert_eq!(plugin.manifest.contract, 1);
+        assert_eq!(plugin.manifest.id, "native");
+        assert_eq!(plugin.manifest.name, "Native (ryuzi)");
+        assert_eq!(plugin.manifest.publisher, "ryuzi");
+        assert!(plugin.manifest.verified);
+        assert_eq!(plugin.manifest.categories, vec!["runtime".to_string()]);
+        assert_eq!(plugin.manifest.icon.as_deref(), Some("cpu"));
+        assert!(plugin.harness.is_some());
+        assert!(plugin.gateway.is_none());
+        assert!(plugin.connector.is_none());
     }
 
     #[tokio::test]
@@ -295,8 +315,8 @@ mod tests {
                 message_stop(),
             ]],
         });
-        let integ = NativeIntegration::with_llm_factory(factory);
-        let harness = integ.harness().unwrap().create().unwrap();
+        let plugin = native_plugin_with_llm_factory(factory);
+        let harness = plugin.harness.unwrap().create().unwrap();
         let session = harness
             .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
             .await

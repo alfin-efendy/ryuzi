@@ -20,7 +20,7 @@ fn main() -> ExitCode {
             let mut registries = ryuzi_core::Registries::new();
             // The native runtime needs no external binary, so register it
             // unconditionally.
-            registries.install(&ryuzi_core::harness::native::NativeIntegration::new());
+            registries.add_plugin(ryuzi_core::harness::native::native_plugin());
             // Claude Code needs the ACP sidecar. Resolving it may download the
             // bundled adapter; if that fails (offline, or a native-only setup),
             // skip it rather than failing the whole command — `--harness native`
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
                         // Claude Code session.
                         env_remove: vec!["CLAUDECODE".to_string()],
                     };
-                    registries.install(&ryuzi_core::ClaudeCodeIntegration::new(descriptor));
+                    registries.add_plugin(ryuzi_core::harness::acp::claude_code_plugin(descriptor));
                 }
                 Err(e) => {
                     eprintln!("note: claude-code harness unavailable ({e}); native runtime is still available");

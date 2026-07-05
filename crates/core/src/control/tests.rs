@@ -1,8 +1,8 @@
 use super::*;
 use crate::domain::{AttachmentRef, CoreEvent, NewMessage, SessionStatus};
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
-use crate::integration::Registries;
 use crate::paths::now_ms;
+use crate::plugins::Registries;
 use crate::settings::SettingsStore;
 use async_trait::async_trait;
 use serial_test::serial;

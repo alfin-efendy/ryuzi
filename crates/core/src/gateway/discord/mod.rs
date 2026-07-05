@@ -520,7 +520,7 @@ mod tests {
     use crate::control::ControlPlane;
     use crate::domain::SessionStatus;
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
-    use crate::integration::Registries;
+    use crate::plugins::Registries;
     use crate::settings::SettingsStore;
     use crate::store::Store;
     use crate::telemetry::NoopTelemetry;

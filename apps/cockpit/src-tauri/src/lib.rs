@@ -15,7 +15,9 @@ mod scheduler_cmd;
 mod session_io;
 mod term;
 
-use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
+use ryuzi_core::harness::acp::claude_code_plugin_with_resolver;
+use ryuzi_core::harness::native::native_plugin;
+use ryuzi_core::{AcpAdapterDescriptor, ControlPlane, Registries, Store};
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
@@ -154,9 +156,9 @@ fn build_registries() -> Registries {
     let mut registries = Registries::new();
     // The native runtime needs no external binary — register it unconditionally
     // so projects with `harness = "native"` work in the desktop app.
-    registries.install(&ryuzi_core::harness::native::NativeIntegration::new());
+    registries.add_plugin(native_plugin());
 
-    registries.install(&ClaudeCodeIntegration::with_resolver(|| {
+    registries.add_plugin(claude_code_plugin_with_resolver(|| {
         let mut env = Vec::new();
         if let Some(cli) = resolve_claude_code_executable() {
             env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
