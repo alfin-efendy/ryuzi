@@ -70,7 +70,7 @@ pub fn read_kiro_ide_cache_from(
     .to_string();
 
     let profile_arn = profile_json
-        .and_then(|p| read_profile_arn(p))
+        .and_then(read_profile_arn)
         .map(|arn| normalize_profile_region(&arn));
 
     Ok(ImportedKiro {
