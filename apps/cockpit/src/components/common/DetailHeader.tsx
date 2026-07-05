@@ -16,12 +16,14 @@ export function BackButton({ label, onClick }: { label: string; onClick: () => v
 export function DetailHeader({
   chip,
   title,
+  titleNode,
   titleExtra,
   sub,
   children,
 }: {
   chip: ReactNode;
   title: string;
+  titleNode?: ReactNode;
   titleExtra?: ReactNode;
   sub: string;
   children?: ReactNode;
@@ -31,7 +33,9 @@ export function DetailHeader({
       {chip}
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className="overflow-hidden text-ellipsis whitespace-nowrap text-xl font-semibold tracking-[-0.02em]">{title}</span>
+          {titleNode ?? (
+            <span className="overflow-hidden text-ellipsis whitespace-nowrap text-xl font-semibold tracking-[-0.02em]">{title}</span>
+          )}
           {titleExtra}
         </div>
         <div className="text-[12.5px] text-muted-foreground">{sub}</div>

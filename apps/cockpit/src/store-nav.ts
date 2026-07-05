@@ -9,6 +9,7 @@ export type View =
   | { kind: "home" }
   | { kind: "session" }
   | { kind: "models" }
+  | { kind: "providerDetail"; provider: string }
   | { kind: "connectionDetail"; id: string }
   | { kind: "runtime" }
   | { kind: "runtimeDetail"; id: AgentId }

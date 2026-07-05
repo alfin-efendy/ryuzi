@@ -41,7 +41,7 @@ import { StatusDot } from "@/components/common/bits";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
-  { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "connectionDetail"] },
+  { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail", "connectionDetail"] },
   { label: "Runtime", icon: Bot, view: { kind: "runtime" }, group: ["runtime", "runtimeDetail"] },
   { label: "Scheduler", icon: CalendarClock, view: { kind: "scheduler" }, group: ["scheduler", "jobDetail", "jobNew"] },
   { label: "Apps", icon: LayoutGrid, view: { kind: "apps" }, group: ["apps", "appDetail", "registry"] },

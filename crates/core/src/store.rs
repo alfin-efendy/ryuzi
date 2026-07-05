@@ -217,8 +217,10 @@ fn migrations() -> Migrations<'static> {
         ),
         // Models & Runtime batch (design: docs/design/2026-07-04-models-runtime-design.md):
         // provider connections carry real credentials; endpoint_keys gate the
-        // local router endpoint. Keys are plaintext by design (config-apply
-        // must re-read them; OS-keychain encryption is future work).
+        // local router endpoint. Secret columns/fields are encrypted at rest
+        // by secrets::SecretCipher (value-level `enc:` sentinel, no schema
+        // change); config-apply still re-reads the literal key because
+        // row_to_key decrypts on read.
         M::up(
             "CREATE TABLE provider_connections (\
                 id TEXT PRIMARY KEY,\
@@ -372,7 +374,14 @@ where
 {
     let conn = pool.get().await?;
     let out = conn
-        .interact(f)
+        .interact(move |c| {
+            // Pooled connections + WAL still return SQLITE_BUSY immediately on
+            // write contention (e.g. a request's read racing a detached
+            // usage-record / prune write). A busy_timeout makes them wait
+            // instead of erroring — otherwise concurrent load surfaces as a 500.
+            let _ = c.busy_timeout(std::time::Duration::from_secs(5));
+            f(c)
+        })
         .await
         .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
     Ok(out)
@@ -383,7 +392,14 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let cfg = Config::new(path);
+        // Single pooled connection. The store is low-QPS and SQLite is
+        // single-writer anyway; more importantly, multiple WAL connections do
+        // not reliably share the schema/writes on every filesystem — CI hit
+        // "no such table" when a request's read landed on a different pooled
+        // connection than the one migrations/writes ran on. One connection
+        // serializes access and sidesteps that class of bug entirely.
+        let mut cfg = Config::new(path);
+        cfg.pool = Some(deadpool_sqlite::PoolConfig::new(1));
         let pool = cfg.create_pool(Runtime::Tokio1)?;
         interact_on(&pool, |c| {
             let _ = c.pragma_update(None, "journal_mode", "WAL");

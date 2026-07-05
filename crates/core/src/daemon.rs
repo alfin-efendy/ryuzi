@@ -14,6 +14,7 @@ use crate::gateway::{Gateway, GatewayFactory};
 use crate::harness::acp::{claude_code_plugin, AcpAdapterDescriptor};
 use crate::harness::native::native_plugin;
 use crate::harness::HarnessFactory;
+use crate::llm_router::secrets;
 use crate::plugins::Registries;
 use crate::policy;
 use crate::router::Router;
@@ -205,6 +206,10 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
+    // One-time (idempotent) upgrade of any legacy plaintext secrets to
+    // encrypted-at-rest; see `llm_router::secrets::init_and_sweep`'s doc for
+    // the atomicity/idempotency/degraded-state contract.
+    secrets::init_and_sweep(&store).await;
 
     let telemetry: Arc<dyn Telemetry> = match opts.telemetry {
         Some(t) => t,

@@ -48,6 +48,9 @@ pub struct ProviderDescriptor {
     /// True for free-tier passthrough providers that need no credential
     /// (distinct from `AuthScheme::None`, which just means "no header sent").
     pub no_auth: bool,
+    /// Set for providers that authenticate via an AWS SSO-OIDC device-code
+    /// flow (Kiro) rather than redirect+PKCE OAuth or a static API key.
+    pub device_flow: Option<DeviceFlowConfig>,
 }
 
 /// How the OAuth redirect (loopback) listener is bound.
@@ -69,6 +72,42 @@ pub struct OAuthConfig {
     pub max_refresh_age_ms: Option<i64>,
 }
 
+/// AWS SSO-OIDC device-code flow config (Kiro). Distinct from `OAuthConfig`
+/// (redirect+PKCE): device flow has register/device-auth/token endpoints and
+/// no redirect. Ported from 9router (MIT, (c) 2024-2026 decolua and contributors).
+pub struct DeviceFlowConfig {
+    pub register_url: &'static str,
+    pub device_auth_url: &'static str,
+    pub token_url: &'static str,
+    pub client_name: &'static str,
+    pub scopes: &'static [&'static str],
+    pub grant_types: &'static [&'static str],
+    pub issuer_url: &'static str,
+    pub start_url: &'static str,
+    /// Proactive refresh lead (ms). Kiro has no provider-specific value in
+    /// 9router; use the generic 5-minute buffer.
+    pub refresh_lead_ms: i64,
+}
+
+pub const KIRO_DEVICE_FLOW: DeviceFlowConfig = DeviceFlowConfig {
+    register_url: "https://oidc.us-east-1.amazonaws.com/client/register",
+    device_auth_url: "https://oidc.us-east-1.amazonaws.com/device_authorization",
+    token_url: "https://oidc.us-east-1.amazonaws.com/token",
+    client_name: "kiro-oauth-client",
+    scopes: &[
+        "codewhisperer:completions",
+        "codewhisperer:analysis",
+        "codewhisperer:conversations",
+    ],
+    grant_types: &[
+        "urn:ietf:params:oauth:grant-type:device_code",
+        "refresh_token",
+    ],
+    issuer_url: "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6",
+    start_url: "https://view.awsapps.com/start",
+    refresh_lead_ms: 300_000,
+};
+
 use ProviderCategory::*;
 
 pub const CATALOG: &[ProviderDescriptor] = &[
@@ -85,6 +124,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "openai",
@@ -99,6 +139,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "openrouter",
@@ -113,6 +154,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "groq",
@@ -127,6 +169,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "deepseek",
@@ -141,6 +184,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "mistral",
@@ -155,6 +199,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "xai",
@@ -169,6 +214,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "google",
@@ -183,6 +229,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "ollama",
@@ -197,6 +244,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "custom-openai",
@@ -211,6 +259,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: true,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "custom-anthropic",
@@ -225,6 +274,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: true,
         oauth: None,
         no_auth: false,
+        device_flow: None,
     },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
     // Not connectable in F1 (add_connection refuses non-ApiKey categories).
@@ -249,6 +299,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
             max_refresh_age_ms: None,
         }),
         no_auth: false,
+        device_flow: None,
     },
     ProviderDescriptor {
         id: "openai-oauth",
@@ -271,6 +322,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
             max_refresh_age_ms: Some(691_200_000),
         }),
         no_auth: false,
+        device_flow: None,
         // NOTE: openai-oauth upstream is chatgpt.com/backend-api/codex/responses
         // (Responses wire) — applied in server.rs, not via base_url here.
     },
@@ -283,10 +335,19 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         format: ApiFormat::OpenAi,
         base_url: None,
         auth: AuthScheme::Bearer,
-        models: &[],
-        requires_base_url: true,
+        models: &[
+            "claude-sonnet-5",
+            "claude-sonnet-4.5",
+            "claude-haiku-4.5",
+            "deepseek-3.2",
+            "qwen3-coder-next",
+            "glm-5",
+            "MiniMax-M2.5",
+        ],
+        requires_base_url: false,
         oauth: None,
         no_auth: false,
+        device_flow: Some(KIRO_DEVICE_FLOW),
     },
     ProviderDescriptor {
         id: "opencode-free",
@@ -301,6 +362,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         requires_base_url: false,
         oauth: None,
         no_auth: true,
+        device_flow: None,
     },
 ];
 
@@ -310,6 +372,10 @@ pub fn descriptor(id: &str) -> Option<&'static ProviderDescriptor> {
 
 pub fn oauth_config(id: &str) -> Option<&'static OAuthConfig> {
     descriptor(id).and_then(|d| d.oauth.as_ref())
+}
+
+pub fn device_flow_config(id: &str) -> Option<&'static DeviceFlowConfig> {
+    descriptor(id).and_then(|d| d.device_flow.as_ref())
 }
 
 #[cfg(test)]
@@ -322,7 +388,7 @@ mod tests {
         for d in CATALOG {
             assert!(seen.insert(d.id), "duplicate id {}", d.id);
             assert!(!d.name.is_empty());
-            if !d.requires_base_url {
+            if !d.requires_base_url && d.device_flow.is_none() {
                 let url = d.base_url.expect("fixed-URL provider needs base_url");
                 assert!(url.starts_with("https://") || url.starts_with("http://127.0.0.1"));
                 assert!(!url.ends_with('/'), "no trailing slash: {}", url);
@@ -380,5 +446,31 @@ mod tests {
         assert_eq!(d.category, ProviderCategory::Free);
         assert!(d.no_auth);
         assert_eq!(d.base_url, Some("https://opencode.ai/zen/v1"));
+    }
+
+    #[test]
+    fn kiro_is_a_device_flow_provider() {
+        let d = descriptor("kiro").expect("kiro present");
+        assert!(matches!(d.category, ProviderCategory::Free));
+        assert!(d.oauth.is_none());
+        let df = device_flow_config("kiro").expect("kiro device flow");
+        assert_eq!(
+            df.register_url,
+            "https://oidc.us-east-1.amazonaws.com/client/register"
+        );
+        assert_eq!(
+            df.scopes,
+            &[
+                "codewhisperer:completions",
+                "codewhisperer:analysis",
+                "codewhisperer:conversations"
+            ]
+        );
+        assert_eq!(
+            df.issuer_url,
+            "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
+        );
+        assert_eq!(df.refresh_lead_ms, 300_000);
+        assert!(d.models.contains(&"claude-sonnet-4.5"));
     }
 }

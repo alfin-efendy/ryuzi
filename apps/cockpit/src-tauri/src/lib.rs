@@ -263,6 +263,14 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::remove_connection,
             connections_cmd::move_connection,
             connections_cmd::test_connection,
+            connections_cmd::test_connection_model,
+            connections_cmd::connection_provider_quota,
+            connections_cmd::reset_codex_credit,
+            connections_cmd::list_model_routes,
+            connections_cmd::save_model_route,
+            connections_cmd::delete_model_route,
+            connections_cmd::provider_account_route,
+            connections_cmd::set_provider_account_route,
             connections_cmd::connect_oauth,
             connections_cmd::reconnect_oauth,
             connections_cmd::begin_oauth_manual,
@@ -279,9 +287,13 @@ fn make_builder() -> Builder<tauri::Wry> {
             session_io::export_session,
             session_io::import_session,
             session_io::share_session,
+            connections_cmd::start_kiro_device_flow,
+            connections_cmd::await_kiro_device_flow,
+            connections_cmd::import_kiro_token,
         ])
         .events(collect_events![
             events::CoreEventMsg,
+            events::OauthAuthorizeUrlMsg,
             accent::AccentChangedMsg,
             term::TermOutputMsg,
             term::TermExitMsg
@@ -327,6 +339,11 @@ pub fn run() {
                 let store = Store::open(&ryuzi_core::paths::db_path())
                     .await
                     .expect("open ryuzi db");
+                // One-time (idempotent) upgrade of any legacy plaintext
+                // secrets to encrypted-at-rest; see
+                // `llm_router::secrets::init_and_sweep`'s doc for the
+                // atomicity/idempotency/degraded-state contract.
+                ryuzi_core::llm_router::secrets::init_and_sweep(&store).await;
                 let registries = build_registries();
                 ControlPlane::new(store, registries).await
             });

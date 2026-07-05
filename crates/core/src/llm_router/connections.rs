@@ -1,6 +1,9 @@
 //! Provider connections: a provider + credential + priority row the router
-//! can route requests through. Secrets live in the `data` JSON blob.
+//! can route requests through. Secrets live in the `data` JSON blob, encrypted
+//! at rest field-by-field via [`crate::llm_router::secrets`] (decrypted
+//! transparently on read).
 use crate::llm_router::registry::ProviderDescriptor;
+use crate::llm_router::secrets;
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -11,7 +14,9 @@ pub struct ConnectionData {
     pub api_key: Option<String>,
     pub base_url_override: Option<String>,
     pub models_override: Option<Vec<String>>,
-    // OAuth (auth_type == "oauth"): tokens stored plaintext (F3 = keychain).
+    // OAuth (auth_type == "oauth"): tokens are encrypted at rest via
+    // secrets::SecretCipher (keychain-derived master key, file fallback when
+    // the keychain is unavailable) and decrypted transparently on read.
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
@@ -37,6 +42,8 @@ const COLS: &str = "id,provider,auth_type,label,priority,enabled,data,created_at
 
 fn row_to_conn(r: &Row) -> rusqlite::Result<ConnectionRow> {
     let raw: String = r.get(6)?;
+    let mut data: ConnectionData = serde_json::from_str(&raw).unwrap_or_default();
+    secrets::decrypt_conn_data(&mut data);
     Ok(ConnectionRow {
         id: r.get(0)?,
         provider: r.get(1)?,
@@ -44,7 +51,7 @@ fn row_to_conn(r: &Row) -> rusqlite::Result<ConnectionRow> {
         label: r.get(3)?,
         priority: r.get(4)?,
         enabled: r.get::<_, i64>(5)? != 0,
-        data: serde_json::from_str(&raw).unwrap_or_default(),
+        data,
         created_at: r.get(7)?,
         updated_at: r.get(8)?,
     })
@@ -81,7 +88,9 @@ pub async fn get_connection(store: &Store, id: &str) -> anyhow::Result<Option<Co
 /// Insert a connection. `row.priority` is IGNORED — the new row is always
 /// appended at the end (MAX(priority)+1); reorder with [`move_connection`].
 pub async fn add_connection(store: &Store, row: ConnectionRow) -> anyhow::Result<()> {
-    let data = serde_json::to_string(&row.data)?;
+    let mut d = row.data.clone();
+    secrets::encrypt_conn_data(&mut d);
+    let data = serde_json::to_string(&d)?;
     store
         .with_conn(move |c| {
             c.execute(
@@ -102,7 +111,9 @@ pub async fn add_connection(store: &Store, row: ConnectionRow) -> anyhow::Result
 /// NOT written — identity is fixed and ordering changes go through
 /// [`move_connection`].
 pub async fn update_connection(store: &Store, row: ConnectionRow) -> anyhow::Result<()> {
-    let data = serde_json::to_string(&row.data)?;
+    let mut d = row.data.clone();
+    secrets::encrypt_conn_data(&mut d);
+    let data = serde_json::to_string(&d)?;
     store
         .with_conn(move |c| {
             c.execute(
@@ -169,6 +180,56 @@ pub fn is_oauth(row: &ConnectionRow) -> bool {
     row.auth_type == "oauth"
 }
 
+/// Kiro `provider_specific` accessors. The blob shape mirrors 9router:
+/// { authMethod, profileArn?, region?, clientId?, clientSecret? }.
+/// Ported from 9router (MIT, (c) 2024-2026 decolua and contributors).
+pub fn kiro_auth_method(d: &ConnectionData) -> String {
+    d.provider_specific
+        .as_ref()
+        .and_then(|v| v.get("authMethod"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("builder-id")
+        .to_string()
+}
+
+pub fn kiro_profile_arn(d: &ConnectionData) -> Option<String> {
+    d.provider_specific
+        .as_ref()
+        .and_then(|v| v.get("profileArn"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+pub fn kiro_region(d: &ConnectionData) -> String {
+    d.provider_specific
+        .as_ref()
+        .and_then(|v| v.get("region"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("us-east-1")
+        .to_string()
+}
+
+pub fn kiro_client_creds(d: &ConnectionData) -> Option<(String, String)> {
+    let ps = d.provider_specific.as_ref()?;
+    let id = ps.get("clientId")?.as_str()?.to_string();
+    let secret = ps.get("clientSecret")?.as_str()?.to_string();
+    Some((id, secret))
+}
+
+pub fn is_account_bound(auth_method: &str) -> bool {
+    matches!(auth_method, "api_key" | "idc" | "external_idp")
+}
+
+/// Shared default CodeWhisperer profile ARN for non-account-bound auth.
+pub fn default_profile_arn(auth_method: &str) -> &'static str {
+    match auth_method {
+        "google" | "github" => "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK",
+        _ => "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX",
+    }
+}
+
 pub fn effective_base_url(desc: &ProviderDescriptor, row: &ConnectionRow) -> Option<String> {
     row.data
         .base_url_override
@@ -217,6 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn crud_and_priority_ordering() {
+        secrets::use_test_key_file();
         let store = mem_store().await;
         add_connection(&store, row("c1", "openai", 0))
             .await
@@ -280,5 +342,87 @@ mod tests {
         assert!(is_oauth(&r));
         r.auth_type = "api_key".into();
         assert!(!is_oauth(&r));
+    }
+
+    #[tokio::test]
+    async fn at_rest_data_is_ciphertext() {
+        secrets::use_test_key_file();
+        let store = mem_store().await;
+        add_connection(&store, row("c1", "openai", 0))
+            .await
+            .unwrap();
+        let raw: String = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT data FROM provider_connections WHERE id=?1",
+                    params!["c1"],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            !raw.contains("sk-test"),
+            "raw data must not contain plaintext secret: {raw}"
+        );
+        assert!(
+            raw.contains("enc:v1:"),
+            "raw data must contain encrypted marker: {raw}"
+        );
+
+        // Decrypt-on-read is transparent: the row still reads back as plaintext.
+        let list = list_connections(&store).await.unwrap();
+        assert_eq!(list[0].data.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn encrypt_conn_data_is_idempotent() {
+        secrets::use_test_key_file();
+        let mut d = ConnectionData {
+            api_key: Some("sk-test".into()),
+            provider_specific: Some(serde_json::json!({"clientSecret": "shh"})),
+            ..Default::default()
+        };
+        secrets::encrypt_conn_data(&mut d);
+        let once = d.clone();
+        secrets::encrypt_conn_data(&mut d);
+        assert_eq!(
+            d, once,
+            "re-encrypting an already-encrypted row must be a no-op"
+        );
+
+        secrets::decrypt_conn_data(&mut d);
+        assert_eq!(d.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            d.provider_specific,
+            Some(serde_json::json!({"clientSecret": "shh"}))
+        );
+    }
+
+    #[test]
+    fn kiro_accessors_read_provider_specific() {
+        let d = ConnectionData {
+            provider_specific: Some(serde_json::json!({
+                "authMethod": "idc", "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/X",
+                "region": "eu-west-1", "clientId": "c", "clientSecret": "s"
+            })),
+            ..Default::default()
+        };
+        assert_eq!(kiro_auth_method(&d), "idc");
+        assert_eq!(kiro_region(&d), "eu-west-1");
+        assert_eq!(kiro_client_creds(&d), Some(("c".into(), "s".into())));
+        assert!(is_account_bound(&kiro_auth_method(&d)));
+        let empty = ConnectionData::default();
+        assert_eq!(kiro_auth_method(&empty), "builder-id");
+        assert_eq!(kiro_region(&empty), "us-east-1");
+        assert!(kiro_profile_arn(&empty).is_none());
+        assert_eq!(
+            default_profile_arn("github"),
+            "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+        );
+        assert_eq!(
+            default_profile_arn("builder-id"),
+            "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+        );
     }
 }

@@ -1,8 +1,14 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, UsageSeries } from "@/bindings";
+import type { CatalogEntry, ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, ModelRouteInfo, UsageSeries } from "@/bindings";
 
-const status: EndpointStatusInfo = { running: true, port: 8899, baseUrl: "http://127.0.0.1:8899/v1", autostart: false };
+const status: EndpointStatusInfo = {
+  running: true,
+  port: 8899,
+  baseUrl: "http://127.0.0.1:8899/v1",
+  autostart: false,
+  keychainStatus: "ok",
+};
 
 const keys: EndpointKeyInfo[] = [{ id: "k1", name: "VS Code", key: "rz-live-abc123", createdAt: 1751500800000, lastUsedAt: null }];
 
@@ -22,6 +28,50 @@ const connection: ConnectionInfo = {
   needsRelogin: false,
 };
 
+const secondConnection: ConnectionInfo = {
+  ...connection,
+  id: "c2",
+  label: "Personal OpenAI",
+  priority: 1,
+  keyMasked: "sk-…zz99",
+  models: ["gpt-4.1"],
+};
+
+const catalog: CatalogEntry[] = [
+  {
+    id: "openai",
+    name: "OpenAI",
+    color: "#10A37F",
+    initial: "O",
+    category: "api_key",
+    format: "openai",
+    requiresBaseUrl: false,
+    models: ["gpt-4.1", "o3"],
+  },
+  {
+    id: "anthropic",
+    name: "Anthropic",
+    color: "#D97757",
+    initial: "A",
+    category: "api_key",
+    format: "anthropic",
+    requiresBaseUrl: false,
+    models: ["claude-sonnet-4-5"],
+  },
+];
+
+const routes: ModelRouteInfo[] = [
+  {
+    id: "r1",
+    name: "smart",
+    enabled: true,
+    strategy: "fallback",
+    targets: [{ connectionId: "c1", model: "gpt-4.1" }],
+    createdAt: 1751500800000,
+    updatedAt: 1751500800000,
+  },
+];
+
 const usage: UsageSeries = {
   days: [
     { day: "2026-07-03", requests: 4, inputTokens: 1200, outputTokens: 300 },
@@ -37,16 +87,35 @@ mock.module("@/bindings", () => ({
   commands: {
     endpointStatus: () => Promise.resolve({ status: "ok", data: status }),
     listEndpointKeys: () => Promise.resolve({ status: "ok", data: keys }),
-    listProviderCatalog: () => Promise.resolve({ status: "ok", data: [] }),
-    listConnections: () => Promise.resolve({ status: "ok", data: [connection] }),
+    listProviderCatalog: () => Promise.resolve({ status: "ok", data: catalog }),
+    listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
+    listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
+    saveModelRoute: (_route: ModelRouteInfo) => Promise.resolve({ status: "ok", data: routes }),
+    deleteModelRoute: (_id: string) => Promise.resolve({ status: "ok", data: [] }),
+    providerAccountRoute: (provider: string) => Promise.resolve({ status: "ok", data: { provider, strategy: "fallback" } }),
+    setProviderAccountRoute: (provider: string, strategy: string) => Promise.resolve({ status: "ok", data: { provider, strategy } }),
+    connectionUsage: () => Promise.resolve({ status: "ok", data: usage }),
     endpointUsage: () => Promise.resolve({ status: "ok", data: usage }),
+    updateConnection: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
+    moveConnection: () => Promise.resolve({ status: "ok", data: [secondConnection, connection] }),
+    testConnection: () => Promise.resolve({ status: "ok", data: { ok: true, message: "Connection OK" } }),
+    testConnectionModel: () => Promise.resolve({ status: "ok", data: { ok: true, message: "Model OK" } }),
+  },
+  events: {
+    oauthAuthorizeUrlMsg: {
+      listen: () => Promise.resolve(() => {}),
+    },
   },
 }));
 
 const { ModelsView } = await import("./ModelsView");
+const { ProviderDetailView } = await import("./ProviderDetailView");
+const { ConnectionDetailView } = await import("./ConnectionDetailView");
 const { useEndpoint } = await import("@/store-endpoint");
 const { useConnections } = await import("@/store-connections");
+const { useModelRoutes } = await import("@/store-model-routes");
 const { useUsage } = await import("@/store-usage");
+const { useNav } = await import("@/store-nav");
 
 // The zustand singletons are shared across test files in one bun process, so
 // reset BEFORE each test too — an earlier file's hydration (with its own
@@ -54,7 +123,9 @@ const { useUsage } = await import("@/store-usage");
 function resetStores() {
   useEndpoint.setState({ status: null, keys: [], loaded: false });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
+  useModelRoutes.setState({ routes: [], loaded: false });
   useUsage.setState({ byConnection: {}, endpoint: null });
+  useNav.setState({ history: { back: [], current: { kind: "models" }, forward: [] } });
 }
 
 beforeEach(resetStores);
@@ -64,19 +135,33 @@ afterEach(() => {
   resetStores();
 });
 
-test("renders the Models heading and endpoint status after hydration", async () => {
+test("renders provider list first with tab order Providers, Route, Endpoint", async () => {
   render(<ModelsView />);
 
-  await screen.findByText("Running on http://127.0.0.1:8899/v1");
+  await screen.findByRole("button", { name: "OpenAI 2 accounts 2 models" });
   expect(screen.getByRole("heading", { level: 2, name: "Models" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Endpoint" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Providers" })).toBeTruthy();
+  const tabs = screen
+    .getAllByRole("button")
+    .map((button) => button.textContent?.trim())
+    .filter(Boolean);
+  expect(tabs.slice(0, 3)).toEqual(["Providers", "Route", "Endpoint"]);
+  expect(screen.getByRole("button", { name: "OpenAI 2 accounts 2 models" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Anthropic No accounts 1 catalog model" })).toBeTruthy();
+  expect(screen.queryByText("Work OpenAI")).toBeNull();
+});
+
+test("provider list shows Add connection above provider rows", async () => {
+  render(<ModelsView />);
+
+  await screen.findByRole("button", { name: "OpenAI 2 accounts 2 models" });
+  const labels = screen.getAllByRole("button").map((button) => button.textContent?.trim() ?? "");
+  expect(labels.indexOf("Add connection")).toBeLessThan(labels.findIndex((label) => label.includes("OpenAI")));
 });
 
 test("seeds the settings form from the hydrated endpoint status", async () => {
   render(<ModelsView />);
 
+  fireEvent.click(await screen.findByRole("button", { name: "Endpoint" }));
   expect(await screen.findByDisplayValue("8899")).toBeTruthy();
   const autostart = screen.getByRole("switch", { name: "Start automatically with Cockpit" });
   expect(autostart.getAttribute("aria-checked")).toBe("false");
@@ -86,6 +171,7 @@ test("seeds the settings form from the hydrated endpoint status", async () => {
 test("lists endpoint API keys with revoke and create controls", async () => {
   render(<ModelsView />);
 
+  fireEvent.click(await screen.findByRole("button", { name: "Endpoint" }));
   await screen.findByText("VS Code");
   expect(screen.getByText("rz-live-abc123")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy();
@@ -93,25 +179,83 @@ test("lists endpoint API keys with revoke and create controls", async () => {
   expect(newKey.disabled).toBe(true);
 });
 
-test("switching to the Providers tab shows connections instead of endpoint settings", async () => {
-  render(<ModelsView />);
-  await screen.findByText("Running on http://127.0.0.1:8899/v1");
+test("provider detail shows accounts for the selected provider", async () => {
+  useConnections.setState({ catalog, connections: [connection, secondConnection], loaded: true });
+  render(<ProviderDetailView provider="openai" />);
 
-  fireEvent.click(screen.getByRole("button", { name: "Providers" }));
-
-  await screen.findByText("Work OpenAI");
-  expect(screen.getByRole("switch", { name: "Enabled" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Test" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Add connection" })).toBeTruthy();
-  expect(screen.queryByText("Running on http://127.0.0.1:8899/v1")).toBeNull();
+  expect(screen.getByRole("heading", { level: 2, name: "OpenAI" })).toBeTruthy();
+  expect(await screen.findByText("2 active · By order")).toBeTruthy();
+  expect(screen.getByText("Accounts")).toBeTruthy();
+  expect(screen.getByText("Account routing")).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Account routing" })).toBeTruthy();
+  expect(screen.getByText("Work OpenAI")).toBeTruthy();
+  expect(screen.getByText("Personal OpenAI")).toBeTruthy();
+  expect(screen.getAllByRole("switch", { name: "Enabled" })).toHaveLength(2);
+  expect(screen.getByRole("button", { name: "Add account" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Move Work OpenAI down" })).toBeTruthy();
+  expect(screen.getByText("Usage")).toBeTruthy();
+  expect(screen.getAllByText("Models").length).toBeGreaterThan(0);
+  expect(screen.getByText("gpt-4.1")).toBeTruthy();
 });
 
-test("shows empty states for API keys and connections", async () => {
-  useEndpoint.setState({ status, keys: [], loaded: true });
-  useConnections.setState({ catalog: [], connections: [], loaded: true });
+test("Route tab lists model route aliases and their ordered targets", async () => {
   render(<ModelsView />);
 
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+
+  expect(await screen.findByText("smart")).toBeTruthy();
+  expect(screen.getByText("By order")).toBeTruthy();
+  expect(screen.getByText("OpenAI / gpt-4.1")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "New route" })).toBeTruthy();
+});
+
+test("connection detail back returns to its provider detail", () => {
+  useConnections.setState({ catalog, connections: [connection], loaded: true });
+  render(<ConnectionDetailView id="c1" />);
+
+  expect(screen.getByRole("button", { name: "OpenAI" })).toBeTruthy();
+  expect(screen.queryByText("Usage")).toBeNull();
+  expect(screen.queryByText("Models")).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "OpenAI" }));
+  expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "openai" });
+});
+
+test("warns when secrets fall back to a local file instead of the OS keychain", async () => {
+  useEndpoint.setState({ status: { ...status, keychainStatus: "fileFallback" }, keys, loaded: true });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Endpoint" }));
+  await screen.findByText("Secrets are stored in a local file, not the OS keychain.");
+  expect(screen.queryByText("Secrets are stored unencrypted — no OS keychain available.")).toBeNull();
+});
+
+test("warns more strongly when no keychain or file fallback is available", async () => {
+  useEndpoint.setState({ status: { ...status, keychainStatus: "unavailable" }, keys, loaded: true });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Endpoint" }));
+  await screen.findByText("Secrets are stored unencrypted — no OS keychain available.");
+});
+
+test("shows no keychain warning when the master key is in the OS keychain", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Endpoint" }));
+  await screen.findByText("Running on http://127.0.0.1:8899/v1");
+  expect(screen.queryByText("Secrets are stored in a local file, not the OS keychain.")).toBeNull();
+  expect(screen.queryByText("Secrets are stored unencrypted — no OS keychain available.")).toBeNull();
+});
+
+test("shows empty states for API keys, providers, and routes", async () => {
+  useEndpoint.setState({ status, keys: [], loaded: true });
+  useConnections.setState({ catalog: [], connections: [], loaded: true });
+  useModelRoutes.setState({ routes: [], loaded: true });
+  render(<ModelsView />);
+
+  expect(await screen.findByText("No providers in the catalog yet.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Route" }));
+  expect(screen.getByText("No routes yet. Create a route alias to expose a combo-style model.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Endpoint" }));
   expect(await screen.findByText("No API keys yet — create one for external tools.")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Providers" }));
-  expect(screen.getByText("No connections yet. Add a provider connection to route models through Ryuzi.")).toBeTruthy();
 });
