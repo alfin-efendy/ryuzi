@@ -1,5 +1,7 @@
 //! Provider connections: a provider + credential + priority row the router
-//! can route requests through. Secrets live in the `data` JSON blob.
+//! can route requests through. Secrets live in the `data` JSON blob, encrypted
+//! at rest field-by-field via [`crate::llm_router::secrets`] (decrypted
+//! transparently on read).
 use crate::llm_router::registry::ProviderDescriptor;
 use crate::llm_router::secrets;
 use crate::store::Store;
@@ -12,7 +14,9 @@ pub struct ConnectionData {
     pub api_key: Option<String>,
     pub base_url_override: Option<String>,
     pub models_override: Option<Vec<String>>,
-    // OAuth (auth_type == "oauth"): tokens stored plaintext (F3 = keychain).
+    // OAuth (auth_type == "oauth"): tokens are encrypted at rest via
+    // secrets::SecretCipher (keychain-derived master key, file fallback when
+    // the keychain is unavailable) and decrypted transparently on read.
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
