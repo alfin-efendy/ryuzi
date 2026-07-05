@@ -37,9 +37,9 @@ impl SecretCipher {
         if !s.starts_with("enc:") {
             return Ok(s.to_string()); // legacy plaintext
         }
-        let b64 = s
-            .strip_prefix(ENC_PREFIX)
-            .ok_or_else(|| anyhow::anyhow!("unknown secret encoding: {}", &s[..s.len().min(12)]))?;
+        let b64 = s.strip_prefix(ENC_PREFIX).ok_or_else(|| {
+            anyhow::anyhow!("unknown secret encoding: {}", s.get(..12).unwrap_or(s))
+        })?;
         let blob = URL_SAFE_NO_PAD.decode(b64)?;
         if blob.len() < 24 {
             anyhow::bail!("secret blob too short");
@@ -100,5 +100,15 @@ mod tests {
     #[test]
     fn unknown_enc_version_errors_not_passthrough() {
         assert!(cipher().decrypt("enc:v2:whatever").is_err());
+    }
+
+    #[test]
+    fn unknown_version_with_multibyte_char_does_not_panic() {
+        // `enc:v2:` is 7 bytes, `1234` is 4 (through byte 10), so the 2-byte
+        // 'é' occupies bytes 11-12 — byte index 12 lands *inside* it and is not
+        // a char boundary. The error arm must not raw-slice `&s[..12]` (panics);
+        // it must return Err, not panic.
+        let c = SecretCipher::from_key([7u8; 32]);
+        assert!(c.decrypt("enc:v2:1234é_padding_here").is_err());
     }
 }
