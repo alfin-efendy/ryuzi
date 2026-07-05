@@ -17,11 +17,11 @@ expression: text
  │   Approver role IDs                (unset)                                 │
  │   OTel endpoint                    (unset)                                 │
  │   Max concurrent runs              3                                       │
+ │   Max sub-agent spawn depth        2                                       │
  │   Approval timeout (ms)            300000                                  │
  │   Attachment max bytes             26214400                                │
  │   Attachment max count             10                                      │
  │   Attachment allowed extensions    (unset)                                 │
- │   Attachment allowed hosts         cdn.discordapp.com,media.discordapp.net │
  │ ↑↓ select · Enter edit · Space toggle provider · Esc cancel                │
  ╰────────────────────────────────────────────────────────────────────────────╯
  Tab switch  ·  ↑↓ select  ·  Enter edit  ·  ? options  ·  q quit
