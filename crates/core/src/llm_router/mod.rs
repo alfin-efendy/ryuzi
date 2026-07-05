@@ -11,6 +11,7 @@ pub mod quota;
 pub mod registry;
 pub mod responses;
 pub mod routes;
+pub mod secrets;
 pub mod server;
 pub mod sse;
 pub mod translate;

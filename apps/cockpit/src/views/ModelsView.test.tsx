@@ -2,7 +2,13 @@ import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { CatalogEntry, ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, ModelRouteInfo, UsageSeries } from "@/bindings";
 
-const status: EndpointStatusInfo = { running: true, port: 8899, baseUrl: "http://127.0.0.1:8899/v1", autostart: false };
+const status: EndpointStatusInfo = {
+  running: true,
+  port: 8899,
+  baseUrl: "http://127.0.0.1:8899/v1",
+  autostart: false,
+  keychainStatus: "ok",
+};
 
 const keys: EndpointKeyInfo[] = [{ id: "k1", name: "VS Code", key: "rz-live-abc123", createdAt: 1751500800000, lastUsedAt: null }];
 
@@ -134,7 +140,10 @@ test("renders provider list first with tab order Providers, Route, Endpoint", as
 
   await screen.findByRole("button", { name: "OpenAI 2 accounts 2 models" });
   expect(screen.getByRole("heading", { level: 2, name: "Models" })).toBeTruthy();
-  const tabs = screen.getAllByRole("button").map((button) => button.textContent?.trim()).filter(Boolean);
+  const tabs = screen
+    .getAllByRole("button")
+    .map((button) => button.textContent?.trim())
+    .filter(Boolean);
   expect(tabs.slice(0, 3)).toEqual(["Providers", "Route", "Endpoint"]);
   expect(screen.getByRole("button", { name: "OpenAI 2 accounts 2 models" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Anthropic No accounts 1 catalog model" })).toBeTruthy();
@@ -146,9 +155,7 @@ test("provider list shows Add connection above provider rows", async () => {
 
   await screen.findByRole("button", { name: "OpenAI 2 accounts 2 models" });
   const labels = screen.getAllByRole("button").map((button) => button.textContent?.trim() ?? "");
-  expect(labels.findIndex((label) => label === "Add connection")).toBeLessThan(
-    labels.findIndex((label) => label.includes("OpenAI")),
-  );
+  expect(labels.indexOf("Add connection")).toBeLessThan(labels.findIndex((label) => label.includes("OpenAI")));
 });
 
 test("seeds the settings form from the hydrated endpoint status", async () => {
@@ -212,6 +219,32 @@ test("connection detail back returns to its provider detail", () => {
 
   fireEvent.click(screen.getByRole("button", { name: "OpenAI" }));
   expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "openai" });
+});
+
+test("warns when secrets fall back to a local file instead of the OS keychain", async () => {
+  useEndpoint.setState({ status: { ...status, keychainStatus: "fileFallback" }, keys, loaded: true });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Endpoint" }));
+  await screen.findByText("Secrets are stored in a local file, not the OS keychain.");
+  expect(screen.queryByText("Secrets are stored unencrypted — no OS keychain available.")).toBeNull();
+});
+
+test("warns more strongly when no keychain or file fallback is available", async () => {
+  useEndpoint.setState({ status: { ...status, keychainStatus: "unavailable" }, keys, loaded: true });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Endpoint" }));
+  await screen.findByText("Secrets are stored unencrypted — no OS keychain available.");
+});
+
+test("shows no keychain warning when the master key is in the OS keychain", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Endpoint" }));
+  await screen.findByText("Running on http://127.0.0.1:8899/v1");
+  expect(screen.queryByText("Secrets are stored in a local file, not the OS keychain.")).toBeNull();
+  expect(screen.queryByText("Secrets are stored unencrypted — no OS keychain available.")).toBeNull();
 });
 
 test("shows empty states for API keys, providers, and routes", async () => {

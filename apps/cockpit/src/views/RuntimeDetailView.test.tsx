@@ -66,7 +66,13 @@ const anthropicConnection: ConnectionInfo = {
   needsRelogin: false,
 };
 
-const endpointUp: EndpointStatusInfo = { running: true, port: 8787, baseUrl: "http://127.0.0.1:8787", autostart: false };
+const endpointUp: EndpointStatusInfo = {
+  running: true,
+  port: 8787,
+  baseUrl: "http://127.0.0.1:8787",
+  autostart: false,
+  keychainStatus: "ok",
+};
 const endpointKey: EndpointKeyInfo = { id: "key-1", name: "local", key: "rz-abc123", createdAt: 1, lastUsedAt: null };
 const configStatus: RuntimeConfigStatusInfo = {
   configPath: "/home/user/.claude/settings.json",

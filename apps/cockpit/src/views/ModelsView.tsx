@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronRight, Copy, Plus, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronRight, Copy, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useEndpoint } from "@/store-endpoint";
 import { useConnections } from "@/store-connections";
@@ -22,6 +22,7 @@ import {
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
+import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
 
 type Tab = "providers" | "route" | "endpoint";
 
@@ -92,6 +93,12 @@ function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[
   });
 }
 
+// Matches the warning-banner convention used elsewhere (e.g. RuntimeDetailView's
+// endpoint/no-models banners): a bordered row tinted amber for a mild warning,
+// red for a stronger one.
+const WARN = "#F59E0B";
+const DANGER = "#EF4444";
+
 function EndpointTab() {
   const { status, keys, start, stop, setConfig, createKey, revokeKey } = useEndpoint();
   const endpointUsage = useUsage((s) => s.endpoint);
@@ -155,8 +162,22 @@ function EndpointTab() {
     await revokeKey(id);
   };
 
+  const keychainStatus = status?.keychainStatus;
+
   return (
     <div className="flex flex-col gap-3">
+      {keychainStatus && keychainStatus !== "ok" && (
+        <div
+          className="flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]"
+          style={{
+            borderColor: keychainStatus === "unavailable" ? DANGER : WARN,
+            color: keychainStatus === "unavailable" ? DANGER : WARN,
+          }}
+        >
+          <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
+          <span>{keychainStatus === "unavailable" ? KEYCHAIN_UNAVAILABLE_WARNING : KEYCHAIN_FILE_FALLBACK_WARNING}</span>
+        </div>
+      )}
       <Card>
         <div className="flex items-center gap-3 border-b border-border px-[18px] py-3.5">
           <StatusDot color={status?.running ? "#22C55E" : "var(--muted-foreground)"} pulse={!!status?.running} size={8} />
@@ -361,9 +382,7 @@ function RouteForm({
     if (!option) return;
     setDraft((current) => ({
       ...current,
-      targets: current.targets.map((target, i) =>
-        i === index ? { connectionId: option.connectionId, model: option.model } : target,
-      ),
+      targets: current.targets.map((target, i) => (i === index ? { connectionId: option.connectionId, model: option.model } : target)),
     }));
   };
 
@@ -485,7 +504,9 @@ function RouteTargetPill({ target, connections }: { target: { connectionId: stri
   const conn = connections.find((c) => c.id === target.connectionId);
   return (
     <span className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-md bg-muted px-2 py-1 font-mono text-[11.5px] text-muted-foreground">
-      <span className="truncate">{conn?.providerName ?? "Missing"} / {target.model}</span>
+      <span className="truncate">
+        {conn?.providerName ?? "Missing"} / {target.model}
+      </span>
       {conn && conn.label !== conn.providerName && <span className="truncate text-[10.5px] opacity-75">({conn.label})</span>}
       <ModelCapabilityIcons model={target.model} compact />
     </span>
