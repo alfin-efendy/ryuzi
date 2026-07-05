@@ -163,7 +163,10 @@ async fn drive(
 ) -> anyhow::Result<String> {
     let system = match &agent.prompt {
         Some(p) => p.clone(),
-        None => context::assemble_system(&deps.work_dir),
+        None => {
+            let memory = deps.memory.as_ref().and_then(|m| m.snapshot());
+            context::assemble_system(&deps.work_dir, memory.as_deref())
+        }
     };
     // Tools restricted to what this agent may use.
     let tool_defs: Vec<Value> = deps
@@ -679,6 +682,32 @@ pub(crate) mod testutil {
         }
     }
 
+    /// Wraps [`ScriptedLlm`], recording every request body for assertions.
+    pub struct RecordingLlm {
+        inner: ScriptedLlm,
+        pub bodies: Mutex<Vec<Value>>,
+    }
+
+    impl RecordingLlm {
+        pub fn new(turns: Vec<Vec<AnthropicEvent>>) -> Self {
+            RecordingLlm {
+                inner: ScriptedLlm::new(turns),
+                bodies: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmStream for RecordingLlm {
+        async fn stream(
+            &self,
+            body: Value,
+        ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
+            self.bodies.lock().unwrap().push(body.clone());
+            self.inner.stream(body).await
+        }
+    }
+
     /// Convenience: a text-delta event.
     pub fn text_delta(text: &str) -> AnthropicEvent {
         (
@@ -924,6 +953,54 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.block_type == "text" && m.payload["text"] == "all set"));
+    }
+
+    #[tokio::test]
+    async fn memory_snapshot_reaches_primary_system_but_not_subagents() {
+        use crate::harness::native::memory::{MemoryScope, MemoryStore};
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        // Parent calls task -> child explore runs -> parent closes.
+        let parent = vec![
+            tool_use_start(0, "c1", "task"),
+            input_json_delta(0, "{\"subagent_type\":\"explore\",\"prompt\":\"look\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let sub = vec![text_delta("found"), message_delta("end_turn"), message_stop()];
+        let parent_end = vec![text_delta("done"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![parent, sub, parent_end]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        let memdir = tempfile::tempdir().unwrap();
+        let mem = MemoryStore::new(memdir.path().join("MEMORY.md"), None);
+        mem.add(MemoryScope::Global, "remember: the repo uses bun").unwrap();
+        deps.memory = Some(Arc::new(mem));
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                agent: "go".into(),
+                display: "go".into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3);
+        let parent_sys = bodies[0]["system"].as_str().unwrap();
+        assert!(parent_sys.contains("remember: the repo uses bun"));
+        assert!(parent_sys.contains("# Persistent memory (global)"));
+        // No child request may carry the memory text (sub-agents run
+        // memoryless).
+        let child_sys = bodies[1]["system"].as_str().unwrap();
+        assert!(!child_sys.contains("remember: the repo uses bun"));
+        // The parent continuation keeps it.
+        assert!(bodies[2]["system"]
+            .as_str()
+            .unwrap()
+            .contains("remember: the repo uses bun"));
     }
 
     #[tokio::test]
