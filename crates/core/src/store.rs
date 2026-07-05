@@ -765,6 +765,21 @@ impl Store {
         .await
     }
 
+    /// List a session's native todo items in order (content, status).
+    pub async fn list_todos(&self, session_pk: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Vec<(String, String)>> {
+            let mut stmt = c.prepare(
+                "SELECT content, status FROM todos WHERE session_pk=?1 ORDER BY pos",
+            )?;
+            let rows = stmt
+                .query_map(params![session_pk], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Load a session's provider-turn ledger in order, for resume/replay.
     pub async fn list_provider_turns(&self, session_pk: &str) -> anyhow::Result<Vec<ProviderTurn>> {
         let session_pk = session_pk.to_string();

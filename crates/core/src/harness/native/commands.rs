@@ -97,6 +97,11 @@ impl CommandRegistry {
         self.commands.keys().cloned().collect()
     }
 
+    /// All commands, for UI listing.
+    pub fn all(&self) -> Vec<Command> {
+        self.commands.values().cloned().collect()
+    }
+
     /// If `input` is a slash command (`/name args...`), return the resolved
     /// `(expanded_prompt, agent_override)`. Otherwise `None`.
     pub fn resolve(&self, input: &str) -> Option<(String, Option<String>)> {

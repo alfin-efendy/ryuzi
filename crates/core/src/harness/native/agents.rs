@@ -34,6 +34,13 @@ impl AgentMode {
     pub fn is_subagent(self) -> bool {
         matches!(self, AgentMode::Subagent | AgentMode::All)
     }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentMode::Primary => "primary",
+            AgentMode::Subagent => "subagent",
+            AgentMode::All => "all",
+        }
+    }
 }
 
 /// Which tools an agent may call.
@@ -174,6 +181,11 @@ impl AgentRegistry {
 
     pub fn names(&self) -> Vec<String> {
         self.agents.keys().cloned().collect()
+    }
+
+    /// All agents, for UI listing.
+    pub fn all(&self) -> Vec<Agent> {
+        self.agents.values().cloned().collect()
     }
 }
 

@@ -662,6 +662,39 @@ async addFreeConnection(provider: string, label: string) : Promise<Result<Connec
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * The agents available for a project (built-ins plus discovered custom agents).
+ */
+async nativeAgents(projectId: string) : Promise<Result<AgentInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("native_agents", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The slash commands available for a project.
+ */
+async nativeCommands(projectId: string) : Promise<Result<CommandInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("native_commands", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * A session's current native todo list.
+ */
+async sessionTodos(sessionPk: string) : Promise<Result<TodoItem[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("session_todos", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -697,10 +730,12 @@ transport: string; command: string | null; args: string[];
  */
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
+export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CatalogEntry = { id: string; name: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
 export type CmdError = { message: string }
+export type CommandInfo = { name: string; description: string; agent: string | null }
 export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; baseUrl: string | null; models: string[]; 
 /**
  * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
@@ -793,6 +828,7 @@ export type TermOutputMsg = { id: string;
 data: string }
 export type TestResult = { ok: boolean; message: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
+export type TodoItem = { content: string; status: string }
 export type ToolInfo = { name: string; desc: string; perm: string }
 export type UsagePoint = { day: string; requests: number; inputTokens: number; outputTokens: number }
 export type UsageSeries = { days: UsagePoint[]; todayRequests: number; todayInputTokens: number; todayOutputTokens: number }

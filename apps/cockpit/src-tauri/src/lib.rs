@@ -8,6 +8,7 @@ mod error;
 mod events;
 mod fsview_cmd;
 mod gateways_cmd;
+mod native_cmd;
 mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
@@ -239,6 +240,9 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::begin_oauth_manual,
             connections_cmd::complete_oauth_manual,
             connections_cmd::add_free_connection,
+            native_cmd::native_agents,
+            native_cmd::native_commands,
+            native_cmd::session_todos,
         ])
         .events(collect_events![
             events::CoreEventMsg,

@@ -13,6 +13,7 @@ import { StatusDot } from "@/components/common/bits";
 import { Transcript } from "@/components/transcript/Transcript";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
+import { TodoPanel } from "@/components/session/TodoPanel";
 
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects } = useStore();
@@ -83,6 +84,9 @@ export function SessionView() {
             <PanelRight aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
           </Button>
         </div>
+
+        {/* Native runtime plan (todowrite) */}
+        <TodoPanel sessionPk={session.sessionPk} running={running} />
 
         {/* Transcript */}
         <Transcript rows={rows} agentName={agent?.name ?? "Agent"} agentColor={agent?.color ?? "var(--muted-foreground)"} running={running}>
