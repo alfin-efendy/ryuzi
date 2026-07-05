@@ -175,6 +175,14 @@ fn build_registries() -> Registries {
         })
     }));
 
+    // Discord is a built-in gateway (its factory is a no-op unless the
+    // `discord` feature is on); register it like `native`/`claude-code` so
+    // Cockpit's `list_plugins`/`set_plugin_enabled` recognize it — the store
+    // seeds `enabled_gateways = "discord"` by default, so leaving this
+    // unregistered made Cockpit diverge from the CLI/`serve`, which both
+    // already register it (see `crates/cli/src/main.rs`'s `build_registries`).
+    registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
+
     ryuzi_core::plugins::install_builtins(&mut registries);
     ryuzi_core::plugins::load_user_plugins(&mut registries);
     registries
@@ -408,6 +416,20 @@ mod tests {
         let names = registries.harness.names();
         assert!(names.iter().any(|n| n == "native"), "got: {names:?}");
         assert!(names.iter().any(|n| n == "claude-code"), "got: {names:?}");
+    }
+
+    /// Regression test: Cockpit's composition root historically omitted
+    /// `discord_plugin()`, so `list_plugins` omitted discord and
+    /// `set_plugin_enabled("discord")` errored "unknown plugin: discord",
+    /// diverging from the CLI and `ryuzi serve` (both of which register it —
+    /// see `crates/cli/src/main.rs`'s `build_registries`).
+    #[test]
+    fn build_registries_registers_discord_plugin() {
+        let registries = build_registries();
+        assert!(
+            registries.plugins.get("discord").is_some(),
+            "discord plugin missing from Cockpit's composition root"
+        );
     }
 
     #[test]

@@ -92,6 +92,45 @@ fn list_shows_redaction_defaults_and_unset() {
     assert_eq!(out[0].split(" = ").next(), Some("workdir_root"));
 }
 
+/// Regression test: `cmd_config` used to run settings get/set/list without
+/// ever populating the process-wide `plugin.*` fields registry (that table
+/// is normally populated as a side effect of `Registries::add_plugin`, which
+/// only `deps.build_registries` calls — and `ryuzi config` never calls it).
+/// So `config set plugin.<id>.<key> ...` failed "unknown setting" for every
+/// real plugin field, and `config get` would report a registered secret as
+/// non-secret (empty table → `is_secret` false) and print it unredacted.
+#[test]
+fn plugin_setting_is_recognized_validated_and_redacted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("t.sqlite");
+
+    // `plugin.github.token` comes from the `github` catalog manifest's
+    // `[auth]` block (`auth.setting`), registered as a synthetic secret
+    // `String` field by `register_plugin_fields`.
+    let (code, out, _) = run(&db, &["config", "set", "plugin.github.token", "tok"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.last().map(String::as_str),
+        Some("set plugin.github.token")
+    );
+
+    let (code, out, _) = run(&db, &["config", "get", "plugin.github.token"]);
+    assert_eq!(code, 0);
+    assert_eq!(out.last().map(String::as_str), Some("••••••••"));
+
+    let (_, out, _) = run(&db, &["config", "get", "--reveal", "plugin.github.token"]);
+    assert_eq!(out.last().map(String::as_str), Some("tok"));
+
+    // An unrecognized `plugin.*` key must still error "unknown setting",
+    // same as before this fix.
+    let (code, _, errs) = run(&db, &["config", "set", "plugin.nope-unknown.token", "x"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        errs.last().map(String::as_str),
+        Some("unknown setting: plugin.nope-unknown.token")
+    );
+}
+
 #[test]
 fn usage_strings_and_unknown_subcommand() {
     let tmp = tempfile::tempdir().unwrap();

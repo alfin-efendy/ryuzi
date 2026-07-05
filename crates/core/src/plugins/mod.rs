@@ -59,6 +59,30 @@ pub fn install_builtins(regs: &mut Registries) {
     }
 }
 
+/// Populate the process-wide `PLUGIN_FIELDS` registry (see `host`'s module
+/// doc) with every built-in plugin's settings keys, without any of the
+/// side-effectful or networked work a full composition root does.
+///
+/// Callers that only need `validate_setting`/`is_secret` to recognize
+/// `plugin.*` keys (e.g. `ryuzi config get/set/list`) should call this
+/// instead of building a real `Registries` — in particular, this
+/// deliberately never resolves the claude-code ACP sidecar the way
+/// `crates/cli/src/main.rs`'s `build_registries` does, which can print a
+/// noisy `eprintln!` note on failure (a regression in `config get` output)
+/// and, worse, touch the network or the filesystem to download an adapter.
+///
+/// The built `Registries` value is dropped at the end of this function:
+/// registration into `PLUGIN_FIELDS` is a side effect of
+/// `Registries::add_plugin` (`host::register_plugin_fields`), not something
+/// read back from the `Registries` itself.
+pub fn register_builtin_plugin_fields() {
+    let mut regs = Registries::new();
+    regs.add_plugin(builtin::discord_plugin());
+    regs.add_plugin(crate::harness::native::native_plugin());
+    install_builtins(&mut regs);
+    load_user_plugins(&mut regs);
+}
+
 /// Discover and register user-authored plugins from
 /// `~/.config/ryuzi/plugins/*/ryuzi-plugin.toml`. Call after
 /// [`install_builtins`] so a user manifest can never shadow a built-in
@@ -119,8 +143,15 @@ pub(crate) fn load_user_plugins_from(regs: &mut Registries, base: &std::path::Pa
 /// - unknown id → an error (`"unknown plugin: {id}"`)
 /// - harness-capable → add/remove `id` in the `enabled_runtimes` CSV setting
 /// - gateway-capable → add/remove `id` in the `enabled_gateways` CSV setting
-/// - everything else (manifest-only or connector-only) → set
-///   `plugin.<id>.enabled` to `"true"`/`"false"`
+/// - experimental (docs-only, no capability) → an error, since
+///   `is_enabled` always reports it disabled regardless of any
+///   `plugin.<id>.enabled` write (see that method's doc) — toggling would
+///   silently no-op
+/// - no harness/gateway/connector capability (manifest-only, e.g. a
+///   provider/cli-agent metadata entry) → an error, since `is_enabled`
+///   always reports it enabled regardless of any `plugin.<id>.enabled`
+///   write — toggling would silently no-op
+/// - connector-only → set `plugin.<id>.enabled` to `"true"`/`"false"`
 pub async fn toggle_enabled(
     host: &PluginHost,
     settings: &SettingsStore,
@@ -135,6 +166,12 @@ pub async fn toggle_enabled(
     }
     if plugin.gateway.is_some() {
         return toggle_csv(settings, "enabled_gateways", id, enable).await;
+    }
+    if plugin.manifest.experimental {
+        anyhow::bail!("{id} is experimental — nothing to enable");
+    }
+    if plugin.connector.is_none() {
+        anyhow::bail!("{id} is always available");
     }
     settings
         .set(
@@ -389,23 +426,47 @@ mod toggle_enabled_tests {
     }
 
     #[tokio::test]
-    async fn manifest_only_and_connector_only_toggle_plugin_enabled_flag() {
+    async fn manifest_only_toggle_errors_instead_of_silently_no_opping() {
         let (settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
         host.add(manifest_only("anthropic-toggle-test"));
-        host.add(connector_only("acme-toggle-test"));
 
-        toggle_enabled(&host, &settings, "anthropic-toggle-test", true)
+        let err = toggle_enabled(&host, &settings, "anthropic-toggle-test", true)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(err.to_string(), "anthropic-toggle-test is always available");
+        // Confirm it really is a no-op: no `plugin.<id>.enabled` row exists.
         assert_eq!(
             settings
                 .get("plugin.anthropic-toggle-test.enabled")
                 .await
-                .unwrap()
-                .as_deref(),
-            Some("true")
+                .unwrap(),
+            None
         );
+    }
+
+    #[tokio::test]
+    async fn experimental_toggle_errors_instead_of_silently_no_opping() {
+        let (settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        let mut plugin = manifest_only("zep-toggle-test");
+        plugin.manifest.experimental = true;
+        host.add(plugin);
+
+        let err = toggle_enabled(&host, &settings, "zep-toggle-test", true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "zep-toggle-test is experimental — nothing to enable"
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_only_toggle_still_flips_plugin_enabled_flag() {
+        let (settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        host.add(connector_only("acme-toggle-test"));
 
         toggle_enabled(&host, &settings, "acme-toggle-test", true)
             .await
@@ -418,6 +479,12 @@ mod toggle_enabled_tests {
                 .as_deref(),
             Some("true")
         );
+        // Read-back through `is_enabled` too, not just the raw setting.
+        assert!(host
+            .is_enabled(&settings, "acme-toggle-test")
+            .await
+            .unwrap());
+
         toggle_enabled(&host, &settings, "acme-toggle-test", false)
             .await
             .unwrap();
@@ -429,6 +496,10 @@ mod toggle_enabled_tests {
                 .as_deref(),
             Some("false")
         );
+        assert!(!host
+            .is_enabled(&settings, "acme-toggle-test")
+            .await
+            .unwrap());
     }
 }
 

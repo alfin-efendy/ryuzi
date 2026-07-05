@@ -253,6 +253,32 @@ fn unknown_plugin_id_exits_1() {
     }
 }
 
+#[test]
+fn toggling_a_manifest_only_or_experimental_plugin_errors_instead_of_no_opping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("t.sqlite");
+
+    // `anthropic` is a manifest-only provider plugin (no harness/gateway/
+    // connector capability) — `is_enabled` always reports it enabled, so
+    // toggling it must error rather than silently no-op (see
+    // `ryuzi_core::plugins::toggle_enabled`'s doc).
+    let (code, _, errs) = run(&db, &["plugins", "disable", "anthropic"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        errs.last().map(String::as_str),
+        Some("anthropic is always available")
+    );
+
+    // `zep` is one of the catalog's docs-only experimental entries —
+    // `is_enabled` always reports it disabled, so toggling it must error too.
+    let (code, _, errs) = run(&db, &["plugins", "enable", "zep"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        errs.last().map(String::as_str),
+        Some("zep is experimental — nothing to enable")
+    );
+}
+
 /// Regression test for the real binary's composition root
 /// (`crates/cli/src/main.rs`'s `build_registries`), which historically wired
 /// `native`/`claude-code` but not `discord` — so `ryuzi plugins disable

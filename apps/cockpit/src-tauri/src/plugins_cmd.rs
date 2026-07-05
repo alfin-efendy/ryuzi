@@ -689,18 +689,14 @@ mod tests {
         let cp = test_cp().await;
         let settings = SettingsStore::new(cp.store().clone());
 
-        // anthropic is a manifest-only plugin: toggling flips its own flag.
-        ryuzi_core::plugins::toggle_enabled(cp.plugins(), &settings, "anthropic", true)
+        // anthropic is a manifest-only plugin (no harness/gateway/connector
+        // capability): `is_enabled` always reports it enabled regardless of
+        // any `plugin.<id>.enabled` write, so toggling it must error rather
+        // than silently no-op (see `toggle_enabled`'s doc).
+        let err = ryuzi_core::plugins::toggle_enabled(cp.plugins(), &settings, "anthropic", true)
             .await
-            .unwrap();
-        assert_eq!(
-            settings
-                .get("plugin.anthropic.enabled")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("true")
-        );
+            .unwrap_err();
+        assert_eq!(err.to_string(), "anthropic is always available");
 
         settings
             .set("default_perm_mode", "acceptEdits")
