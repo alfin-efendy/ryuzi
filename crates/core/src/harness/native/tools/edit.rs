@@ -85,8 +85,12 @@ impl Tool for Edit {
             .unified_diff()
             .header(path, path)
             .to_string();
+        let fmt_note = match crate::harness::native::format::maybe_format(&resolved).await {
+            Some(fmt) => format!(" (formatted with {fmt})"),
+            None => String::new(),
+        };
         Ok(ToolOutput::ok(truncate(
-            &format!("edited {path}\n{diff}"),
+            &format!("edited {path}{fmt_note}\n{diff}"),
             &ctx.caps,
         )))
     }

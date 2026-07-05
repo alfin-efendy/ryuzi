@@ -53,10 +53,11 @@ impl Tool for Write {
         if let Err(e) = tokio::fs::write(&resolved, content).await {
             return Ok(ToolOutput::error(format!("write: {path}: {e}")));
         }
-        Ok(ToolOutput::ok(format!(
-            "wrote {} bytes to {path}",
-            content.len()
-        )))
+        let mut msg = format!("wrote {} bytes to {path}", content.len());
+        if let Some(fmt) = crate::harness::native::format::maybe_format(&resolved).await {
+            msg.push_str(&format!(" (formatted with {fmt})"));
+        }
+        Ok(ToolOutput::ok(msg))
     }
 }
 
