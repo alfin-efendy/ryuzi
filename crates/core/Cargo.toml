@@ -43,6 +43,15 @@ axum = "0.8"
 reqwest = { workspace = true, default-features = true, features = ["json", "stream"] }
 bytes = "1"
 tokio-stream = "0.1"
+# Native agent runtime (harness/native): file-name globbing, gitignore-aware
+# walking, ripgrep-style content search, and edit diffs.
+globset.workspace = true
+ignore.workspace = true
+grep-searcher.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+regex.workspace = true
+similar.workspace = true
 toml_edit = "0.22"
 opentelemetry = { version = "0.32.0", features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace", "metrics"], optional = true }
