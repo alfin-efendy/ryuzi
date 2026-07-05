@@ -107,8 +107,14 @@ pub async fn verify_key(store: &Store, presented: &str) -> anyhow::Result<bool> 
             for row in rows {
                 let (id, stored) = row?;
                 // decrypt_field passes non-`enc:`-prefixed values through, so
-                // legacy plaintext keys (pre-F3b) still match.
-                let plain = secrets::decrypt_field(&stored).unwrap_or(stored);
+                // legacy plaintext keys (pre-F3b) still match. A genuine
+                // decrypt ERROR (an `enc:`-prefixed value that won't decrypt —
+                // lost/rotated master key) must be skipped, never fall back to
+                // the raw ciphertext: falling back would let the ciphertext
+                // string itself authenticate as if it were the plaintext key.
+                let Ok(plain) = secrets::decrypt_field(&stored) else {
+                    continue;
+                };
                 if plain == presented {
                     c.execute(
                         "UPDATE endpoint_keys SET last_used_at=?2 WHERE id=?1",
@@ -157,6 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_list_verify_revoke() {
+        secrets::use_test_key_file();
         let store = mem_store().await;
         assert!(first_key(&store).await.unwrap().is_none());
         let k = create_key(&store, "dev").await.unwrap();
@@ -174,6 +181,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_key_authenticates_after_encryption() {
+        secrets::use_test_key_file();
         let store = mem_store().await;
         let k = create_key(&store, "dev").await.unwrap();
 
@@ -190,6 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn at_rest_key_is_ciphertext() {
+        secrets::use_test_key_file();
         let store = mem_store().await;
         let k = create_key(&store, "dev").await.unwrap();
 
@@ -213,6 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_key_matches_legacy_plaintext_row() {
+        secrets::use_test_key_file();
         let store = mem_store().await;
         let plaintext = "ryz-legacy-plaintext-key";
 
@@ -232,5 +242,66 @@ mod tests {
             .unwrap();
 
         assert!(verify_key(&store, plaintext).await.unwrap());
+    }
+
+    /// The merge-blocking fail-open bug: `verify_key` used to do
+    /// `decrypt_field(&stored).unwrap_or(stored)`, so on a genuine decrypt
+    /// ERROR (an `enc:`-prefixed value that won't decrypt under the current
+    /// master key — e.g. the OS keychain key was lost/rotated) `plain` fell
+    /// back to the raw ciphertext, and presenting THAT ciphertext string as
+    /// the "key" would authenticate. This asserts the fixed behavior: an
+    /// undecryptable row is skipped (never matches), while legacy plaintext
+    /// and normally-created keys keep authenticating.
+    #[tokio::test]
+    async fn verify_key_rejects_ciphertext_string_on_decrypt_failure() {
+        secrets::use_test_key_file();
+        let store = mem_store().await;
+
+        // Ciphertext produced by a cipher with a DIFFERENT master key than
+        // whatever the process-global `secrets::cipher()` resolves to in
+        // this test binary — simulating a lost/rotated master key. Stored
+        // directly via `with_conn`, bypassing `create_key`'s encrypting
+        // write path (which would use the *current* process-global key).
+        let foreign = secrets::SecretCipher::from_key([9u8; 32]);
+        let undecryptable = foreign.encrypt("whatever");
+        let id = new_id();
+        let raw = undecryptable.clone();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "INSERT INTO endpoint_keys(id,name,key,created_at,last_used_at) VALUES (?1,?2,?3,?4,NULL)",
+                    params![id, "corrupt", raw, now_ms()],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        // Presenting the raw ciphertext string itself must NOT authenticate.
+        assert!(
+            !verify_key(&store, &undecryptable).await.unwrap(),
+            "an undecryptable ciphertext row must never authenticate, \
+             even when the presented value equals the stored ciphertext"
+        );
+
+        // Sanity: a legacy plaintext row still authenticates...
+        let legacy = "ryz-legacy-still-works";
+        let legacy_id = new_id();
+        let legacy_owned = legacy.to_string();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "INSERT INTO endpoint_keys(id,name,key,created_at,last_used_at) VALUES (?1,?2,?3,?4,NULL)",
+                    params![legacy_id, "legacy", legacy_owned, now_ms()],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        assert!(verify_key(&store, legacy).await.unwrap());
+
+        // ...and a normally-created (properly encrypted) key still works too.
+        let k = create_key(&store, "normal").await.unwrap();
+        assert!(verify_key(&store, &k.key).await.unwrap());
     }
 }

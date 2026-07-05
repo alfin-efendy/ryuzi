@@ -278,6 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn crud_and_priority_ordering() {
+        secrets::use_test_key_file();
         let store = mem_store().await;
         add_connection(&store, row("c1", "openai", 0))
             .await
@@ -345,6 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn at_rest_data_is_ciphertext() {
+        secrets::use_test_key_file();
         let store = mem_store().await;
         add_connection(&store, row("c1", "openai", 0))
             .await
@@ -375,6 +377,7 @@ mod tests {
 
     #[test]
     fn encrypt_conn_data_is_idempotent() {
+        secrets::use_test_key_file();
         let mut d = ConnectionData {
             api_key: Some("sk-test".into()),
             provider_specific: Some(serde_json::json!({"clientSecret": "shh"})),

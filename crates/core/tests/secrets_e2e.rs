@@ -12,6 +12,23 @@ use ryuzi_core::Store;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+/// Hermetic test seam: point the process-global master key at a
+/// process-unique temp file instead of the real OS keychain / the real
+/// `state_dir()/secret.key` (mirrors the `Once`-guarded helper of the same
+/// shape in `ryuzi_core::llm_router::secrets`'s own `#[cfg(test)]` module —
+/// duplicated here because this integration test is a separate crate and
+/// can't reach that `pub(crate)` item). Must run before the FIRST call that
+/// touches the global cipher in this binary; call it at the top of every
+/// test below.
+fn use_test_key_file() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let path =
+            std::env::temp_dir().join(format!("ryuzi-test-secret-{}.key", std::process::id()));
+        std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
+    });
+}
+
 /// Mock OpenAI-compatible upstream (`POST /v1/chat/completions`) that
 /// captures the incoming `Authorization` header (into an
 /// `Arc<Mutex<Option<String>>>`) and replies with a minimal valid non-stream
@@ -56,6 +73,7 @@ async fn mock_openai_upstream_capturing_auth(
 /// routing.
 #[tokio::test]
 async fn encrypted_connection_serves_plaintext_credential() {
+    use_test_key_file();
     let (up_port, _h, captured_auth) = mock_openai_upstream_capturing_auth().await;
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -138,6 +156,7 @@ async fn encrypted_connection_serves_plaintext_credential() {
 /// credential.
 #[tokio::test]
 async fn legacy_plaintext_db_swept_then_serves() {
+    use_test_key_file();
     let (up_port, _h, captured_auth) = mock_openai_upstream_capturing_auth().await;
 
     let tmp = tempfile::NamedTempFile::new().unwrap();

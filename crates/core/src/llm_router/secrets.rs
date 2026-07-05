@@ -166,17 +166,24 @@ pub fn decrypt_conn_data(d: &mut crate::llm_router::connections::ConnectionData)
         d.needs_relogin = Some(true);
     }
     if let Some(serde_json::Value::String(s)) = &d.provider_specific {
-        match decrypt_field(s) {
-            Ok(plain) => match serde_json::from_str::<serde_json::Value>(&plain) {
-                Ok(v) => d.provider_specific = Some(v),
+        // Only attempt a decrypt when the string is actually our ciphertext
+        // encoding. A bare (legacy) string here isn't something this code
+        // ever produced via encryption, so leave it as-is rather than
+        // spuriously failing the JSON-reparse below and flagging
+        // `needs_relogin`.
+        if s.starts_with("enc:") {
+            match decrypt_field(s) {
+                Ok(plain) => match serde_json::from_str::<serde_json::Value>(&plain) {
+                    Ok(v) => d.provider_specific = Some(v),
+                    Err(err) => {
+                        tracing::warn!("failed to parse decrypted provider_specific json: {err}");
+                        d.needs_relogin = Some(true);
+                    }
+                },
                 Err(err) => {
-                    tracing::warn!("failed to parse decrypted provider_specific json: {err}");
+                    tracing::warn!("failed to decrypt connection provider_specific: {err}");
                     d.needs_relogin = Some(true);
                 }
-            },
-            Err(err) => {
-                tracing::warn!("failed to decrypt connection provider_specific: {err}");
-                d.needs_relogin = Some(true);
             }
         }
     }
@@ -206,7 +213,8 @@ pub fn decrypt_conn_data(d: &mut crate::llm_router::connections::ConnectionData)
 /// cipher itself falls back to an ephemeral key in this state) until the
 /// keychain recovers on a later start.
 pub async fn init_and_sweep(store: &Store) {
-    let _ = cipher();
+    // No separate `cipher()` call needed: `keychain_status()` already forces
+    // it internally so the two globals are always initialized together.
     let status = keychain_status();
     if !should_sweep(status) {
         tracing::warn!(
@@ -363,7 +371,16 @@ fn generate_key_bytes() -> [u8; 32] {
 ///
 /// **Never panics** — every keyring/file error is swallowed into a fallback
 /// so a broken keychain or read-only disk never blocks startup.
+///
+/// **Test seam:** when `RYUZI_SECRET_KEY_FILE` is set, that file is used as
+/// the key store directly and the OS keychain is never touched. Unset (the
+/// production default) this has no effect. See [`use_test_key_file`] below,
+/// which is how `cargo test` stays hermetic against the real OS keychain and
+/// the real `state_dir()/secret.key`.
 fn load() -> (SecretCipher, KeychainStatus) {
+    if let Ok(path) = std::env::var("RYUZI_SECRET_KEY_FILE") {
+        return load_from_file(Path::new(&path));
+    }
     match Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).and_then(|e| e.get_secret()) {
         Ok(bytes) => match <[u8; 32]>::try_from(bytes.as_slice()) {
             Ok(key) => (SecretCipher::from_key(key), KeychainStatus::Ok),
@@ -372,8 +389,12 @@ fn load() -> (SecretCipher, KeychainStatus) {
                     "keychain-stored secret has unexpected length; treating as corrupt \
                      and falling back to file"
                 );
-                let (cipher, _) = load_from_file(&fallback_path());
-                (cipher, KeychainStatus::Unavailable)
+                // Whatever status `load_from_file` actually produced — almost
+                // always `FileFallback` (a durable file key was written), so
+                // secrets ARE still encrypted at rest, just not in the OS
+                // keychain. Only the rare case where the file fallback itself
+                // fails degrades further to `Unavailable`.
+                load_from_file(&fallback_path())
             }
         },
         Err(KeyringError::NoEntry) => provision_keychain(),
@@ -386,6 +407,27 @@ fn load() -> (SecretCipher, KeychainStatus) {
             load_from_file(&fallback_path())
         }
     }
+}
+
+/// Test-only hermetic seam: point [`load`] at a process-unique temp file via
+/// `RYUZI_SECRET_KEY_FILE` instead of the real OS keychain / the real
+/// [`crate::paths::state_dir`]. Must be called before the FIRST call to
+/// [`cipher`] in this test binary — `CIPHER`/`STATUS` are `OnceLock`s that
+/// initialize (and resolve `load()`) exactly once per binary, so whichever
+/// test runs first "wins"; the `Once` below just makes repeated calls (from
+/// many tests in the same binary) cheap and race-free. Call this at the top
+/// of every test — in this module, `connections.rs`, `keys.rs`, and
+/// `tests/secrets_e2e.rs` (which has its own copy, being a separate crate) —
+/// that transitively touches the process-global cipher, so `cargo test`
+/// never creates/modifies the real `secret.key` file or OS keychain entry.
+#[cfg(test)]
+pub(crate) fn use_test_key_file() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let path =
+            std::env::temp_dir().join(format!("ryuzi-test-secret-{}.key", std::process::id()));
+        std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
+    });
 }
 
 /// The keychain has no entry yet: generate a fresh key and store it there.
@@ -586,10 +628,11 @@ mod tests {
     // (that's the whole point — it forces the master-key globals to init).
     // This is no new risk: `add_connection`/`create_key` already call
     // `cipher()` transitively via `encrypt_conn_data`/`encrypt_field` in the
-    // `connections`/`keys` test suites, so the global has been exercised
-    // under `cargo test` since Task 4. On this dev box (and CI) that
-    // resolves deterministically to the file fallback for the lifetime of
-    // the test binary.
+    // `connections`/`keys` test suites. Every test below that touches the
+    // global cipher calls [`use_test_key_file`] first, which points `load()`
+    // at a process-unique temp file (via `RYUZI_SECRET_KEY_FILE`) instead of
+    // the real OS keychain/state dir — so this is hermetic everywhere, not
+    // just "on this dev box (and CI)".
 
     async fn mem_store() -> Store {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -665,6 +708,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_encrypts_legacy_plaintext_rows() {
+        use_test_key_file();
         let store = mem_store().await;
         // Raw plaintext inserted directly via `with_conn`, bypassing the
         // encrypting write paths (`add_connection`/`create_key`) entirely —
@@ -693,6 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_is_idempotent() {
+        use_test_key_file();
         let store = mem_store().await;
         insert_raw_connection(&store, "c1", r#"{"apiKey":"sk-legacy-plain"}"#).await;
         insert_raw_endpoint_key(&store, "k1", "ryz-legacy-plain").await;
@@ -719,6 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_skips_a_row_that_is_already_fully_encrypted() {
+        use_test_key_file();
         let store = mem_store().await;
         let mut data = crate::llm_router::connections::ConnectionData {
             api_key: Some("sk-already".into()),
@@ -754,6 +800,7 @@ mod tests {
         // this test binary. `decrypt_conn_data` must leave the ciphertext in
         // place (never blank it, never panic) and flag `needs_relogin` — the
         // honest, non-bricking behavior for a locked/lost-key row.
+        use_test_key_file();
         let foreign = SecretCipher::from_key([42u8; 32]);
         let ciphertext = foreign.encrypt("sk-locked");
         let mut d = crate::llm_router::connections::ConnectionData {
