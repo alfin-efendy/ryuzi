@@ -398,8 +398,9 @@ async fn anthropic_client_gets_error_frame_when_kiro_upstream_truncates() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
+    let status = resp.status();
     let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "expected 200, got {status}; body: {body}");
     // saw the partial content...
     assert!(body.contains("content_block_delta"), "body: {body}");
     // ...and a terminal ERROR event, NOT a clean message_stop.
@@ -440,8 +441,10 @@ async fn openai_client_non_stream_tool_only_response_is_well_formed() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
+    let status = resp.status();
+    let raw = resp.text().await.unwrap();
+    assert_eq!(status, 200, "expected 200, got {status}; body: {raw}");
+    let body: Value = serde_json::from_str(&raw).unwrap();
     let msg = &body["choices"][0]["message"];
     assert_eq!(msg["tool_calls"][0]["id"], "t1", "body: {body}");
     assert_eq!(msg["tool_calls"][0]["function"]["name"], "get_weather");
@@ -480,8 +483,10 @@ async fn anthropic_client_non_stream_tool_only_response_has_no_empty_text_block(
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
+    let status = resp.status();
+    let raw = resp.text().await.unwrap();
+    assert_eq!(status, 200, "expected 200, got {status}; body: {raw}");
+    let body: Value = serde_json::from_str(&raw).unwrap();
     let content = body["content"]
         .as_array()
         .unwrap_or_else(|| panic!("content must be an array: {body}"));
