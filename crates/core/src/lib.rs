@@ -12,6 +12,7 @@ pub mod harness;
 pub mod integration;
 pub mod llm_router;
 pub mod mcp;
+pub mod orch;
 pub mod paths;
 pub mod policy;
 pub mod registry;
