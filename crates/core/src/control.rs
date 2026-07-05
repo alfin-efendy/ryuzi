@@ -115,6 +115,13 @@ impl ControlPlane {
         &self.store
     }
 
+    /// The plugin host — every installed plugin's manifest, capabilities, and
+    /// enablement state (see `plugins::host::PluginHost`). Used by `serve.rs`
+    /// to expose plugins over HTTP without duplicating `Registries`' shape.
+    pub fn plugins(&self) -> &crate::plugins::PluginHost {
+        &self.registries.plugins
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<CoreEvent> {
         self.events.subscribe()
     }

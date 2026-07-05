@@ -4,6 +4,8 @@
 //! `attach`) can drive and observe sessions.
 
 use crate::control::ControlPlane;
+use crate::plugins::{CorePlugin, PluginSource};
+use crate::settings::SettingsStore;
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -23,6 +25,8 @@ pub fn router(cp: Arc<ControlPlane>) -> Router {
         .route("/sessions/{pk}/prompt", post(prompt))
         .route("/projects/{id}/session", post(start))
         .route("/events", get(events))
+        .route("/plugins", get(list_plugins))
+        .route("/plugins/{id}", get(get_plugin))
         .with_state(cp)
 }
 
@@ -96,6 +100,108 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// `GET /plugins` — every installed plugin as a compact summary (identity,
+/// categories, verification/experimental flags, computed capabilities, and
+/// current enablement). See [`plugin_summary`] and [`capabilities`].
+async fn list_plugins(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse {
+    let settings = SettingsStore::new(cp.store().clone());
+    let mut entries = Vec::new();
+    for plugin in cp.plugins().list() {
+        match cp
+            .plugins()
+            .is_enabled(&settings, &plugin.manifest.id)
+            .await
+        {
+            Ok(enabled) => entries.push(plugin_summary(&plugin, enabled)),
+            Err(e) => return err(&e),
+        }
+    }
+    Json(entries).into_response()
+}
+
+/// `GET /plugins/{id}` — the plugin's full manifest (via `PluginManifest`'s
+/// own `Serialize`, so new manifest fields show up automatically) with
+/// `enabled` and `source` merged in as extra top-level keys. The manifest
+/// carries no secret VALUES (only setting/env key names — see
+/// `ryuzi_plugin_sdk::AuthSpec`), so this is safe to return verbatim; do not
+/// add settings-value lookups here.
+async fn get_plugin(
+    State(cp): State<Arc<ControlPlane>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(plugin) = cp.plugins().get(&id) else {
+        return not_found(&id);
+    };
+    let settings = SettingsStore::new(cp.store().clone());
+    let enabled = match cp.plugins().is_enabled(&settings, &id).await {
+        Ok(enabled) => enabled,
+        Err(e) => return err(&e),
+    };
+
+    let mut value = match serde_json::to_value(&plugin.manifest) {
+        Ok(value) => value,
+        Err(e) => return err(&e.into()),
+    };
+    if let Some(map) = value.as_object_mut() {
+        map.insert("enabled".to_string(), json!(enabled));
+        map.insert("source".to_string(), json!(source_label(&plugin.source)));
+    }
+    Json(value).into_response()
+}
+
+/// The `{id, name, description, categories, verified, experimental, enabled,
+/// capabilities}` shape `GET /plugins` returns for one plugin.
+fn plugin_summary(plugin: &CorePlugin, enabled: bool) -> Value {
+    let m = &plugin.manifest;
+    json!({
+        "id": m.id,
+        "name": m.name,
+        "description": m.description,
+        "categories": m.categories,
+        "verified": m.verified,
+        "experimental": m.experimental,
+        "enabled": enabled,
+        "capabilities": capabilities(plugin),
+    })
+}
+
+/// Which of the four extension axes `plugin` advertises. `runtime` counts
+/// both a live `HarnessFactory` (native/claude-code) AND a manifest-only
+/// `RuntimeMeta` (a CLI-agent catalog entry with no in-process factory), per
+/// the same distinction `runtimes_meta` draws between the two.
+fn capabilities(plugin: &CorePlugin) -> Vec<&'static str> {
+    let mut caps = Vec::new();
+    if plugin.manifest.provider.is_some() {
+        caps.push("provider");
+    }
+    if plugin.harness.is_some() || plugin.manifest.runtime.is_some() {
+        caps.push("runtime");
+    }
+    if plugin.gateway.is_some() {
+        caps.push("gateway");
+    }
+    if plugin.connector.is_some() {
+        caps.push("connector");
+    }
+    caps
+}
+
+fn source_label(source: &PluginSource) -> &'static str {
+    match source {
+        PluginSource::Builtin => "builtin",
+        PluginSource::Catalog => "catalog",
+        PluginSource::User(_) => "user",
+    }
+}
+
+fn not_found(id: &str) -> axum::response::Response {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({ "error": format!("unknown plugin: {id}") })),
+    )
+        .into_response()
+}
+
 fn err(e: &anyhow::Error) -> axum::response::Response {
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -107,12 +213,71 @@ fn err(e: &anyhow::Error) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::Registries;
+    use crate::connector::{Connector, ConnectorCtx};
+    use crate::domain::McpServerSpec;
+    use crate::plugins::{CorePlugin, PluginSource, Registries};
+    use async_trait::async_trait;
+    use ryuzi_plugin_sdk::PluginManifest;
 
     async fn test_cp() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(tmp.path()).await.unwrap();
         ControlPlane::new(store, Registries::new()).await
+    }
+
+    /// A connector that contributes no MCP servers — enough to exercise the
+    /// connector-only branch of `PluginHost::is_enabled` (`plugin.<id>.
+    /// enabled`, defaulting to `false`) without depending on a real
+    /// integration.
+    struct NoopConnector;
+
+    #[async_trait]
+    impl Connector for NoopConnector {
+        async fn mcp_servers(&self, _ctx: &ConnectorCtx) -> anyhow::Result<Vec<McpServerSpec>> {
+            Ok(vec![])
+        }
+    }
+
+    fn minimal_manifest(id: &str, name: &str) -> PluginManifest {
+        PluginManifest {
+            contract: 1,
+            id: id.to_string(),
+            name: name.to_string(),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            mcp: vec![],
+            skills: vec![],
+            menu: None,
+            provider: None,
+            runtime: None,
+        }
+    }
+
+    /// Every model-provider/CLI-agent builtin (via `install_builtins`, which
+    /// includes the `anthropic` provider) plus one connector-only test
+    /// plugin so `/plugins`' enabled-by-default-false branch has something to
+    /// exercise.
+    async fn test_cp_with_plugins() -> Arc<ControlPlane> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let mut regs = Registries::new();
+        crate::plugins::install_builtins(&mut regs);
+        regs.add_plugin(CorePlugin {
+            manifest: minimal_manifest("acme-test-connector", "Acme Test Connector"),
+            harness: None,
+            gateway: None,
+            connector: Some(Arc::new(NoopConnector)),
+            source: PluginSource::Builtin,
+        });
+        ControlPlane::new(store, regs).await
     }
 
     #[tokio::test]
@@ -130,5 +295,98 @@ mod tests {
         let cp = test_cp().await;
         let port = serve(cp, 0).await.unwrap();
         assert!(port > 0);
+    }
+
+    #[tokio::test]
+    async fn list_plugins_shows_anthropic_enabled_with_provider_capability() {
+        let cp = test_cp_with_plugins().await;
+        let port = serve(cp, 0).await.unwrap();
+
+        let body: Vec<Value> = reqwest::get(format!("http://127.0.0.1:{port}/plugins"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let anthropic = body
+            .iter()
+            .find(|p| p["id"] == "anthropic")
+            .expect("anthropic plugin present in /plugins");
+        assert_eq!(anthropic["name"], "Anthropic");
+        assert_eq!(anthropic["enabled"], true);
+        assert_eq!(anthropic["capabilities"], json!(["provider"]));
+    }
+
+    #[tokio::test]
+    async fn get_plugin_returns_manifest_fields_plus_enabled_and_source() {
+        let cp = test_cp_with_plugins().await;
+        let port = serve(cp, 0).await.unwrap();
+
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/anthropic"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+
+        assert_eq!(body["id"], "anthropic");
+        assert_eq!(body["contract"], 1);
+        assert_eq!(body["provider"]["format"], "anthropic");
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["source"], "builtin");
+    }
+
+    #[tokio::test]
+    async fn unknown_plugin_id_is_404_with_error_envelope() {
+        let cp = test_cp_with_plugins().await;
+        let port = serve(cp, 0).await.unwrap();
+
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/nope"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "unknown plugin: nope");
+    }
+
+    #[tokio::test]
+    async fn connector_only_plugin_is_disabled_until_setting_flips_true() {
+        let cp = test_cp_with_plugins().await;
+        // Keep a handle to write the setting directly after the server (which
+        // consumes an `Arc<ControlPlane>` into its router state) is started.
+        let store = cp.store().clone();
+        let port = serve(cp, 0).await.unwrap();
+
+        let fetch = || {
+            let url = format!("http://127.0.0.1:{port}/plugins");
+            async move {
+                reqwest::get(url)
+                    .await
+                    .unwrap()
+                    .json::<Vec<Value>>()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let before = fetch().await;
+        let entry = before
+            .iter()
+            .find(|p| p["id"] == "acme-test-connector")
+            .expect("connector-only test plugin present");
+        assert_eq!(entry["enabled"], false);
+        assert_eq!(entry["capabilities"], json!(["connector"]));
+
+        store
+            .set_setting_raw("plugin.acme-test-connector.enabled", "true")
+            .await
+            .unwrap();
+
+        let after = fetch().await;
+        let entry = after
+            .iter()
+            .find(|p| p["id"] == "acme-test-connector")
+            .unwrap();
+        assert_eq!(entry["enabled"], true);
     }
 }
