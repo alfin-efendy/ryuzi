@@ -22,8 +22,11 @@ for new files or full rewrites.
 - When the task is complete, stop and summarize what you did. Do not ask for \
 confirmation to proceed with reversible work.";
 
-/// Assemble the system prompt for a session rooted at `work_dir`.
-pub fn assemble_system(work_dir: &Path) -> String {
+/// Assemble the system prompt for a session rooted at `work_dir`. `extra_skill_dirs`
+/// (plugin-bundled skill directories — see
+/// `crate::plugins::PluginHost::enabled_skill_dirs`) are folded into the
+/// discovered skill set alongside the worktree/global ones.
+pub fn assemble_system(work_dir: &Path, extra_skill_dirs: &[std::path::PathBuf]) -> String {
     let mut sections: Vec<String> = vec![BASE_PROMPT.to_string()];
 
     // Environment facts.
@@ -53,7 +56,9 @@ pub fn assemble_system(work_dir: &Path) -> String {
     }
 
     // Available skills (names + descriptions only; bodies load via the tool).
-    if let Some(guidance) = super::skills::SkillRegistry::load(work_dir).guidance() {
+    if let Some(guidance) =
+        super::skills::SkillRegistry::load_with(work_dir, extra_skill_dirs).guidance()
+    {
         sections.push(guidance);
     }
 
@@ -76,7 +81,7 @@ mod tests {
     #[test]
     fn includes_base_prompt_and_environment() {
         let dir = tempfile::tempdir().unwrap();
-        let sys = assemble_system(dir.path());
+        let sys = assemble_system(dir.path(), &[]);
         assert!(sys.contains("You are ryuzi"));
         assert!(sys.contains("Working directory"));
         assert!(sys.contains(&dir.path().display().to_string()));
@@ -86,7 +91,7 @@ mod tests {
     fn includes_project_agents_md() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "Follow the house style.").unwrap();
-        let sys = assemble_system(dir.path());
+        let sys = assemble_system(dir.path(), &[]);
         assert!(sys.contains("Follow the house style."));
         assert!(sys.contains("Instructions from"));
     }

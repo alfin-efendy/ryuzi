@@ -98,6 +98,73 @@ pub fn find_field(key: &str) -> Option<&'static ConfigField> {
     all_fields().into_iter().find(|f| f.key == key)
 }
 
+/// Whether `key` is a secret — either a static `ConfigField` marked secret,
+/// or a `plugin.*` field a plugin's manifest declared secret (see
+/// `crate::plugins::plugin_field`).
 pub fn is_secret(key: &str) -> bool {
-    find_field(key).map(|f| f.secret).unwrap_or(false)
+    if let Some(f) = find_field(key) {
+        return f.secret;
+    }
+    crate::plugins::plugin_field(key)
+        .map(|f| f.secret)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::{CorePlugin, PluginHost, PluginSource};
+    use ryuzi_plugin_sdk::{AuthKind, AuthSpec, PluginManifest};
+
+    #[test]
+    fn is_secret_true_for_a_registered_secret_plugin_field_false_for_its_other_keys() {
+        // Unique id — `plugin_field` is a process-wide registry (see
+        // `crate::plugins::host`), so a shared id could collide with another
+        // test's plugin in the same test binary.
+        let id = "task7-catalogtest-plugin";
+        let manifest = PluginManifest {
+            contract: 1,
+            id: id.to_string(),
+            name: "Catalog Test Plugin".to_string(),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            verified: false,
+            experimental: false,
+            auth: Some(AuthSpec {
+                kind: AuthKind::Token,
+                setting: Some(format!("plugin.{id}.token")),
+                env: None,
+                help_url: None,
+            }),
+            settings: vec![],
+            mcp: vec![],
+            skills: vec![],
+            menu: None,
+            provider: None,
+            runtime: None,
+        };
+        let mut host = PluginHost::new();
+        host.add(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            source: PluginSource::Builtin,
+        });
+
+        assert!(
+            is_secret(&format!("plugin.{id}.token")),
+            "auth.setting-backed fields are always registered as secret"
+        );
+        assert!(
+            !is_secret(&format!("plugin.{id}.enabled")),
+            "the enabled toggle is a plain Bool, not a secret"
+        );
+        assert!(!is_secret(&format!("plugin.{id}.nope")));
+        assert!(!is_secret("workdir_root"));
+    }
 }

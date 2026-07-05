@@ -63,6 +63,12 @@ impl Connector for DeclarativeConnector {
         let Some(auth) = &self.manifest.auth else {
             return Ok(());
         };
+        // NOTE: `auth.kind = "none"` only means ensure_auth never *requires*
+        // a credential — if the manifest still populates `auth.setting` or
+        // `auth.env`, `${auth}` substitution (`resolve_auth`, below) may
+        // still resolve a value from those sources and inject it into an
+        // `[[mcp]]` entry. "none" is about the gate, not about whether a
+        // value exists.
         if auth.kind == AuthKind::None {
             return Ok(());
         }

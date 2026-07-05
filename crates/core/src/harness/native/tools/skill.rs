@@ -1,6 +1,7 @@
 //! `skill` — load a skill's full instructions on demand (progressive
-//! disclosure). Skills are discovered fresh from the worktree/global dirs on
-//! each call via [`crate::harness::native::skills::SkillRegistry`].
+//! disclosure). Skills are discovered fresh from the worktree/global dirs
+//! (plus any plugin-bundled skill dirs) on each call via
+//! [`crate::harness::native::skills::SkillRegistry`].
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::harness::native::skills::SkillRegistry;
@@ -40,7 +41,7 @@ impl Tool for SkillTool {
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("skill: `name` is required"))?;
-        let reg = SkillRegistry::load(&ctx.work_dir);
+        let reg = SkillRegistry::load_with(&ctx.work_dir, &ctx.extra_skill_dirs);
         match reg.get(name) {
             Some(skill) => Ok(ToolOutput::ok(truncate(
                 &format!("# Skill: {}\n\n{}", skill.name, skill.body),

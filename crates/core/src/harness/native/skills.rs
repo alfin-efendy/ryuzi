@@ -23,9 +23,19 @@ pub struct SkillRegistry {
 impl SkillRegistry {
     /// Discover skills under the worktree and the global config/claude dirs.
     pub fn load(work_dir: &Path) -> SkillRegistry {
+        Self::load_with(work_dir, &[])
+    }
+
+    /// Like [`Self::load`], but also scans `extra` directories — each
+    /// treated as a skills root itself (i.e. `<extra>/<name>/SKILL.md`),
+    /// exactly like `.ryuzi/skills` or `~/.claude/skills`. Used to fold in
+    /// plugin-bundled skill directories (`PluginHost::enabled_skill_dirs`)
+    /// beside the worktree/global ones. A name already found in an earlier
+    /// (worktree/global) directory wins over one from `extra`.
+    pub fn load_with(work_dir: &Path, extra: &[std::path::PathBuf]) -> SkillRegistry {
         let mut skills = BTreeMap::new();
-        for base in skill_dirs(work_dir) {
-            for skill in read_skills(&base) {
+        for base in skill_dirs(work_dir).iter().chain(extra) {
+            for skill in read_skills(base) {
                 skills.entry(skill.name.clone()).or_insert(skill);
             }
         }
@@ -123,6 +133,41 @@ mod tests {
         assert_eq!(s.description, "Work with PDFs");
         assert!(s.body.contains("pdftotext"));
         assert!(reg.guidance().unwrap().contains("pdf: Work with PDFs"));
+    }
+
+    #[test]
+    fn load_with_merges_an_extra_dir_alongside_the_worktree_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".ryuzi/skills/pdf");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Work with PDFs\n---\nUse pdftotext to extract text.",
+        )
+        .unwrap();
+
+        // A plugin-bundled skills root, entirely outside the worktree.
+        let extra = tempfile::tempdir().unwrap();
+        let extra_skill_dir = extra.path().join("triage");
+        std::fs::create_dir_all(&extra_skill_dir).unwrap();
+        std::fs::write(
+            extra_skill_dir.join("SKILL.md"),
+            "---\nname: triage\ndescription: Triage issues\n---\nLabel and assign.",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::load_with(dir.path(), &[extra.path().to_path_buf()]);
+        assert_eq!(reg.get("pdf").unwrap().description, "Work with PDFs");
+        let s = reg.get("triage").unwrap();
+        assert_eq!(s.description, "Triage issues");
+        assert!(s.body.contains("Label and assign."));
+        assert_eq!(reg.names(), vec!["pdf".to_string(), "triage".to_string()]);
+    }
+
+    #[test]
+    fn load_with_no_extra_dirs_matches_load() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(SkillRegistry::load_with(dir.path(), &[]).names().is_empty());
     }
 
     #[test]

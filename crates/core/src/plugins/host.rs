@@ -17,17 +17,93 @@
 //! can answer identity/enablement questions later (e.g. for a settings UI).
 //! `connector` is deliberately NOT fanned into `ConnectorRegistry` here — a
 //! `CorePlugin` carries a live `Arc<dyn Connector>` instance (not a
-//! `ConnectorFactory`), consumed directly from the host by a later task.
+//! `ConnectorFactory`), consumed directly from the host by
+//! `ControlPlane::start_harness_session` (`control::lifecycle`), which
+//! attaches every enabled connector-capable plugin's MCP servers to the
+//! session.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
-use ryuzi_plugin_sdk::PluginManifest;
+use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 
 use crate::connector::{Connector, ConnectorRegistry};
 use crate::gateway::{GatewayFactory, GatewayRegistry};
 use crate::harness::{HarnessFactory, HarnessRegistry};
 use crate::settings::{csv, SettingsStore};
+
+/// Process-wide registry of every `plugin.*` settings key any installed
+/// plugin has declared, populated by [`PluginHost::add`]. Backs
+/// `crate::settings::store::validate_setting`'s acceptance of `plugin.*`
+/// keys and `crate::settings::catalog::is_secret`'s secret-flagging for
+/// plugin-owned fields.
+///
+/// Global rather than threaded through `SettingsStore`/`validate_setting`
+/// because validation is a free function called from many places (CLI,
+/// Tauri commands, the settings store itself) that don't otherwise carry a
+/// `Registries` handle. Registration is add-only and idempotent — the same
+/// key registered twice (e.g. across two `PluginHost`s in different tests)
+/// simply overwrites; tests that care about isolation use unique plugin ids.
+static PLUGIN_FIELDS: OnceLock<RwLock<HashMap<String, SettingField>>> = OnceLock::new();
+
+fn plugin_fields() -> &'static RwLock<HashMap<String, SettingField>> {
+    PLUGIN_FIELDS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Look up a `plugin.*` settings field previously registered by
+/// [`PluginHost::add`] — `None` if no installed plugin declares `key`.
+pub fn plugin_field(key: &str) -> Option<SettingField> {
+    plugin_fields()
+        .read()
+        .expect("PLUGIN_FIELDS lock poisoned")
+        .get(key)
+        .cloned()
+}
+
+/// Register every `plugin.*` settings key `manifest` declares:
+/// - each `manifest.settings[]` field, verbatim
+/// - `manifest.auth.setting`, if present, as a synthetic secret `String`
+///   field (the manifest's `[auth]` block only names the key; it has no
+///   label/help of its own)
+/// - `plugin.<id>.enabled`, always, as a `Bool` field — this is what makes
+///   `validate_setting("plugin.<id>.enabled", ...)` accept every installed
+///   plugin, not just connector-capable ones (harmless for the others: they
+///   just never read the key back via `is_enabled`)
+fn register_plugin_fields(manifest: &PluginManifest) {
+    let mut fields = plugin_fields()
+        .write()
+        .expect("PLUGIN_FIELDS lock poisoned");
+    for f in &manifest.settings {
+        fields.insert(f.key.clone(), f.clone());
+    }
+    if let Some(auth) = &manifest.auth {
+        if let Some(key) = &auth.setting {
+            fields.insert(
+                key.clone(),
+                SettingField {
+                    key: key.clone(),
+                    label: format!("{} auth", manifest.name),
+                    help: String::new(),
+                    secret: true,
+                    required: false,
+                    kind: FieldKind::String,
+                },
+            );
+        }
+    }
+    let enabled_key = format!("plugin.{}.enabled", manifest.id);
+    fields.insert(
+        enabled_key.clone(),
+        SettingField {
+            key: enabled_key,
+            label: format!("Enable {}", manifest.name),
+            help: String::new(),
+            secret: false,
+            required: false,
+            kind: FieldKind::Bool,
+        },
+    );
+}
 
 /// Where a plugin's manifest/behavior came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +150,7 @@ impl PluginHost {
             );
             return false;
         }
+        register_plugin_fields(&plugin.manifest);
         self.by_id
             .insert(plugin.manifest.id.clone(), self.order.len());
         self.order.push(Arc::new(plugin));
@@ -117,6 +194,39 @@ impl PluginHost {
         }
         let key = format!("plugin.{id}.enabled");
         Ok(settings.get(&key).await?.as_deref() == Some("true"))
+    }
+
+    /// Every `manifest.skills[].path` (resolved relative to the plugin's own
+    /// directory) contributed by an *enabled* [`PluginSource::User`] plugin,
+    /// filtered down to directories that actually exist on disk — handed to
+    /// the native runtime as `SessionCtx::extra_skill_dirs` so plugin-bundled
+    /// skills show up beside the worktree/global ones (see
+    /// `harness::native::skills::SkillRegistry::load_with`).
+    ///
+    /// Builtin/catalog plugins never contribute here: a `SkillDef.path` is
+    /// only meaningful relative to a manifest's own directory on disk, which
+    /// only `PluginSource::User` carries.
+    pub async fn enabled_skill_dirs(&self, settings: &SettingsStore) -> Vec<std::path::PathBuf> {
+        let mut dirs = Vec::new();
+        for plugin in &self.order {
+            let PluginSource::User(base) = &plugin.source else {
+                continue;
+            };
+            if plugin.manifest.skills.is_empty() {
+                continue;
+            }
+            match self.is_enabled(settings, &plugin.manifest.id).await {
+                Ok(true) => {}
+                _ => continue,
+            }
+            for skill in &plugin.manifest.skills {
+                let dir = base.join(&skill.path);
+                if dir.is_dir() {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
     }
 }
 
@@ -439,14 +549,102 @@ mod tests {
 
         assert!(!host.is_enabled(&settings, "github").await.unwrap());
 
-        // `plugin.<id>.enabled` isn't in the static schema yet (a later task
-        // wires `validate_setting` for it), so `SettingsStore::set` would
-        // reject it — write the raw row directly, mirroring how that task
-        // will persist it.
+        // `settings.set` would work equally well now that `validate_setting`
+        // accepts `plugin.<id>.enabled` (see `settings::store`) — writing the
+        // raw row directly here just mirrors the CLI/Tauri path least
+        // coupled to that validation.
         store
             .set_setting_raw("plugin.github.enabled", "true")
             .await
             .unwrap();
         assert!(host.is_enabled(&settings, "github").await.unwrap());
+    }
+
+    // ---------- PluginHost::enabled_skill_dirs ----------
+
+    #[tokio::test]
+    async fn enabled_skill_dirs_returns_existing_paths_for_enabled_user_plugins() {
+        let (store, settings, _tmp) = open_settings().await;
+        let base = tempfile::tempdir().unwrap();
+        let skill_dir = base.path().join("skills/triage");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        let plugin = CorePlugin {
+            manifest: PluginManifest {
+                skills: vec![ryuzi_plugin_sdk::SkillDef {
+                    name: "triage".into(),
+                    description: String::new(),
+                    path: "skills/triage".into(),
+                }],
+                ..manifest("task7-skill-user")
+            },
+            harness: None,
+            gateway: None,
+            connector: Some(Arc::new(FakeConnector)),
+            source: PluginSource::User(base.path().to_path_buf()),
+        };
+        let mut host = PluginHost::new();
+        host.add(plugin);
+
+        assert!(
+            host.enabled_skill_dirs(&settings).await.is_empty(),
+            "connector-only plugin defaults to disabled — its skills must not surface either"
+        );
+
+        store
+            .set_setting_raw("plugin.task7-skill-user.enabled", "true")
+            .await
+            .unwrap();
+        assert_eq!(host.enabled_skill_dirs(&settings).await, vec![skill_dir]);
+    }
+
+    #[tokio::test]
+    async fn enabled_skill_dirs_skips_nonexistent_paths_and_non_user_sources() {
+        let (store, settings, _tmp) = open_settings().await;
+        let base = tempfile::tempdir().unwrap();
+        // No directory created for "skills/missing" — the enabled user
+        // plugin's declared skill path simply doesn't exist on disk.
+        let mut host = PluginHost::new();
+        host.add(CorePlugin {
+            manifest: PluginManifest {
+                skills: vec![ryuzi_plugin_sdk::SkillDef {
+                    name: "missing".into(),
+                    description: String::new(),
+                    path: "skills/missing".into(),
+                }],
+                ..manifest("task7-skill-missing")
+            },
+            harness: None,
+            gateway: None,
+            connector: Some(Arc::new(FakeConnector)),
+            source: PluginSource::User(base.path().to_path_buf()),
+        });
+        store
+            .set_setting_raw("plugin.task7-skill-missing.enabled", "true")
+            .await
+            .unwrap();
+
+        // A manifest-only builtin (always enabled) whose skill path DOES
+        // exist on disk must still be skipped: only `PluginSource::User`
+        // carries the on-disk directory a relative `SkillDef.path` resolves
+        // against.
+        let builtin_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(builtin_dir.path().join("skills/present")).unwrap();
+        host.add(CorePlugin {
+            manifest: PluginManifest {
+                skills: vec![ryuzi_plugin_sdk::SkillDef {
+                    name: "present".into(),
+                    description: String::new(),
+                    path: "skills/present".into(),
+                }],
+                ..manifest("task7-skill-builtin")
+            },
+            harness: None,
+            gateway: None,
+            connector: None,
+            source: PluginSource::Builtin,
+        });
+
+        assert!(host.enabled_skill_dirs(&settings).await.is_empty());
     }
 }

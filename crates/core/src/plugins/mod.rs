@@ -25,7 +25,7 @@ pub mod host;
 pub mod providers;
 pub mod runtimes_meta;
 
-pub use host::{CorePlugin, PluginHost, PluginSource, Registries};
+pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) and every CLI agent

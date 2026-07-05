@@ -114,6 +114,7 @@ impl Harness for NativeHarness {
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 work_dir: ctx.work_dir,
+                extra_skill_dirs: ctx.extra_skill_dirs,
                 model,
                 perm_mode: ctx.perm_mode,
                 project_policy: None,
@@ -272,6 +273,7 @@ mod tests {
             effort: None,
             resume: None,
             mcp_servers: vec![],
+            extra_skill_dirs: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
             store,
