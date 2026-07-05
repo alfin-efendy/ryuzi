@@ -6,7 +6,7 @@ use super::ledger::Ledger;
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::tools::{OutputCaps, ToolCtx, ToolRegistry};
-use super::{context, HARNESS_ID};
+use super::{context, NATIVE_ID};
 use crate::approval::ApprovalHub;
 use crate::domain::{CoreEvent, NewMessage, PermMode};
 use crate::harness::TurnPrompt;
@@ -371,7 +371,7 @@ async fn emit_row(
                 tool_kind,
             });
         }
-        Err(e) => tracing::warn!("native[{HARNESS_ID}]: insert_message failed: {e}"),
+        Err(e) => tracing::warn!("native[{NATIVE_ID}]: insert_message failed: {e}"),
     }
 }
 

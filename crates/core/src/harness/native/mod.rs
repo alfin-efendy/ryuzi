@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// The native runtime harness id, stored in `projects.harness`.
-pub const HARNESS_ID: &str = "native";
+pub const NATIVE_ID: &str = "native";
 
 /// The native agent runtime as a [`Harness`]. Each session runs the agentic
 /// loop in-process via [`runner::run_turn`].
@@ -180,7 +180,7 @@ impl Default for NativeIntegration {
 
 impl Integration for NativeIntegration {
     fn id(&self) -> &str {
-        HARNESS_ID
+        NATIVE_ID
     }
     fn harness(&self) -> Option<Arc<dyn HarnessFactory>> {
         Some(self.factory.clone())
