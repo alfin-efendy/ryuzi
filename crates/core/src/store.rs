@@ -769,9 +769,8 @@ impl Store {
     pub async fn list_todos(&self, session_pk: &str) -> anyhow::Result<Vec<(String, String)>> {
         let session_pk = session_pk.to_string();
         self.with_conn(move |c| -> rusqlite::Result<Vec<(String, String)>> {
-            let mut stmt = c.prepare(
-                "SELECT content, status FROM todos WHERE session_pk=?1 ORDER BY pos",
-            )?;
+            let mut stmt =
+                c.prepare("SELECT content, status FROM todos WHERE session_pk=?1 ORDER BY pos")?;
             let rows = stmt
                 .query_map(params![session_pk], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
