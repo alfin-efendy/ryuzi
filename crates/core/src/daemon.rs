@@ -235,6 +235,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
             registries.add_plugin(native_plugin());
         }
     }
+    crate::plugins::install_builtins(&mut registries);
     for (id, factory) in opts.extra_harness_factories {
         registries.harness.register(id, factory);
     }

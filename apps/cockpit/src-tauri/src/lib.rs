@@ -173,6 +173,8 @@ fn build_registries() -> Registries {
             env_remove: vec!["CLAUDECODE".to_string()],
         })
     }));
+
+    ryuzi_core::plugins::install_builtins(&mut registries);
     registries
 }
 

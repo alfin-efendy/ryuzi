@@ -41,6 +41,7 @@ fn main() -> ExitCode {
                     eprintln!("note: claude-code harness unavailable ({e}); native runtime is still available");
                 }
             }
+            ryuzi_core::plugins::install_builtins(&mut registries);
             Ok(registries)
         }),
     };
