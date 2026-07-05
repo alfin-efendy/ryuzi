@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use predicates::prelude::*;
 use ryuzi_core::{Connector, ConnectorCtx, CorePlugin, McpServerSpec, PluginSource, Registries};
 use ryuzi_plugin_sdk::PluginManifest;
 
@@ -231,6 +232,32 @@ fn unknown_plugin_id_exits_1() {
             Some("unknown plugin: nope")
         );
     }
+}
+
+/// Regression test for the real binary's composition root
+/// (`crates/cli/src/main.rs`'s `build_registries`), which historically wired
+/// `native`/`claude-code` but not `discord` — so `ryuzi plugins disable
+/// discord` reported "unknown plugin: discord" against a real build even
+/// though a fresh store seeds `enabled_gateways = "discord"`. Spawns the
+/// actual compiled `ryuzi` binary (unlike every other test in this file,
+/// which exercises `dispatch::run_cli` in-process against `test_registries`)
+/// so a regression in `main.rs` itself — not just the fixture mirroring it —
+/// would be caught. `RYUZI_ACP_PATH` points at a path that doesn't exist so
+/// the claude-code sidecar resolution fails fast (no network/bun probe)
+/// instead of trying to download anything; that's harmless here since
+/// `discord` registration doesn't depend on it.
+#[test]
+fn real_binary_registers_and_disables_the_discord_plugin() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_cmd::Command::cargo_bin("ryuzi")
+        .unwrap()
+        .args(["plugins", "disable", "discord"])
+        .env("XDG_DATA_HOME", tmp.path())
+        .env("HOME", tmp.path())
+        .env("RYUZI_ACP_PATH", tmp.path().join("no-such-acp-binary"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("disabled discord"));
 }
 
 #[test]

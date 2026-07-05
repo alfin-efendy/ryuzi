@@ -41,6 +41,13 @@ fn main() -> ExitCode {
                     eprintln!("note: claude-code harness unavailable ({e}); native runtime is still available");
                 }
             }
+            // Discord is a built-in gateway (its factory is a no-op unless the
+            // `discord` feature is on, which this crate's Cargo.toml enables);
+            // register it like `native`/`claude-code` so `ryuzi plugins
+            // enable/disable discord` recognizes it — the store seeds
+            // `enabled_gateways = "discord"` by default, so leaving this
+            // unregistered made that setting refer to an "unknown plugin".
+            registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
             ryuzi_core::plugins::install_builtins(&mut registries);
             ryuzi_core::plugins::load_user_plugins(&mut registries);
             Ok(registries)
