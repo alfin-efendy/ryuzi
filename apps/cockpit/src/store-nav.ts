@@ -137,7 +137,7 @@ export const useNav = create<NavState>((set, get) => ({
   ),
   rightMaximized: false,
   searchQuery: "",
-  composerAgent: "claude",
+  composerAgent: "",
   composerBranch: "main",
   projectSettingsFor: null,
 

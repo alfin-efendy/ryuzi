@@ -1,32 +1,79 @@
-import { useState } from "react";
-import { ArrowUp, ChevronDown, CircleAlert, GitBranch, Mic, PanelBottom, PanelRight, Plus } from "lucide-react";
-import { Button, Textarea } from "@ryuzi/ui";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowUp, ChevronDown, CircleAlert, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
+import { toast } from "sonner";
+import { Button, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
+import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
-import { runtimeById, defaultRuntimeOf, useRuntimes } from "@/store-runtimes";
+import { useNative } from "@/store-native";
+import { chatRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
+import { basename } from "@/lib/paths";
+import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalPrompt } from "@/components/ApprovalPrompt";
-import { AgentMenu } from "@/components/common/AgentMenu";
 import { StatusDot } from "@/components/common/bits";
 import { Transcript } from "@/components/transcript/Transcript";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
+import { startVoiceDictation } from "@/lib/voice";
 
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects } = useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
-  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
+  const [attachments, setAttachments] = useState<string[]>([]);
+  const [contextRefs, setContextRefs] = useState<string[]>([]);
+  const [contextHits, setContextHits] = useState<string[]>([]);
+  const [listening, setListening] = useState(false);
+  const stopVoice = useRef<(() => void) | null>(null);
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
   const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
   const runtimes = useRuntimes((s) => s.runtimes);
-  const agent = runtimeById(runtimes, nav.composerAgent) ?? defaultRuntimeOf(runtimes);
   const project = projects.find((p) => p.projectId === session?.projectId);
+  const projectId = project?.projectId;
+  const runtimeId = project?.harness === "claude-code" ? "claude" : project?.harness;
+  const agent = chatRuntimeOf(runtimes, runtimeId);
+  const isNativeSession = runtimeId === "native";
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
+  const loadCommands = useNative((s) => s.loadCommands);
+  const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
+
+  useEffect(() => {
+    if (projectId && isNativeSession) void loadCommands(projectId);
+  }, [projectId, isNativeSession, loadCommands]);
+
+  const slashQuery = useMemo(() => {
+    const trimmed = draft.trimStart();
+    if (!trimmed.startsWith("/") || trimmed.includes(" ")) return null;
+    return trimmed.slice(1).toLowerCase();
+  }, [draft]);
+  const slashMatches = useMemo(() => {
+    if (!isNativeSession || slashQuery === null) return [];
+    return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
+  }, [isNativeSession, nativeCommands, slashQuery]);
+  const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
+  const contextQueryText = contextQuery?.query ?? null;
+
+  useEffect(() => {
+    if (!projectId || contextQueryText === null) {
+      setContextHits([]);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void commands.searchFiles(projectId, contextQueryText).then((res) => {
+        if (!cancelled) setContextHits(res.status === "ok" ? res.data.slice(0, 6) : []);
+      });
+    }, 120);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [projectId, contextQueryText]);
 
   if (!session) {
     return (
@@ -40,9 +87,49 @@ export function SessionView() {
 
   const submit = () => {
     const t = draft.trim();
-    if (!t) return;
+    if (!t && attachments.length === 0) return;
     setDraft("");
-    void send(session.sessionPk, t);
+    setAttachments([]);
+    setContextRefs([]);
+    void send(session.sessionPk, t, {
+      context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
+      attachments,
+    });
+  };
+
+  const attachFiles = async () => {
+    const picked = await commands.pickFiles();
+    if (!picked.length) return;
+    setAttachments((cur) => Array.from(new Set([...cur, ...picked])));
+  };
+
+  const pickContext = (path: string) => {
+    setDraft((cur) => replaceActiveContextToken(cur, path));
+    setContextRefs((cur) => uniqueContextRefs([...cur, path]));
+    setContextHits([]);
+  };
+
+  const toggleVoice = () => {
+    if (listening) {
+      stopVoice.current?.();
+      stopVoice.current = null;
+      setListening(false);
+      return;
+    }
+    const started = startVoiceDictation({
+      onText: (text) => setDraft((cur) => (cur.trim() ? `${cur.trimEnd()} ${text}` : text)),
+      onEnd: () => {
+        stopVoice.current = null;
+        setListening(false);
+      },
+      onError: (message) => toast.error(message),
+    });
+    if (!started.ok) {
+      toast.error(started.message);
+      return;
+    }
+    stopVoice.current = started.stop;
+    setListening(true);
   };
 
   return (
@@ -109,9 +196,37 @@ export function SessionView() {
               rows={1}
               className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
             />
+            {slashMatches.length > 0 && (
+              <MenuPanel onClose={() => undefined} className="bottom-[82px] left-2.5 z-50 w-[320px]">
+                <MenuSectionLabel>Commands</MenuSectionLabel>
+                {slashMatches.map((cmd) => (
+                  <MenuItem key={cmd.name} onClick={() => setDraft(`/${cmd.name} `)} className="font-medium">
+                    <span className="font-mono text-[12px] text-muted-foreground">/{cmd.name}</span>
+                    <span className="min-w-0 flex-1 truncate">{cmd.description}</span>
+                  </MenuItem>
+                ))}
+              </MenuPanel>
+            )}
+            {contextHits.length > 0 && (
+              <MenuPanel onClose={() => setContextHits([])} className="bottom-[82px] left-2.5 z-50 w-[360px]">
+                <MenuSectionLabel>Context</MenuSectionLabel>
+                {contextHits.map((path) => (
+                  <MenuItem key={path} onClick={() => pickContext(path)} className="font-medium">
+                    <FileText aria-hidden size={13} strokeWidth={2} className="size-[13px] text-muted-foreground" />
+                    <span className="min-w-0 flex-1 truncate">{path}</span>
+                  </MenuItem>
+                ))}
+              </MenuPanel>
+            )}
             <div className="relative flex items-center gap-1.5 px-2.5 pb-2.5 pt-1.5">
-              <Button variant="ghost" size="icon-sm" title="Attach" className="rounded-full text-muted-foreground">
-                <Plus aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                title="Attach"
+                onClick={() => void attachFiles()}
+                className="rounded-full text-muted-foreground"
+              >
+                <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
               </Button>
               <Button variant="ghost" size="sm" className="font-medium" style={{ color: "#E8703A" }}>
                 <CircleAlert aria-hidden size={12} strokeWidth={2} className="size-3" />
@@ -119,12 +234,17 @@ export function SessionView() {
                 <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
               </Button>
               <div className="flex-1" />
-              <Button variant="ghost" size="sm" onClick={() => setAgentMenuOpen((v) => !v)} className="font-semibold">
+              <Button variant="ghost" size="sm" className="font-semibold">
                 <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
                 {agent?.model || agent?.name || "No agent"}
-                <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
               </Button>
-              <Button variant="ghost" size="icon-sm" title="Voice" className="rounded-full text-muted-foreground">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                title="Voice"
+                onClick={toggleVoice}
+                className={`rounded-full ${listening ? "bg-accent text-accent-foreground" : "text-muted-foreground"}`}
+              >
                 <Mic aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
               </Button>
               {composerMode(session.status) === "stop" ? (
@@ -136,15 +256,39 @@ export function SessionView() {
                   <ArrowUp aria-hidden size={14} strokeWidth={2.2} className="size-3.5" />
                 </Button>
               )}
-              {agentMenuOpen && (
-                <AgentMenu
-                  value={nav.composerAgent}
-                  onPick={nav.setComposerAgent}
-                  onClose={() => setAgentMenuOpen(false)}
-                  className="bottom-[42px] right-[74px] z-40 w-[280px]"
-                />
-              )}
             </div>
+            {(attachments.length > 0 || contextRefs.length > 0) && (
+              <div className="flex flex-wrap gap-1.5 px-2.5 pb-2">
+                {contextRefs.map((path) => (
+                  <Button
+                    key={`ctx-${path}`}
+                    variant="outline"
+                    size="sm"
+                    title={path}
+                    onClick={() => setContextRefs((cur) => cur.filter((p) => p !== path))}
+                    className="max-w-[220px] rounded-full px-2 text-[12px] text-muted-foreground"
+                  >
+                    <FileText aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
+                    <span className="truncate">{path}</span>
+                    <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
+                  </Button>
+                ))}
+                {attachments.map((path) => (
+                  <Button
+                    key={path}
+                    variant="outline"
+                    size="sm"
+                    title={path}
+                    onClick={() => setAttachments((cur) => cur.filter((p) => p !== path))}
+                    className="max-w-[220px] rounded-full px-2 text-[12px] text-muted-foreground"
+                  >
+                    <Paperclip aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
+                    <span className="truncate">{basename(path)}</span>
+                    <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
+                  </Button>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 

@@ -1,5 +1,10 @@
 use crate::error::CmdError;
-use ryuzi_core::{ControlPlane, Message, PermMode, Project, Session};
+use ryuzi_core::domain::AttachmentRef;
+use ryuzi_core::{ControlPlane, Message, PermMode, Project, Session, TurnPrompt};
+use serde::{Deserialize, Serialize};
+use specta::Type;
+use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -62,18 +67,207 @@ pub async fn connect_project(
         .await?)
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatContextArg {
+    pub branch: Option<String>,
+    pub voice_transcript: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatRequestOptions {
+    pub runtime_id: Option<String>,
+    pub model: Option<String>,
+    pub context: Option<ChatContextArg>,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+}
+
+fn harness_for_runtime(runtime_id: &str) -> Result<&'static str, CmdError> {
+    match runtime_id {
+        "native" => Ok("native"),
+        "claude" => Ok("claude-code"),
+        other => Err(CmdError {
+            message: format!("runtime '{other}' cannot run chat sessions yet"),
+        }),
+    }
+}
+
+async fn apply_runtime_choice(
+    cp: &ControlPlane,
+    project_id: &str,
+    runtime_id: Option<&str>,
+    model: Option<&str>,
+) -> R<()> {
+    let runtime_id = runtime_id.filter(|v| !v.trim().is_empty());
+    let model = model
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    if runtime_id.is_none() && model.is_none() {
+        return Ok(());
+    };
+    let harness = match runtime_id {
+        Some(runtime_id) => harness_for_runtime(runtime_id)?,
+        None => "",
+    };
+    let Some(project) = cp.store().get_project(project_id).await? else {
+        return Err(CmdError {
+            message: format!("unknown project: {project_id}"),
+        });
+    };
+    let next_harness = if harness.is_empty() {
+        project.harness.as_str()
+    } else {
+        harness
+    };
+    let current_model = project.model.clone();
+    let next_model = if runtime_id.is_some() {
+        model
+    } else {
+        model.or_else(|| current_model.clone())
+    };
+    if project.harness != next_harness || current_model != next_model {
+        cp.store()
+            .update_project(project_id, next_model, project.perm_mode, next_harness)
+            .await?;
+    }
+    Ok(())
+}
+
+fn chat_agent_prompt(prompt: &str, context: Option<&ChatContextArg>) -> String {
+    let Some(context) = context else {
+        return prompt.to_string();
+    };
+    let mut lines = Vec::new();
+    if let Some(branch) = context
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("- Branch: {branch}"));
+    }
+    if let Some(voice) = context
+        .voice_transcript
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("- Voice transcript: {voice}"));
+    }
+    for reference in context
+        .references
+        .iter()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("- Referenced file: {reference}"));
+    }
+    if lines.is_empty() {
+        prompt.to_string()
+    } else if prompt.trim().is_empty() {
+        format!("[Chat context]\n{}", lines.join("\n"))
+    } else {
+        format!("{prompt}\n\n[Chat context]\n{}", lines.join("\n"))
+    }
+}
+
+fn percent_encode_file_path(path: &str) -> String {
+    let mut out = String::new();
+    for b in path.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(*b, b'/' | b':' | b'.' | b'-' | b'_' | b'~') {
+            out.push(*b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+fn file_url_from_abs_path(path: &Path) -> String {
+    let mut normalized = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) && !normalized.starts_with('/') {
+        normalized = format!("/{normalized}");
+    }
+    format!("file://{}", percent_encode_file_path(&normalized))
+}
+
+fn content_type_for_path(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    match ext.as_str() {
+        "txt" | "md" | "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml" | "yaml" | "yml" => {
+            Some("text/plain".to_string())
+        }
+        "png" => Some("image/png".to_string()),
+        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+        "gif" => Some("image/gif".to_string()),
+        "pdf" => Some("application/pdf".to_string()),
+        "zip" => Some("application/zip".to_string()),
+        _ => None,
+    }
+}
+
+async fn attachment_refs_from_paths(paths: &[String]) -> R<Vec<AttachmentRef>> {
+    let mut out = Vec::new();
+    for raw in paths {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let path = tokio::fs::canonicalize(raw).await?;
+        let meta = tokio::fs::metadata(&path).await?;
+        if !meta.is_file() {
+            return Err(CmdError {
+                message: format!("attachment is not a file: {}", path.display()),
+            });
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
+        out.push(AttachmentRef {
+            name,
+            url: file_url_from_abs_path(&path),
+            content_type: content_type_for_path(&path),
+            size: meta.len(),
+        });
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn start_session(
     cp: State<'_, Arc<ControlPlane>>,
     project_id: String,
     prompt: String,
+    options: Option<ChatRequestOptions>,
 ) -> R<Session> {
+    let options = options.unwrap_or_default();
+    apply_runtime_choice(
+        &cp,
+        &project_id,
+        options.runtime_id.as_deref(),
+        options.model.as_deref(),
+    )
+    .await?;
+    let attachments = attachment_refs_from_paths(&options.attachments).await?;
+    let agent_prompt = chat_agent_prompt(&prompt, options.context.as_ref());
     // `.inner()` -> &Arc<ControlPlane>: start/continue_session take `self: &Arc<Self>`.
-    // Cockpit doesn't source attachments yet (Discord-only for now) — always `&[]`.
     Ok(cp
         .inner()
-        .start_session(&project_id, &prompt, "cockpit", &[])
+        .start_session_with_prompt(
+            &project_id,
+            TurnPrompt {
+                agent: agent_prompt,
+                display: prompt,
+            },
+            "cockpit",
+            &attachments,
+        )
         .await?)
 }
 
@@ -83,11 +277,22 @@ pub async fn continue_session(
     cp: State<'_, Arc<ControlPlane>>,
     session_pk: String,
     prompt: String,
+    options: Option<ChatRequestOptions>,
 ) -> R<()> {
+    let options = options.unwrap_or_default();
+    let attachments = attachment_refs_from_paths(&options.attachments).await?;
+    let agent_prompt = chat_agent_prompt(&prompt, options.context.as_ref());
     // `.inner()` -> &Arc<ControlPlane>: start/continue_session take `self: &Arc<Self>`.
     Ok(cp
         .inner()
-        .continue_session(&session_pk, &prompt, &[])
+        .continue_session_with_prompt(
+            &session_pk,
+            TurnPrompt {
+                agent: agent_prompt,
+                display: prompt,
+            },
+            &attachments,
+        )
         .await?)
 }
 
@@ -143,6 +348,19 @@ pub async fn pick_directory(app: tauri::AppHandle) -> Option<String> {
 
 #[tauri::command]
 #[specta::specta]
+pub async fn pick_files(app: tauri::AppHandle) -> Vec<String> {
+    tokio::task::spawn_blocking(move || app.dialog().file().blocking_pick_files())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.to_string())
+        .collect()
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn list_messages(
     cp: State<'_, Arc<ControlPlane>>,
     session_pk: String,
@@ -172,5 +390,49 @@ mod tests {
     fn sizes_over_the_cap_are_rejected_with_the_size() {
         let err = check_read_size(MAX_READ_BYTES + 1).unwrap_err();
         assert_eq!(err.message, "file too large (2097153 bytes)");
+    }
+
+    #[test]
+    fn harness_for_runtime_maps_chat_runtimes() {
+        assert_eq!(harness_for_runtime("native").unwrap(), "native");
+        assert_eq!(harness_for_runtime("claude").unwrap(), "claude-code");
+        assert!(harness_for_runtime("codex").is_err());
+    }
+
+    #[test]
+    fn chat_request_options_deserializes_model() {
+        let opts: ChatRequestOptions =
+            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
+                .unwrap();
+        assert_eq!(opts.runtime_id.as_deref(), Some("native"));
+        assert_eq!(opts.model.as_deref(), Some("fable"));
+    }
+
+    #[test]
+    fn chat_agent_prompt_appends_context_without_changing_display_text() {
+        let out = chat_agent_prompt(
+            "/review auth",
+            Some(&ChatContextArg {
+                branch: Some("feature/auth".into()),
+                voice_transcript: Some("review the auth changes".into()),
+                references: vec![],
+            }),
+        );
+        assert!(out.starts_with("/review auth\n\n[Chat context]"));
+        assert!(out.contains("- Branch: feature/auth"));
+        assert!(out.contains("- Voice transcript: review the auth changes"));
+    }
+
+    #[test]
+    fn chat_agent_prompt_appends_referenced_files_from_context_mentions() {
+        let out = chat_agent_prompt(
+            "explain this",
+            Some(&ChatContextArg {
+                references: vec!["src/main.rs".into(), "crates/core/src/lib.rs".into()],
+                ..Default::default()
+            }),
+        );
+        assert!(out.contains("- Referenced file: src/main.rs"));
+        assert!(out.contains("- Referenced file: crates/core/src/lib.rs"));
     }
 }

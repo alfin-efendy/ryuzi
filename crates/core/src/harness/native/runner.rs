@@ -74,7 +74,7 @@ pub async fn run_turn(
             let agent = override_agent
                 .and_then(|n| deps.agents.get(&n))
                 .unwrap_or_else(|| deps.agent.clone());
-            (expanded, agent)
+            (merge_agent_prompt_suffix(expanded, &prompt), agent)
         }
         None => (prompt.agent.clone(), deps.agent.clone()),
     };
@@ -107,6 +107,21 @@ pub async fn run_turn(
     // 4. Best-effort: give a fresh session a generated title.
     maybe_generate_title(deps, &prompt.display).await;
     Ok(())
+}
+
+fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
+    if prompt.agent == prompt.display {
+        return expanded;
+    }
+    let Some(suffix) = prompt.agent.strip_prefix(&prompt.display) else {
+        return expanded;
+    };
+    let suffix = suffix.trim();
+    if suffix.is_empty() {
+        expanded
+    } else {
+        format!("{expanded}\n\n{suffix}")
+    }
 }
 
 /// If this session has no title yet, generate a terse one from the first
@@ -1021,6 +1036,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Review the current working changes"));
+    }
+
+    #[tokio::test]
+    async fn slash_command_expansion_preserves_agent_prompt_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![
+            text_delta("reviewed"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                display: "/review auth".into(),
+                agent: "/review auth\n\n[Chat context]\n- Branch: feature/auth\n\n[User attached 1 file - saved to disk:]"
+                    .into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let turns = deps.store.list_provider_turns("s1").await.unwrap();
+        let user_text = turns[0].payload[0]["text"].as_str().unwrap();
+        assert!(user_text.contains("Review the current working changes"));
+        assert!(user_text.contains("auth"));
+        assert!(user_text.contains("[Chat context]"));
+        assert!(user_text.contains("feature/auth"));
+        assert!(user_text.contains("[User attached 1 file"));
     }
 
     #[tokio::test]

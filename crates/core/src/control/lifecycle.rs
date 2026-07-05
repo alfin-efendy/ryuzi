@@ -19,6 +19,25 @@ impl ControlPlane {
         started_by: &str,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<Session> {
+        self.start_session_with_prompt(
+            project_id,
+            TurnPrompt {
+                agent: prompt.to_string(),
+                display: prompt.to_string(),
+            },
+            started_by,
+            attachments,
+        )
+        .await
+    }
+
+    pub async fn start_session_with_prompt(
+        self: &Arc<Self>,
+        project_id: &str,
+        prompt: TurnPrompt,
+        started_by: &str,
+        attachments: &[AttachmentRef],
+    ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
@@ -50,7 +69,7 @@ impl ControlPlane {
         worktree::create(Path::new(&project.workdir), &short, &branch, &worktree_path)?;
 
         let now = now_ms();
-        let title: String = prompt.chars().take(80).collect();
+        let title: String = prompt.display.chars().take(80).collect();
         let session = Session {
             session_pk: session_pk.clone(),
             project_id: project.project_id.clone(),
@@ -89,14 +108,14 @@ impl ControlPlane {
             .start_harness_session(&project, &session_pk, &worktree_path, None)
             .await?;
         let final_prompt = self
-            .with_attachments(&session_pk, prompt, attachments)
+            .with_attachments(&session_pk, &prompt.agent, attachments)
             .await;
         self.spawn_prompt(
             handle,
             session_pk.clone(),
             TurnPrompt {
                 agent: final_prompt,
-                display: prompt.to_string(),
+                display: prompt.display,
             },
         );
 
@@ -120,6 +139,23 @@ impl ControlPlane {
         self: &Arc<Self>,
         session_pk: &str,
         prompt: &str,
+        attachments: &[AttachmentRef],
+    ) -> anyhow::Result<()> {
+        self.continue_session_with_prompt(
+            session_pk,
+            TurnPrompt {
+                agent: prompt.to_string(),
+                display: prompt.to_string(),
+            },
+            attachments,
+        )
+        .await
+    }
+
+    pub async fn continue_session_with_prompt(
+        self: &Arc<Self>,
+        session_pk: &str,
+        prompt: TurnPrompt,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<()> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
@@ -183,13 +219,15 @@ impl ControlPlane {
                 }
             }
         };
-        let final_prompt = self.with_attachments(session_pk, prompt, attachments).await;
+        let final_prompt = self
+            .with_attachments(session_pk, &prompt.agent, attachments)
+            .await;
         self.spawn_prompt(
             handle,
             session_pk.to_string(),
             TurnPrompt {
                 agent: final_prompt,
-                display: prompt.to_string(),
+                display: prompt.display,
             },
         );
         Ok(())
