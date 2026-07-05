@@ -406,6 +406,36 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.message, "Network error: connection refused");
     }
+
+    /// A kiro device-flow connection must persist the registered AWS SSO-OIDC
+    /// client creds so `refresh_kiro` routes to the AWS token endpoint (via
+    /// `kiro_client_creds` finding both) instead of the kiro.dev social one.
+    #[test]
+    fn device_provider_specific_carries_client_creds_for_refresh() {
+        let ps = kiro_device_provider_specific(
+            "cid-1",
+            "secret-1",
+            "arn:aws:codewhisperer:us-east-1:1:profile/X",
+        );
+        assert_eq!(ps["authMethod"], "builder-id");
+        assert_eq!(ps["region"], "us-east-1");
+        assert_eq!(
+            ps["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:1:profile/X"
+        );
+
+        // The whole point of the fix: the persisted shape must make
+        // `kiro_client_creds` return Some, which is what selects the AWS
+        // SSO-OIDC (builder-id) refresh endpoint.
+        let data = ConnectionData {
+            provider_specific: Some(ps),
+            ..Default::default()
+        };
+        assert_eq!(
+            connections::kiro_client_creds(&data),
+            Some(("cid-1".to_string(), "secret-1".to_string()))
+        );
+    }
 }
 
 /// Drive the full interactive OAuth flow: binds a loopback listener, opens
@@ -702,11 +732,14 @@ pub async fn await_kiro_device_flow(
                 access_token: Some(tokens.access_token),
                 refresh_token: tokens.refresh_token,
                 expires_at: Some(tokens.expires_at),
-                provider_specific: Some(serde_json::json!({
-                    "authMethod": "builder-id",
-                    "profileArn": profile_arn,
-                    "region": "us-east-1",
-                })),
+                // The AWS SSO-OIDC client creds registered in
+                // `start_kiro_device_flow` MUST be carried here — see
+                // [`kiro_device_provider_specific`].
+                provider_specific: Some(kiro_device_provider_specific(
+                    &client.client_id,
+                    &client.client_secret,
+                    &profile_arn,
+                )),
                 ..Default::default()
             },
             created_at: now,
@@ -715,6 +748,30 @@ pub async fn await_kiro_device_flow(
     )
     .await?;
     Ok(assemble(&cp).await?)
+}
+
+/// Build the `provider_specific` blob for a Kiro device-flow (builder-id)
+/// connection. The AWS SSO-OIDC `clientId`/`clientSecret` registered in
+/// [`start_kiro_device_flow`] MUST be carried here: `oauth::refresh::refresh_kiro`
+/// selects the AWS SSO-OIDC token endpoint only when
+/// `connections::kiro_client_creds` finds BOTH, and otherwise falls through to
+/// the kiro.dev SOCIAL refresh endpoint (meant for google/github/imported).
+/// Omitting them would make a builder-id connection fail its first refresh
+/// (~5 min before the ~1h expiry, or on a 401/403) and flip to `needs_relogin`.
+/// For the device flow both are always present — the client was just
+/// registered — so they're added unconditionally.
+fn kiro_device_provider_specific(
+    client_id: &str,
+    client_secret: &str,
+    profile_arn: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "authMethod": "builder-id",
+        "profileArn": profile_arn,
+        "region": "us-east-1",
+        "clientId": client_id,
+        "clientSecret": client_secret,
+    })
 }
 
 /// Import Kiro OAuth tokens from an already-installed, logged-in Kiro IDE
