@@ -2,12 +2,14 @@
 //! `enc:v1:<base64url(nonce‖ciphertext)>`; anything without the `enc:` prefix
 //! is treated as legacy plaintext and passed through unchanged, so no schema
 //! migration is needed — legacy rows upgrade lazily (and via a startup sweep).
+use crate::store::Store;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{
     aead::{Aead, Generate, Key, KeyInit},
     XChaCha20Poly1305, XNonce,
 };
 use keyring::{Entry, Error as KeyringError};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::path::{Path, PathBuf};
@@ -176,6 +178,174 @@ pub fn decrypt_conn_data(d: &mut crate::llm_router::connections::ConnectionData)
                 tracing::warn!("failed to decrypt connection provider_specific: {err}");
                 d.needs_relogin = Some(true);
             }
+        }
+    }
+}
+
+/// One-time (and idempotent — safe to call on every boot) upgrade path: force
+/// the master-key globals ([`cipher`]/[`keychain_status`]) to initialize,
+/// then, when the keychain is usable, sweep every `provider_connections` and
+/// `endpoint_keys` row and encrypt any secret field that is still legacy
+/// plaintext. Rows that are already fully encrypted are left completely
+/// untouched — no decrypt→re-encrypt churn — which is what makes a second
+/// call a true no-op (no nonce changes on already-encrypted rows).
+///
+/// **Atomicity:** each row is swept with its own UPDATE. A failure partway
+/// through (a single row's read/write error) is logged and that one row is
+/// skipped — it is picked up again on the next start. The whole sweep is
+/// deliberately NOT one transaction, so one bad row can never block or
+/// half-apply changes to the others.
+///
+/// **Degraded state:** when [`keychain_status`] is
+/// [`KeychainStatus::Unavailable`], the sweep is skipped entirely. Existing
+/// `enc:` rows are effectively locked — they will fail to decrypt against
+/// whatever key is in play, and [`decrypt_conn_data`] already surfaces that
+/// as `needs_relogin` (never a crash, never a silently blanked secret). New
+/// secrets keep being written by the normal `encrypt_field`/
+/// `encrypt_conn_data` call sites (plaintext for now, since the process-wide
+/// cipher itself falls back to an ephemeral key in this state) until the
+/// keychain recovers on a later start.
+pub async fn init_and_sweep(store: &Store) {
+    let _ = cipher();
+    let status = keychain_status();
+    if !should_sweep(status) {
+        tracing::warn!(
+            "keychain unavailable at startup; skipping the encryption sweep \
+             (existing enc: rows stay locked — decrypt failures flag needs_relogin \
+             instead of crashing or dropping data)"
+        );
+        return;
+    }
+    sweep_connections(store).await;
+    sweep_endpoint_keys(store).await;
+}
+
+/// Whether [`init_and_sweep`] should run its sweep for a given keychain
+/// status. Pure so the "never sweep when Unavailable" rule is directly
+/// unit-testable without touching the process-global cipher/keychain.
+fn should_sweep(status: KeychainStatus) -> bool {
+    !matches!(status, KeychainStatus::Unavailable)
+}
+
+/// True when any secret field of `d` is still legacy plaintext, i.e. would be
+/// changed by [`encrypt_conn_data`]. The sweep uses this to skip rows that
+/// are already fully encrypted, so re-running it never churns nonces.
+fn conn_data_needs_encryption(d: &crate::llm_router::connections::ConnectionData) -> bool {
+    for v in [&d.api_key, &d.access_token, &d.refresh_token]
+        .into_iter()
+        .flatten()
+    {
+        if !v.starts_with("enc:") {
+            return true;
+        }
+    }
+    if let Some(v) = &d.provider_specific {
+        let already_encrypted = matches!(v, serde_json::Value::String(s) if s.starts_with("enc:"));
+        if !already_encrypted {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sweep `provider_connections`: encrypt any row whose `data` still holds a
+/// plaintext secret field. See [`init_and_sweep`] for the atomicity/idempotency
+/// contract.
+async fn sweep_connections(store: &Store) {
+    let rows: Vec<(String, String)> = match store
+        .with_conn(|c| -> rusqlite::Result<Vec<(String, String)>> {
+            let mut stmt = c.prepare("SELECT id, data FROM provider_connections")?;
+            let items = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!("secret sweep: failed to list provider_connections: {err}");
+            return;
+        }
+    };
+
+    for (id, raw) in rows {
+        let mut data: crate::llm_router::connections::ConnectionData =
+            match serde_json::from_str(&raw) {
+                Ok(d) => d,
+                Err(err) => {
+                    tracing::warn!(
+                        "secret sweep: skipping connection {id}, unparseable data json: {err}"
+                    );
+                    continue;
+                }
+            };
+        if !conn_data_needs_encryption(&data) {
+            continue; // already fully encrypted — leave untouched
+        }
+        encrypt_conn_data(&mut data);
+        let new_json = match serde_json::to_string(&data) {
+            Ok(j) => j,
+            Err(err) => {
+                tracing::warn!("secret sweep: failed to serialize connection {id}: {err}");
+                continue;
+            }
+        };
+        let row_id = id.clone();
+        if let Err(err) = store
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE provider_connections SET data=?2 WHERE id=?1",
+                    params![row_id, new_json],
+                )
+                .map(|_| ())
+            })
+            .await
+        {
+            tracing::warn!(
+                "secret sweep: failed to persist encrypted data for connection {id}: {err}"
+            );
+        }
+    }
+}
+
+/// Sweep `endpoint_keys`: encrypt any row whose `key` column is still
+/// plaintext. See [`init_and_sweep`] for the atomicity/idempotency contract.
+async fn sweep_endpoint_keys(store: &Store) {
+    let rows: Vec<(String, String)> = match store
+        .with_conn(|c| -> rusqlite::Result<Vec<(String, String)>> {
+            let mut stmt = c.prepare("SELECT id, key FROM endpoint_keys")?;
+            let items = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!("secret sweep: failed to list endpoint_keys: {err}");
+            return;
+        }
+    };
+
+    for (id, raw) in rows {
+        if raw.starts_with("enc:") {
+            continue; // already encrypted — leave untouched
+        }
+        let encrypted = encrypt_field(&raw);
+        let row_id = id.clone();
+        if let Err(err) = store
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE endpoint_keys SET key=?2 WHERE id=?1",
+                    params![row_id, encrypted],
+                )
+                .map(|_| ())
+            })
+            .await
+        {
+            tracing::warn!("secret sweep: failed to persist encrypted key {id}: {err}");
         }
     }
 }
@@ -409,4 +579,193 @@ mod tests {
     // because `cipher()`/`keychain_status()`/`load()` touch the real OS
     // keychain and the production state dir, which a `cargo test` run must
     // never mutate.
+
+    // --- init_and_sweep -----------------------------------------------
+    //
+    // Note: `init_and_sweep` necessarily calls the process-global `cipher()`
+    // (that's the whole point — it forces the master-key globals to init).
+    // This is no new risk: `add_connection`/`create_key` already call
+    // `cipher()` transitively via `encrypt_conn_data`/`encrypt_field` in the
+    // `connections`/`keys` test suites, so the global has been exercised
+    // under `cargo test` since Task 4. On this dev box (and CI) that
+    // resolves deterministically to the file fallback for the lifetime of
+    // the test binary.
+
+    async fn mem_store() -> Store {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (_, path) = tmp.keep().unwrap();
+        Store::open(&path).await.unwrap()
+    }
+
+    async fn insert_raw_connection(store: &Store, id: &str, raw_data_json: &str) {
+        let id = id.to_string();
+        let raw = raw_data_json.to_string();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "INSERT INTO provider_connections(id,provider,auth_type,label,priority,enabled,data,created_at,updated_at) \
+                     VALUES (?1,'openai','api_key','L',0,1,?2,1,1)",
+                    params![id, raw],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn insert_raw_endpoint_key(store: &Store, id: &str, raw_key: &str) {
+        let id = id.to_string();
+        let raw = raw_key.to_string();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "INSERT INTO endpoint_keys(id,name,key,created_at,last_used_at) VALUES (?1,'dev',?2,1,NULL)",
+                    params![id, raw],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn raw_connection_data(store: &Store, id: &str) -> String {
+        let id = id.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT data FROM provider_connections WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn raw_endpoint_key(store: &Store, id: &str) -> String {
+        let id = id.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT key FROM endpoint_keys WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn sweep_runs_only_when_keychain_ok_or_file_fallback() {
+        assert!(should_sweep(KeychainStatus::Ok));
+        assert!(should_sweep(KeychainStatus::FileFallback));
+        assert!(!should_sweep(KeychainStatus::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn sweep_encrypts_legacy_plaintext_rows() {
+        let store = mem_store().await;
+        // Raw plaintext inserted directly via `with_conn`, bypassing the
+        // encrypting write paths (`add_connection`/`create_key`) entirely —
+        // this simulates a pre-F3b database.
+        insert_raw_connection(&store, "c1", r#"{"apiKey":"sk-legacy-plain"}"#).await;
+        insert_raw_endpoint_key(&store, "k1", "ryz-legacy-plain").await;
+
+        init_and_sweep(&store).await;
+
+        let raw_data = raw_connection_data(&store, "c1").await;
+        assert!(raw_data.contains("enc:v1:"), "got {raw_data}");
+        assert!(!raw_data.contains("sk-legacy-plain"), "got {raw_data}");
+
+        let raw_key = raw_endpoint_key(&store, "k1").await;
+        assert!(raw_key.starts_with("enc:v1:"), "got {raw_key}");
+
+        // Reading back through the normal (decrypting) read paths still
+        // yields the original plaintext.
+        let conns = crate::llm_router::connections::list_connections(&store)
+            .await
+            .unwrap();
+        assert_eq!(conns[0].data.api_key.as_deref(), Some("sk-legacy-plain"));
+        let keys = crate::llm_router::keys::list_keys(&store).await.unwrap();
+        assert_eq!(keys[0].key, "ryz-legacy-plain");
+    }
+
+    #[tokio::test]
+    async fn sweep_is_idempotent() {
+        let store = mem_store().await;
+        insert_raw_connection(&store, "c1", r#"{"apiKey":"sk-legacy-plain"}"#).await;
+        insert_raw_endpoint_key(&store, "k1", "ryz-legacy-plain").await;
+
+        init_and_sweep(&store).await;
+        let raw_data_1 = raw_connection_data(&store, "c1").await;
+        let raw_key_1 = raw_endpoint_key(&store, "k1").await;
+
+        // A second sweep must be a true no-op: same ciphertext, no nonce
+        // churn — proves the needs-encryption pre-check works.
+        init_and_sweep(&store).await;
+        let raw_data_2 = raw_connection_data(&store, "c1").await;
+        let raw_key_2 = raw_endpoint_key(&store, "k1").await;
+
+        assert_eq!(
+            raw_data_1, raw_data_2,
+            "already-encrypted connection data must not be rewritten"
+        );
+        assert_eq!(
+            raw_key_1, raw_key_2,
+            "already-encrypted endpoint key must not be rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_a_row_that_is_already_fully_encrypted() {
+        let store = mem_store().await;
+        let mut data = crate::llm_router::connections::ConnectionData {
+            api_key: Some("sk-already".into()),
+            provider_specific: Some(serde_json::json!({"clientSecret": "shh"})),
+            ..Default::default()
+        };
+        encrypt_conn_data(&mut data);
+        let json = serde_json::to_string(&data).unwrap();
+        insert_raw_connection(&store, "c1", &json).await;
+        insert_raw_endpoint_key(&store, "k1", &encrypt_field("ryz-already")).await;
+
+        let before_data = raw_connection_data(&store, "c1").await;
+        let before_key = raw_endpoint_key(&store, "k1").await;
+
+        init_and_sweep(&store).await;
+
+        assert_eq!(
+            before_data,
+            raw_connection_data(&store, "c1").await,
+            "already-encrypted connection row must not be touched"
+        );
+        assert_eq!(
+            before_key,
+            raw_endpoint_key(&store, "k1").await,
+            "already-encrypted endpoint key row must not be touched"
+        );
+    }
+
+    #[test]
+    fn locked_row_when_keychain_unavailable() {
+        // A "key-lost"/wrong-key scenario: the ciphertext was produced with a
+        // key OTHER than whatever the process-global cipher resolves to in
+        // this test binary. `decrypt_conn_data` must leave the ciphertext in
+        // place (never blank it, never panic) and flag `needs_relogin` — the
+        // honest, non-bricking behavior for a locked/lost-key row.
+        let foreign = SecretCipher::from_key([42u8; 32]);
+        let ciphertext = foreign.encrypt("sk-locked");
+        let mut d = crate::llm_router::connections::ConnectionData {
+            api_key: Some(ciphertext.clone()),
+            ..Default::default()
+        };
+        decrypt_conn_data(&mut d);
+        assert_eq!(
+            d.api_key.as_deref(),
+            Some(ciphertext.as_str()),
+            "undecryptable ciphertext must be left in place, not blanked"
+        );
+        assert_eq!(d.needs_relogin, Some(true));
+    }
 }
