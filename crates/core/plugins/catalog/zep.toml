@@ -1,0 +1,11 @@
+contract = 1
+id = "zep"
+name = "Zep"
+version = "0.1.0"
+publisher = "community (jaysack)"
+description = "Docs-only entry: Zep Cloud has NO official MCP server. The only known option is a low-confidence community package (`mcp-server-zep-cloud` by jaysack, v0.1.0) using ZEP_API_KEY over stdio — not wired here pending verification. If you need durable agent memory today, prefer the `mem0`, `honcho`, `graphiti`, or `cavemem` catalog entries instead."
+homepage = "https://github.com/jaysack/mcp-server-zep-cloud"
+icon = "brain"
+categories = ["memory"]
+verified = false
+experimental = true

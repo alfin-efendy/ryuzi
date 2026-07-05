@@ -1,0 +1,23 @@
+contract = 1
+id = "vercel"
+name = "Vercel"
+version = "0.1.0"
+publisher = "Vercel (official)"
+description = "Project, deployment, and log access — with both read and write operations today — via Vercel's official remote MCP server. OAuth is restricted to approved clients only, not general open registration."
+homepage = "https://vercel.com/docs"
+icon = "triangle"
+categories = ["deploy"]
+verified = true
+
+[auth]
+kind = "oauth"
+help_url = "https://vercel.com/docs"
+
+[[mcp]]
+name = "vercel"
+transport = "http"
+url = "https://mcp.vercel.com"
+
+[menu]
+section = "plugins"
+label = "Vercel"

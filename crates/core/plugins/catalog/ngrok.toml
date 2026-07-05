@@ -1,0 +1,11 @@
+contract = 1
+id = "ngrok"
+name = "ngrok"
+version = "0.1.0"
+publisher = "community (nijikokun, stale)"
+description = "Docs-only entry: ngrok has NO official MCP server. The only known community option (`nijikokun/ngrok-mcp`, using NGROK_API_KEY) is not published to npm, requires cloning and building locally, and has been stale since January 2026 — not wired here. Prefer the `cloudflare` catalog entry (Cloudflare Tunnel, covered by Cloudflare's official MCP server) for a maintained alternative."
+homepage = "https://github.com/nijikokun/ngrok-mcp"
+icon = "radio"
+categories = ["tunnel"]
+verified = false
+experimental = true

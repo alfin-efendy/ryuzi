@@ -20,6 +20,7 @@
 //! [`install_builtins`] adds all of them in one call.
 
 pub mod builtin;
+pub mod catalog;
 pub mod declarative;
 pub mod host;
 pub mod providers;
@@ -31,7 +32,8 @@ pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) and every CLI agent
-/// ([`runtimes_meta::cli_agent_plugins`]) — to `regs`.
+/// ([`runtimes_meta::cli_agent_plugins`]) — plus the embedded integration
+/// catalog ([`catalog::catalog_plugins`]) to `regs`.
 ///
 /// This deliberately does NOT add `native`, `claude-code`, or `discord`:
 /// those carry host-injected config (an ACP adapter descriptor, a gateway
@@ -39,11 +41,20 @@ pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
 /// first and call `install_builtins` afterward (see `runtimes_meta`'s module
 /// doc for why `native` is skipped from the CLI-agent catalog for exactly
 /// this reason — it would otherwise collide with the harness plugin).
+///
+/// The catalog is added last: `Registries::add_plugin` keeps the first
+/// registration for a colliding id, so providers and CLI agents (added
+/// above) always win over a same-id catalog entry, and both of those always
+/// lose to `native`/`claude-code`/`discord` (added by the composition root
+/// before calling this function).
 pub fn install_builtins(regs: &mut Registries) {
     for plugin in providers::provider_plugins() {
         regs.add_plugin(plugin);
     }
     for plugin in runtimes_meta::cli_agent_plugins() {
+        regs.add_plugin(plugin);
+    }
+    for plugin in catalog::catalog_plugins() {
         regs.add_plugin(plugin);
     }
 }
@@ -588,9 +599,13 @@ mod install_builtins_tests {
         // every runtimes-catalog entry EXCEPT `native` (already registered
         // above, under the same id, by the harness plugin) and `ollama`
         // (already covered by the `ollama` model-provider plugin — see
-        // `runtimes_meta`'s module doc).
-        let expected =
-            3 + crate::llm_router::registry::CATALOG.len() + (crate::runtimes::CATALOG.len() - 2);
+        // `runtimes_meta`'s module doc) + every embedded integration-catalog
+        // entry (`catalog::CATALOG_MANIFESTS`, disjoint from all of the
+        // above by construction — see `catalog`'s own collision test).
+        let expected = 3
+            + crate::llm_router::registry::CATALOG.len()
+            + (crate::runtimes::CATALOG.len() - 2)
+            + catalog::CATALOG_MANIFESTS.len();
         assert_eq!(
             ids.len(),
             expected,

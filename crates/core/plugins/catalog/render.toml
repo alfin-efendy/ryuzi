@@ -1,0 +1,26 @@
+contract = 1
+id = "render"
+name = "Render"
+version = "0.1.0"
+publisher = "Render (official, render-oss)"
+description = "Service, deploy, and log access via Render's official MCP server (`render-oss/render-mcp-server`), authenticated with a Render API key sent as a Bearer header."
+homepage = "https://render.com/docs"
+icon = "cloud"
+categories = ["deploy"]
+verified = true
+
+[auth]
+kind = "token"
+setting = "plugin.render.api_key"
+env = "RENDER_API_KEY"
+help_url = "https://render.com/docs/api-keys"
+
+[[mcp]]
+name = "render"
+transport = "http"
+url = "https://mcp.render.com/mcp"
+headers = { Authorization = "Bearer ${auth}" }
+
+[menu]
+section = "plugins"
+label = "Render"

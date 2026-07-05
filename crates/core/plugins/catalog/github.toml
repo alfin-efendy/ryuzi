@@ -1,0 +1,26 @@
+contract = 1
+id = "github"
+name = "GitHub"
+version = "0.1.0"
+publisher = "GitHub (official)"
+description = "Repos, issues, and pull requests via GitHub's official remote MCP server (api.githubcopilot.com/mcp/). Wikis are not covered — no wiki toolset upstream. The previous `npx`-based reference server, published under the now-archived `modelcontextprotocol` reference-servers repo, is dead — do not use it. Auth accepts either GitHub's OAuth flow or a personal access token sent as a Bearer header — this manifest wires the token path so it works headlessly."
+homepage = "https://github.com/github/github-mcp-server"
+icon = "github"
+categories = ["vcs", "issues"]
+verified = true
+
+[auth]
+kind = "token"
+setting = "plugin.github.token"
+env = "GITHUB_PERSONAL_ACCESS_TOKEN"
+help_url = "https://github.com/settings/tokens"
+
+[[mcp]]
+name = "github"
+transport = "http"
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = "Bearer ${auth}" }
+
+[menu]
+section = "plugins"
+label = "GitHub"

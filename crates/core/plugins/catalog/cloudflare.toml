@@ -1,0 +1,23 @@
+contract = 1
+id = "cloudflare"
+name = "Cloudflare"
+version = "0.1.0"
+publisher = "Cloudflare (official)"
+description = "Cloudflare's official remote MCP server — a general API surface that also covers Tunnel endpoints; there is no dedicated Tunnel-only MCP server. Cloudflare also publishes 15 domain-specific servers at `*.mcp.cloudflare.com/mcp` (Workers, DNS, docs, and more) for narrower scopes than this general one."
+homepage = "https://developers.cloudflare.com/agents/model-context-protocol/"
+icon = "cloud"
+categories = ["tunnel"]
+verified = true
+
+[auth]
+kind = "oauth"
+help_url = "https://developers.cloudflare.com/agents/model-context-protocol/"
+
+[[mcp]]
+name = "cloudflare"
+transport = "http"
+url = "https://mcp.cloudflare.com/mcp"
+
+[menu]
+section = "plugins"
+label = "Cloudflare"
