@@ -171,6 +171,7 @@ impl PluginHost {
     /// - unknown id → `false`
     /// - harness-capable → the `enabled_runtimes` CSV setting contains `id`
     /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
+    /// - experimental → always `false` (see below)
     /// - manifest-only (no harness/gateway/connector capability) → always
     ///   `true`
     /// - connector-only → the setting `plugin.<id>.enabled == "true"`
@@ -186,6 +187,16 @@ impl PluginHost {
         if plugin.gateway.is_some() {
             let enabled = csv(settings.get("enabled_gateways").await?.as_deref());
             return Ok(enabled.iter().any(|g| g == id));
+        }
+        if plugin.manifest.experimental {
+            // Experimental catalog entries (ngrok/zep/vercel-sandbox) are
+            // docs-only: no harness/gateway/connector capability backs them,
+            // so there is nothing to actually enable. Report disabled
+            // unconditionally — this wins over the manifest-only fallback
+            // below even if a stray `plugin.<id>.enabled = true` setting
+            // exists. Real capabilities (providers, cli-agents) always
+            // hardcode `experimental = false`, so this never affects them.
+            return Ok(false);
         }
         if plugin.connector.is_none() {
             // Manifest-only plugin (e.g. a provider/cli-agent metadata entry
@@ -539,6 +550,35 @@ mod tests {
         host.add(manifest_only("anthropic"));
 
         assert!(host.is_enabled(&settings, "anthropic").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_enabled_experimental_manifest_only_plugin_is_always_false() {
+        let (store, settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        host.add(CorePlugin {
+            manifest: PluginManifest {
+                experimental: true,
+                ..manifest("ngrok-like")
+            },
+            ..manifest_only("ngrok-like")
+        });
+
+        assert!(
+            !host.is_enabled(&settings, "ngrok-like").await.unwrap(),
+            "experimental plugins have nothing to enable — must report disabled"
+        );
+
+        // Writing `plugin.<id>.enabled = true` must not flip it: experimental
+        // wins over the manifest-only "always enabled" fallback.
+        store
+            .set_setting_raw("plugin.ngrok-like.enabled", "true")
+            .await
+            .unwrap();
+        assert!(
+            !host.is_enabled(&settings, "ngrok-like").await.unwrap(),
+            "experimental still wins even once plugin.<id>.enabled is set"
+        );
     }
 
     #[tokio::test]

@@ -60,26 +60,57 @@ impl Connector for DeclarativeConnector {
     }
 
     async fn ensure_auth(&self, ctx: &ConnectorCtx) -> anyhow::Result<()> {
-        let Some(auth) = &self.manifest.auth else {
-            return Ok(());
-        };
-        // NOTE: `auth.kind = "none"` only means ensure_auth never *requires*
-        // a credential — if the manifest still populates `auth.setting` or
-        // `auth.env`, `${auth}` substitution (`resolve_auth`, below) may
-        // still resolve a value from those sources and inject it into an
-        // `[[mcp]]` entry. "none" is about the gate, not about whether a
-        // value exists.
-        if auth.kind == AuthKind::None {
-            return Ok(());
+        if let Some(auth) = &self.manifest.auth {
+            // NOTE: `auth.kind = "none"` only means ensure_auth never
+            // *requires* a credential — if the manifest still populates
+            // `auth.setting` or `auth.env`, `${auth}` substitution
+            // (`resolve_auth`, below) may still resolve a value from those
+            // sources and inject it into an `[[mcp]]` entry. "none" is about
+            // the gate, not about whether a value exists.
+            if auth.kind != AuthKind::None && self.resolve_auth(ctx).await?.is_none() {
+                let id = &self.manifest.id;
+                match &auth.help_url {
+                    Some(url) => anyhow::bail!("configure {id}: see {url}"),
+                    None => anyhow::bail!("configure {id}: missing credentials"),
+                }
+            }
         }
-        if self.resolve_auth(ctx).await?.is_some() {
-            return Ok(());
+        // Beyond the (auth-specific) credential above, some manifests
+        // declare non-auth `[[settings]]` fields that an `[[mcp]]` entry's
+        // `${setting:KEY}` placeholder depends on to function at all (e.g.
+        // honcho's `plugin.honcho.user` header, datadog's
+        // `plugin.datadog.app_key` header) — `required = true` marks those.
+        // A missing one would otherwise only surface once the MCP server
+        // rejects an empty/absent header, so check it up front here too,
+        // with the same friendly "name the plugin + key (+ help_url)" shape
+        // as the auth error above.
+        for field in &self.manifest.settings {
+            if !field.required {
+                continue;
+            }
+            let present = ctx
+                .settings
+                .get(&field.key)
+                .await?
+                .is_some_and(|v| !v.is_empty());
+            if present {
+                continue;
+            }
+            let id = &self.manifest.id;
+            let key = &field.key;
+            match self
+                .manifest
+                .auth
+                .as_ref()
+                .and_then(|a| a.help_url.as_ref())
+            {
+                Some(url) => {
+                    anyhow::bail!("configure {id}: missing required setting {key} — see {url}")
+                }
+                None => anyhow::bail!("configure {id}: missing required setting {key}"),
+            }
         }
-        let id = &self.manifest.id;
-        match &auth.help_url {
-            Some(url) => anyhow::bail!("configure {id}: see {url}"),
-            None => anyhow::bail!("configure {id}: missing credentials"),
-        }
+        Ok(())
     }
 }
 
@@ -335,6 +366,75 @@ env = { GITHUB_TOKEN = "${auth}" }
             .await
             .unwrap();
         let manifest = PluginManifest::from_toml(GITHUB_STDIO_MANIFEST).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        connector.ensure_auth(&ctx(settings)).await.unwrap();
+    }
+
+    const ACME_REQUIRED_SETTING_MANIFEST: &str = r#"
+contract = 1
+id = "acme-required"
+name = "Acme Required"
+
+[auth]
+kind = "token"
+setting = "plugin.acme-required.token"
+help_url = "https://acme.example.com/tokens"
+
+[[settings]]
+key = "plugin.acme-required.user"
+label = "Acme user"
+help = "Sent as a header identifying the acting user."
+required = true
+
+[[mcp]]
+name = "acme-required"
+transport = "http"
+url = "https://mcp.acme.example.com"
+headers = { Authorization = "Bearer ${auth}", X-Acme-User = "${setting:plugin.acme-required.user}" }
+"#;
+
+    #[tokio::test]
+    async fn ensure_auth_errs_naming_the_missing_required_setting_field() {
+        let (store, settings, _tmp) = open_settings().await;
+        // Auth is satisfied — only the required non-auth setting is missing.
+        store
+            .set_setting_raw("plugin.acme-required.token", "secret-token")
+            .await
+            .unwrap();
+        let manifest = PluginManifest::from_toml(ACME_REQUIRED_SETTING_MANIFEST).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acme-required"),
+            "message should name the plugin id: {msg}"
+        );
+        assert!(
+            msg.contains("plugin.acme-required.user"),
+            "message should name the missing required key: {msg}"
+        );
+        assert!(
+            msg.contains("https://acme.example.com/tokens"),
+            "message should include help_url: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_auth_is_ok_once_auth_and_required_settings_are_both_present() {
+        let (store, settings, _tmp) = open_settings().await;
+        store
+            .set_setting_raw("plugin.acme-required.token", "secret-token")
+            .await
+            .unwrap();
+        store
+            .set_setting_raw("plugin.acme-required.user", "alice")
+            .await
+            .unwrap();
+        let manifest = PluginManifest::from_toml(ACME_REQUIRED_SETTING_MANIFEST).unwrap();
         let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
         let connector = plugin.connector.clone().unwrap();
 
