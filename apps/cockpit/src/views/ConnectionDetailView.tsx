@@ -97,12 +97,23 @@ export function ConnectionDetailView({ id }: { id: string }) {
   };
 
   const needsRelogin = conn.authType === "oauth" && conn.needsRelogin;
+  // Kiro authenticates via the AWS SSO-OIDC device-code flow, not the
+  // redirect+PKCE flow `reconnectOauth` drives — there's no loopback
+  // callback to re-run in place. Point the user back at "Add connection"
+  // (sign in again or re-import from the Kiro IDE) instead of trying, and
+  // failing, to reuse the redirect-based reconnect.
+  const isKiro = conn.provider === "kiro";
 
   const reconnect = async () => {
     setReconnecting(true);
     const ok = await reconnectOauth(conn.id);
     setReconnecting(false);
     if (ok) toast.success(`Reconnected ${conn.providerName}`);
+  };
+
+  const reconnectKiro = () => {
+    nav.navigate({ kind: "models" });
+    toast("Reconnect Kiro from Add connection — sign in again or import from the Kiro IDE.");
   };
 
   return (
@@ -116,7 +127,12 @@ export function ConnectionDetailView({ id }: { id: string }) {
           titleExtra={needsRelogin ? <Pill variant="warn">Needs re-login</Pill> : undefined}
           sub={conn.providerName}
         >
-          {needsRelogin && (
+          {needsRelogin && isKiro && (
+            <Button onClick={reconnectKiro} className="shrink-0">
+              Reconnect via Add connection
+            </Button>
+          )}
+          {needsRelogin && !isKiro && (
             <Button onClick={() => void reconnect()} disabled={reconnecting} className="shrink-0">
               {reconnecting ? "Reconnecting…" : "Reconnect"}
             </Button>
