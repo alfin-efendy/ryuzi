@@ -215,6 +215,43 @@ impl NewMessage {
     }
 }
 
+/// One durable entry in the native runtime's provider-turn ledger: a single
+/// Anthropic-format message (`{role, content:[...]}`) as sent to / received
+/// from the model. Separate from the display-oriented [`Message`] rows; this
+/// is what the native runner replays to reconstruct history on resume.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTurn {
+    pub session_pk: String,
+    pub seq: i64,
+    pub role: String, // user | assistant
+    /// The Anthropic `content` array for this turn.
+    pub payload: serde_json::Value,
+    pub created_at: i64,
+}
+
+/// Input to `Store::insert_provider_turn`; `seq` and `created_at` are assigned
+/// by the store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewProviderTurn {
+    pub session_pk: String,
+    pub role: String,
+    pub payload: serde_json::Value,
+}
+
+impl NewProviderTurn {
+    pub fn new(
+        session_pk: impl Into<String>,
+        role: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        NewProviderTurn {
+            session_pk: session_pk.into(),
+            role: role.into(),
+            payload,
+        }
+    }
+}
+
 /// Public event broadcast to consumers (the Tauri layer re-emits these).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "camelCase")]
