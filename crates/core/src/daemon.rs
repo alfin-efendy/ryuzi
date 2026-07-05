@@ -230,6 +230,9 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
             let descriptor = (opts.adapter)()?;
             registries.install(&ClaudeCodeIntegration::new(descriptor));
         }
+        if enabled_runtimes.iter().any(|r| r == "native") {
+            registries.install(&crate::harness::native::NativeIntegration::new());
+        }
     }
     for (id, factory) in opts.extra_harness_factories {
         registries.harness.register(id, factory);

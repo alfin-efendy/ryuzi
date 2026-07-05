@@ -68,12 +68,20 @@ pub static CATALOG: ProviderCatalog = ProviderCatalog {
         description: "Drive sessions from a Discord server",
         fields: DISCORD_FIELDS,
     }],
-    runtimes: &[RuntimeDescriptor {
-        id: "claude-code",
-        label: "Claude Code",
-        description: "Anthropic's Claude Code CLI (uses your host login)",
-        fields: &[],
-    }],
+    runtimes: &[
+        RuntimeDescriptor {
+            id: "claude-code",
+            label: "Claude Code",
+            description: "Anthropic's Claude Code CLI (uses your host login)",
+            fields: &[],
+        },
+        RuntimeDescriptor {
+            id: "native",
+            label: "Native (ryuzi)",
+            description: "Ryuzi's built-in agent runtime — runs the loop and tools in-process, using your configured model providers",
+            fields: &[],
+        },
+    ],
 };
 
 /// All fields in schema order: globals, then each gateway's fields, then

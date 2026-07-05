@@ -17,16 +17,30 @@ fn main() -> ExitCode {
         detect_claude: ryuzi_cli::detect::detect_claude,
         sidecar_status: Box::new(|| ryuzi_cli::sidecar_host::manager().status()),
         build_registries: Box::new(|| {
-            let resolved = ryuzi_cli::sidecar_host::manager().resolve()?;
-            let descriptor = ryuzi_core::AcpAdapterDescriptor {
-                command: resolved.command,
-                args: resolved.args,
-                env: vec![],
-                // REQUIRED: the adapter refuses to start inside a nested Claude Code session.
-                env_remove: vec!["CLAUDECODE".to_string()],
-            };
             let mut registries = ryuzi_core::Registries::new();
-            registries.install(&ryuzi_core::ClaudeCodeIntegration::new(descriptor));
+            // The native runtime needs no external binary, so register it
+            // unconditionally.
+            registries.install(&ryuzi_core::harness::native::NativeIntegration::new());
+            // Claude Code needs the ACP sidecar. Resolving it may download the
+            // bundled adapter; if that fails (offline, or a native-only setup),
+            // skip it rather than failing the whole command — `--harness native`
+            // still works.
+            match ryuzi_cli::sidecar_host::manager().resolve() {
+                Ok(resolved) => {
+                    let descriptor = ryuzi_core::AcpAdapterDescriptor {
+                        command: resolved.command,
+                        args: resolved.args,
+                        env: vec![],
+                        // REQUIRED: the adapter refuses to start inside a nested
+                        // Claude Code session.
+                        env_remove: vec!["CLAUDECODE".to_string()],
+                    };
+                    registries.install(&ryuzi_core::ClaudeCodeIntegration::new(descriptor));
+                }
+                Err(e) => {
+                    eprintln!("note: claude-code harness unavailable ({e}); native runtime is still available");
+                }
+            }
             Ok(registries)
         }),
     };

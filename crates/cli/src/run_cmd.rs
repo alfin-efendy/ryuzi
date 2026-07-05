@@ -7,8 +7,9 @@ use ryuzi_core::{ControlPlane, CoreEvent};
 use crate::dispatch::Deps;
 
 const PERM_MODES: [&str; 4] = ["default", "acceptEdits", "bypassPermissions", "plan"];
+const HARNESSES: [&str; 2] = ["claude-code", "native"];
 const USAGE: &str =
-    "usage: ryuzi run --dir <git-repo> --prompt <text> [--model x] [--effort y] [--mode m]";
+    "usage: ryuzi run --dir <git-repo> --prompt <text> [--harness native|claude-code] [--model x] [--effort y] [--mode m]";
 
 fn parse_mode(s: &str) -> Option<PermMode> {
     match s {
@@ -43,6 +44,7 @@ pub fn cmd_run(args: &[String], deps: &mut Deps) -> u8 {
         .arg(clap::Arg::new("model").long("model"))
         .arg(clap::Arg::new("effort").long("effort"))
         .arg(clap::Arg::new("mode").long("mode"))
+        .arg(clap::Arg::new("harness").long("harness"))
         .try_get_matches_from(std::iter::once("run".to_string()).chain(args.iter().cloned()));
     let matches = match matches {
         Ok(m) => m,
@@ -67,20 +69,32 @@ pub fn cmd_run(args: &[String], deps: &mut Deps) -> u8 {
         },
     };
     let (model, effort) = (get("model"), get("effort"));
+    let harness = get("harness").unwrap_or_else(|| "claude-code".to_string());
+    if !HARNESSES.contains(&harness.as_str()) {
+        (deps.err)(&format!(
+            "--harness must be one of: {}",
+            HARNESSES.join(", ")
+        ));
+        return 1;
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(run_session(&dir, &prompt, model, effort, mode, deps))
+    rt.block_on(run_session(
+        &dir, &prompt, model, effort, mode, &harness, deps,
+    ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     dir: &str,
     prompt: &str,
     model: Option<String>,
     effort: Option<String>,
     mode: Option<PermMode>,
+    harness: &str,
     deps: &mut Deps,
 ) -> u8 {
     let workdir = match std::fs::canonicalize(expand_home(dir)) {
@@ -124,7 +138,10 @@ async fn run_session(
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| workdir_str.clone());
-            let p = match cp.connect_project(Path::new(&workdir), &name).await {
+            let p = match cp
+                .connect_project_with_harness(Path::new(&workdir), &name, harness)
+                .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     (deps.err)(&format!("✗ {e}"));

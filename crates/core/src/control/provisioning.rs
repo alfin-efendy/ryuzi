@@ -73,7 +73,22 @@ async fn run_git(args: &[&str]) -> anyhow::Result<()> {
 }
 
 impl ControlPlane {
+    /// Connect an existing local git repo as a project driven by the default
+    /// `claude-code` harness. Prefer [`connect_project_with_harness`] to select
+    /// a runtime.
     pub async fn connect_project(&self, workdir: &Path, name: &str) -> anyhow::Result<Project> {
+        self.connect_project_with_harness(workdir, name, "claude-code")
+            .await
+    }
+
+    /// Connect an existing local git repo as a project driven by `harness`
+    /// (e.g. `"native"` or `"claude-code"`).
+    pub async fn connect_project_with_harness(
+        &self,
+        workdir: &Path,
+        name: &str,
+        harness: &str,
+    ) -> anyhow::Result<Project> {
         // Must be an existing git repo (worktrees need a HEAD commit).
         git2::Repository::open(workdir)
             .map_err(|_| anyhow::anyhow!("not a git repository: {}", workdir.display()))?;
@@ -82,7 +97,7 @@ impl ControlPlane {
             name: name.to_string(),
             workdir: workdir.to_string_lossy().into_owned(),
             source: None,
-            harness: "claude-code".into(),
+            harness: harness.to_string(),
             model: None,
             effort: None,
             perm_mode: PermMode::Default,
