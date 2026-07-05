@@ -30,6 +30,7 @@ pub struct RouterServer {
     store: Arc<Store>,
     inner: Mutex<Inner>,
     oauth_token_url_override: Mutex<Option<String>>,
+    kiro_base_override: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -40,6 +41,11 @@ struct AppState {
     /// (post-401) refresh path. `None` in production, which uses each
     /// provider's static `registry::oauth_config` token_url.
     oauth_token_url_override: Option<String>,
+    /// Test-only override for the kiro `generateAssistantResponse` endpoint
+    /// (kiro's URL is hard-coded, unlike the other providers' base URLs,
+    /// which already have a per-connection `base_url_override`). `None` in
+    /// production, which uses `kiro_endpoints(..)[0]`.
+    kiro_base_override: Option<String>,
 }
 
 impl RouterServer {
@@ -51,6 +57,7 @@ impl RouterServer {
                 port: 0,
             }),
             oauth_token_url_override: Mutex::new(None),
+            kiro_base_override: Mutex::new(None),
         }
     }
 
@@ -62,6 +69,16 @@ impl RouterServer {
     #[doc(hidden)]
     pub fn set_oauth_token_url_override(&self, url: Option<String>) {
         *self.oauth_token_url_override.lock().unwrap() = url;
+    }
+
+    /// Test-only seam: point kiro's upstream request at a mock endpoint
+    /// instead of the real kiro.dev/CodeWhisperer URL. Must be called before
+    /// [`start`](Self::start) — it's read once when the server starts. Never
+    /// set this in production code; `None` (the default) uses
+    /// `kiro_endpoints(..)[0]`.
+    #[doc(hidden)]
+    pub fn set_kiro_base_override(&self, url: Option<String>) {
+        *self.kiro_base_override.lock().unwrap() = url;
     }
 
     pub fn status(&self) -> RouterStatus {
@@ -83,6 +100,7 @@ impl RouterServer {
             store: self.store.clone(),
             http: reqwest::Client::new(),
             oauth_token_url_override: self.oauth_token_url_override.lock().unwrap().clone(),
+            kiro_base_override: self.kiro_base_override.lock().unwrap().clone(),
         };
         let app = Router::new()
             .route("/v1/messages", post(handle_messages))
@@ -452,6 +470,9 @@ async fn handle_messages(
         }
         Err(e) => return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    if target.conn.provider == "kiro" {
+        return serve_kiro(&state, target, ClientFormat::Anthropic, &body).await;
+    }
     if target.conn.provider == "openai-oauth" {
         return anthropic_error(StatusCode::BAD_REQUEST, OPENAI_OAUTH_WRONG_ROUTE_MSG);
     }
@@ -537,6 +558,9 @@ async fn handle_chat(
         }
         Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    if target.conn.provider == "kiro" {
+        return serve_kiro(&state, target, ClientFormat::OpenAi, &body).await;
+    }
     if target.conn.provider == "openai-oauth" {
         return openai_error(StatusCode::BAD_REQUEST, OPENAI_OAUTH_WRONG_ROUTE_MSG);
     }
@@ -624,6 +648,9 @@ async fn handle_responses(
         }
         Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    if target.conn.provider == "kiro" {
+        return serve_kiro(&state, target, ClientFormat::Responses, &body).await;
+    }
     if let Some(r) = ensure_fresh_or_reconnect_error(&state, &mut target, openai_error).await {
         return r;
     }
@@ -1144,6 +1171,525 @@ fn spawn_responses_pump(
     Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
+// ---------------------------------------------------------------------------
+// Kiro (CodeWhisperer) native routing
+// ---------------------------------------------------------------------------
+
+/// Which wire format the calling client speaks — kiro serves all three off
+/// the same upstream, so this picks the request translator and the
+/// streaming/non-stream encoder on the way back out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ClientFormat {
+    Anthropic,
+    OpenAi,
+    Responses,
+}
+
+/// Ordered kiro upstream endpoints for `generateAssistantResponse`. MVP only
+/// ever sends to `[0]` (no fallback loop yet — a future retry across `[1]`,
+/// `[2]` on failure can reuse this ordering without change). Account-bound
+/// auth (api_key/idc/external_idp) moves the two `amazonaws.com` hosts first
+/// because kiro.dev rejects an account-bound bearer token.
+fn kiro_endpoints(auth_method: &str, region: &str) -> Vec<String> {
+    let kiro_dev = "https://runtime.us-east-1.kiro.dev/generateAssistantResponse".to_string();
+    let codewhisperer =
+        format!("https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse");
+    let q = format!("https://q.{region}.amazonaws.com/generateAssistantResponse");
+    if connections::is_account_bound(auth_method) {
+        vec![codewhisperer, q, kiro_dev]
+    } else {
+        vec![kiro_dev, codewhisperer, q]
+    }
+}
+
+/// Verbatim kiro (CodeWhisperer) upstream request — no fingerprint/cloaking
+/// headers (spec §2): just the wire's own contract (AWS event-stream
+/// accept, the `x-amz-target` operation name, a static SDK user-agent pair,
+/// an invocation id, and the bearer token). `state.kiro_base_override`
+/// (test-only) replaces the endpoint verbatim when set; production always
+/// resolves `kiro_endpoints(..)[0]`.
+fn kiro_upstream_request(
+    state: &AppState,
+    target: &RouteTarget,
+    kiro_body: &Value,
+) -> reqwest::RequestBuilder {
+    let data = &target.conn.data;
+    let auth_method = connections::kiro_auth_method(data);
+    let url = match &state.kiro_base_override {
+        Some(u) => u.clone(),
+        None => kiro_endpoints(&auth_method, &connections::kiro_region(data))
+            .into_iter()
+            .next()
+            .expect("kiro_endpoints always returns at least one URL"),
+    };
+    let token = data.access_token.clone().unwrap_or_default();
+    let mut req = state
+        .http
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/vnd.amazon.eventstream")
+        .header(
+            "x-amz-target",
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+        )
+        .header("user-agent", "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0")
+        .header("x-amz-user-agent", "aws-sdk-js/3.0.0 kiro-ide/1.0.0")
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("authorization", format!("Bearer {token}"));
+    if auth_method == "api_key" {
+        req = req.header("tokentype", "API_KEY");
+    } else if auth_method == "external_idp" {
+        req = req.header("TokenType", "EXTERNAL_IDP");
+    }
+    req.json(kiro_body)
+}
+
+/// Send the kiro upstream request; on a 401/403, refresh once via
+/// `force_refresh` (kiro connections are oauth, so this dispatches straight
+/// to the kiro refresh branch — AWS SSO-OIDC or the social endpoint,
+/// whichever the connection's auth method calls for) and retry the same
+/// request. Mirrors `send_upstream`'s retry shape exactly: the retry is kept
+/// only if the refresh itself succeeds, and a 401 arriving mid-stream is NOT
+/// retried (this is only called pre-stream, before any response bytes are
+/// read).
+async fn send_kiro(
+    state: &AppState,
+    target: &mut RouteTarget,
+    kiro_body: &Value,
+) -> anyhow::Result<reqwest::Response> {
+    let resp = kiro_upstream_request(state, target, kiro_body)
+        .send()
+        .await?;
+    if matches!(resp.status().as_u16(), 401 | 403) {
+        let refreshed = match &state.oauth_token_url_override {
+            Some(token_url) => oauth::refresh::force_refresh_with_token_url(
+                &state.store,
+                &state.http,
+                &mut target.conn,
+                token_url,
+            )
+            .await
+            .is_ok(),
+            None => oauth::refresh::force_refresh(&state.store, &state.http, &mut target.conn)
+                .await
+                .is_ok(),
+        };
+        if refreshed {
+            return Ok(kiro_upstream_request(state, target, kiro_body)
+                .send()
+                .await?);
+        }
+    }
+    Ok(resp)
+}
+
+/// Translate the client's own wire-format body into kiro's
+/// `generateAssistantResponse` payload. Anthropic and OpenAI clients each
+/// have a direct translator; a Responses client has none of its own, so its
+/// body is first normalized to the internal chat shape via
+/// `responses::responses_request_to_chat`, then routed through the same
+/// OpenAI translator.
+fn kiro_request_body(
+    body: &Value,
+    client_format: ClientFormat,
+    model: &str,
+    data: &connections::ConnectionData,
+    conversation_id: &str,
+) -> Value {
+    match client_format {
+        ClientFormat::Anthropic => {
+            crate::llm_router::kiro::anthropic_request_to_kiro(body, model, data, conversation_id)
+        }
+        ClientFormat::OpenAi => {
+            crate::llm_router::kiro::openai_request_to_kiro(body, model, data, conversation_id)
+        }
+        ClientFormat::Responses => {
+            let chat = crate::llm_router::responses::responses_request_to_chat(body);
+            crate::llm_router::kiro::openai_request_to_kiro(&chat, model, data, conversation_id)
+        }
+    }
+}
+
+/// Forward one OpenAI chunk (from `KiroToOpenAiStream`) down `tx`, re-encoded
+/// per `client_format`: an OpenAI client gets it verbatim as an SSE `data:`
+/// line; Anthropic/Responses clients get it translated through their own
+/// streaming encoder — the same encoders the other pumps use, so the
+/// per-event shape matches exactly. `Err(())` means the client disconnected
+/// (send failed); the caller stops pumping but keeps recording.
+async fn forward_openai_chunk(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    client_format: ClientFormat,
+    oai: &Value,
+    anth: &mut translate::OpenAiToAnthropicStream,
+    rs: &mut crate::llm_router::responses::ResponsesStreamState,
+) -> Result<(), ()> {
+    match client_format {
+        ClientFormat::OpenAi => {
+            let line = bytes::Bytes::from(format!("data: {oai}\n\n"));
+            tx.send(Ok(line)).await.map_err(|_| ())
+        }
+        ClientFormat::Anthropic => {
+            for (name, data) in anth.feed(oai) {
+                if tx.send(Ok(format_sse(&name, &data))).await.is_err() {
+                    return Err(());
+                }
+            }
+            Ok(())
+        }
+        ClientFormat::Responses => {
+            for (name, data) in rs.feed(oai) {
+                if tx.send(Ok(format_sse(&name, &data))).await.is_err() {
+                    return Err(());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Close out a clean stream (kiro sent its `messageStopEvent` terminal
+/// frame): OpenAI gets `data: [DONE]`; Anthropic/Responses get their own
+/// encoder's `finish()` (message_stop / response.completed).
+async fn emit_kiro_finish(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    client_format: ClientFormat,
+    anth: &mut translate::OpenAiToAnthropicStream,
+    rs: &mut crate::llm_router::responses::ResponsesStreamState,
+) {
+    match client_format {
+        ClientFormat::OpenAi => {
+            let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
+        }
+        ClientFormat::Anthropic => {
+            for (name, data) in anth.finish() {
+                let _ = tx.send(Ok(format_sse(&name, &data))).await;
+            }
+        }
+        ClientFormat::Responses => {
+            for (name, data) in rs.finish() {
+                let _ = tx.send(Ok(format_sse(&name, &data))).await;
+            }
+        }
+    }
+}
+
+/// Terminal error frame in the client's own format — used both for a
+/// mid-stream transport error and for a clean EOF that never sent a
+/// `messageStopEvent` (a truncated stream, not a completed one; do not
+/// follow it with `emit_kiro_finish`).
+async fn emit_kiro_error(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    client_format: ClientFormat,
+    anth: &mut translate::OpenAiToAnthropicStream,
+    rs: &mut crate::llm_router::responses::ResponsesStreamState,
+    kiro: &crate::llm_router::kiro::KiroToOpenAiStream,
+    message: &str,
+) {
+    match client_format {
+        ClientFormat::OpenAi => {
+            let err = kiro.error_frame(message);
+            let _ = tx
+                .send(Ok(bytes::Bytes::from(format!("data: {err}\n\n"))))
+                .await;
+        }
+        ClientFormat::Anthropic => {
+            for (name, data) in anth.error_frame(message) {
+                let _ = tx.send(Ok(format_sse(&name, &data))).await;
+            }
+        }
+        ClientFormat::Responses => {
+            let (name, data) = rs.error_frame(message);
+            let _ = tx.send(Ok(format_sse(&name, &data))).await;
+        }
+    }
+}
+
+/// Pump a kiro upstream response (AWS event-stream framing) into the
+/// client's own streaming format. One `AwsEventStreamParser` +
+/// `KiroToOpenAiStream` decodes the wire; the resulting OpenAI chunks are
+/// re-encoded per `client_format` and sent down the channel backing the
+/// response body — reusing the exact terminal/error contract
+/// `spawn_anthropic_to_openai_pump`/`spawn_responses_pump` already have.
+fn spawn_kiro_pump(
+    resp: reqwest::Response,
+    client_format: ClientFormat,
+    model: String,
+    store: Arc<Store>,
+    ctx: RecordCtx,
+) -> Body {
+    use futures::StreamExt;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let mut parser = crate::llm_router::aws_stream::AwsEventStreamParser::default();
+        let mut kiro = crate::llm_router::kiro::KiroToOpenAiStream::new(&model);
+        let mut anth = translate::OpenAiToAnthropicStream::new(&model);
+        let mut rs = crate::llm_router::responses::ResponsesStreamState::new();
+        let mut stream = resp.bytes_stream();
+        let mut errored = false;
+        'pump: while let Some(item) = stream.next().await {
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => {
+                    emit_kiro_error(
+                        &tx,
+                        client_format,
+                        &mut anth,
+                        &mut rs,
+                        &kiro,
+                        &format!("upstream stream interrupted: {e}"),
+                    )
+                    .await;
+                    errored = true;
+                    break;
+                }
+            };
+            for frame in parser.feed(&chunk) {
+                for oai in kiro.feed(&frame) {
+                    if forward_openai_chunk(&tx, client_format, &oai, &mut anth, &mut rs)
+                        .await
+                        .is_err()
+                    {
+                        // Client disconnected; stop pumping but still record
+                        // what we saw so far.
+                        break 'pump;
+                    }
+                }
+            }
+        }
+        if !errored {
+            if kiro.saw_terminal() {
+                emit_kiro_finish(&tx, client_format, &mut anth, &mut rs).await;
+            } else {
+                // Upstream closed cleanly but never sent a messageStopEvent —
+                // that's a truncated stream, not a completed one.
+                errored = true;
+                emit_kiro_error(
+                    &tx,
+                    client_format,
+                    &mut anth,
+                    &mut rs,
+                    &kiro,
+                    "upstream stream ended without a terminal event",
+                )
+                .await;
+            }
+        }
+        let (input, output) = kiro.usage();
+        crate::llm_router::usage::record(
+            &store,
+            &ctx.conn_id,
+            &ctx.provider,
+            &ctx.model,
+            &ctx.client_format,
+            crate::llm_router::usage::Usage { input, output },
+            if errored { 502 } else { 200 },
+            ctx.started,
+            errored.then(|| "stream interrupted".to_string()),
+        );
+    });
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// Fold a fully-drained sequence of `KiroToOpenAiStream` chunks (through its
+/// terminal chunk) into a single non-stream `chat.completion` value — kiro's
+/// wire has no non-stream mode of its own, so a client that asked for one
+/// still needs its content/tool_calls/finish_reason assembled from the same
+/// chunks the streaming path would have sent one at a time.
+fn aggregate_openai_chunks(chunks: &[Value], model: &str, input: i64, output: i64) -> Value {
+    let id = chunks
+        .first()
+        .and_then(|c| c["id"].as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4()));
+    let mut content = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut finish_reason = "stop".to_string();
+    for c in chunks {
+        let delta = &c["choices"][0]["delta"];
+        if let Some(t) = delta["content"].as_str() {
+            content.push_str(t);
+        }
+        for tc in delta["tool_calls"].as_array().cloned().unwrap_or_default() {
+            let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+            while tool_calls.len() <= idx {
+                tool_calls.push(json!({
+                    "id": "", "type": "function",
+                    "function": {"name": "", "arguments": ""}
+                }));
+            }
+            if let Some(tc_id) = tc["id"].as_str() {
+                tool_calls[idx]["id"] = json!(tc_id);
+            }
+            if let Some(name) = tc["function"]["name"].as_str() {
+                tool_calls[idx]["function"]["name"] = json!(name);
+            }
+            if let Some(args) = tc["function"]["arguments"].as_str() {
+                let existing = tool_calls[idx]["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                tool_calls[idx]["function"]["arguments"] = json!(format!("{existing}{args}"));
+            }
+        }
+        if let Some(fr) = c["choices"][0]["finish_reason"].as_str() {
+            finish_reason = fr.to_string();
+        }
+    }
+    let mut message = json!({"role": "assistant", "content": content});
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+    json!({
+        "id": id, "object": "chat.completion", "model": model,
+        "created": crate::paths::now_ms() / 1000,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason, "logprobs": null}],
+        "usage": {"prompt_tokens": input, "completion_tokens": output, "total_tokens": input + output},
+    })
+}
+
+/// Non-stream kiro response: buffer the whole (always-streaming) kiro
+/// upstream body, decode it through the same `AwsEventStreamParser` +
+/// `KiroToOpenAiStream` pipeline as the streaming path, then fold the
+/// resulting chunks into one non-stream value re-encoded in the client's own
+/// format (mirrors `openai_to_anthropic_response`/`chat_response_to_responses`,
+/// which already do this same OpenAI-chat -> client-format step for the
+/// other providers' non-stream replies).
+async fn kiro_non_stream_response(
+    resp: reqwest::Response,
+    client_format: ClientFormat,
+    model: &str,
+    err: fn(StatusCode, &str) -> Response,
+) -> Result<(Value, crate::llm_router::usage::Usage), Response> {
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("[kiro] {e}")))?;
+    let mut parser = crate::llm_router::aws_stream::AwsEventStreamParser::default();
+    let mut kiro = crate::llm_router::kiro::KiroToOpenAiStream::new(model);
+    let mut chunks: Vec<Value> = Vec::new();
+    for frame in parser.feed(&bytes) {
+        chunks.extend(kiro.feed(&frame));
+    }
+    if !kiro.saw_terminal() {
+        return Err(err(
+            StatusCode::BAD_GATEWAY,
+            "[kiro] upstream stream ended without a terminal event",
+        ));
+    }
+    let (input, output) = kiro.usage();
+    let agg = aggregate_openai_chunks(&chunks, model, input, output);
+    let out = match client_format {
+        ClientFormat::OpenAi => agg,
+        ClientFormat::Anthropic => translate::openai_to_anthropic_response(&agg),
+        ClientFormat::Responses => crate::llm_router::responses::chat_response_to_responses(&agg),
+    };
+    Ok((out, crate::llm_router::usage::Usage { input, output }))
+}
+
+/// Route a kiro (CodeWhisperer free-tier) connection natively: translate the
+/// client's own wire-format body to Kiro's `generateAssistantResponse`
+/// payload, send it with the verbatim kiro headers (refreshing once on a
+/// 401/403 like `send_upstream`), and pump the AWS event-stream response
+/// back out re-encoded in the client's own format (or aggregate it into one
+/// JSON body for a non-stream request). Kiro serves all three client formats
+/// off the same upstream, so — unlike `openai-oauth` — there's no
+/// wrong-route guard here.
+async fn serve_kiro(
+    state: &AppState,
+    mut target: RouteTarget,
+    client_format: ClientFormat,
+    body: &Value,
+) -> Response {
+    let err_fn: fn(StatusCode, &str) -> Response = match client_format {
+        ClientFormat::Anthropic => anthropic_error,
+        ClientFormat::OpenAi | ClientFormat::Responses => openai_error,
+    };
+    if let Some(r) = ensure_fresh_or_reconnect_error(state, &mut target, err_fn).await {
+        return r;
+    }
+
+    let model = target.upstream_model.clone();
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+    let kiro_body = kiro_request_body(
+        body,
+        client_format,
+        &model,
+        &target.conn.data,
+        &conversation_id,
+    );
+
+    let stream = body["stream"].as_bool().unwrap_or(false);
+    let started = crate::paths::now_ms();
+    let resp = match send_kiro(state, &mut target, &kiro_body).await {
+        Ok(r) => r,
+        Err(e) => return err_fn(StatusCode::BAD_GATEWAY, &format!("upstream kiro: {e}")),
+    };
+    if !resp.status().is_success() {
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "upstream error".to_string());
+        return err_fn(status, &format!("[kiro] {body_text}"));
+    }
+
+    let ctx = RecordCtx {
+        conn_id: target.conn.id.clone(),
+        provider: target.conn.provider.clone(),
+        model: model.clone(),
+        client_format: match client_format {
+            ClientFormat::Anthropic => "anthropic",
+            ClientFormat::OpenAi => "openai",
+            ClientFormat::Responses => "responses",
+        }
+        .to_string(),
+        started,
+    };
+
+    if stream {
+        sse_response(spawn_kiro_pump(
+            resp,
+            client_format,
+            model,
+            state.store.clone(),
+            ctx,
+        ))
+    } else {
+        match kiro_non_stream_response(resp, client_format, &model, err_fn).await {
+            Ok((v, usage)) => {
+                crate::llm_router::usage::record(
+                    &state.store,
+                    &ctx.conn_id,
+                    &ctx.provider,
+                    &ctx.model,
+                    &ctx.client_format,
+                    usage,
+                    200,
+                    ctx.started,
+                    None,
+                );
+                Json(v).into_response()
+            }
+            Err(r) => {
+                crate::llm_router::usage::record(
+                    &state.store,
+                    &ctx.conn_id,
+                    &ctx.provider,
+                    &ctx.model,
+                    &ctx.client_format,
+                    crate::llm_router::usage::Usage::default(),
+                    502,
+                    ctx.started,
+                    Some("stream interrupted".to_string()),
+                );
+                r
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,6 +1716,7 @@ mod tests {
             store,
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            kiro_base_override: None,
         }
     }
 
@@ -1375,5 +1922,272 @@ mod tests {
             req.headers().get("authorization").unwrap(),
             "Bearer sk-live"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Kiro upstream (Task 8)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn kiro_upstream_request_uses_bearer_and_verbatim_headers_no_fingerprint() {
+        let state = test_state().await;
+        let desc = registry::descriptor("kiro").unwrap();
+        let conn = mk_conn(
+            "k1",
+            "kiro",
+            "oauth",
+            ConnectionData {
+                access_token: Some("kiro-at".into()),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "claude-sonnet-5".into(),
+        };
+        let kiro_body = json!({"conversationState": {}});
+        let req = kiro_upstream_request(&state, &target, &kiro_body)
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://runtime.us-east-1.kiro.dev/generateAssistantResponse"
+        );
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer kiro-at"
+        );
+        assert_eq!(
+            req.headers().get("x-amz-target").unwrap(),
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+        );
+        assert_eq!(
+            req.headers().get("accept").unwrap(),
+            "application/vnd.amazon.eventstream"
+        );
+        assert_eq!(
+            req.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            req.headers().get("user-agent").unwrap(),
+            "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0"
+        );
+        assert_eq!(
+            req.headers().get("x-amz-user-agent").unwrap(),
+            "aws-sdk-js/3.0.0 kiro-ide/1.0.0"
+        );
+        assert_eq!(
+            req.headers().get("amz-sdk-request").unwrap(),
+            "attempt=1; max=3"
+        );
+        assert!(req.headers().get("amz-sdk-invocation-id").is_some());
+        // Neither account-bound tokentype header applies to builder-id auth.
+        assert!(req.headers().get("tokentype").is_none());
+        assert!(req.headers().get("TokenType").is_none());
+        // No fingerprint/cloaking headers beyond the verbatim wire contract.
+        let names: std::collections::HashSet<&str> =
+            req.headers().keys().map(|k| k.as_str()).collect();
+        let allowed: std::collections::HashSet<&str> = [
+            "content-type",
+            "accept",
+            "x-amz-target",
+            "user-agent",
+            "x-amz-user-agent",
+            "amz-sdk-request",
+            "amz-sdk-invocation-id",
+            "authorization",
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            names.is_subset(&allowed),
+            "unexpected headers: {:?}",
+            names.difference(&allowed).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_upstream_request_adds_tokentype_header_for_api_key_auth() {
+        let state = test_state().await;
+        let desc = registry::descriptor("kiro").unwrap();
+        let conn = mk_conn(
+            "k2",
+            "kiro",
+            "oauth",
+            ConnectionData {
+                access_token: Some("at".into()),
+                provider_specific: Some(json!({"authMethod": "api_key"})),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "claude-sonnet-5".into(),
+        };
+        let req = kiro_upstream_request(&state, &target, &json!({}))
+            .build()
+            .unwrap();
+        // Header names are case-insensitive, so `get` finds it either way —
+        // just assert the one value that was actually inserted.
+        assert_eq!(req.headers().get("tokentype").unwrap(), "API_KEY");
+        // Account-bound auth: amazonaws host, not kiro.dev.
+        assert!(req
+            .url()
+            .as_str()
+            .contains("codewhisperer.us-east-1.amazonaws.com"));
+    }
+
+    #[tokio::test]
+    async fn kiro_upstream_request_adds_external_idp_tokentype_header() {
+        let state = test_state().await;
+        let desc = registry::descriptor("kiro").unwrap();
+        let conn = mk_conn(
+            "k3",
+            "kiro",
+            "oauth",
+            ConnectionData {
+                access_token: Some("at".into()),
+                provider_specific: Some(json!({"authMethod": "external_idp"})),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "claude-sonnet-5".into(),
+        };
+        let req = kiro_upstream_request(&state, &target, &json!({}))
+            .build()
+            .unwrap();
+        // Header names are case-insensitive; only one tokentype header is
+        // ever inserted (never both branches).
+        assert_eq!(req.headers().get("TokenType").unwrap(), "EXTERNAL_IDP");
+    }
+
+    #[tokio::test]
+    async fn kiro_upstream_request_honors_base_override() {
+        let mut state = test_state().await;
+        state.kiro_base_override = Some("http://127.0.0.1:9999/mock-kiro".into());
+        let desc = registry::descriptor("kiro").unwrap();
+        let conn = mk_conn(
+            "k4",
+            "kiro",
+            "oauth",
+            ConnectionData {
+                access_token: Some("at".into()),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "claude-sonnet-5".into(),
+        };
+        let req = kiro_upstream_request(&state, &target, &json!({}))
+            .build()
+            .unwrap();
+        assert_eq!(req.url().as_str(), "http://127.0.0.1:9999/mock-kiro");
+    }
+
+    #[test]
+    fn kiro_endpoints_orders_amazonaws_first_for_account_bound_auth() {
+        let default_order = kiro_endpoints("builder-id", "us-east-1");
+        assert_eq!(
+            default_order,
+            vec![
+                "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+                "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+                "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
+            ]
+        );
+        let account_bound = kiro_endpoints("api_key", "us-east-1");
+        assert_eq!(
+            account_bound,
+            vec![
+                "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+                "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
+                "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+            ]
+        );
+        // idc / external_idp are also account-bound; region flows into the
+        // amazonaws hosts (kiro.dev's own host stays pinned to us-east-1).
+        assert_eq!(
+            kiro_endpoints("idc", "eu-west-1")[0],
+            "https://codewhisperer.eu-west-1.amazonaws.com/generateAssistantResponse"
+        );
+    }
+
+    #[test]
+    fn kiro_request_body_routes_anthropic_and_openai_clients_directly() {
+        let data = ConnectionData::default();
+        let anthropic_body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let out = kiro_request_body(&anthropic_body, ClientFormat::Anthropic, "m", &data, "c1");
+        assert_eq!(out["conversationState"]["conversationId"], "c1");
+        assert!(
+            out["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("hi")
+        );
+
+        let openai_body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let out2 = kiro_request_body(&openai_body, ClientFormat::OpenAi, "m", &data, "c2");
+        assert_eq!(out2["conversationState"]["conversationId"], "c2");
+    }
+
+    #[test]
+    fn kiro_request_body_routes_responses_client_through_chat_translation_first() {
+        let data = ConnectionData::default();
+        let body = json!({"model": "m", "input": "hello there", "stream": false});
+        let out = kiro_request_body(
+            &body,
+            ClientFormat::Responses,
+            "claude-sonnet-5",
+            &data,
+            "conv-x",
+        );
+        assert_eq!(out["conversationState"]["conversationId"], "conv-x");
+        let content = out["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(content.contains("hello there"));
+    }
+
+    #[test]
+    fn aggregate_openai_chunks_folds_content_and_usage() {
+        let chunks = vec![
+            json!({"id": "chatcmpl-1", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": "lo"}}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ];
+        let v = aggregate_openai_chunks(&chunks, "claude-sonnet-5", 10, 4);
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["id"], "chatcmpl-1");
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["prompt_tokens"], 10);
+        assert_eq!(v["usage"]["completion_tokens"], 4);
+        assert_eq!(v["usage"]["total_tokens"], 14);
+    }
+
+    #[test]
+    fn aggregate_openai_chunks_folds_tool_call_fragments() {
+        let chunks = vec![
+            json!({"id": "chatcmpl-2", "choices": [{"index": 0, "delta": {"role": "assistant",
+                "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": ""}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "{\"city\":\"Paris\"}"}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        ];
+        let v = aggregate_openai_chunks(&chunks, "m", 0, 0);
+        let tc = &v["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_1");
+        assert_eq!(tc["function"]["name"], "get_weather");
+        assert_eq!(tc["function"]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
     }
 }

@@ -37,3 +37,15 @@ export function quotaColor(pct: number): string {
   if (pct >= 75) return "#F59E0B";
   return "#22C55E";
 }
+
+// Kiro (free tier) device sign-in + Kiro IDE import copy. Kiro doesn't
+// publish a fixed free-tier quota, so this deliberately never states a
+// number — only what's happening in the current step.
+export const KIRO_PICKER_SUBTITLE = "Free — sign in required";
+export const KIRO_SIGNIN_ACTION = "Sign in with Kiro";
+export const KIRO_SIGNIN_SUBTITLE = "Free — sign in with your AWS Builder ID account. No API key needed.";
+export const KIRO_DEVICE_CODE_HINT = "We opened your browser — enter this code to sign in:";
+export const KIRO_WAITING_HINT = "Waiting for you to finish signing in…";
+export const KIRO_IMPORT_ACTION = "Import from Kiro IDE";
+export const KIRO_IMPORT_HINT = "Already signed in to the Kiro IDE on this machine? Import that sign-in instead of starting a new one.";
+export const KIRO_IMPORT_SUCCESS = "Imported your Kiro sign-in";

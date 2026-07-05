@@ -239,6 +239,9 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::begin_oauth_manual,
             connections_cmd::complete_oauth_manual,
             connections_cmd::add_free_connection,
+            connections_cmd::start_kiro_device_flow,
+            connections_cmd::await_kiro_device_flow,
+            connections_cmd::import_kiro_token,
         ])
         .events(collect_events![
             events::CoreEventMsg,
