@@ -51,6 +51,8 @@ pub struct RunnerDeps {
     pub agents: Arc<AgentRegistry>,
     /// Available slash commands.
     pub commands: Arc<CommandRegistry>,
+    /// Worktree snapshot stack for the `revert` tool (most recent last).
+    pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 /// Run one prompt to completion. Returns `Ok(())` once the turn settles
@@ -416,6 +418,15 @@ async fn run_tool_call(
         return tool_result(&t.id, msg, true);
     }
 
+    // Snapshot the worktree before a mutating tool runs, so `revert` can undo
+    // it. `revert` itself must not snapshot (it would capture the change it is
+    // about to undo).
+    if matches!(tool.kind(), "edit" | "execute") && t.name != "revert" {
+        if let Some(sha) = super::snapshot::take(&deps.work_dir).await {
+            deps.snapshots.lock().await.push(sha);
+        }
+    }
+
     // Execute.
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
@@ -424,6 +435,7 @@ async fn run_tool_call(
         cancel: CancellationToken::new(),
         caps: OutputCaps::default(),
         spawn: spawn.clone(),
+        snapshots: deps.snapshots.clone(),
     };
     match tool.execute(&ctx, input).await {
         Ok(out) => {
@@ -718,6 +730,7 @@ mod tests {
             agent,
             agents,
             commands: Arc::new(CommandRegistry::builtin()),
+            snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 

@@ -24,6 +24,7 @@ pub mod grep;
 pub mod ls;
 pub mod mcp;
 pub mod read;
+pub mod revert;
 pub mod skill;
 pub mod task;
 pub mod todo;
@@ -67,6 +68,8 @@ pub struct ToolCtx {
     pub caps: OutputCaps,
     /// Sub-agent spawner for the `task` tool; `None` disables spawning.
     pub spawn: Option<Arc<dyn SubagentSpawner>>,
+    /// Stack of worktree snapshot SHAs for the `revert` tool (most recent last).
+    pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 /// The result of a tool call.
@@ -164,6 +167,7 @@ impl ToolRegistry {
             Arc::new(webfetch::WebFetch),
             Arc::new(websearch::WebSearch),
             Arc::new(skill::SkillTool),
+            Arc::new(revert::Revert),
             Arc::new(task::Task),
         ];
         let mut tools = BTreeMap::new();
@@ -259,6 +263,7 @@ pub(crate) mod testutil {
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),
             spawn: None,
+            snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -321,12 +326,13 @@ mod tests {
             "webfetch",
             "websearch",
             "skill",
+            "revert",
             "task",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 13);
+        assert_eq!(defs.len(), 14);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

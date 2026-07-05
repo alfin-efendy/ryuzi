@@ -21,6 +21,7 @@ pub mod mcp_client;
 pub mod permission;
 pub mod runner;
 pub mod skills;
+pub mod snapshot;
 pub mod tools;
 
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
@@ -121,6 +122,7 @@ impl Harness for NativeHarness {
                 agent,
                 agents,
                 commands,
+                snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             },
             live_cancel: Mutex::new(None),
         }))
