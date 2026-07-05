@@ -69,6 +69,9 @@ where
 /// any error is swallowed so the shutdown always completes), clear `dir`'s
 /// status file, then call `exit(0)`. Generic over `stop`/`exit` so it's
 /// unit-testable without a real `Daemon` or a real `std::process::exit`.
+// Non-test callers are the unix-only signal handlers; on Windows only the
+// unit tests reach this, so the lib build sees it as dead.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) async fn shutdown_once<S, E>(dir: &Path, stopping: &AtomicBool, stop: S, exit: E)
 where
     S: Future<Output = anyhow::Result<()>>,
@@ -566,6 +569,12 @@ impl CanaryHost for ProdCanaryHost {
 /// `std::process::exit(0)`. Both signals share one reentrancy guard and one
 /// `Daemon`/`UpdateManager` handle so whichever fires first wins and the
 /// other is a no-op.
+///
+/// Unix-only: `tokio::signal::unix` does not exist on Windows, and this
+/// unconditional `use` broke `cargo check --workspace` on Windows dev
+/// machines. The daemon itself is unix-only (see README), so the Windows
+/// variant is a compile-shim no-op, not a feature.
+#[cfg(unix)]
 fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -612,6 +621,16 @@ fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Ar
         )
         .await;
     });
+}
+
+/// Windows compile-shim: no SIGTERM/SIGINT to install (the daemon is
+/// unix-only; on Windows only `cargo check/test --workspace` reaches this).
+#[cfg(not(unix))]
+fn install_signal_handlers(
+    _dir: PathBuf,
+    _daemon: Arc<Daemon>,
+    _updater: Option<Arc<UpdateManager>>,
+) {
 }
 
 #[cfg(test)]

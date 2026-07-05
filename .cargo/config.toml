@@ -1,0 +1,6 @@
+# Repo-local cargo aliases only — no build configuration here.
+[alias]
+# Regenerate apps/cockpit/src/bindings.ts. The bin is gated behind a
+# non-default feature so `tauri build` never bundles it (see the [[bin]]
+# in apps/cockpit/src-tauri/Cargo.toml); this alias supplies the feature.
+gen-bindings = "run -p ryuzi-cockpit --bin gen-bindings --features ryuzi-cockpit/gen-bindings"

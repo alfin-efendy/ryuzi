@@ -1,0 +1,31 @@
+name: pr-title
+# Squash-merge uses the PR title as the commit message, and release-please
+# SILENTLY IGNORES any commit that is not a valid conventional commit — that
+# is exactly how #50/#54/#55/#56/#57/#58 vanished from the release PR while
+# the release workflow kept reporting success. This gate makes an invalid
+# title a visible failure instead.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a conventional-commit PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # type(optional-scope)!: description — the grammar release-please parses.
+          re='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([[:alnum:] ._/-]+\))?!?: .+'
+          if printf '%s' "$TITLE" | grep -qE "$re"; then
+            echo "ok: $TITLE"
+          else
+            echo "::error::PR title is not a conventional commit: '$TITLE'"
+            echo "::error::Use 'type(scope): description', e.g. 'feat(cockpit): plugin SDK v1' — release-please silently drops non-conventional squash commits from the release PR, so this is required for the change to appear in a release."
+            exit 1
+          fi
+          # Version-bump visibility: only feat/fix (and breaking '!') bump
+          # versions; other types merge fine but won't appear in changelogs.

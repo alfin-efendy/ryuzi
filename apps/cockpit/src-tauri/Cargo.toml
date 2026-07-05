@@ -10,6 +10,23 @@ default-run = "ryuzi-cockpit"
 name = "ryuzi_cockpit_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Dev-only gate for the gen-bindings helper bin below. Never enabled by
+# `tauri build`, so the bundler skips the bin — without this gate the
+# macOS `--target universal-apple-darwin` release build fails: tauri lipo's
+# only the main app binary, then "Failed to copy binary .../gen-bindings"
+# (this killed the cockpit-v0.1.0 release assets). Run it via the alias in
+# the repo-root .cargo/config.toml: `cargo gen-bindings`.
+gen-bindings = []
+
+# Explicit [[bin]] so the required-features gate applies; tauri-cli's
+# get_binaries honors required-features in both [[bin]] and src/bin
+# auto-discovery paths, dropping the bin from bundling on every platform.
+[[bin]]
+name = "gen-bindings"
+path = "src/bin/gen-bindings.rs"
+required-features = ["gen-bindings"]
+
 [lints]
 workspace = true
 

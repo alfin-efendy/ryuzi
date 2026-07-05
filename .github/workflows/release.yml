@@ -9,11 +9,14 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    # One GitHub release per cycle: only crates/cli creates a release + tag
+    # (vX.Y.Z). cockpit and core are skip-github-release packages — they keep
+    # independent versions and changelogs in the same release PR, and the
+    # cockpit installers are uploaded onto the CLI release by the jobs below
+    # (skipped packages emit no action outputs, so nothing cockpit-* here).
     outputs:
       release_created: ${{ steps.rp.outputs['crates/cli--release_created'] }}
       tag_name: ${{ steps.rp.outputs['crates/cli--tag_name'] }}
-      cockpit_release_created: ${{ steps.rp.outputs['apps/cockpit/src-tauri--release_created'] }}
-      cockpit_tag_name: ${{ steps.rp.outputs['apps/cockpit/src-tauri--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: rp
@@ -148,7 +151,10 @@ jobs:
       - name: Download the released binaries (no rebuild — one provenance per release)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download "${{ needs.release-please.outputs.tag_name }}" --pattern 'ryuzi-*.tar.gz' -D out/
+        # Triple-anchored pattern: the unified release also carries Cockpit
+        # installers; this must only ever match the goreleaser CLI tarballs
+        # (ryuzi-<ver>-<triple>.tar.gz), never a future cockpit .tar.gz bundle.
+        run: gh release download "${{ needs.release-please.outputs.tag_name }}" --pattern 'ryuzi-*-*-*.tar.gz' -D out/
       - name: Stamp version + assemble packages
         run: |
           VERSION="${TAG#v}"
@@ -181,12 +187,75 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  # Cockpit rides the same vX.Y.Z release as the CLI ("one release" model):
+  # installers are built from the release tag (whose tree carries the cockpit
+  # version release-please stamped into tauri.conf.json) and uploaded onto the
+  # CLI release. Needs `sidecar` so manifest.json is already a release asset —
+  # cockpit-release.yml embeds it (the tracked manifest pins v0.0.0 and would
+  # 404 every sidecar download from a released Cockpit).
   cockpit:
-    needs: release-please
-    if: needs.release-please.outputs.cockpit_release_created == 'true'
+    needs: [release-please, sidecar]
+    if: needs.release-please.outputs.release_created == 'true'
     permissions:
       contents: write
     uses: ./.github/workflows/cockpit-release.yml
     with:
-      tag: ${{ needs.release-please.outputs.cockpit_tag_name }}
+      tag: ${{ needs.release-please.outputs.tag_name }}
     secrets: inherit
+
+  # The release is only "done" when every artifact family is present — a
+  # partial upload (like v0.4.0: sidecar only, no CLI binaries, no installers)
+  # must fail loudly here instead of shipping silently. Also appends the
+  # Cockpit section to the release notes (release-please only writes the CLI
+  # changelog into the release body).
+  finalize:
+    needs: [release-please, goreleaser, cockpit]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Verify the release carries every artifact family
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          assets=$(gh release view "$TAG" --json assets -q '.assets[].name')
+          echo "$assets"
+          fail=0
+          for want in \
+            'ryuzi-.+-x86_64-unknown-linux-gnu\.tar\.gz' \
+            'ryuzi-.+-aarch64-unknown-linux-gnu\.tar\.gz' \
+            'ryuzi-.+-x86_64-unknown-linux-musl\.tar\.gz' \
+            'ryuzi-.+-aarch64-unknown-linux-musl\.tar\.gz' \
+            'ryuzi-.+-x86_64-apple-darwin\.tar\.gz' \
+            'ryuzi-.+-aarch64-apple-darwin\.tar\.gz' \
+            '^checksums\.txt$' \
+            '^manifest\.json$' \
+            '-setup\.exe$' \
+            '\.dmg$' \
+            '\.deb$' \
+            '\.rpm$' \
+            '^cockpit-checksums\.txt$'; do
+            echo "$assets" | grep -qE "$want" || { echo "::error::release $TAG is missing an asset matching: $want"; fail=1; }
+          done
+          exit $fail
+      - name: Append the Cockpit section to the release notes (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          body=$(gh release view "$TAG" --json body -q .body)
+          if printf '%s' "$body" | grep -q '<!-- cockpit-notes -->'; then
+            echo "cockpit section already present; skipping"
+            exit 0
+          fi
+          ver=$(jq -r .version apps/cockpit/src-tauri/tauri.conf.json)
+          {
+            printf '%s\n\n' "$body"
+            printf '<!-- cockpit-notes -->\n'
+            printf '## Cockpit %s (desktop app)\n\n' "$ver"
+            printf 'Installers are attached to this release: `*-setup.exe` (Windows x64/arm64), `.dmg` (macOS universal), `.deb`/`.rpm` (Linux x64/arm64). Verify downloads against `cockpit-checksums.txt`. Changelog: apps/cockpit/src-tauri/CHANGELOG.md.\n'
+          } > /tmp/notes.md
+          gh release edit "$TAG" --notes-file /tmp/notes.md
