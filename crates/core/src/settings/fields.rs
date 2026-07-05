@@ -98,6 +98,15 @@ pub static GLOBAL_FIELDS: &[ConfigField] = &[
         ..BASE
     },
     ConfigField {
+        key: "max_spawn_depth",
+        label: "Max sub-agent spawn depth",
+        field_type: FieldType::Int,
+        default: Some("1"),
+        help: "How deep sub-agents may spawn further sub-agents (1 = flat; \
+               delegating agents need `delegate: true`)",
+        ..BASE
+    },
+    ConfigField {
         key: "approval_timeout_ms",
         label: "Approval timeout (ms)",
         field_type: FieldType::Int,

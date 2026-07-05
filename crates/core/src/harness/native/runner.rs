@@ -103,6 +103,7 @@ pub async fn run_turn(
     let spawn: Arc<dyn SubagentSpawner> = Arc::new(RunnerSpawner {
         deps: deps.clone(),
         cancel: cancel.clone(),
+        depth: 0,
     });
     drive(deps, &agent, &mut ledger, &cancel, Some(spawn), true).await?;
 
@@ -377,11 +378,25 @@ fn effective_child_filter(
     )
 }
 
+/// The `max_spawn_depth` setting (default 1 = flat delegation).
+async fn max_spawn_depth(store: &Arc<Store>) -> u8 {
+    store
+        .get_setting("max_spawn_depth")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// A [`SubagentSpawner`] backed by the runner: runs sub-agents in ephemeral
-/// (unpersisted-history) sub-loops and returns their final texts.
+/// (unpersisted-history) sub-loops and returns their final texts. `depth` is
+/// how many delegation hops separate this spawner from the primary agent.
 struct RunnerSpawner {
     deps: RunnerDeps,
     cancel: CancellationToken,
+    depth: u8,
 }
 
 impl RunnerSpawner {
@@ -434,9 +449,44 @@ impl RunnerSpawner {
             &self.deps.tools.names(),
             SUBAGENT_BLOCKLIST,
         );
+        // Orchestrator role: a delegating child gets the `task` tool re-armed
+        // and a spawner one hop deeper, while the spawn-depth budget allows.
+        let child_depth = self.depth.saturating_add(1);
+        let max_depth = max_spawn_depth(&self.deps.store).await;
+        let delegates = child.can_delegate && child_depth < max_depth;
+        if delegates {
+            if let super::agents::ToolFilter::Only(list) = &mut child.tools {
+                if !list.iter().any(|t| t == "task") {
+                    list.push("task".to_string());
+                }
+            }
+            let block = format!(
+                "\n\nYou may delegate subtasks with the `task` tool (spawn depth \
+                 {child_depth} of {max_depth}). Delegate only self-contained work — \
+                 sub-agents cannot see your conversation. Prefer the batch form for \
+                 independent subtasks; do small work yourself."
+            );
+            child.prompt = Some(match child.prompt.take() {
+                Some(p) => format!("{p}{block}"),
+                None => format!(
+                    "{}{block}",
+                    context::assemble_system(&self.deps.work_dir, None)
+                ),
+            });
+        }
         // No display rows, no memory access; history is ephemeral.
         let mut child_deps = self.deps.clone();
         child_deps.memory = None;
+        child_deps.agent = child.clone();
+        let child_spawn: Option<Arc<dyn SubagentSpawner>> = if delegates {
+            Some(Arc::new(RunnerSpawner {
+                deps: child_deps.clone(),
+                cancel: cancel.clone(),
+                depth: child_depth,
+            }))
+        } else {
+            None
+        };
         let mut ledger = Ledger::ephemeral(&self.deps.session_pk);
         if let Err(e) = ledger
             .append_user(json!([{ "type": "text", "text": spec.prompt }]))
@@ -444,7 +494,7 @@ impl RunnerSpawner {
         {
             return result(SubtaskStatus::Error, e.to_string());
         }
-        match drive(&child_deps, &child, &mut ledger, &cancel, None, false).await {
+        match drive(&child_deps, &child, &mut ledger, &cancel, child_spawn, false).await {
             Ok(text) if cancel.is_cancelled() => {
                 result(SubtaskStatus::Interrupted, cap_report(&text))
             }
@@ -1131,6 +1181,7 @@ mod tests {
         let spawner = RunnerSpawner {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
+            depth: 0,
         };
         let results = spawner
             .run_many(vec![
@@ -1163,6 +1214,7 @@ mod tests {
         let spawner = RunnerSpawner {
             deps,
             cancel: CancellationToken::new(),
+            depth: 0,
         };
         let specs = (0..3)
             .map(|i| SubtaskSpec {
@@ -1188,6 +1240,7 @@ mod tests {
         let spawner = RunnerSpawner {
             deps,
             cancel: CancellationToken::new(),
+            depth: 0,
         };
         let results = spawner
             .run_many(vec![
@@ -1216,7 +1269,11 @@ mod tests {
         let deps = deps_at(dir.path(), llm).await;
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let spawner = RunnerSpawner { deps, cancel };
+        let spawner = RunnerSpawner {
+            deps,
+            cancel,
+            depth: 0,
+        };
         let results = spawner
             .run_many(vec![
                 SubtaskSpec {
@@ -1233,6 +1290,147 @@ mod tests {
         assert!(results
             .iter()
             .all(|r| r.status == SubtaskStatus::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_child_delegates_when_depth_allows() {
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        // parent → task(orchestrator) → orchestrator → task(explore) →
+        // explore reports → orchestrator synthesizes → parent closes.
+        let parent = vec![
+            tool_use_start(0, "c1", "task"),
+            input_json_delta(
+                0,
+                "{\"subagent_type\":\"orchestrator\",\"prompt\":\"coordinate this\"}",
+            ),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let orch_1 = vec![
+            tool_use_start(0, "c2", "task"),
+            input_json_delta(0, "{\"subagent_type\":\"explore\",\"prompt\":\"look around\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let explore = vec![
+            text_delta("explored ok"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let orch_2 = vec![
+            text_delta("coordinated: explored ok"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let parent_end = vec![text_delta("done"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![
+            parent, orch_1, explore, orch_2, parent_end,
+        ]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        deps.store.set_setting("max_spawn_depth", "2").await.unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                agent: "go wide".into(),
+                display: "go wide".into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 5, "orchestrator's delegation really ran");
+        // The orchestrator child carries the capability block and the task tool.
+        let orch_sys = bodies[1]["system"].as_str().unwrap();
+        assert!(orch_sys.contains("spawn depth 1 of 2"), "{orch_sys}");
+        let orch_tools: Vec<&str> = bodies[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(orch_tools.contains(&"task"));
+        assert!(!orch_tools.contains(&"memory"), "memory stays blocked");
+        // The grandchild explore ran and fed the orchestrator's synthesis.
+        let task_row_out = deps
+            .store
+            .list_messages("s1")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.block_type == "tool_call" && m.payload["name"] == "task")
+            .expect("task row")
+            .payload["output"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(task_row_out.contains("coordinated: explored ok"));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_child_cannot_delegate_at_default_depth() {
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = vec![
+            tool_use_start(0, "c1", "task"),
+            input_json_delta(
+                0,
+                "{\"subagent_type\":\"orchestrator\",\"prompt\":\"coordinate\"}",
+            ),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // The orchestrator tries to delegate anyway; the tool must refuse.
+        let orch_try = vec![
+            tool_use_start(0, "c2", "task"),
+            input_json_delta(0, "{\"subagent_type\":\"explore\",\"prompt\":\"x\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let orch_give_up = vec![
+            text_delta("did it alone"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let parent_end = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![
+            parent,
+            orch_try,
+            orch_give_up,
+            parent_end,
+        ]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        // max_spawn_depth unset → default 1 → flat delegation only.
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                agent: "go".into(),
+                display: "go".into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 4, "no grandchild stream was opened");
+        // `task` was filtered out of the child's toolset entirely, so the
+        // allow-list gate refuses the attempt.
+        let orch_tools: Vec<&str> = bodies[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(!orch_tools.contains(&"task"));
+        let msgs = serde_json::to_string(&bodies[2]["messages"]).unwrap();
+        assert!(msgs.contains("not permitted"), "{msgs}");
+        // And its system prompt has no capability block.
+        assert!(!bodies[1]["system"].as_str().unwrap().contains("spawn depth"));
     }
 
     #[tokio::test]
