@@ -105,9 +105,9 @@ jobs:
           git config --global user.name "ryuzi CI"
       - run: cargo fmt --check
         if: matrix.os == 'ubuntu-latest'
-      - run: cargo clippy -p ryuzi-core -p ryuzi-cli --all-targets -- -D warnings
+      - run: cargo clippy -p ryuzi-core -p ryuzi-cli -p ryuzi-plugin-sdk --all-targets -- -D warnings
         if: matrix.os == 'ubuntu-latest'
-      - run: cargo test -p ryuzi-core -p ryuzi-cli
+      - run: cargo test -p ryuzi-core -p ryuzi-cli -p ryuzi-plugin-sdk
       - name: Build + smoke the CLI binary (absorbs the old build-smoke job)
         run: |
           cargo build -p ryuzi-cli

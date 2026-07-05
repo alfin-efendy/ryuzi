@@ -70,6 +70,7 @@ desktop UI and shared web UI).
 | --- | --- | --- |
 | `crates/core` | `ryuzi-core` — engine: control plane, store (SQLite), gateways (Discord), harness, LLM router, scheduler, settings, telemetry, update, worktrees | Cargo |
 | `crates/cli` | `ryuzi-cli` — the `ryuzi` CLI and ratatui TUI (the product binary) | Cargo |
+| `crates/plugin-sdk` | `ryuzi-plugin-sdk` — declarative plugin contract: manifest types, category vocabulary, validation, placeholder substitution (no `ryuzi-core` dependency) | Cargo |
 | `apps/cockpit` | Tauri desktop app frontend | Bun, Vite, React, Tailwind v4 |
 | `apps/cockpit/src-tauri` | `ryuzi-cockpit` — Tauri shell and desktop commands, depends on `ryuzi-core` | Cargo, Tauri 2 |
 | `apps/mission-control` | Planned web app (not implemented) | Bun |
@@ -147,8 +148,9 @@ Keep dependencies flowing inward:
 
 ### Rust Workspace
 
-- Cargo workspace members are `crates/core`, `crates/cli`, and
-  `apps/cockpit/src-tauri` (declared in root `Cargo.toml`).
+- Cargo workspace members are `crates/core`, `crates/cli`,
+  `crates/plugin-sdk`, and `apps/cockpit/src-tauri` (declared in root
+  `Cargo.toml`).
 - Shared dependencies and lint levels live in `[workspace.dependencies]` and
   `[workspace.lints]` in the root `Cargo.toml`; members opt in with
   `workspace = true`. Add new shared deps there, not per-crate.
