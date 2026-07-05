@@ -90,16 +90,31 @@ async fn connect_mcp_tools(
     extra
 }
 
+async fn resolve_native_model(
+    store: &crate::store::Store,
+    configured: Option<String>,
+) -> Option<String> {
+    if let Some(model) = configured.filter(|m| !m.trim().is_empty()) {
+        if crate::llm_router::client::route_model_for_anthropic_messages(store, &model)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Some(model);
+        }
+    }
+    crate::llm_router::client::default_anthropic_messages_model(store).await
+}
+
 #[async_trait]
 impl Harness for NativeHarness {
     async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
         let llm = self.llm_factory.create(ctx.store.clone());
-        // Fall back to the first enabled connection's model when the project
-        // pins none, so a native run "just works" without an explicit --model.
-        let model = match ctx.model {
-            Some(m) if !m.is_empty() => Some(m),
-            _ => crate::llm_router::client::default_model(&ctx.store).await,
-        };
+        // Native speaks Anthropic Messages internally; resolve configured
+        // routes/models through that capability and fall back to a compatible
+        // route/model when a stale project pins a Responses-only target.
+        let model = resolve_native_model(&ctx.store, ctx.model).await;
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
@@ -320,5 +335,70 @@ mod tests {
         // cancel()/end() are safe no-ops when idle.
         session.cancel().await.unwrap();
         session.end().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_model_resolution_falls_back_from_responses_only_model() {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+        use crate::llm_router::routes::{
+            self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
+        };
+
+        fn conn(id: &str, provider: &str, model: &str) -> ConnectionRow {
+            let is_oauth = provider.ends_with("oauth");
+            ConnectionRow {
+                id: id.into(),
+                provider: provider.into(),
+                auth_type: if is_oauth {
+                    "oauth".into()
+                } else {
+                    "api_key".into()
+                },
+                label: id.into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: (!is_oauth).then(|| format!("sk-{id}")),
+                    access_token: is_oauth.then(|| format!("at-{id}")),
+                    models_override: Some(vec![model.into()]),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            }
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        connections::add_connection(&store, conn("chatgpt", "openai-oauth", "gpt-5.2-codex"))
+            .await
+            .unwrap();
+        connections::add_connection(&store, conn("claude", "anthropic", "claude-sonnet-4-5"))
+            .await
+            .unwrap();
+        routes::save_model_route(
+            &store,
+            ModelRouteInfo {
+                id: "r1".into(),
+                name: "fable".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::Fallback,
+                targets: vec![ModelRouteTarget {
+                    connection_id: "claude".into(),
+                    model: "claude-sonnet-4-5".into(),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resolve_native_model(&store, Some("openai-oauth/gpt-5.2-codex".into()))
+                .await
+                .as_deref(),
+            Some("fable")
+        );
     }
 }

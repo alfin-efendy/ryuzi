@@ -188,6 +188,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::resolve_approval,
             commands::read_file,
             commands::pick_directory,
+            commands::pick_files,
             commands::backdrop_capability,
             commands::get_setting,
             commands::set_setting,

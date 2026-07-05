@@ -1,11 +1,21 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, events, type Project, type Session, type CoreEvent, type Message } from "./bindings";
+import { commands, events, type Project, type Session, type CoreEvent, type Message, type ChatRequestOptions } from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
 import type { Row } from "./lib/transcript";
 
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
+export type ChatOptions = {
+  runtimeId?: string | null;
+  model?: string | null;
+  context?: {
+    branch?: string | null;
+    voiceTranscript?: string | null;
+    references?: string[];
+  } | null;
+  attachments?: string[];
+};
 
 type State = {
   projects: Project[];
@@ -23,8 +33,8 @@ type State = {
   refresh: () => Promise<void>;
   addProject: () => Promise<void>;
   setProjectHarness: (projectId: string, harness: string) => Promise<void>;
-  start: (projectId: string, prompt: string) => Promise<void>;
-  send: (sessionPk: string, prompt: string) => Promise<void>;
+  start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
+  send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
   stop: (sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
   end: (sessionPk: string) => Promise<boolean>;
@@ -41,6 +51,22 @@ function outputPreview(v: unknown): string | null {
   if (v === undefined || v === null) return null;
   if (typeof v === "string") return v;
   return JSON.stringify(v, null, 2);
+}
+
+function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions | null {
+  if (!options) return null;
+  return {
+    runtimeId: options.runtimeId ?? null,
+    model: options.model ?? null,
+    context: options.context
+      ? {
+          branch: options.context.branch ?? null,
+          voiceTranscript: options.context.voiceTranscript ?? null,
+          references: options.context.references ?? [],
+        }
+      : null,
+    attachments: options.attachments ?? [],
+  };
 }
 
 // Projects a persisted/streamed message block onto the render Row shape.
@@ -217,8 +243,8 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  start: async (projectId, prompt) => {
-    const res = await commands.startSession(projectId, prompt);
+  start: async (projectId, prompt, options) => {
+    const res = await commands.startSession(projectId, prompt, toChatRequestOptions(options));
     if (res.status === "ok") {
       const pk = res.data.sessionPk;
       set({ focusedSessionPk: pk });
@@ -227,8 +253,8 @@ export const useStore = create<State>((set, get) => ({
       toast.error("Couldn't start session: " + res.error.message);
     }
   },
-  send: async (sessionPk, prompt) => {
-    const res = await commands.continueSession(sessionPk, prompt);
+  send: async (sessionPk, prompt, options) => {
+    const res = await commands.continueSession(sessionPk, prompt, toChatRequestOptions(options));
     if (res.status === "error") {
       toast.error("Couldn't send message: " + res.error.message);
     }

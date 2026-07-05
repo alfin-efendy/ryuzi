@@ -298,6 +298,30 @@ fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (session_pk, pos)\
             );",
         ),
+        // Orchestration task graph. Keep this migration idempotent because some
+        // dev DBs already reached user_version 11 from a newer cockpit build.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS orch_tasks (\
+                id TEXT PRIMARY KEY,\
+                root_id TEXT,\
+                project_id TEXT NOT NULL,\
+                title TEXT NOT NULL,\
+                body TEXT NOT NULL,\
+                agent TEXT NOT NULL DEFAULT '',\
+                status TEXT NOT NULL DEFAULT 'todo',\
+                session_pk TEXT,\
+                result TEXT,\
+                error TEXT,\
+                created_at INTEGER,\
+                finished_at INTEGER\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_orch_tasks_root ON orch_tasks(root_id, status);\
+            CREATE TABLE IF NOT EXISTS orch_task_deps (\
+                task_id TEXT NOT NULL,\
+                dep_id TEXT NOT NULL,\
+                PRIMARY KEY (task_id, dep_id)\
+            );",
+        ),
     ])
 }
 
@@ -1283,6 +1307,23 @@ mod tests {
                     c.query_row("SELECT count(*) FROM provider_turns", [], |r| r.get(0))?;
                 let td: i64 = c.query_row("SELECT count(*) FROM todos", [], |r| r.get(0))?;
                 Ok((pt, td))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn migration_11_creates_orchestration_tables() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let counts = store
+            .with_conn(|c| {
+                let tasks: i64 =
+                    c.query_row("SELECT count(*) FROM orch_tasks", [], |r| r.get(0))?;
+                let deps: i64 =
+                    c.query_row("SELECT count(*) FROM orch_task_deps", [], |r| r.get(0))?;
+                Ok((tasks, deps))
             })
             .await
             .unwrap();

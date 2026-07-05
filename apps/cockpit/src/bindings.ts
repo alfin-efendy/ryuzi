@@ -37,17 +37,17 @@ async connectProject(workdir: string, name: string) : Promise<Result<Project, Cm
     else return { status: "error", error: e  as any };
 }
 },
-async startSession(projectId: string, prompt: string) : Promise<Result<Session, CmdError>> {
+async startSession(projectId: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_session", { projectId, prompt }) };
+    return { status: "ok", data: await TAURI_INVOKE("start_session", { projectId, prompt, options }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async continueSession(sessionPk: string, prompt: string) : Promise<Result<null, CmdError>> {
+async continueSession(sessionPk: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("continue_session", { sessionPk, prompt }) };
+    return { status: "ok", data: await TAURI_INVOKE("continue_session", { sessionPk, prompt, options }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -82,6 +82,9 @@ async readFile(path: string) : Promise<Result<string, CmdError>> {
 },
 async pickDirectory() : Promise<string | null> {
     return await TAURI_INVOKE("pick_directory");
+},
+async pickFiles() : Promise<string[]> {
+    return await TAURI_INVOKE("pick_files");
 },
 async backdropCapability() : Promise<BackdropCapability> {
     return await TAURI_INVOKE("backdrop_capability");
@@ -879,6 +882,8 @@ export type AgentInfo = { name: string; description: string; mode: string; built
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CatalogEntry = { id: string; name: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
+export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
+export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[] }
 export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }

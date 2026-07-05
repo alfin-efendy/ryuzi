@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { goBackHistory, goForwardHistory, navigateHistory, type NavHistory, type View } from "./store-nav";
+import { goBackHistory, goForwardHistory, navigateHistory, useNav, type NavHistory, type View } from "./store-nav";
 
 const home: View = { kind: "home" };
 const models: View = { kind: "models" };
@@ -71,4 +71,8 @@ test("readClampedPanelSize parses, defaults, and clamps a persisted size to the 
   expect(readClampedPanelSize("garbage", 1600, RIGHT_WIDTH)).toBe(RIGHT_WIDTH.def); // invalid → default
   expect(readClampedPanelSize("0", 1600, RIGHT_WIDTH)).toBe(RIGHT_WIDTH.def); // non-positive → default
   expect(readClampedPanelSize("2000", 900, BOTTOM_HEIGHT)).toBe(540); // 60% of 900
+});
+
+test("composer runtime starts unset so new chat follows the configured default runtime", () => {
+  expect(useNav.getState().composerAgent).toBe("");
 });
