@@ -363,7 +363,14 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let cfg = Config::new(path);
+        // Single pooled connection. The store is low-QPS and SQLite is
+        // single-writer anyway; more importantly, multiple WAL connections do
+        // not reliably share the schema/writes on every filesystem — CI hit
+        // "no such table" when a request's read landed on a different pooled
+        // connection than the one migrations/writes ran on. One connection
+        // serializes access and sidesteps that class of bug entirely.
+        let mut cfg = Config::new(path);
+        cfg.pool = Some(deadpool_sqlite::PoolConfig::new(1));
         let pool = cfg.create_pool(Runtime::Tokio1)?;
         interact_on(&pool, |c| {
             let _ = c.pragma_update(None, "journal_mode", "WAL");
