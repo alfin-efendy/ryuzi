@@ -589,12 +589,76 @@ async moveConnection(id: string, dir: number) : Promise<Result<ConnectionInfo[],
 }
 },
 /**
- * Hit the upstream's model-list (openai) / a 1-token message (anthropic)
- * to distinguish bad key (401/403) from network trouble.
+ * Hit the upstream's model-list endpoint to distinguish bad credentials
+ * (401/403) from network trouble, and persist the discovered model ids.
  */
 async testConnection(id: string) : Promise<Result<TestResult, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("test_connection", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async testConnectionModel(id: string, model: string) : Promise<Result<TestResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("test_connection_model", { id, model }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async connectionProviderQuota(id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async resetCodexCredit(id: string) : Promise<Result<CodexResetCreditResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reset_codex_credit", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listModelRoutes() : Promise<Result<ModelRouteInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_model_routes") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async saveModelRoute(route: ModelRouteInfo) : Promise<Result<ModelRouteInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_model_route", { route }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteModelRoute(id: string) : Promise<Result<ModelRouteInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_model_route", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async providerAccountRoute(provider: string) : Promise<Result<ProviderAccountRouteInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("provider_account_route", { provider }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setProviderAccountRoute(provider: string, strategy: ModelRouteStrategy) : Promise<Result<ProviderAccountRouteInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_provider_account_route", { provider, strategy }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -728,6 +792,52 @@ async shareSession(sessionPk: string) : Promise<Result<string, CmdError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Start Kiro's AWS SSO-OIDC device-code flow: registers a public client,
+ * starts a device authorization, opens the browser to the verification URL,
+ * and stashes the in-flight state under a fresh `flow_id` for
+ * [`await_kiro_device_flow`] to poll. Does not touch the store — nothing is
+ * persisted until the user completes the browser step.
+ */
+async startKiroDeviceFlow() : Promise<Result<DeviceFlowInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_kiro_device_flow") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Poll the token endpoint for a flow started by [`start_kiro_device_flow`]
+ * until the user completes the browser step (or the code expires/is
+ * denied), then persist the resulting `kiro`/`oauth` connection. The flow
+ * state is consumed from [`FLOWS`] up front — a `flow_id` can only ever be
+ * awaited once, success or failure.
+ */
+async awaitKiroDeviceFlow(label: string, flowId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("await_kiro_device_flow", { label, flowId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Import Kiro OAuth tokens from an already-installed, logged-in Kiro IDE
+ * (its AWS SSO token cache + optional client registration + profile.json),
+ * so a connection can be created without running the device-code flow.
+ * Validates the imported refresh token with one [`oauth::refresh::force_refresh`]
+ * call (which mints a fresh access token) before persisting — a dead/expired
+ * import token surfaces its error instead of a connection that can't route.
+ */
+async importKiroToken(label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("import_kiro_token", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -737,11 +847,13 @@ async shareSession(sessionPk: string) : Promise<Result<string, CmdError>> {
 export const events = __makeEvents__<{
 accentChangedMsg: AccentChangedMsg,
 coreEventMsg: CoreEventMsg,
+oauthAuthorizeUrlMsg: OauthAuthorizeUrlMsg,
 termExitMsg: TermExitMsg,
 termOutputMsg: TermOutputMsg
 }>({
 accentChangedMsg: "accent-changed-msg",
 coreEventMsg: "core-event-msg",
+oauthAuthorizeUrlMsg: "oauth-authorize-url-msg",
 termExitMsg: "term-exit-msg",
 termOutputMsg: "term-output-msg"
 })
@@ -768,6 +880,9 @@ export type AppInfo = { id: string; name: string; kind: string; initial: string;
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CatalogEntry = { id: string; name: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
 export type CmdError = { message: string }
+export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
+export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
+export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
 export type CommandInfo = { name: string; description: string; agent: string | null }
 export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; baseUrl: string | null; models: string[]; 
 /**
@@ -801,9 +916,15 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  */
 { kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null }
 export type CoreEventMsg = { event: CoreEvent }
+/**
+ * Device-code flow info shown to the user while they complete the browser
+ * step (Kiro): the short code to enter, the URL to visit, and the poll
+ * cadence the frontend's `await_kiro_device_flow` call will honor.
+ */
+export type DeviceFlowInfo = { flowId: string; userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number; interval: number }
 export type DirEntryInfo = { name: string; dir: boolean }
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
-export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean }
+export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string; 
 /**
@@ -818,13 +939,42 @@ export type GatewayResourceInfo = { label: string; sub: string; pct: number }
 export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
 export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+/**
+ * Where the process's master key actually came from. Surfaced to the UI
+ * (via a later task's DTO mapping) so users know whether their secrets are
+ * protected by the OS keychain or a weaker fallback.
+ */
+export type KeychainStatus = 
+/**
+ * Master key is stored in (and was read from, or freshly provisioned
+ * into) the OS keychain.
+ */
+"ok" | 
+/**
+ * The OS keychain is unavailable (headless/locked/no D-Bus session), so
+ * the master key lives in a permission-restricted file instead.
+ */
+"fileFallback" | 
+/**
+ * Neither the keychain nor the fallback file could be used reliably;
+ * an ephemeral in-memory key is in play and secrets will not survive a
+ * restart, or a previously stored key was corrupt and was replaced.
+ */
+"unavailable"
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 /**
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
  */
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
+export type ModelRouteInfo = { id: string; name: string; enabled: boolean; strategy: ModelRouteStrategy; targets: ModelRouteTarget[]; createdAt: number; updatedAt: number }
+export type ModelRouteStrategy = "fallback" | "round-robin"
+export type ModelRouteTarget = { connectionId: string; model: string }
+export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
+export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
+export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
+export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type RegistryEntry = { 
 /**
  * Registry name, e.g. `io.github.owner/server`.

@@ -15,7 +15,7 @@
 //! native wire format.
 
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
-use crate::llm_router::{connections, oauth, translate};
+use crate::llm_router::{capabilities, connections, oauth, routes, translate};
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -56,39 +56,146 @@ pub struct RouteTarget {
 }
 
 pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Option<RouteTarget>> {
+    route_model_for_body(store, requested, None).await
+}
+
+pub async fn route_model_for_body(
+    store: &Store,
+    requested: &str,
+    body: Option<&Value>,
+) -> anyhow::Result<Option<RouteTarget>> {
     let conns = connections::list_connections(store).await?;
     let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
+    let required = body
+        .map(capabilities::required_capabilities_from_body)
+        .unwrap_or_default();
     if let Some((prov, model)) = requested.split_once('/') {
-        for conn in enabled {
-            if conn.provider == prov {
-                if let Some(desc) = registry::descriptor(&conn.provider) {
-                    return Ok(Some(RouteTarget {
-                        conn,
-                        desc,
-                        upstream_model: model.to_string(),
-                    }));
-                }
+        let candidates: Vec<_> = enabled
+            .into_iter()
+            .filter(|conn| {
+                conn.provider == prov
+                    && registry::descriptor(&conn.provider)
+                        .map(|desc| connection_serves_model(desc, conn, model, true))
+                        .unwrap_or(false)
+            })
+            .collect();
+        for conn in ordered_provider_connections(store, prov, model, candidates).await? {
+            if let Some(desc) = registry::descriptor(&conn.provider) {
+                return Ok(Some(RouteTarget {
+                    conn,
+                    desc,
+                    upstream_model: model.to_string(),
+                }));
+            }
+        }
+        return Ok(None);
+    }
+    let route_list = routes::list_model_routes(store).await?;
+    if let Some(route) = routes::route_by_name(&route_list, requested) {
+        let targets =
+            prefer_capable_targets(routes::ordered_targets(store, route).await?, required);
+        for target in targets {
+            let Some(conn) = enabled.iter().find(|c| c.id == target.connection_id) else {
+                continue;
+            };
+            let Some(desc) = registry::descriptor(&conn.provider) else {
+                continue;
+            };
+            if connection_serves_model(desc, conn, &target.model, false) {
+                return Ok(Some(RouteTarget {
+                    conn: conn.clone(),
+                    desc,
+                    upstream_model: target.model,
+                }));
             }
         }
         return Ok(None);
     }
     // Bare model: first (highest-priority) connection listing it.
+    let mut provider_order = Vec::<String>::new();
+    let mut grouped = std::collections::BTreeMap::<String, Vec<connections::ConnectionRow>>::new();
     for conn in enabled {
         let Some(desc) = registry::descriptor(&conn.provider) else {
             continue;
         };
-        if connections::effective_models(desc, &conn)
-            .iter()
-            .any(|m| m == requested)
-        {
-            return Ok(Some(RouteTarget {
-                conn,
-                desc,
-                upstream_model: requested.to_string(),
-            }));
+        if connection_serves_model(desc, &conn, requested, false) {
+            if !grouped.contains_key(&conn.provider) {
+                provider_order.push(conn.provider.clone());
+            }
+            grouped.entry(conn.provider.clone()).or_default().push(conn);
+        }
+    }
+    for provider in provider_order {
+        let candidates = grouped.remove(&provider).unwrap_or_default();
+        for conn in ordered_provider_connections(store, &provider, requested, candidates).await? {
+            if let Some(desc) = registry::descriptor(&conn.provider) {
+                return Ok(Some(RouteTarget {
+                    conn,
+                    desc,
+                    upstream_model: requested.to_string(),
+                }));
+            }
         }
     }
     Ok(None)
+}
+
+fn connection_serves_model(
+    desc: &ProviderDescriptor,
+    conn: &connections::ConnectionRow,
+    model: &str,
+    allow_unlisted: bool,
+) -> bool {
+    let models = connections::effective_models(desc, conn);
+    (allow_unlisted && models.is_empty()) || models.iter().any(|m| m == model)
+}
+
+async fn ordered_provider_connections(
+    store: &Store,
+    provider: &str,
+    scope: &str,
+    candidates: Vec<connections::ConnectionRow>,
+) -> anyhow::Result<Vec<connections::ConnectionRow>> {
+    if candidates.len() <= 1 {
+        return Ok(candidates);
+    }
+    let ids = candidates
+        .iter()
+        .map(|conn| conn.id.clone())
+        .collect::<Vec<_>>();
+    let ordered_ids = routes::ordered_provider_connection_ids(store, provider, scope, &ids).await?;
+    let mut by_id = candidates
+        .into_iter()
+        .map(|conn| (conn.id.clone(), conn))
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(ordered_ids
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect())
+}
+
+fn prefer_capable_targets(
+    targets: Vec<routes::ModelRouteTarget>,
+    required: capabilities::RequiredCapabilities,
+) -> Vec<routes::ModelRouteTarget> {
+    if !required.any() || targets.len() <= 1 {
+        return targets;
+    }
+    let mut capable = Vec::new();
+    let mut rest = Vec::new();
+    for target in targets {
+        if required.satisfied_by(capabilities::model_capabilities(&target.model)) {
+            capable.push(target);
+        } else {
+            rest.push(target);
+        }
+    }
+    if capable.is_empty() {
+        rest
+    } else {
+        capable.extend(rest);
+        capable
+    }
 }
 
 /// The first model of the highest-priority enabled connection, as a

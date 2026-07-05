@@ -61,12 +61,18 @@ const anthropicConnection: ConnectionInfo = {
   priority: 0,
   enabled: true,
   baseUrl: null,
-  models: ["claude-sonnet-4"],
+  models: ["claude-sonnet-4", "claude-sonnet-4"],
   keyMasked: "sk-…3fk9",
   needsRelogin: false,
 };
 
-const endpointUp: EndpointStatusInfo = { running: true, port: 8787, baseUrl: "http://127.0.0.1:8787", autostart: false };
+const endpointUp: EndpointStatusInfo = {
+  running: true,
+  port: 8787,
+  baseUrl: "http://127.0.0.1:8787",
+  autostart: false,
+  keychainStatus: "ok",
+};
 const endpointKey: EndpointKeyInfo = { id: "key-1", name: "local", key: "rz-abc123", createdAt: 1, lastUsedAt: null };
 const configStatus: RuntimeConfigStatusInfo = {
   configPath: "/home/user/.claude/settings.json",
@@ -92,6 +98,7 @@ mock.module("@/bindings", () => ({
     listEndpointKeys: () => ok([endpointKey]),
     listProviderCatalog: () => ok([]),
     listConnections: () => ok([anthropicConnection]),
+    listModelRoutes: () => ok([]),
     listApps: () => ok([githubApp]),
     listRuntimes: () => ok([claudeRuntime]),
     refreshRuntimes: () => ok([claudeRuntime]),
@@ -103,6 +110,7 @@ const { useRuntimes } = await import("@/store-runtimes");
 const { useApps } = await import("@/store-apps");
 const { useEndpoint } = await import("@/store-endpoint");
 const { useConnections } = await import("@/store-connections");
+const { useModelRoutes } = await import("@/store-model-routes");
 
 beforeEach(() => {
   runtimeConfigStatus.mockClear();
@@ -111,6 +119,7 @@ beforeEach(() => {
   useApps.setState({ apps: [githubApp], loaded: true, probing: null });
   useEndpoint.setState({ status: null, keys: [], loaded: false });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
+  useModelRoutes.setState({ routes: [], loaded: false });
 });
 
 // Reset the shared zustand singletons on the way out too: the view's mount
@@ -122,6 +131,7 @@ afterEach(() => {
   useApps.setState({ apps: [], loaded: false, probing: null });
   useEndpoint.setState({ status: null, keys: [], loaded: false });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
+  useModelRoutes.setState({ routes: [], loaded: false });
 });
 
 // Render and flush the mount-effect hydrates (config status, endpoint,

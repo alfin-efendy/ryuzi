@@ -61,7 +61,7 @@ fn callback_path(mode: RedirectMode) -> &'static str {
 
 fn redirect_uri_for(mode: RedirectMode, bound_port: u16) -> String {
     match mode {
-        RedirectMode::LoopbackRandom => format!("http://127.0.0.1:{bound_port}/callback"),
+        RedirectMode::LoopbackRandom => format!("http://localhost:{bound_port}/callback"),
         RedirectMode::LoopbackFixed(p) => format!("http://localhost:{p}/auth/callback"),
     }
 }
@@ -294,6 +294,8 @@ pub struct ManualStart {
 /// provider never actually dereferences this URL (Anthropic's `code=true`
 /// echoes the code+state directly on the page instead of redirecting), it
 /// only needs to match a redirect_uri the client is registered for.
+/// `LoopbackFixed` providers (Codex) must use the browser flow because the
+/// provider redirects to the fixed callback URL instead of showing a code.
 fn manual_redirect_uri(mode: RedirectMode) -> Result<String> {
     match mode {
         RedirectMode::LoopbackRandom => {
@@ -303,7 +305,9 @@ fn manual_redirect_uri(mode: RedirectMode) -> Result<String> {
             drop(listener);
             Ok(redirect_uri_for(mode, port))
         }
-        RedirectMode::LoopbackFixed(p) => Ok(redirect_uri_for(mode, p)),
+        RedirectMode::LoopbackFixed(_) => bail!(
+            "manual paste OAuth is not available for fixed-port providers; use Connect with browser so Ryuzi can receive the callback"
+        ),
     }
 }
 
@@ -380,7 +384,7 @@ mod tests {
         );
         assert_eq!(
             redirect_uri_for(RedirectMode::LoopbackRandom, 54321),
-            "http://127.0.0.1:54321/callback"
+            "http://localhost:54321/callback"
         );
         assert_eq!(
             redirect_uri_for(RedirectMode::LoopbackFixed(1455), 0),
@@ -401,5 +405,16 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains(&port.to_string()), "{msg}");
         assert!(msg.contains("already in use"), "{msg}");
+    }
+
+    #[test]
+    fn manual_flow_rejects_fixed_port_providers() {
+        let err = match begin_manual("openai-oauth") {
+            Ok(_) => panic!("fixed-port OAuth should not start manual paste flow"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("manual paste"), "{msg}");
+        assert!(msg.contains("Connect with browser"), "{msg}");
     }
 }
