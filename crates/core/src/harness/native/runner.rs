@@ -51,6 +51,9 @@ pub struct RunnerDeps {
     pub agents: Arc<AgentRegistry>,
     /// Available slash commands.
     pub commands: Arc<CommandRegistry>,
+    /// Persistent memory (None in contexts without a session row, e.g. bare
+    /// tests, and always None inside sub-agents).
+    pub memory: Option<Arc<super::memory::MemoryStore>>,
     /// Worktree snapshot stack for the `revert` tool (most recent last).
     pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
@@ -350,8 +353,10 @@ impl SubagentSpawner for RunnerSpawner {
         ledger
             .append_user(json!([{ "type": "text", "text": prompt }]))
             .await?;
-        // No nested spawner (depth 1), no display rows.
-        drive(&self.deps, &agent, &mut ledger, &self.cancel, None, false).await
+        // No nested spawner (depth 1), no display rows, no memory access.
+        let mut child_deps = self.deps.clone();
+        child_deps.memory = None;
+        drive(&child_deps, &agent, &mut ledger, &self.cancel, None, false).await
     }
 
     fn available(&self) -> Vec<String> {
@@ -452,6 +457,7 @@ async fn run_tool_call(
         cancel: CancellationToken::new(),
         caps: OutputCaps::default(),
         spawn: spawn.clone(),
+        memory: deps.memory.clone(),
         snapshots: deps.snapshots.clone(),
     };
     match tool.execute(&ctx, input).await {
@@ -747,6 +753,7 @@ mod tests {
             agent,
             agents,
             commands: Arc::new(CommandRegistry::builtin()),
+            memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }

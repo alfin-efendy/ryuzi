@@ -109,6 +109,14 @@ impl Harness for NativeHarness {
         // connections alive for the session's lifetime.
         let mcp_tools = connect_mcp_tools(&ctx.mcp_servers).await;
         let tools = Arc::new(tools::ToolRegistry::with_extra(mcp_tools));
+        // Persistent memory keys off the session's project; without a session
+        // row (bare tests) the feature is simply off, keeping runs hermetic.
+        let memory_store = match ctx.store.get_session(&ctx.session_pk).await {
+            Ok(Some(session)) => Some(Arc::new(memory::MemoryStore::at_default(Some(
+                &session.project_id,
+            )))),
+            _ => None,
+        };
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             deps: runner::RunnerDeps {
@@ -125,6 +133,7 @@ impl Harness for NativeHarness {
                 agent,
                 agents,
                 commands,
+                memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             },
             live_cancel: Mutex::new(None),

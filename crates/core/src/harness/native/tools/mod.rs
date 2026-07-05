@@ -24,6 +24,7 @@ pub mod grep;
 pub mod ls;
 pub mod lsp;
 pub mod mcp;
+pub mod memory;
 pub mod read;
 pub mod revert;
 pub mod skill;
@@ -69,6 +70,8 @@ pub struct ToolCtx {
     pub caps: OutputCaps,
     /// Sub-agent spawner for the `task` tool; `None` disables spawning.
     pub spawn: Option<Arc<dyn SubagentSpawner>>,
+    /// Persistent memory for the `memory` tool; `None` for sub-agents.
+    pub memory: Option<Arc<crate::harness::native::memory::MemoryStore>>,
     /// Stack of worktree snapshot SHAs for the `revert` tool (most recent last).
     pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
@@ -168,6 +171,7 @@ impl ToolRegistry {
             Arc::new(webfetch::WebFetch),
             Arc::new(websearch::WebSearch),
             Arc::new(skill::SkillTool),
+            Arc::new(memory::MemoryTool),
             Arc::new(revert::Revert),
             Arc::new(lsp::Lsp),
             Arc::new(task::Task),
@@ -265,6 +269,7 @@ pub(crate) mod testutil {
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),
             spawn: None,
+            memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
@@ -328,6 +333,7 @@ mod tests {
             "webfetch",
             "websearch",
             "skill",
+            "memory",
             "revert",
             "lsp",
             "task",
@@ -335,7 +341,7 @@ mod tests {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 15);
+        assert_eq!(defs.len(), 16);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

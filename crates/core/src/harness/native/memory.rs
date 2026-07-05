@@ -95,16 +95,8 @@ impl MemoryStore {
     /// Persist `entries` to `scope` atomically, enforcing [`BUDGET`].
     pub fn save(&self, scope: MemoryScope, entries: &[String]) -> anyhow::Result<()> {
         let path = self.path_for(scope)?;
+        validate_budget(scope, entries)?;
         let joined = entries.join(DELIM);
-        let size = joined.chars().count();
-        if size > BUDGET {
-            anyhow::bail!(
-                "memory ({}) would be {size}/{BUDGET} chars — over budget. \
-                 Consolidate first: merge related entries or remove stale ones.\n{}",
-                scope.as_str(),
-                render_entry_sizes(entries),
-            );
-        }
         let parent = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("memory path has no parent: {}", path.display()))?;
@@ -156,6 +148,27 @@ impl MemoryStore {
             Some(sections.join("\n\n"))
         }
     }
+}
+
+/// Error when `entries` joined would exceed [`BUDGET`] — usable ahead of
+/// [`MemoryStore::save`] so a multi-op batch can validate every scope before
+/// persisting any of them.
+pub fn validate_budget(scope: MemoryScope, entries: &[String]) -> anyhow::Result<()> {
+    let size = joined_chars(entries);
+    if size > BUDGET {
+        anyhow::bail!(
+            "memory ({}) would be {size}/{BUDGET} chars — over budget. \
+             Consolidate first: merge related entries or remove stale ones.\n{}",
+            scope.as_str(),
+            render_entry_sizes(entries),
+        );
+    }
+    Ok(())
+}
+
+/// Character count of the joined file content for `entries`.
+pub fn joined_chars(entries: &[String]) -> usize {
+    entries.join(DELIM).chars().count()
 }
 
 /// Split file text into trimmed, non-empty entries.
