@@ -1,0 +1,23 @@
+contract = 1
+id = "notion"
+name = "Notion"
+version = "0.1.0"
+publisher = "Notion (official)"
+description = "Pages, databases, and search via Notion's official remote MCP server. Auth is OAuth only in this manifest. A local stdio alternative exists (`npx -y @notionhq/notion-mcp-server` with a NOTION_TOKEN) but the research marks it at-risk, so the hosted server is the one wired here."
+homepage = "https://developers.notion.com/docs/mcp"
+icon = "notebook"
+categories = ["docs", "wiki", "productivity"]
+verified = true
+
+[auth]
+kind = "oauth"
+help_url = "https://developers.notion.com/docs/mcp"
+
+[[mcp]]
+name = "notion"
+transport = "http"
+url = "https://mcp.notion.com/mcp"
+
+[menu]
+section = "plugins"
+label = "Notion"

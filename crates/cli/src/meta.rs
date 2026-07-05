@@ -20,6 +20,7 @@ pub fn help_text() -> String {
         "                     ryuzi run --dir <repo> --prompt <text> [--harness native|claude-code] [--model x] [--effort y] [--mode m]",
         "  serve              run the HTTP surface (GET /health,/sessions,/events; POST /sessions/:pk/prompt) [--port N]",
         "  orch               orchestrated task graphs: submit --project <id> <goal...> | list | cancel <id> | retry <id>",
+        "  plugins            list/inspect/enable/disable plugins: ryuzi plugins <list|info|enable|disable> [id]",
     ]
     .join("\n")
 }

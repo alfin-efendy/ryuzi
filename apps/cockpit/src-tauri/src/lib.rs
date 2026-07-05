@@ -9,13 +9,16 @@ mod events;
 mod fsview_cmd;
 mod gateways_cmd;
 mod native_cmd;
+mod plugins_cmd;
 mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
 mod session_io;
 mod term;
 
-use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
+use ryuzi_core::harness::acp::claude_code_plugin_with_resolver;
+use ryuzi_core::harness::native::native_plugin;
+use ryuzi_core::{AcpAdapterDescriptor, ControlPlane, Registries, Store};
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
@@ -154,9 +157,9 @@ fn build_registries() -> Registries {
     let mut registries = Registries::new();
     // The native runtime needs no external binary — register it unconditionally
     // so projects with `harness = "native"` work in the desktop app.
-    registries.install(&ryuzi_core::harness::native::NativeIntegration::new());
+    registries.add_plugin(native_plugin());
 
-    registries.install(&ClaudeCodeIntegration::with_resolver(|| {
+    registries.add_plugin(claude_code_plugin_with_resolver(|| {
         let mut env = Vec::new();
         if let Some(cli) = resolve_claude_code_executable() {
             env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
@@ -171,6 +174,17 @@ fn build_registries() -> Registries {
             env_remove: vec!["CLAUDECODE".to_string()],
         })
     }));
+
+    // Discord is a built-in gateway (its factory is a no-op unless the
+    // `discord` feature is on); register it like `native`/`claude-code` so
+    // Cockpit's `list_plugins`/`set_plugin_enabled` recognize it — the store
+    // seeds `enabled_gateways = "discord"` by default, so leaving this
+    // unregistered made Cockpit diverge from the CLI/`serve`, which both
+    // already register it (see `crates/cli/src/main.rs`'s `build_registries`).
+    registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
+
+    ryuzi_core::plugins::install_builtins(&mut registries);
+    ryuzi_core::plugins::load_user_plugins(&mut registries);
     registries
 }
 
@@ -188,6 +202,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::resolve_approval,
             commands::read_file,
             commands::pick_directory,
+            commands::pick_files,
             commands::backdrop_capability,
             commands::get_setting,
             commands::set_setting,
@@ -265,6 +280,11 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_agents,
             native_cmd::native_commands,
             native_cmd::session_todos,
+            plugins_cmd::list_plugins,
+            plugins_cmd::plugin_detail,
+            plugins_cmd::set_plugin_enabled,
+            plugins_cmd::set_plugin_setting,
+            plugins_cmd::plugin_models,
             session_io::export_session,
             session_io::import_session,
             session_io::share_session,
@@ -285,6 +305,9 @@ fn make_builder() -> Builder<tauri::Wry> {
 /// dev-run export, the `export_bindings` test, and the `gen-bindings` bin
 /// (which exists because the Windows lib-test harness crashes at startup —
 /// tauri-apps/tauri#13419 — while bin artifacts get the app manifest linked).
+/// The bin is feature-gated (`required-features = ["gen-bindings"]`) so
+/// `tauri build` never bundles it; run it via `cargo gen-bindings` (alias in
+/// the repo-root .cargo/config.toml).
 pub fn export_bindings(out: &std::path::Path) {
     make_builder()
         .export(
@@ -399,7 +422,7 @@ mod tests {
 
     /// Generates `src/bindings.ts` without launching the Tauri GUI.
     /// Run via: `cargo test -p ryuzi-cockpit export_bindings -- --nocapture`
-    /// (On Windows prefer `cargo run -p ryuzi-cockpit --bin gen-bindings` —
+    /// (On Windows prefer `cargo gen-bindings` — alias in .cargo/config.toml;
     /// the lib-test harness crashes at startup, tauri-apps/tauri#13419.)
     #[test]
     fn export_bindings_test() {
@@ -416,6 +439,20 @@ mod tests {
         let names = registries.harness.names();
         assert!(names.iter().any(|n| n == "native"), "got: {names:?}");
         assert!(names.iter().any(|n| n == "claude-code"), "got: {names:?}");
+    }
+
+    /// Regression test: Cockpit's composition root historically omitted
+    /// `discord_plugin()`, so `list_plugins` omitted discord and
+    /// `set_plugin_enabled("discord")` errored "unknown plugin: discord",
+    /// diverging from the CLI and `ryuzi serve` (both of which register it —
+    /// see `crates/cli/src/main.rs`'s `build_registries`).
+    #[test]
+    fn build_registries_registers_discord_plugin() {
+        let registries = build_registries();
+        assert!(
+            registries.plugins.get("discord").is_some(),
+            "discord plugin missing from Cockpit's composition root"
+        );
     }
 
     #[test]

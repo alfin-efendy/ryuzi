@@ -858,8 +858,7 @@ mod tests {
     async fn tick_records_scheduler_liveness() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
-        let cp =
-            crate::control::ControlPlane::new(store, crate::integration::Registries::new()).await;
+        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
         tick(&cp).await;
         let val = cp
             .store()

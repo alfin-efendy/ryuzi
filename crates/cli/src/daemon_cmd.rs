@@ -69,6 +69,9 @@ where
 /// any error is swallowed so the shutdown always completes), clear `dir`'s
 /// status file, then call `exit(0)`. Generic over `stop`/`exit` so it's
 /// unit-testable without a real `Daemon` or a real `std::process::exit`.
+// Non-test callers are the unix-only signal handlers; on Windows only the
+// unit tests reach this, so the lib build sees it as dead.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) async fn shutdown_once<S, E>(dir: &Path, stopping: &AtomicBool, stop: S, exit: E)
 where
     S: Future<Output = anyhow::Result<()>>,
@@ -566,6 +569,11 @@ impl CanaryHost for ProdCanaryHost {
 /// `std::process::exit(0)`. Both signals share one reentrancy guard and one
 /// `Daemon`/`UpdateManager` handle so whichever fires first wins and the
 /// other is a no-op.
+///
+/// Unix-only: `tokio::signal::unix` does not exist on Windows, and an
+/// unconditional `use` used to break `cargo check --workspace` on Windows
+/// dev machines. The non-unix variant below drives the same teardown from
+/// `ctrl_c` instead.
 #[cfg(unix)]
 fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
     use tokio::signal::unix::{signal, SignalKind};
@@ -615,11 +623,10 @@ fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Ar
     });
 }
 
-/// Windows has no SIGTERM; Ctrl-C / console-close both surface through
-/// `tokio::signal::ctrl_c`, driving the same [`shutdown_once`] teardown.
-/// (This also lets `ryuzi-cli` build natively on Windows instead of only
-/// through the zigbuild cross-compile.)
-#[cfg(windows)]
+/// Non-unix (Windows): there is no SIGTERM; Ctrl-C / console-close both
+/// surface through `tokio::signal::ctrl_c`, driving the same
+/// [`shutdown_once`] teardown so a native Windows daemon still cleans up.
+#[cfg(not(unix))]
 fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
     let stopping = Arc::new(AtomicBool::new(false));
     tokio::spawn(async move {

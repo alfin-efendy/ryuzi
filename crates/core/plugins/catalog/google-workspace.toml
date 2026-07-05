@@ -1,0 +1,27 @@
+contract = 1
+id = "google-workspace"
+name = "Google Workspace"
+version = "0.1.0"
+publisher = "community (taylorwilsdon)"
+description = "Gmail, Calendar, Drive, Docs, and Sheets via the community `workspace-mcp` server (taylorwilsdon, active, 2.8k stars), run locally through `uvx` (the `uv` Python tool runner must be installed). Google's own remote MCP server exists but is a gated Developer Preview (`*.mcp.googleapis.com/mcp/v1`, no Meet support), so it is not wired here. Requires a Google OAuth client id (and usually a client secret, which ryuzi does not store — set GOOGLE_OAUTH_CLIENT_SECRET in the environment ryuzi runs in if your OAuth client needs one)."
+homepage = "https://github.com/taylorwilsdon/google_workspace_mcp"
+icon = "layout-grid"
+categories = ["productivity", "docs"]
+verified = false
+
+[auth]
+kind = "oauth"
+setting = "plugin.google-workspace.client_id"
+env = "GOOGLE_OAUTH_CLIENT_ID"
+help_url = "https://github.com/taylorwilsdon/google_workspace_mcp"
+
+[[mcp]]
+name = "google-workspace"
+transport = "stdio"
+command = "uvx"
+args = ["workspace-mcp", "--tool-tier", "core"]
+env = { GOOGLE_OAUTH_CLIENT_ID = "${auth}" }
+
+[menu]
+section = "plugins"
+label = "Google Workspace"

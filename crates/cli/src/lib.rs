@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod meta;
 pub mod orch_cmd;
 pub mod paint;
+pub mod plugins_cmd;
 pub mod run_cmd;
 pub mod serve_cmd;
 pub mod sidecar_host;

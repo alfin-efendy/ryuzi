@@ -43,7 +43,9 @@ or install the CLI inside WSL with the same curl command.
 ### Cockpit (desktop app)
 
 Download the installer for your platform from the latest
-[`cockpit-v*` release](https://github.com/alfin-efendy/ryuzi/releases):
+[release](https://github.com/alfin-efendy/ryuzi/releases/latest) — CLI
+binaries and Cockpit installers ship on the same release (Cockpit keeps its
+own version number, shown in the release notes):
 
 | Platform | File |
 | --- | --- |

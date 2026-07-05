@@ -342,3 +342,44 @@ test("setProjectHarness is a no-op when the harness is unchanged", async () => {
   expect(update).not.toHaveBeenCalled();
   update.mockRestore();
 });
+
+test("start forwards chat options so composer runtime, context, and attachments reach IPC", async () => {
+  reset();
+  const start = spyOn(commands, "startSession").mockResolvedValue({
+    status: "ok",
+    data: {
+      sessionPk: "s1",
+      projectId: "p1",
+      agentSessionId: null,
+      worktreePath: null,
+      branch: "harness/s1",
+      title: "/review",
+      status: "running",
+      startedBy: "cockpit",
+      createdAt: 1,
+      lastActive: 1,
+      resumeAttempts: 0,
+    },
+  });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await useStore.getState().start("p1", "/review", {
+    runtimeId: "native",
+    model: "fable",
+    context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
+    attachments: ["C:\\tmp\\notes.txt"],
+  });
+
+  expect(start).toHaveBeenCalledWith("p1", "/review", {
+    runtimeId: "native",
+    model: "fable",
+    context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
+    attachments: ["C:\\tmp\\notes.txt"],
+  });
+  expect(useStore.getState().focusedSessionPk).toBe("s1");
+
+  start.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});

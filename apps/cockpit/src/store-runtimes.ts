@@ -111,6 +111,12 @@ export function defaultRuntimeOf(runtimes: RuntimeInfo[]): RuntimeInfo | undefin
   return runtimes.find((a) => a.isDefault) ?? runtimes.find((a) => a.runnable);
 }
 
+export function chatRuntimeOf(runtimes: RuntimeInfo[], selectedId?: string | null): RuntimeInfo | undefined {
+  const selected = selectedId ? runtimeById(runtimes, selectedId) : undefined;
+  if (selected?.runnable) return selected;
+  return runtimes.find((a) => a.isDefault && a.runnable) ?? runtimes.find((a) => a.runnable);
+}
+
 export function runtimeById(runtimes: RuntimeInfo[], id: string): RuntimeInfo | undefined {
   return runtimes.find((a) => a.id === id);
 }

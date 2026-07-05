@@ -48,7 +48,10 @@ npm/platform/*/ryuzi
 npm/platform/*/ryuzi.exe
 
 /target
-/.cargo
+# Local cargo state stays ignored, but the tracked alias file is real config
+# (`cargo gen-bindings` — see apps/cockpit/src-tauri/Cargo.toml).
+/.cargo/*
+!/.cargo/config.toml
 
 # Local agent/skill tooling artifacts (session-local, not part of the repo)
 .agents/

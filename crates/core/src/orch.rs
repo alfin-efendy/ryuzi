@@ -1368,7 +1368,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut regs = crate::integration::Registries::new();
+        let mut regs = crate::plugins::Registries::new();
         regs.harness
             .register("claude-code", Arc::new(EchoHarnessFactory));
         let cp = ControlPlane::new(store, regs).await;

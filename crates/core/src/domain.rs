@@ -88,6 +88,14 @@ pub struct Session {
 }
 
 /// An MCP server the agent can use as tools (attached to an ACP session in Spec 3).
+///
+/// After plugin `${auth}`/setting substitution, a resolved `McpServerSpec`'s
+/// `transport` carries RESOLVED SECRETS in `Stdio::env`/`Http::headers` (API
+/// keys, tokens, etc.). `Serialize` exists for internal wiring only — nothing
+/// in this codebase serializes a resolved spec today, but if a future
+/// feature does (session export, events, logs, or any other user-visible
+/// output), it MUST redact `env`/`headers` values first. Never serialize a
+/// resolved `McpServerSpec` verbatim into anything a user or client can read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerSpec {

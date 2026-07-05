@@ -23,10 +23,39 @@ pub struct SkillRegistry {
 impl SkillRegistry {
     /// Discover skills under the worktree and the global config/claude dirs.
     pub fn load(work_dir: &Path) -> SkillRegistry {
+        Self::load_with(work_dir, &[])
+    }
+
+    /// Like [`Self::load`], but also scans `extra` directories — each
+    /// can be either:
+    ///   - A skills root (i.e. `<extra>/<name>/SKILL.md`), exactly like
+    ///     `.ryuzi/skills` or `~/.claude/skills`, OR
+    ///   - A leaf skill directory (i.e. `<extra>/SKILL.md` directly).
+    ///
+    /// Used to fold in plugin-bundled skill directories
+    /// (`PluginHost::enabled_skill_dirs`) beside the worktree/global ones.
+    /// A name already found in an earlier (worktree/global) directory wins
+    /// over one from `extra`.
+    pub fn load_with(work_dir: &Path, extra: &[std::path::PathBuf]) -> SkillRegistry {
         let mut skills = BTreeMap::new();
-        for base in skill_dirs(work_dir) {
-            for skill in read_skills(&base) {
-                skills.entry(skill.name.clone()).or_insert(skill);
+        for base in skill_dirs(work_dir).iter().chain(extra) {
+            // Check if this is a leaf skill dir (SKILL.md at the base).
+            if base.join("SKILL.md").is_file() {
+                // This is a leaf: parse it as a single skill.
+                let dir_name = base
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                if let Ok(text) = std::fs::read_to_string(base.join("SKILL.md")) {
+                    let skill = parse_skill(&dir_name, &text);
+                    skills.entry(skill.name.clone()).or_insert(skill);
+                }
+            } else {
+                // This is a root: scan for subdirectories containing SKILL.md.
+                for skill in read_skills(base) {
+                    skills.entry(skill.name.clone()).or_insert(skill);
+                }
             }
         }
         SkillRegistry { skills }
@@ -126,6 +155,54 @@ mod tests {
     }
 
     #[test]
+    fn load_with_merges_an_extra_dir_alongside_the_worktree_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".ryuzi/skills/pdf");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Work with PDFs\n---\nUse pdftotext to extract text.",
+        )
+        .unwrap();
+
+        // A plugin-bundled skills root, entirely outside the worktree.
+        let extra = tempfile::tempdir().unwrap();
+        let extra_skill_dir = extra.path().join("triage");
+        std::fs::create_dir_all(&extra_skill_dir).unwrap();
+        std::fs::write(
+            extra_skill_dir.join("SKILL.md"),
+            "---\nname: triage\ndescription: Triage issues\n---\nLabel and assign.",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::load_with(dir.path(), &[extra.path().to_path_buf()]);
+        assert_eq!(reg.get("pdf").unwrap().description, "Work with PDFs");
+        let s = reg.get("triage").unwrap();
+        assert_eq!(s.description, "Triage issues");
+        assert!(s.body.contains("Label and assign."));
+        // Check that both skills are present (there may be other global skills too).
+        let names = reg.names();
+        assert!(
+            names.contains(&"pdf".to_string()),
+            "pdf skill must be present"
+        );
+        assert!(
+            names.contains(&"triage".to_string()),
+            "triage skill must be present"
+        );
+    }
+
+    #[test]
+    fn load_with_no_extra_dirs_matches_load() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both load and load_with should have the same result when no extras are
+        // provided (but may include global skills from ~/.claude/skills, etc).
+        let via_load = SkillRegistry::load(dir.path()).names();
+        let via_load_with = SkillRegistry::load_with(dir.path(), &[]).names();
+        assert_eq!(via_load, via_load_with);
+    }
+
+    #[test]
     fn empty_skills_dir_yields_nothing() {
         // read_skills over a non-existent / empty dir returns no skills.
         let dir = tempfile::tempdir().unwrap();
@@ -138,5 +215,75 @@ mod tests {
         assert_eq!(s.name, "mytool");
         assert!(s.description.contains("mytool"));
         assert_eq!(s.body, "No frontmatter, just a body.");
+    }
+
+    #[test]
+    fn load_with_extra_leaf_dir_containing_skill_md() {
+        // Test that plugin-bundled leaf skill dirs (SKILL.md directly inside)
+        // are discovered as single skills, not roots.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".ryuzi/skills/pdf");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Work with PDFs\n---\nUse pdftotext to extract text.",
+        )
+        .unwrap();
+
+        // A plugin-bundled LEAF skill dir (not a root).
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let plugin_skill = plugin_dir.path().join("github-triage");
+        std::fs::create_dir_all(&plugin_skill).unwrap();
+        std::fs::write(
+            plugin_skill.join("SKILL.md"),
+            "---\nname: github-triage\ndescription: Triage GitHub issues\n---\nLabel and assign issues.",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::load_with(dir.path(), std::slice::from_ref(&plugin_skill));
+        assert_eq!(reg.get("pdf").unwrap().description, "Work with PDFs");
+        let s = reg.get("github-triage").unwrap();
+        assert_eq!(s.description, "Triage GitHub issues");
+        assert!(s.body.contains("Label and assign"));
+        // Check that both skills are present (there may be other global skills too).
+        let names = reg.names();
+        assert!(
+            names.contains(&"pdf".to_string()),
+            "pdf skill must be present"
+        );
+        assert!(
+            names.contains(&"github-triage".to_string()),
+            "github-triage skill must be present"
+        );
+    }
+
+    #[test]
+    fn load_with_extra_root_dir_with_subdirs() {
+        // Test that root-shaped extra dirs (with subdirectories containing
+        // SKILL.md) still work as before.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".ryuzi/skills/pdf");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Work with PDFs\n---\nUse pdftotext to extract text.",
+        )
+        .unwrap();
+
+        // A plugin-bundled ROOT dir with subdirectories.
+        let plugin_root = tempfile::tempdir().unwrap();
+        let plugin_skill = plugin_root.path().join("github-triage");
+        std::fs::create_dir_all(&plugin_skill).unwrap();
+        std::fs::write(
+            plugin_skill.join("SKILL.md"),
+            "---\nname: github-triage\ndescription: Triage GitHub issues\n---\nLabel and assign issues.",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::load_with(dir.path(), &[plugin_root.path().to_path_buf()]);
+        assert_eq!(reg.get("pdf").unwrap().description, "Work with PDFs");
+        let s = reg.get("github-triage").unwrap();
+        assert_eq!(s.description, "Triage GitHub issues");
+        assert!(s.body.contains("Label and assign"));
     }
 }

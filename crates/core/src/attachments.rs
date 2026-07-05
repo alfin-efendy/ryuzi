@@ -77,6 +77,24 @@ pub struct UreqFetcher;
 
 impl AttachmentFetcher for UreqFetcher {
     fn fetch_capped(&self, url: &str, max_bytes: u64) -> anyhow::Result<FetchOutcome> {
+        if url.starts_with("file://") {
+            let parsed = url::Url::parse(url).context("parse file attachment URL")?;
+            let path = parsed
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file attachment URL"))?;
+            if std::fs::metadata(&path)?.len() > max_bytes {
+                return Ok(FetchOutcome::TooBig);
+            }
+            let mut buf = Vec::new();
+            std::fs::File::open(&path)?
+                .take(max_bytes.saturating_add(1))
+                .read_to_end(&mut buf)?;
+            if buf.len() as u64 > max_bytes {
+                return Ok(FetchOutcome::TooBig);
+            }
+            return Ok(FetchOutcome::Ok(buf));
+        }
+
         let resp = match ureq::get(url).call() {
             Ok(resp) => resp,
             Err(ureq::Error::Status(code, _)) => return Ok(FetchOutcome::HttpError(code)),
@@ -327,7 +345,7 @@ pub async fn materialize_attachments(
             continue;
         }
 
-        if !opts.allowed_hosts.is_empty() {
+        if !opts.allowed_hosts.is_empty() && !r.url.starts_with("file://") {
             let trusted = https_host(&r.url).is_some_and(|h| opts.allowed_hosts.contains(&h));
             if !trusted {
                 skipped.push(SkippedAttachment {
@@ -755,6 +773,24 @@ mod tests {
         assert!(text.contains("image/png"));
         assert!(text.contains("Skipped huge.zip"));
         assert!(text.contains("exceeds"));
+    }
+
+    #[test]
+    fn ureq_fetcher_reads_capped_file_urls_for_cockpit_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, b"hello from disk").unwrap();
+        let url = url::Url::from_file_path(&path).unwrap().to_string();
+
+        match UreqFetcher.fetch_capped(&url, 1_000).unwrap() {
+            FetchOutcome::Ok(bytes) => assert_eq!(bytes, b"hello from disk"),
+            other => panic!("expected file bytes, got {other:?}"),
+        }
+
+        assert!(matches!(
+            UreqFetcher.fetch_capped(&url, 4).unwrap(),
+            FetchOutcome::TooBig
+        ));
     }
 
     #[tokio::test]

@@ -1,0 +1,25 @@
+contract = 1
+id = "linear"
+name = "Linear"
+version = "0.1.0"
+publisher = "Linear (official)"
+description = "Issues, projects, and cycles via Linear's official remote MCP server. Accepts either OAuth 2.1 or an API key sent as a Bearer header — this manifest wires the API-key path so it works headlessly; explain the OAuth alternative to users who prefer it. The previous SSE-based endpoint was removed; this manifest points at the current `/mcp` endpoint instead."
+homepage = "https://linear.app/docs/mcp"
+icon = "list-todo"
+categories = ["issues", "productivity"]
+verified = true
+
+[auth]
+kind = "token"
+setting = "plugin.linear.api_key"
+help_url = "https://linear.app/docs/mcp"
+
+[[mcp]]
+name = "linear"
+transport = "http"
+url = "https://mcp.linear.app/mcp"
+headers = { Authorization = "Bearer ${auth}" }
+
+[menu]
+section = "plugins"
+label = "Linear"

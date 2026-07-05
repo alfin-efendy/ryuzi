@@ -1,0 +1,27 @@
+contract = 1
+id = "e2b"
+name = "E2B"
+version = "0.1.0"
+publisher = "E2B (official image; upstream repo archived)"
+description = "Ephemeral code-execution sandboxes via E2B's MCP server, run through Docker's MCP Catalog image (`docker run -i --rm -e E2B_API_KEY mcp/e2b`) — a local Docker daemon is required. The upstream `mcp-server` repo under the `e2b-dev` org was archived 2026-04-16 and the corresponding npm package under the `e2b` scope is deprecated, so the Docker Catalog image is the only sanctioned path today; E2B's current MCP direction is actually the inverse (a gateway running inside the sandbox), not this classic client-facing server."
+homepage = "https://e2b.dev/docs"
+icon = "box"
+categories = ["sandbox"]
+verified = false
+
+[auth]
+kind = "api-key"
+setting = "plugin.e2b.api_key"
+env = "E2B_API_KEY"
+help_url = "https://e2b.dev/docs"
+
+[[mcp]]
+name = "e2b"
+transport = "stdio"
+command = "docker"
+args = ["run", "-i", "--rm", "-e", "E2B_API_KEY", "mcp/e2b"]
+env = { E2B_API_KEY = "${auth}" }
+
+[menu]
+section = "plugins"
+label = "E2B"

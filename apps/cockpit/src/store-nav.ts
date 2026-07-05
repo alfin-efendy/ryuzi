@@ -21,6 +21,7 @@ export type View =
   | { kind: "registry" }
   | { kind: "gateways" }
   | { kind: "gatewayDetail"; id: string }
+  | { kind: "pluginDetail"; id: string }
   | { kind: "settings" };
 
 export type RightTab = "review" | "file";
@@ -136,7 +137,7 @@ export const useNav = create<NavState>((set, get) => ({
   ),
   rightMaximized: false,
   searchQuery: "",
-  composerAgent: "claude",
+  composerAgent: "",
   composerBranch: "main",
   projectSettingsFor: null,
 

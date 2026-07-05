@@ -22,6 +22,10 @@ pub struct SessionCtx {
     pub resume: Option<String>,
     /// MCP servers to attach (from the connector axis).
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Extra skill directories contributed by enabled user plugins (see
+    /// `crate::plugins::PluginHost::enabled_skill_dirs`), on top of the
+    /// native runtime's usual worktree/global skill dirs.
+    pub extra_skill_dirs: Vec<PathBuf>,
     /// Event bus for normalized session output.
     pub events: broadcast::Sender<CoreEvent>,
     /// Shared approval hub for tool-permission requests.
@@ -121,6 +125,7 @@ mod tests {
             effort: None,
             resume: None,
             mcp_servers: vec![],
+            extra_skill_dirs: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
             store,

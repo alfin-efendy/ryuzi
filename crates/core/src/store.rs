@@ -298,16 +298,14 @@ fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (session_pk, pos)\
             );",
         ),
-        // Orchestration & heartbeat hardening
-        // (design: docs/design/2026-07-05-native-orchestration-memory-design.md).
-        // jobs.pre_check = optional wake-gate command run before a scheduled
-        // job wakes the agent (empty stdout / non-zero exit skips the fire).
-        // orch_tasks/orch_task_deps = the auto-decomposition task graph the
-        // orch dispatcher drives (roots have root_id NULL; deps gate
-        // todo→ready promotion).
+        // Orchestration task graph (design:
+        // docs/design/2026-07-05-native-orchestration-memory-design.md):
+        // the auto-decomposition graph the orch dispatcher drives (roots have
+        // root_id NULL; deps gate todo→ready promotion). Keep this migration
+        // idempotent because some dev DBs already reached user_version 11
+        // from a newer cockpit build.
         M::up(
-            "ALTER TABLE jobs ADD COLUMN pre_check TEXT NOT NULL DEFAULT '';\
-            CREATE TABLE orch_tasks (\
+            "CREATE TABLE IF NOT EXISTS orch_tasks (\
                 id TEXT PRIMARY KEY,\
                 root_id TEXT,\
                 project_id TEXT NOT NULL,\
@@ -321,13 +319,31 @@ fn migrations() -> Migrations<'static> {
                 created_at INTEGER,\
                 finished_at INTEGER\
             );\
-            CREATE INDEX idx_orch_tasks_root ON orch_tasks(root_id, status);\
-            CREATE TABLE orch_task_deps (\
+            CREATE INDEX IF NOT EXISTS idx_orch_tasks_root ON orch_tasks(root_id, status);\
+            CREATE TABLE IF NOT EXISTS orch_task_deps (\
                 task_id TEXT NOT NULL,\
                 dep_id TEXT NOT NULL,\
                 PRIMARY KEY (task_id, dep_id)\
             );",
         ),
+        // Heartbeat hardening: jobs.pre_check = optional wake-gate command
+        // run before a scheduled job wakes the agent (empty stdout /
+        // non-zero exit skips the fire). Hook-guarded (SQLite has no ADD
+        // COLUMN IF NOT EXISTS) because some dev DBs gained this column at
+        // user_version 11 from a pre-merge build — same story as the
+        // idempotent orch migration above.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let exists = tx
+                .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='pre_check'")?
+                .exists([])?;
+            if !exists {
+                tx.execute(
+                    "ALTER TABLE jobs ADD COLUMN pre_check TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -1320,17 +1336,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_11_adds_pre_check_and_orch_task_graph() {
+    async fn migrations_11_12_add_orch_task_graph_and_pre_check() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         store
             .with_conn(|c| {
-                // jobs.pre_check exists with an empty default.
+                // Migration 12: jobs.pre_check exists with an empty default.
                 let has_pre_check: bool = c
                     .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='pre_check'")?
                     .exists([])?;
                 assert!(has_pre_check, "jobs.pre_check column");
-                // orch task graph roundtrips.
+                // Migration 11: the orch task graph roundtrips.
                 c.execute(
                     "INSERT INTO orch_tasks(id, root_id, project_id, title, body, created_at) \
                      VALUES ('t1', NULL, 'p1', 'root goal', 'do it', 1)",

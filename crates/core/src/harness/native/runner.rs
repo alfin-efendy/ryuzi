@@ -39,6 +39,9 @@ const TEXT_FLUSH_BYTES: usize = 120;
 pub struct RunnerDeps {
     pub session_pk: String,
     pub work_dir: PathBuf,
+    /// Plugin-bundled skill directories folded in beside the worktree/global
+    /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
+    pub extra_skill_dirs: Vec<PathBuf>,
     pub model: Option<String>,
     pub perm_mode: PermMode,
     pub project_policy: Option<String>,
@@ -76,7 +79,7 @@ pub async fn run_turn(
             let agent = override_agent
                 .and_then(|n| deps.agents.get(&n))
                 .unwrap_or_else(|| deps.agent.clone());
-            (expanded, agent)
+            (merge_agent_prompt_suffix(expanded, &prompt), agent)
         }
         None => (prompt.agent.clone(), deps.agent.clone()),
     };
@@ -110,6 +113,21 @@ pub async fn run_turn(
     // 4. Best-effort: give a fresh session a generated title.
     maybe_generate_title(deps, &prompt.display).await;
     Ok(())
+}
+
+fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
+    if prompt.agent == prompt.display {
+        return expanded;
+    }
+    let Some(suffix) = prompt.agent.strip_prefix(&prompt.display) else {
+        return expanded;
+    };
+    let suffix = suffix.trim();
+    if suffix.is_empty() {
+        expanded
+    } else {
+        format!("{expanded}\n\n{suffix}")
+    }
 }
 
 /// If this session has no title yet, generate a terse one from the first
@@ -168,7 +186,7 @@ async fn drive(
         Some(p) => p.clone(),
         None => {
             let memory = deps.memory.as_ref().and_then(|m| m.snapshot());
-            context::assemble_system(&deps.work_dir, memory.as_deref())
+            context::assemble_system(&deps.work_dir, &deps.extra_skill_dirs, memory.as_deref())
         }
     };
     // Tools restricted to what this agent may use.
@@ -456,7 +474,11 @@ impl RunnerSpawner {
                 Some(p) => format!("{p}{block}"),
                 None => format!(
                     "{}{block}",
-                    context::assemble_system(&self.deps.work_dir, None)
+                    context::assemble_system(
+                        &self.deps.work_dir,
+                        &self.deps.extra_skill_dirs,
+                        None
+                    )
                 ),
             });
         }
@@ -618,6 +640,7 @@ async fn run_tool_call(
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
         work_dir: deps.work_dir.clone(),
+        extra_skill_dirs: deps.extra_skill_dirs.clone(),
         store: deps.store.clone(),
         cancel: CancellationToken::new(),
         caps: OutputCaps::default(),
@@ -932,6 +955,7 @@ mod tests {
         RunnerDeps {
             session_pk: "s1".into(),
             work_dir: dir.to_path_buf(),
+            extra_skill_dirs: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
             perm_mode: PermMode::BypassPermissions,
@@ -1603,6 +1627,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Review the current working changes"));
+    }
+
+    #[tokio::test]
+    async fn slash_command_expansion_preserves_agent_prompt_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![
+            text_delta("reviewed"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                display: "/review auth".into(),
+                agent: "/review auth\n\n[Chat context]\n- Branch: feature/auth\n\n[User attached 1 file - saved to disk:]"
+                    .into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let turns = deps.store.list_provider_turns("s1").await.unwrap();
+        let user_text = turns[0].payload[0]["text"].as_str().unwrap();
+        assert!(user_text.contains("Review the current working changes"));
+        assert!(user_text.contains("auth"));
+        assert!(user_text.contains("[Chat context]"));
+        assert!(user_text.contains("feature/auth"));
+        assert!(user_text.contains("[User attached 1 file"));
     }
 
     #[tokio::test]
