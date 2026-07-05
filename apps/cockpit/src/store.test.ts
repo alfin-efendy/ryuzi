@@ -1,5 +1,21 @@
-import { test, expect } from "bun:test";
+import { test, expect, spyOn } from "bun:test";
 import { useStore } from "./store";
+import { commands, type Project } from "./bindings";
+
+function project(overrides: Partial<Project> = {}): Project {
+  return {
+    projectId: "p1",
+    name: "demo",
+    workdir: "/tmp/demo",
+    source: null,
+    harness: "claude-code",
+    model: "anthropic/claude-x",
+    effort: null,
+    permMode: "default",
+    createdAt: 1,
+    ...overrides,
+  };
+}
 
 function reset() {
   useStore.setState({
@@ -298,4 +314,31 @@ test("result event leaves other sessions' status untouched", () => {
   useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
   const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
   expect(byPk).toEqual({ s1: "idle", s2: "running" });
+});
+
+test("setProjectHarness calls updateProject with the chosen harness, preserving model/permMode", async () => {
+  reset();
+  useStore.setState({ projects: [project({ harness: "claude-code" })] });
+  const updated = project({ harness: "native" });
+  const update = spyOn(commands, "updateProject").mockResolvedValue({ status: "ok", data: updated });
+  const list = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [updated] });
+  const sessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await useStore.getState().setProjectHarness("p1", "native");
+
+  expect(update).toHaveBeenCalledWith("p1", "anthropic/claude-x", "default", "native");
+  expect(useStore.getState().projects[0].harness).toBe("native");
+
+  update.mockRestore();
+  list.mockRestore();
+  sessions.mockRestore();
+});
+
+test("setProjectHarness is a no-op when the harness is unchanged", async () => {
+  reset();
+  useStore.setState({ projects: [project({ harness: "native" })] });
+  const update = spyOn(commands, "updateProject");
+  await useStore.getState().setProjectHarness("p1", "native");
+  expect(update).not.toHaveBeenCalled();
+  update.mockRestore();
 });
