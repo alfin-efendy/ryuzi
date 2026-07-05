@@ -5,6 +5,7 @@ pub mod detect;
 pub mod dispatch;
 pub mod doctor;
 pub mod meta;
+pub mod orch_cmd;
 pub mod paint;
 pub mod run_cmd;
 pub mod serve_cmd;
