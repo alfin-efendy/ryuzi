@@ -4,29 +4,25 @@
 //! open-sse/translator/request/{claude-to-kiro,openai-to-kiro}.js.
 //!
 //! MVP scope (correctness-critical subset): strict role alternation (merge
-//! consecutive same-role turns with "\n\n"), system-prompt folding, tool
+//! consecutive same-role turns with "\n\n"), system-prompt folding + the
+//! always-present `"[Context: Current time is <RFC3339>]"` timestamp prefix
+//! on `currentMessage` content (so the model has current-date context), tool
 //! specs, tool results, `toolUses` in history, the last-user-message →
 //! `currentMessage` split, and the two 400-guards (flatten tool blocks to
 //! text when the client sent no tools; drop/salvage orphaned tool results
 //! whose id has no matching `toolUses`).
 //!
+//! The assembled `currentMessage` content is, joined with "\n\n":
+//! `[Context: Current time is <ts>]` + (optional folded system text) + user
+//! content. The prefix goes ONLY on `currentMessage.content`, never on
+//! history items.
+//!
 //! Deferred (documented, not built — see task-6 brief): image blocks; the
 //! `-thinking` / `-agentic` synthetic model-suffix variants + thinking-budget
-//! injection + agentic system prompt; `inferenceConfig.temperature`/`topP`.
-//! `maxTokens` = `body.max_tokens || 32000` (anthropic) / hardcoded `32000`
-//! (openai) — matches 9router's known behavior, not "fixed" here.
-//!
-//! Deviation from the brief's prose (flagged, not silently dropped): 9router
-//! unconditionally prepends a `"[Context: Current time is <RFC3339>]"`
-//! (`chrono::Utc::now()`) prefix to `currentMessage`'s content. The brief's
-//! own acceptance test `consecutive_user_turns_merge_and_last_is_current`
-//! asserts EXACT equality (`content == "a\n\nb"`, not `.contains(..)`) with no
-//! such prefix — which a live wall-clock value can never satisfy
-//! deterministically. Since that test is unambiguous (not a timing race —
-//! guaranteed mismatch), this port follows the concrete test over the prose
-//! and does NOT inject the timestamp prefix. System-prompt folding IS kept
-//! (verified by `anthropic_single_user_turn_with_tool`'s `.contains(..)`
-//! checks). See task-6 report for the full rationale.
+//! injection + agentic system prompt (only the `[Context:...]` line is added
+//! now); `inferenceConfig.temperature`/`topP`. `maxTokens` =
+//! `body.max_tokens || 32000` (anthropic) / hardcoded `32000` (openai) —
+//! matches 9router's known behavior, not "fixed" here.
 
 use crate::llm_router::connections::{self, ConnectionData};
 use serde_json::{json, Value};
@@ -637,6 +633,11 @@ pub fn anthropic_request_to_kiro(
             final_content = format!("{sys_text}\n\n{final_content}");
         }
     }
+    // Always-present current-time context prefix — goes ONLY on
+    // currentMessage.content (never history), assembled as
+    // `[Context: ...]\n\n<system>\n\n<user>` (matches 9router).
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    final_content = format!("[Context: Current time is {timestamp}]\n\n{final_content}");
 
     current_message["userInputMessage"]["content"] = json!(final_content);
     current_message["userInputMessage"]["origin"] = json!("AI_EDITOR");
@@ -923,6 +924,15 @@ pub fn openai_request_to_kiro(
 
     // No top-level `system` field in OpenAI bodies: system messages are
     // folded in via the ordinary role normalization above (system -> user).
+    // The current-time context prefix still goes on currentMessage.content
+    // only (never history), assembled as `[Context: ...]\n\n<content>`.
+    let content = current_message["userInputMessage"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let final_content = format!("[Context: Current time is {timestamp}]\n\n{content}");
+    current_message["userInputMessage"]["content"] = json!(final_content);
     current_message["userInputMessage"]["origin"] = json!("AI_EDITOR");
 
     let mut payload = json!({
@@ -956,6 +966,11 @@ mod tests {
         let cur = &k["conversationState"]["currentMessage"]["userInputMessage"];
         assert_eq!(cur["modelId"], "claude-sonnet-4.5");
         assert_eq!(cur["origin"], "AI_EDITOR");
+        // Prefix pinned to the very start: `[Context:...]\n\n<system>\n\n<user>`.
+        assert!(cur["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Context: Current time is "));
         assert!(cur["content"]
             .as_str()
             .unwrap()
@@ -998,10 +1013,13 @@ mod tests {
             k["conversationState"]["history"].as_array().unwrap().len(),
             0
         );
-        assert_eq!(
-            k["conversationState"]["currentMessage"]["userInputMessage"]["content"],
-            "a\n\nb"
-        );
+        // The merged content is prefixed with the non-deterministic timestamp
+        // line, so assert on structure rather than exact equality.
+        let content = k["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(content.starts_with("[Context: Current time is "));
+        assert!(content.ends_with("a\n\nb"));
     }
 
     #[test]
@@ -1173,5 +1191,41 @@ mod tests {
             .unwrap()
             .contains("[Tool result: rainy]"));
         assert!(cur.get("userInputMessageContext").is_none());
+    }
+
+    #[test]
+    fn context_prefix_is_on_current_message_only_and_appears_exactly_once() {
+        // Multi-turn so history has real user/assistant content to inspect.
+        let body = serde_json::json!({ "messages": [
+            { "role": "user", "content": "first turn" },
+            { "role": "assistant", "content": "first reply" },
+            { "role": "user", "content": "second turn" },
+        ]});
+        let k = anthropic_request_to_kiro(&body, "m", &ConnectionData::default(), "c");
+
+        let marker = "[Context: Current time is ";
+        let cur_content = k["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap();
+        // Exactly once on currentMessage, pinned to the start.
+        assert_eq!(cur_content.matches(marker).count(), 1);
+        assert!(cur_content.starts_with(marker));
+        assert!(cur_content.ends_with("second turn"));
+
+        // Never on any history item (user or assistant content).
+        let history = k["conversationState"]["history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        for item in history {
+            let content = item["userInputMessage"]["content"]
+                .as_str()
+                .or_else(|| item["assistantResponseMessage"]["content"].as_str())
+                .unwrap();
+            assert!(!content.contains(marker));
+        }
+        assert_eq!(history[0]["userInputMessage"]["content"], "first turn");
+        assert_eq!(
+            history[1]["assistantResponseMessage"]["content"],
+            "first reply"
+        );
     }
 }
