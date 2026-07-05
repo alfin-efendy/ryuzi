@@ -27,6 +27,10 @@ pub struct JobRow {
     pub prompt: String,
     pub notify_success: bool,
     pub notify_fail: bool,
+    /// Optional wake-gate command run before the agent wakes: empty stdout,
+    /// non-zero exit, or timeout skips the fire; stdout is otherwise appended
+    /// to the prompt as context.
+    pub pre_check: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,7 +176,7 @@ fn parse_time(t: &str) -> Option<(u32, u32)> {
 // ---------------------------------------------------------------------------
 
 const JOB_COLS: &str =
-    "id,name,cron,mode,natural_text,project_id,branch,agent,gateway,enabled,prompt,notify_success,notify_fail";
+    "id,name,cron,mode,natural_text,project_id,branch,agent,gateway,enabled,prompt,notify_success,notify_fail,pre_check";
 
 fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     Ok(JobRow {
@@ -189,6 +193,7 @@ fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         prompt: r.get(10)?,
         notify_success: r.get::<_, i64>(11)? != 0,
         notify_fail: r.get::<_, i64>(12)? != 0,
+        pre_check: r.get(13)?,
     })
 }
 
@@ -225,18 +230,19 @@ pub async fn upsert_job(store: &Store, job: JobRow) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
-                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,agent,gateway,enabled,prompt,notify_success,notify_fail,created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
+                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,agent,gateway,enabled,prompt,notify_success,notify_fail,pre_check,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
                  ON CONFLICT(id) DO UPDATE SET \
                    name=excluded.name, cron=excluded.cron, mode=excluded.mode, \
                    natural_text=excluded.natural_text, project_id=excluded.project_id, \
                    branch=excluded.branch, agent=excluded.agent, gateway=excluded.gateway, \
                    enabled=excluded.enabled, prompt=excluded.prompt, \
-                   notify_success=excluded.notify_success, notify_fail=excluded.notify_fail",
+                   notify_success=excluded.notify_success, notify_fail=excluded.notify_fail, \
+                   pre_check=excluded.pre_check",
                 params![
                     job.id, job.name, job.cron, job.mode, job.natural_text, job.project_id,
                     job.branch, job.agent, job.gateway, job.enabled as i64, job.prompt,
-                    job.notify_success as i64, job.notify_fail as i64, now
+                    job.notify_success as i64, job.notify_fail as i64, job.pre_check, now
                 ],
             )
             .map(|_| ())
@@ -357,6 +363,90 @@ pub async fn has_running_run(store: &Store, job_id: &str) -> anyhow::Result<bool
 }
 
 // ---------------------------------------------------------------------------
+// Silence + wake gates (hermes-agent cron conventions)
+// ---------------------------------------------------------------------------
+
+/// Prompt header teaching scheduled sessions the silence convention.
+pub const SCHED_HEADER: &str = "[Scheduled run] If, after checking, there is nothing worth \
+reporting or doing, reply with a single line starting with [SILENT] - the run is still \
+recorded but no notification is delivered.";
+
+/// Whether a scheduled run's final reply opts out of delivery.
+pub(crate) fn is_silent(text: &str) -> bool {
+    text.trim_start().starts_with("[SILENT]")
+}
+
+/// The (notify, note) decision for a finished run's final assistant text.
+pub(crate) fn run_note_for(final_text: Option<&str>) -> (bool, Option<String>) {
+    match final_text {
+        Some(t) if is_silent(t) => (false, Some("[SILENT] suppressed".to_string())),
+        _ => (true, None),
+    }
+}
+
+/// The final assistant message of a session: the trailing run of assistant
+/// text rows (they are persisted delta-shaped), concatenated in order.
+async fn final_assistant_text(store: &Store, session_pk: &str) -> Option<String> {
+    let msgs = store.list_messages(session_pk).await.ok()?;
+    let mut parts: Vec<String> = Vec::new();
+    for m in msgs.iter().rev() {
+        if m.role == "assistant" && m.block_type == "text" {
+            if let Some(t) = m.payload.get("text").and_then(|t| t.as_str()) {
+                parts.push(t.to_string());
+            }
+        } else if m.role == "assistant" && m.block_type == "thought" {
+            continue;
+        } else {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.reverse();
+    Some(parts.concat())
+}
+
+/// Outcome of a job's wake-gate pre-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreCheckOutcome {
+    /// Nothing to do - skip this fire entirely (reason for the log).
+    Skip(String),
+    /// Wake the agent; stdout is appended to the job prompt.
+    Wake(String),
+}
+
+/// Run a job's `pre_check` command (60s cap; `cmd /C` on Windows, `sh -c`
+/// elsewhere). Empty stdout, non-zero exit, spawn failure, or timeout skips
+/// the fire.
+pub async fn run_pre_check(cmd: &str) -> PreCheckOutcome {
+    let mut c = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    };
+    match tokio::time::timeout(Duration::from_secs(60), c.output()).await {
+        Err(_) => PreCheckOutcome::Skip("pre-check timed out after 60s".into()),
+        Ok(Err(e)) => PreCheckOutcome::Skip(format!("pre-check failed to spawn: {e}")),
+        Ok(Ok(o)) if !o.status.success() => {
+            PreCheckOutcome::Skip(format!("pre-check exited with {}", o.status))
+        }
+        Ok(Ok(o)) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if stdout.is_empty() {
+                PreCheckOutcome::Skip("pre-check produced no output".into())
+            } else {
+                PreCheckOutcome::Wake(stdout)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 
@@ -384,6 +474,15 @@ pub async fn diff_totals(workdir: &str) -> Option<(i64, i64)> {
 /// Execute `job` now: create the run row, start the agent session, and close
 /// the run when the session's first turn completes. Returns the run id.
 pub async fn execute_job(cp: &Arc<ControlPlane>, job: &JobRow) -> anyhow::Result<String> {
+    execute_job_with(cp, job, None).await
+}
+
+/// [`execute_job`] with optional pre-check output appended to the prompt.
+pub async fn execute_job_with(
+    cp: &Arc<ControlPlane>,
+    job: &JobRow,
+    pre_check_output: Option<String>,
+) -> anyhow::Result<String> {
     let store = cp.store().clone();
     let run_id = format!("r-{}", &crate::paths::new_id()[..8]);
     let started = crate::paths::now_ms();
@@ -414,8 +513,12 @@ pub async fn execute_job(cp: &Arc<ControlPlane>, job: &JobRow) -> anyhow::Result
 
     // Subscribe BEFORE starting so a fast turn can't slip past the listener.
     let mut rx = cp.subscribe();
+    let mut prompt = format!("{SCHED_HEADER}\n\n{}", job.prompt);
+    if let Some(out) = &pre_check_output {
+        prompt.push_str(&format!("\n\nPre-check output:\n{out}"));
+    }
     let session = match cp
-        .start_session(&job.project_id, &job.prompt, "scheduler", &[])
+        .start_session(&job.project_id, &prompt, "scheduler", &[])
         .await
     {
         Ok(s) => s,
@@ -488,11 +591,19 @@ pub async fn execute_job(cp: &Arc<ControlPlane>, job: &JobRow) -> anyhow::Result
             _ => (0, 0),
         };
         let now = crate::paths::now_ms();
-        let note = if status == "success" && add == 0 && del == 0 {
-            Some("No changes produced".to_string())
+        let final_text = if status == "success" {
+            final_assistant_text(cp2.store(), &session_pk).await
         } else {
             None
         };
+        let (notify, silent_note) = run_note_for(final_text.as_deref());
+        let note = silent_note.or_else(|| {
+            if status == "success" && add == 0 && del == 0 {
+                Some("No changes produced".to_string())
+            } else {
+                None
+            }
+        });
         let _ = finalize_run(
             cp2.store(),
             &run_id2,
@@ -505,16 +616,18 @@ pub async fn execute_job(cp: &Arc<ControlPlane>, job: &JobRow) -> anyhow::Result
             note,
         )
         .await;
-        let level = if status == "success" {
-            "success"
-        } else {
-            "error"
-        };
-        let text = match &error {
-            Some(e) => format!("job {job_name} run {run_id2} failed — {e}"),
-            None => format!("job {job_name} run {run_id2} finished — +{add} −{del}"),
-        };
-        let _ = crate::gateways::add_event(cp2.store(), &gateway, level, &text).await;
+if status != "success" || notify {
+            let level = if status == "success" {
+                "success"
+            } else {
+                "error"
+            };
+            let text = match &error {
+                Some(e) => format!("job {job_name} run {run_id2} failed — {e}"),
+                None => format!("job {job_name} run {run_id2} finished — +{add} −{del}"),
+            };
+            let _ = crate::gateways::add_event(cp2.store(), &gateway, level, &text).await;
+        }
         let _ = cp2.send_event(CoreEvent::JobRunChanged {
             job_id,
             run_id: run_id2,
@@ -557,41 +670,63 @@ pub fn spawn_runner(cp: Arc<ControlPlane>) -> tokio::task::JoinHandle<()> {
 
 pub async fn run_loop(cp: Arc<ControlPlane>) {
     loop {
-        {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            let store = cp.store().clone();
-            let jobs = match list_jobs(&store).await {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            let now = crate::paths::now_ms();
-            for job in jobs.into_iter().filter(|j| j.enabled) {
-                let key = format!("job_last_fired.{}", job.id);
-                let last_fired: i64 = store
-                    .get_setting(&key)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.parse().ok())
-                    // First sighting: anchor at now so we fire on the NEXT occurrence.
-                    .unwrap_or(now);
-                if last_fired == now {
-                    let _ = store.set_setting(&key, &now.to_string()).await;
-                    continue;
-                }
-                let Some(next) = next_run_after(&job.cron, last_fired) else {
-                    continue;
-                };
-                if next > now {
-                    continue;
-                }
-                if has_running_run(&store, &job.id).await.unwrap_or(true) {
-                    continue;
-                }
-                let _ = store.set_setting(&key, &now.to_string()).await;
-                let _ = execute_job(&cp, &job).await;
-            }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tick(&cp).await;
+    }
+}
+
+/// One scheduler pass: record liveness, then fire any due jobs (through their
+/// wake-gate pre-checks). Factored out of [`run_loop`] so tests can drive it
+/// without sleeping.
+pub async fn tick(cp: &Arc<ControlPlane>) {
+    let store = cp.store().clone();
+    let now = crate::paths::now_ms();
+    // Cheap staleness probe for health surfaces.
+    let _ = store
+        .set_setting("scheduler_last_tick", &now.to_string())
+        .await;
+    let jobs = match list_jobs(&store).await {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    for job in jobs.into_iter().filter(|j| j.enabled) {
+        let key = format!("job_last_fired.{}", job.id);
+        let last_fired: i64 = store
+            .get_setting(&key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            // First sighting: anchor at now so we fire on the NEXT occurrence.
+            .unwrap_or(now);
+        if last_fired == now {
+            let _ = store.set_setting(&key, &now.to_string()).await;
+            continue;
         }
+        let Some(next) = next_run_after(&job.cron, last_fired) else {
+            continue;
+        };
+        if next > now {
+            continue;
+        }
+        if has_running_run(&store, &job.id).await.unwrap_or(true) {
+            continue;
+        }
+        let _ = store.set_setting(&key, &now.to_string()).await;
+        // Wake gate: a configured pre-check must produce output, or the fire
+        // is skipped entirely (no session, no run row).
+        let pre = if job.pre_check.trim().is_empty() {
+            None
+        } else {
+            match run_pre_check(&job.pre_check).await {
+                PreCheckOutcome::Skip(reason) => {
+                    tracing::debug!("scheduler: job {} skipped ({reason})", job.id);
+                    continue;
+                }
+                PreCheckOutcome::Wake(out) => Some(out),
+            }
+        };
+        let _ = execute_job_with(cp, &job, pre).await;
     }
 }
 
@@ -647,6 +782,54 @@ mod tests {
         assert!(next_run_after("not a cron", now).is_none());
     }
 
+    #[test]
+    fn silent_prefix_detection_and_note() {
+        assert!(is_silent("[SILENT] nothing to do"));
+        assert!(is_silent("  [SILENT]"));
+        assert!(!is_silent("done: [SILENT] not a prefix"));
+        assert!(!is_silent("all good"));
+        assert_eq!(
+            run_note_for(Some("[SILENT] ok")),
+            (false, Some("[SILENT] suppressed".to_string()))
+        );
+        assert_eq!(run_note_for(Some("did things")), (true, None));
+        assert_eq!(run_note_for(None), (true, None));
+    }
+
+    #[tokio::test]
+    async fn pre_check_gates_on_output_and_exit() {
+        assert_eq!(
+            run_pre_check("echo hi").await,
+            PreCheckOutcome::Wake("hi".into())
+        );
+        assert!(matches!(
+            run_pre_check("exit 1").await,
+            PreCheckOutcome::Skip(_)
+        ));
+        // Succeeds but prints nothing: still a skip.
+        let quiet = if cfg!(windows) { "rem quiet" } else { "true" };
+        assert!(matches!(
+            run_pre_check(quiet).await,
+            PreCheckOutcome::Skip(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tick_records_scheduler_liveness() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let cp =
+            crate::control::ControlPlane::new(store, crate::integration::Registries::new()).await;
+        tick(&cp).await;
+        let val = cp
+            .store()
+            .get_setting("scheduler_last_tick")
+            .await
+            .unwrap()
+            .expect("liveness recorded");
+        assert!(val.parse::<i64>().unwrap() > 0);
+    }
+
     #[tokio::test]
     async fn job_and_run_crud_roundtrip() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -666,6 +849,7 @@ mod tests {
             prompt: "Run npm audit".into(),
             notify_success: false,
             notify_fail: true,
+            pre_check: "git status --short".into(),
         };
         upsert_job(&store, job.clone()).await.unwrap();
         assert_eq!(get_job(&store, "j1").await.unwrap().unwrap(), job);
