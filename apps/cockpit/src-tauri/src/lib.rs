@@ -246,6 +246,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::session_todos,
             session_io::export_session,
             session_io::import_session,
+            session_io::share_session,
         ])
         .events(collect_events![
             events::CoreEventMsg,

@@ -58,6 +58,18 @@ test("exportSession returns the JSON payload", async () => {
   spy.mockRestore();
 });
 
+test("shareSession returns the rendered HTML", async () => {
+  reset();
+  const spy = spyOn(commands, "shareSession").mockResolvedValue({
+    status: "ok",
+    data: "<!doctype html><title>x</title>",
+  });
+  const out = await useNative.getState().shareSession("s1");
+  expect(spy).toHaveBeenCalledWith("s1");
+  expect(out).toContain("<!doctype html>");
+  spy.mockRestore();
+});
+
 test("importSession reports success", async () => {
   reset();
   const spy = spyOn(commands, "importSession").mockResolvedValue({

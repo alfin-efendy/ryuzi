@@ -717,6 +717,17 @@ async importSession(projectId: string, data: string) : Promise<Result<Session, C
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Render a session as a self-contained, shareable HTML document.
+ */
+async shareSession(sessionPk: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("share_session", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 

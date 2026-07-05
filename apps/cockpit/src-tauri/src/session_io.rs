@@ -3,7 +3,7 @@
 //! session for viewing.
 
 use crate::error::CmdError;
-use ryuzi_core::domain::{NewMessage, NewProviderTurn, Session, SessionStatus};
+use ryuzi_core::domain::{Message, NewMessage, NewProviderTurn, Session, SessionStatus};
 use ryuzi_core::paths::{new_id, now_ms};
 use ryuzi_core::{ControlPlane, Store};
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,84 @@ pub async fn export_session(cp: State<'_, Arc<ControlPlane>>, session_pk: String
     Ok(serde_json::to_string_pretty(&export).map_err(anyhow::Error::from)?)
 }
 
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Render a session's transcript to a self-contained, shareable HTML document.
+fn build_html(title: &str, messages: &[Message]) -> String {
+    let mut body = String::new();
+    for m in messages {
+        let content = match m.block_type.as_str() {
+            "tool_call" => {
+                let name = m
+                    .payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool");
+                let out = m
+                    .payload
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                format!(
+                    "<strong>{}</strong>\n{}",
+                    escape_html(name),
+                    escape_html(out)
+                )
+            }
+            "status" => escape_html(
+                m.payload
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            ),
+            _ => escape_html(m.payload.get("text").and_then(|v| v.as_str()).unwrap_or("")),
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        body.push_str(&format!(
+            "<div class=\"msg {}\"><div class=\"role\">{}</div><pre class=\"content\">{}</pre></div>\n",
+            escape_html(&m.block_type),
+            escape_html(&m.role),
+            content
+        ));
+    }
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>{title}</title><style>\
+         body{{font:14px/1.5 system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;color:#222}}\
+         h1{{font-size:1.3rem}}.msg{{margin:1rem 0;border-left:3px solid #ddd;padding-left:.75rem}}\
+         .role{{font-weight:600;font-size:.75rem;text-transform:uppercase;color:#888}}\
+         .content{{white-space:pre-wrap;font:inherit;margin:.25rem 0 0}}\
+         .msg.tool_call{{border-color:#7c3aed}}.msg.status{{border-color:#16a34a}}\
+         </style></head><body><h1>{escaped_title}</h1>{body}\
+         <footer style=\"margin-top:2rem;color:#aaa;font-size:.75rem\">Shared from ryuzi</footer>\
+         </body></html>",
+        title = escape_html(title),
+        escaped_title = escape_html(title),
+        body = body
+    )
+}
+
+/// Render a session as a self-contained, shareable HTML document.
+#[tauri::command]
+#[specta::specta]
+pub async fn share_session(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -> R<String> {
+    let session = cp
+        .store()
+        .get_session(&session_pk)
+        .await?
+        .ok_or_else(|| CmdError::from(anyhow::anyhow!("unknown session {session_pk}")))?;
+    let messages = cp.list_messages(&session_pk).await?;
+    let title = session.title.unwrap_or_else(|| "ryuzi session".to_string());
+    Ok(build_html(&title, &messages))
+}
+
 /// Import a previously exported session JSON as a new archived session.
 #[tauri::command]
 #[specta::specta]
@@ -211,5 +289,43 @@ mod tests {
             .unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].payload[0]["text"], "hello");
+    }
+
+    #[test]
+    fn build_html_renders_and_escapes() {
+        let messages = vec![
+            Message {
+                session_pk: "s".into(),
+                seq: 1,
+                role: "user".into(),
+                block_type: "text".into(),
+                payload: serde_json::json!({ "text": "hi <script>" }),
+                tool_call_id: None,
+                status: None,
+                tool_kind: None,
+                created_at: 0,
+            },
+            Message {
+                session_pk: "s".into(),
+                seq: 2,
+                role: "assistant".into(),
+                block_type: "tool_call".into(),
+                payload: serde_json::json!({ "name": "bash", "output": "done" }),
+                tool_call_id: Some("t1".into()),
+                status: Some("completed".into()),
+                tool_kind: Some("execute".into()),
+                created_at: 0,
+            },
+        ];
+        let html = build_html("My & Session", &messages);
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("My &amp; Session"));
+        // User text is escaped (no live <script>).
+        assert!(html.contains("hi &lt;script&gt;"));
+        assert!(!html.contains("<script>"));
+        // Tool call renders name + output.
+        assert!(html.contains("<strong>bash</strong>"));
+        assert!(html.contains("done"));
+        assert!(html.contains("Shared from ryuzi"));
     }
 }

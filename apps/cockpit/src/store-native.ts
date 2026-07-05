@@ -13,6 +13,7 @@ type NativeState = {
   loadTodos: (sessionPk: string) => Promise<void>;
   exportSession: (sessionPk: string) => Promise<string | null>;
   importSession: (projectId: string, data: string) => Promise<boolean>;
+  shareSession: (sessionPk: string) => Promise<string | null>;
 };
 
 export const useNative = create<NativeState>((set) => ({
@@ -51,5 +52,11 @@ export const useNative = create<NativeState>((set) => ({
   importSession: async (projectId, data) => {
     const res = await commands.importSession(projectId, data);
     return res.status === "ok";
+  },
+
+  // Renders the session as a self-contained HTML document, or null on failure.
+  shareSession: async (sessionPk) => {
+    const res = await commands.shareSession(sessionPk);
+    return res.status === "ok" ? res.data : null;
   },
 }));
