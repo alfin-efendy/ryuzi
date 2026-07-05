@@ -44,7 +44,12 @@ sysinfo = "0.33"
 croner = "2"
 chrono.workspace = true
 axum = "0.8"
-reqwest = { workspace = true, default-features = true, features = ["json", "stream"] }
+# rustls, NOT default-features (= native-tls): reqwest's default-tls pulls
+# openssl-sys on linux targets, which the macOS-hosted zigbuild cross-compiles
+# in release.yml cannot build (this killed the v0.4.0 goreleaser job). Every
+# other TLS consumer here (serenity, ureq, cockpit reqwest) is already rustls.
+# http2 + charset keep the rest of the old default feature set.
+reqwest = { workspace = true, features = ["rustls-tls", "http2", "charset", "json", "stream"] }
 bytes = "1"
 tokio-stream = { version = "0.1", features = ["sync"] }
 # Native agent runtime (harness/native): file-name globbing, gitignore-aware

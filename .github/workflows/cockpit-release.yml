@@ -1,7 +1,9 @@
 name: cockpit-release
-# Builds Cockpit installers for an existing `cockpit-vX.Y.Z` GitHub release
-# and uploads them + checksums. Called from release.yml when release-please
-# cuts a cockpit release; dispatchable manually to (re)build for any tag.
+# Builds Cockpit installers for an existing unified `vX.Y.Z` GitHub release
+# (cockpit no longer gets its own release/tag — its independent version lives
+# in tauri.conf.json at the tag, stamped by release-please) and uploads them
+# + checksums onto that release. Called from release.yml on every CLI
+# release; dispatchable manually to (re)build installers for any release tag.
 #
 # Signing is READY but dormant: the Apple env vars below are empty until the
 # secrets exist, and Tauri skips signing when they are empty. Windows signing
@@ -17,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing cockpit release tag (e.g. cockpit-v0.1.0)"
+        description: "Existing release tag to build from and upload to (e.g. v0.5.0)"
         required: true
         type: string
 
@@ -65,6 +67,19 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
+      # The tracked crates/core/sidecar.manifest.json pins release_tag v0.0.0;
+      # shipping it means every sidecar download from a released Cockpit 404s.
+      # The `sidecar` job in release.yml uploads the real manifest.json as a
+      # release asset before this workflow runs (and it stays there for manual
+      # re-dispatches), so embed it from the release itself.
+      - name: Embed the release sidecar manifest (pins adapter version + sha256)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
+            --pattern manifest.json --output crates/core/sidecar.manifest.json --clobber
+          cat crates/core/sidecar.manifest.json
       - name: Build installers
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}

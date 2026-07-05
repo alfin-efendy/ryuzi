@@ -304,6 +304,9 @@ fn make_builder() -> Builder<tauri::Wry> {
 /// dev-run export, the `export_bindings` test, and the `gen-bindings` bin
 /// (which exists because the Windows lib-test harness crashes at startup —
 /// tauri-apps/tauri#13419 — while bin artifacts get the app manifest linked).
+/// The bin is feature-gated (`required-features = ["gen-bindings"]`) so
+/// `tauri build` never bundles it; run it via `cargo gen-bindings` (alias in
+/// the repo-root .cargo/config.toml).
 pub fn export_bindings(out: &std::path::Path) {
     make_builder()
         .export(
@@ -416,7 +419,7 @@ mod tests {
 
     /// Generates `src/bindings.ts` without launching the Tauri GUI.
     /// Run via: `cargo test -p ryuzi-cockpit export_bindings -- --nocapture`
-    /// (On Windows prefer `cargo run -p ryuzi-cockpit --bin gen-bindings` —
+    /// (On Windows prefer `cargo gen-bindings` — alias in .cargo/config.toml;
     /// the lib-test harness crashes at startup, tauri-apps/tauri#13419.)
     #[test]
     fn export_bindings_test() {
