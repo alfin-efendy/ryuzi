@@ -1,46 +1,62 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import { commands, type ProviderQuotaInfo } from "@/bindings";
 import { useConnections } from "@/store-connections";
-import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
 import {
   Button,
   Input,
   SettingsCard as Card,
   SettingsCardHeader as CardHeader,
-  SettingsCardHint as CardHint,
   SettingsCardRow as CardRow,
   SettingsCardTitle as CardTitle,
-  Textarea,
 } from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { Chip, Pill } from "@/components/common/bits";
-import { UsageChart } from "@/components/common/UsageChart";
+import { ProviderQuotaCard } from "@/components/ProviderQuotaCard";
 
 export function ConnectionDetailView({ id }: { id: string }) {
   const nav = useNav();
   const { connections, loaded, hydrate, update, remove, test, reconnectOauth } = useConnections();
-  const usage = useUsage((s) => s.byConnection[id]);
-  const loadUsage = useUsage((s) => s.loadConnection);
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
-  const [modelsText, setModelsText] = useState("");
   const [initFor, setInitFor] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
+  const [providerQuota, setProviderQuota] = useState<ProviderQuotaInfo | null>(null);
+  const [quotaLoading, setQuotaLoading] = useState(false);
+  const [resettingCredit, setResettingCredit] = useState(false);
 
   useEffect(() => {
     if (!loaded) void hydrate();
   }, [loaded, hydrate]);
 
-  useEffect(() => {
-    void loadUsage(id);
-  }, [id, loadUsage]);
-
   const conn = connections.find((c) => c.id === id);
+  const supportsProviderQuota =
+    !!conn && conn.authType === "oauth" && (conn.provider === "anthropic-oauth" || conn.provider === "openai-oauth");
+
+  const loadProviderQuota = useCallback(async () => {
+    if (!conn || !supportsProviderQuota) {
+      setProviderQuota(null);
+      return;
+    }
+    setQuotaLoading(true);
+    const result = await commands.connectionProviderQuota(conn.id);
+    setQuotaLoading(false);
+    if (result.status === "ok") {
+      setProviderQuota(result.data);
+      return;
+    }
+    toast.error(`Quota failed: ${result.error.message}`);
+  }, [conn, supportsProviderQuota]);
+
+  useEffect(() => {
+    if (supportsProviderQuota) void loadProviderQuota();
+    else setProviderQuota(null);
+  }, [supportsProviderQuota, loadProviderQuota]);
 
   // Seed the form fields once per connection — later hydrations (e.g. after
   // Save) shouldn't clobber an in-progress edit.
@@ -49,7 +65,6 @@ export function ConnectionDetailView({ id }: { id: string }) {
       setLabel(conn.label);
       setApiKey("");
       setBaseUrl(conn.baseUrl ?? "");
-      setModelsText(conn.models.join("\n"));
       setInitFor(conn.id);
     }
   }, [conn, initFor]);
@@ -71,10 +86,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
       enabled: conn.enabled,
       apiKey: apiKey || null,
       baseUrl: baseUrl || null,
-      models: modelsText
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean),
+      models: conn.models,
     });
     setApiKey("");
     setSaving(false);
@@ -93,7 +105,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
   const del = async () => {
     if (!window.confirm(`Remove ${conn.label || conn.providerName}? This cannot be undone.`)) return;
     await remove(id);
-    nav.navigate({ kind: "models" });
+    nav.navigate({ kind: "providerDetail", provider: conn.provider });
   };
 
   const needsRelogin = conn.authType === "oauth" && conn.needsRelogin;
@@ -105,14 +117,37 @@ export function ConnectionDetailView({ id }: { id: string }) {
     if (ok) toast.success(`Reconnected ${conn.providerName}`);
   };
 
+  const resetCodexCredit = async () => {
+    if (!window.confirm("Spend one Codex reset credit now? This cannot be undone.")) return;
+    setResettingCredit(true);
+    const result = await commands.resetCodexCredit(conn.id);
+    setResettingCredit(false);
+    if (result.status === "ok") {
+      if (result.data.reset) toast.success("Codex reset credit applied.");
+      else toast.error(result.data.message ?? "No Codex reset credits available.");
+      await loadProviderQuota();
+      return;
+    }
+    toast.error(`Reset credit failed: ${result.error.message}`);
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[860px]">
-        <BackButton label="Models" onClick={() => nav.navigate({ kind: "models" })} />
+        <BackButton label={conn.providerName} onClick={() => nav.navigate({ kind: "providerDetail", provider: conn.provider })} />
 
         <DetailHeader
           chip={<Chip initial={conn.initial} color={conn.color} size={44} />}
-          title={conn.label || conn.providerName}
+          title={label || conn.providerName}
+          titleNode={
+            <Input
+              aria-label="Connection label"
+              className="h-9 w-full max-w-[420px] min-w-0 border-transparent bg-transparent px-0 text-xl font-semibold shadow-none hover:border-border focus-visible:border-ring"
+              value={label}
+              onChange={(event) => setLabel(event.target.value)}
+              placeholder={conn.providerName}
+            />
+          }
           titleExtra={needsRelogin ? <Pill variant="warn">Needs re-login</Pill> : undefined}
           sub={conn.providerName}
         >
@@ -135,34 +170,16 @@ export function ConnectionDetailView({ id }: { id: string }) {
           </Button>
         </DetailHeader>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Usage</CardTitle>
-            <CardHint>Last 14 days of traffic through this connection</CardHint>
-          </CardHeader>
-          <div className="px-[18px] py-3">
-            <UsageChart points={usage?.days ?? []} />
-            {usage && (
-              <div className="mt-2 text-xs text-muted-foreground">
-                Today: {usage.todayRequests} req · {(usage.todayInputTokens + usage.todayOutputTokens).toLocaleString()} tokens
-              </div>
-            )}
-          </div>
-        </Card>
-
-        <Card className="mt-3">
-          <CardHeader>
-            <CardTitle>Identity</CardTitle>
-          </CardHeader>
-          <CardRow>
-            <span className="w-28 shrink-0 text-[13px] font-medium">Provider</span>
-            <span className="flex-1 text-[13px] text-muted-foreground">{conn.providerName}</span>
-          </CardRow>
-          <CardRow>
-            <span className="w-28 shrink-0 text-[13px] font-medium">Label</span>
-            <Input className="flex-1" value={label} onChange={(e) => setLabel(e.target.value)} placeholder={conn.providerName} />
-          </CardRow>
-        </Card>
+        {supportsProviderQuota && (
+          <ProviderQuotaCard
+            provider={conn.provider}
+            quota={providerQuota}
+            loading={quotaLoading}
+            resetting={resettingCredit}
+            onRefresh={() => void loadProviderQuota()}
+            onResetCredit={() => void resetCodexCredit()}
+          />
+        )}
 
         <Card className="mt-3">
           <CardHeader>
@@ -192,21 +209,6 @@ export function ConnectionDetailView({ id }: { id: string }) {
             <Input className="flex-1" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://host/v1" />
           </CardRow>
           <div className="px-[18px] pb-3 text-[11.5px] text-muted-foreground">Leave empty for the provider default.</div>
-        </Card>
-
-        <Card className="mt-3">
-          <CardHeader>
-            <CardTitle>Models</CardTitle>
-          </CardHeader>
-          <div className="px-[18px] py-3">
-            <Textarea
-              className="min-h-[96px] resize-y font-mono text-xs"
-              value={modelsText}
-              onChange={(e) => setModelsText(e.target.value)}
-              placeholder="one model per line"
-            />
-            <div className="mt-1.5 text-[11.5px] text-muted-foreground">Leave empty for the provider's default list.</div>
-          </div>
         </Card>
 
         <div className="mt-4 flex justify-end">

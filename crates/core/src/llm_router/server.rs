@@ -1,7 +1,9 @@
 //! The local endpoint server: Anthropic + OpenAI compatible surface on
 //! 127.0.0.1, gated by endpoint keys, routed to provider connections.
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
-use crate::llm_router::{connections, keys, oauth, sse::SseParser, translate};
+use crate::llm_router::{
+    capabilities, connections, keys, oauth, routes, sse::SseParser, translate,
+};
 use crate::store::Store;
 use axum::body::Body;
 use axum::extract::State;
@@ -185,39 +187,146 @@ pub struct RouteTarget {
 }
 
 pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Option<RouteTarget>> {
+    route_model_for_body(store, requested, None).await
+}
+
+pub async fn route_model_for_body(
+    store: &Store,
+    requested: &str,
+    body: Option<&Value>,
+) -> anyhow::Result<Option<RouteTarget>> {
     let conns = connections::list_connections(store).await?;
     let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
+    let required = body
+        .map(capabilities::required_capabilities_from_body)
+        .unwrap_or_default();
     if let Some((prov, model)) = requested.split_once('/') {
-        for conn in enabled {
-            if conn.provider == prov {
-                if let Some(desc) = registry::descriptor(&conn.provider) {
-                    return Ok(Some(RouteTarget {
-                        conn,
-                        desc,
-                        upstream_model: model.to_string(),
-                    }));
-                }
+        let candidates: Vec<_> = enabled
+            .into_iter()
+            .filter(|conn| {
+                conn.provider == prov
+                    && registry::descriptor(&conn.provider)
+                        .map(|desc| connection_serves_model(desc, conn, model, true))
+                        .unwrap_or(false)
+            })
+            .collect();
+        for conn in ordered_provider_connections(store, prov, model, candidates).await? {
+            if let Some(desc) = registry::descriptor(&conn.provider) {
+                return Ok(Some(RouteTarget {
+                    conn,
+                    desc,
+                    upstream_model: model.to_string(),
+                }));
+            }
+        }
+        return Ok(None);
+    }
+    let route_list = routes::list_model_routes(store).await?;
+    if let Some(route) = routes::route_by_name(&route_list, requested) {
+        let targets =
+            prefer_capable_targets(routes::ordered_targets(store, route).await?, required);
+        for target in targets {
+            let Some(conn) = enabled.iter().find(|c| c.id == target.connection_id) else {
+                continue;
+            };
+            let Some(desc) = registry::descriptor(&conn.provider) else {
+                continue;
+            };
+            if connection_serves_model(desc, conn, &target.model, false) {
+                return Ok(Some(RouteTarget {
+                    conn: conn.clone(),
+                    desc,
+                    upstream_model: target.model,
+                }));
             }
         }
         return Ok(None);
     }
     // Bare model: first (highest-priority) connection listing it.
+    let mut provider_order = Vec::<String>::new();
+    let mut grouped = std::collections::BTreeMap::<String, Vec<connections::ConnectionRow>>::new();
     for conn in enabled {
         let Some(desc) = registry::descriptor(&conn.provider) else {
             continue;
         };
-        if connections::effective_models(desc, &conn)
-            .iter()
-            .any(|m| m == requested)
-        {
-            return Ok(Some(RouteTarget {
-                conn,
-                desc,
-                upstream_model: requested.to_string(),
-            }));
+        if connection_serves_model(desc, &conn, requested, false) {
+            if !grouped.contains_key(&conn.provider) {
+                provider_order.push(conn.provider.clone());
+            }
+            grouped.entry(conn.provider.clone()).or_default().push(conn);
+        }
+    }
+    for provider in provider_order {
+        let candidates = grouped.remove(&provider).unwrap_or_default();
+        for conn in ordered_provider_connections(store, &provider, requested, candidates).await? {
+            if let Some(desc) = registry::descriptor(&conn.provider) {
+                return Ok(Some(RouteTarget {
+                    conn,
+                    desc,
+                    upstream_model: requested.to_string(),
+                }));
+            }
         }
     }
     Ok(None)
+}
+
+fn connection_serves_model(
+    desc: &ProviderDescriptor,
+    conn: &connections::ConnectionRow,
+    model: &str,
+    allow_unlisted: bool,
+) -> bool {
+    let models = connections::effective_models(desc, conn);
+    (allow_unlisted && models.is_empty()) || models.iter().any(|m| m == model)
+}
+
+async fn ordered_provider_connections(
+    store: &Store,
+    provider: &str,
+    scope: &str,
+    candidates: Vec<connections::ConnectionRow>,
+) -> anyhow::Result<Vec<connections::ConnectionRow>> {
+    if candidates.len() <= 1 {
+        return Ok(candidates);
+    }
+    let ids = candidates
+        .iter()
+        .map(|conn| conn.id.clone())
+        .collect::<Vec<_>>();
+    let ordered_ids = routes::ordered_provider_connection_ids(store, provider, scope, &ids).await?;
+    let mut by_id = candidates
+        .into_iter()
+        .map(|conn| (conn.id.clone(), conn))
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(ordered_ids
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect())
+}
+
+fn prefer_capable_targets(
+    targets: Vec<routes::ModelRouteTarget>,
+    required: capabilities::RequiredCapabilities,
+) -> Vec<routes::ModelRouteTarget> {
+    if !required.any() || targets.len() <= 1 {
+        return targets;
+    }
+    let mut capable = Vec::new();
+    let mut rest = Vec::new();
+    for target in targets {
+        if required.satisfied_by(capabilities::model_capabilities(&target.model)) {
+            capable.push(target);
+        } else {
+            rest.push(target);
+        }
+    }
+    if capable.is_empty() {
+        rest
+    } else {
+        capable.extend(rest);
+        capable
+    }
 }
 
 /// Anthropic's Claude-Code-branded system prefix, required by the
@@ -225,6 +334,23 @@ pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Optio
 /// contract for the OAuth token, not a client-visible feature; no other
 /// header/body cloaking is added (spec #2).
 const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+const CODEX_DEFAULT_INSTRUCTIONS: &str =
+    "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer.";
+const CODEX_ALLOWED_RESPONSE_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "tools",
+    "tool_choice",
+    "stream",
+    "store",
+    "reasoning",
+    "service_tier",
+    "include",
+    "prompt_cache_key",
+    "client_metadata",
+    "text",
+];
 
 /// Ensure the outgoing Anthropic `system` field begins with the Claude-Code
 /// prefix block: a bare string is wrapped into `[prefix, {type:text,text:the
@@ -244,6 +370,226 @@ fn inject_claude_system_prompt(body: &mut Value) {
         _ => json!([prefix]),
     };
     body["system"] = new_system;
+}
+
+fn normalize_responses_input(input: Value) -> Value {
+    match input {
+        Value::String(s) => {
+            let text = if s.is_empty() { "..." } else { s.as_str() };
+            json!([{"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": text}]}])
+        }
+        Value::Array(items) if !items.is_empty() => Value::Array(items),
+        _ => json!([{"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "..."}]}]),
+    }
+}
+
+fn convert_codex_system_items_to_developer(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        let is_system = item
+            .get("role")
+            .and_then(Value::as_str)
+            .map(|r| r == "system")
+            .unwrap_or(false)
+            && item
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|t| t == "message")
+                .unwrap_or(true);
+        if is_system {
+            item["role"] = json!("developer");
+        }
+    }
+}
+
+fn strip_codex_stored_item_refs(body: &mut Value) {
+    fn is_server_id(s: &str) -> bool {
+        ["rs_", "fc_", "resp_", "msg_"]
+            .iter()
+            .any(|prefix| s.starts_with(prefix))
+    }
+
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    items.retain_mut(|item| {
+        if item.as_str().map(is_server_id).unwrap_or(false) {
+            return false;
+        }
+        if item
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|t| t == "item_reference")
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(is_server_id)
+            .unwrap_or(false)
+        {
+            if let Some(obj) = item.as_object_mut() {
+                obj.remove("id");
+            }
+        }
+        true
+    });
+}
+
+fn normalize_codex_tools(body: &mut Value) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    tools.retain_mut(|tool| {
+        let Some(obj) = tool.as_object_mut() else {
+            return false;
+        };
+        let tool_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        if tool_type != "function" {
+            return matches!(
+                tool_type,
+                "custom"
+                    | "image_generation"
+                    | "web_search"
+                    | "web_search_preview"
+                    | "file_search"
+                    | "computer"
+                    | "computer_use_preview"
+                    | "code_interpreter"
+                    | "mcp"
+                    | "local_shell"
+                    | "tool_search"
+            );
+        }
+
+        if obj.contains_key("function") {
+            let Some(function) = obj.get("function").and_then(Value::as_object) else {
+                return false;
+            };
+            let Some(name) = function.get("name").and_then(Value::as_str) else {
+                return false;
+            };
+            let name = name.trim().chars().take(128).collect::<String>();
+            if name.is_empty() {
+                return false;
+            }
+            let description = function
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let parameters = function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            obj.clear();
+            obj.insert("type".into(), json!("function"));
+            obj.insert("name".into(), json!(name));
+            if !description.is_empty() {
+                obj.insert("description".into(), json!(description));
+            }
+            obj.insert("parameters".into(), parameters);
+        }
+        true
+    });
+}
+
+fn codex_virtual_model_to_upstream(model: &str) -> (String, Option<&'static str>) {
+    let mut upstream = model.strip_suffix("-review").unwrap_or(model).to_string();
+    for effort in ["xhigh", "high", "medium", "low", "none"] {
+        let suffix = format!("-{effort}");
+        if upstream.ends_with(&suffix) {
+            let new_len = upstream.len() - suffix.len();
+            upstream.truncate(new_len);
+            return (upstream, Some(effort));
+        }
+    }
+    (upstream, None)
+}
+
+fn normalize_codex_responses_body(body: &mut Value, upstream_model: &str, cache_key: Option<&str>) {
+    let (model, model_effort) = codex_virtual_model_to_upstream(upstream_model);
+    body["model"] = json!(model);
+    let input = body.get("input").cloned().unwrap_or(Value::Null);
+    body["input"] = normalize_responses_input(input);
+    convert_codex_system_items_to_developer(body);
+    strip_codex_stored_item_refs(body);
+    normalize_codex_tools(body);
+
+    body["stream"] = json!(true);
+    body["store"] = json!(false);
+    if body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        body["instructions"] = json!(CODEX_DEFAULT_INSTRUCTIONS);
+    }
+    if body.get("prompt_cache_key").is_none() {
+        if let Some(key) = cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+    }
+
+    if body.get("reasoning").is_none() {
+        let effort = body
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .or(model_effort)
+            .unwrap_or("low");
+        body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+    } else if body
+        .get("reasoning")
+        .and_then(|r| r.get("summary"))
+        .is_none()
+    {
+        body["reasoning"]["summary"] = json!("auto");
+    }
+    if body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(Value::as_str)
+        .map(|e| e != "none")
+        .unwrap_or(false)
+    {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
+
+    for key in [
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "logprobs",
+        "top_logprobs",
+        "n",
+        "seed",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "user",
+        "prompt_cache_retention",
+        "metadata",
+        "stream_options",
+        "safety_identifier",
+        "previous_response_id",
+        "reasoning_effort",
+    ] {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove(key);
+        }
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.retain(|k, _| CODEX_ALLOWED_RESPONSE_FIELDS.contains(&k.as_str()));
+    }
 }
 
 fn upstream_request(
@@ -295,11 +641,19 @@ fn oauth_upstream_request(
             inject_claude_system_prompt(&mut anthropic_body);
             Ok(state
                 .http
-                .post(format!("{base}/messages"))
+                .post(format!("{base}/messages?beta=true"))
                 .json(&anthropic_body)
                 .header("authorization", format!("Bearer {access_token}"))
                 .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", "oauth-2025-04-20"))
+                .header(
+                    "anthropic-beta",
+                    crate::llm_router::models::ANTHROPIC_OAUTH_BETA,
+                )
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .header("user-agent", "claude-cli/2.1.92 (external, sdk-cli)")
+                .header("x-app", "cli")
+                .header("x-stainless-helper-method", "stream")
+                .header("x-stainless-retry-count", "0"))
         }
         "openai-oauth" => {
             // Codex's Responses wire is a fixed protocol endpoint, distinct
@@ -440,7 +794,7 @@ async fn handle_messages(
         return r;
     }
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let mut target = match route_model(&state.store, &requested).await {
+    let mut target = match route_model_for_body(&state.store, &requested, Some(&body)).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return anthropic_error(
@@ -527,7 +881,7 @@ async fn handle_chat(
         return r;
     }
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let mut target = match route_model(&state.store, &requested).await {
+    let mut target = match route_model_for_body(&state.store, &requested, Some(&body)).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return openai_error(
@@ -614,7 +968,7 @@ async fn handle_responses(
     }
     let mut chat = crate::llm_router::responses::responses_request_to_chat(&body);
     let requested = chat["model"].as_str().unwrap_or("").to_string();
-    let mut target = match route_model(&state.store, &requested).await {
+    let mut target = match route_model_for_body(&state.store, &requested, Some(&body)).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return openai_error(
@@ -630,12 +984,11 @@ async fn handle_responses(
 
     // Codex (openai-oauth) speaks the Responses wire natively both ways — no
     // chat translation applies (that's only built for routing/model
-    // resolution above). Pass the client's ORIGINAL Responses body straight
-    // through (only rewriting `model` to the bare upstream id), same-format
-    // proxy style, just like `proxy_passthrough` elsewhere.
+    // resolution above). Normalize the client's Responses body to the subset
+    // accepted by ChatGPT's Codex backend, then proxy it same-format.
     if target.conn.provider == "openai-oauth" {
         let mut passthrough_body = body.clone();
-        passthrough_body["model"] = json!(target.upstream_model);
+        normalize_codex_responses_body(&mut passthrough_body, &target.upstream_model, None);
         let started = crate::paths::now_ms();
         let resp = proxy_passthrough(&state, &mut target, &passthrough_body, openai_error).await;
         crate::llm_router::usage::record(
@@ -707,6 +1060,15 @@ async fn handle_models(State(state): State<AppState>, headers: HeaderMap) -> Res
     };
     let mut data: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let routes = match routes::list_model_routes(&state.store).await {
+        Ok(r) => r,
+        Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    for route in routes.iter().filter(|r| r.enabled && !r.targets.is_empty()) {
+        if seen.insert(route.name.clone()) {
+            data.push(json!({"id": route.name, "object": "model", "owned_by": "route"}));
+        }
+    }
     for conn in conns.iter().filter(|c| c.enabled) {
         let Some(desc) = registry::descriptor(&conn.provider) else {
             continue;
@@ -1240,15 +1602,22 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert_eq!(req.url().as_str(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
         assert_eq!(
             req.headers().get("authorization").unwrap(),
             "Bearer at-secret"
         );
-        assert_eq!(
-            req.headers().get("anthropic-beta").unwrap(),
-            "oauth-2025-04-20"
-        );
+        let beta = req
+            .headers()
+            .get("anthropic-beta")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(beta.contains("claude-code-20250219"));
+        assert!(beta.contains("oauth-2025-04-20"));
         assert_eq!(
             req.headers().get("anthropic-version").unwrap(),
             "2023-06-01"
@@ -1256,6 +1625,37 @@ mod tests {
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(sent["system"][0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
         assert_eq!(sent["system"][1]["text"], "be helpful");
+    }
+
+    #[test]
+    fn codex_oauth_responses_body_is_normalized_for_backend() {
+        let mut body = json!({
+            "model": "openai-oauth/gpt-5.3-codex-high",
+            "input": "hi",
+            "temperature": 0.2,
+            "max_output_tokens": 128,
+            "previous_response_id": "resp_old",
+            "stream": false
+        });
+
+        normalize_codex_responses_body(&mut body, "gpt-5.3-codex-high", Some("session-1"));
+
+        assert_eq!(body["model"], "gpt-5.3-codex");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert!(body["instructions"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Codex"));
+        assert_eq!(body["prompt_cache_key"], "session-1");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body["input"].as_array().is_some());
     }
 
     #[tokio::test]
@@ -1375,5 +1775,224 @@ mod tests {
             req.headers().get("authorization").unwrap(),
             "Bearer sk-live"
         );
+    }
+
+    #[tokio::test]
+    async fn route_model_resolves_named_route_to_first_available_target() {
+        let state = test_state().await;
+        let mut first = mk_conn(
+            "c1",
+            "openai",
+            "api_key",
+            ConnectionData {
+                api_key: Some("sk-live".into()),
+                models_override: Some(vec!["gpt-first".into()]),
+                ..Default::default()
+            },
+        );
+        first.enabled = false;
+        let second = mk_conn(
+            "c2",
+            "anthropic",
+            "api_key",
+            ConnectionData {
+                api_key: Some("sk-live".into()),
+                models_override: Some(vec!["claude-fallback".into()]),
+                ..Default::default()
+            },
+        );
+        connections::add_connection(&state.store, first)
+            .await
+            .unwrap();
+        connections::add_connection(&state.store, second)
+            .await
+            .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "smart".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    crate::llm_router::routes::ModelRouteTarget {
+                        connection_id: "c1".into(),
+                        model: "gpt-first".into(),
+                    },
+                    crate::llm_router::routes::ModelRouteTarget {
+                        connection_id: "c2".into(),
+                        model: "claude-fallback".into(),
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let target = route_model(&state.store, "smart").await.unwrap().unwrap();
+
+        assert_eq!(target.conn.id, "c2");
+        assert_eq!(target.conn.provider, "anthropic");
+        assert_eq!(target.upstream_model, "claude-fallback");
+    }
+
+    #[tokio::test]
+    async fn route_model_round_robin_rotates_targets_across_requests() {
+        let state = test_state().await;
+        for (id, model) in [("c1", "gpt-one"), ("c2", "gpt-two")] {
+            connections::add_connection(
+                &state.store,
+                mk_conn(
+                    id,
+                    "openai",
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("sk-live".into()),
+                        models_override: Some(vec![model.into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "rr".into(),
+                name: "balanced".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::RoundRobin,
+                targets: vec![
+                    crate::llm_router::routes::ModelRouteTarget {
+                        connection_id: "c1".into(),
+                        model: "gpt-one".into(),
+                    },
+                    crate::llm_router::routes::ModelRouteTarget {
+                        connection_id: "c2".into(),
+                        model: "gpt-two".into(),
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let first = route_model(&state.store, "balanced")
+            .await
+            .unwrap()
+            .unwrap();
+        let second = route_model(&state.store, "balanced")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.upstream_model, "gpt-one");
+        assert_eq!(second.upstream_model, "gpt-two");
+    }
+
+    #[tokio::test]
+    async fn provider_model_round_robin_rotates_accounts_for_same_provider() {
+        let state = test_state().await;
+        for id in ["c1", "c2"] {
+            connections::add_connection(
+                &state.store,
+                mk_conn(
+                    id,
+                    "openai",
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("sk-live".into()),
+                        models_override: Some(vec!["gpt-shared".into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        crate::llm_router::routes::save_provider_account_route(
+            &state.store,
+            "openai",
+            crate::llm_router::routes::ModelRouteStrategy::RoundRobin,
+        )
+        .await
+        .unwrap();
+
+        let first = route_model(&state.store, "openai/gpt-shared")
+            .await
+            .unwrap()
+            .unwrap();
+        let second = route_model(&state.store, "openai/gpt-shared")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.conn.id, "c1");
+        assert_eq!(second.conn.id, "c2");
+    }
+
+    #[tokio::test]
+    async fn named_route_auto_switches_to_target_matching_request_capability() {
+        let state = test_state().await;
+        for (id, model) in [("c1", "text-only"), ("c2", "gpt-4o")] {
+            connections::add_connection(
+                &state.store,
+                mk_conn(
+                    id,
+                    "openai",
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("sk-live".into()),
+                        models_override: Some(vec![model.into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "cap".into(),
+                name: "smart-vision".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    crate::llm_router::routes::ModelRouteTarget {
+                        connection_id: "c1".into(),
+                        model: "text-only".into(),
+                    },
+                    crate::llm_router::routes::ModelRouteTarget {
+                        connection_id: "c2".into(),
+                        model: "gpt-4o".into(),
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let body = json!({
+            "model": "smart-vision",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]
+            }]
+        });
+        let target = route_model_for_body(&state.store, "smart-vision", Some(&body))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(target.conn.id, "c2");
+        assert_eq!(target.upstream_model, "gpt-4o");
     }
 }

@@ -7,3 +7,10 @@ use tauri_specta::Event;
 pub struct CoreEventMsg {
     pub event: CoreEvent,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct OauthAuthorizeUrlMsg {
+    pub provider: String,
+    pub authorize_url: String,
+}

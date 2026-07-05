@@ -9,6 +9,7 @@ import { ProjectSettingsModal } from "./components/modals/ProjectSettingsModal";
 import { HomeView } from "./views/HomeView";
 import { SessionView } from "./views/SessionView";
 import { ModelsView } from "./views/ModelsView";
+import { ProviderDetailView } from "./views/ProviderDetailView";
 import { ConnectionDetailView } from "./views/ConnectionDetailView";
 import { RuntimeView } from "./views/RuntimeView";
 import { RuntimeDetailView } from "./views/RuntimeDetailView";
@@ -32,6 +33,8 @@ function MainView() {
       return <SessionView />;
     case "models":
       return <ModelsView />;
+    case "providerDetail":
+      return <ProviderDetailView provider={view.provider} />;
     case "connectionDetail":
       return <ConnectionDetailView id={view.id} />;
     case "runtime":

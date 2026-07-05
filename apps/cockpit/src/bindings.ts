@@ -589,12 +589,76 @@ async moveConnection(id: string, dir: number) : Promise<Result<ConnectionInfo[],
 }
 },
 /**
- * Hit the upstream's model-list (openai) / a 1-token message (anthropic)
- * to distinguish bad key (401/403) from network trouble.
+ * Hit the upstream's model-list endpoint to distinguish bad credentials
+ * (401/403) from network trouble, and persist the discovered model ids.
  */
 async testConnection(id: string) : Promise<Result<TestResult, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("test_connection", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async testConnectionModel(id: string, model: string) : Promise<Result<TestResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("test_connection_model", { id, model }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async connectionProviderQuota(id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async resetCodexCredit(id: string) : Promise<Result<CodexResetCreditResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reset_codex_credit", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listModelRoutes() : Promise<Result<ModelRouteInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_model_routes") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async saveModelRoute(route: ModelRouteInfo) : Promise<Result<ModelRouteInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_model_route", { route }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteModelRoute(id: string) : Promise<Result<ModelRouteInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_model_route", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async providerAccountRoute(provider: string) : Promise<Result<ProviderAccountRouteInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("provider_account_route", { provider }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setProviderAccountRoute(provider: string, strategy: ModelRouteStrategy) : Promise<Result<ProviderAccountRouteInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_provider_account_route", { provider, strategy }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -671,11 +735,13 @@ async addFreeConnection(provider: string, label: string) : Promise<Result<Connec
 export const events = __makeEvents__<{
 accentChangedMsg: AccentChangedMsg,
 coreEventMsg: CoreEventMsg,
+oauthAuthorizeUrlMsg: OauthAuthorizeUrlMsg,
 termExitMsg: TermExitMsg,
 termOutputMsg: TermOutputMsg
 }>({
 accentChangedMsg: "accent-changed-msg",
 coreEventMsg: "core-event-msg",
+oauthAuthorizeUrlMsg: "oauth-authorize-url-msg",
 termExitMsg: "term-exit-msg",
 termOutputMsg: "term-output-msg"
 })
@@ -701,6 +767,9 @@ export type AppInfo = { id: string; name: string; kind: string; initial: string;
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type CatalogEntry = { id: string; name: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
 export type CmdError = { message: string }
+export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
+export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
+export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
 export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; baseUrl: string | null; models: string[]; 
 /**
  * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
@@ -755,8 +824,15 @@ export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: s
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
  */
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
+export type ModelRouteInfo = { id: string; name: string; enabled: boolean; strategy: ModelRouteStrategy; targets: ModelRouteTarget[]; createdAt: number; updatedAt: number }
+export type ModelRouteStrategy = "fallback" | "round-robin"
+export type ModelRouteTarget = { connectionId: string; model: string }
+export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
+export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
+export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
+export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type RegistryEntry = { 
 /**
  * Registry name, e.g. `io.github.owner/server`.
