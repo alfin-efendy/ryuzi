@@ -17,6 +17,7 @@ pub mod context;
 pub mod format;
 pub mod ledger;
 pub mod llm;
+pub mod lsp;
 pub mod mcp_client;
 pub mod permission;
 pub mod runner;

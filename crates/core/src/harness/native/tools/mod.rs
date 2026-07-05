@@ -22,6 +22,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod ls;
+pub mod lsp;
 pub mod mcp;
 pub mod read;
 pub mod revert;
@@ -168,6 +169,7 @@ impl ToolRegistry {
             Arc::new(websearch::WebSearch),
             Arc::new(skill::SkillTool),
             Arc::new(revert::Revert),
+            Arc::new(lsp::Lsp),
             Arc::new(task::Task),
         ];
         let mut tools = BTreeMap::new();
@@ -327,12 +329,13 @@ mod tests {
             "websearch",
             "skill",
             "revert",
+            "lsp",
             "task",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 14);
+        assert_eq!(defs.len(), 15);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));
