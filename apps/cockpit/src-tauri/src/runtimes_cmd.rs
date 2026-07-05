@@ -83,7 +83,20 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
     for desc in runtimes::CATALOG {
         let snap = snapshots.get(desc.id).cloned().unwrap_or_default();
         let cfg = configs.iter().find(|c| c.id == desc.id);
-        let detected = snap.binary_path.is_some();
+        // The native runtime runs in-process, so it's always "available"
+        // regardless of any binary on PATH.
+        let is_native = desc.id == "native";
+        let binary_path = if is_native {
+            Some("in-process".to_string())
+        } else {
+            snap.binary_path.clone()
+        };
+        let installed_version = if is_native {
+            Some(env!("CARGO_PKG_VERSION").to_string())
+        } else {
+            snap.installed_version.clone()
+        };
+        let detected = binary_path.is_some();
         let mut models: Vec<String> = desc.models.iter().map(|m| m.to_string()).collect();
         if models.is_empty() {
             models = snap.local_models.clone();
@@ -108,8 +121,8 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
             color: desc.color.to_string(),
             initial: desc.initial.to_string(),
             connection: desc.connection.to_string(),
-            binary_path: snap.binary_path,
-            installed_version: snap.installed_version,
+            binary_path,
+            installed_version,
             latest_version: snap.latest_version,
             npm_package: desc.npm_package.map(|s| s.to_string()),
             models,
@@ -122,7 +135,8 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
             flags: cfg.map(|c| c.flags.clone()).unwrap_or_default(),
             tiers,
             is_default: default_agent == desc.id,
-            runnable: desc.id == "claude",
+            // The native runtime and claude-code have working session harnesses.
+            runnable: desc.id == "claude" || is_native,
         });
     }
     Ok(out)
@@ -155,6 +169,11 @@ pub async fn list_runtimes(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<RuntimeInf
 pub async fn refresh_runtimes(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<RuntimeInfo>> {
     let mut snapshots = std::collections::HashMap::new();
     for desc in runtimes::CATALOG {
+        // Native runs in-process — nothing to probe on PATH; assemble marks it
+        // available directly.
+        if desc.id == "native" {
+            continue;
+        }
         let det = runtimes::detect(desc.binary).await;
         let latest = match desc.npm_package {
             Some(pkg) => npm_latest(pkg).await,
@@ -397,4 +416,31 @@ pub async fn reset_runtime_config(id: String) -> Result<RuntimeConfigStatusInfo,
         }
     }
     status_of(&id, &home)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    async fn test_cp() -> Arc<ControlPlane> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        ControlPlane::new(store, ryuzi_core::Registries::new()).await
+    }
+
+    #[tokio::test]
+    async fn native_runtime_is_listed_and_available() {
+        let cp = test_cp().await;
+        let list = assemble(&cp).await.unwrap();
+        let native = list
+            .iter()
+            .find(|r| r.id == "native")
+            .expect("native runtime must appear in the Runtime list");
+        assert_eq!(native.name, "Native (ryuzi)");
+        // Available (in-process) without any binary on PATH, and runnable.
+        assert!(native.binary_path.is_some(), "native must be available");
+        assert!(native.installed_version.is_some());
+        assert!(native.runnable, "native must be runnable");
+    }
 }
