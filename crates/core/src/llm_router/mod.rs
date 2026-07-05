@@ -1,8 +1,10 @@
 //! Local LLM router: provider registry, credentialed connections, endpoint
 //! keys, format translation, and the axum endpoint server.
+pub mod aws_stream;
 pub mod capabilities;
 pub mod connections;
 pub mod keys;
+pub mod kiro;
 pub mod models;
 pub mod oauth;
 pub mod quota;

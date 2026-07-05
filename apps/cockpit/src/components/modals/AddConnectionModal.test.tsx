@@ -68,9 +68,23 @@ const claudeOauth: CatalogEntry = {
   models: [],
 };
 
+// `kiro` is the one catalog entry with a "device" category — a free provider
+// that signs in via AWS SSO-OIDC device-code flow (or an import from an
+// already-logged-in Kiro IDE) instead of the plain API-key form.
+const kiroProvider: CatalogEntry = {
+  id: "kiro",
+  name: "Kiro",
+  color: "#7c3aed",
+  initial: "K",
+  category: "device",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: [],
+};
+
 beforeEach(() => {
   useConnections.setState({
-    catalog: [anthropic, customOpenAi, customAnthropic, claudeOauth],
+    catalog: [anthropic, customOpenAi, customAnthropic, claudeOauth, kiroProvider],
     connections: [],
   });
   addConnection.mockClear();
@@ -177,4 +191,14 @@ test("fixed OAuth provider connects with browser and exposes a copyable login UR
   expect(screen.getByDisplayValue(authorizeUrl)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Copy login URL" }));
   expect(writeText).toHaveBeenCalledWith(authorizeUrl);
+});
+
+test("fixed device provider (kiro) shows sign-in and import actions, not an API key form", () => {
+  render(<AddConnectionModal open onClose={() => {}} provider="kiro" />);
+
+  expect(screen.getByText("Add account")).toBeTruthy();
+  expect(screen.getByLabelText("Label")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Sign in with Kiro" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Import from Kiro IDE" })).toBeTruthy();
+  expect(screen.queryByLabelText("API key")).toBeNull();
 });

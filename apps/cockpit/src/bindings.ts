@@ -726,6 +726,52 @@ async addFreeConnection(provider: string, label: string) : Promise<Result<Connec
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Start Kiro's AWS SSO-OIDC device-code flow: registers a public client,
+ * starts a device authorization, opens the browser to the verification URL,
+ * and stashes the in-flight state under a fresh `flow_id` for
+ * [`await_kiro_device_flow`] to poll. Does not touch the store — nothing is
+ * persisted until the user completes the browser step.
+ */
+async startKiroDeviceFlow() : Promise<Result<DeviceFlowInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_kiro_device_flow") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Poll the token endpoint for a flow started by [`start_kiro_device_flow`]
+ * until the user completes the browser step (or the code expires/is
+ * denied), then persist the resulting `kiro`/`oauth` connection. The flow
+ * state is consumed from [`FLOWS`] up front — a `flow_id` can only ever be
+ * awaited once, success or failure.
+ */
+async awaitKiroDeviceFlow(label: string, flowId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("await_kiro_device_flow", { label, flowId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Import Kiro OAuth tokens from an already-installed, logged-in Kiro IDE
+ * (its AWS SSO token cache + optional client registration + profile.json),
+ * so a connection can be created without running the device-code flow.
+ * Validates the imported refresh token with one [`oauth::refresh::force_refresh`]
+ * call (which mints a fresh access token) before persisting — a dead/expired
+ * import token surfaces its error instead of a connection that can't route.
+ */
+async importKiroToken(label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("import_kiro_token", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -802,6 +848,12 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  */
 { kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null }
 export type CoreEventMsg = { event: CoreEvent }
+/**
+ * Device-code flow info shown to the user while they complete the browser
+ * step (Kiro): the short code to enter, the URL to visit, and the poll
+ * cadence the frontend's `await_kiro_device_flow` call will honor.
+ */
+export type DeviceFlowInfo = { flowId: string; userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number; interval: number }
 export type DirEntryInfo = { name: string; dir: boolean }
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean }

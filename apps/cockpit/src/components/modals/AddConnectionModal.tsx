@@ -1,13 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Loader2 } from "lucide-react";
+import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
-import { events, type CatalogEntry } from "@/bindings";
+import { events, type CatalogEntry, type DeviceFlowInfo } from "@/bindings";
 import { Chip } from "@/components/common/bits";
 import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
+import {
+  KIRO_DEVICE_CODE_HINT,
+  KIRO_IMPORT_ACTION,
+  KIRO_IMPORT_HINT,
+  KIRO_IMPORT_SUCCESS,
+  KIRO_SIGNIN_ACTION,
+  KIRO_SIGNIN_SUBTITLE,
+  KIRO_WAITING_HINT,
+} from "@/constants";
 
 const COMPATIBLE_IDS = ["custom-openai", "custom-anthropic"] as const;
 
 type CompatibleId = (typeof COMPATIBLE_IDS)[number];
+type DeviceStep = "form" | "waiting";
 
 function formatLabel(entry: CatalogEntry): string {
   return entry.format === "anthropic" ? "Anthropic-compatible" : "OpenAI-compatible";
@@ -35,16 +46,8 @@ function compatibleEntries(catalog: CatalogEntry[]): CatalogEntry[] {
   return COMPATIBLE_IDS.map((id) => catalog.find((entry) => entry.id === id) ?? fallbackEntry(id));
 }
 
-export function AddConnectionModal({
-  open,
-  onClose,
-  provider,
-}: {
-  open: boolean;
-  onClose: () => void;
-  provider?: string;
-}) {
-  const { catalog, add, connectOauth, addFree } = useConnections();
+export function AddConnectionModal({ open, onClose, provider }: { open: boolean; onClose: () => void; provider?: string }) {
+  const { catalog, add, connectOauth, addFree, startKiroDevice, awaitKiroDevice, importKiro } = useConnections();
   const [selectedId, setSelectedId] = useState<CompatibleId>("custom-openai");
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -52,6 +55,8 @@ export function AddConnectionModal({
   const [saving, setSaving] = useState(false);
   const [oauthWaiting, setOauthWaiting] = useState(false);
   const [oauthAuthorizeUrl, setOauthAuthorizeUrl] = useState("");
+  const [deviceStep, setDeviceStep] = useState<DeviceStep>("form");
+  const [deviceInfo, setDeviceInfo] = useState<DeviceFlowInfo | null>(null);
   const choices = useMemo(() => compatibleEntries(catalog), [catalog]);
   const fixed = provider ? catalog.find((entry) => entry.id === provider) : null;
   const selected = fixed ?? choices.find((entry) => entry.id === selectedId) ?? choices[0];
@@ -71,20 +76,24 @@ export function AddConnectionModal({
     setSaving(false);
     setOauthWaiting(false);
     setOauthAuthorizeUrl("");
-  }, [open, provider]);
+    setDeviceStep("form");
+    setDeviceInfo(null);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
     let active = true;
     let unlisten: (() => void) | null = null;
 
-    void events.oauthAuthorizeUrlMsg.listen((event) => {
-      if (!active || selectedRef.current?.id !== event.payload.provider) return;
-      setOauthAuthorizeUrl(event.payload.authorizeUrl);
-    }).then((stop) => {
-      if (active) unlisten = stop;
-      else stop();
-    });
+    void events.oauthAuthorizeUrlMsg
+      .listen((event) => {
+        if (!active || selectedRef.current?.id !== event.payload.provider) return;
+        setOauthAuthorizeUrl(event.payload.authorizeUrl);
+      })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      });
 
     return () => {
       active = false;
@@ -101,6 +110,8 @@ export function AddConnectionModal({
     setSaving(false);
     setOauthWaiting(false);
     setOauthAuthorizeUrl("");
+    setDeviceStep("form");
+    setDeviceInfo(null);
     onClose();
   };
 
@@ -140,6 +151,48 @@ export function AddConnectionModal({
     if (oauthAuthorizeUrl) void navigator.clipboard.writeText(oauthAuthorizeUrl);
   };
 
+  // Kiro (the "device" category) signs in via AWS SSO-OIDC device-code flow —
+  // start a fresh sign-in, or import an existing sign-in from a Kiro IDE on
+  // this machine. The `selectedRef` guard drops results that resolve after the
+  // user has navigated to a different provider.
+  const startDevice = async () => {
+    if (!selected || saving) return;
+    const target = selected;
+    setSaving(true);
+    const info = await startKiroDevice();
+    if (selectedRef.current?.id !== target.id) return;
+    if (!info) {
+      setSaving(false);
+      return;
+    }
+    setDeviceInfo(info);
+    setDeviceStep("waiting");
+    const ok = await awaitKiroDevice(label.trim() || target.name, info.flowId);
+    if (selectedRef.current?.id !== target.id) return;
+    setSaving(false);
+    if (ok) close();
+    else setDeviceStep("form");
+  };
+
+  const importFromIde = async () => {
+    if (!selected || saving) return;
+    const target = selected;
+    setSaving(true);
+    const ok = await importKiro(label.trim() || target.name);
+    if (selectedRef.current?.id !== target.id) return;
+    setSaving(false);
+    if (ok) {
+      toast.success(KIRO_IMPORT_SUCCESS);
+      close();
+    }
+  };
+
+  const copyDeviceCode = () => {
+    if (!deviceInfo) return;
+    void navigator.clipboard.writeText(deviceInfo.userCode);
+    toast.success("Copied");
+  };
+
   return (
     <Modal onClose={close} width={480}>
       <div className="flex items-center gap-3">
@@ -147,7 +200,11 @@ export function AddConnectionModal({
         <div className="min-w-0 flex-1">
           <div className="text-[15px] font-semibold tracking-[-0.01em]">{title}</div>
           <div className="text-xs text-muted-foreground">
-            {selected ? (provider ? selected.name : "Connect an OpenAI-compatible or Anthropic-compatible endpoint") : "Provider unavailable"}
+            {selected
+              ? provider
+                ? selected.name
+                : "Connect an OpenAI-compatible or Anthropic-compatible endpoint"
+              : "Provider unavailable"}
           </div>
         </div>
       </div>
@@ -212,6 +269,42 @@ export function AddConnectionModal({
                   </div>
                 </FormField>
               )}
+            </div>
+          )}
+        </>
+      ) : selected?.category === "device" ? (
+        <>
+          {deviceStep === "form" && (
+            <>
+              <div className="mt-3.5 flex flex-col gap-3">
+                <FormField label="Label">
+                  <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected.name} />
+                </FormField>
+              </div>
+              <p className="mt-2 text-[11.5px] text-muted-foreground">{KIRO_SIGNIN_SUBTITLE}</p>
+              <Button size="lg" onClick={() => void startDevice()} disabled={saving} className="mt-2 w-full">
+                {saving ? "Opening..." : KIRO_SIGNIN_ACTION}
+              </Button>
+              <Button size="lg" variant="outline" onClick={() => void importFromIde()} disabled={saving} className="mt-2 w-full">
+                {saving ? "Importing..." : KIRO_IMPORT_ACTION}
+              </Button>
+              <p className="mt-2 text-[11.5px] text-muted-foreground">{KIRO_IMPORT_HINT}</p>
+            </>
+          )}
+
+          {deviceStep === "waiting" && deviceInfo && (
+            <div className="mt-3.5 flex flex-col items-center gap-3 rounded-md border border-border px-4 py-4 text-center">
+              <p className="text-[12.5px] text-muted-foreground">{KIRO_DEVICE_CODE_HINT}</p>
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono text-lg font-semibold tracking-[0.08em]">{deviceInfo.userCode}</span>
+                <Button variant="ghost" size="icon-sm" title="Copy code" onClick={copyDeviceCode} className="text-muted-foreground">
+                  <Copy aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                </Button>
+              </div>
+              <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+                <Loader2 aria-hidden size={13} strokeWidth={2} className="shrink-0 animate-spin" />
+                {KIRO_WAITING_HINT}
+              </div>
             </div>
           )}
         </>

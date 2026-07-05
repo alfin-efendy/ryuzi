@@ -13,7 +13,9 @@ use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 use tauri_specta::Event as _;
@@ -68,6 +70,37 @@ pub struct ManualStartInfo {
     pub verifier: String,
     pub state: String,
     pub redirect_uri: String,
+}
+
+/// Device-code flow info shown to the user while they complete the browser
+/// step (Kiro): the short code to enter, the URL to visit, and the poll
+/// cadence the frontend's `await_kiro_device_flow` call will honor.
+#[derive(Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceFlowInfo {
+    pub flow_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    pub expires_in: i64,
+    pub interval: i64,
+}
+
+/// In-flight Kiro device-code flow state, stashed between
+/// `start_kiro_device_flow` (which registers the client and starts the
+/// device authorization) and `await_kiro_device_flow` (which polls the token
+/// endpoint) — mirrors `oauth::refresh`'s `REFRESH_LOCKS` shape.
+struct KiroFlowState {
+    client: oauth::device::RegisteredClient,
+    device_code: String,
+    interval: i64,
+    deadline_ms: i64,
+}
+
+static FLOWS: OnceLock<Mutex<HashMap<String, KiroFlowState>>> = OnceLock::new();
+
+fn flows() -> &'static Mutex<HashMap<String, KiroFlowState>> {
+    FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Mask a secret for display: first 3 + last 4 chars, elided in between.
@@ -152,6 +185,40 @@ fn provider_http_client() -> R<reqwest::Client> {
         })
 }
 
+/// Pick out the ids of OTHER kiro connections that are dead
+/// (`needs_relogin == Some(true)`) and should be cleared once a fresh kiro
+/// connection (`keep_id`) has been persisted. Split out from
+/// [`remove_dead_kiro_connections`] so the actual selection logic — the fix
+/// for the reconnect-shadow bug below — is unit-testable without a live
+/// `Store`. Never selects `keep_id` itself, never selects a healthy kiro row
+/// (`needs_relogin` `None`/`false`), and never selects a non-kiro row.
+fn dead_kiro_connection_ids(rows: &[ConnectionRow], keep_id: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.provider == "kiro" && r.id != keep_id && r.data.needs_relogin == Some(true))
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+/// After persisting a fresh kiro connection (`keep_id`) via
+/// [`await_kiro_device_flow`] or [`import_kiro_token`], remove any OTHER
+/// kiro connection still flagged `needs_relogin`.
+///
+/// Without this cleanup, reconnecting Kiro doesn't actually fix anything:
+/// `add_connection` always appends the new row at `MAX(priority)+1`, so the
+/// OLD dead `needs_relogin` row keeps its lower priority and stays
+/// `enabled`. `route_model` (server.rs) returns the FIRST enabled
+/// connection for a provider ordered by `priority ASC`, so it keeps
+/// resolving to the stale row and every kiro request keeps 401ing — the
+/// app's own "Reconnect" / "Import from Kiro IDE" flow would silently leave
+/// the user in a still-broken state until they manually deleted the old row.
+async fn remove_dead_kiro_connections(cp: &ControlPlane, keep_id: &str) -> anyhow::Result<()> {
+    let rows = connections::list_connections(cp.store()).await?;
+    for id in dead_kiro_connection_ids(&rows, keep_id) {
+        connections::remove_connection(cp.store(), &id).await?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
@@ -162,10 +229,14 @@ pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
             name: d.name.into(),
             color: d.color.into(),
             initial: d.initial.into(),
-            category: match d.category {
-                ProviderCategory::ApiKey => "api_key".into(),
-                ProviderCategory::OAuth => "oauth".into(),
-                ProviderCategory::Free => "free".into(),
+            category: if d.device_flow.is_some() {
+                "device".into()
+            } else {
+                match d.category {
+                    ProviderCategory::ApiKey => "api_key".into(),
+                    ProviderCategory::OAuth => "oauth".into(),
+                    ProviderCategory::Free => "free".into(),
+                }
             },
             format: match d.format {
                 ApiFormat::Anthropic => "anthropic".into(),
@@ -686,6 +757,94 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.message, "Model gpt-test returned HTTP 404 Not Found");
     }
+
+    /// A kiro device-flow connection must persist the registered AWS SSO-OIDC
+    /// client creds so `refresh_kiro` routes to the AWS token endpoint (via
+    /// `kiro_client_creds` finding both) instead of the kiro.dev social one.
+    #[test]
+    fn device_provider_specific_carries_client_creds_for_refresh() {
+        let ps = kiro_device_provider_specific(
+            "cid-1",
+            "secret-1",
+            "arn:aws:codewhisperer:us-east-1:1:profile/X",
+        );
+        assert_eq!(ps["authMethod"], "builder-id");
+        assert_eq!(ps["region"], "us-east-1");
+        assert_eq!(
+            ps["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:1:profile/X"
+        );
+
+        // The whole point of the fix: the persisted shape must make
+        // `kiro_client_creds` return Some, which is what selects the AWS
+        // SSO-OIDC (builder-id) refresh endpoint.
+        let data = ConnectionData {
+            provider_specific: Some(ps),
+            ..Default::default()
+        };
+        assert_eq!(
+            connections::kiro_client_creds(&data),
+            Some(("cid-1".to_string(), "secret-1".to_string()))
+        );
+    }
+
+    fn kiro_row(id: &str, needs_relogin: Option<bool>) -> ConnectionRow {
+        ConnectionRow {
+            id: id.into(),
+            provider: "kiro".into(),
+            auth_type: "oauth".into(),
+            label: "Kiro".into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                needs_relogin,
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// The reconnect-shadow fix, isolated from the store: reconnecting Kiro
+    /// (device flow or import) must clear ONLY the other dead kiro rows —
+    /// not the just-created row, not a healthy kiro row, and not a dead row
+    /// belonging to some other provider.
+    #[test]
+    fn dead_kiro_connection_ids_targets_only_other_dead_kiro_rows() {
+        let rows = vec![
+            kiro_row("dead-1", Some(true)),
+            kiro_row("healthy-none", None),
+            kiro_row("healthy-false", Some(false)),
+            kiro_row("new-1", Some(true)), // the just-persisted row itself
+            ConnectionRow {
+                id: "other-provider-dead".into(),
+                provider: "anthropic-oauth".into(),
+                auth_type: "oauth".into(),
+                label: "Other".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    needs_relogin: Some(true),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        ];
+        assert_eq!(
+            dead_kiro_connection_ids(&rows, "new-1"),
+            vec!["dead-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn dead_kiro_connection_ids_empty_when_no_dead_rows() {
+        let rows = vec![
+            kiro_row("healthy-1", None),
+            kiro_row("healthy-2", Some(false)),
+        ];
+        assert!(dead_kiro_connection_ids(&rows, "healthy-1").is_empty());
+    }
 }
 
 /// Drive the full interactive OAuth flow: binds a loopback listener, opens
@@ -839,6 +998,14 @@ pub async fn add_free_connection(
             message: format!("{} is not a free provider", desc.name),
         });
     }
+    if desc.device_flow.is_some() {
+        return Err(CmdError {
+            message: format!(
+                "{} uses device login — connect it from the provider list.",
+                desc.name
+            ),
+        });
+    }
     let now = ryuzi_core::paths::now_ms();
     let mut row = ConnectionRow {
         id: ryuzi_core::paths::new_id(),
@@ -853,5 +1020,248 @@ pub async fn add_free_connection(
     };
     connections::add_connection(cp.store(), row.clone()).await?;
     refresh_models_best_effort(&cp, &mut row).await;
+    Ok(assemble(&cp).await?)
+}
+
+/// Start Kiro's AWS SSO-OIDC device-code flow: registers a public client,
+/// starts a device authorization, opens the browser to the verification URL,
+/// and stashes the in-flight state under a fresh `flow_id` for
+/// [`await_kiro_device_flow`] to poll. Does not touch the store — nothing is
+/// persisted until the user completes the browser step.
+#[tauri::command]
+#[specta::specta]
+pub async fn start_kiro_device_flow(
+    _cp: State<'_, Arc<ControlPlane>>,
+    app: tauri::AppHandle,
+) -> R<DeviceFlowInfo> {
+    let http = reqwest::Client::new();
+    let cfg = registry::device_flow_config("kiro").ok_or_else(|| CmdError {
+        message: "kiro device flow is not configured".into(),
+    })?;
+    let client = oauth::device::register_client(&http, cfg)
+        .await
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
+    let auth = oauth::device::start_device_authorization(&http, cfg, &client)
+        .await
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
+
+    let flow_id = ryuzi_core::paths::new_id();
+    let deadline_ms = ryuzi_core::paths::now_ms() + auth.expires_in * 1000;
+    flows().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        flow_id.clone(),
+        KiroFlowState {
+            client,
+            device_code: auth.device_code.clone(),
+            interval: auth.interval,
+            deadline_ms,
+        },
+    );
+
+    let _ = app
+        .opener()
+        .open_url(auth.verification_uri_complete.clone(), None::<&str>);
+
+    Ok(DeviceFlowInfo {
+        flow_id,
+        user_code: auth.user_code,
+        verification_uri: auth.verification_uri,
+        verification_uri_complete: auth.verification_uri_complete,
+        expires_in: auth.expires_in,
+        interval: auth.interval,
+    })
+}
+
+/// Poll the token endpoint for a flow started by [`start_kiro_device_flow`]
+/// until the user completes the browser step (or the code expires/is
+/// denied), then persist the resulting `kiro`/`oauth` connection. The flow
+/// state is consumed from [`FLOWS`] up front — a `flow_id` can only ever be
+/// awaited once, success or failure.
+#[tauri::command]
+#[specta::specta]
+pub async fn await_kiro_device_flow(
+    cp: State<'_, Arc<ControlPlane>>,
+    label: String,
+    flow_id: String,
+) -> R<Vec<ConnectionInfo>> {
+    let KiroFlowState {
+        client,
+        device_code,
+        mut interval,
+        deadline_ms,
+    } = flows()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&flow_id)
+        .ok_or_else(|| CmdError {
+            message: "device sign-in flow not found — start again".into(),
+        })?;
+
+    let http = reqwest::Client::new();
+    let cfg = registry::device_flow_config("kiro").ok_or_else(|| CmdError {
+        message: "kiro device flow is not configured".into(),
+    })?;
+
+    let tokens = loop {
+        if ryuzi_core::paths::now_ms() > deadline_ms {
+            return Err(CmdError {
+                message: "device code expired — start again".into(),
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(interval.max(1) as u64)).await;
+        match oauth::device::poll_token_once(&http, cfg.token_url, &client, &device_code)
+            .await
+            .map_err(|e| CmdError {
+                message: e.to_string(),
+            })? {
+            oauth::device::PollOutcome::Pending => continue,
+            oauth::device::PollOutcome::SlowDown => {
+                interval = (interval + 5).min(30);
+                continue;
+            }
+            oauth::device::PollOutcome::Denied => {
+                return Err(CmdError {
+                    message: "sign-in was denied".into(),
+                });
+            }
+            oauth::device::PollOutcome::Expired => {
+                return Err(CmdError {
+                    message: "device code expired — start again".into(),
+                });
+            }
+            oauth::device::PollOutcome::Ready(tokens) => break tokens,
+        }
+    };
+
+    let profile_arn = oauth::device::resolve_profile_arn(&http, &tokens.access_token)
+        .await
+        .unwrap_or_else(|| connections::default_profile_arn("builder-id").to_string());
+
+    let now = ryuzi_core::paths::now_ms();
+    let new_id = ryuzi_core::paths::new_id();
+    connections::add_connection(
+        cp.store(),
+        ConnectionRow {
+            id: new_id.clone(),
+            provider: "kiro".into(),
+            auth_type: "oauth".into(),
+            label,
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                access_token: Some(tokens.access_token),
+                refresh_token: tokens.refresh_token,
+                expires_at: Some(tokens.expires_at),
+                // The AWS SSO-OIDC client creds registered in
+                // `start_kiro_device_flow` MUST be carried here — see
+                // [`kiro_device_provider_specific`].
+                provider_specific: Some(kiro_device_provider_specific(
+                    &client.client_id,
+                    &client.client_secret,
+                    &profile_arn,
+                )),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await?;
+    // Sign-in via device flow succeeded — any OTHER kiro row still marked
+    // `needs_relogin` is now dead weight that would otherwise keep
+    // shadowing this fresh connection in `route_model`. See
+    // `remove_dead_kiro_connections`.
+    remove_dead_kiro_connections(&cp, &new_id).await?;
+    Ok(assemble(&cp).await?)
+}
+
+/// Build the `provider_specific` blob for a Kiro device-flow (builder-id)
+/// connection. The AWS SSO-OIDC `clientId`/`clientSecret` registered in
+/// [`start_kiro_device_flow`] MUST be carried here: `oauth::refresh::refresh_kiro`
+/// selects the AWS SSO-OIDC token endpoint only when
+/// `connections::kiro_client_creds` finds BOTH, and otherwise falls through to
+/// the kiro.dev SOCIAL refresh endpoint (meant for google/github/imported).
+/// Omitting them would make a builder-id connection fail its first refresh
+/// (~5 min before the ~1h expiry, or on a 401/403) and flip to `needs_relogin`.
+/// For the device flow both are always present — the client was just
+/// registered — so they're added unconditionally.
+fn kiro_device_provider_specific(
+    client_id: &str,
+    client_secret: &str,
+    profile_arn: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "authMethod": "builder-id",
+        "profileArn": profile_arn,
+        "region": "us-east-1",
+        "clientId": client_id,
+        "clientSecret": client_secret,
+    })
+}
+
+/// Import Kiro OAuth tokens from an already-installed, logged-in Kiro IDE
+/// (its AWS SSO token cache + optional client registration + profile.json),
+/// so a connection can be created without running the device-code flow.
+/// Validates the imported refresh token with one [`oauth::refresh::force_refresh`]
+/// call (which mints a fresh access token) before persisting — a dead/expired
+/// import token surfaces its error instead of a connection that can't route.
+#[tauri::command]
+#[specta::specta]
+pub async fn import_kiro_token(
+    cp: State<'_, Arc<ControlPlane>>,
+    label: String,
+) -> R<Vec<ConnectionInfo>> {
+    let imported = oauth::import::read_kiro_ide_cache()?;
+
+    let mut provider_specific = serde_json::json!({
+        "authMethod": imported.auth_method,
+        "region": imported.region.unwrap_or_else(|| "us-east-1".into()),
+    });
+    if let Some(arn) = imported.profile_arn {
+        provider_specific["profileArn"] = serde_json::json!(arn);
+    }
+    if let (Some(client_id), Some(client_secret)) = (imported.client_id, imported.client_secret) {
+        provider_specific["clientId"] = serde_json::json!(client_id);
+        provider_specific["clientSecret"] = serde_json::json!(client_secret);
+    }
+
+    let now = ryuzi_core::paths::now_ms();
+    let new_id = ryuzi_core::paths::new_id();
+    let mut row = ConnectionRow {
+        id: new_id.clone(),
+        provider: "kiro".into(),
+        auth_type: "oauth".into(),
+        label,
+        priority: 0,
+        enabled: true,
+        data: ConnectionData {
+            refresh_token: Some(imported.refresh_token),
+            provider_specific: Some(provider_specific),
+            ..Default::default()
+        },
+        created_at: now,
+        updated_at: now,
+    };
+
+    let http = reqwest::Client::new();
+    // This refreshes `row` IN MEMORY before it's ever inserted: `row.id` isn't
+    // in the DB yet, so `force_refresh`'s internal `update_connection` (an
+    // UPDATE-by-id) is a harmless 0-row no-op here — the fresh access token
+    // it mints is captured straight into `row.data` and only actually
+    // persisted by the `add_connection` call below.
+    oauth::refresh::force_refresh(cp.store(), &http, &mut row)
+        .await
+        .map_err(|e| CmdError {
+            message: format!("imported Kiro token looks dead: {e}"),
+        })?;
+
+    connections::add_connection(cp.store(), row).await?;
+    // Import succeeded — clear any OTHER dead kiro row so it doesn't keep
+    // shadowing this fresh connection in `route_model`. See
+    // `remove_dead_kiro_connections`.
+    remove_dead_kiro_connections(&cp, &new_id).await?;
     Ok(assemble(&cp).await?)
 }

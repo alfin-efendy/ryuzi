@@ -4,11 +4,13 @@ import {
   commands,
   type CatalogEntry,
   type ConnectionInfo,
+  type DeviceFlowInfo,
   type ManualStartInfo,
   type TestResult,
   type Result,
   type CmdError,
 } from "./bindings";
+import { KIRO_IMPORT_ACTION, KIRO_SIGNIN_ACTION } from "./constants";
 
 // Providers tab: catalog + credentialed provider connections.
 
@@ -42,6 +44,9 @@ type ConnectionsState = {
     redirectUri: string,
   ) => Promise<boolean>;
   addFree: (provider: string, label: string) => Promise<boolean>;
+  startKiroDevice: () => Promise<DeviceFlowInfo | null>;
+  awaitKiroDevice: (label: string, flowId: string) => Promise<boolean>;
+  importKiro: (label: string) => Promise<boolean>;
 };
 
 function apply(set: (p: Partial<ConnectionsState>) => void, res: Result<ConnectionInfo[], CmdError>, action: string): boolean {
@@ -87,4 +92,12 @@ export const useConnections = create<ConnectionsState>((set) => ({
   completeOauthManual: async (provider, label, verifier, state, pasted, redirectUri) =>
     apply(set, await commands.completeOauthManual(provider, label, verifier, state, pasted, redirectUri), "Connect"),
   addFree: async (provider, label) => apply(set, await commands.addFreeConnection(provider, label), "Add connection"),
+  startKiroDevice: async () => {
+    const res = await commands.startKiroDeviceFlow();
+    if (res.status === "ok") return res.data;
+    toast.error(`${KIRO_SIGNIN_ACTION} failed: ${res.error.message}`);
+    return null;
+  },
+  awaitKiroDevice: async (label, flowId) => apply(set, await commands.awaitKiroDeviceFlow(label, flowId), KIRO_SIGNIN_ACTION),
+  importKiro: async (label) => apply(set, await commands.importKiroToken(label), KIRO_IMPORT_ACTION),
 }));
