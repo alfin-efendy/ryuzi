@@ -157,4 +157,43 @@ mod tests {
             "not json"
         );
     }
+
+    #[test]
+    fn corrupt_prelude_resyncs_to_next_valid_frame() {
+        let mut p = AwsEventStreamParser::default();
+        // A leading 12-byte prelude with total=20 but headers_len=0xFFFFFFFF, so
+        // `headers_len + 16 > total` trips the corrupt guard. A valid frame
+        // follows immediately: the parser must drop bytes, resync, and still
+        // yield the valid frame without panicking or hanging. (If the guard were
+        // removed, parse_frame would slice `bytes[12..12 + 0xFFFFFFFF]` and panic
+        // with index-out-of-bounds — this test proves the resync path runs.)
+        let mut bytes = vec![0u8, 0, 0, 20, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+        bytes.extend(frame("assistantResponseEvent", r#"{"content":"ok"}"#));
+        let frames = p.feed(&bytes);
+        let recovered: Vec<_> = frames
+            .iter()
+            .filter(|f| f.event_type.as_deref() == Some("assistantResponseEvent"))
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].payload["content"], "ok");
+    }
+
+    #[test]
+    fn oversized_total_len_does_not_hang() {
+        let mut p = AwsEventStreamParser::default();
+        // A leading prelude claiming total = 0x7FFFFFFF (~2 GiB, well over the
+        // 16 MiB MAX_FRAME cap). The range check must fire BEFORE the
+        // `buf.len() < total` wait, so a single feed containing this bogus
+        // prelude plus a valid frame terminates and yields the valid frame
+        // rather than blocking forever waiting for 2 GiB of bytes.
+        let mut bytes = vec![0x7Fu8, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0];
+        bytes.extend(frame("assistantResponseEvent", r#"{"content":"ok"}"#));
+        let frames = p.feed(&bytes);
+        let recovered: Vec<_> = frames
+            .iter()
+            .filter(|f| f.event_type.as_deref() == Some("assistantResponseEvent"))
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].payload["content"], "ok");
+    }
 }
