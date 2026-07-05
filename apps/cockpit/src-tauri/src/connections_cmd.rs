@@ -126,10 +126,14 @@ pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
             name: d.name.into(),
             color: d.color.into(),
             initial: d.initial.into(),
-            category: match d.category {
-                ProviderCategory::ApiKey => "api_key".into(),
-                ProviderCategory::OAuth => "oauth".into(),
-                ProviderCategory::Free => "free".into(),
+            category: if d.device_flow.is_some() {
+                "device".into()
+            } else {
+                match d.category {
+                    ProviderCategory::ApiKey => "api_key".into(),
+                    ProviderCategory::OAuth => "oauth".into(),
+                    ProviderCategory::Free => "free".into(),
+                }
             },
             format: match d.format {
                 ApiFormat::Anthropic => "anthropic".into(),
@@ -505,6 +509,14 @@ pub async fn add_free_connection(
     if desc.category != ProviderCategory::Free {
         return Err(CmdError {
             message: format!("{} is not a free provider", desc.name),
+        });
+    }
+    if desc.device_flow.is_some() {
+        return Err(CmdError {
+            message: format!(
+                "{} uses device login — connect it from the provider list.",
+                desc.name
+            ),
         });
     }
     let now = ryuzi_core::paths::now_ms();

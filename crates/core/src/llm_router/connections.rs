@@ -169,6 +169,56 @@ pub fn is_oauth(row: &ConnectionRow) -> bool {
     row.auth_type == "oauth"
 }
 
+/// Kiro `provider_specific` accessors. The blob shape mirrors 9router:
+/// { authMethod, profileArn?, region?, clientId?, clientSecret? }.
+/// Ported from 9router (MIT, (c) 2024-2026 decolua and contributors).
+pub fn kiro_auth_method(d: &ConnectionData) -> String {
+    d.provider_specific
+        .as_ref()
+        .and_then(|v| v.get("authMethod"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("builder-id")
+        .to_string()
+}
+
+pub fn kiro_profile_arn(d: &ConnectionData) -> Option<String> {
+    d.provider_specific
+        .as_ref()
+        .and_then(|v| v.get("profileArn"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+pub fn kiro_region(d: &ConnectionData) -> String {
+    d.provider_specific
+        .as_ref()
+        .and_then(|v| v.get("region"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("us-east-1")
+        .to_string()
+}
+
+pub fn kiro_client_creds(d: &ConnectionData) -> Option<(String, String)> {
+    let ps = d.provider_specific.as_ref()?;
+    let id = ps.get("clientId")?.as_str()?.to_string();
+    let secret = ps.get("clientSecret")?.as_str()?.to_string();
+    Some((id, secret))
+}
+
+pub fn is_account_bound(auth_method: &str) -> bool {
+    matches!(auth_method, "api_key" | "idc" | "external_idp")
+}
+
+/// Shared default CodeWhisperer profile ARN for non-account-bound auth.
+pub fn default_profile_arn(auth_method: &str) -> &'static str {
+    match auth_method {
+        "google" | "github" => "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK",
+        _ => "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX",
+    }
+}
+
 pub fn effective_base_url(desc: &ProviderDescriptor, row: &ConnectionRow) -> Option<String> {
     row.data
         .base_url_override
@@ -280,5 +330,32 @@ mod tests {
         assert!(is_oauth(&r));
         r.auth_type = "api_key".into();
         assert!(!is_oauth(&r));
+    }
+
+    #[test]
+    fn kiro_accessors_read_provider_specific() {
+        let d = ConnectionData {
+            provider_specific: Some(serde_json::json!({
+                "authMethod": "idc", "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/X",
+                "region": "eu-west-1", "clientId": "c", "clientSecret": "s"
+            })),
+            ..Default::default()
+        };
+        assert_eq!(kiro_auth_method(&d), "idc");
+        assert_eq!(kiro_region(&d), "eu-west-1");
+        assert_eq!(kiro_client_creds(&d), Some(("c".into(), "s".into())));
+        assert!(is_account_bound(&kiro_auth_method(&d)));
+        let empty = ConnectionData::default();
+        assert_eq!(kiro_auth_method(&empty), "builder-id");
+        assert_eq!(kiro_region(&empty), "us-east-1");
+        assert!(kiro_profile_arn(&empty).is_none());
+        assert_eq!(
+            default_profile_arn("github"),
+            "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+        );
+        assert_eq!(
+            default_profile_arn("builder-id"),
+            "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+        );
     }
 }
