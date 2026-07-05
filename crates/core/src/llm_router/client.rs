@@ -297,11 +297,19 @@ fn oauth_upstream_request(
             inject_claude_system_prompt(&mut anthropic_body);
             Ok(ctx
                 .http
-                .post(format!("{base}/messages"))
+                .post(format!("{base}/messages?beta=true"))
                 .json(&anthropic_body)
                 .header("authorization", format!("Bearer {access_token}"))
                 .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", "oauth-2025-04-20"))
+                .header(
+                    "anthropic-beta",
+                    crate::llm_router::models::ANTHROPIC_OAUTH_BETA,
+                )
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .header("user-agent", "claude-cli/2.1.92 (external, sdk-cli)")
+                .header("x-app", "cli")
+                .header("x-stainless-helper-method", "stream")
+                .header("x-stainless-retry-count", "0"))
         }
         "openai-oauth" => {
             // Codex's Responses wire is a fixed protocol endpoint, distinct
@@ -853,14 +861,17 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert_eq!(req.url().as_str(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
         assert_eq!(
             req.headers().get("authorization").unwrap(),
             "Bearer at-secret"
         );
         assert_eq!(
             req.headers().get("anthropic-beta").unwrap(),
-            "oauth-2025-04-20"
+            crate::llm_router::models::ANTHROPIC_OAUTH_BETA
         );
         assert_eq!(
             req.headers().get("anthropic-version").unwrap(),
