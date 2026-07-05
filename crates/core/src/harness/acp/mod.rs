@@ -54,7 +54,9 @@ use crate::domain::{CoreEvent, NewMessage};
 use crate::harness::acp::notification::NotificationSink;
 use crate::harness::acp::transport::PermissionContext;
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
+use crate::plugins::{CorePlugin, PluginSource};
 use crate::store::Store;
+use ryuzi_plugin_sdk::PluginManifest;
 
 /// One request the [`AcpSession`] hands to the client loop. Each carries a
 /// reply channel; the loop performs the round-trip and answers.
@@ -889,43 +891,52 @@ impl HarnessFactory for LazyAcpHarnessFactory {
     }
 }
 
-/// The `claude-code` integration: plugs into the harness axis only, producing an
+/// The `claude-code` built-in plugin: harness-only, producing an
 /// [`AcpHarnessFactory`] over a host-injected [`AcpAdapterDescriptor`]. The
-/// descriptor's `command` is supplied by the host (Task 5 wires the bundled
-/// sidecar path; tests inject a stub descriptor).
-pub struct ClaudeCodeIntegration {
-    factory: Arc<dyn HarnessFactory>,
+/// descriptor's `command` is supplied by the host (the bundled sidecar path
+/// in production; tests inject a stub descriptor).
+pub fn claude_code_plugin(descriptor: AcpAdapterDescriptor) -> CorePlugin {
+    claude_code_plugin_with_factory(Arc::new(AcpHarnessFactory::new(descriptor)))
 }
 
-impl ClaudeCodeIntegration {
-    pub fn new(descriptor: AcpAdapterDescriptor) -> Self {
-        Self {
-            factory: Arc::new(AcpHarnessFactory::new(descriptor)),
-        }
-    }
-
-    /// Defer adapter resolution to the first `claude-code` session start (see
-    /// [`LazyAcpHarnessFactory`]). Use this from hosts whose startup path must
-    /// not block on — or fail with — the sidecar resolve.
-    pub fn with_resolver(
-        resolver: impl Fn() -> anyhow::Result<AcpAdapterDescriptor> + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            factory: Arc::new(LazyAcpHarnessFactory {
-                resolver: Box::new(resolver),
-                resolved: std::sync::Mutex::new(None),
-            }),
-        }
-    }
+/// Defer adapter resolution to the first `claude-code` session start (see
+/// [`LazyAcpHarnessFactory`]). Use this from hosts whose startup path must
+/// not block on — or fail with — the sidecar resolve.
+pub fn claude_code_plugin_with_resolver(
+    resolver: impl Fn() -> anyhow::Result<AcpAdapterDescriptor> + Send + Sync + 'static,
+) -> CorePlugin {
+    claude_code_plugin_with_factory(Arc::new(LazyAcpHarnessFactory {
+        resolver: Box::new(resolver),
+        resolved: std::sync::Mutex::new(None),
+    }))
 }
 
-impl crate::integration::Integration for ClaudeCodeIntegration {
-    fn id(&self) -> &str {
-        "claude-code"
-    }
-
-    fn harness(&self) -> Option<Arc<dyn HarnessFactory>> {
-        Some(self.factory.clone())
+fn claude_code_plugin_with_factory(factory: Arc<dyn HarnessFactory>) -> CorePlugin {
+    CorePlugin {
+        manifest: PluginManifest {
+            contract: 1,
+            id: "claude-code".to_string(),
+            name: "Claude Code".to_string(),
+            version: "0.0.0".to_string(),
+            publisher: "ryuzi".to_string(),
+            description: "Anthropic's Claude Code CLI (uses your host login)".to_string(),
+            homepage: None,
+            icon: Some("terminal".to_string()),
+            categories: vec!["runtime".to_string()],
+            verified: true,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            mcp: vec![],
+            skills: vec![],
+            menu: None,
+            provider: None,
+            runtime: None,
+        },
+        harness: Some(factory),
+        gateway: None,
+        connector: None,
+        source: PluginSource::Builtin,
     }
 }
 
@@ -968,7 +979,7 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
-        let integ = ClaudeCodeIntegration::with_resolver(move || {
+        let plugin = claude_code_plugin_with_resolver(move || {
             counter.fetch_add(1, Ordering::SeqCst);
             Ok(AcpAdapterDescriptor::default())
         });
@@ -976,8 +987,8 @@ mod tests {
         // Installing into registries must not touch the resolver — that is the
         // whole point: hosts register the harness at startup without paying
         // for (or requiring) the sidecar resolve/download.
-        let mut registries = crate::integration::Registries::new();
-        registries.install(&integ);
+        let mut registries = crate::plugins::Registries::new();
+        registries.add_plugin(plugin);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let factory = registries.harness.get("claude-code").unwrap();
@@ -991,20 +1002,19 @@ mod tests {
 
     #[tokio::test]
     async fn with_resolver_surfaces_errors_at_create_and_retries_next_time() {
-        use crate::integration::Integration as _;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
-        let integ = ClaudeCodeIntegration::with_resolver(move || {
+        let plugin = claude_code_plugin_with_resolver(move || {
             if counter.fetch_add(1, Ordering::SeqCst) == 0 {
                 anyhow::bail!("offline");
             }
             Ok(AcpAdapterDescriptor::default())
         });
 
-        let factory = integ.harness().unwrap();
+        let factory = plugin.harness.unwrap();
         // First session start fails with the resolver's error…
         let err = factory.create().err().expect("first create should fail");
         assert!(err.to_string().contains("offline"), "got: {err:#}");
@@ -1112,6 +1122,21 @@ mod tests {
             "expected exit code 0, got: {:?}",
             outcome.exit_code
         );
+    }
+
+    #[test]
+    fn claude_code_plugin_manifest_has_expected_identity() {
+        let plugin = claude_code_plugin(AcpAdapterDescriptor::default());
+        assert_eq!(plugin.manifest.contract, 1);
+        assert_eq!(plugin.manifest.id, "claude-code");
+        assert_eq!(plugin.manifest.name, "Claude Code");
+        assert_eq!(plugin.manifest.publisher, "ryuzi");
+        assert!(plugin.manifest.verified);
+        assert_eq!(plugin.manifest.categories, vec!["runtime".to_string()]);
+        assert_eq!(plugin.manifest.icon.as_deref(), Some("terminal"));
+        assert!(plugin.harness.is_some());
+        assert!(plugin.gateway.is_none());
+        assert!(plugin.connector.is_none());
     }
 }
 

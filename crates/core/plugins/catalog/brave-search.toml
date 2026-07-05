@@ -1,0 +1,27 @@
+contract = 1
+id = "brave-search"
+name = "Brave Search"
+version = "0.1.0"
+publisher = "Brave (official)"
+description = "Web, news, and local search via Brave's official MCP server (`@brave/brave-search-mcp-server`), run over stdio through `npx`. This replaces the previous Brave search server published under the now-archived `modelcontextprotocol` reference-servers repo — do not use that one."
+homepage = "https://brave.com/search/api/"
+icon = "search"
+categories = ["search"]
+verified = true
+
+[auth]
+kind = "api-key"
+setting = "plugin.brave-search.api_key"
+env = "BRAVE_API_KEY"
+help_url = "https://brave.com/search/api/"
+
+[[mcp]]
+name = "brave-search"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@brave/brave-search-mcp-server", "--transport", "stdio"]
+env = { BRAVE_API_KEY = "${auth}" }
+
+[menu]
+section = "plugins"
+label = "Brave Search"

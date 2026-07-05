@@ -1,0 +1,20 @@
+contract = 1
+id = "graphiti"
+name = "Graphiti"
+version = "0.1.0"
+publisher = "getzep (official)"
+description = "Temporal knowledge-graph memory via Graphiti's official MCP server (`getzep/graphiti`, `mcp_server/`). No `npx` package exists — the server ships as a docker-compose stack or a local `uv run main.py --transport stdio` process, and needs its own LLM key (OPENAI_API_KEY, ANTHROPIC_API_KEY, or similar) plus a graph database (NEO4J_* or FALKORDB_* env vars). This manifest wires the stdio path; it assumes ryuzi is started from a local checkout of the `mcp_server/` directory (or an equivalent `uv`-resolvable environment) and that the required LLM/graph-DB env vars are already set in ryuzi's own process environment — there is no single auth field to broker here."
+homepage = "https://github.com/getzep/graphiti"
+icon = "network"
+categories = ["knowledge-graph", "memory"]
+verified = false
+
+[[mcp]]
+name = "graphiti"
+transport = "stdio"
+command = "uv"
+args = ["run", "main.py", "--transport", "stdio"]
+
+[menu]
+section = "plugins"
+label = "Graphiti"

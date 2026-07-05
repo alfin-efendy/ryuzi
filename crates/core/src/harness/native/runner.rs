@@ -37,6 +37,9 @@ const TEXT_FLUSH_BYTES: usize = 120;
 pub struct RunnerDeps {
     pub session_pk: String,
     pub work_dir: PathBuf,
+    /// Plugin-bundled skill directories folded in beside the worktree/global
+    /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
+    pub extra_skill_dirs: Vec<PathBuf>,
     pub model: Option<String>,
     pub perm_mode: PermMode,
     pub project_policy: Option<String>,
@@ -160,7 +163,7 @@ async fn drive(
 ) -> anyhow::Result<String> {
     let system = match &agent.prompt {
         Some(p) => p.clone(),
-        None => context::assemble_system(&deps.work_dir),
+        None => context::assemble_system(&deps.work_dir, &deps.extra_skill_dirs),
     };
     // Tools restricted to what this agent may use.
     let tool_defs: Vec<Value> = deps
@@ -448,6 +451,7 @@ async fn run_tool_call(
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
         work_dir: deps.work_dir.clone(),
+        extra_skill_dirs: deps.extra_skill_dirs.clone(),
         store: deps.store.clone(),
         cancel: CancellationToken::new(),
         caps: OutputCaps::default(),
@@ -735,6 +739,7 @@ mod tests {
         RunnerDeps {
             session_pk: "s1".into(),
             work_dir: dir.to_path_buf(),
+            extra_skill_dirs: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
             perm_mode: PermMode::BypassPermissions,

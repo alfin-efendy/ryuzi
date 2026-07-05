@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { Check, Minus, Plus, Store } from "lucide-react";
-import { Button, Segmented, SettingsCard as Card } from "@ryuzi/ui";
-import { Chip, Pill, StatusDot } from "@/components/common/bits";
-import type { AppInfo } from "@/bindings";
+import { Badge, Button, NativeSelect, Segmented, SettingsCard as Card, Switch } from "@ryuzi/ui";
+import { Chip, IconChip, Pill, PluginStatusBadge, StatusDot } from "@/components/common/bits";
+import type { AppInfo, PluginInfo } from "@/bindings";
 import { agentAllowed, useApps } from "@/store-apps";
 import { useRuntimes } from "@/store-runtimes";
 import { useGateways } from "@/store-gateways";
+import { catalogPlugins, usePlugins } from "@/store-plugins";
+import { pluginIcon } from "@/lib/plugin-icons";
 import { AddAppModal } from "@/components/modals/AddAppModal";
 import { useNav } from "@/store-nav";
 
@@ -18,17 +20,68 @@ function appStatus(app: AppInfo): { color: string; label: string } {
   return { color: "var(--muted-foreground)", label: "Unchecked" };
 }
 
+/** Pure so the Catalog tab's category filter is unit-testable without mounting
+ *  the view — `"all"` (the default) passes every plugin through untouched. */
+export function filterByCategory(plugins: PluginInfo[], category: string): PluginInfo[] {
+  if (category === "all") return plugins;
+  return plugins.filter((p) => p.categories.includes(category));
+}
+
+function CatalogCard({ plugin, onOpen, onToggle }: { plugin: PluginInfo; onOpen: () => void; onToggle: () => void }) {
+  const Icon = pluginIcon(plugin.icon);
+  return (
+    <Card className="flex flex-col gap-3 px-[18px] py-4">
+      <Button variant="ghost" onClick={onOpen} className="h-auto w-full justify-start gap-3 p-0 text-left">
+        <IconChip icon={Icon} size={38} />
+        <span className="min-w-0 flex-1">
+          <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-sm font-semibold">{plugin.name}</span>
+          <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11.5px] text-muted-foreground">
+            {plugin.description}
+          </span>
+        </span>
+        <PluginStatusBadge verified={plugin.verified} experimental={plugin.experimental} />
+      </Button>
+      <div className="flex flex-wrap gap-1.5">
+        {plugin.categories.map((c) => (
+          <Badge key={c} variant="outline">
+            {c}
+          </Badge>
+        ))}
+      </div>
+      <div className="flex items-center gap-2 pt-0.5">
+        <span className="flex-1" />
+        <Button variant="outline" size="sm" onClick={onOpen}>
+          Configure
+        </Button>
+        <span className={plugin.experimental ? "pointer-events-none opacity-40" : ""}>
+          <Switch on={plugin.enabled} onToggle={onToggle} label={`${plugin.name} enabled`} />
+        </span>
+      </div>
+    </Card>
+  );
+}
+
 export function AppsView() {
   const nav = useNav();
   const { apps, loaded, hydrate, toggleAgent } = useApps();
   const runtimes = useRuntimes((s) => s.runtimes);
   const gateways = useGateways((s) => s.gateways);
-  const [tab, setTab] = useState<"installed" | "access">("installed");
+  const { plugins, loaded: pluginsLoaded, load: loadPlugins, setEnabled: setPluginEnabled } = usePlugins();
+  const [tab, setTab] = useState<"installed" | "access" | "catalog">("installed");
+  const [category, setCategory] = useState("all");
   const [addOpen, setAddOpen] = useState(false);
 
   useEffect(() => {
     void hydrate();
   }, [hydrate]);
+
+  useEffect(() => {
+    if (!pluginsLoaded) void loadPlugins();
+  }, [pluginsLoaded, loadPlugins]);
+
+  const catalog = catalogPlugins(plugins);
+  const categories = Array.from(new Set(catalog.flatMap((p) => p.categories))).sort();
+  const filteredCatalog = filterByCategory(catalog, category);
 
   const scopeLabel = (app: AppInfo): string => {
     if (app.scope === "global") return "Global";
@@ -61,13 +114,14 @@ export function AppsView() {
             options={[
               { id: "installed", label: "Installed" },
               { id: "access", label: "Access" },
+              { id: "catalog", label: "Catalog" },
             ]}
             value={tab}
             onChange={setTab}
           />
         </div>
 
-        {loaded && apps.length === 0 && (
+        {tab !== "catalog" && loaded && apps.length === 0 && (
           <Card className="p-6 text-center text-[13px] text-muted-foreground">
             No apps installed yet. Add an MCP server by hand or browse the registry.
           </Card>
@@ -158,6 +212,47 @@ export function AppsView() {
             <p className="mx-0.5 mb-0 mt-2.5 text-xs text-muted-foreground">
               Access here applies before per-tool permissions — a blocked agent never sees the app’s tools.
             </p>
+          </>
+        )}
+
+        {tab === "catalog" && (
+          <>
+            {categories.length > 0 && (
+              <div className="mb-4 flex items-center gap-2">
+                <span className="text-[12.5px] font-medium text-muted-foreground">Category</span>
+                <NativeSelect value={category} onChange={(e) => setCategory(e.target.value)} className="w-[200px]">
+                  <option value="all">All categories</option>
+                  {categories.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </NativeSelect>
+              </div>
+            )}
+
+            {pluginsLoaded && catalog.length === 0 && (
+              <Card className="p-6 text-center text-[13px] text-muted-foreground">No catalog integrations available yet.</Card>
+            )}
+
+            {pluginsLoaded && catalog.length > 0 && filteredCatalog.length === 0 && (
+              <Card className="p-6 text-center text-[13px] text-muted-foreground">No integrations match this category.</Card>
+            )}
+
+            {filteredCatalog.length > 0 && (
+              <div className="grid grid-cols-2 gap-3">
+                {filteredCatalog.map((plugin) => (
+                  <CatalogCard
+                    key={plugin.id}
+                    plugin={plugin}
+                    onOpen={() => nav.navigate({ kind: "pluginDetail", id: plugin.id })}
+                    onToggle={() => {
+                      if (!plugin.experimental) void setPluginEnabled(plugin.id, !plugin.enabled);
+                    }}
+                  />
+                ))}
+              </div>
+            )}
           </>
         )}
       </div>

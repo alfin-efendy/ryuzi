@@ -20,7 +20,7 @@ fn main() -> ExitCode {
             let mut registries = ryuzi_core::Registries::new();
             // The native runtime needs no external binary, so register it
             // unconditionally.
-            registries.install(&ryuzi_core::harness::native::NativeIntegration::new());
+            registries.add_plugin(ryuzi_core::harness::native::native_plugin());
             // Claude Code needs the ACP sidecar. Resolving it may download the
             // bundled adapter; if that fails (offline, or a native-only setup),
             // skip it rather than failing the whole command — `--harness native`
@@ -35,12 +35,21 @@ fn main() -> ExitCode {
                         // Claude Code session.
                         env_remove: vec!["CLAUDECODE".to_string()],
                     };
-                    registries.install(&ryuzi_core::ClaudeCodeIntegration::new(descriptor));
+                    registries.add_plugin(ryuzi_core::harness::acp::claude_code_plugin(descriptor));
                 }
                 Err(e) => {
                     eprintln!("note: claude-code harness unavailable ({e}); native runtime is still available");
                 }
             }
+            // Discord is a built-in gateway (its factory is a no-op unless the
+            // `discord` feature is on, which this crate's Cargo.toml enables);
+            // register it like `native`/`claude-code` so `ryuzi plugins
+            // enable/disable discord` recognizes it — the store seeds
+            // `enabled_gateways = "discord"` by default, so leaving this
+            // unregistered made that setting refer to an "unknown plugin".
+            registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
+            ryuzi_core::plugins::install_builtins(&mut registries);
+            ryuzi_core::plugins::load_user_plugins(&mut registries);
             Ok(registries)
         }),
     };

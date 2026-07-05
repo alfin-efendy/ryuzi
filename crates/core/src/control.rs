@@ -2,7 +2,7 @@ use crate::approval::ApprovalHub;
 use crate::attachments::{AttachmentFetcher, UreqFetcher};
 use crate::domain::{CoreEvent, Message, PermMode, Project, Session};
 use crate::harness::HarnessSession;
-use crate::integration::Registries;
+use crate::plugins::Registries;
 use crate::store::Store;
 use crate::telemetry::{NoopTelemetry, Telemetry};
 use std::collections::HashMap;
@@ -113,6 +113,13 @@ impl ControlPlane {
     /// command layer. Returns a borrow; callers that need ownership clone.
     pub fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// The plugin host — every installed plugin's manifest, capabilities, and
+    /// enablement state (see `plugins::host::PluginHost`). Used by `serve.rs`
+    /// to expose plugins over HTTP without duplicating `Registries`' shape.
+    pub fn plugins(&self) -> &crate::plugins::PluginHost {
+        &self.registries.plugins
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CoreEvent> {

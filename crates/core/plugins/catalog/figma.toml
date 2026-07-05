@@ -1,0 +1,23 @@
+contract = 1
+id = "figma"
+name = "Figma"
+version = "0.1.0"
+publisher = "Figma (official)"
+description = "Design file inspection and Dev Mode context via Figma's official remote MCP server. Auth is OAuth only in this manifest. A local alternative exists when the Figma desktop app is running in Dev Mode (`http://127.0.0.1:3845/mcp`, no auth) — useful for a single-machine setup, but the hosted server is what is wired here."
+homepage = "https://www.figma.com/developers"
+icon = "figma"
+categories = ["design"]
+verified = true
+
+[auth]
+kind = "oauth"
+help_url = "https://www.figma.com/developers"
+
+[[mcp]]
+name = "figma"
+transport = "http"
+url = "https://mcp.figma.com/mcp"
+
+[menu]
+section = "plugins"
+label = "Figma"

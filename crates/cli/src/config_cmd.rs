@@ -21,6 +21,14 @@ pub fn cmd_config(args: &[String], deps: &mut Deps) -> u8 {
 }
 
 async fn config_inner(args: &[String], deps: &mut Deps) -> u8 {
+    // `ryuzi config` doesn't go through `deps.build_registries` (that would
+    // pull in the claude-code ACP sidecar resolution and its noisy
+    // `eprintln!` note on failure — see that closure in `main.rs`). Without
+    // this, the process-wide `plugin.*` settings registry stays empty here:
+    // `config set plugin.<id>.<key> ...` would fail "unknown setting", and
+    // `config get` would report `is_secret` as `false` for a real plugin
+    // secret and print it unredacted.
+    ryuzi_core::plugins::register_builtin_plugin_fields();
     match args.first().map(String::as_str) {
         Some("get") => {
             let rest = &args[1..];

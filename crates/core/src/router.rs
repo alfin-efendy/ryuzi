@@ -524,7 +524,7 @@ mod tests {
     async fn test_control_plane() -> (Arc<ControlPlane>, Arc<Store>) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
-        let cp = ControlPlane::new(store, crate::integration::Registries::new()).await;
+        let cp = ControlPlane::new(store, crate::plugins::Registries::new()).await;
         let store_ref = cp.store().clone();
         (cp, store_ref)
     }
@@ -884,7 +884,7 @@ mod tests {
     ) -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(db_guard.path()).await.unwrap();
-        let mut regs = crate::integration::Registries::new();
+        let mut regs = crate::plugins::Registries::new();
         regs.harness.register("claude-code", harness);
         let cp = ControlPlane::new(store, regs).await;
         let store_ref = cp.store().clone();

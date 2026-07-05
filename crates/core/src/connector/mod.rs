@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub struct ConnectorCtx {
     pub project_id: String,
     pub work_dir: PathBuf,
+    pub settings: crate::settings::SettingsStore,
 }
 
 /// A service the agent uses as tools, exposed as MCP server(s) attached to a session.
@@ -65,11 +66,14 @@ mod tests {
 
     #[tokio::test]
     async fn connector_yields_mcp_servers_and_default_auth_is_ok() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let f = FakeConnectorFactory;
         let c = f.create(&serde_json::json!({})).unwrap();
         let ctx = ConnectorCtx {
             project_id: "p1".into(),
             work_dir: PathBuf::from("/tmp"),
+            settings: crate::settings::SettingsStore::new(store),
         };
         c.ensure_auth(&ctx).await.unwrap(); // default impl returns Ok
         let servers = c.mcp_servers(&ctx).await.unwrap();

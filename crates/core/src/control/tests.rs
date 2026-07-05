@@ -1,8 +1,8 @@
 use super::*;
 use crate::domain::{AttachmentRef, CoreEvent, NewMessage, SessionStatus};
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
-use crate::integration::Registries;
 use crate::paths::now_ms;
+use crate::plugins::Registries;
 use crate::settings::SettingsStore;
 use async_trait::async_trait;
 use serial_test::serial;
@@ -139,6 +139,10 @@ struct Counters {
     ended: Arc<AtomicBool>,
     /// Prompts observed by `send_prompt` across every produced session, in order.
     prompts: Arc<Mutex<Vec<String>>>,
+    /// The `SessionCtx.mcp_servers` the most recent `start_session` call was
+    /// built with — lets plugin-connector tests assert on exactly what
+    /// `start_harness_session` attached, without a bespoke fake per test.
+    mcp_servers: Arc<Mutex<Option<Vec<crate::domain::McpServerSpec>>>>,
 }
 
 struct FakeHarness {
@@ -150,6 +154,7 @@ struct FakeHarness {
 impl Harness for FakeHarness {
     async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
         self.counters.starts.fetch_add(1, Ordering::SeqCst);
+        *self.counters.mcp_servers.lock().unwrap() = Some(ctx.mcp_servers.clone());
         Ok(Box::new(FakeSession {
             store: ctx.store.clone(),
             events: ctx.events.clone(),
@@ -1676,4 +1681,243 @@ async fn drain_waits_for_an_in_flight_turn_up_to_the_timeout() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert_eq!(cp.running_count(), 0);
+}
+
+// ---------- plugin connector MCP servers attach to sessions ----------
+
+/// A connector-capable declarative plugin: one `[[mcp]]` stdio server named
+/// `server_name`, whose only env var is `${auth}` — so `connector.mcp_servers()`
+/// succeeds when `plugin.<id>.token` is set and fails (unresolved
+/// placeholder) when it isn't. Exercises `attach_plugin_mcp_servers`'s
+/// "broken connector" path with a real, not a fake, `Connector`.
+fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CorePlugin {
+    use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, PluginManifest};
+
+    let manifest = PluginManifest {
+        contract: 1,
+        id: id.to_string(),
+        name: format!("Test Plugin {id}"),
+        version: String::new(),
+        publisher: String::new(),
+        description: String::new(),
+        homepage: None,
+        icon: None,
+        categories: vec![],
+        verified: false,
+        experimental: false,
+        auth: Some(AuthSpec {
+            kind: AuthKind::Token,
+            setting: Some(format!("plugin.{id}.token")),
+            env: None,
+            help_url: None,
+        }),
+        settings: vec![],
+        mcp: vec![McpServerDef {
+            name: server_name.to_string(),
+            transport: McpTransportDef::Stdio,
+            command: Some("acme-mcp".to_string()),
+            args: vec![],
+            env: std::collections::BTreeMap::from([("TOKEN".to_string(), "${auth}".to_string())]),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+        }],
+        skills: vec![],
+        menu: None,
+        provider: None,
+        runtime: None,
+    };
+    crate::plugins::declarative::declarative_plugin(manifest, crate::plugins::PluginSource::Builtin)
+        .expect("test manifest must validate")
+}
+
+/// Build a `ControlPlane` wired like `fake_control_plane`, but whose
+/// `Registries` also carries `plugin` — for the plugin-connector
+/// session-attach tests below. Returns the full `Counters` (not just its
+/// `prompts` field) so a test can inspect `counters.mcp_servers`.
+async fn fake_control_plane_with_plugin(
+    plugin: crate::plugins::CorePlugin,
+) -> (
+    Arc<ControlPlane>,
+    Arc<Store>,
+    Counters,
+    tempfile::NamedTempFile,
+) {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let mut regs = registries_with(false, counters.clone());
+    regs.add_plugin(plugin);
+    let cp = ControlPlane::new(store, regs).await;
+    let store_ref = cp.store().clone();
+    (cp, store_ref, counters, db_guard)
+}
+
+#[tokio::test]
+#[serial]
+async fn enabled_declarative_plugins_mcp_server_attaches_to_the_session() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) =
+        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-attach", "acme")).await;
+    store
+        .set_setting_raw("plugin.task7-lc-attach.token", "sekret")
+        .await
+        .unwrap();
+    store
+        .set_setting_raw("plugin.task7-lc-attach.enabled", "true")
+        .await
+        .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+    cp.start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+
+    let servers = counters
+        .mcp_servers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("start_session must build a SessionCtx");
+    assert!(
+        servers.iter().any(|s| s.name == "acme"),
+        "expected the enabled plugin's mcp server to attach, got: {servers:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn disabled_declarative_plugins_mcp_server_does_not_attach() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) =
+        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-disabled", "acme")).await;
+    // Configured, but never enabled — `plugin.<id>.enabled` defaults to false.
+    store
+        .set_setting_raw("plugin.task7-lc-disabled.token", "sekret")
+        .await
+        .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+    cp.start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+
+    let servers = counters
+        .mcp_servers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("start_session must build a SessionCtx");
+    assert!(
+        !servers.iter().any(|s| s.name == "acme"),
+        "a disabled plugin's mcp server must not attach, got: {servers:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn broken_plugin_connector_is_skipped_and_never_fails_session_start() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) =
+        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-broken", "acme")).await;
+    // Enabled, but never configured — `${auth}` has nothing to resolve from,
+    // so `connector.mcp_servers()` returns `Err`.
+    store
+        .set_setting_raw("plugin.task7-lc-broken.enabled", "true")
+        .await
+        .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+    // The whole point: a broken connector must never prevent session start.
+    cp.start_session(&project.project_id, "go", "test", &[])
+        .await
+        .expect("a broken plugin connector must not fail session start");
+
+    let servers = counters
+        .mcp_servers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("start_session must build a SessionCtx");
+    assert!(
+        !servers.iter().any(|s| s.name == "acme"),
+        "a connector that failed to resolve must not contribute a server, got: {servers:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn db_configured_server_wins_over_a_same_named_plugin_server() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) =
+        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-collide", "acme")).await;
+    store
+        .set_setting_raw("plugin.task7-lc-collide.token", "sekret")
+        .await
+        .unwrap();
+    store
+        .set_setting_raw("plugin.task7-lc-collide.enabled", "true")
+        .await
+        .unwrap();
+
+    // A DB-configured server sharing the plugin's server name ("acme").
+    crate::mcp::upsert_server(
+        &store,
+        crate::mcp::McpServerRow {
+            id: "acme".into(),
+            name: "Acme (DB)".into(),
+            kind: "MCP server".into(),
+            color: "#000000".into(),
+            description: String::new(),
+            transport: "stdio".into(),
+            command: Some("db-acme-mcp".into()),
+            args: vec![],
+            env: vec![],
+            url: None,
+            scope: "global".into(),
+            scope_gateways: vec![],
+            version: None,
+            publisher: None,
+            status: "unknown".into(),
+            status_detail: None,
+            auth_kind: "none".into(),
+            auth_detail: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+    cp.start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+
+    let servers = counters
+        .mcp_servers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("start_session must build a SessionCtx");
+    let acme: Vec<_> = servers.iter().filter(|s| s.name == "acme").collect();
+    assert_eq!(
+        acme.len(),
+        1,
+        "exactly one \"acme\" server must attach, got: {servers:?}"
+    );
+    match &acme[0].transport {
+        crate::domain::McpTransport::Stdio { command, .. } => {
+            assert_eq!(
+                command, "db-acme-mcp",
+                "the DB-configured server must win over the plugin's same-named one"
+            );
+        }
+        other => panic!("expected a stdio transport, got: {other:?}"),
+    }
 }

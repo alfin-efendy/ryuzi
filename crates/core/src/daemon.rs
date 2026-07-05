@@ -11,10 +11,11 @@
 use crate::control::ControlPlane;
 use crate::domain::{ApprovalDecision, ApprovalRequest, CoreEvent, Surface};
 use crate::gateway::{Gateway, GatewayFactory};
-use crate::harness::acp::{AcpAdapterDescriptor, ClaudeCodeIntegration};
+use crate::harness::acp::{claude_code_plugin, AcpAdapterDescriptor};
+use crate::harness::native::native_plugin;
 use crate::harness::HarnessFactory;
-use crate::integration::Registries;
 use crate::llm_router::secrets;
+use crate::plugins::Registries;
 use crate::policy;
 use crate::router::Router;
 use crate::settings::{csv, SettingsStore, CATALOG};
@@ -46,14 +47,14 @@ pub struct BuildDaemonOpts {
     pub telemetry: Option<Arc<dyn Telemetry>>,
     /// Gateway factories available to wire, keyed by the id an entry in the
     /// `enabled_gateways` setting names (e.g. `"discord"`). 4D-b registers
-    /// its gateway(s) here (directly or via an `Integration`).
+    /// its gateway(s) here (directly, or via a plugin's `add_plugin`).
     pub extra_gateway_factories: Vec<(String, Arc<dyn GatewayFactory>)>,
     /// Harness factories to register directly (keyed by `Project.harness`),
-    /// alongside whatever `ClaudeCodeIntegration` installs under
+    /// alongside whatever the `claude_code_plugin` installs under
     /// `"claude-code"` when `enabled_runtimes` calls for it. Registered
     /// unconditionally (registration is cheap — a `HarnessFactory` isn't
     /// instantiated until a session actually starts), and installed AFTER
-    /// the `ClaudeCodeIntegration` step so an entry here can override it.
+    /// the `claude_code_plugin` step so an entry here can override it.
     /// Empty in production today; exists so tests can wire a fake harness
     /// through the real `build_daemon` composition (e.g. to exercise the
     /// real spawned approval fan-out end-to-end) without spinning up an
@@ -190,7 +191,7 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 
 /// Build order (each stage depends on the previous one):
 /// `Store::open` → settings → telemetry select → `Registries` (installs
-/// `ClaudeCodeIntegration` iff `enabled_runtimes` contains `"claude-code"`,
+/// `claude_code_plugin` iff `enabled_runtimes` contains `"claude-code"`,
 /// then `opts.extra_harness_factories`) → `ControlPlane::new_with_telemetry`
 /// → gateways (from `enabled_gateways` + `extra_gateway_factories` + the
 /// provider catalog) → the outbound `Router` spawned on one `cp.subscribe()`
@@ -233,12 +234,14 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         let enabled_runtimes = csv(settings.get("enabled_runtimes").await?.as_deref());
         if enabled_runtimes.iter().any(|r| r == "claude-code") {
             let descriptor = (opts.adapter)()?;
-            registries.install(&ClaudeCodeIntegration::new(descriptor));
+            registries.add_plugin(claude_code_plugin(descriptor));
         }
         if enabled_runtimes.iter().any(|r| r == "native") {
-            registries.install(&crate::harness::native::NativeIntegration::new());
+            registries.add_plugin(native_plugin());
         }
     }
+    crate::plugins::install_builtins(&mut registries);
+    crate::plugins::load_user_plugins(&mut registries);
     for (id, factory) in opts.extra_harness_factories {
         registries.harness.register(id, factory);
     }

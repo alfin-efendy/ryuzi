@@ -64,6 +64,10 @@ pub struct ToolCtx {
     pub session_pk: String,
     /// The session worktree — the sandbox jail root.
     pub work_dir: PathBuf,
+    /// Plugin-bundled skill directories (see
+    /// `crate::plugins::PluginHost::enabled_skill_dirs`), consulted by the
+    /// `skill` tool alongside `work_dir`'s own skill dirs.
+    pub extra_skill_dirs: Vec<PathBuf>,
     pub store: Arc<Store>,
     pub cancel: CancellationToken,
     pub caps: OutputCaps,
@@ -261,6 +265,7 @@ pub(crate) mod testutil {
         ToolCtx {
             session_pk: "test-session".into(),
             work_dir: dir.to_path_buf(),
+            extra_skill_dirs: vec![],
             store,
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),

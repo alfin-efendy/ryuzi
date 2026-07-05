@@ -1,0 +1,23 @@
+contract = 1
+id = "slack"
+name = "Slack"
+version = "0.1.0"
+publisher = "Slack (official)"
+description = "Channels, messages, and search via Slack's official remote MCP server. Restricted to directory-published or internal Slack apps — it will not work with an arbitrary personal token. The old community stdio reference server is archived; this manifest points at the current hosted endpoint."
+homepage = "https://slack.com"
+icon = "slack"
+categories = ["communication"]
+verified = true
+
+[auth]
+kind = "oauth"
+help_url = "https://api.slack.com/apps"
+
+[[mcp]]
+name = "slack"
+transport = "http"
+url = "https://mcp.slack.com/mcp"
+
+[menu]
+section = "plugins"
+label = "Slack"

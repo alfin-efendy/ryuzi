@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "apps/cockpit/src-tauri"]
+members = ["crates/core", "crates/cli", "crates/plugin-sdk", "apps/cockpit/src-tauri"]
 
 [workspace.package]
 edition = "2021"
@@ -26,8 +26,10 @@ serial_test = "3"
 similar = "2"
 specta = "2.0.0-rc.22"
 tempfile = "3"
+thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
 tokio-util = "0.7"
+toml = "0.8"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

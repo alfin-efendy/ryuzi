@@ -760,6 +760,55 @@ async sessionTodos(sessionPk: string) : Promise<Result<TodoItem[], CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+async listPlugins() : Promise<Result<PluginInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_plugins") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async pluginDetail(id: string) : Promise<Result<PluginDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_detail", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Same semantics as `ryuzi plugins enable/disable` — delegates to the
+ * shared core helper so the two surfaces never drift.
+ */
+async setPluginEnabled(id: string, enabled: boolean) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_enabled", { id, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Validated write through `SettingsStore::set` — rejects unknown keys and
+ * type-mismatched values the same way `ryuzi config set` does. Never
+ * returns a value, so no secret can leak back through this command.
+ */
+async setPluginSetting(key: string, value: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_setting", { key, value }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async pluginModels(id: string) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_models", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Export a session as a pretty JSON string.
  */
@@ -971,6 +1020,41 @@ export type ModelRouteStrategy = "fallback" | "round-robin"
 export type ModelRouteTarget = { connectionId: string; model: string }
 export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
+export type PluginAuthInfo = { 
+/**
+ * `none` | `api-key` | `token` | `oauth`.
+ */
+kind: string; setting: string | null; env: string | null; helpUrl: string | null; 
+/**
+ * A persisted (non-empty) row exists for `setting`, OR `env` is set in
+ * the process environment. Never reveals the value itself.
+ */
+configured: boolean }
+export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; menuLabel: string | null; homepage: string | null; publisher: string }
+export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean; 
+/**
+ * A persisted (non-empty) row exists for `key`. Never the value itself.
+ */
+valueSet: boolean }
+export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[]; verified: boolean; experimental: boolean; enabled: boolean; 
+/**
+ * `builtin` | `catalog` | `user`.
+ */
+source: string; 
+/**
+ * Any of `provider` | `runtime` | `gateway` | `connector`.
+ */
+capabilities: string[] }
+export type PluginMcpInfo = { name: string; 
+/**
+ * `stdio` | `http`.
+ */
+transport: string; 
+/**
+ * The raw manifest string (command for stdio, url for http) — no
+ * `${auth}` substitution, matching `ryuzi plugins info`'s output.
+ */
+commandOrUrl: string }
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }

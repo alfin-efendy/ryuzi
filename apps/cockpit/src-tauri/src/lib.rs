@@ -9,13 +9,16 @@ mod events;
 mod fsview_cmd;
 mod gateways_cmd;
 mod native_cmd;
+mod plugins_cmd;
 mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
 mod session_io;
 mod term;
 
-use ryuzi_core::{AcpAdapterDescriptor, ClaudeCodeIntegration, ControlPlane, Registries, Store};
+use ryuzi_core::harness::acp::claude_code_plugin_with_resolver;
+use ryuzi_core::harness::native::native_plugin;
+use ryuzi_core::{AcpAdapterDescriptor, ControlPlane, Registries, Store};
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
@@ -154,9 +157,9 @@ fn build_registries() -> Registries {
     let mut registries = Registries::new();
     // The native runtime needs no external binary — register it unconditionally
     // so projects with `harness = "native"` work in the desktop app.
-    registries.install(&ryuzi_core::harness::native::NativeIntegration::new());
+    registries.add_plugin(native_plugin());
 
-    registries.install(&ClaudeCodeIntegration::with_resolver(|| {
+    registries.add_plugin(claude_code_plugin_with_resolver(|| {
         let mut env = Vec::new();
         if let Some(cli) = resolve_claude_code_executable() {
             env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
@@ -171,6 +174,17 @@ fn build_registries() -> Registries {
             env_remove: vec!["CLAUDECODE".to_string()],
         })
     }));
+
+    // Discord is a built-in gateway (its factory is a no-op unless the
+    // `discord` feature is on); register it like `native`/`claude-code` so
+    // Cockpit's `list_plugins`/`set_plugin_enabled` recognize it — the store
+    // seeds `enabled_gateways = "discord"` by default, so leaving this
+    // unregistered made Cockpit diverge from the CLI/`serve`, which both
+    // already register it (see `crates/cli/src/main.rs`'s `build_registries`).
+    registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
+
+    ryuzi_core::plugins::install_builtins(&mut registries);
+    ryuzi_core::plugins::load_user_plugins(&mut registries);
     registries
 }
 
@@ -265,6 +279,11 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_agents,
             native_cmd::native_commands,
             native_cmd::session_todos,
+            plugins_cmd::list_plugins,
+            plugins_cmd::plugin_detail,
+            plugins_cmd::set_plugin_enabled,
+            plugins_cmd::set_plugin_setting,
+            plugins_cmd::plugin_models,
             session_io::export_session,
             session_io::import_session,
             session_io::share_session,
@@ -414,6 +433,20 @@ mod tests {
         let names = registries.harness.names();
         assert!(names.iter().any(|n| n == "native"), "got: {names:?}");
         assert!(names.iter().any(|n| n == "claude-code"), "got: {names:?}");
+    }
+
+    /// Regression test: Cockpit's composition root historically omitted
+    /// `discord_plugin()`, so `list_plugins` omitted discord and
+    /// `set_plugin_enabled("discord")` errored "unknown plugin: discord",
+    /// diverging from the CLI and `ryuzi serve` (both of which register it —
+    /// see `crates/cli/src/main.rs`'s `build_registries`).
+    #[test]
+    fn build_registries_registers_discord_plugin() {
+        let registries = build_registries();
+        assert!(
+            registries.plugins.get("discord").is_some(),
+            "discord plugin missing from Cockpit's composition root"
+        );
     }
 
     #[test]

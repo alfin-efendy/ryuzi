@@ -9,10 +9,10 @@ pub mod fsview;
 pub mod gateway;
 pub mod gateways;
 pub mod harness;
-pub mod integration;
 pub mod llm_router;
 pub mod mcp;
 pub mod paths;
+pub mod plugins;
 pub mod policy;
 pub mod registry;
 pub mod router;
@@ -34,11 +34,11 @@ pub use domain::{
     PermMode, Project, Session, SessionStatus, Surface,
 };
 pub use gateway::{Gateway, GatewayFactory, GatewayRegistry, MessageRef};
-pub use harness::acp::{AcpAdapterDescriptor, ClaudeCodeIntegration};
+pub use harness::acp::AcpAdapterDescriptor;
 pub use harness::{
     Harness, HarnessFactory, HarnessRegistry, HarnessSession, SessionCtx, TurnPrompt,
 };
-pub use integration::{Integration, Registries};
+pub use plugins::{CorePlugin, PluginHost, PluginSource, Registries};
 pub use registry::Registry;
 pub use router::{chunk, ConnectOpts, ConnectOutcome, Router};
 pub use store::Store;

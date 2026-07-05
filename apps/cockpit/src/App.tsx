@@ -21,6 +21,7 @@ import { AppDetailView } from "./views/AppDetailView";
 import { RegistryView } from "./views/RegistryView";
 import { GatewaysView } from "./views/GatewaysView";
 import { GatewayDetailView } from "./views/GatewayDetailView";
+import { PluginDetailView } from "./views/PluginDetailView";
 import { SettingsView } from "./views/SettingsView";
 import { Badge, Toaster } from "@ryuzi/ui";
 
@@ -57,6 +58,8 @@ function MainView() {
       return <GatewaysView />;
     case "gatewayDetail":
       return <GatewayDetailView id={view.id} />;
+    case "pluginDetail":
+      return <PluginDetailView id={view.id} />;
     case "settings":
       return <SettingsView />;
   }

@@ -2,9 +2,11 @@
 //! harness-session wiring and the background prompt driver.
 
 use super::{ControlPlane, RESUME_NUDGE};
+use crate::connector::ConnectorCtx;
 use crate::domain::{AttachmentRef, CoreEvent, PermMode, Project, Session, SessionStatus};
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
+use crate::settings::SettingsStore;
 use crate::worktree;
 use std::path::Path;
 use std::sync::Arc;
@@ -332,9 +334,13 @@ impl ControlPlane {
         } else {
             project.harness.as_str()
         };
-        let mcp_servers = crate::mcp::servers_for_session(&self.store, mcp_agent_id)
+        let mut mcp_servers = crate::mcp::servers_for_session(&self.store, mcp_agent_id)
             .await
             .unwrap_or_default();
+        let settings = SettingsStore::new(self.store.clone());
+        self.attach_plugin_mcp_servers(&project.project_id, work_dir, &settings, &mut mcp_servers)
+            .await;
+        let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
             work_dir: work_dir.to_path_buf(),
@@ -343,6 +349,7 @@ impl ControlPlane {
             effort: project.effort.clone(),
             resume,
             mcp_servers,
+            extra_skill_dirs,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             store: self.store.clone(),
@@ -360,6 +367,62 @@ impl ControlPlane {
             .unwrap()
             .insert(session_pk.to_string(), handle.clone());
         Ok(handle)
+    }
+
+    /// Extend `mcp_servers` with the MCP servers of every enabled,
+    /// connector-capable plugin (`registries.plugins`). A DB-configured
+    /// server (already in `mcp_servers`) wins over a plugin server with the
+    /// same name — the plugin's entry is dropped rather than overriding it.
+    /// A connector that fails to enable, fails `ensure_auth` (e.g. missing
+    /// credential — logged with its friendly, secret-free message), or
+    /// fails to resolve its servers is logged via `tracing::warn!` and
+    /// skipped: a broken plugin integration must never prevent a session
+    /// from starting.
+    async fn attach_plugin_mcp_servers(
+        &self,
+        project_id: &str,
+        work_dir: &Path,
+        settings: &SettingsStore,
+        mcp_servers: &mut Vec<crate::domain::McpServerSpec>,
+    ) {
+        let mut names: std::collections::HashSet<String> =
+            mcp_servers.iter().map(|s| s.name.clone()).collect();
+        for plugin in self.registries.plugins.list() {
+            let Some(connector) = &plugin.connector else {
+                continue;
+            };
+            let id = &plugin.manifest.id;
+            match self.registries.plugins.is_enabled(settings, id).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(plugin = %id, "plugin connector failed: {e}");
+                    continue;
+                }
+            }
+            let ctx = ConnectorCtx {
+                project_id: project_id.to_string(),
+                work_dir: work_dir.to_path_buf(),
+                settings: settings.clone(),
+            };
+            if let Err(e) = connector.ensure_auth(&ctx).await {
+                tracing::warn!(plugin = %id, "plugin connector not ready: {e}");
+                continue;
+            }
+            match connector.mcp_servers(&ctx).await {
+                Ok(specs) => {
+                    for spec in specs {
+                        if !names.insert(spec.name.clone()) {
+                            continue; // a DB-configured (or earlier plugin's) server wins
+                        }
+                        mcp_servers.push(spec);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %id, "plugin connector failed: {e}");
+                }
+            }
+        }
     }
 
     /// Drive a prompt on `handle` in the background. `send_prompt` blocks until
