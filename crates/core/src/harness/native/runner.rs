@@ -398,6 +398,23 @@ async fn run_tool_call(
         insert_tool_row(deps, t, &input, tool.kind()).await;
     }
 
+    // Plugin hooks: a `tool.before` hook may deny the call.
+    let hook = super::hooks::run(
+        &deps.work_dir,
+        "tool.before",
+        &json!({ "tool": t.name, "input": input }),
+    )
+    .await;
+    if !hook.allowed {
+        let msg = hook
+            .message
+            .unwrap_or_else(|| "blocked by plugin hook".to_string());
+        if emit_display {
+            finish_tool_row(deps, &t.id, &msg, true).await;
+        }
+        return tool_result(&t.id, &msg, true);
+    }
+
     // Permission gate.
     let spec = tool.permission(&input);
     let decision = evaluate(

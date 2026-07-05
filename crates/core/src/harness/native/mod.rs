@@ -15,6 +15,7 @@ pub mod commands;
 pub mod compaction;
 pub mod context;
 pub mod format;
+pub mod hooks;
 pub mod ledger;
 pub mod llm;
 pub mod lsp;
