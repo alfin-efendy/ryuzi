@@ -87,10 +87,10 @@ pub struct TodoWrite;
 
 #[async_trait]
 impl Tool for TodoWrite {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "todowrite"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Replace the session's todo list. Pass the complete desired list each \
          time; it overwrites the previous one. Use this to plan and track \
          multi-step work."
@@ -139,10 +139,10 @@ pub struct TodoRead;
 
 #[async_trait]
 impl Tool for TodoRead {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "todoread"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Read the session's current todo list."
     }
     fn input_schema(&self) -> Value {

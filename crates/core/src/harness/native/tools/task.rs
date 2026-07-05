@@ -14,10 +14,10 @@ pub struct Task;
 
 #[async_trait]
 impl Tool for Task {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "task"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Delegate a self-contained subtask to a sub-agent. Provide a precise, \
          standalone `prompt` (the sub-agent does not see this conversation) and \
          a `subagent_type` (e.g. `general` for multi-step work, `explore` for \

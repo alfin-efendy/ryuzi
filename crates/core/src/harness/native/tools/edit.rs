@@ -9,10 +9,10 @@ pub struct Edit;
 
 #[async_trait]
 impl Tool for Edit {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "edit"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Replace an exact string in a file relative to the working directory. \
          By default `old_string` must occur exactly once; set `replace_all` to \
          replace every occurrence. Returns a unified diff of the change."

@@ -22,6 +22,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod ls;
+pub mod mcp;
 pub mod read;
 pub mod task;
 pub mod todo;
@@ -115,10 +116,11 @@ impl PermissionSpec {
 /// A built-in tool the native runtime can call.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Tool id as exposed to the model (e.g. `"bash"`).
-    fn name(&self) -> &'static str;
+    /// Tool id as exposed to the model (e.g. `"bash"`). Built-ins return a
+    /// static string; MCP tools return a dynamic `mcp__server__tool` name.
+    fn name(&self) -> &str;
     /// Description text included in the tool definition sent to the model.
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str;
     /// Hand-written JSON schema for the tool input.
     fn input_schema(&self) -> Value;
     /// `tool_kind` column for the Cockpit UI: read|edit|search|execute|fetch|other.
@@ -138,13 +140,14 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// The set of built-in tools, keyed by name.
+/// The set of tools available to a session, keyed by name. Built-ins plus any
+/// per-session MCP tools.
 pub struct ToolRegistry {
-    tools: BTreeMap<&'static str, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
-    /// All Phase 1 built-ins.
+    /// All built-in tools.
     pub fn builtin() -> Self {
         let list: Vec<Arc<dyn Tool>> = vec![
             Arc::new(read::Read),
@@ -161,9 +164,18 @@ impl ToolRegistry {
         ];
         let mut tools = BTreeMap::new();
         for t in list {
-            tools.insert(t.name(), t);
+            tools.insert(t.name().to_string(), t);
         }
         ToolRegistry { tools }
+    }
+
+    /// The built-ins plus a set of extra (e.g. MCP) tools.
+    pub fn with_extra(extra: Vec<Arc<dyn Tool>>) -> Self {
+        let mut reg = Self::builtin();
+        for t in extra {
+            reg.tools.insert(t.name().to_string(), t);
+        }
+        reg
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -175,8 +187,8 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.definition()).collect()
     }
 
-    pub fn names(&self) -> Vec<&'static str> {
-        self.tools.keys().copied().collect()
+    pub fn names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
     }
 }
 

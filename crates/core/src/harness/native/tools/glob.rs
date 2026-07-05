@@ -11,10 +11,10 @@ pub struct Glob;
 
 #[async_trait]
 impl Tool for Glob {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "glob"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Find files by glob pattern (e.g. `**/*.rs`) under the working \
          directory, ignoring gitignored files. Returns matching paths relative \
          to the working directory."

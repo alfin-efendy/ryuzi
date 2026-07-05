@@ -48,10 +48,10 @@ fn html_to_text(html: &str) -> String {
 
 #[async_trait]
 impl Tool for WebFetch {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "webfetch"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Fetch a URL over HTTP(S) and return its content. `format` may be \
          `text` (HTML stripped to text, the default), `markdown`, or `html` \
          (raw)."

@@ -12,10 +12,10 @@ pub struct Grep;
 
 #[async_trait]
 impl Tool for Grep {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "grep"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Search file contents for a regular expression under the working \
          directory, ignoring gitignored files. Returns `path:line:text` for \
          each match. Optionally restrict to files whose name matches `include` \

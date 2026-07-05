@@ -11,10 +11,10 @@ pub struct Read;
 
 #[async_trait]
 impl Tool for Read {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "read"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Read a UTF-8 text file relative to the working directory. Supports an \
          optional line offset and limit. Output lines are prefixed with their \
          1-based line number."

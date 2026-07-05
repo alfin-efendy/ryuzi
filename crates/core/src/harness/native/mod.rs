@@ -15,6 +15,7 @@ pub mod commands;
 pub mod context;
 pub mod ledger;
 pub mod llm;
+pub mod mcp_client;
 pub mod permission;
 pub mod runner;
 pub mod tools;
@@ -33,23 +34,18 @@ pub const NATIVE_ID: &str = "native";
 pub struct NativeHarness {
     /// Factory for the LLM stream. Overridable in tests to script conversations.
     llm_factory: Arc<dyn llm::LlmStreamFactory>,
-    tools: Arc<tools::ToolRegistry>,
 }
 
 impl NativeHarness {
     pub fn new() -> Self {
         NativeHarness {
             llm_factory: Arc::new(llm::RouterLlmStreamFactory),
-            tools: Arc::new(tools::ToolRegistry::builtin()),
         }
     }
 
     /// Construct with a custom LLM stream factory (used by tests).
     pub fn with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory>) -> Self {
-        NativeHarness {
-            llm_factory,
-            tools: Arc::new(tools::ToolRegistry::builtin()),
-        }
+        NativeHarness { llm_factory }
     }
 }
 
@@ -57,6 +53,35 @@ impl Default for NativeHarness {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Connect the session's enabled MCP servers (stdio only) and build native
+/// tool wrappers for their tools. Failures are logged and skipped.
+async fn connect_mcp_tools(
+    mcp_servers: &[crate::domain::McpServerSpec],
+) -> Vec<Arc<dyn tools::Tool>> {
+    let mut extra: Vec<Arc<dyn tools::Tool>> = Vec::new();
+    for spec in mcp_servers {
+        if !matches!(spec.transport, crate::domain::McpTransport::Stdio { .. }) {
+            continue; // HTTP MCP transport is not yet executed natively
+        }
+        match mcp_client::McpConnection::connect_stdio(spec).await {
+            Ok(conn) => {
+                let conn = Arc::new(conn);
+                for t in &conn.tools {
+                    extra.push(Arc::new(tools::mcp::McpTool::new(
+                        &conn.server_name,
+                        &t.name,
+                        &t.description,
+                        t.input_schema.clone(),
+                        conn.clone(),
+                    )));
+                }
+            }
+            Err(e) => tracing::warn!("native: MCP server `{}` unavailable: {e}", spec.name),
+        }
+    }
+    extra
 }
 
 #[async_trait]
@@ -67,6 +92,10 @@ impl Harness for NativeHarness {
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
         let agent = agents.default_agent();
+        // Connect MCP servers and expose their tools; the wrapping Arcs keep the
+        // connections alive for the session's lifetime.
+        let mcp_tools = connect_mcp_tools(&ctx.mcp_servers).await;
+        let tools = Arc::new(tools::ToolRegistry::with_extra(mcp_tools));
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             deps: runner::RunnerDeps {
@@ -79,7 +108,7 @@ impl Harness for NativeHarness {
                 events: ctx.events,
                 approvals: ctx.approvals,
                 llm,
-                tools: self.tools.clone(),
+                tools,
                 agent,
                 agents,
                 commands,

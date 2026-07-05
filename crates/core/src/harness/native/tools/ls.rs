@@ -8,10 +8,10 @@ pub struct Ls;
 
 #[async_trait]
 impl Tool for Ls {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "ls"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "List the entries of a directory relative to the working directory. \
          Directories are suffixed with `/`."
     }

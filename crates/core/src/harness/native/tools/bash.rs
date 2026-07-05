@@ -13,10 +13,10 @@ pub struct Bash;
 
 #[async_trait]
 impl Tool for Bash {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "bash"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Run a shell command with `sh -c` in the working directory. Returns \
          merged stdout and stderr, plus the exit code on failure. Has a \
          timeout (default 120s, max 600s)."

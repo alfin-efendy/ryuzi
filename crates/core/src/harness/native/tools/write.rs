@@ -8,10 +8,10 @@ pub struct Write;
 
 #[async_trait]
 impl Tool for Write {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "write"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Write `content` to a file relative to the working directory, creating \
          parent directories as needed. Overwrites an existing file."
     }
