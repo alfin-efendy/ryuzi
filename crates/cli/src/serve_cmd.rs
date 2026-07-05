@@ -47,6 +47,10 @@ async fn run_serve(port: u16, deps: &mut Deps) -> u8 {
         }
     };
     let cp = ControlPlane::new(store, registries).await;
+    // Background loops: cron jobs (30s tick) and the orch task dispatcher
+    // (5s tick) run in every daemon host, Cockpit included.
+    ryuzi_core::scheduler::spawn_runner(cp.clone());
+    ryuzi_core::orch::spawn_runner(cp.clone());
     let bound = match serve::serve(cp, port).await {
         Ok(p) => p,
         Err(e) => {

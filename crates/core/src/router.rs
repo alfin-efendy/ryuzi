@@ -314,6 +314,7 @@ impl Router {
             CoreEvent::SessionCreated { .. }
             | CoreEvent::ApprovalRequested { .. }
             | CoreEvent::JobRunChanged { .. }
+            | CoreEvent::OrchTaskChanged { .. }
             | CoreEvent::RuntimeUpdateLog { .. }
             | CoreEvent::RuntimeUpdateDone { .. } => {}
         }

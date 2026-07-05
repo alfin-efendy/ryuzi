@@ -386,7 +386,8 @@ pub(crate) fn run_note_for(final_text: Option<&str>) -> (bool, Option<String>) {
 
 /// The final assistant message of a session: the trailing run of assistant
 /// text rows (they are persisted delta-shaped), concatenated in order.
-async fn final_assistant_text(store: &Store, session_pk: &str) -> Option<String> {
+/// Shared with the orch dispatcher, which captures worker/judge reports.
+pub(crate) async fn final_assistant_text(store: &Store, session_pk: &str) -> Option<String> {
     let msgs = store.list_messages(session_pk).await.ok()?;
     let mut parts: Vec<String> = Vec::new();
     for m in msgs.iter().rev() {

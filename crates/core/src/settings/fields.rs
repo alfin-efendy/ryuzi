@@ -218,14 +218,15 @@ mod tests {
     use crate::settings::{all_fields, find_field};
 
     #[test]
-    fn schema_has_25_keys_and_correct_flags() {
+    fn schema_has_26_keys_and_correct_flags() {
         let fields = all_fields();
-        assert_eq!(fields.len(), 25); // 22 global + 3 discord + 0 claude-code
+        assert_eq!(fields.len(), 26); // 23 global + 3 discord + 0 claude-code
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();
         // list order: globals first, then discord fields
         assert_eq!(keys[0], "workdir_root");
+        assert!(keys.contains(&"max_spawn_depth"));
         assert_eq!(
-            &keys[22..],
+            &keys[23..],
             &["discord.token", "discord.app_id", "discord.guild_id"]
         );
         // the only required global is workdir_root; all 3 discord fields required; token is the only secret

@@ -13,9 +13,14 @@
 //! non-decomposed submit starts at `waiting`). Child lifecycle:
 //! `todo → ready → running → done|failed|cancelled`.
 
+use crate::control::ControlPlane;
+use crate::domain::CoreEvent;
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// One row of the orchestrated task graph.
 #[derive(Debug, Clone, PartialEq)]
@@ -513,6 +518,385 @@ pub fn children_by_status(tasks: &[OrchTask]) -> BTreeMap<&str, usize> {
     map
 }
 
+/// Move a task from `expected` to `status` without touching outcome fields.
+pub async fn set_status(
+    store: &Store,
+    id: &str,
+    expected: &str,
+    status: &str,
+) -> anyhow::Result<bool> {
+    let (id, expected, status) = (id.to_string(), expected.to_string(), status.to_string());
+    store
+        .with_conn(move |c| {
+            let n = c.execute(
+                "UPDATE orch_tasks SET status=?3 WHERE id=?1 AND status=?2",
+                params![id, expected, status],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+}
+
+/// Fail a root from any non-terminal state, recording the error.
+pub async fn fail_root(store: &Store, id: &str, error: &str) -> anyhow::Result<bool> {
+    let (id, error) = (id.to_string(), error.to_string());
+    let now = crate::paths::now_ms();
+    store
+        .with_conn(move |c| {
+            let n = c.execute(
+                "UPDATE orch_tasks SET status='failed', error=?2, finished_at=?3 \
+                 WHERE id=?1 AND status IN ('decomposing','waiting','judging')",
+                params![id, error, now],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+}
+
+// ---------------------------------------------------------------------------
+// Submission + LLM decomposition
+// ---------------------------------------------------------------------------
+
+fn emit_changed(cp: &Arc<ControlPlane>, task_id: &str, root_id: Option<String>, status: &str) {
+    let _ = cp.send_event(CoreEvent::OrchTaskChanged {
+        task_id: task_id.to_string(),
+        root_id,
+        status: status.to_string(),
+    });
+}
+
+/// Submit a goal for orchestrated execution. With `decompose`, an LLM plans
+/// the subtasks in the background (the root sits in `decomposing` meanwhile);
+/// otherwise the goal itself becomes the root's single subtask. Returns the
+/// root id — the dispatcher loop picks the work up on its next tick.
+pub async fn submit(
+    cp: &Arc<ControlPlane>,
+    project_id: &str,
+    goal: &str,
+    decompose: bool,
+) -> anyhow::Result<String> {
+    if cp.store().get_project(project_id).await?.is_none() {
+        anyhow::bail!("unknown project: {project_id}");
+    }
+    if !decompose {
+        let title: String = goal.chars().take(80).collect();
+        return submit_with_plan(
+            cp,
+            project_id,
+            goal,
+            vec![PlannedTask {
+                title,
+                body: goal.to_string(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+        )
+        .await;
+    }
+    let root = insert_root(cp.store(), project_id, goal, "decomposing").await?;
+    emit_changed(cp, &root, None, "decomposing");
+    let (cp2, root2, project_id, goal) = (
+        cp.clone(),
+        root.clone(),
+        project_id.to_string(),
+        goal.to_string(),
+    );
+    tokio::spawn(async move {
+        let roster = crate::harness::native::agents::AgentRegistry::builtin().names();
+        let attached = match decompose_goal(cp2.store(), &goal, &roster).await {
+            Ok(plan) => attach_plan(&cp2, &root2, &project_id, &plan).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = attached {
+            let _ = fail_root(cp2.store(), &root2, &e.to_string()).await;
+            emit_changed(&cp2, &root2, None, "failed");
+        }
+    });
+    Ok(root)
+}
+
+/// Insert a pre-planned decomposition under a fresh `waiting` root. The entry
+/// point for non-decomposed submits and for tests that bypass the LLM.
+pub async fn submit_with_plan(
+    cp: &Arc<ControlPlane>,
+    project_id: &str,
+    goal: &str,
+    plan: Vec<PlannedTask>,
+) -> anyhow::Result<String> {
+    let root = insert_root(cp.store(), project_id, goal, "waiting").await?;
+    let ids = insert_children(cp.store(), &root, project_id, &plan).await?;
+    emit_changed(cp, &root, None, "waiting");
+    for id in &ids {
+        emit_changed(cp, id, Some(root.clone()), "todo");
+    }
+    Ok(root)
+}
+
+/// Attach an LLM-produced plan to a `decomposing` root and release it.
+async fn attach_plan(
+    cp: &Arc<ControlPlane>,
+    root: &str,
+    project_id: &str,
+    plan: &[PlannedTask],
+) -> anyhow::Result<()> {
+    let ids = insert_children(cp.store(), root, project_id, plan).await?;
+    if !set_status(cp.store(), root, "decomposing", "waiting").await? {
+        anyhow::bail!("root {root} left `decomposing` while planning (cancelled?)");
+    }
+    emit_changed(cp, root, None, "waiting");
+    for id in &ids {
+        emit_changed(cp, id, Some(root.to_string()), "todo");
+    }
+    Ok(())
+}
+
+/// One-shot LLM decomposition through the in-process router (no tools).
+pub async fn decompose_goal(
+    store: &Arc<Store>,
+    goal: &str,
+    roster: &[String],
+) -> anyhow::Result<Vec<PlannedTask>> {
+    use crate::llm_router::client::{self, MessageStreamEvent};
+    let model = client::default_model(store)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no default model configured for decomposition"))?;
+    let ctx = client::UpstreamCtx::new(store.clone());
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 2048,
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": decomposition_prompt(goal, roster)}]
+        }],
+        "stream": true,
+    });
+    let mut rx = client::anthropic_messages_stream(&ctx, body).await?;
+    let mut text = String::new();
+    while let Some(item) = rx.recv().await {
+        let ev = item?;
+        if let Some(MessageStreamEvent::TextDelta { text: t, .. }) =
+            MessageStreamEvent::from_event(&ev)
+        {
+            text.push_str(&t);
+        }
+    }
+    parse_decomposition(&text, roster)
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher
+// ---------------------------------------------------------------------------
+
+/// How long one worker/judge session may run before the watcher gives up.
+const SESSION_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// The `max_concurrent_runs` setting (default 3, floor 1).
+async fn max_concurrent(store: &Store) -> usize {
+    store
+        .get_setting("max_concurrent_runs")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+        .max(1)
+}
+
+/// Spawn the dispatcher loop on the host's runtime (Tauri's setup hook has no
+/// ambient tokio context, hence the returned handle — the scheduler pattern).
+pub fn spawn_runner(cp: Arc<ControlPlane>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_loop(cp))
+}
+
+pub async fn run_loop(cp: Arc<ControlPlane>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        tick(&cp).await;
+    }
+}
+
+/// One dispatcher pass: promote unblocked tasks, start workers up to the
+/// concurrency cap, then settle roots (failure digests / judge sessions).
+/// Factored out of [`run_loop`] so tests can drive it without sleeping.
+pub async fn tick(cp: &Arc<ControlPlane>) {
+    let store = cp.store();
+    if let Ok(promoted) = promote_ready(store).await {
+        for id in &promoted {
+            if let Ok(Some(t)) = get_task(store, id).await {
+                emit_changed(cp, id, t.root_id.clone(), "ready");
+            }
+        }
+    }
+    let cap = max_concurrent(store).await;
+    match claim_ready(store, cap).await {
+        Ok(claimed) => {
+            for t in claimed {
+                start_worker(cp, t).await;
+            }
+        }
+        Err(e) => tracing::warn!("orch: claim failed: {e}"),
+    }
+    if let Ok(failed) = roots_with_failed_children(store).await {
+        for (root, digest) in failed {
+            if fail_root(store, &root.id, &format!("subtasks failed: {digest}"))
+                .await
+                .unwrap_or(false)
+            {
+                emit_changed(cp, &root.id, None, "failed");
+            }
+        }
+    }
+    if let Ok(ready) = roots_ready_to_judge(store).await {
+        for root in ready {
+            start_judge(cp, root).await;
+        }
+    }
+}
+
+/// Start one claimed subtask as its own agent session and watch it to
+/// completion in the background.
+async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
+    let store = cp.store();
+    // Subscribe BEFORE starting so a fast turn can't slip past the watcher.
+    let rx = cp.subscribe();
+    let prompt = format!("[Orchestrated subtask: {}]\n\n{}", t.title, t.body);
+    let session = match cp
+        .start_session(&t.project_id, &prompt, "orchestrator", &[])
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = finish_task(store, &t.id, "running", "failed", None, Some(e.to_string()))
+                .await;
+            emit_changed(cp, &t.id, t.root_id.clone(), "failed");
+            return;
+        }
+    };
+    let _ = set_task_session(store, &t.id, &session.session_pk).await;
+    emit_changed(cp, &t.id, t.root_id.clone(), "running");
+    let (cp2, task_id, root_id, session_pk) = (
+        cp.clone(),
+        t.id.clone(),
+        t.root_id.clone(),
+        session.session_pk.clone(),
+    );
+    tokio::spawn(async move {
+        let outcome = watch_session(rx, &session_pk).await;
+        let (status, result, error) = match outcome {
+            Ok(()) => {
+                let report = crate::scheduler::final_assistant_text(cp2.store(), &session_pk).await;
+                ("done", report, None)
+            }
+            Err(e) => ("failed", None, Some(e)),
+        };
+        match finish_task(cp2.store(), &task_id, "running", status, result, error).await {
+            Ok(true) => emit_changed(&cp2, &task_id, root_id, status),
+            _ => tracing::debug!("orch: task {task_id} outcome discarded (cancelled?)"),
+        }
+    });
+}
+
+/// Start the judge session for a root whose children are all done.
+async fn start_judge(cp: &Arc<ControlPlane>, root: OrchTask) {
+    let store = cp.store();
+    if !set_status(store, &root.id, "waiting", "judging")
+        .await
+        .unwrap_or(false)
+    {
+        return; // cancelled or already picked up
+    }
+    emit_changed(cp, &root.id, None, "judging");
+    let children = match list_tasks(store, Some(&root.id)).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = fail_root(store, &root.id, &e.to_string()).await;
+            emit_changed(cp, &root.id, None, "failed");
+            return;
+        }
+    };
+    let rx = cp.subscribe();
+    let session = match cp
+        .start_session(&root.project_id, &judge_prompt(&root, &children), "orchestrator", &[])
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = fail_root(store, &root.id, &e.to_string()).await;
+            emit_changed(cp, &root.id, None, "failed");
+            return;
+        }
+    };
+    let _ = set_task_session(store, &root.id, &session.session_pk).await;
+    let (cp2, root_id, session_pk) = (cp.clone(), root.id.clone(), session.session_pk.clone());
+    tokio::spawn(async move {
+        let outcome = watch_session(rx, &session_pk).await;
+        let changed = match outcome {
+            Ok(()) => {
+                let verdict =
+                    crate::scheduler::final_assistant_text(cp2.store(), &session_pk).await;
+                finish_task(cp2.store(), &root_id, "judging", "done", verdict, None).await
+            }
+            Err(e) => {
+                finish_task(cp2.store(), &root_id, "judging", "failed", None, Some(e)).await
+            }
+        };
+        if changed.unwrap_or(false) {
+            let status = get_task(cp2.store(), &root_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.status)
+                .unwrap_or_else(|| "done".into());
+            emit_changed(&cp2, &root_id, None, &status);
+        }
+    });
+}
+
+fn judge_prompt(root: &OrchTask, children: &[OrchTask]) -> String {
+    let mut s = format!(
+        "You are judging an orchestrated goal that was decomposed into subtasks, \
+         each run by its own agent session.\n\nGoal:\n{}\n\nSubtask outcomes:\n",
+        root.body
+    );
+    for c in children.iter().filter(|c| c.root_id.is_some()) {
+        let report: String = c
+            .result
+            .as_deref()
+            .unwrap_or("(no report)")
+            .chars()
+            .take(2000)
+            .collect();
+        s.push_str(&format!("- {}: {report}\n", c.title));
+    }
+    s.push_str(
+        "\nVerify the goal is satisfied by these outcomes; fix small gaps yourself \
+         where possible. Reply with one final report of the overall outcome.",
+    );
+    s
+}
+
+/// Wait for the session's terminal event on the broadcast bus (the
+/// scheduler's watcher shape, 2h deadline).
+async fn watch_session(
+    mut rx: broadcast::Receiver<CoreEvent>,
+    session_pk: &str,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + SESSION_DEADLINE;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(CoreEvent::Result { session_pk: pk })) if pk == session_pk => return Ok(()),
+            Ok(Ok(CoreEvent::Error {
+                session_pk: pk,
+                message,
+            })) if pk == session_pk => return Err(message),
+            Ok(Ok(_)) => continue,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(_)) => return Err("event bus closed".into()),
+            Err(_) => return Err("timed out after 2h".into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +1132,242 @@ mod tests {
         );
         let b = get_task(&s, &ids[1]).await.unwrap().unwrap();
         assert_eq!(b.status, "cancelled");
+    }
+
+    // -- dispatcher integration ---------------------------------------------
+
+    use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
+    use async_trait::async_trait;
+
+    /// A harness whose sessions write one assistant text row and finish.
+    struct EchoHarness;
+    struct EchoSession {
+        store: Arc<Store>,
+        session_pk: String,
+    }
+
+    #[async_trait]
+    impl HarnessSession for EchoSession {
+        async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+            let first_line = prompt.display.lines().next().unwrap_or("").to_string();
+            self.store
+                .insert_message(crate::domain::NewMessage {
+                    session_pk: self.session_pk.clone(),
+                    role: "assistant".into(),
+                    block_type: "text".into(),
+                    payload: serde_json::json!({
+                        "text": format!("worked on: {first_line}")
+                    }),
+                    tool_call_id: None,
+                    status: None,
+                    tool_kind: None,
+                })
+                .await?;
+            Ok(())
+        }
+        async fn cancel(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn end(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn agent_session_id(&self) -> Option<String> {
+            Some(self.session_pk.clone())
+        }
+    }
+
+    #[async_trait]
+    impl Harness for EchoHarness {
+        async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            Ok(Box::new(EchoSession {
+                store: ctx.store.clone(),
+                session_pk: ctx.session_pk.clone(),
+            }))
+        }
+    }
+
+    struct EchoHarnessFactory;
+    impl HarnessFactory for EchoHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Ok(Arc::new(EchoHarness))
+        }
+    }
+
+    /// A ControlPlane wired to the echo harness plus a project rooted at a
+    /// fresh git repo (worktree creation needs a HEAD commit).
+    async fn cp_with_project() -> (Arc<ControlPlane>, tempfile::TempDir) {
+        let repo = tempfile::tempdir().unwrap();
+        {
+            let r = git2::Repository::init(repo.path()).unwrap();
+            let sig = git2::Signature::now("t", "t@t").unwrap();
+            let tree_id = r.index().unwrap().write_tree().unwrap();
+            let tree = r.find_tree(tree_id).unwrap();
+            r.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        std::mem::forget(tmp);
+        store
+            .insert_project(crate::domain::Project {
+                project_id: "p1".into(),
+                name: "p1".into(),
+                workdir: repo.path().to_string_lossy().into_owned(),
+                source: None,
+                harness: "claude-code".into(),
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: Some(0),
+            })
+            .await
+            .unwrap();
+        let mut regs = crate::integration::Registries::new();
+        regs.harness
+            .register("claude-code", Arc::new(EchoHarnessFactory));
+        let cp = ControlPlane::new(store, regs).await;
+        (cp, repo)
+    }
+
+    async fn drive_until(
+        cp: &Arc<ControlPlane>,
+        root: &str,
+        target: &str,
+        max_ms: u64,
+    ) -> OrchTask {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(max_ms);
+        loop {
+            tick(cp).await;
+            let t = get_task(cp.store(), root).await.unwrap().unwrap();
+            if t.status == target {
+                return t;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "root stuck in `{}` waiting for `{target}`",
+                t.status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_runs_plan_to_root_judgment() {
+        let (cp, _repo) = cp_with_project().await;
+        let mut rx = cp.subscribe();
+        let root = submit_with_plan(
+            &cp,
+            "p1",
+            "ship the widget",
+            vec![
+                PlannedTask {
+                    title: "research".into(),
+                    body: "find prior art".into(),
+                    agent: "explore".into(),
+                    parents: vec![],
+                },
+                PlannedTask {
+                    title: "implement".into(),
+                    body: "build the widget".into(),
+                    agent: "build".into(),
+                    parents: vec![0],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let done = drive_until(&cp, &root, "done", 10_000).await;
+        // The judge session's report became the root's result.
+        assert!(
+            done.result.as_deref().unwrap_or("").contains("worked on:"),
+            "{:?}",
+            done.result
+        );
+
+        // Children completed in dependency order with captured reports.
+        let children: Vec<OrchTask> = list_tasks(cp.store(), Some(&root))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.root_id.is_some())
+            .collect();
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|c| c.status == "done"));
+        assert!(children
+            .iter()
+            .all(|c| c.result.as_deref().unwrap_or("").contains("worked on:")));
+        assert!(children.iter().all(|c| c.session_pk.is_some()));
+
+        // The event stream saw the key transitions.
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::OrchTaskChanged { status, .. } = ev {
+                seen.push(status);
+            }
+        }
+        for expected in ["waiting", "todo", "ready", "running", "judging", "done"] {
+            assert!(
+                seen.iter().any(|s| s == expected),
+                "missing `{expected}` in {seen:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_start_failure_fails_task_then_root() {
+        let (cp, _repo) = cp_with_project().await;
+        // A project whose harness is not registered: start_session errors.
+        cp.store()
+            .insert_project(crate::domain::Project {
+                project_id: "p2".into(),
+                name: "p2".into(),
+                workdir: "C:/nonexistent-dir-for-orch-test".into(),
+                source: None,
+                harness: "no-such-harness".into(),
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: Some(0),
+            })
+            .await
+            .unwrap();
+        let root = submit_with_plan(
+            &cp,
+            "p2",
+            "doomed goal",
+            vec![PlannedTask {
+                title: "will not start".into(),
+                body: "x".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+        )
+        .await
+        .unwrap();
+
+        let failed = drive_until(&cp, &root, "failed", 10_000).await;
+        assert!(
+            failed.error.as_deref().unwrap_or("").contains("subtasks failed"),
+            "{:?}",
+            failed.error
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_without_decompose_queues_a_single_child() {
+        let (cp, _repo) = cp_with_project().await;
+        let root = submit(&cp, "p1", "just do it", false).await.unwrap();
+        let tasks = list_tasks(cp.store(), Some(&root)).await.unwrap();
+        let (roots, children): (Vec<_>, Vec<_>) =
+            tasks.into_iter().partition(|t| t.root_id.is_none());
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].status, "waiting");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, "todo");
+        assert_eq!(children[0].body, "just do it");
+        // Unknown projects are rejected up front.
+        assert!(submit(&cp, "nope", "x", false).await.is_err());
     }
 
     #[tokio::test]

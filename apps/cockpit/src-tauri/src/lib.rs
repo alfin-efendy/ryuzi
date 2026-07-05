@@ -333,6 +333,8 @@ pub fn run() {
             // The scheduler loop fires enabled jobs for real (30s tick). Runs
             // on the tauri async runtime — setup() has no ambient tokio context.
             tauri::async_runtime::spawn(ryuzi_core::scheduler::run_loop(cp.clone()));
+            // The orch dispatcher drives auto-decomposed task graphs (5s tick).
+            tauri::async_runtime::spawn(ryuzi_core::orch::run_loop(cp.clone()));
             // Capture clones BEFORE app.manage(cp) moves the Arc away.
             let cp2 = cp.clone();
             // Make Arc<ControlPlane> available to all Tauri commands.
