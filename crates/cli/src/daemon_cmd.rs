@@ -566,6 +566,7 @@ impl CanaryHost for ProdCanaryHost {
 /// `std::process::exit(0)`. Both signals share one reentrancy guard and one
 /// `Daemon`/`UpdateManager` handle so whichever fires first wins and the
 /// other is a no-op.
+#[cfg(unix)]
 fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -598,6 +599,31 @@ fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Ar
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     tokio::spawn(async move {
         sigint.recv().await;
+        shutdown_once(
+            &dir,
+            &stopping,
+            async {
+                if let Some(u) = &updater {
+                    u.stop();
+                }
+                daemon.stop().await;
+                Ok(())
+            },
+            |c| std::process::exit(c),
+        )
+        .await;
+    });
+}
+
+/// Windows has no SIGTERM; Ctrl-C / console-close both surface through
+/// `tokio::signal::ctrl_c`, driving the same [`shutdown_once`] teardown.
+/// (This also lets `ryuzi-cli` build natively on Windows instead of only
+/// through the zigbuild cross-compile.)
+#[cfg(windows)]
+fn install_signal_handlers(dir: PathBuf, daemon: Arc<Daemon>, updater: Option<Arc<UpdateManager>>) {
+    let stopping = Arc::new(AtomicBool::new(false));
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
         shutdown_once(
             &dir,
             &stopping,
