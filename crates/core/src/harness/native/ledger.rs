@@ -7,10 +7,13 @@ use crate::store::Store;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-/// An in-memory + persisted conversation history for one session.
+/// An in-memory conversation history for one session, optionally persisted to
+/// the `provider_turns` table. Sub-agents use an ephemeral (unpersisted)
+/// ledger so their internal turns don't pollute the parent session's history.
 pub struct Ledger {
     session_pk: String,
-    store: Arc<Store>,
+    /// `None` for an ephemeral (sub-agent) ledger.
+    store: Option<Arc<Store>>,
     /// Anthropic messages: `{role, content:[...]}` objects.
     turns: Vec<Value>,
 }
@@ -25,9 +28,18 @@ impl Ledger {
             .collect();
         Ok(Ledger {
             session_pk: session_pk.to_string(),
-            store,
+            store: Some(store),
             turns,
         })
+    }
+
+    /// A fresh, unpersisted ledger (for sub-agent runs).
+    pub fn ephemeral(session_pk: &str) -> Ledger {
+        Ledger {
+            session_pk: session_pk.to_string(),
+            store: None,
+            turns: Vec::new(),
+        }
     }
 
     /// Append a user turn (content = Anthropic content-block array).
@@ -41,13 +53,15 @@ impl Ledger {
     }
 
     async fn append(&mut self, role: &str, content: Value) -> anyhow::Result<()> {
-        self.store
-            .insert_provider_turn(NewProviderTurn::new(
-                self.session_pk.clone(),
-                role,
-                content.clone(),
-            ))
-            .await?;
+        if let Some(store) = &self.store {
+            store
+                .insert_provider_turn(NewProviderTurn::new(
+                    self.session_pk.clone(),
+                    role,
+                    content.clone(),
+                ))
+                .await?;
+        }
         self.turns.push(json!({ "role": role, "content": content }));
         Ok(())
     }

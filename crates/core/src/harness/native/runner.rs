@@ -2,16 +2,19 @@
 //! the model, executing tools, and persisting + streaming everything through
 //! the same [`CoreEvent`] surface the ACP harness uses.
 
+use super::agents::{Agent, AgentRegistry};
+use super::commands::CommandRegistry;
 use super::ledger::Ledger;
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
-use super::tools::{OutputCaps, ToolCtx, ToolRegistry};
+use super::tools::{OutputCaps, SubagentSpawner, ToolCtx, ToolRegistry};
 use super::{context, NATIVE_ID};
 use crate::approval::ApprovalHub;
 use crate::domain::{CoreEvent, NewMessage, PermMode};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
 use crate::store::Store;
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -28,7 +31,9 @@ const MAX_TOKENS: i64 = 8192;
 const TEXT_FLUSH_BYTES: usize = 120;
 
 /// Everything one native session needs to run turns. Built by
-/// [`super::NativeHarness::start_session`].
+/// [`super::NativeHarness::start_session`]. Cloneable so a sub-agent spawner
+/// can carry a copy.
+#[derive(Clone)]
 pub struct RunnerDeps {
     pub session_pk: String,
     pub work_dir: PathBuf,
@@ -40,16 +45,36 @@ pub struct RunnerDeps {
     pub approvals: Arc<ApprovalHub>,
     pub llm: Arc<dyn LlmStream>,
     pub tools: Arc<ToolRegistry>,
+    /// The selected primary agent for this session.
+    pub agent: Agent,
+    /// Available agents (for sub-agent spawning).
+    pub agents: Arc<AgentRegistry>,
+    /// Available slash commands.
+    pub commands: Arc<CommandRegistry>,
 }
 
 /// Run one prompt to completion. Returns `Ok(())` once the turn settles
 /// (end_turn / cancellation); the control plane then emits `CoreEvent::Result`.
+///
+/// Resolves a leading slash command (expanding its template and any agent
+/// override), persists the user's display row, then drives the agentic loop.
 pub async fn run_turn(
     deps: &RunnerDeps,
     prompt: TurnPrompt,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    // 1. Persist + broadcast the user's message (display text).
+    // Slash-command resolution on the raw user text.
+    let (agent_text, agent) = match deps.commands.resolve(&prompt.display) {
+        Some((expanded, override_agent)) => {
+            let agent = override_agent
+                .and_then(|n| deps.agents.get(&n))
+                .unwrap_or_else(|| deps.agent.clone());
+            (expanded, agent)
+        }
+        None => (prompt.agent.clone(), deps.agent.clone()),
+    };
+
+    // 1. Persist + broadcast the user's message (raw display text).
     emit_row(
         deps,
         "user",
@@ -64,17 +89,52 @@ pub async fn run_turn(
     // 2. Load history and append the user turn to the ledger.
     let mut ledger = Ledger::load(deps.store.clone(), &deps.session_pk).await?;
     ledger
-        .append_user(json!([{ "type": "text", "text": prompt.agent }]))
+        .append_user(json!([{ "type": "text", "text": agent_text }]))
         .await?;
 
-    let system = context::assemble_system(&deps.work_dir);
-    let tool_defs = deps.tools.definitions();
-    let model = deps.model.clone().unwrap_or_default();
+    // 3. Drive the loop with a spawner available for the `task` tool.
+    let spawn: Arc<dyn SubagentSpawner> = Arc::new(RunnerSpawner {
+        deps: deps.clone(),
+        cancel: cancel.clone(),
+    });
+    drive(deps, &agent, &mut ledger, &cancel, Some(spawn), true).await?;
+    Ok(())
+}
 
-    // 3. Provider-turn loop.
+/// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
+/// `emit_display` gates persistence of display rows (off for sub-agents so
+/// their internal steps don't clutter the parent transcript). Returns the
+/// final assistant text.
+async fn drive(
+    deps: &RunnerDeps,
+    agent: &Agent,
+    ledger: &mut Ledger,
+    cancel: &CancellationToken,
+    spawn: Option<Arc<dyn SubagentSpawner>>,
+    emit_display: bool,
+) -> anyhow::Result<String> {
+    let system = match &agent.prompt {
+        Some(p) => p.clone(),
+        None => context::assemble_system(&deps.work_dir),
+    };
+    // Tools restricted to what this agent may use.
+    let tool_defs: Vec<Value> = deps
+        .tools
+        .definitions()
+        .into_iter()
+        .filter(|d| {
+            d.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| agent.tools.allows(n))
+                .unwrap_or(false)
+        })
+        .collect();
+    let model = deps.model.clone().unwrap_or_default();
+    let mut final_text = String::new();
+
     for _ in 0..MAX_PROVIDER_TURNS {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(final_text);
         }
         let body = json!({
             "model": model,
@@ -93,12 +153,12 @@ pub async fn run_turn(
             if cancel.is_cancelled() {
                 // Mid-stream cancel: the assistant turn was not appended, so the
                 // ledger still ends at the user turn — valid for a later resume.
-                return Ok(());
+                return Ok(final_text);
             }
             let ev = match item {
                 Ok(ev) => ev,
                 Err(e) => {
-                    flush_text(deps, &mut text_buf).await;
+                    flush_text(deps, &mut text_buf, emit_display).await;
                     return Err(e);
                 }
             };
@@ -110,20 +170,22 @@ pub async fn run_turn(
                     turn.text.push_str(&text);
                     text_buf.push_str(&text);
                     if text_buf.len() >= TEXT_FLUSH_BYTES || text_buf.contains('\n') {
-                        flush_text(deps, &mut text_buf).await;
+                        flush_text(deps, &mut text_buf, emit_display).await;
                     }
                 }
                 MessageStreamEvent::ThinkingDelta { text, .. } => {
-                    emit_row(
-                        deps,
-                        "assistant",
-                        "thought",
-                        json!({ "text": text }),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                    if emit_display {
+                        emit_row(
+                            deps,
+                            "assistant",
+                            "thought",
+                            json!({ "text": text }),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    }
                 }
                 MessageStreamEvent::ContentBlockStart { index, block } => {
                     if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
@@ -158,7 +220,7 @@ pub async fn run_turn(
                     turn.stop_reason = stop_reason;
                 }
                 MessageStreamEvent::Error(msg) => {
-                    flush_text(deps, &mut text_buf).await;
+                    flush_text(deps, &mut text_buf, emit_display).await;
                     anyhow::bail!("{msg}");
                 }
                 MessageStreamEvent::MessageStop => break,
@@ -166,7 +228,10 @@ pub async fn run_turn(
                 | MessageStreamEvent::ContentBlockStop { .. } => {}
             }
         }
-        flush_text(deps, &mut text_buf).await;
+        flush_text(deps, &mut text_buf, emit_display).await;
+        if !turn.text.is_empty() {
+            final_text = turn.text.clone();
+        }
 
         // Assemble the assistant turn's content for the ledger.
         let mut content: Vec<Value> = Vec::new();
@@ -182,49 +247,102 @@ pub async fn run_turn(
                 "input": t.parsed_input(),
             }));
         }
-        // An empty assistant turn (no text, no tools) still needs a body.
         if content.is_empty() {
             content.push(json!({ "type": "text", "text": "" }));
         }
         ledger.append_assistant(json!(content)).await?;
 
         if tool_calls.is_empty() {
-            return Ok(()); // end_turn (or max_tokens with no tools)
+            return Ok(final_text); // end_turn
         }
 
         // Execute each tool call, collecting tool_result blocks.
         let mut results: Vec<Value> = Vec::new();
         for (i, t) in tool_calls.iter().enumerate() {
             if cancel.is_cancelled() {
-                // Fill this and every remaining tool_use with an interrupted
-                // result so the appended user turn stays provider-valid.
                 for rest in &tool_calls[i..] {
                     results.push(tool_result(&rest.id, "Interrupted by user", true));
                 }
                 break;
             }
-            results.push(run_tool_call(deps, t).await);
+            results.push(run_tool_call(deps, agent, t, emit_display, &spawn).await);
         }
         ledger.append_user(json!(results)).await?;
 
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(final_text);
         }
     }
-    Ok(())
+    Ok(final_text)
 }
 
-/// Insert the tool_call row, gate it, execute, and update the row. Returns the
-/// Anthropic `tool_result` block to append to the ledger.
-async fn run_tool_call(deps: &RunnerDeps, t: &ToolAccum) -> Value {
+/// A [`SubagentSpawner`] backed by the runner: runs a sub-agent in an ephemeral
+/// (unpersisted-history) sub-loop and returns its final text.
+struct RunnerSpawner {
+    deps: RunnerDeps,
+    cancel: CancellationToken,
+}
+
+#[async_trait]
+impl SubagentSpawner for RunnerSpawner {
+    async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String> {
+        let agent = self
+            .deps
+            .agents
+            .get(agent_type)
+            .filter(|a| a.mode.is_subagent())
+            .ok_or_else(|| anyhow::anyhow!("unknown sub-agent `{agent_type}`"))?;
+        let mut ledger = Ledger::ephemeral(&self.deps.session_pk);
+        ledger
+            .append_user(json!([{ "type": "text", "text": prompt }]))
+            .await?;
+        // No nested spawner (depth 1), no display rows.
+        drive(&self.deps, &agent, &mut ledger, &self.cancel, None, false).await
+    }
+
+    fn available(&self) -> Vec<String> {
+        self.deps
+            .agents
+            .subagents()
+            .into_iter()
+            .map(|a| a.name)
+            .collect()
+    }
+}
+
+/// Insert the tool_call row (if displaying), gate it, execute, and update the
+/// row. Returns the Anthropic `tool_result` block to append to the ledger.
+async fn run_tool_call(
+    deps: &RunnerDeps,
+    agent: &Agent,
+    t: &ToolAccum,
+    emit_display: bool,
+    spawn: &Option<Arc<dyn SubagentSpawner>>,
+) -> Value {
     let input = t.parsed_input();
     let Some(tool) = deps.tools.get(&t.name) else {
         let msg = format!("unknown tool `{}`", t.name);
-        insert_tool_row(deps, t, &input, "unknown").await;
-        finish_tool_row(deps, &t.id, &msg, true).await;
+        if emit_display {
+            insert_tool_row(deps, t, &input, "unknown").await;
+            finish_tool_row(deps, &t.id, &msg, true).await;
+        }
         return tool_result(&t.id, &msg, true);
     };
-    insert_tool_row(deps, t, &input, tool.kind()).await;
+    // Enforce the agent's tool allow-list.
+    if !agent.tools.allows(&t.name) {
+        let msg = format!(
+            "tool `{}` is not permitted for the `{}` agent",
+            t.name, agent.name
+        );
+        if emit_display {
+            insert_tool_row(deps, t, &input, tool.kind()).await;
+            finish_tool_row(deps, &t.id, &msg, true).await;
+        }
+        return tool_result(&t.id, &msg, true);
+    }
+    if emit_display {
+        insert_tool_row(deps, t, &input, tool.kind()).await;
+    }
 
     // Permission gate.
     let spec = tool.permission(&input);
@@ -240,7 +358,9 @@ async fn run_tool_call(deps: &RunnerDeps, t: &ToolAccum) -> Value {
     .await;
     if decision == PermDecision::Deny {
         let msg = "Denied by user";
-        finish_tool_row(deps, &t.id, msg, true).await;
+        if emit_display {
+            finish_tool_row(deps, &t.id, msg, true).await;
+        }
         return tool_result(&t.id, msg, true);
     }
 
@@ -251,16 +371,27 @@ async fn run_tool_call(deps: &RunnerDeps, t: &ToolAccum) -> Value {
         store: deps.store.clone(),
         cancel: CancellationToken::new(),
         caps: OutputCaps::default(),
+        spawn: spawn.clone(),
     };
     match tool.execute(&ctx, input).await {
         Ok(out) => {
-            finish_tool_row_with_display(deps, &t.id, &out.for_model, out.is_error, out.display)
+            if emit_display {
+                finish_tool_row_with_display(
+                    deps,
+                    &t.id,
+                    &out.for_model,
+                    out.is_error,
+                    out.display,
+                )
                 .await;
+            }
             tool_result(&t.id, &out.for_model, out.is_error)
         }
         Err(e) => {
             let msg = format!("{}: {e}", t.name);
-            finish_tool_row(deps, &t.id, &msg, true).await;
+            if emit_display {
+                finish_tool_row(deps, &t.id, &msg, true).await;
+            }
             tool_result(&t.id, &msg, true)
         }
     }
@@ -321,22 +452,25 @@ async fn finish_tool_row_with_display(
     }
 }
 
-/// Flush any buffered streaming text as one delta-shaped `text` row.
-async fn flush_text(deps: &RunnerDeps, buf: &mut String) {
+/// Flush any buffered streaming text as one delta-shaped `text` row (only when
+/// displaying — sub-agents keep their text internal).
+async fn flush_text(deps: &RunnerDeps, buf: &mut String, emit_display: bool) {
     if buf.is_empty() {
         return;
     }
     let text = std::mem::take(buf);
-    emit_row(
-        deps,
-        "assistant",
-        "text",
-        json!({ "text": text }),
-        None,
-        None,
-        None,
-    )
-    .await;
+    if emit_display {
+        emit_row(
+            deps,
+            "assistant",
+            "text",
+            json!({ "text": text }),
+            None,
+            None,
+            None,
+        )
+        .await;
+    }
 }
 
 /// Persist a message row and broadcast the matching `CoreEvent::Message`.
@@ -515,6 +649,8 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
         let (events, _rx) = broadcast::channel(256);
+        let agents = Arc::new(AgentRegistry::builtin());
+        let agent = agents.default_agent();
         RunnerDeps {
             session_pk: "s1".into(),
             work_dir: dir.to_path_buf(),
@@ -527,6 +663,9 @@ mod tests {
             approvals: Arc::new(ApprovalHub::new()),
             llm,
             tools: Arc::new(ToolRegistry::builtin()),
+            agent,
+            agents,
+            commands: Arc::new(CommandRegistry::builtin()),
         }
     }
 
@@ -633,6 +772,103 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn task_tool_spawns_subagent_and_returns_its_report() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parent turn: call the `task` tool delegating to `explore`.
+        let parent = vec![
+            tool_use_start(0, "call-1", "task"),
+            input_json_delta(
+                0,
+                "{\"subagent_type\":\"explore\",\"prompt\":\"find the readme\"}",
+            ),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // After the tool_result comes back, the parent ends the turn.
+        let parent_end = vec![
+            text_delta("all set"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        // The sub-agent (explore) runs one turn and reports.
+        let sub = vec![
+            text_delta("The readme is README.md"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        // ScriptedLlm serves turns in order across BOTH parent and sub-agent
+        // stream() calls: parent turn 1, then the sub-agent's turn, then the
+        // parent's continuation.
+        let llm = Arc::new(ScriptedLlm::new(vec![parent, sub, parent_end]));
+        let deps = deps_at(dir.path(), llm).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                agent: "where is the readme?".into(),
+                display: "where is the readme?".into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        // The task tool_call row carries the sub-agent's report as output.
+        let task_row = msgs
+            .iter()
+            .find(|m| m.block_type == "tool_call" && m.payload["name"] == "task")
+            .expect("a task tool_call row");
+        assert_eq!(task_row.status.as_deref(), Some("completed"));
+        assert!(task_row.payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("README.md"));
+        // The sub-agent's internal text is NOT persisted as a parent row.
+        assert!(!msgs
+            .iter()
+            .any(|m| m.block_type == "text" && m.payload["text"] == "The readme is README.md"));
+        // The parent's own closing text is present.
+        assert!(msgs
+            .iter()
+            .any(|m| m.block_type == "text" && m.payload["text"] == "all set"));
+    }
+
+    #[tokio::test]
+    async fn slash_command_expands_and_switches_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        // /review pins the plan agent (read-only). The model just ends the turn.
+        let turn = vec![
+            text_delta("reviewed"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                agent: "/review".into(),
+                display: "/review".into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // The display row keeps the raw "/review"; the ledger's user turn holds
+        // the expanded template.
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        assert_eq!(msgs[0].payload["text"], "/review");
+        let turns = deps.store.list_provider_turns("s1").await.unwrap();
+        assert!(turns[0].payload[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Review the current working changes"));
     }
 
     #[tokio::test]

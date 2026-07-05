@@ -10,6 +10,8 @@
 //!
 //! See `docs/design/2026-07-05-native-agent-runtime-design.md`.
 
+pub mod agents;
+pub mod commands;
 pub mod context;
 pub mod ledger;
 pub mod llm;
@@ -61,6 +63,10 @@ impl Default for NativeHarness {
 impl Harness for NativeHarness {
     async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
         let llm = self.llm_factory.create(ctx.store.clone());
+        // Discover agents + slash commands from the worktree (and global config).
+        let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
+        let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
+        let agent = agents.default_agent();
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             deps: runner::RunnerDeps {
@@ -74,6 +80,9 @@ impl Harness for NativeHarness {
                 approvals: ctx.approvals,
                 llm,
                 tools: self.tools.clone(),
+                agent,
+                agents,
+                commands,
             },
             live_cancel: Mutex::new(None),
         }))

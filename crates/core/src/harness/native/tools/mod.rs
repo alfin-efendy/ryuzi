@@ -23,6 +23,7 @@ pub mod glob;
 pub mod grep;
 pub mod ls;
 pub mod read;
+pub mod task;
 pub mod todo;
 pub mod webfetch;
 pub mod write;
@@ -43,6 +44,16 @@ impl Default for OutputCaps {
     }
 }
 
+/// Spawns a sub-agent for the `task` tool. Implemented by the runner; `None`
+/// inside a sub-agent's own `ToolCtx` (sub-agents cannot nest further).
+#[async_trait]
+pub trait SubagentSpawner: Send + Sync {
+    /// Run `agent_type` on `prompt` to completion and return its final text.
+    async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String>;
+    /// Names of agents that may be spawned (for the tool description/errors).
+    fn available(&self) -> Vec<String>;
+}
+
 /// Everything a tool needs to run one call.
 pub struct ToolCtx {
     pub session_pk: String,
@@ -51,6 +62,8 @@ pub struct ToolCtx {
     pub store: Arc<Store>,
     pub cancel: CancellationToken,
     pub caps: OutputCaps,
+    /// Sub-agent spawner for the `task` tool; `None` disables spawning.
+    pub spawn: Option<Arc<dyn SubagentSpawner>>,
 }
 
 /// The result of a tool call.
@@ -144,6 +157,7 @@ impl ToolRegistry {
             Arc::new(todo::TodoWrite),
             Arc::new(todo::TodoRead),
             Arc::new(webfetch::WebFetch),
+            Arc::new(task::Task),
         ];
         let mut tools = BTreeMap::new();
         for t in list {
@@ -228,6 +242,7 @@ pub(crate) mod testutil {
             store,
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),
+            spawn: None,
         }
     }
 }
@@ -288,11 +303,12 @@ mod tests {
             "todowrite",
             "todoread",
             "webfetch",
+            "task",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 10);
+        assert_eq!(defs.len(), 11);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));
