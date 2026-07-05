@@ -149,6 +149,40 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<ConnectionInfo>> {
         .collect())
 }
 
+/// Pick out the ids of OTHER kiro connections that are dead
+/// (`needs_relogin == Some(true)`) and should be cleared once a fresh kiro
+/// connection (`keep_id`) has been persisted. Split out from
+/// [`remove_dead_kiro_connections`] so the actual selection logic — the fix
+/// for the reconnect-shadow bug below — is unit-testable without a live
+/// `Store`. Never selects `keep_id` itself, never selects a healthy kiro row
+/// (`needs_relogin` `None`/`false`), and never selects a non-kiro row.
+fn dead_kiro_connection_ids(rows: &[ConnectionRow], keep_id: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.provider == "kiro" && r.id != keep_id && r.data.needs_relogin == Some(true))
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+/// After persisting a fresh kiro connection (`keep_id`) via
+/// [`await_kiro_device_flow`] or [`import_kiro_token`], remove any OTHER
+/// kiro connection still flagged `needs_relogin`.
+///
+/// Without this cleanup, reconnecting Kiro doesn't actually fix anything:
+/// `add_connection` always appends the new row at `MAX(priority)+1`, so the
+/// OLD dead `needs_relogin` row keeps its lower priority and stays
+/// `enabled`. `route_model` (server.rs) returns the FIRST enabled
+/// connection for a provider ordered by `priority ASC`, so it keeps
+/// resolving to the stale row and every kiro request keeps 401ing — the
+/// app's own "Reconnect" / "Import from Kiro IDE" flow would silently leave
+/// the user in a still-broken state until they manually deleted the old row.
+async fn remove_dead_kiro_connections(cp: &ControlPlane, keep_id: &str) -> anyhow::Result<()> {
+    let rows = connections::list_connections(cp.store()).await?;
+    for id in dead_kiro_connection_ids(&rows, keep_id) {
+        connections::remove_connection(cp.store(), &id).await?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
@@ -436,6 +470,64 @@ mod tests {
             Some(("cid-1".to_string(), "secret-1".to_string()))
         );
     }
+
+    fn kiro_row(id: &str, needs_relogin: Option<bool>) -> ConnectionRow {
+        ConnectionRow {
+            id: id.into(),
+            provider: "kiro".into(),
+            auth_type: "oauth".into(),
+            label: "Kiro".into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                needs_relogin,
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// The reconnect-shadow fix, isolated from the store: reconnecting Kiro
+    /// (device flow or import) must clear ONLY the other dead kiro rows —
+    /// not the just-created row, not a healthy kiro row, and not a dead row
+    /// belonging to some other provider.
+    #[test]
+    fn dead_kiro_connection_ids_targets_only_other_dead_kiro_rows() {
+        let rows = vec![
+            kiro_row("dead-1", Some(true)),
+            kiro_row("healthy-none", None),
+            kiro_row("healthy-false", Some(false)),
+            kiro_row("new-1", Some(true)), // the just-persisted row itself
+            ConnectionRow {
+                id: "other-provider-dead".into(),
+                provider: "anthropic-oauth".into(),
+                auth_type: "oauth".into(),
+                label: "Other".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    needs_relogin: Some(true),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        ];
+        assert_eq!(
+            dead_kiro_connection_ids(&rows, "new-1"),
+            vec!["dead-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn dead_kiro_connection_ids_empty_when_no_dead_rows() {
+        let rows = vec![
+            kiro_row("healthy-1", None),
+            kiro_row("healthy-2", Some(false)),
+        ];
+        assert!(dead_kiro_connection_ids(&rows, "healthy-1").is_empty());
+    }
 }
 
 /// Drive the full interactive OAuth flow: binds a loopback listener, opens
@@ -719,10 +811,11 @@ pub async fn await_kiro_device_flow(
         .unwrap_or_else(|| connections::default_profile_arn("builder-id").to_string());
 
     let now = ryuzi_core::paths::now_ms();
+    let new_id = ryuzi_core::paths::new_id();
     connections::add_connection(
         cp.store(),
         ConnectionRow {
-            id: ryuzi_core::paths::new_id(),
+            id: new_id.clone(),
             provider: "kiro".into(),
             auth_type: "oauth".into(),
             label,
@@ -747,6 +840,11 @@ pub async fn await_kiro_device_flow(
         },
     )
     .await?;
+    // Sign-in via device flow succeeded — any OTHER kiro row still marked
+    // `needs_relogin` is now dead weight that would otherwise keep
+    // shadowing this fresh connection in `route_model`. See
+    // `remove_dead_kiro_connections`.
+    remove_dead_kiro_connections(&cp, &new_id).await?;
     Ok(assemble(&cp).await?)
 }
 
@@ -801,8 +899,9 @@ pub async fn import_kiro_token(
     }
 
     let now = ryuzi_core::paths::now_ms();
+    let new_id = ryuzi_core::paths::new_id();
     let mut row = ConnectionRow {
-        id: ryuzi_core::paths::new_id(),
+        id: new_id.clone(),
         provider: "kiro".into(),
         auth_type: "oauth".into(),
         label,
@@ -818,6 +917,11 @@ pub async fn import_kiro_token(
     };
 
     let http = reqwest::Client::new();
+    // This refreshes `row` IN MEMORY before it's ever inserted: `row.id` isn't
+    // in the DB yet, so `force_refresh`'s internal `update_connection` (an
+    // UPDATE-by-id) is a harmless 0-row no-op here — the fresh access token
+    // it mints is captured straight into `row.data` and only actually
+    // persisted by the `add_connection` call below.
     oauth::refresh::force_refresh(cp.store(), &http, &mut row)
         .await
         .map_err(|e| CmdError {
@@ -825,5 +929,9 @@ pub async fn import_kiro_token(
         })?;
 
     connections::add_connection(cp.store(), row).await?;
+    // Import succeeded — clear any OTHER dead kiro row so it doesn't keep
+    // shadowing this fresh connection in `route_model`. See
+    // `remove_dead_kiro_connections`.
+    remove_dead_kiro_connections(&cp, &new_id).await?;
     Ok(assemble(&cp).await?)
 }

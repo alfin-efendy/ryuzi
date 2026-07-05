@@ -238,7 +238,7 @@ fn first_nonempty_profile_arn(json: &serde_json::Value) -> Option<String> {
         .find_map(|p| {
             p.get("arn")
                 .and_then(|v| v.as_str())
-                .filter(|arn| !arn.is_empty())
+                .filter(|arn| !arn.trim().is_empty())
         })
         .map(String::from)
 }
@@ -524,6 +524,7 @@ mod tests {
         let json = serde_json::json!({
             "profiles": [
                 {"arn": ""},
+                {"arn": "   "},
                 {"arn": "arn:aws:codewhisperer:us-east-1:123:profile/abc"},
                 {"arn": "arn:aws:codewhisperer:us-east-1:123:profile/def"},
             ]
@@ -543,6 +544,13 @@ mod tests {
         );
         assert_eq!(
             first_nonempty_profile_arn(&serde_json::json!({"profiles": [{"arn": ""}]})),
+            None
+        );
+        // Whitespace-only ARN must be treated the same as empty — matches
+        // `kiro_profile_arn`/`kiro_region`/import normalization, which all
+        // trim before checking emptiness.
+        assert_eq!(
+            first_nonempty_profile_arn(&serde_json::json!({"profiles": [{"arn": "   "}]})),
             None
         );
     }

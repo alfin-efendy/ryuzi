@@ -1126,7 +1126,11 @@ impl KiroToOpenAiStream {
                         }
                         let args = match item.get("input") {
                             Some(Value::String(s)) => Some(s.clone()),
-                            Some(v) if v.is_object() => {
+                            // Matches 9router's `typeof input === "object"`
+                            // gate, which is also true for JSON arrays — a
+                            // bare array `input` must be stringified into an
+                            // arguments delta too, not silently dropped.
+                            Some(v) if v.is_object() || v.is_array() => {
                                 Some(serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
                             }
                             _ => None,
@@ -1564,6 +1568,22 @@ mod tests {
             out.last().unwrap()["choices"][0]["finish_reason"],
             "tool_calls"
         );
+    }
+
+    #[test]
+    fn tool_use_array_input_is_stringified_not_dropped() {
+        let mut s = KiroToOpenAiStream::new("m");
+        let out = s.feed(&frame(
+            "toolUseEvent",
+            json!({ "toolUseId": "t1", "name": "batch", "input": ["a", "b", 1] }),
+        ));
+        let args: String = out
+            .iter()
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .collect();
+        assert_eq!(args, "[\"a\",\"b\",1]");
     }
 
     #[test]
