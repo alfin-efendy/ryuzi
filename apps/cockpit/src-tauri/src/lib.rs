@@ -137,12 +137,18 @@ fn resolve_claude_code_executable() -> Option<String> {
     None
 }
 
-/// Build the extension registries and install the `claude-agent-acp` harness
-/// integration with the resolved adapter path.
+/// Build the extension registries: the in-process `native` harness (needs no
+/// external binary) plus the `claude-agent-acp` harness with the resolved
+/// adapter path.
 ///
 /// `env_remove: ["CLAUDECODE"]` is required: the adapter checks for this
 /// variable to detect a nested Claude Code session and refuses to start.
 fn build_registries() -> Registries {
+    let mut registries = Registries::new();
+    // The native runtime needs no external binary — register it unconditionally
+    // so projects with `harness = "native"` work in the desktop app.
+    registries.install(&ryuzi_core::harness::native::NativeIntegration::new());
+
     let mut env = Vec::new();
     if let Some(cli) = resolve_claude_code_executable() {
         env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
@@ -156,7 +162,6 @@ fn build_registries() -> Registries {
         // inside a Claude Code session and refuses to start.
         env_remove: vec!["CLAUDECODE".to_string()],
     };
-    let mut registries = Registries::new();
     registries.install(&ClaudeCodeIntegration::new(descriptor));
     registries
 }
