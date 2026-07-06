@@ -19,7 +19,6 @@ export * from "./components/ui/form-field";
 export * from "./components/ui/input";
 export * from "./components/ui/menu-panel";
 export * from "./components/ui/modal";
-export * from "./components/ui/native-select";
 export * from "./components/ui/resizable";
 export * from "./components/ui/scroll-area";
 export * from "./components/ui/segmented";
