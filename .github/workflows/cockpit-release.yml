@@ -5,8 +5,10 @@ name: cockpit-release
 # + checksums onto that release. Called from release.yml on every CLI
 # release; dispatchable manually to (re)build installers for any release tag.
 #
-# Signing is READY but dormant: the Apple env vars below are empty until the
-# secrets exist, and Tauri skips signing when they are empty. Windows signing
+# Signing is READY but dormant: the Apple env vars are only exported when the
+# APPLE_CERTIFICATE secret exists (Tauri attempts codesigning whenever the
+# variable is PRESENT — even set-but-empty, which is what an absent secret
+# evaluates to; that broke the v0.5.0 macos build). Windows signing
 # additionally needs bundle.windows.signCommand in tauri.conf.json once a
 # certificate exists. Until then release notes must carry the Gatekeeper
 # (`xattr -d com.apple.quarantine`) / SmartScreen bypass instructions.
@@ -80,7 +82,13 @@ jobs:
           gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
             --pattern manifest.json --output crates/core/sidecar.manifest.json --clobber
           cat crates/core/sidecar.manifest.json
-      - name: Build installers
+      # Absent secrets evaluate to "" but the env var is still SET, and Tauri
+      # keys "should I sign?" on presence alone — it then feeds the empty cert
+      # to `security import`, which fails the build. Export the signing env
+      # only when the certificate secret actually exists.
+      - name: Export Apple signing env (only when the certificate secret exists)
+        if: matrix.slug == 'macos-universal'
+        shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -88,6 +96,20 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "No APPLE_CERTIFICATE secret — building unsigned."
+            exit 0
+          fi
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!name}" ] || continue
+            {
+              echo "${name}<<__SIGNING_EOF__"
+              printf '%s\n' "${!name}"
+              echo "__SIGNING_EOF__"
+            } >> "$GITHUB_ENV"
+          done
+      - name: Build installers
         run: bun run --cwd apps/cockpit tauri build ${{ matrix.args }}
       - name: Collect bundles
         shell: bash
