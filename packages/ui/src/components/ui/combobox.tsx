@@ -91,6 +91,8 @@ function Combobox({
   allowCreate = false,
   onCreate,
   searchThreshold = 6,
+  footer,
+  trigger,
   className,
 }: ComboboxProps) {
   const [query, setQuery] = React.useState("");
@@ -139,13 +141,22 @@ function Combobox({
         data-slot="combobox-trigger"
         aria-label={ariaLabel}
         className={cn(
-          buttonVariants({ variant: "outline" }),
-          "justify-between gap-2 font-normal data-placeholder:text-muted-foreground",
+          trigger !== undefined
+            ? "cursor-pointer rounded-lg text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+            : cn(buttonVariants({ variant: "outline" }), "justify-between gap-2 font-normal data-placeholder:text-muted-foreground"),
           className,
         )}
       >
-        <ComboboxPrimitive.Value placeholder={placeholder} />
-        <ChevronsUpDown aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+        {trigger !== undefined ? (
+          trigger
+        ) : (
+          <>
+            <span data-slot="combobox-value" className="truncate">
+              <ComboboxPrimitive.Value placeholder={placeholder} />
+            </span>
+            <ChevronsUpDown aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+          </>
+        )}
       </ComboboxPrimitive.Trigger>
       <ComboboxPrimitive.Portal>
         <ComboboxPrimitive.Positioner align="start" sideOffset={6} className="z-50 outline-none">
@@ -194,6 +205,11 @@ function Combobox({
                 )
               }
             </ComboboxPrimitive.List>
+            {footer !== undefined && (
+              <div data-slot="combobox-footer" className="border-t border-border p-1.5">
+                {footer}
+              </div>
+            )}
           </ComboboxPrimitive.Popup>
         </ComboboxPrimitive.Positioner>
       </ComboboxPrimitive.Portal>

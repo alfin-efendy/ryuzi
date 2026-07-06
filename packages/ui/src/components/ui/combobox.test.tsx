@@ -167,3 +167,30 @@ test("allowCreate: no Create item when the text matches an existing option", asy
   await waitFor(() => expect(screen.getByRole("option", { name: /Apple/ })).toBeTruthy());
   expect(screen.queryByRole("option", { name: /Create/ })).toBeNull();
 });
+
+test("footer renders as a pinned action row and is clickable", async () => {
+  const onOpenFolder = mock(() => {});
+  render(
+    <Combobox
+      options={few}
+      value={null}
+      onValueChange={() => {}}
+      aria-label="Project"
+      footer={
+        <button type="button" onClick={onOpenFolder}>
+          Open folder
+        </button>
+      }
+    />,
+  );
+  await openCombobox("Project");
+  fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
+  expect(onOpenFolder).toHaveBeenCalledTimes(1);
+});
+
+test("custom trigger content replaces the default button contents", () => {
+  render(<Combobox options={few} value={null} onValueChange={() => {}} aria-label="Branch" trigger={<span>main</span>} />);
+  const trigger = screen.getByRole("combobox", { name: "Branch" });
+  expect(trigger.textContent).toContain("main");
+  expect(trigger.querySelector('[data-slot="combobox-value"]')).toBeNull();
+});
