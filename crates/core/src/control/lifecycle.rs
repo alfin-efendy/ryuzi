@@ -3,7 +3,7 @@
 
 use super::{ControlPlane, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
-use crate::domain::{AttachmentRef, CoreEvent, PermMode, Project, Session, SessionStatus};
+use crate::domain::{AttachmentRef, CoreEvent, Project, Session, SessionStatus};
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::settings::SettingsStore;
