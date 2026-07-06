@@ -104,6 +104,7 @@ type NavState = {
   searchQuery: string;
   composerAgent: AgentId;
   composerBranch: string;
+  /** Model the next composed session should run on; null = project/runtime default. */
   composerModel: string | null;
   projectSettingsFor: string | null;
   view: () => View;
