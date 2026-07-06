@@ -87,6 +87,32 @@ pub struct Session {
     pub resume_attempts: i64,
 }
 
+/// How a new session's git workspace is prepared (branch controls).
+/// `Default` reproduces the legacy behavior: an isolated worktree on a fresh
+/// engine-named branch cut from the repo HEAD. Not part of the IPC surface —
+/// the cockpit's `GitOptions` (specta) converts into this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionGitOptions {
+    pub use_worktree: bool,
+    pub create_branch: bool,
+    /// User-typed branch name; `None` => auto `harness/{short}`.
+    pub branch_name: Option<String>,
+    /// Branch to cut from (`create_branch`) or run on (`!create_branch`);
+    /// `None` => repo HEAD / current branch (legacy behavior).
+    pub base_branch: Option<String>,
+}
+
+impl Default for SessionGitOptions {
+    fn default() -> Self {
+        SessionGitOptions {
+            use_worktree: true,
+            create_branch: true,
+            branch_name: None,
+            base_branch: None,
+        }
+    }
+}
+
 /// An MCP server the agent can use as tools (attached to an ACP session in Spec 3).
 ///
 /// After plugin `${auth}`/setting substitution, a resolved `McpServerSpec`'s
@@ -381,5 +407,16 @@ mod tests {
         assert_eq!(j["kind"], "sessionCreated");
         assert_eq!(j["session_pk"], "s1");
         assert_eq!(j["project_id"], "p1");
+    }
+
+    #[test]
+    fn session_git_options_default_matches_legacy_behavior() {
+        // Legacy behavior = isolated worktree on a fresh engine-named branch
+        // cut from the repo HEAD.
+        let d = SessionGitOptions::default();
+        assert!(d.use_worktree);
+        assert!(d.create_branch);
+        assert_eq!(d.branch_name, None);
+        assert_eq!(d.base_branch, None);
     }
 }
