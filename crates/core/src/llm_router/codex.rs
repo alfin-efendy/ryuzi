@@ -137,6 +137,9 @@ pub struct ResponsesToOpenAiStream {
     model: String,
     /// function_call item id -> tool_calls[] index, assigned first-seen.
     tool_index: HashMap<String, usize>,
+    /// tool_calls indices that received streamed argument deltas, so a
+    /// complete-arguments item (on `.done`) isn't emitted a second time.
+    tool_args_streamed: std::collections::HashSet<usize>,
     next_index: usize,
     has_tool_calls: bool,
     finished: bool,
@@ -146,7 +149,8 @@ pub struct ResponsesToOpenAiStream {
 
 impl ResponsesToOpenAiStream {
     pub fn new(model: &str) -> Self {
-        Self { model: model.to_string(), tool_index: HashMap::new(), next_index: 0,
+        Self { model: model.to_string(), tool_index: HashMap::new(),
+            tool_args_streamed: std::collections::HashSet::new(), next_index: 0,
             has_tool_calls: false, finished: false, input_tokens: 0, output_tokens: 0 }
     }
 
@@ -168,24 +172,44 @@ impl ResponsesToOpenAiStream {
                     out.push(self.chunk(json!({"reasoning_content": t}), None));
                 }
             }
-            "response.output_item.added" => {
+            "response.output_item.added" | "response.output_item.done" => {
                 let item = data.get("item").cloned().unwrap_or(Value::Null);
                 if item.get("type").and_then(Value::as_str) == Some("function_call") {
                     self.has_tool_calls = true;
-                    let id = item.get("call_id").and_then(Value::as_str)
-                        .or_else(|| item.get("id").and_then(Value::as_str))
-                        .unwrap_or("").to_string();
-                    let index = *self.tool_index.entry(id.clone()).or_insert_with(|| {
+                    // The args-delta events key by the ITEM id (`fc_…`); the
+                    // downstream tool_use must carry the `call_id` (`call_…`) so
+                    // a later tool_result links back. So index by item id but
+                    // EMIT the call_id. (Keying by call_id drops every args
+                    // delta — the "`path` is required" live failure.)
+                    let item_id = item.get("id").and_then(Value::as_str);
+                    let call_id = item.get("call_id").and_then(Value::as_str);
+                    let key = item_id.or(call_id).unwrap_or("").to_string();
+                    let emit_id = call_id.or(item_id).unwrap_or("").to_string();
+                    let is_new = !self.tool_index.contains_key(&key);
+                    let index = *self.tool_index.entry(key).or_insert_with(|| {
                         let i = self.next_index; self.next_index += 1; i });
                     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-                    out.push(self.chunk(json!({"tool_calls": [{"index": index, "id": id,
-                        "type": "function", "function": {"name": name, "arguments": ""}}]}), None));
+                    if is_new {
+                        out.push(self.chunk(json!({"tool_calls": [{"index": index, "id": emit_id,
+                            "type": "function", "function": {"name": name, "arguments": ""}}]}), None));
+                    }
+                    // Some responses carry the complete arguments string on the
+                    // item itself (esp. on `.done`) rather than only via deltas.
+                    // Emit it only if no deltas were streamed for this item, so
+                    // we never double-count.
+                    if let Some(args) = item.get("arguments").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        if !self.tool_args_streamed.contains(&index) {
+                            out.push(self.chunk(json!({"tool_calls": [{"index": index,
+                                "function": {"arguments": args}}]}), None));
+                        }
+                    }
                 }
             }
             "response.function_call_arguments.delta" => {
                 let id = data.get("item_id").and_then(Value::as_str).unwrap_or("");
                 if let Some(&index) = self.tool_index.get(id) {
                     if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                        self.tool_args_streamed.insert(index);
                         out.push(self.chunk(json!({"tool_calls": [{"index": index,
                             "function": {"arguments": delta}}]}), None));
                     }
@@ -518,15 +542,20 @@ mod tests {
 
     #[test]
     fn streamed_function_call_accumulates_and_finishes_as_tool_calls() {
+        // Real Codex frames use a DISTINCT item id (`fc_1`) and `call_id`
+        // (`call_1`): the item is announced with both, but the args-delta keys
+        // by the item id. The decoder must index by item id yet emit the
+        // call_id downstream — otherwise every args delta is dropped.
         let mut s = stream();
         let mut out = s.feed("response.output_item.added",
-            &json!({"item": {"type": "function_call", "call_id": "call_1", "name": "write"}}));
+            &json!({"item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "write"}}));
         out.extend(s.feed("response.function_call_arguments.delta",
-            &json!({"item_id": "call_1", "delta": "{\"path\":"})));
+            &json!({"item_id": "fc_1", "delta": "{\"path\":"})));
         out.extend(s.feed("response.function_call_arguments.delta",
-            &json!({"item_id": "call_1", "delta": "\"a.txt\"}"})));
+            &json!({"item_id": "fc_1", "delta": "\"a.txt\"}"})));
         out.extend(s.feed("response.completed",
             &json!({"response": {"usage": {"input_tokens": 12, "output_tokens": 7}}})));
+        // Downstream tool_use carries the call_id (`call_1`), not the item id.
         let start = out.iter().find(|c| c["choices"][0]["delta"]["tool_calls"][0]["id"] == "call_1").unwrap();
         assert_eq!(start["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "write");
         let args: String = out.iter()
