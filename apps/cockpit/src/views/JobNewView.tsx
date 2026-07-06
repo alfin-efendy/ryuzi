@@ -52,7 +52,10 @@ export function JobNewView() {
       if (cancelled) return;
       if (res.status === "ok") {
         setBranchList(res.data);
-        setBranch(res.data.current);
+        // A detached HEAD's "current" is a short commit id, not a branch name —
+        // preselecting it would let the user unknowingly create a branch named
+        // after a commit id. Leave the selection null; the placeholder shows.
+        if (!res.data.detached) setBranch(res.data.current);
       } else {
         toast.error("Couldn't list branches: " + res.error.message);
       }
