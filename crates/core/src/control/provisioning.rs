@@ -74,10 +74,10 @@ async fn run_git(args: &[&str]) -> anyhow::Result<()> {
 
 impl ControlPlane {
     /// Connect an existing local git repo as a project driven by the default
-    /// `claude-code` harness. Prefer [`connect_project_with_harness`] to select
-    /// a runtime.
+    /// `native` (Ryuzi) harness. Prefer [`connect_project_with_harness`] to
+    /// select a runtime.
     pub async fn connect_project(&self, workdir: &Path, name: &str) -> anyhow::Result<Project> {
-        self.connect_project_with_harness(workdir, name, "claude-code")
+        self.connect_project_with_harness(workdir, name, "native")
             .await
     }
 

@@ -182,7 +182,7 @@ impl HarnessFactory for FakeHarnessFactory {
     }
 }
 
-/// Build a `Registries` with a `claude-code` harness backed by the fake.
+/// Build a `Registries` with a `native` harness backed by the fake.
 fn registries(block_until_cancel: bool) -> Registries {
     registries_with(block_until_cancel, Counters::default())
 }
@@ -192,7 +192,7 @@ fn registries(block_until_cancel: bool) -> Registries {
 fn registries_with(block_until_cancel: bool, counters: Counters) -> Registries {
     let mut regs = Registries::new();
     regs.harness.register(
-        "claude-code",
+        "native",
         Arc::new(FakeHarnessFactory {
             block_until_cancel,
             counters,
@@ -417,7 +417,7 @@ async fn control_plane_with_failing_factory(
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
     regs.harness
-        .register("claude-code", Arc::new(FailingHarnessFactory));
+        .register("native", Arc::new(FailingHarnessFactory));
     let cp = ControlPlane::new(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
@@ -432,7 +432,7 @@ async fn seed_project(store: &Store, project_id: &str) {
             name: "demo".into(),
             workdir: "/tmp/demo".into(),
             source: None,
-            harness: "claude-code".into(),
+            harness: "native".into(),
             model: None,
             effort: None,
             perm_mode: PermMode::Default,
@@ -500,7 +500,7 @@ async fn unknown_harness_errors_cleanly() {
     let _guard = StateDirGuard::new();
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
-    // Empty registry → no harness registered under "claude-code".
+    // Empty registry → no harness registered under "native".
     let cp = ControlPlane::new(store, Registries::new()).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -514,6 +514,15 @@ async fn unknown_harness_errors_cleanly() {
         err.to_string().contains("unknown harness"),
         "expected a clear unknown-harness error, got: {err}"
     );
+}
+
+#[tokio::test]
+async fn connect_project_defaults_to_the_native_harness() {
+    let (cp, _store, _log, _db_guard) = fake_control_plane().await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+    assert_eq!(project.harness, "native");
 }
 
 #[tokio::test]
@@ -685,7 +694,7 @@ async fn failed_cold_resume_rolls_back_the_running_status() {
     let counters = Counters::default();
     let mut regs = Registries::new();
     regs.harness.register(
-        "claude-code",
+        "native",
         Arc::new(FailingResumeFactory {
             counters: counters.clone(),
         }),
