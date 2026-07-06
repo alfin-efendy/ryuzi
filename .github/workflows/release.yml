@@ -18,6 +18,31 @@ jobs:
       release_created: ${{ steps.rp.outputs['crates/cli--release_created'] }}
       tag_name: ${{ steps.rp.outputs['crates/cli--tag_name'] }}
     steps:
+      # skip-github-release packages never get tags from release-please (tags
+      # only come with GitHub releases), yet its fallback lookup for "last
+      # release" is the tag `<component>-v<manifest version>`. Without these
+      # tags, every release merge spawns a phantom release PR that restarts
+      # cockpit/core at 0.1.0 with a full-history changelog (that was PR #66).
+      # Anchor = the last commit that touched the manifest, i.e. the release
+      # commit that stamped the versions currently in it. Runs BEFORE the
+      # release-please step so the tags exist by the time it looks for them.
+      - name: Tag skipped packages (cockpit, core) so release-please keeps tracking them
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          anchor=$(gh api "repos/${GITHUB_REPOSITORY}/commits?path=.release-please-manifest.json&per_page=1" -q '.[0].sha')
+          manifest=$(gh api "repos/${GITHUB_REPOSITORY}/contents/.release-please-manifest.json?ref=${anchor}" -q '.content' | base64 -d)
+          for entry in "cockpit=apps/cockpit/src-tauri" "core=crates/core"; do
+            component="${entry%%=*}" path="${entry#*=}"
+            version=$(printf '%s' "$manifest" | jq -r --arg p "$path" '.[$p]')
+            tag="${component}-v${version}"
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+              echo "${tag} already exists"
+            else
+              gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${tag}" -f sha="${anchor}" >/dev/null
+              echo "created ${tag} @ ${anchor}"
+            fi
+          done
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: rp
         with:
