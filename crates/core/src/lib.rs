@@ -1,5 +1,6 @@
 pub mod approval;
 pub mod attachments;
+pub mod branches;
 pub mod connector;
 pub mod control;
 pub mod daemon;
