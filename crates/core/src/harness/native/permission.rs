@@ -48,8 +48,11 @@ pub async fn evaluate(
     events: &broadcast::Sender<CoreEvent>,
 ) -> PermDecision {
     let tool = key_to_policy_tool(&spec.key);
-    if decide_tool_permission(perm_mode, project_policy, tool) == PolicyOutcome::AutoAllow {
-        return PermDecision::Allow;
+    match decide_tool_permission(perm_mode, project_policy, tool) {
+        PolicyOutcome::AutoAllow => return PermDecision::Allow,
+        // Plan mode hard-denies mutations without a prompt.
+        PolicyOutcome::Deny => return PermDecision::Deny,
+        PolicyOutcome::Prompt => {}
     }
     // Prompt: register a pending approval, surface it, and await the reply.
     let rx = approvals.register(tool_call_id.to_string());
@@ -83,6 +86,21 @@ mod tests {
             assert_eq!(d, PermDecision::Allow, "key {key} should auto-allow");
         }
         assert!(!hub.has_pending(), "no prompt should have been registered");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_mutations_without_prompting_but_allows_reads() {
+        let hub = ApprovalHub::new();
+        let (tx, _rx) = broadcast::channel(4);
+        // Read-class tools still auto-allow under Plan.
+        let read = evaluate(&spec("read"), PermMode::Plan, None, "s", "t1", &hub, &tx).await;
+        assert_eq!(read, PermDecision::Allow);
+        // Edit + bash are hard-denied WITHOUT registering a prompt.
+        for key in ["edit", "bash"] {
+            let d = evaluate(&spec(key), PermMode::Plan, None, "s", "t2", &hub, &tx).await;
+            assert_eq!(d, PermDecision::Deny, "{key} must be denied in Plan mode");
+        }
+        assert!(!hub.has_pending(), "Plan denial must not prompt the user");
     }
 
     #[tokio::test]

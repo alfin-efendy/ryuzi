@@ -833,6 +833,82 @@ async fn oauth_anthropic_upstream_receives_bearer_beta_header_and_system_prompt(
     srv.stop().await;
 }
 
+#[tokio::test]
+async fn oauth_anthropic_cloaking_decloaks_tool_names_for_openai_clients() {
+    use axum::{routing::post, Json, Router};
+
+    let app = Router::new().route(
+        "/v1/messages",
+        post(|Json(body): Json<serde_json::Value>| async move {
+            assert_eq!(body["tools"][0]["name"], "lookup_ide");
+            Json(json!({
+                "id": "msg_tool", "type": "message", "role": "assistant",
+                "model": "mock-claude",
+                "content": [{"type": "tool_use", "id": "tu_1", "name": "lookup_ide", "input": {"q": "x"}}],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 3, "output_tokens": 2}
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = listener.local_addr().unwrap().port();
+    let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+    let now = chrono::Utc::now().timestamp_millis();
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "coauth-cloak".into(),
+            provider: "anthropic-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "claude sub".into(),
+            priority: 0,
+            enabled: true,
+            data: connections::ConnectionData {
+                access_token: Some("sk-ant-oat-test".into()),
+                refresh_token: Some("rt-secret".into()),
+                expires_at: Some(now + 30 * 24 * 3600 * 1000),
+                last_refresh_at: Some(now),
+                base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
+                models_override: Some(vec!["mock-claude".into()]),
+                provider_specific: Some(json!({"claudeCloaking": true})),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let key = keys::create_key(&store, "t").await.unwrap();
+    let srv = RouterServer::new(store.clone());
+    let port = srv.start(0).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .header("x-api-key", &key.key)
+        .json(&json!({"model": "anthropic-oauth/mock-claude",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {
+            "name": "lookup", "description": "Lookup data",
+            "parameters": {"type": "object"}
+        }}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let response_body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        response_body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
+
+    srv.stop().await;
+}
+
 /// Mock OAuth token endpoint for the reactive-401 test: records how many
 /// times it was hit and always returns a fresh access token. The router's
 /// per-`AppState` `oauth_token_url_override` (set via

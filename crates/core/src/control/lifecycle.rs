@@ -3,7 +3,7 @@
 
 use super::{ControlPlane, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
-use crate::domain::{AttachmentRef, CoreEvent, PermMode, Project, Session, SessionStatus};
+use crate::domain::{AttachmentRef, CoreEvent, Project, Session, SessionStatus};
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::settings::SettingsStore;
@@ -47,18 +47,22 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
 
-        // Projects without pinned settings inherit the default agent's
-        // configured model / permission mode (Runtime screen → real effect).
-        if project.model.is_none() || project.perm_mode == PermMode::Default {
-            if let Ok(defaults) = crate::runtimes::session_defaults(&self.store).await {
-                if project.model.is_none() {
-                    project.model = defaults.model;
-                }
-                if project.perm_mode == PermMode::Default {
-                    if let Some(pm) = defaults.perm_mode {
-                        project.perm_mode = pm;
-                    }
-                }
+        // A project without a pinned MODEL inherits THIS session's runtime
+        // config (Runtime screen → real effect), keyed off the project's own
+        // harness — otherwise a native session would inherit the Claude card's
+        // model and every turn would hit the Claude subscription.
+        //
+        // Permission mode is NOT inherited from the runtime card: the project's
+        // own `perm_mode` (set from the composer / project settings) is the
+        // single source of truth. `Default` means "Ask" (prompt before
+        // edits/commands) — inheriting the card's default (e.g. "Full") here is
+        // exactly what made a project set to Ask silently run without asking.
+        if project.model.is_none() {
+            let runtime_id = crate::runtimes::runtime_id_for_harness(&project.harness);
+            if let Ok(defaults) =
+                crate::runtimes::session_defaults_for(&self.store, runtime_id).await
+            {
+                project.model = defaults.model;
             }
         }
 
@@ -219,6 +223,14 @@ impl ControlPlane {
                 }
             }
         };
+        // Refresh the live session's permission mode from the project row so a
+        // change made in the composer/project settings between turns takes
+        // effect NOW — without this the warm handle keeps whatever mode it
+        // started with (ACP delegates permission externally, so its default
+        // no-op set_perm_mode simply does nothing).
+        if let Ok(Some(project)) = self.store.get_project(&session.project_id).await {
+            handle.set_perm_mode(project.perm_mode);
+        }
         let final_prompt = self
             .with_attachments(session_pk, &prompt.agent, attachments)
             .await;

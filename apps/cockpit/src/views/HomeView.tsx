@@ -13,7 +13,7 @@ import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
-import { HOME_SUGGESTIONS } from "@/constants";
+import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
 import { chatRuntimeOf, useRuntimes } from "@/store-runtimes";
 import { basename } from "@/lib/paths";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
@@ -184,10 +184,14 @@ export function HomeView() {
             >
               <Paperclip aria-hidden size={16} strokeWidth={2} />
             </Button>
-            <Button variant="ghost" className="font-medium" style={{ color: "#E8703A" }}>
+            <Button
+              variant="ghost"
+              className="font-medium"
+              title="Permission mode is set on the runtime"
+              style={{ color: agent?.permMode === "full" ? "#E8703A" : undefined }}
+            >
               <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-              Full access
-              <ChevronDown aria-hidden size={12} strokeWidth={2} className="size-3" />
+              {PERM_MODES.find((m) => m.id === agent?.permMode)?.label ?? "Ask"}
             </Button>
             <div className="flex-1" />
             <Button variant="ghost" onClick={() => setAgentMenuOpen((v) => !v)} className="font-semibold">

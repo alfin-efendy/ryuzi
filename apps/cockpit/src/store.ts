@@ -1,6 +1,15 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, events, type Project, type Session, type CoreEvent, type Message, type ChatRequestOptions } from "./bindings";
+import {
+  commands,
+  events,
+  type Project,
+  type Session,
+  type CoreEvent,
+  type Message,
+  type ChatRequestOptions,
+  type PermMode,
+} from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
 import type { Row } from "./lib/transcript";
@@ -33,6 +42,10 @@ type State = {
   refresh: () => Promise<void>;
   addProject: () => Promise<void>;
   setProjectHarness: (projectId: string, harness: string) => Promise<void>;
+  /** Pin (or clear, with null) the model future turns of this project use. */
+  setProjectModel: (projectId: string, model: string | null) => Promise<void>;
+  /** Change the permission mode future turns of this project run under. */
+  setProjectPermMode: (projectId: string, permMode: PermMode) => Promise<void>;
   start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
   send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
   stop: (sessionPk: string) => Promise<void>;
@@ -240,6 +253,30 @@ export const useStore = create<State>((set, get) => ({
       await get().refresh();
     } else if (res.status === "error") {
       toast.error("Couldn't change harness: " + res.error.message);
+    }
+  },
+
+  setProjectModel: async (projectId, model) => {
+    const project = get().projects.find((p) => p.projectId === projectId);
+    if (!project) return;
+    const next = model ?? null;
+    if ((project.model ?? null) === next) return;
+    // Optimistic paint so the composer label updates immediately.
+    set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, model: next } : p)) });
+    const res = await commands.updateProject(projectId, next, project.permMode, project.harness);
+    if (res.status === "error") {
+      toast.error("Couldn't set model: " + res.error.message);
+      await get().refresh();
+    }
+  },
+  setProjectPermMode: async (projectId, permMode) => {
+    const project = get().projects.find((p) => p.projectId === projectId);
+    if (!project || project.permMode === permMode) return;
+    set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode } : p)) });
+    const res = await commands.updateProject(projectId, project.model, permMode, project.harness);
+    if (res.status === "error") {
+      toast.error("Couldn't set permission mode: " + res.error.message);
+      await get().refresh();
     }
   },
 

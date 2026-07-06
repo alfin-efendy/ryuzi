@@ -20,6 +20,7 @@ type ConnectionPatch = {
   apiKey: string | null;
   baseUrl: string | null;
   models: string[];
+  claudeCloaking: boolean | null;
 };
 
 type ConnectionsState = {
@@ -72,7 +73,11 @@ export const useConnections = create<ConnectionsState>((set) => ({
   add: async (provider, label, apiKey, baseUrl) =>
     apply(set, await commands.addConnection(provider, label, apiKey, baseUrl), "Add connection"),
   update: async (id, p) =>
-    void apply(set, await commands.updateConnection(id, p.label, p.enabled, p.apiKey, p.baseUrl, p.models), "Update connection"),
+    void apply(
+      set,
+      await commands.updateConnection(id, p.label, p.enabled, p.apiKey, p.baseUrl, p.models, p.claudeCloaking),
+      "Update connection",
+    ),
   remove: async (id) => void apply(set, await commands.removeConnection(id), "Remove connection"),
   move: async (id, dir) => void apply(set, await commands.moveConnection(id, dir), "Reorder"),
   test: async (id) => {

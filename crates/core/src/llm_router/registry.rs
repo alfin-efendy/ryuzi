@@ -287,7 +287,15 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         format: ApiFormat::Anthropic,
         base_url: Some("https://api.anthropic.com/v1"),
         auth: AuthScheme::Bearer,
-        models: &[],
+        models: &[
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+        ],
         requires_base_url: false,
         oauth: Some(OAuthConfig {
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
@@ -438,6 +446,14 @@ mod tests {
         assert_eq!(o.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
         assert!(matches!(o.redirect, RedirectMode::LoopbackFixed(1455)));
         assert_eq!(o.max_refresh_age_ms, Some(691_200_000));
+    }
+
+    #[test]
+    fn anthropic_oauth_has_seed_models_when_live_discovery_is_unavailable() {
+        let d = descriptor("anthropic-oauth").unwrap();
+        assert!(d.models.contains(&"claude-opus-4-8"));
+        assert!(d.models.contains(&"claude-sonnet-4-6"));
+        assert!(d.models.contains(&"claude-haiku-4-5-20251001"));
     }
 
     #[test]

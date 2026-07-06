@@ -1,8 +1,11 @@
 //! The local endpoint server: Anthropic + OpenAI compatible surface on
 //! 127.0.0.1, gated by endpoint keys, routed to provider connections.
 use crate::llm_router::client::{route_model_for_body, send_upstream, RouteTarget, UpstreamCtx};
+use crate::llm_router::codex::normalize_codex_responses_body;
 use crate::llm_router::registry::{self, ApiFormat};
-use crate::llm_router::{connections, keys, oauth, routes, sse::SseParser, translate};
+use crate::llm_router::{
+    claude_cloak, connections, keys, oauth, routes, sse::SseParser, translate,
+};
 use crate::store::Store;
 use axum::body::Body;
 use axum::extract::State;
@@ -203,248 +206,6 @@ async fn check_auth(
         Ok(true) => Ok(()),
         Ok(false) => Err(err(StatusCode::UNAUTHORIZED, "invalid API key")),
         Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Codex Responses body normalization
-// ---------------------------------------------------------------------------
-
-const CODEX_DEFAULT_INSTRUCTIONS: &str =
-    "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer.";
-const CODEX_ALLOWED_RESPONSE_FIELDS: &[&str] = &[
-    "model",
-    "input",
-    "instructions",
-    "tools",
-    "tool_choice",
-    "stream",
-    "store",
-    "reasoning",
-    "service_tier",
-    "include",
-    "prompt_cache_key",
-    "client_metadata",
-    "text",
-];
-
-fn normalize_responses_input(input: Value) -> Value {
-    match input {
-        Value::String(s) => {
-            let text = if s.is_empty() { "..." } else { s.as_str() };
-            json!([{"type": "message", "role": "user",
-                "content": [{"type": "input_text", "text": text}]}])
-        }
-        Value::Array(items) if !items.is_empty() => Value::Array(items),
-        _ => json!([{"type": "message", "role": "user",
-            "content": [{"type": "input_text", "text": "..."}]}]),
-    }
-}
-
-fn convert_codex_system_items_to_developer(body: &mut Value) {
-    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for item in items {
-        let is_system = item
-            .get("role")
-            .and_then(Value::as_str)
-            .map(|r| r == "system")
-            .unwrap_or(false)
-            && item
-                .get("type")
-                .and_then(Value::as_str)
-                .map(|t| t == "message")
-                .unwrap_or(true);
-        if is_system {
-            item["role"] = json!("developer");
-        }
-    }
-}
-
-fn strip_codex_stored_item_refs(body: &mut Value) {
-    fn is_server_id(s: &str) -> bool {
-        ["rs_", "fc_", "resp_", "msg_"]
-            .iter()
-            .any(|prefix| s.starts_with(prefix))
-    }
-
-    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
-    };
-    items.retain_mut(|item| {
-        if item.as_str().map(is_server_id).unwrap_or(false) {
-            return false;
-        }
-        if item
-            .get("type")
-            .and_then(Value::as_str)
-            .map(|t| t == "item_reference")
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        if item
-            .get("id")
-            .and_then(Value::as_str)
-            .map(is_server_id)
-            .unwrap_or(false)
-        {
-            if let Some(obj) = item.as_object_mut() {
-                obj.remove("id");
-            }
-        }
-        true
-    });
-}
-
-fn normalize_codex_tools(body: &mut Value) {
-    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
-        return;
-    };
-    tools.retain_mut(|tool| {
-        let Some(obj) = tool.as_object_mut() else {
-            return false;
-        };
-        let tool_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
-        if tool_type != "function" {
-            return matches!(
-                tool_type,
-                "custom"
-                    | "image_generation"
-                    | "web_search"
-                    | "web_search_preview"
-                    | "file_search"
-                    | "computer"
-                    | "computer_use_preview"
-                    | "code_interpreter"
-                    | "mcp"
-                    | "local_shell"
-                    | "tool_search"
-            );
-        }
-
-        if obj.contains_key("function") {
-            let Some(function) = obj.get("function").and_then(Value::as_object) else {
-                return false;
-            };
-            let Some(name) = function.get("name").and_then(Value::as_str) else {
-                return false;
-            };
-            let name = name.trim().chars().take(128).collect::<String>();
-            if name.is_empty() {
-                return false;
-            }
-            let description = function
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let parameters = function
-                .get("parameters")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            obj.clear();
-            obj.insert("type".into(), json!("function"));
-            obj.insert("name".into(), json!(name));
-            if !description.is_empty() {
-                obj.insert("description".into(), json!(description));
-            }
-            obj.insert("parameters".into(), parameters);
-        }
-        true
-    });
-}
-
-fn codex_virtual_model_to_upstream(model: &str) -> (String, Option<&'static str>) {
-    let mut upstream = model.strip_suffix("-review").unwrap_or(model).to_string();
-    for effort in ["xhigh", "high", "medium", "low", "none"] {
-        let suffix = format!("-{effort}");
-        if upstream.ends_with(&suffix) {
-            let new_len = upstream.len() - suffix.len();
-            upstream.truncate(new_len);
-            return (upstream, Some(effort));
-        }
-    }
-    (upstream, None)
-}
-
-fn normalize_codex_responses_body(body: &mut Value, upstream_model: &str, cache_key: Option<&str>) {
-    let (model, model_effort) = codex_virtual_model_to_upstream(upstream_model);
-    body["model"] = json!(model);
-    let input = body.get("input").cloned().unwrap_or(Value::Null);
-    body["input"] = normalize_responses_input(input);
-    convert_codex_system_items_to_developer(body);
-    strip_codex_stored_item_refs(body);
-    normalize_codex_tools(body);
-
-    body["stream"] = json!(true);
-    body["store"] = json!(false);
-    if body
-        .get("instructions")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
-        .is_empty()
-    {
-        body["instructions"] = json!(CODEX_DEFAULT_INSTRUCTIONS);
-    }
-    if body.get("prompt_cache_key").is_none() {
-        if let Some(key) = cache_key {
-            body["prompt_cache_key"] = json!(key);
-        }
-    }
-
-    if body.get("reasoning").is_none() {
-        let effort = body
-            .get("reasoning_effort")
-            .and_then(Value::as_str)
-            .or(model_effort)
-            .unwrap_or("low");
-        body["reasoning"] = json!({"effort": effort, "summary": "auto"});
-    } else if body
-        .get("reasoning")
-        .and_then(|r| r.get("summary"))
-        .is_none()
-    {
-        body["reasoning"]["summary"] = json!("auto");
-    }
-    if body
-        .get("reasoning")
-        .and_then(|r| r.get("effort"))
-        .and_then(Value::as_str)
-        .map(|e| e != "none")
-        .unwrap_or(false)
-    {
-        body["include"] = json!(["reasoning.encrypted_content"]);
-    }
-
-    for key in [
-        "temperature",
-        "top_p",
-        "frequency_penalty",
-        "presence_penalty",
-        "logprobs",
-        "top_logprobs",
-        "n",
-        "seed",
-        "max_tokens",
-        "max_completion_tokens",
-        "max_output_tokens",
-        "user",
-        "prompt_cache_retention",
-        "metadata",
-        "stream_options",
-        "safety_identifier",
-        "previous_response_id",
-        "reasoning_effort",
-    ] {
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove(key);
-        }
-    }
-    if let Some(obj) = body.as_object_mut() {
-        obj.retain(|k, _| CODEX_ALLOWED_RESPONSE_FIELDS.contains(&k.as_str()));
     }
 }
 
@@ -834,6 +595,7 @@ async fn send_json(
     body: &Value,
     err: fn(StatusCode, &str) -> Response,
 ) -> Result<Value, Response> {
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
     let resp = send_upstream(&state.ctx(), target, body)
         .await
         .map_err(|e| {
@@ -843,7 +605,7 @@ async fn send_json(
             )
         })?;
     let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or(json!({}));
+    let mut v: Value = resp.json().await.unwrap_or(json!({}));
     if !status.is_success() {
         let msg = v["error"]["message"].as_str().unwrap_or("upstream error");
         return Err(err(
@@ -851,6 +613,7 @@ async fn send_json(
             &format!("[{}] {}", target.conn.provider, msg),
         ));
     }
+    claude_cloak::decloak_response(&mut v, &tool_map);
     Ok(v)
 }
 
@@ -870,6 +633,7 @@ async fn proxy_passthrough(
     body: &Value,
     err: fn(StatusCode, &str) -> Response,
 ) -> Response {
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
     let resp = match send_upstream(&state.ctx(), target, body).await {
         Ok(r) => r,
         Err(e) => {
@@ -886,12 +650,60 @@ async fn proxy_passthrough(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    if status.is_success() && !tool_map.is_empty() {
+        if ct.contains("text/event-stream") || body["stream"].as_bool().unwrap_or(false) {
+            return sse_response(spawn_anthropic_passthrough_decloak_pump(resp, tool_map));
+        }
+        let mut v: Value = resp.json().await.unwrap_or(json!({}));
+        claude_cloak::decloak_response(&mut v, &tool_map);
+        return Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(v.to_string()))
+            .unwrap();
+    }
     let stream = resp.bytes_stream();
     Response::builder()
         .status(status)
         .header("content-type", ct)
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+fn spawn_anthropic_passthrough_decloak_pump(
+    resp: reqwest::Response,
+    tool_map: claude_cloak::ToolNameMap,
+) -> Body {
+    use futures::StreamExt;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let mut parser = SseParser::default();
+        let mut stream = resp.bytes_stream();
+        'pump: while let Some(item) = stream.next().await {
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => {
+                    let data = json!({"type": "error", "error": {"type": "api_error", "message": format!("upstream stream interrupted: {e}")}});
+                    let _ = tx.send(Ok(format_sse("error", &data))).await;
+                    break;
+                }
+            };
+            for ev in parser.feed(&chunk) {
+                if ev.data == "[DONE]" {
+                    continue;
+                }
+                let name = ev.event.clone().unwrap_or_default();
+                let Ok(mut v) = serde_json::from_str::<Value>(&ev.data) else {
+                    continue;
+                };
+                claude_cloak::decloak_event(&name, &mut v, &tool_map);
+                if tx.send(Ok(format_sse(&name, &v))).await.is_err() {
+                    break 'pump;
+                }
+            }
+        }
+    });
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
 fn format_sse(name: &str, data: &Value) -> bytes::Bytes {
@@ -986,6 +798,7 @@ fn spawn_anthropic_to_openai_pump(
     resp: reqwest::Response,
     store: Arc<Store>,
     ctx: RecordCtx,
+    tool_map: claude_cloak::ToolNameMap,
 ) -> Body {
     use futures::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
@@ -1008,7 +821,8 @@ fn spawn_anthropic_to_openai_pump(
             };
             for ev in parser.feed(&chunk) {
                 let name = ev.event.as_deref().unwrap_or("");
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                if let Ok(mut v) = serde_json::from_str::<Value>(&ev.data) {
+                    claude_cloak::decloak_event(name, &mut v, &tool_map);
                     for c in tr.feed(name, &v) {
                         let line = bytes::Bytes::from(format!("data: {c}\n\n"));
                         if tx.send(Ok(line)).await.is_err() {
@@ -1094,6 +908,7 @@ async fn stream_anthropic_upstream_to_openai(
         resp,
         state.store.clone(),
         ctx,
+        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body),
     ))
 }
 
@@ -1120,6 +935,8 @@ async fn stream_responses(
         return openai_error(status, &format!("[{}] {msg}", target.conn.provider));
     }
     let anthropic_upstream = matches!(target.desc.format, ApiFormat::Anthropic);
+    let tool_map =
+        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);
     let store = state.store.clone();
     let ctx = RecordCtx {
         conn_id: target.conn.id.clone(),
@@ -1128,7 +945,13 @@ async fn stream_responses(
         client_format: "responses".into(),
         started,
     };
-    sse_response(spawn_responses_pump(resp, anthropic_upstream, store, ctx))
+    sse_response(spawn_responses_pump(
+        resp,
+        anthropic_upstream,
+        store,
+        ctx,
+        tool_map,
+    ))
 }
 
 /// Pumps an upstream SSE response through Responses encoding. For an
@@ -1141,6 +964,7 @@ fn spawn_responses_pump(
     anthropic_upstream: bool,
     store: Arc<Store>,
     ctx: RecordCtx,
+    tool_map: claude_cloak::ToolNameMap,
 ) -> Body {
     use futures::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
@@ -1166,7 +990,10 @@ fn spawn_responses_pump(
                     let name = ev.event.as_deref().unwrap_or("");
                     serde_json::from_str::<Value>(&ev.data)
                         .ok()
-                        .map(|v| anth.feed(name, &v))
+                        .map(|mut v| {
+                            claude_cloak::decloak_event(name, &mut v, &tool_map);
+                            anth.feed(name, &v)
+                        })
                         .unwrap_or_default()
                 } else if ev.data == "[DONE]" {
                     Vec::new()
@@ -1517,22 +1344,20 @@ fn spawn_kiro_pump(
             }
         }
         if !errored {
-            if kiro.saw_terminal() {
-                emit_kiro_finish(&tx, client_format, &mut anth, &mut rs).await;
-            } else {
-                // Upstream closed cleanly but never sent a messageStopEvent —
-                // that's a truncated stream, not a completed one.
-                errored = true;
-                emit_kiro_error(
-                    &tx,
-                    client_format,
-                    &mut anth,
-                    &mut rs,
-                    &kiro,
-                    "upstream stream ended without a terminal event",
-                )
-                .await;
+            // Kiro terminates plain-text turns with `messageStopEvent` but
+            // tool-use turns with `metadataEvent {stopReason:"TOOL_USE"}` (both
+            // now set the terminal in `KiroToOpenAiStream::feed`). A clean EOF
+            // with neither is still a valid completion (matches 9router, which
+            // finishes on EOF) — feed the EOF finish chunk through, then emit
+            // the client-format finish. A genuine mid-stream break is a
+            // transport `Err` handled above, not this path.
+            if !kiro.saw_terminal() {
+                for oai in kiro.finish() {
+                    let _ =
+                        forward_openai_chunk(&tx, client_format, &oai, &mut anth, &mut rs).await;
+                }
             }
+            emit_kiro_finish(&tx, client_format, &mut anth, &mut rs).await;
         }
         let (input, output) = kiro.usage();
         crate::llm_router::usage::record(
@@ -1778,37 +1603,6 @@ mod tests {
             oauth_token_url_override: None,
             kiro_base_override: None,
         }
-    }
-
-    #[test]
-    fn codex_oauth_responses_body_is_normalized_for_backend() {
-        let mut body = json!({
-            "model": "openai-oauth/gpt-5.3-codex-high",
-            "input": "hi",
-            "temperature": 0.2,
-            "max_output_tokens": 128,
-            "previous_response_id": "resp_old",
-            "stream": false
-        });
-
-        normalize_codex_responses_body(&mut body, "gpt-5.3-codex-high", Some("session-1"));
-
-        assert_eq!(body["model"], "gpt-5.3-codex");
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["store"], false);
-        assert!(body["instructions"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Codex"));
-        assert_eq!(body["prompt_cache_key"], "session-1");
-        assert_eq!(body["reasoning"]["effort"], "high");
-        assert_eq!(body["reasoning"]["summary"], "auto");
-        assert_eq!(body["include"][0], "reasoning.encrypted_content");
-        assert!(body.get("temperature").is_none());
-        assert!(body.get("max_output_tokens").is_none());
-        assert!(body.get("previous_response_id").is_none());
-        assert!(body.get("reasoning_effort").is_none());
-        assert!(body["input"].as_array().is_some());
     }
 
     #[tokio::test]

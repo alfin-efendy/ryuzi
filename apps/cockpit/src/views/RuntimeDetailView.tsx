@@ -99,6 +99,11 @@ export function RuntimeDetailView({ id }: { id: string }) {
 
   const installed = agent.binaryPath !== null;
   const isDefault = agent.isDefault;
+  // The native runtime runs in-process and reaches providers through the
+  // internal router, so the CLI-oriented controls (tier mapping, CLI flags,
+  // binary path, endpoint-config file) are meaningless for it — its only real
+  // knobs are the default model, permission mode, and app access.
+  const isNative = agent.id === "native";
   const hasUpdate =
     installed && agent.latestVersion !== null && agent.installedVersion !== null && agent.latestVersion !== agent.installedVersion;
   const updateCmd = agent.npmPackage ? `npm install -g ${agent.npmPackage}` : null;
@@ -200,74 +205,77 @@ export function RuntimeDetailView({ id }: { id: string }) {
           <CardHeader>
             <CardTitle>Configuration</CardTitle>
           </CardHeader>
-          <div className="flex items-center gap-2.5 px-[18px] pb-1 pt-[11px]">
-            <span className="text-[13px] font-medium">Model mapping</span>
-            <span className="text-[11.5px] text-muted-foreground">Route each tier to any model or combo</span>
-          </div>
-          {agent.tiers.map((tier) => (
-            <div key={tier.id} className="relative flex items-center gap-2.5 px-[18px] py-[7px]">
-              <span className="w-[100px] shrink-0 text-[12.5px] font-medium text-muted-foreground">{tier.label}</span>
-              <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-input bg-background pl-3 pr-1">
-                {tier.combo && (
-                  <span className="flex shrink-0 items-center gap-1 rounded-full bg-secondary px-1.5 py-[2px] text-[9.5px] font-semibold uppercase tracking-[0.03em] text-secondary-foreground">
-                    <Layers aria-hidden size={9} strokeWidth={2} />
-                    combo
-                  </span>
-                )}
-                {tier.value !== null ? (
-                  <>
-                    <span className="min-w-0 flex-1 truncate font-mono text-xs">{tier.value}</span>
-                    <Button
-                      variant="ghost"
-                      size="icon-xs"
-                      title="Clear"
-                      aria-label={`Clear ${tier.label} model`}
-                      onClick={() => void setTier(agent.id, tier.id, null)}
-                      className="text-muted-foreground"
-                    >
-                      <X aria-hidden size={12} strokeWidth={2} />
-                    </Button>
-                  </>
-                ) : (
-                  <span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">Not set</span>
-                )}
-              </div>
-              <Button variant="outline" onClick={() => setOpenTierMenu((v) => (v === tier.id ? null : tier.id))}>
-                Select model
-              </Button>
-              {openTierMenu === tier.id && (
-                <MenuPanel onClose={() => setOpenTierMenu(null)} className="right-[18px] top-[42px] w-[240px]">
-                  {agent.models.length === 0 && (
-                    <div className="px-3 py-2 text-[12px] text-muted-foreground">
-                      No models detected{agent.id === "ollama" ? " — pull one with `ollama pull`" : ""}.
-                    </div>
+          {!isNative && (
+            <div className="flex items-center gap-2.5 px-[18px] pb-1 pt-[11px]">
+              <span className="text-[13px] font-medium">Model mapping</span>
+              <span className="text-[11.5px] text-muted-foreground">Route each tier to any model or combo</span>
+            </div>
+          )}
+          {!isNative &&
+            agent.tiers.map((tier) => (
+              <div key={tier.id} className="relative flex items-center gap-2.5 px-[18px] py-[7px]">
+                <span className="w-[100px] shrink-0 text-[12.5px] font-medium text-muted-foreground">{tier.label}</span>
+                <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-input bg-background pl-3 pr-1">
+                  {tier.combo && (
+                    <span className="flex shrink-0 items-center gap-1 rounded-full bg-secondary px-1.5 py-[2px] text-[9.5px] font-semibold uppercase tracking-[0.03em] text-secondary-foreground">
+                      <Layers aria-hidden size={9} strokeWidth={2} />
+                      combo
+                    </span>
                   )}
-                  {agent.models.map((m) => (
+                  {tier.value !== null ? (
+                    <>
+                      <span className="min-w-0 flex-1 truncate font-mono text-xs">{tier.value}</span>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        title="Clear"
+                        aria-label={`Clear ${tier.label} model`}
+                        onClick={() => void setTier(agent.id, tier.id, null)}
+                        className="text-muted-foreground"
+                      >
+                        <X aria-hidden size={12} strokeWidth={2} />
+                      </Button>
+                    </>
+                  ) : (
+                    <span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">Not set</span>
+                  )}
+                </div>
+                <Button variant="outline" onClick={() => setOpenTierMenu((v) => (v === tier.id ? null : tier.id))}>
+                  Select model
+                </Button>
+                {openTierMenu === tier.id && (
+                  <MenuPanel onClose={() => setOpenTierMenu(null)} className="right-[18px] top-[42px] w-[240px]">
+                    {agent.models.length === 0 && (
+                      <div className="px-3 py-2 text-[12px] text-muted-foreground">
+                        No models detected{agent.id === "ollama" ? " — pull one with `ollama pull`" : ""}.
+                      </div>
+                    )}
+                    {agent.models.map((m) => (
+                      <MenuItem
+                        key={m}
+                        selected={!tier.combo && tier.value === m}
+                        onClick={() => {
+                          void setTier(agent.id, tier.id, m);
+                          setOpenTierMenu(null);
+                        }}
+                      >
+                        <span className="flex-1">{m}</span>
+                      </MenuItem>
+                    ))}
+                    <MenuSeparator />
                     <MenuItem
-                      key={m}
-                      selected={!tier.combo && tier.value === m}
+                      selected={tier.combo === true}
                       onClick={() => {
-                        void setTier(agent.id, tier.id, m);
+                        void setTier(agent.id, tier.id, "route by task", true);
                         setOpenTierMenu(null);
                       }}
                     >
-                      <span className="flex-1">{m}</span>
+                      <span className="flex-1">Route by task (combo)</span>
                     </MenuItem>
-                  ))}
-                  <MenuSeparator />
-                  <MenuItem
-                    selected={tier.combo === true}
-                    onClick={() => {
-                      void setTier(agent.id, tier.id, "route by task", true);
-                      setOpenTierMenu(null);
-                    }}
-                  >
-                    <span className="flex-1">Route by task (combo)</span>
-                  </MenuItem>
-                </MenuPanel>
-              )}
-            </div>
-          ))}
+                  </MenuPanel>
+                )}
+              </div>
+            ))}
           <div className="h-2 border-b border-border" />
           <div className="flex flex-col gap-2 border-b border-border px-[18px] py-3">
             <div className="flex items-center gap-3">
@@ -282,78 +290,105 @@ export function RuntimeDetailView({ id }: { id: string }) {
           </div>
           <CardRow>
             <span className="w-[110px] shrink-0 text-[13px] font-medium">Default model</span>
-            <span className="flex-1 truncate font-mono text-xs text-muted-foreground">{agent.model || "engine default"}</span>
-          </CardRow>
-          <CardRow>
-            <span className="w-[110px] shrink-0 text-[13px] font-medium">CLI flags</span>
-            <Input
-              defaultValue={agent.flags}
-              onBlur={(e) => {
-                if (e.target.value !== agent.flags) void update(agent.id, { flags: e.target.value });
-              }}
-              placeholder="No extra flags"
-              className="flex-1 font-mono text-xs md:text-xs"
-            />
-          </CardRow>
-          <CardRow>
-            <span className="w-[110px] shrink-0 text-[13px] font-medium">Binary</span>
-            <span className="flex-1 truncate font-mono text-xs text-muted-foreground">{agent.binaryPath ?? "not found on PATH"}</span>
-          </CardRow>
-        </Card>
-
-        <Card className="mb-3">
-          <CardHeader>
-            <CardTitle>Endpoint config</CardTitle>
-            <Pill variant={cfg?.configured ? "primary" : "secondary"}>{cfg?.configured ? "Configured" : "Not configured"}</Pill>
-          </CardHeader>
-          {cfg?.configPath && <div className="px-[18px] pb-1 pt-3 font-mono text-[11px] text-muted-foreground">{cfg.configPath}</div>}
-          {cfg && !cfg.supported ? (
-            <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
-              Config apply for this runtime is coming in a later phase.
-            </div>
-          ) : (
-            <>
-              {endpointBlocked && (
-                <div
-                  className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]"
-                  style={{ borderColor: WARN, color: WARN }}
+            {isNative ? (
+              agent.models.length > 0 ? (
+                <NativeSelect
+                  value={agent.model || ""}
+                  onChange={(e) => void update(agent.id, { model: e.target.value })}
+                  className="min-w-0 flex-1"
                 >
-                  <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
-                  <span>Start the endpoint server and create an API key in Models → Endpoint before applying.</span>
-                </div>
-              )}
-              {noModels && (
-                <div
-                  className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]"
-                  style={{ borderColor: WARN, color: WARN }}
-                >
-                  <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
-                  <span>Add an enabled provider connection in Models → Providers to pick models.</span>
-                </div>
-              )}
-              <div className="flex flex-col gap-1 py-2">
-                {agent.id === "claude" && (
-                  <>
-                    <ModelSelectRow label="Opus" value={opus} options={modelOptions} onChange={setOpus} />
-                    <ModelSelectRow label="Sonnet" value={sonnet} options={modelOptions} onChange={setSonnet} />
-                    <ModelSelectRow label="Haiku" value={haiku} options={modelOptions} onChange={setHaiku} />
-                  </>
-                )}
-                <ModelSelectRow label="Default model" value={model} options={modelOptions} onChange={setModel} />
-              </div>
-              <div className="flex items-center justify-end gap-2 border-t border-border px-[18px] py-3">
-                {cfg?.configured && (
-                  <Button variant="outline" onClick={() => void resetConfig()}>
-                    Reset
-                  </Button>
-                )}
-                <Button disabled={endpointBlocked || noModels} onClick={() => void applyConfig()}>
-                  Apply
-                </Button>
-              </div>
-            </>
+                  <option value="">Router default (first usable provider)</option>
+                  {agent.models.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </NativeSelect>
+              ) : (
+                <span className="flex-1 truncate text-xs text-muted-foreground">
+                  Add an enabled provider connection in Models → Providers to pick a model.
+                </span>
+              )
+            ) : (
+              <span className="flex-1 truncate font-mono text-xs text-muted-foreground">{agent.model || "engine default"}</span>
+            )}
+          </CardRow>
+          {!isNative && (
+            <CardRow>
+              <span className="w-[110px] shrink-0 text-[13px] font-medium">CLI flags</span>
+              <Input
+                defaultValue={agent.flags}
+                onBlur={(e) => {
+                  if (e.target.value !== agent.flags) void update(agent.id, { flags: e.target.value });
+                }}
+                placeholder="No extra flags"
+                className="flex-1 font-mono text-xs md:text-xs"
+              />
+            </CardRow>
+          )}
+          {!isNative && (
+            <CardRow>
+              <span className="w-[110px] shrink-0 text-[13px] font-medium">Binary</span>
+              <span className="flex-1 truncate font-mono text-xs text-muted-foreground">{agent.binaryPath ?? "not found on PATH"}</span>
+            </CardRow>
           )}
         </Card>
+
+        {!isNative && (
+          <Card className="mb-3">
+            <CardHeader>
+              <CardTitle>Endpoint config</CardTitle>
+              <Pill variant={cfg?.configured ? "primary" : "secondary"}>{cfg?.configured ? "Configured" : "Not configured"}</Pill>
+            </CardHeader>
+            {cfg?.configPath && <div className="px-[18px] pb-1 pt-3 font-mono text-[11px] text-muted-foreground">{cfg.configPath}</div>}
+            {cfg && !cfg.supported ? (
+              <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+                Config apply for this runtime is coming in a later phase.
+              </div>
+            ) : (
+              <>
+                {endpointBlocked && (
+                  <div
+                    className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]"
+                    style={{ borderColor: WARN, color: WARN }}
+                  >
+                    <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
+                    <span>Start the endpoint server and create an API key in Models → Endpoint before applying.</span>
+                  </div>
+                )}
+                {noModels && (
+                  <div
+                    className="mx-[18px] mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-[12px]"
+                    style={{ borderColor: WARN, color: WARN }}
+                  >
+                    <AlertTriangle aria-hidden size={14} strokeWidth={2} className="mt-px shrink-0" />
+                    <span>Add an enabled provider connection in Models → Providers to pick models.</span>
+                  </div>
+                )}
+                <div className="flex flex-col gap-1 py-2">
+                  {agent.id === "claude" && (
+                    <>
+                      <ModelSelectRow label="Opus" value={opus} options={modelOptions} onChange={setOpus} />
+                      <ModelSelectRow label="Sonnet" value={sonnet} options={modelOptions} onChange={setSonnet} />
+                      <ModelSelectRow label="Haiku" value={haiku} options={modelOptions} onChange={setHaiku} />
+                    </>
+                  )}
+                  <ModelSelectRow label="Default model" value={model} options={modelOptions} onChange={setModel} />
+                </div>
+                <div className="flex items-center justify-end gap-2 border-t border-border px-[18px] py-3">
+                  {cfg?.configured && (
+                    <Button variant="outline" onClick={() => void resetConfig()}>
+                      Reset
+                    </Button>
+                  )}
+                  <Button disabled={endpointBlocked || noModels} onClick={() => void applyConfig()}>
+                    Apply
+                  </Button>
+                </div>
+              </>
+            )}
+          </Card>
+        )}
 
         <Card className="mb-3">
           <CardHeader>

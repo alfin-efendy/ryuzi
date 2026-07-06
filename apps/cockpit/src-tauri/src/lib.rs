@@ -39,17 +39,84 @@ const ADAPTER_BIN: &str = "claude-agent-acp";
 /// host bun exists, else the standalone binary). First resolve needs network
 /// or Bun — the same contract as the CLI. Runs lazily on the first
 /// `claude-code` session start (never at app launch — see
-/// [`build_registries`]). On resolver failure we fall back to the bare
-/// adapter name (dev PATH behavior): the session start then fails with a
-/// clear spawn error instead.
-fn resolve_acp_adapter() -> (String, Vec<String>) {
-    match ryuzi_core::sidecar::host_manager().resolve() {
-        Ok(r) => (r.command, r.args),
-        Err(e) => {
-            eprintln!("[ryuzi] sidecar resolve failed: {e:#}; falling back to PATH lookup of {ADAPTER_BIN}");
-            (ADAPTER_BIN.to_string(), vec![])
+/// [`build_registries`]).
+///
+/// On resolver failure (dev builds embed `release_tag: v0.0.0`, so the
+/// download tier always 404s) we try, in order:
+///   1. the repo-local bundle produced by `bun scripts/build-acp-sidecar.ts
+///      --bundle` (dev builds only), run via the host `bun`;
+///   2. an explicit PATH scan for a globally installed `claude-agent-acp`;
+///   3. an actionable error — surfaced verbatim at session start, which
+///      beats the old bare-name fallback whose only symptom was
+///      "failed to spawn ACP adapter: program not found".
+fn resolve_acp_adapter() -> anyhow::Result<(String, Vec<String>)> {
+    let resolve_err = match ryuzi_core::sidecar::host_manager().resolve() {
+        Ok(r) => return Ok((r.command, r.args)),
+        Err(e) => e,
+    };
+    eprintln!("[ryuzi] sidecar resolve failed: {resolve_err:#}");
+
+    #[cfg(debug_assertions)]
+    if let Some(bundle) = dev_sidecar_bundle() {
+        eprintln!("[ryuzi] using repo-local ACP bundle: {bundle}");
+        return Ok(("bun".to_string(), vec![bundle]));
+    }
+
+    if let Some(found) = find_on_path(ADAPTER_BIN) {
+        eprintln!("[ryuzi] using PATH-installed ACP adapter: {found}");
+        return Ok((found, vec![]));
+    }
+
+    Err(anyhow::anyhow!(
+        "ACP adapter unavailable: {resolve_err:#}. Fix: install bun >= {} so the adapter \
+         can be fetched automatically, set RYUZI_ACP_PATH to an adapter binary, or (dev) \
+         run `bun scripts/build-acp-sidecar.ts --bundle --install-cache` from the repo root.",
+        ryuzi_core::sidecar::embedded_manifest().min_bun
+    ))
+}
+
+/// Dev builds only: the universal JS bundle emitted by
+/// `bun scripts/build-acp-sidecar.ts --bundle` into `<repo>/dist/sidecar/`.
+/// Returns the newest `claude-agent-acp-*.js` there, provided a host `bun`
+/// exists to run it.
+#[cfg(debug_assertions)]
+fn dev_sidecar_bundle() -> Option<String> {
+    if ryuzi_core::sidecar::default_bun_probe().is_none() {
+        return None;
+    }
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dist/sidecar");
+    let mut bundles: Vec<std::path::PathBuf> = std::fs::read_dir(dist)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(ADAPTER_BIN) && n.ends_with(".js"))
+        })
+        .collect();
+    bundles.sort();
+    bundles.pop().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Explicit PATH scan for a globally installed adapter (npm/bun global
+/// installs). Windows also probes `.exe`; `.cmd` shims are skipped because
+/// `CreateProcess` cannot spawn them without a shell.
+fn find_on_path(bin: &str) -> Option<String> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let plain = dir.join(bin);
+        if plain.is_file() {
+            return Some(plain.to_string_lossy().into_owned());
+        }
+        if cfg!(windows) {
+            let exe = dir.join(format!("{bin}.exe"));
+            if exe.is_file() {
+                return Some(exe.to_string_lossy().into_owned());
+            }
         }
     }
+    None
 }
 
 /// Map Rust's `std::env::consts::{OS, ARCH}` to the npm platform-package
@@ -164,7 +231,7 @@ fn build_registries() -> Registries {
         if let Some(cli) = resolve_claude_code_executable() {
             env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
         }
-        let (command, args) = resolve_acp_adapter();
+        let (command, args) = resolve_acp_adapter()?;
         Ok(AcpAdapterDescriptor {
             command,
             args,

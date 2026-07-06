@@ -33,7 +33,13 @@ function MenuPanel({ onClose, className, children }: MenuPanelProps) {
   return (
     <div
       ref={ref}
-      className={cn("absolute z-50 rounded-lg border border-border bg-popover p-[5px] text-popover-foreground shadow-lg", className)}
+      className={cn(
+        // Cap tall menus and scroll inside instead of overflowing off-screen —
+        // a long list (e.g. all provider models) was unscrollable and its tail
+        // was unreachable. Callers may still override max-h via className.
+        "absolute z-50 max-h-[min(60vh,380px)] overflow-y-auto overscroll-contain rounded-lg border border-border bg-popover p-[5px] text-popover-foreground shadow-lg",
+        className,
+      )}
     >
       {children}
     </div>

@@ -43,7 +43,11 @@ pub struct RunnerDeps {
     /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
     pub extra_skill_dirs: Vec<PathBuf>,
     pub model: Option<String>,
-    pub perm_mode: PermMode,
+    /// Interior-mutable so a LIVE session can pick up a permission-mode change
+    /// (from the composer / project settings) on the NEXT turn without being
+    /// torn down — the control plane refreshes it in the continue path. The
+    /// tool gate reads it fresh per call via [`RunnerDeps::current_perm_mode`].
+    pub perm_mode: Arc<std::sync::Mutex<PermMode>>,
     pub project_policy: Option<String>,
     pub store: Arc<Store>,
     pub events: broadcast::Sender<CoreEvent>,
@@ -61,6 +65,21 @@ pub struct RunnerDeps {
     pub memory: Option<Arc<super::memory::MemoryStore>>,
     /// Worktree snapshot stack for the `revert` tool (most recent last).
     pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+impl RunnerDeps {
+    /// The current permission mode, read fresh at each tool gate so a
+    /// mid-session mode change (refreshed by the control plane on continue)
+    /// takes effect on the next tool call.
+    pub fn current_perm_mode(&self) -> PermMode {
+        *self.perm_mode.lock().expect("perm_mode mutex poisoned")
+    }
+
+    /// Overwrite the live permission mode (called by the control plane before
+    /// each continued turn so composer/project-settings changes take effect).
+    pub fn set_perm_mode(&self, mode: PermMode) {
+        *self.perm_mode.lock().expect("perm_mode mutex poisoned") = mode;
+    }
 }
 
 /// Run one prompt to completion. Returns `Ok(())` once the turn settles
@@ -329,7 +348,11 @@ async fn drive(
             }));
         }
         if content.is_empty() {
-            content.push(json!({ "type": "text", "text": "" }));
+            // An assistant turn must exist for valid role alternation, but an
+            // EMPTY text block ({"text":""}) makes Anthropic 400 the NEXT
+            // request ("text content blocks must be non-empty") — which
+            // poisons the whole session. Use a non-empty sentinel instead.
+            content.push(json!({ "type": "text", "text": "(no output)" }));
         }
         ledger.append_assistant(json!(content)).await?;
 
@@ -607,11 +630,12 @@ async fn run_tool_call(
         return tool_result(&t.id, &msg, true);
     }
 
-    // Permission gate.
+    // Permission gate. Read the mode fresh so a mid-session change applies.
+    let perm_mode = deps.current_perm_mode();
     let spec = tool.permission(&input);
     let decision = evaluate(
         &spec,
-        deps.perm_mode,
+        perm_mode,
         deps.project_policy.as_deref(),
         &deps.session_pk,
         &t.id,
@@ -620,7 +644,14 @@ async fn run_tool_call(
     )
     .await;
     if decision == PermDecision::Deny {
-        let msg = "Denied by user";
+        // Plan mode denies mutations outright (no prompt) — tell the model why
+        // so it plans instead of retrying, rather than showing "Denied by user".
+        let msg = if perm_mode == PermMode::Plan && !matches!(tool.kind(), "read") {
+            "Plan mode is read-only: file edits and shell commands are disabled. \
+             Propose a plan for the user to review; they can switch to Ask/Edit/Full to execute it."
+        } else {
+            "Denied by user"
+        };
         if emit_display {
             finish_tool_row(deps, &t.id, msg, true).await;
         }
@@ -958,7 +989,7 @@ mod tests {
             extra_skill_dirs: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
-            perm_mode: PermMode::BypassPermissions,
+            perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
             project_policy: None,
             store,
             events,

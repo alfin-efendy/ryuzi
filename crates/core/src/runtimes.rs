@@ -487,18 +487,48 @@ pub async fn run_npm_update(
     Ok(status.success())
 }
 
+/// Map a project's `harness` id (as stored on the project row) to the runtime
+/// catalog id whose config the session should inherit. The two identifier
+/// spaces diverge for Claude only: harness `"claude-code"` ⇒ runtime `"claude"`.
+/// Anything else (notably `"native"`) is already a catalog id.
+pub fn runtime_id_for_harness(harness: &str) -> &str {
+    match harness {
+        "claude-code" => "claude",
+        other => other,
+    }
+}
+
+/// Session parameters inherited from a SPECIFIC runtime's persisted config.
+/// This is what a starting session must use: a native session inherits the
+/// Native runtime card's model/perm-mode, a claude-code session inherits the
+/// Claude card's — NOT whatever happens to be the global `default_agent`.
+/// (The historical `session_defaults`, which keyed off `default_agent`, made
+/// every native session fall back to the Claude connection because the Claude
+/// row's model is what it read.)
+pub async fn session_defaults_for(
+    store: &Store,
+    runtime_id: &str,
+) -> anyhow::Result<SessionDefaults> {
+    let cfg = get_config(store, runtime_id).await?;
+    // Only a model the user explicitly picked is injected into sessions —
+    // catalog defaults are UI initial values, not session overrides (an
+    // unrecognized id would break the adapter's own default resolution).
+    let model = cfg
+        .as_ref()
+        .and_then(|c| c.model.clone())
+        .filter(|m| !m.trim().is_empty());
+    let perm_mode = cfg.as_ref().map(|c| ui_perm_to_core(&c.perm_mode));
+    Ok(SessionDefaults { model, perm_mode })
+}
+
+/// Back-compat entry point that inherits from the global `default_agent`.
+/// Prefer [`session_defaults_for`] with the session's own runtime id.
 pub async fn session_defaults(store: &Store) -> anyhow::Result<SessionDefaults> {
     let default_id = store
         .get_setting("default_agent")
         .await?
         .unwrap_or_else(|| "claude".to_string());
-    let cfg = get_config(store, &default_id).await?;
-    // Only a model the user explicitly picked is injected into sessions —
-    // catalog defaults are UI initial values, not session overrides (an
-    // unrecognized id would break the adapter's own default resolution).
-    let model = cfg.as_ref().and_then(|c| c.model.clone());
-    let perm_mode = cfg.as_ref().map(|c| ui_perm_to_core(&c.perm_mode));
-    Ok(SessionDefaults { model, perm_mode })
+    session_defaults_for(store, &default_id).await
 }
 
 #[cfg(test)]
@@ -628,6 +658,82 @@ mod tests {
         let d = session_defaults(&store).await.unwrap();
         assert_eq!(d.model.as_deref(), Some("claude-haiku-4-5"));
         assert_eq!(d.perm_mode, Some(PermMode::BypassPermissions));
+    }
+
+    #[test]
+    fn harness_maps_to_runtime_catalog_id() {
+        assert_eq!(runtime_id_for_harness("claude-code"), "claude");
+        assert_eq!(runtime_id_for_harness("native"), "native");
+        // Unknown harness ids pass through unchanged.
+        assert_eq!(runtime_id_for_harness("codex"), "codex");
+    }
+
+    #[tokio::test]
+    async fn session_defaults_for_reads_the_named_runtime_not_the_default_agent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        // The Native runtime card is configured with a router model, while the
+        // (global default) Claude card carries a different one. A native
+        // session must inherit the NATIVE model — the old default-agent path
+        // wrongly returned the Claude model here, which is why every native
+        // turn hit the Claude subscription.
+        upsert_config(
+            &store,
+            RuntimeConfig {
+                id: "native".into(),
+                enabled: true,
+                model: Some("openrouter/deepseek/deepseek-chat:free".into()),
+                perm_mode: "edit".into(),
+                flags: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        upsert_config(
+            &store,
+            RuntimeConfig {
+                id: "claude".into(),
+                enabled: true,
+                model: Some("claude-opus-4-5".into()),
+                perm_mode: "ask".into(),
+                flags: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let native = session_defaults_for(&store, "native").await.unwrap();
+        assert_eq!(
+            native.model.as_deref(),
+            Some("openrouter/deepseek/deepseek-chat:free")
+        );
+
+        let claude = session_defaults_for(&store, "claude").await.unwrap();
+        assert_eq!(claude.model.as_deref(), Some("claude-opus-4-5"));
+    }
+
+    #[tokio::test]
+    async fn session_defaults_for_treats_blank_model_as_unset() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        upsert_config(
+            &store,
+            RuntimeConfig {
+                id: "native".into(),
+                enabled: true,
+                model: Some("   ".into()),
+                perm_mode: "ask".into(),
+                flags: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let d = session_defaults_for(&store, "native").await.unwrap();
+        assert_eq!(
+            d.model, None,
+            "a blank model must not shadow the router default"
+        );
     }
 }
 

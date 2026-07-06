@@ -383,6 +383,7 @@ pub fn anthropic_to_openai_response(resp: &Value) -> Value {
 enum OpenBlock {
     None,
     Text,
+    Thinking,
     Tool,
 }
 
@@ -452,6 +453,30 @@ impl OpenAiToAnthropicStream {
         let choice = &chunk["choices"][0];
         let delta = &choice["delta"];
 
+        // Reasoning (Codex/Kiro OpenAI-format upstreams stream it as
+        // `reasoning_content`) surfaces as an Anthropic `thinking` block.
+        // Placed BEFORE the text branch: reasoning typically precedes content,
+        // so a turn that streams reasoning then text yields a thinking block
+        // followed by a separate text block on the next index.
+        if let Some(text) = delta["reasoning_content"].as_str() {
+            if !text.is_empty() {
+                if !matches!(self.block, OpenBlock::Thinking) {
+                    self.close_block(&mut out);
+                    self.index += 1;
+                    self.block = OpenBlock::Thinking;
+                    out.push((
+                        "content_block_start".into(),
+                        json!({"type": "content_block_start", "index": self.index,
+                               "content_block": {"type": "thinking", "thinking": ""}}),
+                    ));
+                }
+                out.push((
+                    "content_block_delta".into(),
+                    json!({"type": "content_block_delta", "index": self.index,
+                           "delta": {"type": "thinking_delta", "thinking": text}}),
+                ));
+            }
+        }
         if let Some(text) = delta["content"].as_str() {
             if !text.is_empty() {
                 if !matches!(self.block, OpenBlock::Text) {
@@ -995,6 +1020,58 @@ mod tests {
         assert_eq!(evs[6].1["delta"]["partial_json"], "{\"a\"");
         assert_eq!(evs[9].1["delta"]["stop_reason"], "tool_use");
         assert_eq!(evs[9].1["usage"]["output_tokens"], 3);
+    }
+
+    #[test]
+    fn reasoning_content_chunk_yields_thinking_block() {
+        // Codex/Kiro OpenAI-format upstreams stream reasoning as
+        // `delta.reasoning_content`; it must surface as an Anthropic
+        // `thinking` block (thinking-typed content_block_start + a
+        // thinking_delta) so the native runner shows the model's reasoning
+        // rather than silently dropping it. Reasoning precedes text, so the
+        // thinking block gets its own (earlier) index and the text lands in a
+        // separate, later block.
+        let mut s = OpenAiToAnthropicStream::new("m");
+        let mut evs = Vec::new();
+        evs.extend(s.feed(&json!({"id": "c1", "choices": [{"index": 0,
+            "delta": {"reasoning_content": "let me think"}}]})));
+        evs.extend(s.feed(&json!({"choices": [{"index": 0,
+            "delta": {"reasoning_content": " more"}}]})));
+        evs.extend(s.feed(&json!({"choices": [{"index": 0,
+            "delta": {"content": "answer"}}]})));
+        evs.extend(
+            s.feed(&json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})),
+        );
+        evs.extend(s.finish());
+        let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start", // thinking block opens
+                "content_block_delta", // thinking_delta
+                "content_block_delta", // thinking_delta (continuation)
+                "content_block_stop",  // thinking block closes
+                "content_block_start", // text block opens (separate index)
+                "content_block_delta", // text_delta
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        // Thinking block: index 0, correct type + delta shape (this is what
+        // MessageStreamEvent::from_event decodes as ThinkingDelta).
+        assert_eq!(evs[1].1["content_block"]["type"], "thinking");
+        assert_eq!(evs[1].1["index"], 0);
+        assert_eq!(evs[2].1["delta"]["type"], "thinking_delta");
+        assert_eq!(evs[2].1["delta"]["thinking"], "let me think");
+        assert_eq!(evs[2].1["index"], 0);
+        assert_eq!(evs[3].1["delta"]["thinking"], " more");
+        // Text block lands on a separate, later index.
+        assert_eq!(evs[5].1["content_block"]["type"], "text");
+        assert_eq!(evs[5].1["index"], 1);
+        assert_eq!(evs[6].1["delta"]["text"], "answer");
+        assert_eq!(evs[6].1["index"], 1);
     }
 
     #[test]

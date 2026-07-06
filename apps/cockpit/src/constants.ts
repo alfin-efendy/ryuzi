@@ -10,6 +10,37 @@ export const PERM_MODES: { id: UiPermMode; label: string; desc: string }[] = [
   { id: "full", label: "Full", desc: "Full access — no approval prompts." },
 ];
 
+// The project row stores the engine's `PermMode`; the composer speaks the UI
+// four-mode vocabulary. These keep the two in sync (mirrors the Rust
+// `ui_perm_to_core` in crates/core/src/runtimes.rs).
+export type CorePermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan";
+
+export function corePermToUi(mode: CorePermMode | string): UiPermMode {
+  switch (mode) {
+    case "plan":
+      return "plan";
+    case "acceptEdits":
+      return "edit";
+    case "bypassPermissions":
+      return "full";
+    default:
+      return "ask";
+  }
+}
+
+export function uiPermToCore(mode: UiPermMode): CorePermMode {
+  switch (mode) {
+    case "plan":
+      return "plan";
+    case "edit":
+      return "acceptEdits";
+    case "full":
+      return "bypassPermissions";
+    default:
+      return "default";
+  }
+}
+
 export type GatewayFsMode = "full" | "projects" | "read";
 
 export const GW_FS_MODES: { id: GatewayFsMode; label: string; desc: string }[] = [

@@ -15,7 +15,7 @@
 //! native wire format.
 
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
-use crate::llm_router::{capabilities, connections, oauth, routes, translate};
+use crate::llm_router::{capabilities, claude_cloak, connections, oauth, routes, translate};
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -190,11 +190,16 @@ async fn route_models_for_body_matching(
     Ok(out)
 }
 
+/// All providers are now drivable on the Anthropic-Messages / native path
+/// (including `openai-oauth`/Codex, via [`codex_stream`]), so routing no
+/// longer needs to exclude anything here. Kept as a named predicate — rather
+/// than inlined `true` at each call site — so a future not-yet-drivable
+/// provider has a single place to gate.
 fn anthropic_messages_target_allowed(
-    conn: &connections::ConnectionRow,
+    _conn: &connections::ConnectionRow,
     _desc: &ProviderDescriptor,
 ) -> bool {
-    conn.provider != "openai-oauth"
+    true
 }
 
 async fn expanded_route_targets(
@@ -302,7 +307,14 @@ fn connection_serves_model(
     allow_unlisted: bool,
 ) -> bool {
     let models = connections::effective_models(desc, conn);
-    (allow_unlisted && models.is_empty()) || models.iter().any(|m| m == model)
+    // Codex picker entries carry an effort suffix (`-high`) the connection's
+    // model list doesn't contain; match on the base id.
+    let needle = if conn.provider == "openai-oauth" {
+        crate::llm_router::codex::codex_base_model(model)
+    } else {
+        model
+    };
+    (allow_unlisted && models.is_empty()) || models.iter().any(|m| m == needle)
 }
 
 async fn ordered_provider_connections(
@@ -376,8 +388,8 @@ pub async fn default_model(store: &Store) -> Option<String> {
 }
 
 /// Default model for the native runtime / Anthropic Messages client path.
-/// Prefer named routes so user-created combo aliases become the natural native
-/// default, but skip `openai-oauth` because it only accepts Responses wire.
+/// Prefer named routes so user-created combo aliases become the natural
+/// native default.
 pub async fn default_anthropic_messages_model(store: &Store) -> Option<String> {
     let conns = connections::list_connections(store).await.ok()?;
     let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
@@ -414,30 +426,119 @@ pub async fn default_anthropic_messages_model(store: &Store) -> Option<String> {
     None
 }
 
+/// Whether the in-process native client can actually drive `conn` on the
+/// Anthropic-Messages path. Reachable in-process:
+///   * any api-key / no-auth connection (generic `/messages` or `/chat/
+///     completions` wiring in [`upstream_request`], with OpenAI↔Anthropic
+///     translation),
+///   * the `anthropic-oauth` Claude subscription,
+///   * `kiro` (AWS CodeWhisperer) via [`kiro_stream`] — the same
+///     EventStream→OpenAI→Anthropic translation the endpoint server uses, and
+///   * `openai-oauth` (Codex) via [`codex_stream`] — an Anthropic→OpenAI-chat→
+///     Responses request translation, with the Responses SSE decoded back
+///     into Anthropic events.
+fn native_client_can_drive(conn: &connections::ConnectionRow) -> bool {
+    if !connections::is_oauth(conn) {
+        return true;
+    }
+    matches!(
+        conn.provider.as_str(),
+        "anthropic-oauth" | "kiro" | "openai-oauth"
+    )
+}
+
+/// The models a native session can actually be pointed at, in the order the
+/// UI should present them: enabled named routes (combos) that have at least
+/// one natively-drivable target, then every `provider/model` served by an
+/// enabled, credentialed, natively-drivable connection.
+///
+/// This is the source of truth for the Native runtime card + composer model
+/// picker — the Native catalog entry has an empty model list on purpose
+/// ("models come from connections"), so without this the picker was empty and
+/// users could never pin a native model (hence it "always went to the Claude
+/// subscription" default). Only models that will actually run are listed, so
+/// the picker never offers an entry that would error on send. Codex
+/// (`openai-oauth`) connections additionally get `-low/-medium/-high/-xhigh`
+/// effort-suffixed variants of each model, since Codex routes those through
+/// [`crate::llm_router::codex::codex_base_model`].
+pub async fn selectable_native_models(store: &Store) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let push = |m: String, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+        if seen.insert(m.clone()) {
+            out.push(m);
+        }
+    };
+
+    let enabled: Vec<connections::ConnectionRow> = match connections::list_connections(store).await
+    {
+        Ok(conns) => conns.into_iter().filter(|c| c.enabled).collect(),
+        Err(_) => Vec::new(),
+    };
+
+    // Routes first — but only if at least one target is drivable in-process,
+    // so a Codex-only or keyless route isn't offered as a native model.
+    if let Ok(routes) = routes::list_model_routes(store).await {
+        for route in routes
+            .into_iter()
+            .filter(|r| r.enabled && !r.targets.is_empty())
+        {
+            let usable = route.targets.iter().any(|target| {
+                enabled
+                    .iter()
+                    .find(|c| c.id == target.connection_id)
+                    .is_some_and(|c| {
+                        native_client_can_drive(c)
+                            && registry::descriptor(&c.provider).is_some_and(|desc| {
+                                connection_has_required_credentials(desc, c)
+                                    && connection_serves_model(desc, c, &target.model, false)
+                            })
+                    })
+            });
+            if usable {
+                push(route.name, &mut out, &mut seen);
+            }
+        }
+    }
+
+    for conn in &enabled {
+        let Some(desc) = registry::descriptor(&conn.provider) else {
+            continue;
+        };
+        if !native_client_can_drive(conn) || !connection_has_required_credentials(desc, conn) {
+            continue;
+        }
+        for model in connections::effective_models(desc, conn) {
+            push(format!("{}/{}", conn.provider, model), &mut out, &mut seen);
+            if conn.provider == "openai-oauth" {
+                for effort in ["low", "medium", "high", "xhigh"] {
+                    push(
+                        format!("{}/{}-{effort}", conn.provider, model),
+                        &mut out,
+                        &mut seen,
+                    );
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// Anthropic's Claude-Code-branded system prefix, required by the
 /// anthropic-oauth (Claude subscription) upstream — that's the wire's own
 /// contract for the OAuth token, not a client-visible feature; no other
 /// header/body cloaking is added (spec #2).
-const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
-
 /// Ensure the outgoing Anthropic `system` field begins with the Claude-Code
 /// prefix block: a bare string is wrapped into `[prefix, {type:text,text:the
 /// old string}]`; an array gets the prefix prepended (skipped if already
 /// present); an absent/other value is replaced with `[prefix]`.
 fn inject_claude_system_prompt(body: &mut Value) {
-    let prefix = json!({"type": "text", "text": CLAUDE_CODE_SYSTEM_PROMPT});
-    let current = body.get("system").cloned().unwrap_or(Value::Null);
-    let new_system = match current {
-        Value::String(s) => json!([prefix, {"type": "text", "text": s}]),
-        Value::Array(mut arr) => {
-            if arr.first() != Some(&prefix) {
-                arr.insert(0, prefix);
-            }
-            Value::Array(arr)
-        }
-        _ => json!([prefix]),
-    };
-    body["system"] = new_system;
+    crate::llm_router::models::inject_claude_code_system_prompt(body);
+}
+
+fn claude_cloak_map_for(target: &RouteTarget, body: &Value) -> claude_cloak::ToolNameMap {
+    claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +593,12 @@ fn oauth_upstream_request(
                 .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
             let mut anthropic_body = body.clone();
             inject_claude_system_prompt(&mut anthropic_body);
-            Ok(ctx
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let cloaked = claude_cloak::enabled(&target.conn.data);
+            if cloaked {
+                claude_cloak::apply_request_cloak(&mut anthropic_body, &access_token, &session_id);
+            }
+            let req = ctx
                 .http
                 .post(format!("{base}/messages?beta=true"))
                 .json(&anthropic_body)
@@ -506,7 +612,12 @@ fn oauth_upstream_request(
                 .header("user-agent", "claude-cli/2.1.92 (external, sdk-cli)")
                 .header("x-app", "cli")
                 .header("x-stainless-helper-method", "stream")
-                .header("x-stainless-retry-count", "0"))
+                .header("x-stainless-retry-count", "0");
+            Ok(if cloaked {
+                claude_cloak::spoof_headers(req, &session_id)
+            } else {
+                req
+            })
         }
         "openai-oauth" => {
             // Codex's Responses wire is a fixed protocol endpoint, distinct
@@ -675,15 +786,44 @@ async fn upstream_status_failure(
     resp: reqwest::Response,
 ) -> UpstreamAttemptFailure {
     let status = resp.status().as_u16();
-    let v: Value = resp.json().await.unwrap_or(json!({}));
-    let message = v["error"]["message"]
-        .as_str()
-        .unwrap_or("upstream error")
-        .to_string();
+    // Read the body as text first so non-JSON errors (Kiro/AWS return an
+    // `{"message":...}` or `__type` shape, or plain text) aren't discarded as
+    // a generic "upstream error". Try the common JSON error shapes, then fall
+    // back to a trimmed raw-body snippet.
+    let body = resp.text().await.unwrap_or_default();
+    let message = extract_upstream_error_message(&body);
     UpstreamAttemptFailure {
         provider,
         message,
         status: Some(status),
+    }
+}
+
+/// Pull a human-readable error out of an upstream error body across the shapes
+/// providers actually use: Anthropic/OpenAI `{"error":{"message"}}`, a bare
+/// `{"error":"..."}`, AWS/Kiro `{"message":...}` / `{"Message":...}`, else a
+/// trimmed snippet of the raw body (never just "upstream error" when the
+/// upstream actually said something).
+fn extract_upstream_error_message(body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        for path in [
+            &v["error"]["message"],
+            &v["error"],
+            &v["message"],
+            &v["Message"],
+        ] {
+            if let Some(s) = path.as_str() {
+                if !s.trim().is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        "upstream error".to_string()
+    } else {
+        trimmed.chars().take(300).collect()
     }
 }
 
@@ -820,14 +960,6 @@ pub async fn anthropic_messages_stream(
 
     let mut failures = Vec::new();
     for mut target in targets {
-        if target.conn.provider == "openai-oauth" {
-            failures.push(UpstreamAttemptFailure {
-                provider: target.conn.provider.clone(),
-                message: "the OpenAI (ChatGPT) connection speaks the Responses API and cannot serve the native runtime yet".into(),
-                status: Some(400),
-            });
-            continue;
-        }
         if let Err(failure) = ensure_fresh_for_attempt(ctx, &mut target).await {
             let try_next = should_try_next_target(&failure);
             failures.push(failure);
@@ -842,6 +974,42 @@ pub async fn anthropic_messages_stream(
         attempt_body["stream"] = json!(true);
 
         let started = crate::paths::now_ms();
+
+        // Kiro has its own AWS-EventStream upstream (not the generic
+        // `/messages` or `/chat/completions` path), so it's handled before the
+        // format match. On a non-2xx it records a failure and tries the next
+        // fallback target, matching the other providers' behavior.
+        if target.conn.provider == "kiro" {
+            match kiro_stream(ctx, &mut target, &attempt_body, started).await {
+                Ok(rx) => return Ok(rx),
+                Err(failure) => {
+                    let try_next = should_try_next_target(&failure);
+                    failures.push(failure);
+                    if try_next {
+                        continue;
+                    }
+                    return Err(fallback_error(&requested, &failures));
+                }
+            }
+        }
+
+        // Codex speaks the Responses API, not `/messages` or `/chat/
+        // completions`, so — like Kiro — it's handled before the format
+        // match via its own translation + upstream pipeline.
+        if target.conn.provider == "openai-oauth" {
+            match codex_stream(ctx, &mut target, &attempt_body, started).await {
+                Ok(rx) => return Ok(rx),
+                Err(failure) => {
+                    let try_next = should_try_next_target(&failure);
+                    failures.push(failure);
+                    if try_next {
+                        continue;
+                    }
+                    return Err(fallback_error(&requested, &failures));
+                }
+            }
+        }
+
         let conn_id = target.conn.id.clone();
         let provider = target.conn.provider.clone();
         let upstream_model = target.upstream_model.clone();
@@ -849,6 +1017,7 @@ pub async fn anthropic_messages_stream(
 
         match target.desc.format {
             ApiFormat::Anthropic => {
+                let tool_map = claude_cloak_map_for(&target, &attempt_body);
                 let resp = send_upstream(ctx, &mut target, &attempt_body).await?;
                 if !resp.status().is_success() {
                     let failure = upstream_status_failure(provider, resp).await;
@@ -861,8 +1030,17 @@ pub async fn anthropic_messages_stream(
                 }
                 let store = ctx.store.clone();
                 tokio::spawn(async move {
-                    pump_anthropic(resp, tx, store, conn_id, provider, upstream_model, started)
-                        .await;
+                    pump_anthropic(
+                        resp,
+                        tx,
+                        store,
+                        conn_id,
+                        provider,
+                        upstream_model,
+                        started,
+                        tool_map,
+                    )
+                    .await;
                 });
                 return Ok(rx);
             }
@@ -925,6 +1103,7 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
         match target.desc.format {
             ApiFormat::Anthropic => {
                 let provider = target.conn.provider.clone();
+                let tool_map = claude_cloak_map_for(&target, &attempt_body);
                 let resp = send_upstream(ctx, &mut target, &attempt_body).await?;
                 if !resp.status().is_success() {
                     let failure = upstream_status_failure(provider, resp).await;
@@ -935,7 +1114,9 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
                     }
                     return Err(fallback_error(&requested, &failures));
                 }
-                return Ok(resp.json().await?);
+                let mut v: Value = resp.json().await?;
+                claude_cloak::decloak_response(&mut v, &tool_map);
+                return Ok(v);
             }
             ApiFormat::OpenAi => {
                 let upstream_body = translate::openai_to_anthropic_request(&attempt_body)
@@ -969,6 +1150,7 @@ async fn pump_anthropic(
     provider: String,
     model: String,
     started: i64,
+    tool_map: claude_cloak::ToolNameMap,
 ) {
     use crate::llm_router::sse::SseParser;
     use futures::StreamExt;
@@ -992,16 +1174,17 @@ async fn pump_anthropic(
             if ev.data == "[DONE]" {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<Value>(&ev.data) else {
+            let Ok(mut v) = serde_json::from_str::<Value>(&ev.data) else {
                 continue;
             };
+            let name = ev.event.clone().unwrap_or_default();
+            claude_cloak::decloak_event(&name, &mut v, &tool_map);
             if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
                 input_tokens += u.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
             }
             if let Some(u) = v.get("usage") {
                 output_tokens += u.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
             }
-            let name = ev.event.clone().unwrap_or_default();
             if tx.send(Ok((name, v))).await.is_err() {
                 break 'pump; // consumer dropped
             }
@@ -1092,10 +1275,337 @@ async fn pump_openai_translated(
     );
 }
 
+// ---------------------------------------------------------------------------
+// Kiro (AWS CodeWhisperer) — in-process native support
+//
+// The endpoint server (`server.rs`) already serves kiro; this is the same
+// pipeline retargeted from its `AppState` to `UpstreamCtx` so the native
+// runtime can drive kiro too (Anthropic body → kiro `generateAssistantResponse`
+// → AWS EventStream → OpenAI chunks → Anthropic events). The translators
+// (`kiro`, `aws_stream`, `translate::OpenAiToAnthropicStream`) are shared.
+// ---------------------------------------------------------------------------
+
+/// Ordered kiro `generateAssistantResponse` endpoints. Account-bound auth
+/// (api_key/idc/external_idp) puts the two `amazonaws.com` hosts first because
+/// kiro.dev rejects an account-bound bearer token. Mirrors server.rs.
+fn kiro_endpoints(auth_method: &str, region: &str) -> Vec<String> {
+    let kiro_dev = "https://runtime.us-east-1.kiro.dev/generateAssistantResponse".to_string();
+    let codewhisperer =
+        format!("https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse");
+    let q = format!("https://q.{region}.amazonaws.com/generateAssistantResponse");
+    if connections::is_account_bound(auth_method) {
+        vec![codewhisperer, q, kiro_dev]
+    } else {
+        vec![kiro_dev, codewhisperer, q]
+    }
+}
+
+/// Build the verbatim kiro upstream request (wire contract only — no cloaking).
+fn kiro_upstream_request(
+    ctx: &UpstreamCtx,
+    target: &RouteTarget,
+    kiro_body: &Value,
+) -> reqwest::RequestBuilder {
+    let data = &target.conn.data;
+    let auth_method = connections::kiro_auth_method(data);
+    let url = kiro_endpoints(&auth_method, &connections::kiro_region(data))
+        .into_iter()
+        .next()
+        .expect("kiro_endpoints always returns at least one URL");
+    let token = data.access_token.clone().unwrap_or_default();
+    let mut req = ctx
+        .http
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/vnd.amazon.eventstream")
+        .header(
+            "x-amz-target",
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+        )
+        .header("user-agent", "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0")
+        .header("x-amz-user-agent", "aws-sdk-js/3.0.0 kiro-ide/1.0.0")
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("authorization", format!("Bearer {token}"));
+    if auth_method == "api_key" {
+        req = req.header("tokentype", "API_KEY");
+    } else if auth_method == "external_idp" {
+        req = req.header("TokenType", "EXTERNAL_IDP");
+    }
+    req.json(kiro_body)
+}
+
+/// Send the kiro request; on 401/403 refresh once and retry (mirrors
+/// [`send_upstream`]). Pre-stream only — a mid-stream 401 is not retried.
+async fn send_kiro(
+    ctx: &UpstreamCtx,
+    target: &mut RouteTarget,
+    kiro_body: &Value,
+) -> anyhow::Result<reqwest::Response> {
+    let resp = kiro_upstream_request(ctx, target, kiro_body).send().await?;
+    if matches!(resp.status().as_u16(), 401 | 403) {
+        let refreshed = match &ctx.oauth_token_url_override {
+            Some(token_url) => oauth::refresh::force_refresh_with_token_url(
+                &ctx.store,
+                &ctx.http,
+                &mut target.conn,
+                token_url,
+            )
+            .await
+            .is_ok(),
+            None => oauth::refresh::force_refresh(&ctx.store, &ctx.http, &mut target.conn)
+                .await
+                .is_ok(),
+        };
+        if refreshed {
+            return Ok(kiro_upstream_request(ctx, target, kiro_body).send().await?);
+        }
+    }
+    Ok(resp)
+}
+
+/// Start a kiro stream for the native path: translate the Anthropic body to
+/// kiro's payload, send, and spawn a pump that yields Anthropic events. Returns
+/// the receiver on a successful (2xx) upstream; a non-2xx becomes an
+/// [`UpstreamAttemptFailure`] so the caller can try the next fallback target.
+async fn kiro_stream(
+    ctx: &UpstreamCtx,
+    target: &mut RouteTarget,
+    body: &Value,
+    started: i64,
+) -> Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>, UpstreamAttemptFailure> {
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+    let kiro_body = crate::llm_router::kiro::anthropic_request_to_kiro(
+        body,
+        &target.upstream_model,
+        &target.conn.data,
+        &conversation_id,
+    );
+    let resp = send_kiro(ctx, target, &kiro_body)
+        .await
+        .map_err(|e| UpstreamAttemptFailure {
+            provider: target.conn.provider.clone(),
+            message: format!("upstream kiro: {e}"),
+            status: None,
+        })?;
+    if !resp.status().is_success() {
+        return Err(upstream_status_failure(target.conn.provider.clone(), resp).await);
+    }
+    let (tx, rx) = mpsc::channel::<anyhow::Result<AnthropicEvent>>(64);
+    let store = ctx.store.clone();
+    let conn_id = target.conn.id.clone();
+    let provider = target.conn.provider.clone();
+    let model = target.upstream_model.clone();
+    tokio::spawn(async move {
+        pump_kiro(resp, model, tx, store, conn_id, provider, started).await;
+    });
+    Ok(rx)
+}
+
+/// Pump a kiro AWS-EventStream response into Anthropic events: decode frames
+/// with `AwsEventStreamParser`, turn them into OpenAI chunks via
+/// `KiroToOpenAiStream`, then translate those into Anthropic events with the
+/// same `OpenAiToAnthropicStream` the openrouter pump uses.
+async fn pump_kiro(
+    resp: reqwest::Response,
+    model: String,
+    tx: mpsc::Sender<anyhow::Result<AnthropicEvent>>,
+    store: Arc<Store>,
+    conn_id: String,
+    provider: String,
+    started: i64,
+) {
+    use futures::StreamExt;
+    let mut parser = crate::llm_router::aws_stream::AwsEventStreamParser::default();
+    let mut kiro = crate::llm_router::kiro::KiroToOpenAiStream::new(&model);
+    let mut tr = translate::OpenAiToAnthropicStream::new(&model);
+    let mut stream = resp.bytes_stream();
+    let mut errored = false;
+    'pump: while let Some(item) = stream.next().await {
+        let chunk = match item {
+            Ok(c) => c,
+            Err(e) => {
+                for (name, data) in tr.error_frame(&format!("upstream stream interrupted: {e}")) {
+                    let _ = tx.send(Ok((name, data))).await;
+                }
+                errored = true;
+                break;
+            }
+        };
+        for frame in parser.feed(&chunk) {
+            for oai in kiro.feed(&frame) {
+                for (name, data) in tr.feed(&oai) {
+                    if tx.send(Ok((name, data))).await.is_err() {
+                        break 'pump; // consumer dropped
+                    }
+                }
+            }
+        }
+    }
+    if !errored {
+        // A clean EOF is a valid completion even if no explicit terminal frame
+        // (`messageStopEvent`/`metadataEvent`) was seen — Kiro ends some turns
+        // that way (matches 9router, which finishes on EOF). Emit the finish
+        // chunk via `finish_on_eof` and translate it, rather than erroring; a
+        // genuine mid-stream break is a transport `Err` and is handled above.
+        if !kiro.saw_terminal() {
+            for oai in kiro.finish() {
+                for (name, data) in tr.feed(&oai) {
+                    let _ = tx.send(Ok((name, data))).await;
+                }
+            }
+        }
+        for (name, data) in tr.finish() {
+            let _ = tx.send(Ok((name, data))).await;
+        }
+    }
+    let (input, output) = kiro.usage();
+    crate::llm_router::usage::record(
+        &store,
+        &conn_id,
+        &provider,
+        &model,
+        "native",
+        crate::llm_router::usage::Usage { input, output },
+        if errored { 502 } else { 200 },
+        started,
+        errored.then(|| "stream interrupted".to_string()),
+    );
+}
+
+/// Start a Codex stream for the native path: Anthropic body -> OpenAI chat ->
+/// Responses request -> Codex-normalized -> POST (via the existing openai-oauth
+/// upstream branch), then a pump that yields Anthropic events.
+async fn codex_stream(
+    ctx: &UpstreamCtx,
+    target: &mut RouteTarget,
+    body: &Value,
+    started: i64,
+) -> Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>, UpstreamAttemptFailure> {
+    // Clone the provider up front rather than borrowing `target` inside the
+    // closure — a reborrow through `target` (a `&mut`) here would keep it
+    // immutably borrowed across the `send_upstream(ctx, target, ...)` call
+    // below, which needs `&mut target`.
+    let provider = target.conn.provider.clone();
+    let fail = |e: String| UpstreamAttemptFailure {
+        provider: provider.clone(),
+        message: e,
+        status: None,
+    };
+    let chat = translate::anthropic_to_openai_request(body).map_err(|e| fail(e.to_string()))?;
+    let mut responses = crate::llm_router::codex::openai_chat_to_responses_request(&chat);
+    crate::llm_router::codex::normalize_codex_responses_body(
+        &mut responses,
+        &target.upstream_model,
+        None,
+    );
+    let resp = send_upstream(ctx, target, &responses)
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(upstream_status_failure(target.conn.provider.clone(), resp).await);
+    }
+    let (tx, rx) = mpsc::channel::<anyhow::Result<AnthropicEvent>>(64);
+    let store = ctx.store.clone();
+    let conn_id = target.conn.id.clone();
+    let provider = target.conn.provider.clone();
+    let model = target.upstream_model.clone();
+    tokio::spawn(async move {
+        pump_codex(resp, model, tx, store, conn_id, provider, started).await;
+    });
+    Ok(rx)
+}
+
+/// Pump a Codex Responses SSE response into Anthropic events: decode with
+/// `ResponsesToOpenAiStream`, translate via `OpenAiToAnthropicStream`. A
+/// `response.failed`/`error` event decodes to a bare `{"error":{"message":
+/// ...}}` element (see `ResponsesToOpenAiStream::feed`) that
+/// `OpenAiToAnthropicStream::feed` doesn't understand and would silently
+/// drop — it's checked for explicitly and turned into an Anthropic error
+/// frame before it ever reaches `tr.feed`.
+async fn pump_codex(
+    resp: reqwest::Response,
+    model: String,
+    tx: mpsc::Sender<anyhow::Result<AnthropicEvent>>,
+    store: Arc<Store>,
+    conn_id: String,
+    provider: String,
+    started: i64,
+) {
+    use crate::llm_router::sse::SseParser;
+    use futures::StreamExt;
+    let mut parser = SseParser::default();
+    let mut dec = crate::llm_router::codex::ResponsesToOpenAiStream::new(&model);
+    let mut tr = translate::OpenAiToAnthropicStream::new(&model);
+    let mut stream = resp.bytes_stream();
+    let mut errored = false;
+    'pump: while let Some(item) = stream.next().await {
+        let chunk = match item {
+            Ok(c) => c,
+            Err(e) => {
+                for (name, data) in tr.error_frame(&format!("upstream stream interrupted: {e}")) {
+                    let _ = tx.send(Ok((name, data))).await;
+                }
+                errored = true;
+                break;
+            }
+        };
+        for ev in parser.feed(&chunk) {
+            let Ok(data) = serde_json::from_str::<Value>(&ev.data) else {
+                continue;
+            };
+            let name = ev.event.clone().unwrap_or_default();
+            for oai in dec.feed(&name, &data) {
+                if let Some(err) = oai
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    for (n, d) in tr.error_frame(err) {
+                        let _ = tx.send(Ok((n, d))).await;
+                    }
+                    errored = true;
+                    break 'pump;
+                }
+                for (n, d) in tr.feed(&oai) {
+                    if tx.send(Ok((n, d))).await.is_err() {
+                        break 'pump;
+                    }
+                }
+            }
+        }
+    }
+    if !errored {
+        if !dec.saw_terminal() {
+            for oai in dec.finish() {
+                for (n, d) in tr.feed(&oai) {
+                    let _ = tx.send(Ok((n, d))).await;
+                }
+            }
+        }
+        for (n, d) in tr.finish() {
+            let _ = tx.send(Ok((n, d))).await;
+        }
+    }
+    let (input, output) = dec.usage();
+    crate::llm_router::usage::record(
+        &store,
+        &conn_id,
+        &provider,
+        &model,
+        "native",
+        crate::llm_router::usage::Usage { input, output },
+        if errored { 502 } else { 200 },
+        started,
+        errored.then(|| "stream interrupted".to_string()),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm_router::connections::{ConnectionData, ConnectionRow};
+    use crate::llm_router::models::CLAUDE_CODE_SYSTEM_PROMPT;
 
     fn mk_conn(id: &str, provider: &str, auth_type: &str, data: ConnectionData) -> ConnectionRow {
         ConnectionRow {
@@ -1125,6 +1635,38 @@ mod tests {
         assert_eq!(sys.len(), 2);
         assert_eq!(sys[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
         assert_eq!(sys[1]["text"], "be nice");
+    }
+
+    #[test]
+    fn extract_upstream_error_reads_every_common_shape_and_falls_back_to_raw() {
+        // Anthropic / OpenAI
+        assert_eq!(
+            extract_upstream_error_message(r#"{"error":{"message":"model not found"}}"#),
+            "model not found"
+        );
+        // Bare {"error":"..."}
+        assert_eq!(
+            extract_upstream_error_message(r#"{"error":"invalid_grant"}"#),
+            "invalid_grant"
+        );
+        // AWS / Kiro lowercase + capitalized message keys
+        assert_eq!(
+            extract_upstream_error_message(r#"{"message":"ValidationException: bad tool schema"}"#),
+            "ValidationException: bad tool schema"
+        );
+        assert_eq!(
+            extract_upstream_error_message(
+                r#"{"__type":"ThrottlingException","Message":"Rate exceeded"}"#
+            ),
+            "Rate exceeded"
+        );
+        // Non-JSON body is surfaced verbatim (trimmed), NOT swallowed.
+        assert_eq!(
+            extract_upstream_error_message("  Bad Gateway  "),
+            "Bad Gateway"
+        );
+        // Truly empty body → generic sentinel.
+        assert_eq!(extract_upstream_error_message("   "), "upstream error");
     }
 
     #[test]
@@ -1204,6 +1746,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_request_for_anthropic_applies_full_cloak_when_enabled() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("anthropic-oauth").unwrap();
+        let conn = mk_conn(
+            "c1",
+            "anthropic-oauth",
+            "oauth",
+            ConnectionData {
+                access_token: Some("sk-ant-oat-test".into()),
+                provider_specific: Some(json!({"claudeCloaking": true})),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "claude-x".into(),
+        };
+        let body = json!({
+            "model": "claude-x",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "lookup", "input": {"q": "x"}}
+                ]}
+            ],
+            "tools": [{"name": "lookup", "description": "Lookup data", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "lookup"}
+        });
+        let req = upstream_request(&ctx, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(req.headers().contains_key("x-stainless-runtime-version"));
+        assert!(req.headers().contains_key("x-claude-code-session-id"));
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(sent["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.92."));
+        assert_eq!(sent["system"][1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(sent["tools"][0]["name"], "lookup_ide");
+        assert!(sent["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "Bash"));
+        assert_eq!(sent["messages"][0]["content"][0]["name"], "lookup_ide");
+        assert_eq!(sent["tool_choice"]["name"], "lookup_ide");
+        assert!(sent["metadata"]["user_id"]
+            .as_str()
+            .unwrap()
+            .contains("\"session_id\""));
+    }
+
+    #[tokio::test]
     async fn oauth_request_for_openai_hits_codex_responses_with_account_and_session_headers() {
         let ctx = test_ctx().await;
         let desc = registry::descriptor("openai-oauth").unwrap();
@@ -1267,7 +1865,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_messages_route_skips_responses_only_route_target() {
+    async fn anthropic_messages_route_serves_codex_route_target_now_that_its_drivable() {
+        // Codex is now natively drivable (via `codex_stream`), so a route
+        // listing it first is no longer skipped at the routing layer — it's
+        // served, same as any other provider.
         let ctx = test_ctx().await;
         connections::add_connection(
             &ctx.store,
@@ -1328,9 +1929,260 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(target.conn.id, "chatgpt");
+        assert_eq!(target.conn.provider, "openai-oauth");
+        assert_eq!(target.upstream_model, "gpt-5.2-codex");
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_route_skips_uncredentialed_route_target() {
+        // An openai-oauth connection with no token still can't actually be
+        // driven, so it's skipped in favor of the next fallback target —
+        // same as any other provider missing credentials.
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "chatgpt",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    models_override: Some(vec!["gpt-5.2-codex".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "claude",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-ant".into()),
+                    models_override: Some(vec!["claude-sonnet-4-5".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "fable".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        connection_id: "chatgpt".into(),
+                        model: "gpt-5.2-codex".into(),
+                    },
+                    routes::ModelRouteTarget {
+                        connection_id: "claude".into(),
+                        model: "claude-sonnet-4-5".into(),
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let target = route_model_for_anthropic_messages(&ctx.store, "fable")
+            .await
+            .unwrap()
+            .unwrap();
+
         assert_eq!(target.conn.id, "claude");
         assert_eq!(target.conn.provider, "anthropic");
         assert_eq!(target.upstream_model, "claude-sonnet-4-5");
+    }
+
+    #[tokio::test]
+    async fn codex_is_offered_and_effort_variants_route_to_openai_oauth() {
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "cx",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at".into()),
+                    models_override: Some(vec!["gpt-5.2-codex".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let models = selectable_native_models(&ctx.store).await;
+        assert!(
+            models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex"),
+            "got {models:?}"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m == "openai-oauth/gpt-5.2-codex-high"),
+            "effort variant missing: {models:?}"
+        );
+
+        // The suffixed id routes to the openai-oauth connection.
+        let t = route_model_for_anthropic_messages(&ctx.store, "openai-oauth/gpt-5.2-codex-high")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.conn.provider, "openai-oauth");
+        assert_eq!(t.upstream_model, "gpt-5.2-codex-high");
+    }
+
+    #[tokio::test]
+    async fn selectable_native_models_lists_usable_routes_then_connection_models_and_skips_unreachable(
+    ) {
+        let ctx = test_ctx().await;
+        // Codex (openai-oauth) IS drivable natively now (via `codex_stream`),
+        // so its models and any route pointing at it must be offered.
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "chatgpt",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at-codex".into()),
+                    models_override: Some(vec!["gpt-5.2-codex".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        // OpenRouter WITH a key — drivable in-process (OpenAI-format + translation).
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "or",
+                "openrouter",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-or".into()),
+                    models_override: Some(vec!["deepseek/deepseek-chat:free".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        // OpenRouter WITHOUT a key — must NOT be offered (would error on send).
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "or-nokey",
+                "openrouter",
+                "api_key",
+                ConnectionData {
+                    api_key: None,
+                    models_override: Some(vec!["keyless/model".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        // Kiro (oauth) IS drivable natively now (AWS EventStream pipeline), so
+        // its models must be offered.
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "kiro1",
+                "kiro",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at-kiro".into()),
+                    models_override: Some(vec!["claude-sonnet-5".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        // A usable route (openrouter target with a key) and a Codex-only route
+        // — both are drivable, so both must be offered.
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "usable-combo".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![routes::ModelRouteTarget {
+                    connection_id: "or".into(),
+                    model: "deepseek/deepseek-chat:free".into(),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r2".into(),
+                name: "codex-only".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![routes::ModelRouteTarget {
+                    connection_id: "chatgpt".into(),
+                    model: "gpt-5.2-codex".into(),
+                }],
+                created_at: 2,
+                updated_at: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        let models = selectable_native_models(&ctx.store).await;
+
+        // Usable route first; the openrouter provider/model is offered.
+        assert_eq!(models.first().map(String::as_str), Some("usable-combo"));
+        assert!(models
+            .iter()
+            .any(|m| m == "openrouter/deepseek/deepseek-chat:free"));
+        // Kiro is drivable natively — its models are offered.
+        assert!(
+            models.iter().any(|m| m == "kiro/claude-sonnet-5"),
+            "kiro must be offered, got: {models:?}"
+        );
+        // Codex is drivable natively — its model (plus effort variants) and
+        // the Codex-only route are offered.
+        assert!(
+            models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex"),
+            "got: {models:?}"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m == "openai-oauth/gpt-5.2-codex-high"),
+            "effort variant missing, got: {models:?}"
+        );
+        assert!(
+            models.iter().any(|m| m == "codex-only"),
+            "codex-only route must be offered, got: {models:?}"
+        );
+        // A keyless connection's models are never offered.
+        assert!(
+            !models.iter().any(|m| m == "openrouter/keyless/model"),
+            "got: {models:?}"
+        );
     }
 
     #[tokio::test]
@@ -1624,6 +2476,66 @@ mod tests {
 
         assert_eq!(response["model"], "claude-second");
         assert_eq!(response["content"][0]["text"], "fallback worked");
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_decloaks_tool_names_for_cloaked_anthropic_oauth() {
+        use axum::{routing::post, Json, Router};
+
+        async fn ok(Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(body["tools"][0]["name"], "lookup_ide");
+            Json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": body["model"].clone(),
+                "content": [{"type": "tool_use", "id": "tu_1", "name": "lookup_ide", "input": {"q": "x"}}],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }))
+        }
+
+        let app = Router::new().route("/messages", post(ok));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        let now = crate::paths::now_ms();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "claude-oauth",
+                "anthropic-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("sk-ant-oat-test".into()),
+                    expires_at: Some(now + 24 * 60 * 60 * 1000),
+                    last_refresh_at: Some(now),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["claude-x".into()]),
+                    provider_specific: Some(json!({"claudeCloaking": true})),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let response = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "anthropic-oauth/claude-x",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "lookup", "description": "Lookup data", "input_schema": {"type": "object"}}]
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["content"][0]["name"], "lookup");
     }
 
     #[tokio::test]

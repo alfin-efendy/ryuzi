@@ -98,7 +98,12 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
         };
         let detected = binary_path.is_some();
         let mut models: Vec<String> = desc.models.iter().map(|m| m.to_string()).collect();
-        if models.is_empty() {
+        if is_native {
+            // The native runtime has no fixed catalog: its selectable models
+            // are the user's enabled routes + provider connections, so the
+            // picker reflects what the router can actually reach today.
+            models = ryuzi_core::llm_router::client::selectable_native_models(cp.store()).await;
+        } else if models.is_empty() {
             models = snap.local_models.clone();
         }
         let model = cfg

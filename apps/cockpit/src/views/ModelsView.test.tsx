@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { CatalogEntry, ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, ModelRouteInfo, UsageSeries } from "@/bindings";
 
 const status: EndpointStatusInfo = {
@@ -26,6 +26,7 @@ const connection: ConnectionInfo = {
   models: ["gpt-4.1", "o3"],
   keyMasked: "sk-…3fk9",
   needsRelogin: false,
+  claudeCloaking: false,
 };
 
 const secondConnection: ConnectionInfo = {
@@ -35,6 +36,23 @@ const secondConnection: ConnectionInfo = {
   priority: 1,
   keyMasked: "sk-…zz99",
   models: ["gpt-4.1"],
+};
+
+const claudeConnection: ConnectionInfo = {
+  id: "c3",
+  provider: "anthropic-oauth",
+  providerName: "Claude Code",
+  color: "#D97757",
+  initial: "C",
+  authType: "oauth",
+  label: "Claude subscription",
+  priority: 0,
+  enabled: true,
+  baseUrl: null,
+  models: ["claude-opus-4-8"],
+  keyMasked: null,
+  needsRelogin: false,
+  claudeCloaking: true,
 };
 
 const catalog: CatalogEntry[] = [
@@ -82,6 +100,18 @@ const usage: UsageSeries = {
   todayOutputTokens: 210,
 };
 
+const updateConnection = mock(
+  (
+    _id: string,
+    _label: string,
+    _enabled: boolean,
+    _apiKey: string | null,
+    _baseUrl: string | null,
+    _models: string[],
+    _claudeCloaking: boolean | null,
+  ) => Promise.resolve({ status: "ok" as const, data: [connection, secondConnection, claudeConnection] }),
+);
+
 // Mock the Tauri IPC boundary before the component (and the stores it uses) load.
 mock.module("@/bindings", () => ({
   commands: {
@@ -96,10 +126,23 @@ mock.module("@/bindings", () => ({
     setProviderAccountRoute: (provider: string, strategy: string) => Promise.resolve({ status: "ok", data: { provider, strategy } }),
     connectionUsage: () => Promise.resolve({ status: "ok", data: usage }),
     endpointUsage: () => Promise.resolve({ status: "ok", data: usage }),
-    updateConnection: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
+    updateConnection,
     moveConnection: () => Promise.resolve({ status: "ok", data: [secondConnection, connection] }),
     testConnection: () => Promise.resolve({ status: "ok", data: { ok: true, message: "Connection OK" } }),
     testConnectionModel: () => Promise.resolve({ status: "ok", data: { ok: true, message: "Model OK" } }),
+    connectionProviderQuota: () =>
+      Promise.resolve({
+        status: "ok",
+        data: {
+          provider: "anthropic-oauth",
+          plan: "Claude Code",
+          message: null,
+          limitReached: false,
+          reviewLimitReached: false,
+          resetCredits: null,
+          quotas: [],
+        },
+      }),
   },
   events: {
     oauthAuthorizeUrlMsg: {
@@ -219,6 +262,21 @@ test("connection detail back returns to its provider detail", () => {
 
   fireEvent.click(screen.getByRole("button", { name: "OpenAI" }));
   expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "openai" });
+});
+
+test("connection detail saves the Claude cloaking toggle", async () => {
+  updateConnection.mockClear();
+  useConnections.setState({ catalog, connections: [claudeConnection], loaded: true });
+  render(<ConnectionDetailView id="c3" />);
+
+  const toggle = screen.getByRole("switch", { name: "Claude Code cloaking" });
+  expect(toggle.getAttribute("aria-checked")).toBe("true");
+  fireEvent.click(toggle);
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() =>
+    expect(updateConnection).toHaveBeenCalledWith("c3", "Claude subscription", true, null, null, ["claude-opus-4-8"], false),
+  );
 });
 
 test("warns when secrets fall back to a local file instead of the OS keychain", async () => {

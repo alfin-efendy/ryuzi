@@ -115,7 +115,8 @@ impl Harness for NativeHarness {
         let llm = self.llm_factory.create(ctx.store.clone());
         // Native speaks Anthropic Messages internally; resolve configured
         // routes/models through that capability and fall back to a compatible
-        // route/model when a stale project pins a Responses-only target.
+        // route/model when a stale project pins a target no connection
+        // actually serves anymore.
         let model = resolve_native_model(&ctx.store, ctx.model).await;
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
@@ -140,7 +141,7 @@ impl Harness for NativeHarness {
                 work_dir: ctx.work_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 model,
-                perm_mode: ctx.perm_mode,
+                perm_mode: Arc::new(std::sync::Mutex::new(ctx.perm_mode)),
                 project_policy: None,
                 store: ctx.store,
                 events: ctx.events,
@@ -190,6 +191,12 @@ impl HarnessSession for NativeSession {
             tok.cancel();
         }
         Ok(())
+    }
+
+    fn set_perm_mode(&self, mode: crate::domain::PermMode) {
+        // Live update: the next turn's tool gate reads this fresh, so a
+        // composer/project-settings permission change applies without a restart.
+        self.deps.set_perm_mode(mode);
     }
 
     fn agent_session_id(&self) -> Option<String> {
@@ -369,45 +376,59 @@ mod tests {
         session.end().await.unwrap();
     }
 
+    fn conn_for_resolution_tests(
+        id: &str,
+        provider: &str,
+        model: &str,
+    ) -> crate::llm_router::connections::ConnectionRow {
+        use crate::llm_router::connections::{ConnectionData, ConnectionRow};
+        let is_oauth = provider.ends_with("oauth");
+        ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: if is_oauth {
+                "oauth".into()
+            } else {
+                "api_key".into()
+            },
+            label: id.into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                api_key: (!is_oauth).then(|| format!("sk-{id}")),
+                access_token: is_oauth.then(|| format!("at-{id}")),
+                models_override: Some(vec![model.into()]),
+                ..Default::default()
+            },
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
     #[tokio::test]
-    async fn native_model_resolution_falls_back_from_responses_only_model() {
-        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+    async fn native_model_resolution_serves_a_configured_codex_model_directly() {
+        // Codex (openai-oauth) is drivable on the native path now (via
+        // `codex_stream`), so a project pinned to it resolves directly
+        // instead of falling back to the default route.
+        use crate::llm_router::connections;
         use crate::llm_router::routes::{
             self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
         };
 
-        fn conn(id: &str, provider: &str, model: &str) -> ConnectionRow {
-            let is_oauth = provider.ends_with("oauth");
-            ConnectionRow {
-                id: id.into(),
-                provider: provider.into(),
-                auth_type: if is_oauth {
-                    "oauth".into()
-                } else {
-                    "api_key".into()
-                },
-                label: id.into(),
-                priority: 0,
-                enabled: true,
-                data: ConnectionData {
-                    api_key: (!is_oauth).then(|| format!("sk-{id}")),
-                    access_token: is_oauth.then(|| format!("at-{id}")),
-                    models_override: Some(vec![model.into()]),
-                    ..Default::default()
-                },
-                created_at: 1,
-                updated_at: 1,
-            }
-        }
-
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
-        connections::add_connection(&store, conn("chatgpt", "openai-oauth", "gpt-5.2-codex"))
-            .await
-            .unwrap();
-        connections::add_connection(&store, conn("claude", "anthropic", "claude-sonnet-4-5"))
-            .await
-            .unwrap();
+        connections::add_connection(
+            &store,
+            conn_for_resolution_tests("chatgpt", "openai-oauth", "gpt-5.2-codex"),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &store,
+            conn_for_resolution_tests("claude", "anthropic", "claude-sonnet-4-5"),
+        )
+        .await
+        .unwrap();
         routes::save_model_route(
             &store,
             ModelRouteInfo {
@@ -428,6 +449,56 @@ mod tests {
 
         assert_eq!(
             resolve_native_model(&store, Some("openai-oauth/gpt-5.2-codex".into()))
+                .await
+                .as_deref(),
+            Some("openai-oauth/gpt-5.2-codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_model_resolution_falls_back_from_an_unresolvable_model() {
+        // A configured model that no enabled connection actually serves
+        // (stale project config, renamed/removed connection, ...) still
+        // falls back to the default native model.
+        use crate::llm_router::connections;
+        use crate::llm_router::routes::{
+            self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        connections::add_connection(
+            &store,
+            conn_for_resolution_tests("chatgpt", "openai-oauth", "gpt-5.2-codex"),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &store,
+            conn_for_resolution_tests("claude", "anthropic", "claude-sonnet-4-5"),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &store,
+            ModelRouteInfo {
+                id: "r1".into(),
+                name: "fable".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::Fallback,
+                targets: vec![ModelRouteTarget {
+                    connection_id: "claude".into(),
+                    model: "claude-sonnet-4-5".into(),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resolve_native_model(&store, Some("openai-oauth/gpt-9-does-not-exist".into()))
                 .await
                 .as_deref(),
             Some("fable")
