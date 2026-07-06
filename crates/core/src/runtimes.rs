@@ -31,7 +31,7 @@ pub struct RuntimeDescriptor {
 pub const CATALOG: &[RuntimeDescriptor] = &[
     RuntimeDescriptor {
         id: "native",
-        name: "Native (ryuzi)",
+        name: "Ryuzi",
         color: "#7C5CFF",
         initial: "R",
         connection: "In-process · your model providers",

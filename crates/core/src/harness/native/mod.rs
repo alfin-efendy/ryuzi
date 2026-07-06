@@ -250,7 +250,7 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
         manifest: PluginManifest {
             contract: 1,
             id: NATIVE_ID.to_string(),
-            name: "Native (ryuzi)".to_string(),
+            name: "Ryuzi".to_string(),
             version: "0.0.0".to_string(),
             publisher: "ryuzi".to_string(),
             description: "Ryuzi's built-in agent runtime — runs the loop and tools in-process, using your configured model providers".to_string(),
@@ -325,7 +325,7 @@ mod tests {
         let plugin = native_plugin();
         assert_eq!(plugin.manifest.contract, 1);
         assert_eq!(plugin.manifest.id, "native");
-        assert_eq!(plugin.manifest.name, "Native (ryuzi)");
+        assert_eq!(plugin.manifest.name, "Ryuzi");
         assert_eq!(plugin.manifest.publisher, "ryuzi");
         assert!(plugin.manifest.verified);
         assert_eq!(plugin.manifest.categories, vec!["runtime".to_string()]);

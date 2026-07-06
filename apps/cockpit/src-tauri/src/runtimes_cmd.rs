@@ -442,7 +442,7 @@ mod tests {
             .iter()
             .find(|r| r.id == "native")
             .expect("native runtime must appear in the Runtime list");
-        assert_eq!(native.name, "Native (ryuzi)");
+        assert_eq!(native.name, "Ryuzi");
         // Available (in-process) without any binary on PATH, and runnable.
         assert!(native.binary_path.is_some(), "native must be available");
         assert!(native.installed_version.is_some());
