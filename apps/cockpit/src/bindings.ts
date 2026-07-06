@@ -930,7 +930,12 @@ export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
-export type CatalogEntry = { id: string; name: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
+export type CatalogEntry = { id: string; name: string; 
+/**
+ * Vendor family id (a catalog id). Entries sharing a family render as one
+ * provider card; the entry whose id == family is the display head.
+ */
+family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
 export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[] }
 export type CmdError = { message: string }
@@ -1031,7 +1036,13 @@ export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: s
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
 export type ModelRouteInfo = { id: string; name: string; enabled: boolean; strategy: ModelRouteStrategy; targets: ModelRouteTarget[]; createdAt: number; updatedAt: number }
 export type ModelRouteStrategy = "fallback" | "round-robin"
-export type ModelRouteTarget = { connectionId: string; model: string }
+export type ModelRouteTarget = { 
+/**
+ * A family id (registry family head), e.g. "anthropic" — NOT a
+ * connection id. The router expands this to every enabled account in
+ * the family serving `model`, at request time.
+ */
+provider: string; model: string }
 export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PluginAuthInfo = { 

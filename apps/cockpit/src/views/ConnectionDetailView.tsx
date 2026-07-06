@@ -19,7 +19,7 @@ import { ProviderQuotaCard } from "@/components/ProviderQuotaCard";
 
 export function ConnectionDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { connections, loaded, hydrate, update, remove, test, reconnectOauth } = useConnections();
+  const { connections, catalog, loaded, hydrate, update, remove, test, reconnectOauth } = useConnections();
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
@@ -82,6 +82,8 @@ export function ConnectionDetailView({ id }: { id: string }) {
   }
   if (!conn) return null;
 
+  const providerFamily = catalog.find((entry) => entry.id === conn.provider)?.family ?? conn.provider;
+
   const save = async () => {
     setSaving(true);
     await update(id, {
@@ -109,7 +111,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
   const del = async () => {
     if (!window.confirm(`Remove ${conn.label || conn.providerName}? This cannot be undone.`)) return;
     await remove(id);
-    nav.navigate({ kind: "providerDetail", provider: conn.provider });
+    nav.navigate({ kind: "providerDetail", provider: providerFamily });
   };
 
   const needsRelogin = conn.authType === "oauth" && conn.needsRelogin;
@@ -149,7 +151,10 @@ export function ConnectionDetailView({ id }: { id: string }) {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[860px]">
-        <BackButton label={conn.providerName} onClick={() => nav.navigate({ kind: "providerDetail", provider: conn.provider })} />
+        <BackButton
+          label={catalog.find((entry) => entry.id === providerFamily)?.name ?? conn.providerName}
+          onClick={() => nav.navigate({ kind: "providerDetail", provider: providerFamily })}
+        />
 
         <DetailHeader
           chip={<Chip initial={conn.initial} color={conn.color} size={44} />}

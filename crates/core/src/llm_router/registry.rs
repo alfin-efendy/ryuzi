@@ -31,6 +31,12 @@ pub enum ProviderCategory {
 pub struct ProviderDescriptor {
     pub id: &'static str,
     pub name: &'static str,
+    /// Vendor family this descriptor belongs to. Descriptors sharing a family
+    /// (e.g. `anthropic` + `anthropic-oauth`) render as ONE provider in the UI
+    /// and pool their accounts for routing/failover. The family id is always
+    /// the id of a catalog entry (the "family head") whose display identity
+    /// (name/color/initial) represents the group.
+    pub family: &'static str,
     pub color: &'static str,
     pub initial: &'static str,
     pub category: ProviderCategory,
@@ -114,6 +120,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "anthropic",
         name: "Anthropic",
+        family: "anthropic",
         color: "#D97757",
         initial: "A",
         category: ApiKey,
@@ -129,6 +136,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "openai",
         name: "OpenAI",
+        family: "openai",
         color: "#0FA47F",
         initial: "O",
         category: ApiKey,
@@ -144,6 +152,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "openrouter",
         name: "OpenRouter",
+        family: "openrouter",
         color: "#6E56CF",
         initial: "R",
         category: ApiKey,
@@ -159,6 +168,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "groq",
         name: "Groq",
+        family: "groq",
         color: "#F55036",
         initial: "G",
         category: ApiKey,
@@ -174,6 +184,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "deepseek",
         name: "DeepSeek",
+        family: "deepseek",
         color: "#4D6BFE",
         initial: "D",
         category: ApiKey,
@@ -189,6 +200,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "mistral",
         name: "Mistral",
+        family: "mistral",
         color: "#FA5111",
         initial: "M",
         category: ApiKey,
@@ -204,6 +216,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "xai",
         name: "xAI",
+        family: "xai",
         color: "#9CA3AF",
         initial: "X",
         category: ApiKey,
@@ -219,6 +232,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "google",
         name: "Google (Gemini)",
+        family: "google",
         color: "#4285F4",
         initial: "G",
         category: ApiKey,
@@ -234,6 +248,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "ollama",
         name: "Ollama (local)",
+        family: "ollama",
         color: "#8B8B8B",
         initial: "L",
         category: ApiKey,
@@ -249,6 +264,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "custom-openai",
         name: "Custom (OpenAI-compatible)",
+        family: "custom-openai",
         color: "#8B8B8B",
         initial: "C",
         category: ApiKey,
@@ -264,6 +280,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "custom-anthropic",
         name: "Custom (Anthropic-compatible)",
+        family: "custom-anthropic",
         color: "#8B8B8B",
         initial: "C",
         category: ApiKey,
@@ -281,6 +298,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "anthropic-oauth",
         name: "Anthropic (Claude subscription)",
+        family: "anthropic",
         color: "#D97757",
         initial: "A",
         category: OAuth,
@@ -312,6 +330,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "openai-oauth",
         name: "OpenAI (ChatGPT)",
+        family: "openai",
         color: "#0FA47F",
         initial: "O",
         category: OAuth,
@@ -337,6 +356,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "kiro",
         name: "Kiro (free tier)",
+        family: "kiro",
         color: "#7C3AED",
         initial: "K",
         category: Free,
@@ -360,6 +380,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "opencode-free",
         name: "OpenCode (free)",
+        family: "opencode-free",
         color: "#F5A623",
         initial: "OC",
         category: Free,
@@ -376,6 +397,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
 
 pub fn descriptor(id: &str) -> Option<&'static ProviderDescriptor> {
     CATALOG.iter().find(|d| d.id == id)
+}
+
+pub fn family_of(id: &str) -> Option<&'static str> {
+    descriptor(id).map(|d| d.family)
 }
 
 pub fn oauth_config(id: &str) -> Option<&'static OAuthConfig> {
@@ -488,5 +513,28 @@ mod tests {
         );
         assert_eq!(df.refresh_lead_ms, 300_000);
         assert!(d.models.contains(&"claude-sonnet-4.5"));
+    }
+
+    #[test]
+    fn families_are_wellformed() {
+        for d in CATALOG {
+            // every family resolves to a "family head" descriptor whose id IS the family
+            let head = descriptor(d.family).expect("family head exists");
+            assert_eq!(
+                head.family, head.id,
+                "family head {} must be its own family",
+                head.id
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_variants_join_vendor_families() {
+        assert_eq!(family_of("anthropic-oauth"), Some("anthropic"));
+        assert_eq!(family_of("openai-oauth"), Some("openai"));
+        assert_eq!(family_of("anthropic"), Some("anthropic"));
+        assert_eq!(family_of("kiro"), Some("kiro"));
+        assert_eq!(family_of("custom-openai"), Some("custom-openai"));
+        assert_eq!(family_of("nope"), None);
     }
 }

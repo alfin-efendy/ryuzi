@@ -55,10 +55,28 @@ const claudeConnection: ConnectionInfo = {
   claudeCloaking: true,
 };
 
+const anthropicApiConnection: ConnectionInfo = {
+  id: "c4",
+  provider: "anthropic",
+  providerName: "Anthropic",
+  color: "#D97757",
+  initial: "A",
+  authType: "api_key",
+  label: "Team Anthropic",
+  priority: 0,
+  enabled: true,
+  baseUrl: null,
+  models: ["claude-sonnet-4-5"],
+  keyMasked: "sk-…9f21",
+  needsRelogin: false,
+  claudeCloaking: false,
+};
+
 const catalog: CatalogEntry[] = [
   {
     id: "openai",
     name: "OpenAI",
+    family: "openai",
     color: "#10A37F",
     initial: "O",
     category: "api_key",
@@ -69,12 +87,24 @@ const catalog: CatalogEntry[] = [
   {
     id: "anthropic",
     name: "Anthropic",
+    family: "anthropic",
     color: "#D97757",
     initial: "A",
     category: "api_key",
     format: "anthropic",
     requiresBaseUrl: false,
     models: ["claude-sonnet-4-5"],
+  },
+  {
+    id: "anthropic-oauth",
+    name: "Claude Code",
+    family: "anthropic",
+    color: "#D97757",
+    initial: "A",
+    category: "oauth",
+    format: "anthropic",
+    requiresBaseUrl: false,
+    models: ["claude-opus-4-8"],
   },
 ];
 
@@ -84,7 +114,7 @@ const routes: ModelRouteInfo[] = [
     name: "smart",
     enabled: true,
     strategy: "fallback",
-    targets: [{ connectionId: "c1", model: "gpt-4.1" }],
+    targets: [{ provider: "openai", model: "gpt-4.1" }],
     createdAt: 1751500800000,
     updatedAt: 1751500800000,
   },
@@ -99,6 +129,8 @@ const usage: UsageSeries = {
   todayInputTokens: 900,
   todayOutputTokens: 210,
 };
+
+const saveModelRoute = mock((_route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
 
 const updateConnection = mock(
   (
@@ -120,7 +152,7 @@ mock.module("@/bindings", () => ({
     listProviderCatalog: () => Promise.resolve({ status: "ok", data: catalog }),
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
-    saveModelRoute: (_route: ModelRouteInfo) => Promise.resolve({ status: "ok", data: routes }),
+    saveModelRoute,
     deleteModelRoute: (_id: string) => Promise.resolve({ status: "ok", data: [] }),
     providerAccountRoute: (provider: string) => Promise.resolve({ status: "ok", data: { provider, strategy: "fallback" } }),
     setProviderAccountRoute: (provider: string, strategy: string) => Promise.resolve({ status: "ok", data: { provider, strategy } }),
@@ -189,16 +221,31 @@ test("renders provider list first with tab order Providers, Route, Endpoint", as
     .filter(Boolean);
   expect(tabs.slice(0, 3)).toEqual(["Providers", "Route", "Endpoint"]);
   expect(screen.getByRole("button", { name: "OpenAI 2 accounts 2 models" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Anthropic No accounts 1 catalog model" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Anthropic No accounts 2 catalog models" })).toBeTruthy();
   expect(screen.queryByText("Work OpenAI")).toBeNull();
 });
 
-test("provider list shows Add connection above provider rows", async () => {
+test("provider list has no global Add connection button", async () => {
   render(<ModelsView />);
 
   await screen.findByRole("button", { name: "OpenAI 2 accounts 2 models" });
-  const labels = screen.getAllByRole("button").map((button) => button.textContent?.trim() ?? "");
-  expect(labels.indexOf("Add connection")).toBeLessThan(labels.findIndex((label) => label.includes("OpenAI")));
+  expect(screen.queryByRole("button", { name: /add connection/i })).toBeNull();
+});
+
+test("providers tab groups anthropic + anthropic-oauth accounts into one Anthropic row", async () => {
+  useConnections.setState({
+    catalog,
+    connections: [connection, secondConnection, anthropicApiConnection, claudeConnection],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  const anthropicRow = await screen.findByRole("button", { name: "Anthropic 2 accounts 2 models" });
+  expect(anthropicRow).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /add connection/i })).toBeNull();
+
+  fireEvent.click(anthropicRow);
+  expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
 });
 
 test("seeds the settings form from the hydrated endpoint status", async () => {
@@ -241,6 +288,18 @@ test("provider detail shows accounts for the selected provider", async () => {
   expect(screen.getByText("gpt-4.1")).toBeTruthy();
 });
 
+test("provider detail spans the vendor family across catalog auth methods", async () => {
+  useConnections.setState({ catalog, connections: [claudeConnection, anthropicApiConnection], loaded: true });
+  render(<ProviderDetailView provider="anthropic" />);
+
+  expect(screen.getByRole("heading", { level: 2, name: "Anthropic" })).toBeTruthy();
+  expect(await screen.findByText("2 accounts · 2 catalog models")).toBeTruthy();
+  expect(screen.getByText("Claude subscription")).toBeTruthy();
+  expect(screen.getByText("Team Anthropic")).toBeTruthy();
+  expect(screen.getByText("Subscription · no key · 1 model")).toBeTruthy();
+  expect(screen.getByText("API key · sk-…9f21 · 1 model")).toBeTruthy();
+});
+
 test("Route tab lists model route aliases and their ordered targets", async () => {
   render(<ModelsView />);
 
@@ -250,6 +309,49 @@ test("Route tab lists model route aliases and their ordered targets", async () =
   expect(screen.getByText("By order")).toBeTruthy();
   expect(screen.getByText("OpenAI / gpt-4.1")).toBeTruthy();
   expect(screen.getByRole("button", { name: "New route" })).toBeTruthy();
+});
+
+test("route target dropdown collapses multiple accounts of the same provider into one option per model", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+
+  // connection and secondConnection are both `openai` accounts that both
+  // serve gpt-4.1 — the dropdown must dedupe to a single family+model option.
+  expect(screen.getAllByRole("option", { name: "OpenAI / gpt-4.1" })).toHaveLength(1);
+});
+
+test("route target dropdown collapses anthropic + anthropic-oauth accounts sharing a model into one Anthropic option", async () => {
+  const sharedModel = "claude-4.5-haiku";
+  useConnections.setState({
+    catalog,
+    connections: [
+      { ...anthropicApiConnection, models: [sharedModel] },
+      { ...claudeConnection, models: [sharedModel] },
+    ],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+
+  expect(screen.getAllByRole("option", { name: `Anthropic / ${sharedModel}` })).toHaveLength(1);
+});
+
+test("route form saves targets as {provider, model} scoped to the family, not the connection", async () => {
+  saveModelRoute.mockClear();
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+  fireEvent.change(screen.getByPlaceholderText("smart"), { target: { value: "combo" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save route" }));
+
+  await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
+  const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
+  expect(savedRoute.targets).toEqual([{ provider: "openai", model: "gpt-4.1" }]);
 });
 
 test("connection detail back returns to its provider detail", () => {
@@ -277,6 +379,16 @@ test("connection detail saves the Claude cloaking toggle", async () => {
   await waitFor(() =>
     expect(updateConnection).toHaveBeenCalledWith("c3", "Claude subscription", true, null, null, ["claude-opus-4-8"], false),
   );
+});
+
+test("connection detail back button routes to the account's vendor family, not its raw catalog id", () => {
+  useConnections.setState({ catalog, connections: [claudeConnection], loaded: true });
+  render(<ConnectionDetailView id="c3" />);
+
+  // The back button is labelled with the family head's catalog name
+  // ("Anthropic"), not the member's own name ("Claude Code").
+  fireEvent.click(screen.getByRole("button", { name: "Anthropic" }));
+  expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
 });
 
 test("warns when secrets fall back to a local file instead of the OS keychain", async () => {

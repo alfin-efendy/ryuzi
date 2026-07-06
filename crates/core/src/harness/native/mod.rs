@@ -437,7 +437,7 @@ mod tests {
                 enabled: true,
                 strategy: ModelRouteStrategy::Fallback,
                 targets: vec![ModelRouteTarget {
-                    connection_id: "claude".into(),
+                    provider: "anthropic".into(),
                     model: "claude-sonnet-4-5".into(),
                 }],
                 created_at: 1,
@@ -448,10 +448,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_native_model(&store, Some("openai-oauth/gpt-5.2-codex".into()))
+            resolve_native_model(&store, Some("openai/gpt-5.2-codex".into()))
                 .await
                 .as_deref(),
-            Some("openai-oauth/gpt-5.2-codex")
+            Some("openai/gpt-5.2-codex")
         );
     }
 
@@ -487,7 +487,7 @@ mod tests {
                 enabled: true,
                 strategy: ModelRouteStrategy::Fallback,
                 targets: vec![ModelRouteTarget {
-                    connection_id: "claude".into(),
+                    provider: "anthropic".into(),
                     model: "claude-sonnet-4-5".into(),
                 }],
                 created_at: 1,
@@ -498,7 +498,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_native_model(&store, Some("openai-oauth/gpt-9-does-not-exist".into()))
+            resolve_native_model(&store, Some("openai/gpt-9-does-not-exist".into()))
                 .await
                 .as_deref(),
             Some("fable")

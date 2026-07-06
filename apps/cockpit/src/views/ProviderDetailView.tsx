@@ -107,7 +107,8 @@ function AccountRow({ conn, index, count }: { conn: ConnectionInfo; index: numbe
       >
         <span className="block text-sm font-semibold text-foreground">{name}</span>
         <span className="block text-xs text-muted-foreground">
-          {conn.keyMasked ?? "no key"} · {modelLabel(conn.models.length)}
+          {conn.authType === "oauth" ? "Subscription" : conn.authType === "free" ? "Free" : "API key"} · {conn.keyMasked ?? "no key"} ·{" "}
+          {modelLabel(conn.models.length)}
           {conn.needsRelogin ? " · needs re-login" : ""}
         </span>
       </Button>
@@ -213,7 +214,14 @@ export function ProviderDetailView({ provider }: { provider: string }) {
     };
   }, [provider]);
 
-  const providerConnections = useMemo(() => connections.filter((c) => c.provider === provider), [connections, provider]);
+  const memberIds = useMemo(
+    () => new Set(catalog.filter((entry) => entry.family === provider).map((entry) => entry.id)),
+    [catalog, provider],
+  );
+  const providerConnections = useMemo(
+    () => connections.filter((c) => memberIds.has(c.provider) || c.provider === provider),
+    [connections, memberIds, provider],
+  );
   const providerConnectionIds = providerConnections.map((conn) => conn.id).join("|");
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on providerConnectionIds so usage reloads only when the set of connection ids changes, not on every providerConnections re-derive
@@ -228,7 +236,13 @@ export function ProviderDetailView({ provider }: { provider: string }) {
   const name = catalogEntry?.name ?? fallback?.providerName ?? provider;
   const color = catalogEntry?.color ?? fallback?.color ?? "#8B8B8B";
   const initial = catalogEntry?.initial ?? fallback?.initial ?? "?";
-  const catalogModels = catalogEntry?.models ?? [];
+  const catalogModels = useMemo(() => {
+    const set = new Set<string>();
+    for (const entry of catalog) {
+      if (entry.family === provider) for (const model of entry.models) set.add(model);
+    }
+    return Array.from(set);
+  }, [catalog, provider]);
   const activeCount = providerConnections.filter((c) => c.enabled).length;
   // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on providerConnectionIds so usage re-aggregates only when the set of connection ids changes
   const usage = useMemo(
@@ -321,7 +335,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
 
         <ProviderModelsCard connections={providerConnections} catalogModels={catalogModels} />
       </div>
-      <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} provider={provider} />
+      <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} family={provider} />
     </div>
   );
 }
