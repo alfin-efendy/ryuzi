@@ -28,6 +28,9 @@ type R<T> = Result<T, CmdError>;
 pub struct CatalogEntry {
     pub id: String,
     pub name: String,
+    /// Vendor family id (a catalog id). Entries sharing a family render as one
+    /// provider card; the entry whose id == family is the display head.
+    pub family: String,
     pub color: String,
     pub initial: String,
     pub category: String,
@@ -231,6 +234,7 @@ pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
         .map(|d| CatalogEntry {
             id: d.id.into(),
             name: d.name.into(),
+            family: d.family.into(),
             color: d.color.into(),
             initial: d.initial.into(),
             category: if d.device_flow.is_some() {

@@ -113,14 +113,14 @@ async fn route_models_for_body_matching(
         let candidates: Vec<_> = enabled
             .into_iter()
             .filter(|conn| {
-                conn.provider == prov
-                    && registry::descriptor(&conn.provider)
-                        .map(|desc| {
-                            target_allowed(conn, desc)
-                                && connection_has_required_credentials(desc, conn)
-                                && connection_serves_model(desc, conn, model, true)
-                        })
-                        .unwrap_or(false)
+                registry::descriptor(&conn.provider)
+                    .map(|desc| {
+                        desc.family == prov
+                            && target_allowed(conn, desc)
+                            && connection_has_required_credentials(desc, conn)
+                            && connection_serves_model(desc, conn, model, true)
+                    })
+                    .unwrap_or(false)
             })
             .collect();
         let mut out = Vec::new();
@@ -168,10 +168,11 @@ async fn route_models_for_body_matching(
             && connection_has_required_credentials(desc, &conn)
             && connection_serves_model(desc, &conn, requested, false)
         {
-            if !grouped.contains_key(&conn.provider) {
-                provider_order.push(conn.provider.clone());
+            let family = desc.family.to_string();
+            if !grouped.contains_key(&family) {
+                provider_order.push(family.clone());
             }
-            grouped.entry(conn.provider.clone()).or_default().push(conn);
+            grouped.entry(family).or_default().push(conn);
         }
     }
     let mut out = Vec::new();
@@ -208,37 +209,21 @@ async fn expanded_route_targets(
     target: &routes::ModelRouteTarget,
     target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
 ) -> anyhow::Result<Vec<RouteTarget>> {
-    let Some(primary) = enabled.iter().find(|conn| conn.id == target.connection_id) else {
-        return Ok(Vec::new());
-    };
-    let Some(primary_desc) = registry::descriptor(&primary.provider) else {
-        return Ok(Vec::new());
-    };
-    if !target_allowed(primary, primary_desc)
-        || !connection_serves_model(primary_desc, primary, &target.model, false)
-    {
-        return Ok(Vec::new());
-    }
-
     let mut candidates = Vec::new();
-    for conn in std::iter::once(primary).chain(
-        enabled
-            .iter()
-            .filter(|conn| conn.id != primary.id && conn.provider == primary.provider),
-    ) {
+    for conn in enabled {
         let Some(desc) = registry::descriptor(&conn.provider) else {
             continue;
         };
-        if target_allowed(conn, desc)
+        if desc.family == target.provider
+            && target_allowed(conn, desc)
             && connection_has_required_credentials(desc, conn)
             && connection_serves_model(desc, conn, &target.model, false)
         {
             candidates.push(conn.clone());
         }
     }
-
     let ordered =
-        ordered_provider_connections(store, &primary.provider, &target.model, candidates).await?;
+        ordered_provider_connections(store, &target.provider, &target.model, candidates).await?;
     Ok(ordered
         .into_iter()
         .filter_map(|conn| {
@@ -256,27 +241,15 @@ fn route_target_has_candidate(
     target: &routes::ModelRouteTarget,
     target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
 ) -> bool {
-    let Some(primary) = enabled.iter().find(|conn| conn.id == target.connection_id) else {
-        return false;
-    };
-    let Some(primary_desc) = registry::descriptor(&primary.provider) else {
-        return false;
-    };
-    if !target_allowed(primary, primary_desc)
-        || !connection_serves_model(primary_desc, primary, &target.model, false)
-    {
-        return false;
-    }
-
     enabled.iter().any(|conn| {
-        conn.provider == primary.provider
-            && registry::descriptor(&conn.provider)
-                .map(|desc| {
-                    target_allowed(conn, desc)
-                        && connection_has_required_credentials(desc, conn)
-                        && connection_serves_model(desc, conn, &target.model, false)
-                })
-                .unwrap_or(false)
+        registry::descriptor(&conn.provider)
+            .map(|desc| {
+                desc.family == target.provider
+                    && target_allowed(conn, desc)
+                    && connection_has_required_credentials(desc, conn)
+                    && connection_serves_model(desc, conn, &target.model, false)
+            })
+            .unwrap_or(false)
     })
 }
 
@@ -381,7 +354,7 @@ pub async fn default_model(store: &Store) -> Option<String> {
             .into_iter()
             .next()
         {
-            return Some(format!("{}/{}", conn.provider, model));
+            return Some(format!("{}/{}", desc.family, model));
         }
     }
     None
@@ -420,7 +393,7 @@ pub async fn default_anthropic_messages_model(store: &Store) -> Option<String> {
             .into_iter()
             .next()
         {
-            return Some(format!("{}/{}", conn.provider, model));
+            return Some(format!("{}/{}", desc.family, model));
         }
     }
     None
@@ -484,16 +457,14 @@ pub async fn selectable_native_models(store: &Store) -> Vec<String> {
             .filter(|r| r.enabled && !r.targets.is_empty())
         {
             let usable = route.targets.iter().any(|target| {
-                enabled
-                    .iter()
-                    .find(|c| c.id == target.connection_id)
-                    .is_some_and(|c| {
-                        native_client_can_drive(c)
-                            && registry::descriptor(&c.provider).is_some_and(|desc| {
-                                connection_has_required_credentials(desc, c)
-                                    && connection_serves_model(desc, c, &target.model, false)
-                            })
-                    })
+                enabled.iter().any(|c| {
+                    native_client_can_drive(c)
+                        && registry::descriptor(&c.provider).is_some_and(|desc| {
+                            desc.family == target.provider
+                                && connection_has_required_credentials(desc, c)
+                                && connection_serves_model(desc, c, &target.model, false)
+                        })
+                })
             });
             if usable {
                 push(route.name, &mut out, &mut seen);
@@ -509,11 +480,11 @@ pub async fn selectable_native_models(store: &Store) -> Vec<String> {
             continue;
         }
         for model in connections::effective_models(desc, conn) {
-            push(format!("{}/{}", conn.provider, model), &mut out, &mut seen);
+            push(format!("{}/{}", desc.family, model), &mut out, &mut seen);
             if conn.provider == "openai-oauth" {
                 for effort in ["low", "medium", "high", "xhigh"] {
                     push(
-                        format!("{}/{}-{effort}", conn.provider, model),
+                        format!("{}/{}-{effort}", desc.family, model),
                         &mut out,
                         &mut seen,
                     );
@@ -706,10 +677,10 @@ pub(crate) async fn send_upstream(
 }
 
 #[derive(Debug, Clone)]
-struct UpstreamAttemptFailure {
-    provider: String,
-    message: String,
-    status: Option<u16>,
+pub(crate) struct UpstreamAttemptFailure {
+    pub(crate) provider: String,
+    pub(crate) message: String,
+    pub(crate) status: Option<u16>,
 }
 
 impl UpstreamAttemptFailure {
@@ -718,7 +689,7 @@ impl UpstreamAttemptFailure {
     }
 }
 
-fn should_try_next_target(failure: &UpstreamAttemptFailure) -> bool {
+pub(crate) fn should_try_next_target(failure: &UpstreamAttemptFailure) -> bool {
     let status_retryable = matches!(
         failure.status,
         Some(401 | 403 | 408 | 409 | 425 | 429 | 500..=599)
@@ -743,7 +714,10 @@ fn should_try_next_target(failure: &UpstreamAttemptFailure) -> bool {
     .any(|needle| msg.contains(needle))
 }
 
-fn fallback_error(requested: &str, failures: &[UpstreamAttemptFailure]) -> anyhow::Error {
+pub(crate) fn fallback_error(
+    requested: &str,
+    failures: &[UpstreamAttemptFailure],
+) -> anyhow::Error {
     if failures.is_empty() {
         return anyhow::anyhow!("no enabled connection serves model '{requested}'");
     }
@@ -760,7 +734,7 @@ fn fallback_error(requested: &str, failures: &[UpstreamAttemptFailure]) -> anyho
     )
 }
 
-async fn ensure_fresh_for_attempt(
+pub(crate) async fn ensure_fresh_for_attempt(
     ctx: &UpstreamCtx,
     target: &mut RouteTarget,
 ) -> Result<(), UpstreamAttemptFailure> {
@@ -781,7 +755,7 @@ async fn ensure_fresh_for_attempt(
     Ok(())
 }
 
-async fn upstream_status_failure(
+pub(crate) async fn upstream_status_failure(
     provider: String,
     resp: reqwest::Response,
 ) -> UpstreamAttemptFailure {
@@ -1909,11 +1883,11 @@ mod tests {
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![
                     routes::ModelRouteTarget {
-                        connection_id: "chatgpt".into(),
+                        provider: "openai".into(),
                         model: "gpt-5.2-codex".into(),
                     },
                     routes::ModelRouteTarget {
-                        connection_id: "claude".into(),
+                        provider: "anthropic".into(),
                         model: "claude-sonnet-4-5".into(),
                     },
                 ],
@@ -1978,11 +1952,11 @@ mod tests {
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![
                     routes::ModelRouteTarget {
-                        connection_id: "chatgpt".into(),
+                        provider: "openai".into(),
                         model: "gpt-5.2-codex".into(),
                     },
                     routes::ModelRouteTarget {
-                        connection_id: "claude".into(),
+                        provider: "anthropic".into(),
                         model: "claude-sonnet-4-5".into(),
                     },
                 ],
@@ -2024,18 +1998,17 @@ mod tests {
 
         let models = selectable_native_models(&ctx.store).await;
         assert!(
-            models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex"),
+            models.iter().any(|m| m == "openai/gpt-5.2-codex"),
             "got {models:?}"
         );
         assert!(
-            models
-                .iter()
-                .any(|m| m == "openai-oauth/gpt-5.2-codex-high"),
+            models.iter().any(|m| m == "openai/gpt-5.2-codex-high"),
             "effort variant missing: {models:?}"
         );
 
-        // The suffixed id routes to the openai-oauth connection.
-        let t = route_model_for_anthropic_messages(&ctx.store, "openai-oauth/gpt-5.2-codex-high")
+        // The family-scoped suffixed id routes to the openai-oauth connection
+        // (the only enabled account in the "openai" family here).
+        let t = route_model_for_anthropic_messages(&ctx.store, "openai/gpt-5.2-codex-high")
             .await
             .unwrap()
             .unwrap();
@@ -2123,7 +2096,7 @@ mod tests {
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![routes::ModelRouteTarget {
-                    connection_id: "or".into(),
+                    provider: "openrouter".into(),
                     model: "deepseek/deepseek-chat:free".into(),
                 }],
                 created_at: 1,
@@ -2140,7 +2113,7 @@ mod tests {
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![routes::ModelRouteTarget {
-                    connection_id: "chatgpt".into(),
+                    provider: "openai".into(),
                     model: "gpt-5.2-codex".into(),
                 }],
                 created_at: 2,
@@ -2165,13 +2138,11 @@ mod tests {
         // Codex is drivable natively — its model (plus effort variants) and
         // the Codex-only route are offered.
         assert!(
-            models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex"),
+            models.iter().any(|m| m == "openai/gpt-5.2-codex"),
             "got: {models:?}"
         );
         assert!(
-            models
-                .iter()
-                .any(|m| m == "openai-oauth/gpt-5.2-codex-high"),
+            models.iter().any(|m| m == "openai/gpt-5.2-codex-high"),
             "effort variant missing, got: {models:?}"
         );
         assert!(
@@ -2186,16 +2157,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_route_expands_same_provider_account_fallbacks() {
+    async fn model_route_expands_to_every_family_account_in_priority_order() {
+        // A route target names a family, not a connection — every enabled
+        // account in that family serving the model is a fallback candidate,
+        // in connection-priority order (creation order here), regardless of
+        // which specific account the route was originally created against.
         let ctx = test_ctx().await;
         connections::add_connection(
             &ctx.store,
             mk_conn(
-                "other-account",
+                "first-account",
                 "anthropic",
                 "api_key",
                 ConnectionData {
-                    api_key: Some("sk-other".into()),
+                    api_key: Some("sk-first".into()),
                     models_override: Some(vec!["claude-fable-5".into()]),
                     ..Default::default()
                 },
@@ -2206,11 +2181,11 @@ mod tests {
         connections::add_connection(
             &ctx.store,
             mk_conn(
-                "picked-account",
+                "second-account",
                 "anthropic",
                 "api_key",
                 ConnectionData {
-                    api_key: Some("sk-picked".into()),
+                    api_key: Some("sk-second".into()),
                     models_override: Some(vec!["claude-fable-5".into()]),
                     ..Default::default()
                 },
@@ -2226,7 +2201,7 @@ mod tests {
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![routes::ModelRouteTarget {
-                    connection_id: "picked-account".into(),
+                    provider: "anthropic".into(),
                     model: "claude-fable-5".into(),
                 }],
                 created_at: 1,
@@ -2244,7 +2219,7 @@ mod tests {
             .map(|target| target.conn.id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, vec!["picked-account", "other-account"]);
+        assert_eq!(ids, vec!["first-account", "second-account"]);
         assert!(targets
             .iter()
             .all(|target| target.upstream_model == "claude-fable-5"));
@@ -2291,11 +2266,11 @@ mod tests {
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![
                     routes::ModelRouteTarget {
-                        connection_id: "openrouter-missing-key".into(),
+                        provider: "openrouter".into(),
                         model: "z-ai/glm-5.2".into(),
                     },
                     routes::ModelRouteTarget {
-                        connection_id: "claude".into(),
+                        provider: "anthropic".into(),
                         model: "claude-sonnet-4-5".into(),
                     },
                 ],
@@ -2358,7 +2333,7 @@ mod tests {
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![routes::ModelRouteTarget {
-                    connection_id: "claude".into(),
+                    provider: "anthropic".into(),
                     model: "claude-sonnet-4-5".into(),
                 }],
                 created_at: 1,
@@ -2449,11 +2424,11 @@ mod tests {
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![
                     routes::ModelRouteTarget {
-                        connection_id: "first".into(),
+                        provider: "anthropic".into(),
                         model: "claude-first".into(),
                     },
                     routes::ModelRouteTarget {
-                        connection_id: "second".into(),
+                        provider: "anthropic".into(),
                         model: "claude-second".into(),
                     },
                 ],
@@ -2527,7 +2502,7 @@ mod tests {
         let response = anthropic_messages(
             &ctx,
             json!({
-                "model": "anthropic-oauth/claude-x",
+                "model": "anthropic/claude-x",
                 "messages": [{"role": "user", "content": "hi"}],
                 "tools": [{"name": "lookup", "description": "Lookup data", "input_schema": {"type": "object"}}]
             }),
@@ -2570,22 +2545,11 @@ mod tests {
         });
 
         let ctx = test_ctx().await;
-        connections::add_connection(
-            &ctx.store,
-            mk_conn(
-                "secondary",
-                "anthropic",
-                "api_key",
-                ConnectionData {
-                    api_key: Some("sk-secondary".into()),
-                    base_url_override: Some(format!("http://127.0.0.1:{port}/secondary")),
-                    models_override: Some(vec!["claude-fable-5".into()]),
-                    ..Default::default()
-                },
-            ),
-        )
-        .await
-        .unwrap();
+        // Creation order (== priority order) now determines fallback order
+        // within the family, since the route target is `{provider:
+        // "anthropic", model}` rather than a connection id — "primary" is
+        // added first so it's attempted first (and hits quota), leaving
+        // "secondary" as the same-family backup.
         connections::add_connection(
             &ctx.store,
             mk_conn(
@@ -2602,6 +2566,22 @@ mod tests {
         )
         .await
         .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "secondary",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-secondary".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/secondary")),
+                    models_override: Some(vec!["claude-fable-5".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
         routes::save_model_route(
             &ctx.store,
             routes::ModelRouteInfo {
@@ -2610,7 +2590,7 @@ mod tests {
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![routes::ModelRouteTarget {
-                    connection_id: "primary".into(),
+                    provider: "anthropic".into(),
                     model: "claude-fable-5".into(),
                 }],
                 created_at: 1,
@@ -2632,6 +2612,106 @@ mod tests {
 
         assert_eq!(response["model"], "claude-fable-5");
         assert_eq!(response["content"][0]["text"], "second account worked");
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_pools_api_key_and_oauth_accounts_within_a_family() {
+        // Cross-auth-method failover: an api-key `anthropic` account backs up
+        // an `anthropic-oauth` account for the same model string, because
+        // both share the "anthropic" family — this is the core of
+        // family-aware routing (Task 3), not just same-provider fallback.
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let oauth_hits = Arc::new(AtomicUsize::new(0));
+        let oauth_hits_for_handler = oauth_hits.clone();
+
+        async fn ok(Json(body): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": body["model"].clone(),
+                "content": [{"type": "text", "text": "api-key backup worked"}],
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }))
+        }
+
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(move || {
+                    let hits = oauth_hits_for_handler.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({"error": {"message": "You're out of extra usage."}})),
+                        )
+                    }
+                }),
+            )
+            .route("/second/messages", post(ok));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        let now = crate::paths::now_ms();
+        // Added first (lower priority) so it's attempted first and hits quota.
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "oauth-acct",
+                "anthropic-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("sk-ant-oat-test".into()),
+                    expires_at: Some(now + 24 * 60 * 60 * 1000),
+                    last_refresh_at: Some(now),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/first")),
+                    models_override: Some(vec!["claude-test-1".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "apikey-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-apikey".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/second")),
+                    models_override: Some(vec!["claude-test-1".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let response = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "anthropic/claude-test-1",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["content"][0]["text"], "api-key backup worked");
+        assert_eq!(
+            oauth_hits.load(Ordering::SeqCst),
+            1,
+            "the anthropic-oauth account must have been tried (and hit quota) before falling back"
+        );
     }
 
     #[tokio::test]

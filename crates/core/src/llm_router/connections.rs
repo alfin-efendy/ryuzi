@@ -157,16 +157,42 @@ pub async fn move_connection(store: &Store, id: &str, dir: i32) -> anyhow::Resul
                     params![cid, i as i64],
                 )?;
             }
+            // Neighbor = adjacent connection of the SAME FAMILY; rows from
+            // other families keep their slots (their priorities are swapped
+            // *values*, not shifted).
+            let providers: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT provider FROM provider_connections ORDER BY priority ASC, created_at ASC",
+                )?;
+                let v = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            };
+            let family_at = |i: usize| {
+                crate::llm_router::registry::family_of(&providers[i])
+                    .unwrap_or(providers[i].as_str())
+                    .to_string()
+            };
             if let Some(pos) = ids.iter().position(|c2| *c2 == id) {
-                let other = pos as i64 + dir as i64;
-                if other >= 0 && (other as usize) < ids.len() {
+                let fam = family_at(pos);
+                let mut other: Option<usize> = None;
+                let mut i = pos as i64 + dir as i64;
+                while i >= 0 && (i as usize) < ids.len() {
+                    if family_at(i as usize) == fam {
+                        other = Some(i as usize);
+                        break;
+                    }
+                    i += dir as i64;
+                }
+                if let Some(other) = other {
                     tx.execute(
                         "UPDATE provider_connections SET priority=?2 WHERE id=?1",
-                        params![ids[pos], other],
+                        params![ids[pos], other as i64],
                     )?;
                     tx.execute(
                         "UPDATE provider_connections SET priority=?2 WHERE id=?1",
-                        params![ids[other as usize], pos as i64],
+                        params![ids[other], pos as i64],
                     )?;
                 }
             }
@@ -283,7 +309,11 @@ mod tests {
         add_connection(&store, row("c1", "openai", 0))
             .await
             .unwrap();
-        add_connection(&store, row("c2", "anthropic", 1))
+        // Same family as c1 ("openai") so the move below has a same-family
+        // neighbor to swap with — move_connection is family-scoped (see
+        // move_swaps_within_family_skipping_other_providers for the
+        // cross-family case).
+        add_connection(&store, row("c2", "openai", 1))
             .await
             .unwrap();
         let list = list_connections(&store).await.unwrap();
@@ -307,6 +337,28 @@ mod tests {
 
         remove_connection(&store, "c1").await.unwrap();
         assert_eq!(list_connections(&store).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn move_swaps_within_family_skipping_other_providers() {
+        // priority order: a (anthropic), x (openai), b (anthropic-oauth)
+        // moving b up must swap b with a (same family), leaving x alone.
+        // After: order b, x, a  — family list [b, a].
+        secrets::use_test_key_file();
+        let store = mem_store().await;
+        add_connection(&store, row("a", "anthropic", 0))
+            .await
+            .unwrap();
+        add_connection(&store, row("x", "openai", 1)).await.unwrap();
+        add_connection(&store, row("b", "anthropic-oauth", 2))
+            .await
+            .unwrap();
+
+        move_connection(&store, "b", -1).await.unwrap();
+
+        let list = list_connections(&store).await.unwrap();
+        let ids: Vec<&str> = list.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "x", "a"]);
     }
 
     #[tokio::test]

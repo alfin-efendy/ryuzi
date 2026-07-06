@@ -15,40 +15,24 @@ import {
   KIRO_WAITING_HINT,
 } from "@/constants";
 
-const COMPATIBLE_IDS = ["custom-openai", "custom-anthropic"] as const;
-
-type CompatibleId = (typeof COMPATIBLE_IDS)[number];
 type DeviceStep = "form" | "waiting";
 
-function formatLabel(entry: CatalogEntry): string {
-  return entry.format === "anthropic" ? "Anthropic-compatible" : "OpenAI-compatible";
+const SUBSCRIPTION_LABELS: Record<string, string> = {
+  "anthropic-oauth": "Claude subscription",
+  "openai-oauth": "ChatGPT subscription",
+};
+
+function authMethodLabel(entry: CatalogEntry): string {
+  if (entry.category === "oauth") return SUBSCRIPTION_LABELS[entry.id] ?? "Subscription";
+  if (entry.category === "device") return "Device sign-in";
+  if (entry.category === "free") return "Free tier";
+  return "API key";
 }
 
-function cardHint(entry: CatalogEntry): string {
-  return entry.format === "anthropic" ? "Messages API format" : "Chat Completions API format";
-}
-
-function fallbackEntry(id: CompatibleId): CatalogEntry {
-  const anthropic = id === "custom-anthropic";
-  return {
-    id,
-    name: anthropic ? "Custom (Anthropic-compatible)" : "Custom (OpenAI-compatible)",
-    color: "#8B8B8B",
-    initial: "C",
-    category: "api_key",
-    format: anthropic ? "anthropic" : "openai",
-    requiresBaseUrl: true,
-    models: [],
-  };
-}
-
-function compatibleEntries(catalog: CatalogEntry[]): CatalogEntry[] {
-  return COMPATIBLE_IDS.map((id) => catalog.find((entry) => entry.id === id) ?? fallbackEntry(id));
-}
-
-export function AddConnectionModal({ open, onClose, provider }: { open: boolean; onClose: () => void; provider?: string }) {
+export function AddConnectionModal({ open, onClose, family }: { open: boolean; onClose: () => void; family: string }) {
   const { catalog, add, connectOauth, addFree, startKiroDevice, awaitKiroDevice, importKiro } = useConnections();
-  const [selectedId, setSelectedId] = useState<CompatibleId>("custom-openai");
+  const members = useMemo(() => catalog.filter((entry) => entry.family === family), [catalog, family]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
@@ -57,10 +41,9 @@ export function AddConnectionModal({ open, onClose, provider }: { open: boolean;
   const [oauthAuthorizeUrl, setOauthAuthorizeUrl] = useState("");
   const [deviceStep, setDeviceStep] = useState<DeviceStep>("form");
   const [deviceInfo, setDeviceInfo] = useState<DeviceFlowInfo | null>(null);
-  const choices = useMemo(() => compatibleEntries(catalog), [catalog]);
-  const fixed = provider ? catalog.find((entry) => entry.id === provider) : null;
-  const selected = fixed ?? choices.find((entry) => entry.id === selectedId) ?? choices[0];
-  const title = provider ? "Add account" : "Add connection";
+  const selected =
+    members.find((entry) => entry.id === selectedId) ?? members.find((entry) => entry.category === "api_key") ?? members[0] ?? null;
+  const title = "Add account";
   const selectedRef = useRef<CatalogEntry | null>(selected);
 
   useEffect(() => {
@@ -69,7 +52,7 @@ export function AddConnectionModal({ open, onClose, provider }: { open: boolean;
 
   useEffect(() => {
     if (!open) return;
-    setSelectedId("custom-openai");
+    setSelectedId(null);
     setLabel("");
     setApiKey("");
     setBaseUrl("");
@@ -199,35 +182,41 @@ export function AddConnectionModal({ open, onClose, provider }: { open: boolean;
         <Chip initial={selected?.initial ?? "C"} color={selected?.color ?? "#8B8B8B"} size={36} />
         <div className="min-w-0 flex-1">
           <div className="text-[15px] font-semibold tracking-[-0.01em]">{title}</div>
-          <div className="text-xs text-muted-foreground">
-            {selected
-              ? provider
-                ? selected.name
-                : "Connect an OpenAI-compatible or Anthropic-compatible endpoint"
-              : "Provider unavailable"}
-          </div>
+          <div className="text-xs text-muted-foreground">{selected ? selected.name : "Provider unavailable"}</div>
         </div>
       </div>
 
-      {!provider && (
-        <div role="radiogroup" aria-label="Connection format" className="mt-4 grid grid-cols-2 gap-2">
-          {choices.map((entry) => {
-            const checked = entry.id === selectedId;
+      {members.length > 1 && (
+        <div role="radiogroup" aria-label="Sign-in method" className="mt-4 grid grid-cols-2 gap-2">
+          {members.map((entry) => {
+            const checked = entry.id === selected?.id;
             return (
               <Button
                 key={entry.id}
                 role="radio"
                 aria-checked={checked}
-                aria-label={formatLabel(entry)}
+                aria-label={authMethodLabel(entry)}
                 variant={checked ? "secondary" : "outline"}
-                onClick={() => setSelectedId(entry.id as CompatibleId)}
+                onClick={() => {
+                  // Switching sign-in method mid-flight (e.g. while an OAuth
+                  // connect is still waiting) must clear the in-flight state,
+                  // otherwise `saving`/`oauthWaiting` stay latched and the newly
+                  // chosen form is dead until the modal is reopened.
+                  if (entry.id === selected?.id) return;
+                  setSelectedId(entry.id);
+                  setSaving(false);
+                  setOauthWaiting(false);
+                  setOauthAuthorizeUrl("");
+                  setDeviceStep("form");
+                  setDeviceInfo(null);
+                }}
                 className="h-auto w-full justify-start gap-[11px] px-3 py-[11px] text-left"
               >
                 <Chip initial={entry.initial} color={entry.color} size={32} />
                 <span className="min-w-0">
-                  <span className="block font-semibold">{formatLabel(entry)}</span>
+                  <span className="block font-semibold">{authMethodLabel(entry)}</span>
                   <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11px] font-normal text-muted-foreground">
-                    {cardHint(entry)}
+                    {entry.name}
                   </span>
                 </span>
               </Button>

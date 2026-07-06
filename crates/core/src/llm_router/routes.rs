@@ -19,7 +19,10 @@ pub enum ModelRouteStrategy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRouteTarget {
-    pub connection_id: String,
+    /// A family id (registry family head), e.g. "anthropic" — NOT a
+    /// connection id. The router expands this to every enabled account in
+    /// the family serving `model`, at request time.
+    pub provider: String,
     pub model: String,
 }
 
@@ -228,12 +231,19 @@ fn sanitize_route(mut route: ModelRouteInfo) -> anyhow::Result<ModelRouteInfo> {
         .targets
         .into_iter()
         .map(|mut target| {
-            target.connection_id = target.connection_id.trim().to_string();
+            target.provider = target.provider.trim().to_string();
             target.model = target.model.trim().to_string();
             target
         })
-        .filter(|target| !target.connection_id.is_empty() && !target.model.is_empty())
+        .filter(|target| !target.provider.is_empty() && !target.model.is_empty())
         .collect();
+    for target in &route.targets {
+        if crate::llm_router::registry::family_of(&target.provider)
+            != Some(target.provider.as_str())
+        {
+            anyhow::bail!("unknown provider family: {}", target.provider);
+        }
+    }
     if route.targets.is_empty() {
         anyhow::bail!("route needs at least one target model");
     }
@@ -257,7 +267,7 @@ mod tests {
             enabled: true,
             strategy: ModelRouteStrategy::Fallback,
             targets: vec![ModelRouteTarget {
-                connection_id: "c1".into(),
+                provider: "openai".into(),
                 model: "m1".into(),
             }],
             created_at: 1,
@@ -287,6 +297,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cannot contain"));
+    }
+
+    #[tokio::test]
+    async fn targets_must_reference_a_family_head() {
+        let store = mem_store().await;
+        let mut bad = route("smart");
+        bad.targets[0].provider = "anthropic-oauth".into(); // member, not head
+        assert!(save_model_route(&store, bad).await.is_err());
+        let mut unknown = route("smart2");
+        unknown.targets[0].provider = "nope".into();
+        assert!(save_model_route(&store, unknown).await.is_err());
     }
 
     #[tokio::test]
