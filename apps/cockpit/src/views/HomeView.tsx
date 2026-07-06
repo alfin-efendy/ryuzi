@@ -222,6 +222,7 @@ export function HomeView() {
                 setComposerModel(m);
                 if (projectId) void setProjectModel(projectId, m);
               }}
+              disabled={modelOptions.length === 0}
               placeholder="Default model"
               trigger={
                 <Button
