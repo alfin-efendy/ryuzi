@@ -321,7 +321,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
 
         <ProviderModelsCard connections={providerConnections} catalogModels={catalogModels} />
       </div>
-      <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} provider={provider} />
+      <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} family={provider} />
     </div>
   );
 }
