@@ -26,6 +26,7 @@ pub mod sidecar;
 pub mod store;
 pub mod telemetry;
 pub mod update;
+pub mod workspace;
 pub mod worktree;
 
 pub use connector::{Connector, ConnectorCtx, ConnectorFactory, ConnectorRegistry};
