@@ -349,9 +349,7 @@ mod tests {
         add_connection(&store, row("a", "anthropic", 0))
             .await
             .unwrap();
-        add_connection(&store, row("x", "openai", 1))
-            .await
-            .unwrap();
+        add_connection(&store, row("x", "openai", 1)).await.unwrap();
         add_connection(&store, row("b", "anthropic-oauth", 2))
             .await
             .unwrap();
