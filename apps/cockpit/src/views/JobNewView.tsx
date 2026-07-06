@@ -7,8 +7,6 @@ import { useStore } from "@/store";
 import {
   Button,
   Combobox,
-  MenuPanel,
-  MenuPanelItem as MenuItem,
   SettingsCard as Card,
   SettingsCardHeader as CardHeader,
   SettingsCardRow as CardRow,
@@ -33,7 +31,6 @@ export function JobNewView() {
   const [schedule, setSchedule] = useState<ScheduleValue>({ mode: "natural", natural: "", cron: "0 9 * * *" });
   const [notifySuccess, setNotifySuccess] = useState(false);
   const [notifyFail, setNotifyFail] = useState(true);
-  const [menu, setMenu] = useState<"project" | "ws" | null>(null);
   const [saving, setSaving] = useState(false);
   const [branch, setBranch] = useState<string | null>(null);
   const [branchList, setBranchList] = useState<BranchList | null>(null);
@@ -113,11 +110,20 @@ export function JobNewView() {
             />
           </div>
           <div className="relative flex flex-wrap items-center gap-1.5 px-[18px] pb-3.5 pt-2">
-            <Button variant="outline" size="sm" onClick={() => setMenu(menu === "project" ? null : "project")}>
-              <Folder aria-hidden size={12} strokeWidth={2} className="size-3" />
-              {project?.name ?? "No project"}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-            </Button>
+            <Combobox
+              aria-label="Project"
+              options={projects.map((p) => ({ value: p.projectId, label: p.name }))}
+              value={project?.projectId ?? null}
+              onValueChange={(id) => setProjectId(id)}
+              placeholder="No project"
+              trigger={
+                <Button variant="outline" size="sm">
+                  <Folder aria-hidden size={12} strokeWidth={2} className="size-3" />
+                  {project?.name ?? "No project"}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+            />
             <Combobox
               aria-label="Branch"
               options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
@@ -132,56 +138,25 @@ export function JobNewView() {
                 </Button>
               }
             />
-            <Button variant="outline" size="sm" onClick={() => setMenu(menu === "ws" ? null : "ws")}>
-              <Server aria-hidden size={12} strokeWidth={2} className="size-3" />
-              {wsName}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-            </Button>
-            {menu === "project" && (
-              <MenuPanel onClose={() => setMenu(null)} className="bottom-11 left-[140px] w-[220px]">
-                {projects.length === 0 && <div className="px-2.5 py-2 text-[12.5px] text-muted-foreground">No projects yet.</div>}
-                {projects.map((p) => (
-                  <MenuItem
-                    key={p.projectId}
-                    selected={p.projectId === project?.projectId}
-                    onClick={() => {
-                      setProjectId(p.projectId);
-                      setMenu(null);
-                    }}
-                  >
-                    <span className="flex-1 font-medium">{p.name}</span>
-                  </MenuItem>
-                ))}
-              </MenuPanel>
-            )}
-            {menu === "ws" && (
-              <MenuPanel onClose={() => setMenu(null)} className="bottom-11 left-[300px] w-[280px]">
-                {gateways.map((w) => {
-                  const eligible = w.id === "local";
-                  return (
-                    <MenuItem
-                      key={w.id}
-                      selected={w.id === gateway}
-                      onClick={() => {
-                        if (!eligible) return;
-                        setGateway(w.id);
-                        setMenu(null);
-                      }}
-                    >
-                      <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md bg-muted">
-                        <span className="font-mono text-[9px] font-semibold text-muted-foreground">{w.badge}</span>
-                      </span>
-                      <span className={`min-w-0 flex-1 ${eligible ? "" : "opacity-50"}`}>
-                        <span className="block text-[13px] font-medium">{w.name}</span>
-                        <span className="block text-[11px] text-muted-foreground">
-                          {eligible ? w.detail : "Runs require the remote daemon (coming)"}
-                        </span>
-                      </span>
-                    </MenuItem>
-                  );
-                })}
-              </MenuPanel>
-            )}
+            <Combobox
+              aria-label="Workspace"
+              options={gateways.map((w) => ({
+                value: w.id,
+                label: w.name,
+                description: w.id === "local" ? w.detail : "Runs require the remote daemon (coming)",
+              }))}
+              value={gateway}
+              onValueChange={(id) => {
+                if (id === "local") setGateway(id);
+              }}
+              trigger={
+                <Button variant="outline" size="sm">
+                  <Server aria-hidden size={12} strokeWidth={2} className="size-3" />
+                  {wsName}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+            />
           </div>
         </Card>
 
