@@ -1,6 +1,8 @@
 //! The local endpoint server: Anthropic + OpenAI compatible surface on
 //! 127.0.0.1, gated by endpoint keys, routed to provider connections.
-use crate::llm_router::client::{route_model_for_body, send_upstream, RouteTarget, UpstreamCtx};
+use crate::llm_router::client::{
+    ensure_fresh_for_attempt, route_models_for_body, send_upstream, RouteTarget, UpstreamCtx,
+};
 use crate::llm_router::codex::normalize_codex_responses_body;
 use crate::llm_router::registry::{self, ApiFormat};
 use crate::llm_router::{
@@ -262,178 +264,250 @@ async fn ensure_fresh_or_reconnect_error(
 async fn handle_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, anthropic_error).await {
         return r;
     }
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let mut target = match route_model_for_body(&state.store, &requested, Some(&body)).await {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            return anthropic_error(
-                StatusCode::NOT_FOUND,
-                &format!(
-                "no enabled connection serves model '{requested}' — add one in Models → Providers"
-            ),
-            )
-        }
+    let targets = match route_models_for_body(&state.store, &requested, Some(&body)).await {
+        Ok(t) => t,
         Err(e) => return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    if target.conn.provider == "kiro" {
-        return serve_kiro(&state, target, ClientFormat::Anthropic, &body).await;
-    }
-    if target.conn.provider == "openai-oauth" {
-        return anthropic_error(StatusCode::BAD_REQUEST, OPENAI_OAUTH_WRONG_ROUTE_MSG);
-    }
-    if let Some(r) = ensure_fresh_or_reconnect_error(&state, &mut target, anthropic_error).await {
-        return r;
-    }
-    let stream = body["stream"].as_bool().unwrap_or(false);
-    body["model"] = json!(target.upstream_model);
-
-    match target.desc.format {
-        ApiFormat::Anthropic => {
-            let started = crate::paths::now_ms();
-            let resp = proxy_passthrough(&state, &mut target, &body, anthropic_error).await;
-            crate::llm_router::usage::record(
-                &state.store,
-                &target.conn.id,
-                &target.conn.provider,
-                &target.upstream_model,
-                "anthropic",
-                crate::llm_router::usage::Usage::default(),
-                resp.status().as_u16(),
-                started,
-                None,
-            );
-            resp
+    // openai-oauth speaks the Responses wire only — skip those targets here;
+    // error only if they were the ONLY candidates (spec: skip, not reject).
+    let had_any = !targets.is_empty();
+    let targets: Vec<_> = targets
+        .into_iter()
+        .filter(|t| t.conn.provider != "openai-oauth")
+        .collect();
+    if targets.is_empty() {
+        if had_any {
+            return anthropic_error(StatusCode::BAD_REQUEST, OPENAI_OAUTH_WRONG_ROUTE_MSG);
         }
-        ApiFormat::OpenAi => {
-            let upstream_body = match translate::anthropic_to_openai_request(&body) {
-                Ok(b) => b,
-                Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e.to_string()),
-            };
-            if stream {
-                let ctx = RecordCtx {
-                    conn_id: target.conn.id.clone(),
-                    provider: target.conn.provider.clone(),
-                    model: target.upstream_model.clone(),
-                    client_format: "anthropic".to_string(),
-                    started: crate::paths::now_ms(),
-                };
-                stream_openai_upstream_to_anthropic(&state, &mut target, &upstream_body, ctx).await
-            } else {
+        return anthropic_error(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "no enabled connection serves model '{requested}' — add one in Models → Providers"
+            ),
+        );
+    }
+
+    let mut failures = Vec::new();
+    for mut target in targets {
+        // Kiro keeps its dedicated single-shot pipeline (as today).
+        if target.conn.provider == "kiro" {
+            return serve_kiro(&state, target, ClientFormat::Anthropic, &body).await;
+        }
+        if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
+            let try_next = crate::llm_router::client::should_try_next_target(&failure);
+            failures.push(failure);
+            if try_next {
+                continue;
+            }
+            break;
+        }
+        let stream = body["stream"].as_bool().unwrap_or(false);
+        let mut attempt_body = body.clone();
+        attempt_body["model"] = json!(target.upstream_model);
+
+        let outcome: Result<Response, AttemptError> = match target.desc.format {
+            ApiFormat::Anthropic => {
                 let started = crate::paths::now_ms();
-                match send_json(&state, &mut target, &upstream_body, anthropic_error).await {
-                    Ok(v) => {
-                        let u = crate::llm_router::usage::usage_from_openai(&v);
+                match proxy_passthrough(&state, &mut target, &attempt_body, anthropic_error).await {
+                    Ok(resp) => {
                         crate::llm_router::usage::record(
                             &state.store,
                             &target.conn.id,
                             &target.conn.provider,
                             &target.upstream_model,
                             "anthropic",
-                            u,
-                            200,
+                            crate::llm_router::usage::Usage::default(),
+                            resp.status().as_u16(),
                             started,
                             None,
                         );
-                        Json(translate::openai_to_anthropic_response(&v)).into_response()
+                        Ok(resp)
                     }
-                    Err(r) => r,
+                    Err(e) => Err(e),
                 }
+            }
+            ApiFormat::OpenAi => {
+                let upstream_body = match translate::anthropic_to_openai_request(&attempt_body) {
+                    Ok(b) => b,
+                    Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e.to_string()),
+                };
+                if stream {
+                    let ctx = RecordCtx {
+                        conn_id: target.conn.id.clone(),
+                        provider: target.conn.provider.clone(),
+                        model: target.upstream_model.clone(),
+                        client_format: "anthropic".to_string(),
+                        started: crate::paths::now_ms(),
+                    };
+                    stream_openai_upstream_to_anthropic(&state, &mut target, &upstream_body, ctx)
+                        .await
+                } else {
+                    let started = crate::paths::now_ms();
+                    match send_json(&state, &mut target, &upstream_body, anthropic_error).await {
+                        Ok(v) => {
+                            let u = crate::llm_router::usage::usage_from_openai(&v);
+                            crate::llm_router::usage::record(
+                                &state.store,
+                                &target.conn.id,
+                                &target.conn.provider,
+                                &target.upstream_model,
+                                "anthropic",
+                                u,
+                                200,
+                                started,
+                                None,
+                            );
+                            Ok(Json(translate::openai_to_anthropic_response(&v)).into_response())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(resp) => return resp,
+            Err(AttemptError::Fatal(resp)) => return resp,
+            Err(AttemptError::Failed(failure)) => {
+                let try_next = crate::llm_router::client::should_try_next_target(&failure);
+                failures.push(failure);
+                if try_next {
+                    continue;
+                }
+                break;
             }
         }
     }
+    give_up(anthropic_error, &requested, &failures)
 }
 
 /// Client speaks OpenAI.
 async fn handle_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, openai_error).await {
         return r;
     }
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let mut target = match route_model_for_body(&state.store, &requested, Some(&body)).await {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            return openai_error(
-                StatusCode::NOT_FOUND,
-                &format!("no enabled connection serves model '{requested}'"),
-            )
-        }
+    let targets = match route_models_for_body(&state.store, &requested, Some(&body)).await {
+        Ok(t) => t,
         Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    if target.conn.provider == "kiro" {
-        return serve_kiro(&state, target, ClientFormat::OpenAi, &body).await;
-    }
-    if target.conn.provider == "openai-oauth" {
-        return openai_error(StatusCode::BAD_REQUEST, OPENAI_OAUTH_WRONG_ROUTE_MSG);
-    }
-    if let Some(r) = ensure_fresh_or_reconnect_error(&state, &mut target, openai_error).await {
-        return r;
-    }
-    let stream = body["stream"].as_bool().unwrap_or(false);
-    body["model"] = json!(target.upstream_model);
-
-    match target.desc.format {
-        ApiFormat::OpenAi => {
-            let started = crate::paths::now_ms();
-            let resp = proxy_passthrough(&state, &mut target, &body, openai_error).await;
-            crate::llm_router::usage::record(
-                &state.store,
-                &target.conn.id,
-                &target.conn.provider,
-                &target.upstream_model,
-                "openai",
-                crate::llm_router::usage::Usage::default(),
-                resp.status().as_u16(),
-                started,
-                None,
-            );
-            resp
+    // openai-oauth speaks the Responses wire only — skip those targets here;
+    // error only if they were the ONLY candidates (spec: skip, not reject).
+    let had_any = !targets.is_empty();
+    let targets: Vec<_> = targets
+        .into_iter()
+        .filter(|t| t.conn.provider != "openai-oauth")
+        .collect();
+    if targets.is_empty() {
+        if had_any {
+            return openai_error(StatusCode::BAD_REQUEST, OPENAI_OAUTH_WRONG_ROUTE_MSG);
         }
-        ApiFormat::Anthropic => {
-            let upstream_body = match translate::openai_to_anthropic_request(&body) {
-                Ok(b) => b,
-                Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
-            };
-            if stream {
-                let ctx = RecordCtx {
-                    conn_id: target.conn.id.clone(),
-                    provider: target.conn.provider.clone(),
-                    model: target.upstream_model.clone(),
-                    client_format: "openai".to_string(),
-                    started: crate::paths::now_ms(),
-                };
-                stream_anthropic_upstream_to_openai(&state, &mut target, &upstream_body, ctx).await
-            } else {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            &format!("no enabled connection serves model '{requested}'"),
+        );
+    }
+
+    let mut failures = Vec::new();
+    for mut target in targets {
+        // Kiro keeps its dedicated single-shot pipeline (as today).
+        if target.conn.provider == "kiro" {
+            return serve_kiro(&state, target, ClientFormat::OpenAi, &body).await;
+        }
+        if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
+            let try_next = crate::llm_router::client::should_try_next_target(&failure);
+            failures.push(failure);
+            if try_next {
+                continue;
+            }
+            break;
+        }
+        let stream = body["stream"].as_bool().unwrap_or(false);
+        let mut attempt_body = body.clone();
+        attempt_body["model"] = json!(target.upstream_model);
+
+        let outcome: Result<Response, AttemptError> = match target.desc.format {
+            ApiFormat::OpenAi => {
                 let started = crate::paths::now_ms();
-                match send_json(&state, &mut target, &upstream_body, openai_error).await {
-                    Ok(v) => {
-                        let u = crate::llm_router::usage::usage_from_anthropic(&v);
+                match proxy_passthrough(&state, &mut target, &attempt_body, openai_error).await {
+                    Ok(resp) => {
                         crate::llm_router::usage::record(
                             &state.store,
                             &target.conn.id,
                             &target.conn.provider,
                             &target.upstream_model,
                             "openai",
-                            u,
-                            200,
+                            crate::llm_router::usage::Usage::default(),
+                            resp.status().as_u16(),
                             started,
                             None,
                         );
-                        Json(translate::anthropic_to_openai_response(&v)).into_response()
+                        Ok(resp)
                     }
-                    Err(r) => r,
+                    Err(e) => Err(e),
                 }
+            }
+            ApiFormat::Anthropic => {
+                let upstream_body = match translate::openai_to_anthropic_request(&attempt_body) {
+                    Ok(b) => b,
+                    Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
+                };
+                if stream {
+                    let ctx = RecordCtx {
+                        conn_id: target.conn.id.clone(),
+                        provider: target.conn.provider.clone(),
+                        model: target.upstream_model.clone(),
+                        client_format: "openai".to_string(),
+                        started: crate::paths::now_ms(),
+                    };
+                    stream_anthropic_upstream_to_openai(&state, &mut target, &upstream_body, ctx)
+                        .await
+                } else {
+                    let started = crate::paths::now_ms();
+                    match send_json(&state, &mut target, &upstream_body, openai_error).await {
+                        Ok(v) => {
+                            let u = crate::llm_router::usage::usage_from_anthropic(&v);
+                            crate::llm_router::usage::record(
+                                &state.store,
+                                &target.conn.id,
+                                &target.conn.provider,
+                                &target.upstream_model,
+                                "openai",
+                                u,
+                                200,
+                                started,
+                                None,
+                            );
+                            Ok(Json(translate::anthropic_to_openai_response(&v)).into_response())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(resp) => return resp,
+            Err(AttemptError::Fatal(resp)) => return resp,
+            Err(AttemptError::Failed(failure)) => {
+                let try_next = crate::llm_router::client::should_try_next_target(&failure);
+                failures.push(failure);
+                if try_next {
+                    continue;
+                }
+                break;
             }
         }
     }
+    give_up(openai_error, &requested, &failures)
 }
 
 /// Client speaks the OpenAI Responses API. Translated to internal chat, routed
@@ -446,91 +520,131 @@ async fn handle_responses(
     if let Err(r) = check_auth(&state, &headers, openai_error).await {
         return r;
     }
-    let mut chat = crate::llm_router::responses::responses_request_to_chat(&body);
+    let chat = crate::llm_router::responses::responses_request_to_chat(&body);
     let requested = chat["model"].as_str().unwrap_or("").to_string();
-    let mut target = match route_model_for_body(&state.store, &requested, Some(&body)).await {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            return openai_error(
-                StatusCode::NOT_FOUND,
-                &format!("no enabled connection serves model '{requested}'"),
-            )
-        }
+    let targets = match route_models_for_body(&state.store, &requested, Some(&body)).await {
+        Ok(t) => t,
         Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    if target.conn.provider == "kiro" {
-        return serve_kiro(&state, target, ClientFormat::Responses, &body).await;
-    }
-    if let Some(r) = ensure_fresh_or_reconnect_error(&state, &mut target, openai_error).await {
-        return r;
-    }
-
-    // Codex (openai-oauth) speaks the Responses wire natively both ways — no
-    // chat translation applies (that's only built for routing/model
-    // resolution above). Normalize the client's Responses body to the subset
-    // accepted by ChatGPT's Codex backend, then proxy it same-format.
-    if target.conn.provider == "openai-oauth" {
-        let mut passthrough_body = body.clone();
-        normalize_codex_responses_body(&mut passthrough_body, &target.upstream_model, None);
-        let started = crate::paths::now_ms();
-        let resp = proxy_passthrough(&state, &mut target, &passthrough_body, openai_error).await;
-        crate::llm_router::usage::record(
-            &state.store,
-            &target.conn.id,
-            &target.conn.provider,
-            &target.upstream_model,
-            "responses",
-            crate::llm_router::usage::Usage::default(),
-            resp.status().as_u16(),
-            started,
-            None,
+    // No openai-oauth filter here — this endpoint serves Codex natively.
+    if targets.is_empty() {
+        return openai_error(
+            StatusCode::NOT_FOUND,
+            &format!("no enabled connection serves model '{requested}'"),
         );
-        return resp;
     }
 
     let stream = chat["stream"].as_bool().unwrap_or(false);
-    chat["model"] = json!(target.upstream_model);
-    let started = crate::paths::now_ms();
 
-    // Normalize the upstream response to OpenAI chat shape, then encode Responses.
-    let upstream_body = match target.desc.format {
-        ApiFormat::OpenAi => chat.clone(),
-        ApiFormat::Anthropic => match translate::openai_to_anthropic_request(&chat) {
-            Ok(b) => b,
-            Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
-        },
-    };
-
-    if stream {
-        stream_responses(&state, &mut target, &upstream_body, started).await
-    } else {
-        match send_json(&state, &mut target, &upstream_body, openai_error).await {
-            Ok(v) => {
-                // normalize to OpenAI chat shape first
-                let chat_resp = match target.desc.format {
-                    ApiFormat::OpenAi => v,
-                    ApiFormat::Anthropic => translate::anthropic_to_openai_response(&v),
-                };
-                let u = crate::llm_router::usage::usage_from_openai(&chat_resp);
-                crate::llm_router::usage::record(
-                    &state.store,
-                    &target.conn.id,
-                    &target.conn.provider,
-                    &target.upstream_model,
-                    "responses",
-                    u,
-                    200,
-                    started,
-                    None,
-                );
-                Json(crate::llm_router::responses::chat_response_to_responses(
-                    &chat_resp,
-                ))
-                .into_response()
+    let mut failures = Vec::new();
+    for mut target in targets {
+        // Kiro keeps its dedicated single-shot pipeline (as today).
+        if target.conn.provider == "kiro" {
+            return serve_kiro(&state, target, ClientFormat::Responses, &body).await;
+        }
+        if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
+            let try_next = crate::llm_router::client::should_try_next_target(&failure);
+            failures.push(failure);
+            if try_next {
+                continue;
             }
-            Err(r) => r,
+            break;
+        }
+
+        // Codex (openai-oauth) speaks the Responses wire natively both ways —
+        // no chat translation applies. Normalize the client's Responses body
+        // to the subset accepted by ChatGPT's Codex backend, then proxy it
+        // same-format.
+        if target.conn.provider == "openai-oauth" {
+            let mut passthrough_body = body.clone();
+            normalize_codex_responses_body(&mut passthrough_body, &target.upstream_model, None);
+            let started = crate::paths::now_ms();
+            match proxy_passthrough(&state, &mut target, &passthrough_body, openai_error).await {
+                Ok(resp) => {
+                    crate::llm_router::usage::record(
+                        &state.store,
+                        &target.conn.id,
+                        &target.conn.provider,
+                        &target.upstream_model,
+                        "responses",
+                        crate::llm_router::usage::Usage::default(),
+                        resp.status().as_u16(),
+                        started,
+                        None,
+                    );
+                    return resp;
+                }
+                Err(AttemptError::Fatal(resp)) => return resp,
+                Err(AttemptError::Failed(failure)) => {
+                    let try_next = crate::llm_router::client::should_try_next_target(&failure);
+                    failures.push(failure);
+                    if try_next {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        let mut attempt_chat = chat.clone();
+        attempt_chat["model"] = json!(target.upstream_model);
+        let started = crate::paths::now_ms();
+
+        // Normalize the upstream response to OpenAI chat shape, then encode Responses.
+        let upstream_body = match target.desc.format {
+            ApiFormat::OpenAi => attempt_chat.clone(),
+            ApiFormat::Anthropic => match translate::openai_to_anthropic_request(&attempt_chat) {
+                Ok(b) => b,
+                Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
+            },
+        };
+
+        let outcome: Result<Response, AttemptError> = if stream {
+            stream_responses(&state, &mut target, &upstream_body, started).await
+        } else {
+            match send_json(&state, &mut target, &upstream_body, openai_error).await {
+                Ok(v) => {
+                    // normalize to OpenAI chat shape first
+                    let chat_resp = match target.desc.format {
+                        ApiFormat::OpenAi => v,
+                        ApiFormat::Anthropic => translate::anthropic_to_openai_response(&v),
+                    };
+                    let u = crate::llm_router::usage::usage_from_openai(&chat_resp);
+                    crate::llm_router::usage::record(
+                        &state.store,
+                        &target.conn.id,
+                        &target.conn.provider,
+                        &target.upstream_model,
+                        "responses",
+                        u,
+                        200,
+                        started,
+                        None,
+                    );
+                    Ok(
+                        Json(crate::llm_router::responses::chat_response_to_responses(
+                            &chat_resp,
+                        ))
+                        .into_response(),
+                    )
+                }
+                Err(e) => Err(e),
+            }
+        };
+        match outcome {
+            Ok(resp) => return resp,
+            Err(AttemptError::Fatal(resp)) => return resp,
+            Err(AttemptError::Failed(failure)) => {
+                let try_next = crate::llm_router::client::should_try_next_target(&failure);
+                failures.push(failure);
+                if try_next {
+                    continue;
+                }
+                break;
+            }
         }
     }
+    give_up(openai_error, &requested, &failures)
 }
 
 async fn handle_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -589,28 +703,79 @@ async fn handle_count_tokens(
 // Upstream I/O
 // ---------------------------------------------------------------------------
 
+/// The outcome of a single upstream attempt that didn't succeed.
+enum AttemptError {
+    /// Return to the client immediately (transport error, translation error).
+    Fatal(Response),
+    /// Candidate for failover — try the next target if the predicate allows.
+    Failed(crate::llm_router::client::UpstreamAttemptFailure),
+}
+
+/// All targets exhausted (or the failure was non-retryable): shape the
+/// accumulated failures into a client-format error. Status = the last
+/// failure's upstream status, else 502.
+fn give_up(
+    err: fn(StatusCode, &str) -> Response,
+    requested: &str,
+    failures: &[crate::llm_router::client::UpstreamAttemptFailure],
+) -> Response {
+    let status = failures
+        .iter()
+        .rev()
+        .find_map(|f| f.status)
+        .and_then(|s| StatusCode::from_u16(s).ok())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    err(
+        status,
+        &crate::llm_router::client::fallback_error(requested, failures).to_string(),
+    )
+}
+
+/// Send the upstream request and pre-check status. A non-2xx becomes a
+/// retryable `Failed`; a transport error is `Fatal` (matches the native
+/// path, which aborts on send errors rather than failing over).
+async fn connect_upstream(
+    state: &AppState,
+    target: &mut RouteTarget,
+    body: &Value,
+    err: fn(StatusCode, &str) -> Response,
+) -> Result<reqwest::Response, AttemptError> {
+    match send_upstream(&state.ctx(), target, body).await {
+        Ok(resp) if resp.status().is_success() => Ok(resp),
+        Ok(resp) => Err(AttemptError::Failed(
+            crate::llm_router::client::upstream_status_failure(target.conn.provider.clone(), resp)
+                .await,
+        )),
+        Err(e) => Err(AttemptError::Fatal(err(
+            StatusCode::BAD_GATEWAY,
+            &format!("upstream {}: {e}", target.conn.provider),
+        ))),
+    }
+}
+
 async fn send_json(
     state: &AppState,
     target: &mut RouteTarget,
     body: &Value,
     err: fn(StatusCode, &str) -> Response,
-) -> Result<Value, Response> {
+) -> Result<Value, AttemptError> {
     let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
-    let resp = send_upstream(&state.ctx(), target, body)
-        .await
-        .map_err(|e| {
-            err(
-                StatusCode::BAD_GATEWAY,
-                &format!("upstream {}: {e}", target.conn.provider),
-            )
-        })?;
+    let resp = send_upstream(&state.ctx(), target, body).await.map_err(|e| {
+        AttemptError::Fatal(err(
+            StatusCode::BAD_GATEWAY,
+            &format!("upstream {}: {e}", target.conn.provider),
+        ))
+    })?;
     let status = resp.status();
     let mut v: Value = resp.json().await.unwrap_or(json!({}));
     if !status.is_success() {
         let msg = v["error"]["message"].as_str().unwrap_or("upstream error");
-        return Err(err(
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            &format!("[{}] {}", target.conn.provider, msg),
+        return Err(AttemptError::Failed(
+            crate::llm_router::client::UpstreamAttemptFailure {
+                provider: target.conn.provider.clone(),
+                message: msg.to_string(),
+                status: Some(status.as_u16()),
+            },
         ));
     }
     claude_cloak::decloak_response(&mut v, &tool_map);
@@ -627,22 +792,17 @@ fn sse_response(body: Body) -> Response {
 }
 
 /// Same-format streaming (and non-streaming) proxy: forward status + body.
+/// A non-2xx upstream becomes a retryable `Failed` (via `connect_upstream`)
+/// rather than being forwarded verbatim — the caller decides whether to fail
+/// over or shape the accumulated failures into a `give_up` error.
 async fn proxy_passthrough(
     state: &AppState,
     target: &mut RouteTarget,
     body: &Value,
     err: fn(StatusCode, &str) -> Response,
-) -> Response {
+) -> Result<Response, AttemptError> {
     let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
-    let resp = match send_upstream(&state.ctx(), target, body).await {
-        Ok(r) => r,
-        Err(e) => {
-            return err(
-                StatusCode::BAD_GATEWAY,
-                &format!("upstream {}: {e}", target.conn.provider),
-            )
-        }
-    };
+    let resp = connect_upstream(state, target, body, err).await?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ct = resp
         .headers()
@@ -650,24 +810,26 @@ async fn proxy_passthrough(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    if status.is_success() && !tool_map.is_empty() {
+    if !tool_map.is_empty() {
         if ct.contains("text/event-stream") || body["stream"].as_bool().unwrap_or(false) {
-            return sse_response(spawn_anthropic_passthrough_decloak_pump(resp, tool_map));
+            return Ok(sse_response(spawn_anthropic_passthrough_decloak_pump(
+                resp, tool_map,
+            )));
         }
         let mut v: Value = resp.json().await.unwrap_or(json!({}));
         claude_cloak::decloak_response(&mut v, &tool_map);
-        return Response::builder()
+        return Ok(Response::builder()
             .status(status)
             .header("content-type", "application/json")
             .body(Body::from(v.to_string()))
-            .unwrap();
+            .unwrap());
     }
     let stream = resp.bytes_stream();
-    Response::builder()
+    Ok(Response::builder()
         .status(status)
         .header("content-type", ct)
         .body(Body::from_stream(stream))
-        .unwrap()
+        .unwrap())
 }
 
 fn spawn_anthropic_passthrough_decloak_pump(
@@ -853,87 +1015,53 @@ fn spawn_anthropic_to_openai_pump(
     Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-/// Client=Anthropic, upstream=OpenAI, stream=true.
+/// Client=Anthropic, upstream=OpenAI, stream=true. Pre-stream only: a non-2xx
+/// upstream becomes a retryable `Failed` (streaming retries happen before any
+/// pump spawns; a mid-stream error still ends the SSE with an error frame).
 async fn stream_openai_upstream_to_anthropic(
     state: &AppState,
     target: &mut RouteTarget,
     upstream_body: &Value,
     ctx: RecordCtx,
-) -> Response {
+) -> Result<Response, AttemptError> {
     let model = upstream_body["model"].as_str().unwrap_or("").to_string();
-    let resp = match send_upstream(&state.ctx(), target, upstream_body).await {
-        Ok(r) => r,
-        Err(e) => return anthropic_error(StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
-    if !resp.status().is_success() {
-        let status =
-            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let v: Value = resp.json().await.unwrap_or(json!({}));
-        let msg = v["error"]["message"]
-            .as_str()
-            .unwrap_or("upstream error")
-            .to_string();
-        return anthropic_error(status, &format!("[{}] {msg}", target.conn.provider));
-    }
-    sse_response(spawn_openai_to_anthropic_pump(
+    let resp = connect_upstream(state, target, upstream_body, anthropic_error).await?;
+    Ok(sse_response(spawn_openai_to_anthropic_pump(
         resp,
         model,
         state.store.clone(),
         ctx,
-    ))
+    )))
 }
 
-/// Client=OpenAI, upstream=Anthropic, stream=true.
+/// Client=OpenAI, upstream=Anthropic, stream=true. Pre-stream retry only.
 async fn stream_anthropic_upstream_to_openai(
     state: &AppState,
     target: &mut RouteTarget,
     upstream_body: &Value,
     ctx: RecordCtx,
-) -> Response {
-    let resp = match send_upstream(&state.ctx(), target, upstream_body).await {
-        Ok(r) => r,
-        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
-    if !resp.status().is_success() {
-        let status =
-            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let v: Value = resp.json().await.unwrap_or(json!({}));
-        let msg = v["error"]["message"]
-            .as_str()
-            .unwrap_or("upstream error")
-            .to_string();
-        return openai_error(status, &format!("[{}] {msg}", target.conn.provider));
-    }
-    sse_response(spawn_anthropic_to_openai_pump(
+) -> Result<Response, AttemptError> {
+    let tool_map =
+        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);
+    let resp = connect_upstream(state, target, upstream_body, openai_error).await?;
+    Ok(sse_response(spawn_anthropic_to_openai_pump(
         resp,
         state.store.clone(),
         ctx,
-        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body),
-    ))
+        tool_map,
+    )))
 }
 
 /// Client=Responses, stream=true. Normalizes the upstream response (OpenAI or
 /// Anthropic format) to OpenAI chat chunks, then encodes Responses SSE.
+/// Pre-stream retry only.
 async fn stream_responses(
     state: &AppState,
     target: &mut RouteTarget,
     upstream_body: &Value,
     started: i64,
-) -> Response {
-    let resp = match send_upstream(&state.ctx(), target, upstream_body).await {
-        Ok(r) => r,
-        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
-    if !resp.status().is_success() {
-        let status =
-            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let v: Value = resp.json().await.unwrap_or(json!({}));
-        let msg = v["error"]["message"]
-            .as_str()
-            .unwrap_or("upstream error")
-            .to_string();
-        return openai_error(status, &format!("[{}] {msg}", target.conn.provider));
-    }
+) -> Result<Response, AttemptError> {
+    let resp = connect_upstream(state, target, upstream_body, openai_error).await?;
     let anthropic_upstream = matches!(target.desc.format, ApiFormat::Anthropic);
     let tool_map =
         claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);
@@ -945,13 +1073,13 @@ async fn stream_responses(
         client_format: "responses".into(),
         started,
     };
-    sse_response(spawn_responses_pump(
+    Ok(sse_response(spawn_responses_pump(
         resp,
         anthropic_upstream,
         store,
         ctx,
         tool_map,
-    ))
+    )))
 }
 
 /// Pumps an upstream SSE response through Responses encoding. For an
@@ -1577,7 +1705,7 @@ async fn serve_kiro(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_router::client::route_model;
+    use crate::llm_router::client::{route_model, route_model_for_body};
     use crate::llm_router::connections::{ConnectionData, ConnectionRow};
 
     fn mk_conn(id: &str, provider: &str, auth_type: &str, data: ConnectionData) -> ConnectionRow {
