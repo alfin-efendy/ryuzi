@@ -679,6 +679,8 @@ mod tests {
         assert_eq!(d.model.as_deref(), Some("claude-haiku-4-5"));
         assert_eq!(d.perm_mode, Some(PermMode::Default));
     }
+
+    #[test]
     fn harness_maps_to_runtime_catalog_id() {
         assert_eq!(runtime_id_for_harness("claude-code"), "claude");
         assert_eq!(runtime_id_for_harness("native"), "native");
