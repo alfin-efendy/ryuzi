@@ -1,0 +1,52 @@
+name: cli-release
+# Rebuilds the CLI binaries (goreleaser: 6 targets + checksums.txt) for an
+# EXISTING unified `vX.Y.Z` release and uploads them onto it (release.mode
+# append + replace_existing_artifacts). This is the backfill path for when
+# the goreleaser job in release.yml fails after the release was already
+# created (v0.5.0: zigbuild could not link the darwin targets against
+# Security.framework). Mirrors that job 1:1 — see release.yml for the
+# rationale behind each step.
+#
+# Sources build from the DISPATCH REF (not the tag) so that config/workflow
+# fixes apply; only dispatch when the ref's Rust sources match the tag
+# (CI-only drift is fine). GORELEASER_CURRENT_TAG pins naming + upload target.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build for and upload to (e.g. v0.5.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.13.0
+      - run: cargo install --locked cargo-zigbuild
+      - name: Embed the release sidecar manifest (pins adapter version + sha256 into the binaries)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
+            --pattern manifest.json --output crates/core/sidecar.manifest.json --clobber
+          cat crates/core/sidecar.manifest.json
+      - name: Validate the injected manifest parses (same serde path the binary uses)
+        run: cargo test -p ryuzi-core sidecar
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ inputs.tag }}

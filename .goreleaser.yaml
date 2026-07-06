@@ -1,10 +1,14 @@
 version: 2
 project_name: ryuzi
 
-# Rust cross-builds via cargo-zigbuild (zig = C toolchain for every target).
-# The release workflow installs zig + cargo-zigbuild and embeds the freshly
-# built sidecar manifest into crates/core BEFORE goreleaser runs; goreleaser
-# itself runs `rustup target add` per declared target.
+# Linux targets cross-build via cargo-zigbuild (zig = C toolchain); darwin
+# targets build with plain cargo on the macOS host — zig ships libSystem stubs
+# but NO Apple framework stubs, and keyring (OS keychain, #57) links
+# Security.framework + CoreFoundation, so zigbuild-linked darwin binaries die
+# at link time with "undefined symbol: _SecKeychain*" (killed the v0.5.0
+# goreleaser job). The release workflow installs zig + cargo-zigbuild and
+# embeds the freshly built sidecar manifest into crates/core BEFORE goreleaser
+# runs; goreleaser itself runs `rustup target add` per declared target.
 
 builds:
   - id: ryuzi
@@ -13,6 +17,15 @@ builds:
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
+    flags:
+      - --release
+      - -p=ryuzi-cli
+
+  - id: ryuzi-darwin
+    builder: rust
+    binary: ryuzi
+    command: build # native cargo, NOT zigbuild — see header comment
+    targets:
       - x86_64-apple-darwin
       - aarch64-apple-darwin
     flags:
@@ -34,7 +47,7 @@ archives:
   # in-field TS self-updater can never match, and that MUST agree
   # byte-for-byte with crates/core/src/update/asset.rs::asset_name.
   - id: default
-    ids: [ryuzi]
+    ids: [ryuzi, ryuzi-darwin]
     formats: [tar.gz]
     name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Target }}"
     files: [README*]
@@ -48,6 +61,11 @@ archives:
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
+
+# release-please owns the release notes; without this, `release.mode: append`
+# would also append a goreleaser-generated commit-log changelog on upload.
+changelog:
+  disable: true
 
 # homebrew_casks: REMOVED (2026-07-04) — brew distribution dropped by decision;
 # no tap repo/token exists. Install paths are curl|sh, npm, and GitHub Releases.
