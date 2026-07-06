@@ -190,11 +190,16 @@ async fn route_models_for_body_matching(
     Ok(out)
 }
 
+/// All providers are now drivable on the Anthropic-Messages / native path
+/// (including `openai-oauth`/Codex, via [`codex_stream`]), so routing no
+/// longer needs to exclude anything here. Kept as a named predicate — rather
+/// than inlined `true` at each call site — so a future not-yet-drivable
+/// provider has a single place to gate.
 fn anthropic_messages_target_allowed(
-    conn: &connections::ConnectionRow,
+    _conn: &connections::ConnectionRow,
     _desc: &ProviderDescriptor,
 ) -> bool {
-    conn.provider != "openai-oauth"
+    true
 }
 
 async fn expanded_route_targets(
@@ -302,7 +307,14 @@ fn connection_serves_model(
     allow_unlisted: bool,
 ) -> bool {
     let models = connections::effective_models(desc, conn);
-    (allow_unlisted && models.is_empty()) || models.iter().any(|m| m == model)
+    // Codex picker entries carry an effort suffix (`-high`) the connection's
+    // model list doesn't contain; match on the base id.
+    let needle = if conn.provider == "openai-oauth" {
+        crate::llm_router::codex::codex_base_model(model)
+    } else {
+        model
+    };
+    (allow_unlisted && models.is_empty()) || models.iter().any(|m| m == needle)
 }
 
 async fn ordered_provider_connections(
@@ -376,8 +388,8 @@ pub async fn default_model(store: &Store) -> Option<String> {
 }
 
 /// Default model for the native runtime / Anthropic Messages client path.
-/// Prefer named routes so user-created combo aliases become the natural native
-/// default, but skip `openai-oauth` because it only accepts Responses wire.
+/// Prefer named routes so user-created combo aliases become the natural
+/// native default.
 pub async fn default_anthropic_messages_model(store: &Store) -> Option<String> {
     let conns = connections::list_connections(store).await.ok()?;
     let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
@@ -419,18 +431,17 @@ pub async fn default_anthropic_messages_model(store: &Store) -> Option<String> {
 ///   * any api-key / no-auth connection (generic `/messages` or `/chat/
 ///     completions` wiring in [`upstream_request`], with OpenAI↔Anthropic
 ///     translation),
-///   * the `anthropic-oauth` Claude subscription, and
+///   * the `anthropic-oauth` Claude subscription,
 ///   * `kiro` (AWS CodeWhisperer) via [`kiro_stream`] — the same
-///     EventStream→OpenAI→Anthropic translation the endpoint server uses.
-/// The one provider still NOT drivable natively is `openai-oauth` (Codex),
-/// whose Responses API needs an Anthropic→Responses request translation the
-/// native path doesn't build yet. Listing a Codex model in the picker would
-/// be a mockup that errors on send, so it's excluded here.
+///     EventStream→OpenAI→Anthropic translation the endpoint server uses, and
+///   * `openai-oauth` (Codex) via [`codex_stream`] — an Anthropic→OpenAI-chat→
+///     Responses request translation, with the Responses SSE decoded back
+///     into Anthropic events.
 fn native_client_can_drive(conn: &connections::ConnectionRow) -> bool {
     if !connections::is_oauth(conn) {
         return true;
     }
-    matches!(conn.provider.as_str(), "anthropic-oauth" | "kiro")
+    matches!(conn.provider.as_str(), "anthropic-oauth" | "kiro" | "openai-oauth")
 }
 
 /// The models a native session can actually be pointed at, in the order the
@@ -443,7 +454,10 @@ fn native_client_can_drive(conn: &connections::ConnectionRow) -> bool {
 /// ("models come from connections"), so without this the picker was empty and
 /// users could never pin a native model (hence it "always went to the Claude
 /// subscription" default). Only models that will actually run are listed, so
-/// the picker never offers a Codex/Kiro entry that would error on send.
+/// the picker never offers an entry that would error on send. Codex
+/// (`openai-oauth`) connections additionally get `-low/-medium/-high/-xhigh`
+/// effort-suffixed variants of each model, since Codex routes those through
+/// [`crate::llm_router::codex::codex_base_model`].
 pub async fn selectable_native_models(store: &Store) -> Vec<String> {
     let mut out = Vec::<String>::new();
     let mut seen = std::collections::HashSet::<String>::new();
@@ -493,6 +507,11 @@ pub async fn selectable_native_models(store: &Store) -> Vec<String> {
         }
         for model in connections::effective_models(desc, conn) {
             push(format!("{}/{}", conn.provider, model), &mut out, &mut seen);
+            if conn.provider == "openai-oauth" {
+                for effort in ["low", "medium", "high", "xhigh"] {
+                    push(format!("{}/{}-{effort}", conn.provider, model), &mut out, &mut seen);
+                }
+            }
         }
     }
 
@@ -934,14 +953,6 @@ pub async fn anthropic_messages_stream(
 
     let mut failures = Vec::new();
     for mut target in targets {
-        if target.conn.provider == "openai-oauth" {
-            failures.push(UpstreamAttemptFailure {
-                provider: target.conn.provider.clone(),
-                message: "the OpenAI (ChatGPT) connection speaks the Responses API and cannot serve the native runtime yet".into(),
-                status: Some(400),
-            });
-            continue;
-        }
         if let Err(failure) = ensure_fresh_for_attempt(ctx, &mut target).await {
             let try_next = should_try_next_target(&failure);
             failures.push(failure);
@@ -963,6 +974,23 @@ pub async fn anthropic_messages_stream(
         // fallback target, matching the other providers' behavior.
         if target.conn.provider == "kiro" {
             match kiro_stream(ctx, &mut target, &attempt_body, started).await {
+                Ok(rx) => return Ok(rx),
+                Err(failure) => {
+                    let try_next = should_try_next_target(&failure);
+                    failures.push(failure);
+                    if try_next {
+                        continue;
+                    }
+                    return Err(fallback_error(&requested, &failures));
+                }
+            }
+        }
+
+        // Codex speaks the Responses API, not `/messages` or `/chat/
+        // completions`, so — like Kiro — it's handled before the format
+        // match via its own translation + upstream pipeline.
+        if target.conn.provider == "openai-oauth" {
+            match codex_stream(ctx, &mut target, &attempt_body, started).await {
                 Ok(rx) => return Ok(rx),
                 Err(failure) => {
                     let try_next = should_try_next_target(&failure);
@@ -1438,6 +1466,102 @@ async fn pump_kiro(
     );
 }
 
+/// Start a Codex stream for the native path: Anthropic body -> OpenAI chat ->
+/// Responses request -> Codex-normalized -> POST (via the existing openai-oauth
+/// upstream branch), then a pump that yields Anthropic events.
+async fn codex_stream(
+    ctx: &UpstreamCtx,
+    target: &mut RouteTarget,
+    body: &Value,
+    started: i64,
+) -> Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>, UpstreamAttemptFailure> {
+    // Clone the provider up front rather than borrowing `target` inside the
+    // closure — a reborrow through `target` (a `&mut`) here would keep it
+    // immutably borrowed across the `send_upstream(ctx, target, ...)` call
+    // below, which needs `&mut target`.
+    let provider = target.conn.provider.clone();
+    let fail = |e: String| UpstreamAttemptFailure {
+        provider: provider.clone(), message: e, status: None };
+    let chat = translate::anthropic_to_openai_request(body).map_err(|e| fail(e.to_string()))?;
+    let mut responses = crate::llm_router::codex::openai_chat_to_responses_request(&chat);
+    crate::llm_router::codex::normalize_codex_responses_body(
+        &mut responses, &target.upstream_model, None);
+    let resp = send_upstream(ctx, target, &responses).await.map_err(|e| fail(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(upstream_status_failure(target.conn.provider.clone(), resp).await);
+    }
+    let (tx, rx) = mpsc::channel::<anyhow::Result<AnthropicEvent>>(64);
+    let store = ctx.store.clone();
+    let conn_id = target.conn.id.clone();
+    let provider = target.conn.provider.clone();
+    let model = target.upstream_model.clone();
+    tokio::spawn(async move { pump_codex(resp, model, tx, store, conn_id, provider, started).await; });
+    Ok(rx)
+}
+
+/// Pump a Codex Responses SSE response into Anthropic events: decode with
+/// `ResponsesToOpenAiStream`, translate via `OpenAiToAnthropicStream`. A
+/// `response.failed`/`error` event decodes to a bare `{"error":{"message":
+/// ...}}` element (see `ResponsesToOpenAiStream::feed`) that
+/// `OpenAiToAnthropicStream::feed` doesn't understand and would silently
+/// drop — it's checked for explicitly and turned into an Anthropic error
+/// frame before it ever reaches `tr.feed`.
+async fn pump_codex(
+    resp: reqwest::Response,
+    model: String,
+    tx: mpsc::Sender<anyhow::Result<AnthropicEvent>>,
+    store: Arc<Store>,
+    conn_id: String,
+    provider: String,
+    started: i64,
+) {
+    use crate::llm_router::sse::SseParser;
+    use futures::StreamExt;
+    let mut parser = SseParser::default();
+    let mut dec = crate::llm_router::codex::ResponsesToOpenAiStream::new(&model);
+    let mut tr = translate::OpenAiToAnthropicStream::new(&model);
+    let mut stream = resp.bytes_stream();
+    let mut errored = false;
+    'pump: while let Some(item) = stream.next().await {
+        let chunk = match item {
+            Ok(c) => c,
+            Err(e) => {
+                for (name, data) in tr.error_frame(&format!("upstream stream interrupted: {e}")) {
+                    let _ = tx.send(Ok((name, data))).await;
+                }
+                errored = true;
+                break;
+            }
+        };
+        for ev in parser.feed(&chunk) {
+            let Ok(data) = serde_json::from_str::<Value>(&ev.data) else { continue };
+            let name = ev.event.clone().unwrap_or_default();
+            for oai in dec.feed(&name, &data) {
+                if let Some(err) = oai.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                    for (n, d) in tr.error_frame(err) { let _ = tx.send(Ok((n, d))).await; }
+                    errored = true;
+                    break 'pump;
+                }
+                for (n, d) in tr.feed(&oai) {
+                    if tx.send(Ok((n, d))).await.is_err() { break 'pump; }
+                }
+            }
+        }
+    }
+    if !errored {
+        if !dec.saw_terminal() {
+            for oai in dec.finish() {
+                for (n, d) in tr.feed(&oai) { let _ = tx.send(Ok((n, d))).await; }
+            }
+        }
+        for (n, d) in tr.finish() { let _ = tx.send(Ok((n, d))).await; }
+    }
+    let (input, output) = dec.usage();
+    crate::llm_router::usage::record(&store, &conn_id, &provider, &model, "native",
+        crate::llm_router::usage::Usage { input, output },
+        if errored { 502 } else { 200 }, started, errored.then(|| "stream interrupted".to_string()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1702,7 +1826,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_messages_route_skips_responses_only_route_target() {
+    async fn anthropic_messages_route_serves_codex_route_target_now_that_its_drivable() {
+        // Codex is now natively drivable (via `codex_stream`), so a route
+        // listing it first is no longer skipped at the routing layer — it's
+        // served, same as any other provider.
         let ctx = test_ctx().await;
         connections::add_connection(
             &ctx.store,
@@ -1763,16 +1890,104 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(target.conn.id, "chatgpt");
+        assert_eq!(target.conn.provider, "openai-oauth");
+        assert_eq!(target.upstream_model, "gpt-5.2-codex");
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_route_skips_uncredentialed_route_target() {
+        // An openai-oauth connection with no token still can't actually be
+        // driven, so it's skipped in favor of the next fallback target —
+        // same as any other provider missing credentials.
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "chatgpt",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    models_override: Some(vec!["gpt-5.2-codex".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "claude",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-ant".into()),
+                    models_override: Some(vec!["claude-sonnet-4-5".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "fable".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        connection_id: "chatgpt".into(),
+                        model: "gpt-5.2-codex".into(),
+                    },
+                    routes::ModelRouteTarget {
+                        connection_id: "claude".into(),
+                        model: "claude-sonnet-4-5".into(),
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let target = route_model_for_anthropic_messages(&ctx.store, "fable")
+            .await
+            .unwrap()
+            .unwrap();
+
         assert_eq!(target.conn.id, "claude");
         assert_eq!(target.conn.provider, "anthropic");
         assert_eq!(target.upstream_model, "claude-sonnet-4-5");
     }
 
     #[tokio::test]
+    async fn codex_is_offered_and_effort_variants_route_to_openai_oauth() {
+        let ctx = test_ctx().await;
+        connections::add_connection(&ctx.store, mk_conn("cx", "openai-oauth", "oauth",
+            ConnectionData { access_token: Some("at".into()),
+                models_override: Some(vec!["gpt-5.2-codex".into()]), ..Default::default() })).await.unwrap();
+
+        let models = selectable_native_models(&ctx.store).await;
+        assert!(models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex"), "got {models:?}");
+        assert!(models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex-high"), "effort variant missing: {models:?}");
+
+        // The suffixed id routes to the openai-oauth connection.
+        let t = route_model_for_anthropic_messages(&ctx.store, "openai-oauth/gpt-5.2-codex-high")
+            .await.unwrap().unwrap();
+        assert_eq!(t.conn.provider, "openai-oauth");
+        assert_eq!(t.upstream_model, "gpt-5.2-codex-high");
+    }
+
+    #[tokio::test]
     async fn selectable_native_models_lists_usable_routes_then_connection_models_and_skips_unreachable(
     ) {
         let ctx = test_ctx().await;
-        // Codex: Responses-only — excluded from the native path entirely.
+        // Codex (openai-oauth) IS drivable natively now (via `codex_stream`),
+        // so its models and any route pointing at it must be offered.
         connections::add_connection(
             &ctx.store,
             mk_conn(
@@ -1838,7 +2053,7 @@ mod tests {
         .await
         .unwrap();
         // A usable route (openrouter target with a key) and a Codex-only route
-        // that must be filtered out because native can't drive Codex.
+        // — both are drivable, so both must be offered.
         routes::save_model_route(
             &ctx.store,
             routes::ModelRouteInfo {
@@ -1886,14 +2101,19 @@ mod tests {
             models.iter().any(|m| m == "kiro/claude-sonnet-5"),
             "kiro must be offered, got: {models:?}"
         );
-        // Codex is Responses-only — neither its model nor a Codex-only route.
+        // Codex is drivable natively — its model (plus effort variants) and
+        // the Codex-only route are offered.
         assert!(
-            !models.iter().any(|m| m.starts_with("openai-oauth/")),
+            models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex"),
             "got: {models:?}"
         );
         assert!(
-            !models.iter().any(|m| m == "codex-only"),
-            "codex-only route must be filtered, got: {models:?}"
+            models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex-high"),
+            "effort variant missing, got: {models:?}"
+        );
+        assert!(
+            models.iter().any(|m| m == "codex-only"),
+            "codex-only route must be offered, got: {models:?}"
         );
         // A keyless connection's models are never offered.
         assert!(

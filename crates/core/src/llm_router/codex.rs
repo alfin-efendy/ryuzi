@@ -378,6 +378,19 @@ fn normalize_codex_tools(body: &mut Value) {
     });
 }
 
+/// The base model id Codex actually serves, with any `-review` / effort
+/// (`-low/-medium/-high/-xhigh/-none`) suffix removed. Used by routing so a
+/// picker entry like `gpt-5.5-high` still matches the connection's `gpt-5.5`.
+pub fn codex_base_model(model: &str) -> &str {
+    let base = model.strip_suffix("-review").unwrap_or(model);
+    for effort in ["-xhigh", "-high", "-medium", "-low", "-none"] {
+        if let Some(stripped) = base.strip_suffix(effort) {
+            return stripped;
+        }
+    }
+    base
+}
+
 pub fn codex_virtual_model_to_upstream(model: &str) -> (String, Option<&'static str>) {
     let mut upstream = model.strip_suffix("-review").unwrap_or(model).to_string();
     for effort in ["xhigh", "high", "medium", "low", "none"] {
@@ -488,6 +501,22 @@ mod tests {
     }
 
     #[test]
+    fn response_failed_yields_an_error_element_for_the_pump_to_surface() {
+        // `pump_codex` (client.rs) inspects each decoded element for an
+        // `error.message` field BEFORE handing it to
+        // `OpenAiToAnthropicStream::feed` (which doesn't understand this
+        // shape and would otherwise silently drop it) and turns it into an
+        // Anthropic error frame instead of swallowing it.
+        let mut s = stream();
+        let out = s.feed("response.failed",
+            &json!({"response": {"error": {"message": "rate limited"}}}));
+        let err = out.iter().find(|el| el.get("error").is_some())
+            .expect("response.failed must yield an error element");
+        assert_eq!(err["error"]["message"], "rate limited");
+        assert!(s.saw_terminal());
+    }
+
+    #[test]
     fn streamed_function_call_accumulates_and_finishes_as_tool_calls() {
         let mut s = stream();
         let mut out = s.feed("response.output_item.added",
@@ -583,6 +612,14 @@ mod tests {
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body["input"].as_array().is_some());
+    }
+
+    #[test]
+    fn codex_base_model_strips_effort_and_review() {
+        assert_eq!(codex_base_model("gpt-5.5-high"), "gpt-5.5");
+        assert_eq!(codex_base_model("gpt-5.2-codex-xhigh"), "gpt-5.2-codex");
+        assert_eq!(codex_base_model("gpt-5.5-review"), "gpt-5.5");
+        assert_eq!(codex_base_model("gpt-5.5"), "gpt-5.5");
     }
 
     #[test]
