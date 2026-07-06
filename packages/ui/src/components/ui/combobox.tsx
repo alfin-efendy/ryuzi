@@ -41,8 +41,9 @@ type ComboboxProps = {
    * className, and event handlers — so passing an interactive element is
    * safe and never produces nested `<button>`s. Non-element content
    * (string, fragment, etc.) renders as children of the default trigger
-   * `<button>` instead. Default (no `trigger`) is an outline button showing
-   * the selected label + ChevronsUpDown.
+   * `<button>` instead — a Fragment in particular has no single element to
+   * merge onto, so it always renders as children. Default (no `trigger`) is
+   * an outline button showing the selected label + ChevronsUpDown.
    */
   trigger?: React.ReactNode;
   className?: string;
@@ -128,7 +129,10 @@ function Combobox({
   // An element trigger (e.g. <Button>) becomes the trigger element itself via
   // Base UI's `render` prop — no nested <button>. Non-element content (string,
   // fragment, etc.) has no element to merge onto, so it renders as children.
-  const triggerElement = trigger !== undefined && React.isValidElement(trigger) ? trigger : undefined;
+  // A Fragment IS a valid element per React.isValidElement, but Base UI's
+  // cloneElement can't merge props onto it (no single DOM node to attach
+  // role/aria/handlers to) — treat it like non-element content.
+  const triggerElement = trigger !== undefined && React.isValidElement(trigger) && trigger.type !== React.Fragment ? trigger : undefined;
 
   return (
     <ComboboxPrimitive.Root<ComboboxItemData>

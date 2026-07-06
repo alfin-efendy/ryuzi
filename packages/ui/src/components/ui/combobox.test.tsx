@@ -205,6 +205,33 @@ test("custom trigger content replaces the default button contents", async () => 
   await screen.findByRole("listbox");
 });
 
+test("a Fragment trigger renders inside the default button, not as the trigger element", async () => {
+  // A Fragment passes React.isValidElement, but Base UI's cloneElement has no
+  // single DOM node to merge role/aria/handlers onto — it must fall back to
+  // rendering as children of the default trigger <button> instead.
+  const { container } = render(
+    <Combobox
+      options={few}
+      value={null}
+      onValueChange={() => {}}
+      aria-label="Branch"
+      trigger={
+        <>
+          <span>frag-label</span>
+          <span>-extra</span>
+        </>
+      }
+    />,
+  );
+  expect(container.querySelectorAll("button").length).toBe(1);
+
+  const trigger = screen.getByRole("combobox", { name: "Branch" });
+  expect(trigger.tagName).toBe("BUTTON");
+  expect(trigger.textContent).toContain("frag-label");
+  fireEvent.click(trigger);
+  await screen.findByRole("listbox");
+});
+
 test("an interactive element trigger becomes the trigger itself — no nested <button>", async () => {
   // Base UI's render-prop merge should make the caller's <Button> the
   // trigger element itself instead of nesting it inside
