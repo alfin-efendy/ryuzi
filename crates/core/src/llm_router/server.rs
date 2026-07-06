@@ -760,12 +760,14 @@ async fn send_json(
     err: fn(StatusCode, &str) -> Response,
 ) -> Result<Value, AttemptError> {
     let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
-    let resp = send_upstream(&state.ctx(), target, body).await.map_err(|e| {
-        AttemptError::Fatal(err(
-            StatusCode::BAD_GATEWAY,
-            &format!("upstream {}: {e}", target.conn.provider),
-        ))
-    })?;
+    let resp = send_upstream(&state.ctx(), target, body)
+        .await
+        .map_err(|e| {
+            AttemptError::Fatal(err(
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream {}: {e}", target.conn.provider),
+            ))
+        })?;
     let status = resp.status();
     let mut v: Value = resp.json().await.unwrap_or(json!({}));
     if !status.is_success() {

@@ -845,7 +845,8 @@ async fn messages_fails_over_to_next_connection_on_retryable_upstream_error() {
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
 
     let (quota_port, _h1, quota_hits) =
-        mock_counting_anthropic_upstream(429, json!({"error": {"message": "quota exceeded"}})).await;
+        mock_counting_anthropic_upstream(429, json!({"error": {"message": "quota exceeded"}}))
+            .await;
     let (ok_port, _h2, ok_hits) = mock_counting_anthropic_upstream(
         200,
         json!({
@@ -1086,11 +1087,9 @@ async fn oauth_anthropic_upstream_receives_bearer_beta_header_and_system_prompt(
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("x-api-key", &key.key)
-        .json(
-            &json!({"model": "anthropic/mock-claude", "max_tokens": 32,
+        .json(&json!({"model": "anthropic/mock-claude", "max_tokens": 32,
                       "system": "be terse",
-                      "messages": [{"role": "user", "content": "hi"}]}),
-        )
+                      "messages": [{"role": "user", "content": "hi"}]}))
         .send()
         .await
         .unwrap();
@@ -1343,10 +1342,8 @@ async fn oauth_401_triggers_refresh_and_retries_once() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("x-api-key", &key.key)
-        .json(
-            &json!({"model": "anthropic/mock-claude", "max_tokens": 16,
-                      "messages": [{"role": "user", "content": "hi"}]}),
-        )
+        .json(&json!({"model": "anthropic/mock-claude", "max_tokens": 16,
+                      "messages": [{"role": "user", "content": "hi"}]}))
         .send()
         .await
         .unwrap();

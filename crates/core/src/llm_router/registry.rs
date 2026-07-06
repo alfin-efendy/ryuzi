@@ -520,7 +520,11 @@ mod tests {
         for d in CATALOG {
             // every family resolves to a "family head" descriptor whose id IS the family
             let head = descriptor(d.family).expect("family head exists");
-            assert_eq!(head.family, head.id, "family head {} must be its own family", head.id);
+            assert_eq!(
+                head.family, head.id,
+                "family head {} must be its own family",
+                head.id
+            );
         }
     }
 
