@@ -55,10 +55,28 @@ const claudeConnection: ConnectionInfo = {
   claudeCloaking: true,
 };
 
+const anthropicApiConnection: ConnectionInfo = {
+  id: "c4",
+  provider: "anthropic",
+  providerName: "Anthropic",
+  color: "#D97757",
+  initial: "A",
+  authType: "api_key",
+  label: "Team Anthropic",
+  priority: 0,
+  enabled: true,
+  baseUrl: null,
+  models: ["claude-sonnet-4-5"],
+  keyMasked: "sk-…9f21",
+  needsRelogin: false,
+  claudeCloaking: false,
+};
+
 const catalog: CatalogEntry[] = [
   {
     id: "openai",
     name: "OpenAI",
+    family: "openai",
     color: "#10A37F",
     initial: "O",
     category: "api_key",
@@ -69,12 +87,24 @@ const catalog: CatalogEntry[] = [
   {
     id: "anthropic",
     name: "Anthropic",
+    family: "anthropic",
     color: "#D97757",
     initial: "A",
     category: "api_key",
     format: "anthropic",
     requiresBaseUrl: false,
     models: ["claude-sonnet-4-5"],
+  },
+  {
+    id: "anthropic-oauth",
+    name: "Claude Code",
+    family: "anthropic",
+    color: "#D97757",
+    initial: "A",
+    category: "oauth",
+    format: "anthropic",
+    requiresBaseUrl: false,
+    models: ["claude-opus-4-8"],
   },
 ];
 
@@ -84,7 +114,9 @@ const routes: ModelRouteInfo[] = [
     name: "smart",
     enabled: true,
     strategy: "fallback",
-    targets: [{ connectionId: "c1", model: "gpt-4.1" }],
+    // TODO(Task 14): should be a family id, not a connection id — route
+    // targets are being redesigned to route by family in that task.
+    targets: [{ provider: "c1", model: "gpt-4.1" }],
     createdAt: 1751500800000,
     updatedAt: 1751500800000,
   },
@@ -189,16 +221,31 @@ test("renders provider list first with tab order Providers, Route, Endpoint", as
     .filter(Boolean);
   expect(tabs.slice(0, 3)).toEqual(["Providers", "Route", "Endpoint"]);
   expect(screen.getByRole("button", { name: "OpenAI 2 accounts 2 models" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Anthropic No accounts 1 catalog model" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Anthropic No accounts 2 catalog models" })).toBeTruthy();
   expect(screen.queryByText("Work OpenAI")).toBeNull();
 });
 
-test("provider list shows Add connection above provider rows", async () => {
+test("provider list has no global Add connection button", async () => {
   render(<ModelsView />);
 
   await screen.findByRole("button", { name: "OpenAI 2 accounts 2 models" });
-  const labels = screen.getAllByRole("button").map((button) => button.textContent?.trim() ?? "");
-  expect(labels.indexOf("Add connection")).toBeLessThan(labels.findIndex((label) => label.includes("OpenAI")));
+  expect(screen.queryByRole("button", { name: /add connection/i })).toBeNull();
+});
+
+test("providers tab groups anthropic + anthropic-oauth accounts into one Anthropic row", async () => {
+  useConnections.setState({
+    catalog,
+    connections: [connection, secondConnection, anthropicApiConnection, claudeConnection],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  const anthropicRow = await screen.findByRole("button", { name: "Anthropic 2 accounts 2 models" });
+  expect(anthropicRow).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /add connection/i })).toBeNull();
+
+  fireEvent.click(anthropicRow);
+  expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
 });
 
 test("seeds the settings form from the hydrated endpoint status", async () => {

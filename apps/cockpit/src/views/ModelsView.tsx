@@ -20,7 +20,6 @@ import {
   Switch,
 } from "@ryuzi/ui";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
-import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
 
@@ -56,23 +55,39 @@ function modelLabel(count: number, catalog = false): string {
 
 function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[]): ProviderRowInfo[] {
   const rows = new Map<string, ProviderRowInfo>();
+  const familyByProvider = new Map(catalog.map((entry) => [entry.id, entry.family]));
+  const catalogModelsByFamily = new Map<string, Set<string>>();
   for (const entry of catalog) {
-    rows.set(entry.id, {
-      id: entry.id,
-      name: entry.name,
-      color: entry.color,
-      initial: entry.initial,
-      category: entry.category,
-      accounts: [],
-      catalogModels: entry.models.length,
-      modelCount: entry.models.length,
-    });
+    const models = catalogModelsByFamily.get(entry.family) ?? new Set<string>();
+    for (const model of entry.models) models.add(model);
+    catalogModelsByFamily.set(entry.family, models);
+    if (!rows.has(entry.family)) {
+      const head = catalog.find((c) => c.id === entry.family) ?? entry;
+      rows.set(entry.family, {
+        id: entry.family,
+        name: head.name,
+        color: head.color,
+        initial: head.initial,
+        category: head.category,
+        accounts: [],
+        catalogModels: 0,
+        modelCount: 0,
+      });
+    }
+  }
+  for (const [family, models] of catalogModelsByFamily) {
+    const row = rows.get(family);
+    if (row) {
+      row.catalogModels = models.size;
+      row.modelCount = models.size;
+    }
   }
   for (const conn of connections) {
+    const family = familyByProvider.get(conn.provider) ?? conn.provider;
     const existing =
-      rows.get(conn.provider) ??
+      rows.get(family) ??
       ({
-        id: conn.provider,
+        id: family,
         name: conn.providerName,
         color: conn.color,
         initial: conn.initial,
@@ -84,7 +99,7 @@ function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[
     existing.accounts.push(conn);
     const models = new Set(existing.accounts.flatMap((account) => account.models));
     existing.modelCount = models.size || existing.catalogModels;
-    rows.set(conn.provider, existing);
+    rows.set(family, existing);
   }
   return Array.from(rows.values()).sort((a, b) => {
     if (a.accounts.length === 0 && b.accounts.length > 0) return 1;
@@ -296,20 +311,12 @@ function ProviderRow({ row }: { row: ProviderRowInfo }) {
   );
 }
 
-function ProvidersTab({ onAdd }: { onAdd: () => void }) {
+function ProvidersTab() {
   const { catalog, connections, loaded } = useConnections();
   const rows = useMemo(() => buildProviderRows(catalog, connections), [catalog, connections]);
 
   return (
     <div className="flex flex-col gap-3">
-      {loaded && (
-        <div className="flex justify-end">
-          <Button onClick={onAdd}>
-            <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
-            Add connection
-          </Button>
-        </div>
-      )}
       {rows.length > 0 && (
         <Card>
           {rows.map((row) => (
@@ -341,6 +348,9 @@ function routeTargetOptions(connections: ConnectionInfo[]): TargetOption[] {
   );
 }
 
+// TODO(Task 14): ModelRouteTarget.provider is meant to be a family id, not a
+// connection id — these targets still carry a raw connectionId in that slot
+// pending the Route tab's per-model-target redesign.
 function newRoute(targets: TargetOption[]): ModelRouteInfo {
   const first = targets[0];
   return {
@@ -348,14 +358,14 @@ function newRoute(targets: TargetOption[]): ModelRouteInfo {
     name: "",
     enabled: true,
     strategy: "fallback",
-    targets: first ? [{ connectionId: first.connectionId, model: first.model }] : [],
+    targets: first ? [{ provider: first.connectionId, model: first.model }] : [],
     createdAt: 0,
     updatedAt: 0,
   };
 }
 
-function targetKey(target: { connectionId: string; model: string }): string {
-  return `${target.connectionId}::${target.model}`;
+function targetKey(target: { provider: string; model: string }): string {
+  return `${target.provider}::${target.model}`;
 }
 
 function RouteForm({
@@ -382,7 +392,8 @@ function RouteForm({
     if (!option) return;
     setDraft((current) => ({
       ...current,
-      targets: current.targets.map((target, i) => (i === index ? { connectionId: option.connectionId, model: option.model } : target)),
+      // TODO(Task 14): see newRoute — `provider` is a connectionId for now.
+      targets: current.targets.map((target, i) => (i === index ? { provider: option.connectionId, model: option.model } : target)),
     }));
   };
 
@@ -391,7 +402,8 @@ function RouteForm({
     if (!option) return;
     setDraft((current) => ({
       ...current,
-      targets: [...current.targets, { connectionId: option.connectionId, model: option.model }],
+      // TODO(Task 14): see newRoute — `provider` is a connectionId for now.
+      targets: [...current.targets, { provider: option.connectionId, model: option.model }],
     }));
   };
 
@@ -500,8 +512,9 @@ function RouteForm({
   );
 }
 
-function RouteTargetPill({ target, connections }: { target: { connectionId: string; model: string }; connections: ConnectionInfo[] }) {
-  const conn = connections.find((c) => c.id === target.connectionId);
+// TODO(Task 14): see newRoute — `target.provider` is a connectionId for now.
+function RouteTargetPill({ target, connections }: { target: { provider: string; model: string }; connections: ConnectionInfo[] }) {
+  const conn = connections.find((c) => c.id === target.provider);
   return (
     <span className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-md bg-muted px-2 py-1 font-mono text-[11.5px] text-muted-foreground">
       <span className="truncate">
@@ -620,7 +633,6 @@ function RouteTab() {
 
 export function ModelsView() {
   const [tab, setTab] = useState<Tab>("providers");
-  const [addOpen, setAddOpen] = useState(false);
   const { loaded: endpointLoaded, hydrate: hydrateEndpoint } = useEndpoint();
   const { loaded: connectionsLoaded, hydrate: hydrateConnections } = useConnections();
   const { loaded: routesLoaded, hydrate: hydrateRoutes } = useModelRoutes();
@@ -654,11 +666,10 @@ export function ModelsView() {
           />
         </div>
 
-        {tab === "providers" && <ProvidersTab onAdd={() => setAddOpen(true)} />}
+        {tab === "providers" && <ProvidersTab />}
         {tab === "route" && <RouteTab />}
         {tab === "endpoint" && <EndpointTab />}
       </div>
-      <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} />
     </div>
   );
 }
