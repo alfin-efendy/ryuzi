@@ -38,11 +38,10 @@ type ProviderRowInfo = {
 
 type TargetOption = {
   key: string;
-  connectionId: string;
+  provider: string; // family id
   model: string;
   providerName: string;
-  accountLabel: string;
-  enabled: boolean;
+  enabled: boolean; // at least one enabled account serves it
 };
 
 function accountLabel(count: number): string {
@@ -335,22 +334,31 @@ function strategyLabel(strategy: ModelRouteStrategy): string {
   return strategy === "round-robin" ? "Round robin" : "By order";
 }
 
-function routeTargetOptions(connections: ConnectionInfo[]): TargetOption[] {
-  return connections.flatMap((conn) =>
-    conn.models.map((model) => ({
-      key: `${conn.id}::${model}`,
-      connectionId: conn.id,
-      model,
-      providerName: conn.providerName,
-      accountLabel: conn.label || conn.providerName,
-      enabled: conn.enabled,
-    })),
-  );
+function routeTargetOptions(catalog: CatalogEntry[], connections: ConnectionInfo[]): TargetOption[] {
+  const familyByProvider = new Map(catalog.map((entry) => [entry.id, entry.family]));
+  const options = new Map<string, TargetOption>();
+  for (const conn of connections) {
+    const family = familyByProvider.get(conn.provider) ?? conn.provider;
+    const head = catalog.find((entry) => entry.id === family);
+    for (const model of conn.models) {
+      const key = `${family}::${model}`;
+      const existing = options.get(key);
+      if (existing) {
+        existing.enabled = existing.enabled || conn.enabled;
+        continue;
+      }
+      options.set(key, {
+        key,
+        provider: family,
+        model,
+        providerName: head?.name ?? conn.providerName,
+        enabled: conn.enabled,
+      });
+    }
+  }
+  return Array.from(options.values());
 }
 
-// TODO(Task 14): ModelRouteTarget.provider is meant to be a family id, not a
-// connection id — these targets still carry a raw connectionId in that slot
-// pending the Route tab's per-model-target redesign.
 function newRoute(targets: TargetOption[]): ModelRouteInfo {
   const first = targets[0];
   return {
@@ -358,7 +366,7 @@ function newRoute(targets: TargetOption[]): ModelRouteInfo {
     name: "",
     enabled: true,
     strategy: "fallback",
-    targets: first ? [{ provider: first.connectionId, model: first.model }] : [],
+    targets: first ? [{ provider: first.provider, model: first.model }] : [],
     createdAt: 0,
     updatedAt: 0,
   };
@@ -392,8 +400,7 @@ function RouteForm({
     if (!option) return;
     setDraft((current) => ({
       ...current,
-      // TODO(Task 14): see newRoute — `provider` is a connectionId for now.
-      targets: current.targets.map((target, i) => (i === index ? { provider: option.connectionId, model: option.model } : target)),
+      targets: current.targets.map((target, i) => (i === index ? { provider: option.provider, model: option.model } : target)),
     }));
   };
 
@@ -402,8 +409,7 @@ function RouteForm({
     if (!option) return;
     setDraft((current) => ({
       ...current,
-      // TODO(Task 14): see newRoute — `provider` is a connectionId for now.
-      targets: [...current.targets, { provider: option.connectionId, model: option.model }],
+      targets: [...current.targets, { provider: option.provider, model: option.model }],
     }));
   };
 
@@ -457,8 +463,8 @@ function RouteForm({
               <NativeSelect value={targetKey(target)} onChange={(event) => setTarget(index, event.target.value)} className="min-w-0 flex-1">
                 {targetOptions.map((option) => (
                   <option key={option.key} value={option.key}>
-                    {option.providerName} / {option.model} ({option.accountLabel}
-                    {option.enabled ? "" : ", disabled"})
+                    {option.providerName} / {option.model}
+                    {option.enabled ? "" : " (no enabled account)"}
                   </option>
                 ))}
               </NativeSelect>
@@ -512,15 +518,13 @@ function RouteForm({
   );
 }
 
-// TODO(Task 14): see newRoute — `target.provider` is a connectionId for now.
-function RouteTargetPill({ target, connections }: { target: { provider: string; model: string }; connections: ConnectionInfo[] }) {
-  const conn = connections.find((c) => c.id === target.provider);
+function RouteTargetPill({ target, catalog }: { target: { provider: string; model: string }; catalog: CatalogEntry[] }) {
+  const head = catalog.find((entry) => entry.id === target.provider);
   return (
     <span className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-md bg-muted px-2 py-1 font-mono text-[11.5px] text-muted-foreground">
       <span className="truncate">
-        {conn?.providerName ?? "Missing"} / {target.model}
+        {head?.name ?? target.provider} / {target.model}
       </span>
-      {conn && conn.label !== conn.providerName && <span className="truncate text-[10.5px] opacity-75">({conn.label})</span>}
       <ModelCapabilityIcons model={target.model} compact />
     </span>
   );
@@ -528,12 +532,12 @@ function RouteTargetPill({ target, connections }: { target: { provider: string; 
 
 function RouteCard({
   route,
-  connections,
+  catalog,
   onEdit,
   onDelete,
 }: {
   route: ModelRouteInfo;
-  connections: ConnectionInfo[];
+  catalog: CatalogEntry[];
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -554,7 +558,7 @@ function RouteCard({
           </div>
           <div className="mt-2 flex min-w-0 flex-wrap gap-1.5">
             {route.targets.map((target, index) => (
-              <RouteTargetPill key={`${route.id}-${index}-${targetKey(target)}`} target={target} connections={connections} />
+              <RouteTargetPill key={`${route.id}-${index}-${targetKey(target)}`} target={target} catalog={catalog} />
             ))}
           </div>
         </div>
@@ -574,10 +578,11 @@ function RouteCard({
 
 function RouteTab() {
   const { routes, loaded, hydrate, save, remove } = useModelRoutes();
+  const catalog = useConnections((s) => s.catalog);
   const connections = useConnections((s) => s.connections);
   const [editing, setEditing] = useState<ModelRouteInfo | null>(null);
   const [saving, setSaving] = useState(false);
-  const targets = useMemo(() => routeTargetOptions(connections), [connections]);
+  const targets = useMemo(() => routeTargetOptions(catalog, connections), [catalog, connections]);
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -617,7 +622,7 @@ function RouteTab() {
         <RouteCard
           key={route.id}
           route={route}
-          connections={connections}
+          catalog={catalog}
           onEdit={() => setEditing(route)}
           onDelete={() => void deleteRoute(route)}
         />

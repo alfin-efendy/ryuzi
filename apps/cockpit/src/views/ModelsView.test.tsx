@@ -114,9 +114,7 @@ const routes: ModelRouteInfo[] = [
     name: "smart",
     enabled: true,
     strategy: "fallback",
-    // TODO(Task 14): should be a family id, not a connection id — route
-    // targets are being redesigned to route by family in that task.
-    targets: [{ provider: "c1", model: "gpt-4.1" }],
+    targets: [{ provider: "openai", model: "gpt-4.1" }],
     createdAt: 1751500800000,
     updatedAt: 1751500800000,
   },
@@ -131,6 +129,8 @@ const usage: UsageSeries = {
   todayInputTokens: 900,
   todayOutputTokens: 210,
 };
+
+const saveModelRoute = mock((_route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
 
 const updateConnection = mock(
   (
@@ -152,7 +152,7 @@ mock.module("@/bindings", () => ({
     listProviderCatalog: () => Promise.resolve({ status: "ok", data: catalog }),
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
-    saveModelRoute: (_route: ModelRouteInfo) => Promise.resolve({ status: "ok", data: routes }),
+    saveModelRoute,
     deleteModelRoute: (_id: string) => Promise.resolve({ status: "ok", data: [] }),
     providerAccountRoute: (provider: string) => Promise.resolve({ status: "ok", data: { provider, strategy: "fallback" } }),
     setProviderAccountRoute: (provider: string, strategy: string) => Promise.resolve({ status: "ok", data: { provider, strategy } }),
@@ -309,6 +309,49 @@ test("Route tab lists model route aliases and their ordered targets", async () =
   expect(screen.getByText("By order")).toBeTruthy();
   expect(screen.getByText("OpenAI / gpt-4.1")).toBeTruthy();
   expect(screen.getByRole("button", { name: "New route" })).toBeTruthy();
+});
+
+test("route target dropdown collapses multiple accounts of the same provider into one option per model", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+
+  // connection and secondConnection are both `openai` accounts that both
+  // serve gpt-4.1 — the dropdown must dedupe to a single family+model option.
+  expect(screen.getAllByRole("option", { name: "OpenAI / gpt-4.1" })).toHaveLength(1);
+});
+
+test("route target dropdown collapses anthropic + anthropic-oauth accounts sharing a model into one Anthropic option", async () => {
+  const sharedModel = "claude-4.5-haiku";
+  useConnections.setState({
+    catalog,
+    connections: [
+      { ...anthropicApiConnection, models: [sharedModel] },
+      { ...claudeConnection, models: [sharedModel] },
+    ],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+
+  expect(screen.getAllByRole("option", { name: `Anthropic / ${sharedModel}` })).toHaveLength(1);
+});
+
+test("route form saves targets as {provider, model} scoped to the family, not the connection", async () => {
+  saveModelRoute.mockClear();
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+  fireEvent.change(screen.getByPlaceholderText("smart"), { target: { value: "combo" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save route" }));
+
+  await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
+  const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
+  expect(savedRoute.targets).toEqual([{ provider: "openai", model: "gpt-4.1" }]);
 });
 
 test("connection detail back returns to its provider detail", () => {
