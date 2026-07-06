@@ -76,3 +76,11 @@ test("readClampedPanelSize parses, defaults, and clamps a persisted size to the 
 test("composer runtime starts unset so new chat follows the configured default runtime", () => {
   expect(useNav.getState().composerAgent).toBe("");
 });
+
+test("composer model starts unset and round-trips through setComposerModel", () => {
+  expect(useNav.getState().composerModel).toBeNull();
+  useNav.getState().setComposerModel("openrouter/qwen3:free");
+  expect(useNav.getState().composerModel).toBe("openrouter/qwen3:free");
+  useNav.getState().setComposerModel(null);
+  expect(useNav.getState().composerModel).toBeNull();
+});

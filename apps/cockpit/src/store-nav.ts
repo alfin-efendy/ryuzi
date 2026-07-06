@@ -104,6 +104,7 @@ type NavState = {
   searchQuery: string;
   composerAgent: AgentId;
   composerBranch: string;
+  composerModel: string | null;
   projectSettingsFor: string | null;
   view: () => View;
   navigate: (view: View) => void;
@@ -120,6 +121,7 @@ type NavState = {
   setSearchQuery: (q: string) => void;
   setComposerAgent: (a: AgentId) => void;
   setComposerBranch: (b: string) => void;
+  setComposerModel: (model: string | null) => void;
   setProjectSettingsFor: (id: string | null) => void;
 };
 
@@ -139,6 +141,7 @@ export const useNav = create<NavState>((set, get) => ({
   searchQuery: "",
   composerAgent: "",
   composerBranch: "main",
+  composerModel: null,
   projectSettingsFor: null,
 
   view: () => get().history.current,
@@ -184,5 +187,6 @@ export const useNav = create<NavState>((set, get) => ({
   setSearchQuery: (q) => set({ searchQuery: q }),
   setComposerAgent: (a) => set({ composerAgent: a }),
   setComposerBranch: (b) => set({ composerBranch: b }),
+  setComposerModel: (model) => set({ composerModel: model }),
   setProjectSettingsFor: (id) => set({ projectSettingsFor: id }),
 }));
