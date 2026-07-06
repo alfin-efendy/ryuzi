@@ -272,6 +272,84 @@ async fn unknown_model_is_404_and_models_lists_connections() {
     assert_eq!(m["data"][0]["id"], "custom-openai/mock-model");
 }
 
+/// /v1/models lists family-scoped ids: connections whose providers share a
+/// family (`anthropic` + `anthropic-oauth`) collapse into ONE
+/// `anthropic/<model>` entry owned by the family, and no raw
+/// `anthropic-oauth/<model>` id leaks.
+#[tokio::test]
+async fn models_dedupes_family_members_under_family_id() {
+    let (store, key, port) = setup().await;
+    let now = chrono::Utc::now().timestamp_millis();
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "ca".into(),
+            provider: "anthropic".into(),
+            auth_type: "api_key".into(),
+            label: "anthropic api".into(),
+            priority: 1,
+            enabled: true,
+            data: connections::ConnectionData {
+                api_key: Some("sk-ant".into()),
+                models_override: Some(vec!["mock-claude".into()]),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "coauth".into(),
+            provider: "anthropic-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "claude sub".into(),
+            priority: 2,
+            enabled: true,
+            data: connections::ConnectionData {
+                access_token: Some("at-token".into()),
+                models_override: Some(vec!["mock-claude".into()]),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let m: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/v1/models"))
+        .header("x-api-key", &key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = m["data"].as_array().unwrap();
+    let family_entries: Vec<_> = data
+        .iter()
+        .filter(|e| e["id"] == "anthropic/mock-claude")
+        .collect();
+    assert_eq!(
+        family_entries.len(),
+        1,
+        "family members must dedupe into one anthropic/mock-claude entry: {data:?}"
+    );
+    assert_eq!(family_entries[0]["owned_by"], "anthropic");
+    assert!(
+        data.iter().all(|e| !e["id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("anthropic-oauth/")),
+        "no raw provider-id model ids may leak: {data:?}"
+    );
+}
+
 #[tokio::test]
 async fn count_tokens_estimates_locally() {
     let (_store, key, port) = setup().await;
