@@ -15,7 +15,7 @@
 //! native wire format.
 
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
-use crate::llm_router::{capabilities, connections, oauth, routes, translate};
+use crate::llm_router::{capabilities, claude_cloak, connections, oauth, routes, translate};
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -511,6 +511,10 @@ fn inject_claude_system_prompt(body: &mut Value) {
     crate::llm_router::models::inject_claude_code_system_prompt(body);
 }
 
+fn claude_cloak_map_for(target: &RouteTarget, body: &Value) -> claude_cloak::ToolNameMap {
+    claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body)
+}
+
 // ---------------------------------------------------------------------------
 // Upstream request construction (moved from server.rs — behavior unchanged,
 // `&AppState` retargeted to `&UpstreamCtx`)
@@ -563,7 +567,12 @@ fn oauth_upstream_request(
                 .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
             let mut anthropic_body = body.clone();
             inject_claude_system_prompt(&mut anthropic_body);
-            Ok(ctx
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let cloaked = claude_cloak::enabled(&target.conn.data);
+            if cloaked {
+                claude_cloak::apply_request_cloak(&mut anthropic_body, &access_token, &session_id);
+            }
+            let req = ctx
                 .http
                 .post(format!("{base}/messages?beta=true"))
                 .json(&anthropic_body)
@@ -577,7 +586,12 @@ fn oauth_upstream_request(
                 .header("user-agent", "claude-cli/2.1.92 (external, sdk-cli)")
                 .header("x-app", "cli")
                 .header("x-stainless-helper-method", "stream")
-                .header("x-stainless-retry-count", "0"))
+                .header("x-stainless-retry-count", "0");
+            Ok(if cloaked {
+                claude_cloak::spoof_headers(req, &session_id)
+            } else {
+                req
+            })
         }
         "openai-oauth" => {
             // Codex's Responses wire is a fixed protocol endpoint, distinct
@@ -968,6 +982,7 @@ pub async fn anthropic_messages_stream(
 
         match target.desc.format {
             ApiFormat::Anthropic => {
+                let tool_map = claude_cloak_map_for(&target, &attempt_body);
                 let resp = send_upstream(ctx, &mut target, &attempt_body).await?;
                 if !resp.status().is_success() {
                     let failure = upstream_status_failure(provider, resp).await;
@@ -980,8 +995,17 @@ pub async fn anthropic_messages_stream(
                 }
                 let store = ctx.store.clone();
                 tokio::spawn(async move {
-                    pump_anthropic(resp, tx, store, conn_id, provider, upstream_model, started)
-                        .await;
+                    pump_anthropic(
+                        resp,
+                        tx,
+                        store,
+                        conn_id,
+                        provider,
+                        upstream_model,
+                        started,
+                        tool_map,
+                    )
+                    .await;
                 });
                 return Ok(rx);
             }
@@ -1044,6 +1068,7 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
         match target.desc.format {
             ApiFormat::Anthropic => {
                 let provider = target.conn.provider.clone();
+                let tool_map = claude_cloak_map_for(&target, &attempt_body);
                 let resp = send_upstream(ctx, &mut target, &attempt_body).await?;
                 if !resp.status().is_success() {
                     let failure = upstream_status_failure(provider, resp).await;
@@ -1054,7 +1079,9 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
                     }
                     return Err(fallback_error(&requested, &failures));
                 }
-                return Ok(resp.json().await?);
+                let mut v: Value = resp.json().await?;
+                claude_cloak::decloak_response(&mut v, &tool_map);
+                return Ok(v);
             }
             ApiFormat::OpenAi => {
                 let upstream_body = translate::openai_to_anthropic_request(&attempt_body)
@@ -1088,6 +1115,7 @@ async fn pump_anthropic(
     provider: String,
     model: String,
     started: i64,
+    tool_map: claude_cloak::ToolNameMap,
 ) {
     use crate::llm_router::sse::SseParser;
     use futures::StreamExt;
@@ -1111,16 +1139,17 @@ async fn pump_anthropic(
             if ev.data == "[DONE]" {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<Value>(&ev.data) else {
+            let Ok(mut v) = serde_json::from_str::<Value>(&ev.data) else {
                 continue;
             };
+            let name = ev.event.clone().unwrap_or_default();
+            claude_cloak::decloak_event(&name, &mut v, &tool_map);
             if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
                 input_tokens += u.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
             }
             if let Some(u) = v.get("usage") {
                 output_tokens += u.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
             }
-            let name = ev.event.clone().unwrap_or_default();
             if tx.send(Ok((name, v))).await.is_err() {
                 break 'pump; // consumer dropped
             }
@@ -1551,6 +1580,62 @@ mod tests {
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(sent["system"][0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
         assert_eq!(sent["system"][1]["text"], "be helpful");
+    }
+
+    #[tokio::test]
+    async fn oauth_request_for_anthropic_applies_full_cloak_when_enabled() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("anthropic-oauth").unwrap();
+        let conn = mk_conn(
+            "c1",
+            "anthropic-oauth",
+            "oauth",
+            ConnectionData {
+                access_token: Some("sk-ant-oat-test".into()),
+                provider_specific: Some(json!({"claudeCloaking": true})),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "claude-x".into(),
+        };
+        let body = json!({
+            "model": "claude-x",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "lookup", "input": {"q": "x"}}
+                ]}
+            ],
+            "tools": [{"name": "lookup", "description": "Lookup data", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "lookup"}
+        });
+        let req = upstream_request(&ctx, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(req.headers().contains_key("x-stainless-runtime-version"));
+        assert!(req.headers().contains_key("x-claude-code-session-id"));
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(sent["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.92."));
+        assert_eq!(sent["system"][1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(sent["tools"][0]["name"], "lookup_ide");
+        assert!(sent["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "Bash"));
+        assert_eq!(sent["messages"][0]["content"][0]["name"], "lookup_ide");
+        assert_eq!(sent["tool_choice"]["name"], "lookup_ide");
+        assert!(sent["metadata"]["user_id"]
+            .as_str()
+            .unwrap()
+            .contains("\"session_id\""));
     }
 
     #[tokio::test]
@@ -2108,6 +2193,66 @@ mod tests {
 
         assert_eq!(response["model"], "claude-second");
         assert_eq!(response["content"][0]["text"], "fallback worked");
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_decloaks_tool_names_for_cloaked_anthropic_oauth() {
+        use axum::{routing::post, Json, Router};
+
+        async fn ok(Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(body["tools"][0]["name"], "lookup_ide");
+            Json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": body["model"].clone(),
+                "content": [{"type": "tool_use", "id": "tu_1", "name": "lookup_ide", "input": {"q": "x"}}],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }))
+        }
+
+        let app = Router::new().route("/messages", post(ok));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        let now = crate::paths::now_ms();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "claude-oauth",
+                "anthropic-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("sk-ant-oat-test".into()),
+                    expires_at: Some(now + 24 * 60 * 60 * 1000),
+                    last_refresh_at: Some(now),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["claude-x".into()]),
+                    provider_specific: Some(json!({"claudeCloaking": true})),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let response = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "anthropic-oauth/claude-x",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "lookup", "description": "Lookup data", "input_schema": {"type": "object"}}]
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["content"][0]["name"], "lookup");
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! Providers tab commands: catalog + credentialed connections CRUD + test.
 use crate::error::CmdError;
 use crate::events::OauthAuthorizeUrlMsg;
+use ryuzi_core::llm_router::claude_cloak;
 use ryuzi_core::llm_router::connections::{self, ConnectionData, ConnectionRow};
 use ryuzi_core::llm_router::models;
 use ryuzi_core::llm_router::oauth;
@@ -54,6 +55,8 @@ pub struct ConnectionInfo {
     /// OAuth connections only: true once refresh has failed terminally and
     /// the user needs to reconnect via the browser/paste flow again.
     pub needs_relogin: bool,
+    /// Anthropic OAuth only: enable full Claude Code-style request cloaking.
+    pub claude_cloaking: bool,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -146,6 +149,7 @@ fn to_info(row: &ConnectionRow) -> ConnectionInfo {
             .unwrap_or_default(),
         key_masked: row.data.api_key.as_deref().map(mask),
         needs_relogin: row.data.needs_relogin.unwrap_or(false),
+        claude_cloaking: row.provider == "anthropic-oauth" && claude_cloak::enabled(&row.data),
     }
 }
 
@@ -312,6 +316,7 @@ pub async fn update_connection(
     api_key: Option<String>,
     base_url: Option<String>,
     models: Vec<String>,
+    claude_cloaking: Option<bool>,
 ) -> R<Vec<ConnectionInfo>> {
     let mut row = connections::get_connection(cp.store(), &id)
         .await?
@@ -332,6 +337,11 @@ pub async fn update_connection(
     } else {
         Some(models)
     };
+    if row.provider == "anthropic-oauth" {
+        if let Some(value) = claude_cloaking {
+            claude_cloak::set_enabled(&mut row.data, value);
+        }
+    }
     row.updated_at = ryuzi_core::paths::now_ms();
     connections::update_connection(cp.store(), row.clone()).await?;
     if row.data.models_override.is_none() {
@@ -476,7 +486,12 @@ fn build_model_probe_request(
     if row.provider == "anthropic-oauth" {
         models::inject_claude_code_system_prompt(&mut body);
         let token = row.data.access_token.clone().unwrap_or_default();
-        return Ok(http
+        let session_id = ryuzi_core::paths::new_id();
+        let cloaked = claude_cloak::enabled(&row.data);
+        if cloaked {
+            claude_cloak::apply_request_cloak(&mut body, &token, &session_id);
+        }
+        let req = http
             .post(format!("{base}/messages?beta=true"))
             .json(&body)
             .header("authorization", format!("Bearer {token}"))
@@ -484,7 +499,12 @@ fn build_model_probe_request(
             .header("anthropic-beta", models::ANTHROPIC_OAUTH_BETA)
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("user-agent", "claude-cli/2.1.92 (external, sdk-cli)")
-            .header("x-app", "cli"));
+            .header("x-app", "cli");
+        return Ok(if cloaked {
+            claude_cloak::spoof_headers(req, &session_id)
+        } else {
+            req
+        });
     }
 
     let path = match desc.format {
@@ -776,6 +796,28 @@ mod tests {
             sent["system"][0]["text"],
             "You are Claude Code, Anthropic's official CLI for Claude."
         );
+    }
+
+    #[test]
+    fn connection_info_exposes_claude_cloaking_for_anthropic_oauth_only() {
+        let mut row = ConnectionRow {
+            id: "c1".into(),
+            provider: "anthropic-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "Claude Code".into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                provider_specific: Some(json!({"claudeCloaking": true})),
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(to_info(&row).claude_cloaking);
+
+        row.provider = "openai-oauth".into();
+        assert!(!to_info(&row).claude_cloaking);
     }
 
     #[test]

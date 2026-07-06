@@ -11,6 +11,7 @@ import {
   SettingsCardHeader as CardHeader,
   SettingsCardRow as CardRow,
   SettingsCardTitle as CardTitle,
+  Switch,
 } from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { Chip, Pill } from "@/components/common/bits";
@@ -22,6 +23,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  const [claudeCloaking, setClaudeCloaking] = useState(false);
   const [initFor, setInitFor] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -65,6 +67,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
       setLabel(conn.label);
       setApiKey("");
       setBaseUrl(conn.baseUrl ?? "");
+      setClaudeCloaking(conn.claudeCloaking);
       setInitFor(conn.id);
     }
   }, [conn, initFor]);
@@ -87,6 +90,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
       apiKey: apiKey || null,
       baseUrl: baseUrl || null,
       models: conn.models,
+      claudeCloaking: conn.provider === "anthropic-oauth" ? claudeCloaking : null,
     });
     setApiKey("");
     setSaving(false);
@@ -226,6 +230,25 @@ export function ConnectionDetailView({ id }: { id: string }) {
           </CardRow>
           <div className="px-[18px] pb-3 text-[11.5px] text-muted-foreground">Leave empty for the provider default.</div>
         </Card>
+
+        {conn.provider === "anthropic-oauth" && (
+          <Card className="mt-3">
+            <CardHeader>
+              <CardTitle>Claude Code</CardTitle>
+            </CardHeader>
+            <CardRow>
+              <div className="min-w-0 flex-1">
+                <div className="text-[13px] font-medium">Cloaking</div>
+                <div className="mt-0.5 text-[11.5px] text-muted-foreground">Send Claude Code-style headers, metadata, billing block, and tool names.</div>
+              </div>
+              <Switch
+                on={claudeCloaking}
+                onToggle={() => setClaudeCloaking((value) => !value)}
+                label="Claude Code cloaking"
+              />
+            </CardRow>
+          </Card>
+        )}
 
         <div className="mt-4 flex justify-end">
           <Button size="lg" onClick={() => void save()} disabled={saving}>

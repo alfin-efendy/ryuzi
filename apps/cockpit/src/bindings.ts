@@ -567,9 +567,9 @@ async addConnection(provider: string, label: string, apiKey: string, baseUrl: st
     else return { status: "error", error: e  as any };
 }
 },
-async updateConnection(id: string, label: string, enabled: boolean, apiKey: string | null, baseUrl: string | null, models: string[]) : Promise<Result<ConnectionInfo[], CmdError>> {
+async updateConnection(id: string, label: string, enabled: boolean, apiKey: string | null, baseUrl: string | null, models: string[], claudeCloaking: boolean | null) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_connection", { id, label, enabled, apiKey, baseUrl, models }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_connection", { id, label, enabled, apiKey, baseUrl, models, claudeCloaking }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -947,7 +947,11 @@ keyMasked: string | null;
  * OAuth connections only: true once refresh has failed terminally and
  * the user needs to reconnect via the browser/paste flow again.
  */
-needsRelogin: boolean }
+needsRelogin: boolean;
+/**
+ * Anthropic OAuth only: enable full Claude Code-style request cloaking.
+ */
+claudeCloaking: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */

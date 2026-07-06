@@ -3,7 +3,9 @@
 use crate::llm_router::client::{route_model_for_body, send_upstream, RouteTarget, UpstreamCtx};
 use crate::llm_router::codex::normalize_codex_responses_body;
 use crate::llm_router::registry::{self, ApiFormat};
-use crate::llm_router::{connections, keys, oauth, routes, sse::SseParser, translate};
+use crate::llm_router::{
+    claude_cloak, connections, keys, oauth, routes, sse::SseParser, translate,
+};
 use crate::store::Store;
 use axum::body::Body;
 use axum::extract::State;
@@ -593,6 +595,7 @@ async fn send_json(
     body: &Value,
     err: fn(StatusCode, &str) -> Response,
 ) -> Result<Value, Response> {
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
     let resp = send_upstream(&state.ctx(), target, body)
         .await
         .map_err(|e| {
@@ -602,7 +605,7 @@ async fn send_json(
             )
         })?;
     let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or(json!({}));
+    let mut v: Value = resp.json().await.unwrap_or(json!({}));
     if !status.is_success() {
         let msg = v["error"]["message"].as_str().unwrap_or("upstream error");
         return Err(err(
@@ -610,6 +613,7 @@ async fn send_json(
             &format!("[{}] {}", target.conn.provider, msg),
         ));
     }
+    claude_cloak::decloak_response(&mut v, &tool_map);
     Ok(v)
 }
 
@@ -629,6 +633,7 @@ async fn proxy_passthrough(
     body: &Value,
     err: fn(StatusCode, &str) -> Response,
 ) -> Response {
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
     let resp = match send_upstream(&state.ctx(), target, body).await {
         Ok(r) => r,
         Err(e) => {
@@ -645,12 +650,60 @@ async fn proxy_passthrough(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    if status.is_success() && !tool_map.is_empty() {
+        if ct.contains("text/event-stream") || body["stream"].as_bool().unwrap_or(false) {
+            return sse_response(spawn_anthropic_passthrough_decloak_pump(resp, tool_map));
+        }
+        let mut v: Value = resp.json().await.unwrap_or(json!({}));
+        claude_cloak::decloak_response(&mut v, &tool_map);
+        return Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(v.to_string()))
+            .unwrap();
+    }
     let stream = resp.bytes_stream();
     Response::builder()
         .status(status)
         .header("content-type", ct)
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+fn spawn_anthropic_passthrough_decloak_pump(
+    resp: reqwest::Response,
+    tool_map: claude_cloak::ToolNameMap,
+) -> Body {
+    use futures::StreamExt;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let mut parser = SseParser::default();
+        let mut stream = resp.bytes_stream();
+        'pump: while let Some(item) = stream.next().await {
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => {
+                    let data = json!({"type": "error", "error": {"type": "api_error", "message": format!("upstream stream interrupted: {e}")}});
+                    let _ = tx.send(Ok(format_sse("error", &data))).await;
+                    break;
+                }
+            };
+            for ev in parser.feed(&chunk) {
+                if ev.data == "[DONE]" {
+                    continue;
+                }
+                let name = ev.event.clone().unwrap_or_default();
+                let Ok(mut v) = serde_json::from_str::<Value>(&ev.data) else {
+                    continue;
+                };
+                claude_cloak::decloak_event(&name, &mut v, &tool_map);
+                if tx.send(Ok(format_sse(&name, &v))).await.is_err() {
+                    break 'pump;
+                }
+            }
+        }
+    });
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
 fn format_sse(name: &str, data: &Value) -> bytes::Bytes {
@@ -745,6 +798,7 @@ fn spawn_anthropic_to_openai_pump(
     resp: reqwest::Response,
     store: Arc<Store>,
     ctx: RecordCtx,
+    tool_map: claude_cloak::ToolNameMap,
 ) -> Body {
     use futures::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
@@ -767,7 +821,8 @@ fn spawn_anthropic_to_openai_pump(
             };
             for ev in parser.feed(&chunk) {
                 let name = ev.event.as_deref().unwrap_or("");
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                if let Ok(mut v) = serde_json::from_str::<Value>(&ev.data) {
+                    claude_cloak::decloak_event(name, &mut v, &tool_map);
                     for c in tr.feed(name, &v) {
                         let line = bytes::Bytes::from(format!("data: {c}\n\n"));
                         if tx.send(Ok(line)).await.is_err() {
@@ -853,6 +908,7 @@ async fn stream_anthropic_upstream_to_openai(
         resp,
         state.store.clone(),
         ctx,
+        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body),
     ))
 }
 
@@ -879,6 +935,8 @@ async fn stream_responses(
         return openai_error(status, &format!("[{}] {msg}", target.conn.provider));
     }
     let anthropic_upstream = matches!(target.desc.format, ApiFormat::Anthropic);
+    let tool_map =
+        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);
     let store = state.store.clone();
     let ctx = RecordCtx {
         conn_id: target.conn.id.clone(),
@@ -887,7 +945,13 @@ async fn stream_responses(
         client_format: "responses".into(),
         started,
     };
-    sse_response(spawn_responses_pump(resp, anthropic_upstream, store, ctx))
+    sse_response(spawn_responses_pump(
+        resp,
+        anthropic_upstream,
+        store,
+        ctx,
+        tool_map,
+    ))
 }
 
 /// Pumps an upstream SSE response through Responses encoding. For an
@@ -900,6 +964,7 @@ fn spawn_responses_pump(
     anthropic_upstream: bool,
     store: Arc<Store>,
     ctx: RecordCtx,
+    tool_map: claude_cloak::ToolNameMap,
 ) -> Body {
     use futures::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
@@ -925,7 +990,10 @@ fn spawn_responses_pump(
                     let name = ev.event.as_deref().unwrap_or("");
                     serde_json::from_str::<Value>(&ev.data)
                         .ok()
-                        .map(|v| anth.feed(name, &v))
+                        .map(|mut v| {
+                            claude_cloak::decloak_event(name, &mut v, &tool_map);
+                            anth.feed(name, &v)
+                        })
                         .unwrap_or_default()
                 } else if ev.data == "[DONE]" {
                     Vec::new()
@@ -1285,7 +1353,8 @@ fn spawn_kiro_pump(
             // transport `Err` handled above, not this path.
             if !kiro.saw_terminal() {
                 for oai in kiro.finish() {
-                    let _ = forward_openai_chunk(&tx, client_format, &oai, &mut anth, &mut rs).await;
+                    let _ =
+                        forward_openai_chunk(&tx, client_format, &oai, &mut anth, &mut rs).await;
                 }
             }
             emit_kiro_finish(&tx, client_format, &mut anth, &mut rs).await;

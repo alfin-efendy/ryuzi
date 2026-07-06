@@ -120,6 +120,7 @@ function AccountRow({ conn, index, count }: { conn: ConnectionInfo; index: numbe
             apiKey: null,
             baseUrl: conn.baseUrl,
             models: conn.models,
+            claudeCloaking: conn.provider === "anthropic-oauth" ? conn.claudeCloaking : null,
           })
         }
         label="Enabled"

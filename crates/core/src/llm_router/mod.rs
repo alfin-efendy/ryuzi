@@ -2,6 +2,7 @@
 //! keys, format translation, and the axum endpoint server.
 pub mod aws_stream;
 pub mod capabilities;
+pub mod claude_cloak;
 pub mod client;
 pub mod codex;
 pub mod connections;
