@@ -804,7 +804,7 @@ async fn oauth_anthropic_upstream_receives_bearer_beta_header_and_system_prompt(
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("x-api-key", &key.key)
         .json(
-            &json!({"model": "anthropic-oauth/mock-claude", "max_tokens": 32,
+            &json!({"model": "anthropic/mock-claude", "max_tokens": 32,
                       "system": "be terse",
                       "messages": [{"role": "user", "content": "hi"}]}),
         )
@@ -890,7 +890,7 @@ async fn oauth_anthropic_cloaking_decloaks_tool_names_for_openai_clients() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .header("x-api-key", &key.key)
-        .json(&json!({"model": "anthropic-oauth/mock-claude",
+        .json(&json!({"model": "anthropic/mock-claude",
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function", "function": {
             "name": "lookup", "description": "Lookup data",
@@ -1061,7 +1061,7 @@ async fn oauth_401_triggers_refresh_and_retries_once() {
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("x-api-key", &key.key)
         .json(
-            &json!({"model": "anthropic-oauth/mock-claude", "max_tokens": 16,
+            &json!({"model": "anthropic/mock-claude", "max_tokens": 16,
                       "messages": [{"role": "user", "content": "hi"}]}),
         )
         .send()

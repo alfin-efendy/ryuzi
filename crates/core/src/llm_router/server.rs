@@ -557,9 +557,9 @@ async fn handle_models(State(state): State<AppState>, headers: HeaderMap) -> Res
             continue;
         };
         for m in connections::effective_models(desc, conn) {
-            let id = format!("{}/{}", conn.provider, m);
+            let id = format!("{}/{}", desc.family, m);
             if seen.insert(id.clone()) {
-                data.push(json!({"id": id, "object": "model", "owned_by": conn.provider}));
+                data.push(json!({"id": id, "object": "model", "owned_by": desc.family}));
             }
         }
     }
