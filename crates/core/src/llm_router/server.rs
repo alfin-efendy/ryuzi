@@ -1644,11 +1644,11 @@ mod tests {
                 strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
                 targets: vec![
                     crate::llm_router::routes::ModelRouteTarget {
-                        connection_id: "c1".into(),
+                        provider: "openai".into(),
                         model: "gpt-first".into(),
                     },
                     crate::llm_router::routes::ModelRouteTarget {
-                        connection_id: "c2".into(),
+                        provider: "anthropic".into(),
                         model: "claude-fallback".into(),
                     },
                 ],
@@ -1695,11 +1695,11 @@ mod tests {
                 strategy: crate::llm_router::routes::ModelRouteStrategy::RoundRobin,
                 targets: vec![
                     crate::llm_router::routes::ModelRouteTarget {
-                        connection_id: "c1".into(),
+                        provider: "openai".into(),
                         model: "gpt-one".into(),
                     },
                     crate::llm_router::routes::ModelRouteTarget {
-                        connection_id: "c2".into(),
+                        provider: "openai".into(),
                         model: "gpt-two".into(),
                     },
                 ],
@@ -1793,11 +1793,11 @@ mod tests {
                 strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
                 targets: vec![
                     crate::llm_router::routes::ModelRouteTarget {
-                        connection_id: "c1".into(),
+                        provider: "openai".into(),
                         model: "text-only".into(),
                     },
                     crate::llm_router::routes::ModelRouteTarget {
-                        connection_id: "c2".into(),
+                        provider: "openai".into(),
                         model: "gpt-4o".into(),
                     },
                 ],
