@@ -77,7 +77,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
         .store()
         .get_setting("default_agent")
         .await?
-        .unwrap_or_else(|| "claude".to_string());
+        .unwrap_or_else(|| "native".to_string());
 
     let mut out = Vec::new();
     for desc in runtimes::CATALOG {
@@ -140,8 +140,10 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
             flags: cfg.map(|c| c.flags.clone()).unwrap_or_default(),
             tiers,
             is_default: default_agent == desc.id,
-            // The native runtime and claude-code have working session harnesses.
-            runnable: desc.id == "claude" || is_native,
+            // Ryuzi-only sessions: the in-process native runtime is the only
+            // session harness. Other catalog entries remain listed — they
+            // still back endpoint/model configuration — but cannot run.
+            runnable: is_native,
         });
     }
     Ok(out)
@@ -447,5 +449,18 @@ mod tests {
         assert!(native.binary_path.is_some(), "native must be available");
         assert!(native.installed_version.is_some());
         assert!(native.runnable, "native must be runnable");
+        assert!(
+            native.is_default,
+            "native is the default agent when none is set"
+        );
+        // Ryuzi-only sessions: nothing else can run, but the other catalog
+        // runtimes stay listed for endpoint/model configuration.
+        assert!(list.len() > 1, "other runtimes must remain listed");
+        assert!(
+            list.iter()
+                .filter(|r| r.id != "native")
+                .all(|r| !r.runnable),
+            "only native is runnable"
+        );
     }
 }

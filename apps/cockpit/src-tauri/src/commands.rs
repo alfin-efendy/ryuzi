@@ -86,14 +86,12 @@ pub struct ChatRequestOptions {
     pub attachments: Vec<String>,
 }
 
-fn harness_for_runtime(runtime_id: &str) -> Result<&'static str, CmdError> {
-    match runtime_id {
-        "native" => Ok("native"),
-        "claude" => Ok("claude-code"),
-        other => Err(CmdError {
-            message: format!("runtime '{other}' cannot run chat sessions yet"),
-        }),
-    }
+/// Ryuzi-only sessions: every runtime id resolves to the native harness.
+/// Legacy ids ("claude", "native") and anything else are accepted so old
+/// frontends or queued payloads can never error here; the Result shape is
+/// kept so call sites stay `?`-compatible.
+fn harness_for_runtime(_runtime_id: &str) -> Result<&'static str, CmdError> {
+    Ok("native")
 }
 
 async fn apply_runtime_choice(
@@ -125,11 +123,10 @@ async fn apply_runtime_choice(
         harness
     };
     let current_model = project.model.clone();
-    let next_model = if runtime_id.is_some() {
-        model
-    } else {
-        model.or_else(|| current_model.clone())
-    };
+    // Ryuzi-only: a runtime choice no longer implies a model reset — the
+    // composer always sends runtimeId "native", so `model: null` must keep
+    // the project's pinned model instead of clearing it.
+    let next_model = model.or_else(|| current_model.clone());
     if project.harness != next_harness || current_model != next_model {
         cp.store()
             .update_project(project_id, next_model, project.perm_mode, next_harness)
@@ -393,10 +390,50 @@ mod tests {
     }
 
     #[test]
-    fn harness_for_runtime_maps_chat_runtimes() {
+    fn harness_for_runtime_always_resolves_native() {
+        // Ryuzi-only sessions: any id — current, legacy, or unknown —
+        // resolves to the native harness instead of erroring.
         assert_eq!(harness_for_runtime("native").unwrap(), "native");
-        assert_eq!(harness_for_runtime("claude").unwrap(), "claude-code");
-        assert!(harness_for_runtime("codex").is_err());
+        assert_eq!(harness_for_runtime("claude").unwrap(), "native");
+        assert_eq!(harness_for_runtime("codex").unwrap(), "native");
+        assert_eq!(harness_for_runtime("anything-legacy").unwrap(), "native");
+    }
+
+    #[tokio::test]
+    async fn apply_runtime_choice_keeps_the_pinned_model_when_none_is_sent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
+        cp.store()
+            .insert_project(Project {
+                project_id: "p1".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                harness: "claude-code".into(),
+                model: Some("openrouter/qwen3:free".into()),
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+
+        // The composer always sends runtimeId "native"; model may be null.
+        apply_runtime_choice(&cp, "p1", Some("native"), None)
+            .await
+            .unwrap();
+
+        let got = cp.store().get_project("p1").await.unwrap().unwrap();
+        assert_eq!(
+            got.harness, "native",
+            "legacy harness migrates on next start"
+        );
+        assert_eq!(
+            got.model.as_deref(),
+            Some("openrouter/qwen3:free"),
+            "model:null must not clear the pinned model"
+        );
     }
 
     #[test]
