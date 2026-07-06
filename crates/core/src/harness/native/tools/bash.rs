@@ -5,7 +5,11 @@
 //! on PATH → Git for Windows (`git.exe`'s sibling `usr\bin\sh.exe`, then
 //! the default install roots). No `cmd.exe` fallback — the tool contract
 //! is POSIX sh, and model-emitted POSIX syntax must keep meaning what it
-//! says. If nothing resolves, the tool returns an actionable error.
+//! says. If nothing resolves, the tool returns an actionable error. The
+//! resolved shell's directory is also prepended to the child's `PATH` so
+//! its sibling POSIX utilities (ls, sleep, grep …) resolve — and shadow
+//! same-named Windows tools — even when `usr\bin` is not on the ambient
+//! PATH (GUI/PowerShell launches).
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
@@ -83,6 +87,22 @@ impl Tool for Bash {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // The resolved sh often lives in Git\usr\bin, which is NOT on the
+        // ambient PATH in GUI/PowerShell contexts — without it the shell
+        // starts but external POSIX utilities (ls, sleep, grep …) are
+        // missing. Prepend so POSIX coreutils shadow same-named Windows
+        // tools (sort, find), matching what a Git Bash login shell does.
+        #[cfg(windows)]
+        if let Some(dir) = shell.parent() {
+            let ambient = std::env::var_os("PATH").unwrap_or_default();
+            let mut dirs: Vec<PathBuf> = std::env::split_paths(&ambient).collect();
+            if !dirs.iter().any(|d| d == dir) {
+                dirs.insert(0, dir.to_path_buf());
+                if let Ok(joined) = std::env::join_paths(dirs) {
+                    cmd.env("PATH", joined);
+                }
+            }
+        }
         // Repo-wide Windows spawn convention (see crate::mcp, crate::runtimes):
         // never flash a console window when the Cockpit GUI runs a tool call.
         #[cfg(windows)]
