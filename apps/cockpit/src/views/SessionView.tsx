@@ -11,6 +11,7 @@ import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { basename } from "@/lib/paths";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
+import { PERM_MODES, corePermToUi, uiPermToCore } from "@/constants";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalPrompt } from "@/components/ApprovalPrompt";
 import { StatusDot } from "@/components/common/bits";
@@ -21,13 +22,16 @@ import { TodoPanel } from "@/components/session/TodoPanel";
 import { startVoiceDictation } from "@/lib/voice";
 
 export function SessionView() {
-  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects } = useStore();
+  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
+    useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<string[]>([]);
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [permMenuOpen, setPermMenuOpen] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
@@ -84,6 +88,10 @@ export function SessionView() {
   const meta = statusMeta(session.status);
   const running = session.status === "running";
   const hasApproval = pendingApprovals.some((a) => a.sessionPk === session.sessionPk);
+  const permUi = corePermToUi(project?.permMode ?? "default");
+  const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
+  const selectedModel = project?.model || agent?.model || "";
+  const modelOptions = agent?.models ?? [];
 
   const submit = () => {
     const t = draft.trim();
@@ -228,16 +236,73 @@ export function SessionView() {
               >
                 <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
               </Button>
-              <Button variant="ghost" size="sm" className="font-medium" style={{ color: "#E8703A" }}>
-                <CircleAlert aria-hidden size={12} strokeWidth={2} className="size-3" />
-                Full access
-                <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-              </Button>
+              <div className="relative">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  title="Permission mode"
+                  onClick={() => setPermMenuOpen((v) => !v)}
+                  className="font-medium"
+                  style={{ color: permUi === "full" ? "#E8703A" : undefined }}
+                >
+                  <CircleAlert aria-hidden size={12} strokeWidth={2} className="size-3" />
+                  {permMeta.label}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+                {permMenuOpen && (
+                  <MenuPanel onClose={() => setPermMenuOpen(false)} className="bottom-[38px] left-0 z-50 w-[280px]">
+                    <MenuSectionLabel>Permission mode</MenuSectionLabel>
+                    {PERM_MODES.map((m) => (
+                      <MenuItem
+                        key={m.id}
+                        selected={m.id === permUi}
+                        onClick={() => {
+                          if (projectId) void setProjectPermMode(projectId, uiPermToCore(m.id));
+                          setPermMenuOpen(false);
+                        }}
+                        className="flex-col items-start gap-0.5"
+                      >
+                        <span className="font-medium">{m.label}</span>
+                        <span className="text-[11px] text-muted-foreground">{m.desc}</span>
+                      </MenuItem>
+                    ))}
+                  </MenuPanel>
+                )}
+              </div>
               <div className="flex-1" />
-              <Button variant="ghost" size="sm" className="font-semibold">
-                <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
-                {agent?.model || agent?.name || "No agent"}
-              </Button>
+              <div className="relative">
+                <Button variant="ghost" size="sm" title="Model" onClick={() => setModelMenuOpen((v) => !v)} className="font-semibold">
+                  <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
+                  {selectedModel || agent?.name || "No agent"}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+                {modelMenuOpen && (
+                  <MenuPanel
+                    onClose={() => setModelMenuOpen(false)}
+                    className="bottom-[38px] right-0 z-50 max-h-[320px] w-[300px] overflow-y-auto"
+                  >
+                    <MenuSectionLabel>{agent ? `${agent.name} models` : "Models"}</MenuSectionLabel>
+                    {modelOptions.length === 0 && (
+                      <div className="px-3 py-2 text-[12px] text-muted-foreground">
+                        No models available. Add a provider connection in Models.
+                      </div>
+                    )}
+                    {modelOptions.map((m) => (
+                      <MenuItem
+                        key={m}
+                        selected={m === selectedModel}
+                        onClick={() => {
+                          if (projectId) void setProjectModel(projectId, m);
+                          setModelMenuOpen(false);
+                        }}
+                        className="font-mono text-[12px]"
+                      >
+                        <span className="min-w-0 flex-1 truncate">{m}</span>
+                      </MenuItem>
+                    ))}
+                  </MenuPanel>
+                )}
+              </div>
               <Button
                 variant="ghost"
                 size="icon-sm"

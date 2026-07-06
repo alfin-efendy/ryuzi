@@ -66,6 +66,11 @@ pub trait HarnessSession: Send + Sync {
     async fn cancel(&self) -> anyhow::Result<()>;
     async fn end(&self) -> anyhow::Result<()>;
     fn agent_session_id(&self) -> Option<String>;
+
+    /// Update the live permission mode for subsequent turns. Default no-op:
+    /// the ACP harness delegates permission to the external agent, so only the
+    /// in-process native session overrides this (see its `RunnerDeps`).
+    fn set_perm_mode(&self, _mode: PermMode) {}
 }
 
 /// Builds a `Harness`. The factory instance carries host-injected config

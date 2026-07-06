@@ -1157,7 +1157,13 @@ impl KiroToOpenAiStream {
                     self.output_tokens = output;
                 }
             }
-            "messageStopEvent" => out.extend(self.terminal_chunk()),
+            // A plain-text turn terminates with `messageStopEvent`; a TOOL-USE
+            // turn instead terminates with `metadataEvent {stopReason:"TOOL_USE"}`
+            // (observed on the live wire) — both are valid terminals, so emit
+            // the finish chunk for either. Without the `metadataEvent` arm a
+            // tool-use turn never sets the terminal and the stream is wrongly
+            // reported as "ended without a terminal event".
+            "messageStopEvent" | "metadataEvent" => out.extend(self.terminal_chunk()),
             // contextUsageEvent / meteringEvent: bookkeeping only upstream,
             // no client chunk here. Unknown event types: ignore.
             _ => {}
@@ -1531,6 +1537,25 @@ mod tests {
         assert_eq!(joined, "Hello");
         assert!(s.saw_terminal());
         assert_eq!(out.last().unwrap()["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn tool_use_turn_terminates_on_metadata_event_not_message_stop() {
+        // Live wire: a tool-use turn ends with `metadataEvent{stopReason:TOOL_USE}`
+        // (then contextUsage/metering, then EOF) and NEVER a `messageStopEvent`.
+        // The stream must recognize this as a valid terminal with a
+        // `tool_calls` finish reason — otherwise the pump reports "ended
+        // without a terminal event" and the whole turn fails.
+        let mut s = KiroToOpenAiStream::new("claude-haiku-4.5");
+        let mut out = s.feed(&frame(
+            "toolUseEvent",
+            json!({ "toolUseId": "t1", "name": "write", "input": "{\"path\":\"a.txt\"}" }),
+        ));
+        out.extend(s.feed(&frame("toolUseEvent", json!({ "toolUseId": "t1", "name": "write", "stop": true }))));
+        assert!(!s.saw_terminal(), "not terminal until the metadata/stop event");
+        out.extend(s.feed(&frame("metadataEvent", json!({ "stopReason": "TOOL_USE" }))));
+        assert!(s.saw_terminal(), "metadataEvent must terminate the tool-use turn");
+        assert_eq!(out.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[test]

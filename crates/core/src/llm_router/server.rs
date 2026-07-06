@@ -1517,22 +1517,19 @@ fn spawn_kiro_pump(
             }
         }
         if !errored {
-            if kiro.saw_terminal() {
-                emit_kiro_finish(&tx, client_format, &mut anth, &mut rs).await;
-            } else {
-                // Upstream closed cleanly but never sent a messageStopEvent —
-                // that's a truncated stream, not a completed one.
-                errored = true;
-                emit_kiro_error(
-                    &tx,
-                    client_format,
-                    &mut anth,
-                    &mut rs,
-                    &kiro,
-                    "upstream stream ended without a terminal event",
-                )
-                .await;
+            // Kiro terminates plain-text turns with `messageStopEvent` but
+            // tool-use turns with `metadataEvent {stopReason:"TOOL_USE"}` (both
+            // now set the terminal in `KiroToOpenAiStream::feed`). A clean EOF
+            // with neither is still a valid completion (matches 9router, which
+            // finishes on EOF) — feed the EOF finish chunk through, then emit
+            // the client-format finish. A genuine mid-stream break is a
+            // transport `Err` handled above, not this path.
+            if !kiro.saw_terminal() {
+                for oai in kiro.finish() {
+                    let _ = forward_openai_chunk(&tx, client_format, &oai, &mut anth, &mut rs).await;
+                }
             }
+            emit_kiro_finish(&tx, client_format, &mut anth, &mut rs).await;
         }
         let (input, output) = kiro.usage();
         crate::llm_router::usage::record(

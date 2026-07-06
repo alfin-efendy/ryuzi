@@ -24,19 +24,32 @@ pub enum PolicyOutcome {
     AutoAllow,
     /// Requires a user prompt.
     Prompt,
+    /// Hard-denied without prompting (Plan mode blocks mutations).
+    Deny,
 }
 
-/// Combined policy decision: per-project allowAlways policy takes precedence,
-/// then the mode-based auto-allow, otherwise Prompt.
+/// Combined policy decision. Order matters:
+///  1. **Plan** is a hard read-only mode — any non-safe (mutating) tool is
+///     DENIED outright, never prompted, and `allowAlways` does NOT override it.
+///     This is what makes the composer's "Plan" mode actually enforce
+///     "propose a plan first; no edits/commands" instead of silently behaving
+///     like "Ask".
+///  2. per-project `allowAlways` auto-allows,
+///  3. the mode-based auto-allow (safe tools always; edits under AcceptEdits;
+///     everything under BypassPermissions),
+///  4. otherwise Prompt.
 ///
 /// `project_policy` is the raw decision string returned by
 /// `Store::get_tool_policy` — currently only `"allowAlways"` triggers an
-/// `AutoAllow`; all other values (including `None`) fall through.
+/// `AutoAllow`.
 pub fn decide_tool_permission(
     perm_mode: PermMode,
     project_policy: Option<&str>,
     tool: &str,
 ) -> PolicyOutcome {
+    if perm_mode == PermMode::Plan && !SAFE_TOOLS.contains(&tool) {
+        return PolicyOutcome::Deny;
+    }
     if project_policy == Some("allowAlways") {
         return PolicyOutcome::AutoAllow;
     }
@@ -135,6 +148,33 @@ mod tests {
         assert_eq!(
             decide_tool_permission(PermMode::Default, Some("allowAlways"), "Bash"),
             PolicyOutcome::AutoAllow
+        );
+    }
+
+    #[test]
+    fn plan_mode_denies_mutations_but_allows_reads_and_ignores_allow_always() {
+        // Read-class tools still auto-allow under Plan.
+        assert_eq!(
+            decide_tool_permission(PermMode::Plan, None, "Read"),
+            PolicyOutcome::AutoAllow
+        );
+        assert_eq!(
+            decide_tool_permission(PermMode::Plan, None, "TodoWrite"),
+            PolicyOutcome::AutoAllow
+        );
+        // Mutating tools are hard-denied — not prompted.
+        assert_eq!(
+            decide_tool_permission(PermMode::Plan, None, "Edit"),
+            PolicyOutcome::Deny
+        );
+        assert_eq!(
+            decide_tool_permission(PermMode::Plan, None, "Bash"),
+            PolicyOutcome::Deny
+        );
+        // allowAlways must NOT punch through Plan's read-only guarantee.
+        assert_eq!(
+            decide_tool_permission(PermMode::Plan, Some("allowAlways"), "Bash"),
+            PolicyOutcome::Deny
         );
     }
 

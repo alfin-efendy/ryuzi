@@ -18,6 +18,11 @@ export function ProjectSettingsModal() {
   if (!projectId || !project) return null;
   const defaultAgent = defaultRuntimeOf(runtimes);
   const pickable = runtimes.filter((a) => a.enabled && a.binaryPath);
+  // Harness options are derived from runtimes that actually have a session
+  // harness (`runnable`), not a hardcoded list — so the set stays honest as
+  // real harnesses are added. runtime id → project harness id.
+  const harnessForRuntime = (id: string) => (id === "claude" ? "claude-code" : id);
+  const harnessOptions = runtimes.filter((a) => a.runnable).map((a) => ({ value: harnessForRuntime(a.id), label: a.name }));
   return (
     <Modal onClose={() => close(null)} width={460}>
       <div className="mb-1 flex items-center gap-2.5">
@@ -43,8 +48,11 @@ export function ProjectSettingsModal() {
               onChange={(e) => void setProjectHarness(project.projectId, e.target.value)}
               className="h-[34px]"
             >
-              <option value="native">Native (ryuzi)</option>
-              <option value="claude-code">Claude Code</option>
+              {harnessOptions.map((h) => (
+                <option key={h.value} value={h.value}>
+                  {h.label}
+                </option>
+              ))}
             </NativeSelect>
           </div>
           <div className="relative flex flex-1 flex-col gap-1.5">

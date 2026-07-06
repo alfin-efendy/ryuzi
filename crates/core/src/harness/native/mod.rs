@@ -140,7 +140,7 @@ impl Harness for NativeHarness {
                 work_dir: ctx.work_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 model,
-                perm_mode: ctx.perm_mode,
+                perm_mode: Arc::new(std::sync::Mutex::new(ctx.perm_mode)),
                 project_policy: None,
                 store: ctx.store,
                 events: ctx.events,
@@ -190,6 +190,12 @@ impl HarnessSession for NativeSession {
             tok.cancel();
         }
         Ok(())
+    }
+
+    fn set_perm_mode(&self, mode: crate::domain::PermMode) {
+        // Live update: the next turn's tool gate reads this fresh, so a
+        // composer/project-settings permission change applies without a restart.
+        self.deps.set_perm_mode(mode);
     }
 
     fn agent_session_id(&self) -> Option<String> {

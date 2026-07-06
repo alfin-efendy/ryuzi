@@ -962,6 +962,11 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  */
 { kind: "jobRunChanged"; job_id: string; run_id: string; status: string } | 
 /**
+ * An orchestrated task changed status (todo|ready|running|done|failed|
+ * cancelled; roots also decomposing|waiting|judging).
+ */
+{ kind: "orchTaskChanged"; task_id: string; root_id: string | null; status: string } | 
+/**
  * A runtime npm install/update produced an output line.
  */
 { kind: "runtimeUpdateLog"; runtime_id: string; line: string } | 

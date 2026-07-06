@@ -11,8 +11,29 @@ use crate::llm_router::registry::{AuthScheme, ProviderDescriptor};
 use crate::store::Store;
 
 pub const ANTHROPIC_OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28";
+pub const CLAUDE_CODE_SYSTEM_PROMPT: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
 pub const CODEX_MODELS_URL: &str =
     "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
+
+/// Anthropic OAuth tokens for Claude subscription traffic require the
+/// Claude-Code-branded leading system block. Keep this shared so normal chat
+/// requests and lightweight model probes satisfy the same upstream contract.
+pub fn inject_claude_code_system_prompt(body: &mut Value) {
+    let prefix = serde_json::json!({"type": "text", "text": CLAUDE_CODE_SYSTEM_PROMPT});
+    let current = body.get("system").cloned().unwrap_or(Value::Null);
+    let new_system = match current {
+        Value::String(s) => serde_json::json!([prefix, {"type": "text", "text": s}]),
+        Value::Array(mut arr) => {
+            if arr.first() != Some(&prefix) {
+                arr.insert(0, prefix);
+            }
+            Value::Array(arr)
+        }
+        _ => serde_json::json!([prefix]),
+    };
+    body["system"] = new_system;
+}
 
 fn raw_models(data: &Value) -> Vec<&Value> {
     if let Value::Array(items) = data {
@@ -298,6 +319,17 @@ mod tests {
                 "gpt-5.4-image"
             ]
         );
+    }
+
+    #[test]
+    fn injects_claude_code_system_prompt_once() {
+        let mut body = json!({"system": [{"type": "text", "text": "custom"}]});
+        inject_claude_code_system_prompt(&mut body);
+        inject_claude_code_system_prompt(&mut body);
+
+        assert_eq!(body["system"][0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(body["system"][1]["text"], "custom");
+        assert_eq!(body["system"].as_array().unwrap().len(), 2);
     }
 
     #[test]

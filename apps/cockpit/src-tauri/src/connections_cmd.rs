@@ -471,9 +471,10 @@ fn build_model_probe_request(
 
     let base = connections::effective_base_url(desc, row)
         .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", row.id))?;
-    let body = model_probe_body(desc.format, model);
+    let mut body = model_probe_body(desc.format, model);
 
     if row.provider == "anthropic-oauth" {
+        models::inject_claude_code_system_prompt(&mut body);
         let token = row.data.access_token.clone().unwrap_or_default();
         return Ok(http
             .post(format!("{base}/messages?beta=true"))
@@ -745,6 +746,36 @@ mod tests {
         assert_eq!(anthropic["model"], "claude-test");
         assert_eq!(anthropic["messages"][0]["content"], "ping");
         assert_eq!(anthropic["max_tokens"], 1);
+    }
+
+    #[test]
+    fn anthropic_oauth_model_probe_injects_claude_code_system_prompt() {
+        let http = reqwest::Client::new();
+        let desc = registry::descriptor("anthropic-oauth").unwrap();
+        let row = ConnectionRow {
+            id: "c1".into(),
+            provider: "anthropic-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "Claude Code".into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                access_token: Some("at-claude".into()),
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        };
+        let req = build_model_probe_request(&http, desc, &row, "claude-opus-4-8")
+            .unwrap()
+            .build()
+            .unwrap();
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+
+        assert_eq!(
+            sent["system"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
     }
 
     #[test]
