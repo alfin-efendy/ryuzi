@@ -1,6 +1,6 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { Combobox, type ComboboxGroup, type ComboboxOption } from "../../index";
+import { Button, Combobox, type ComboboxGroup, type ComboboxOption } from "../../index";
 
 // happy-dom lacks a couple of layout APIs Base UI touches when positioning
 // and scrolling the popup — stub them before anything renders.
@@ -188,9 +188,41 @@ test("footer renders as a pinned action row and is clickable", async () => {
   expect(onOpenFolder).toHaveBeenCalledTimes(1);
 });
 
-test("custom trigger content replaces the default button contents", () => {
+test("custom trigger content replaces the default button contents", async () => {
+  // A <span> is a valid element, so under the render-prop merge it BECOMES the
+  // trigger itself (role="combobox", accessible name, and click handling land
+  // on the span directly) rather than being nested inside a wrapper <button>.
+  // The observable a11y contract — accessible name + click-to-open — still
+  // holds; Base UI additionally logs a dev-only warning here because
+  // `nativeButton` defaults to true while the merged element is a <span>, not
+  // a real <button> (see combobox.test.tsx history / task report for detail).
   render(<Combobox options={few} value={null} onValueChange={() => {}} aria-label="Branch" trigger={<span>main</span>} />);
   const trigger = screen.getByRole("combobox", { name: "Branch" });
+  expect(trigger.tagName).toBe("SPAN");
   expect(trigger.textContent).toContain("main");
   expect(trigger.querySelector('[data-slot="combobox-value"]')).toBeNull();
+  fireEvent.click(trigger);
+  await screen.findByRole("listbox");
+});
+
+test("an interactive element trigger becomes the trigger itself — no nested <button>", async () => {
+  // Base UI's render-prop merge should make the caller's <Button> the
+  // trigger element itself instead of nesting it inside
+  // ComboboxPrimitive.Trigger's own <button> (invalid <button><button> DOM).
+  const { container } = render(
+    <Combobox
+      options={few}
+      value={null}
+      onValueChange={() => {}}
+      aria-label="Branch"
+      trigger={<Button variant="outline">Branch chip</Button>}
+    />,
+  );
+  expect(container.querySelectorAll("button").length).toBe(1);
+
+  const trigger = screen.getByRole("combobox", { name: "Branch" });
+  expect(trigger.tagName).toBe("BUTTON");
+  expect(trigger.textContent).toContain("Branch chip");
+  fireEvent.click(trigger);
+  await screen.findByRole("listbox");
 });

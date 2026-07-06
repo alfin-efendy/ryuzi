@@ -35,9 +35,14 @@ type ComboboxProps = {
   /** Pinned non-option action row below the list. */
   footer?: React.ReactNode;
   /**
-   * Custom trigger content; default is an outline button showing the selected
-   * label + ChevronsUpDown. Rendered inside a <button> — must not contain
-   * interactive elements.
+   * Custom trigger content. When a React element is passed (e.g. a
+   * `<Button>`), it BECOMES the trigger element itself: Base UI's `render`
+   * prop clones it, merging on the trigger's role, aria attributes,
+   * className, and event handlers — so passing an interactive element is
+   * safe and never produces nested `<button>`s. Non-element content
+   * (string, fragment, etc.) renders as children of the default trigger
+   * `<button>` instead. Default (no `trigger`) is an outline button showing
+   * the selected label + ChevronsUpDown.
    */
   trigger?: React.ReactNode;
   className?: string;
@@ -120,6 +125,11 @@ function Combobox({
 
   const selected = React.useMemo<ComboboxItemData | null>(() => flat.find((o) => o.value === value) ?? null, [flat, value]);
 
+  // An element trigger (e.g. <Button>) becomes the trigger element itself via
+  // Base UI's `render` prop — no nested <button>. Non-element content (string,
+  // fragment, etc.) has no element to merge onto, so it renders as children.
+  const triggerElement = trigger !== undefined && React.isValidElement(trigger) ? trigger : undefined;
+
   return (
     <ComboboxPrimitive.Root<ComboboxItemData>
       items={items}
@@ -146,17 +156,19 @@ function Combobox({
             : cn(buttonVariants({ variant: "outline" }), "justify-between gap-2 font-normal data-placeholder:text-muted-foreground"),
           className,
         )}
+        render={triggerElement}
       >
-        {trigger !== undefined ? (
-          trigger
-        ) : (
-          <>
-            <span data-slot="combobox-value" className="truncate">
-              <ComboboxPrimitive.Value placeholder={placeholder} />
-            </span>
-            <ChevronsUpDown aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-          </>
-        )}
+        {triggerElement === undefined &&
+          (trigger !== undefined ? (
+            trigger
+          ) : (
+            <>
+              <span data-slot="combobox-value" className="truncate">
+                <ComboboxPrimitive.Value placeholder={placeholder} />
+              </span>
+              <ChevronsUpDown aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+            </>
+          ))}
       </ComboboxPrimitive.Trigger>
       <ComboboxPrimitive.Portal>
         <ComboboxPrimitive.Positioner align="start" sideOffset={6} className="z-50 outline-none">
