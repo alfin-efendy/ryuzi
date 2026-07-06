@@ -65,7 +65,9 @@ export function JobNewView() {
     };
   }, [branchProjectId]);
 
-  const canCreate = prompt.trim().length > 0 && project !== undefined && !saving;
+  // Gate on the branch list having resolved (preselected or user-picked) so the
+  // `branch ?? "main"` fallback below never fires while branches are still loading.
+  const canCreate = prompt.trim().length > 0 && project !== undefined && branch !== null && !saving;
   const goScheduler = () => nav.navigate({ kind: "scheduler" });
 
   const create = async () => {
