@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Check, Minus, Plus, Store } from "lucide-react";
-import { Badge, Button, NativeSelect, Segmented, SettingsCard as Card, Switch } from "@ryuzi/ui";
+import { Badge, Button, Combobox, Segmented, SettingsCard as Card, Switch } from "@ryuzi/ui";
 import { Chip, IconChip, Pill, PluginStatusBadge, StatusDot } from "@/components/common/bits";
 import type { AppInfo, PluginInfo } from "@/bindings";
 import { agentAllowed, useApps } from "@/store-apps";
@@ -220,14 +220,13 @@ export function AppsView() {
             {categories.length > 0 && (
               <div className="mb-4 flex items-center gap-2">
                 <span className="text-[12.5px] font-medium text-muted-foreground">Category</span>
-                <NativeSelect value={category} onChange={(e) => setCategory(e.target.value)} className="w-[200px]">
-                  <option value="all">All categories</option>
-                  {categories.map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))}
-                </NativeSelect>
+                <Combobox
+                  aria-label="Category"
+                  options={[{ value: "all", label: "All categories" }, ...categories.map((c) => ({ value: c, label: c }))]}
+                  value={category}
+                  onValueChange={setCategory}
+                  className="w-[200px]"
+                />
               </div>
             )}
 
