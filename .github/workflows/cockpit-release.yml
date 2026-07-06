@@ -113,15 +113,17 @@ jobs:
         run: bun run --cwd apps/cockpit tauri build ${{ matrix.args }}
       - name: Collect bundles
         shell: bash
+        # find, not bash globstar — macOS ships bash 3.2, where
+        # `shopt -s globstar` doesn't exist (killed the v0.5.0 macos job
+        # right after its first-ever successful .dmg bundling).
         run: |
-          shopt -s nullglob globstar
           mkdir -p out
-          for f in target/**/release/bundle/nsis/*.exe \
-                   target/**/release/bundle/dmg/*.dmg \
-                   target/**/release/bundle/deb/*.deb \
-                   target/**/release/bundle/rpm/*.rpm; do
-            cp "$f" out/
-          done
+          find target -type f \
+            \( -path '*/release/bundle/nsis/*.exe' \
+            -o -path '*/release/bundle/dmg/*.dmg' \
+            -o -path '*/release/bundle/deb/*.deb' \
+            -o -path '*/release/bundle/rpm/*.rpm' \) \
+            -exec cp {} out/ \;
           ls -la out/
           [ -n "$(ls -A out/)" ] || { echo "no bundles produced"; exit 1; }
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
