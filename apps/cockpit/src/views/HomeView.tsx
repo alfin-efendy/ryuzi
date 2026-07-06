@@ -14,19 +14,18 @@ import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
 import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
-import { chatRuntimeOf, useRuntimes } from "@/store-runtimes";
+import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { basename } from "@/lib/paths";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { projectLabel } from "@/lib/sidebar";
-import { AgentMenu } from "@/components/common/AgentMenu";
 import { StatusDot } from "@/components/common/bits";
 import { startVoiceDictation } from "@/lib/voice";
 
 export function HomeView() {
-  const { projects, sessions, selectedProjectId, selectProject, start, addProject } = useStore();
+  const { projects, sessions, selectedProjectId, selectProject, start, addProject, setProjectModel } = useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
-  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [branchMenuOpen, setBranchMenuOpen] = useState(false);
   const [attachments, setAttachments] = useState<string[]>([]);
@@ -38,14 +37,23 @@ export function HomeView() {
   const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
   const projectId = project?.projectId;
   const runtimes = useRuntimes((s) => s.runtimes);
-  const agent = chatRuntimeOf(runtimes, nav.composerAgent);
-  const requestRuntimeId = agent?.id ?? (nav.composerAgent === "native" || nav.composerAgent === "claude" ? nav.composerAgent : null);
+  // Ryuzi-only: every session runs the native runtime; the user picks a model.
+  const native = runtimeById(runtimes, "native");
+  const modelOptions = native?.models ?? [];
+  const selectedModel = nav.composerModel ?? project?.model ?? native?.model ?? "";
+  const setComposerModel = useNav((s) => s.setComposerModel);
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
 
   useEffect(() => {
-    if (projectId && requestRuntimeId === "native") void loadCommands(projectId);
-  }, [projectId, requestRuntimeId, loadCommands]);
+    if (projectId) void loadCommands(projectId);
+  }, [projectId, loadCommands]);
+
+  // A model picked for one project must not leak into the next one.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
+  useEffect(() => {
+    setComposerModel(null);
+  }, [projectId, setComposerModel]);
 
   const branches = useMemo(() => {
     const fromSessions = sessions.filter((s) => s.projectId === project?.projectId && s.branch).map((s) => s.branch as string);
@@ -58,9 +66,9 @@ export function HomeView() {
     return trimmed.slice(1).toLowerCase();
   }, [draft]);
   const slashMatches = useMemo(() => {
-    if (requestRuntimeId !== "native" || slashQuery === null) return [];
+    if (slashQuery === null) return [];
     return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
-  }, [requestRuntimeId, nativeCommands, slashQuery]);
+  }, [nativeCommands, slashQuery]);
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
   const contextQueryText = contextQuery?.query ?? null;
 
@@ -120,8 +128,8 @@ export function HomeView() {
     const t = draft.trim();
     if ((!t && attachments.length === 0) || !project) return;
     const opts = {
-      runtimeId: requestRuntimeId,
-      model: agent?.model || null,
+      runtimeId: "native",
+      model: nav.composerModel ?? null,
       context: { branch: nav.composerBranch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments,
     };
@@ -188,16 +196,16 @@ export function HomeView() {
               variant="ghost"
               className="font-medium"
               title="Permission mode is set on the runtime"
-              style={{ color: agent?.permMode === "full" ? "#E8703A" : undefined }}
+              style={{ color: native?.permMode === "full" ? "#E8703A" : undefined }}
             >
               <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-              {PERM_MODES.find((m) => m.id === agent?.permMode)?.label ?? "Ask"}
+              {PERM_MODES.find((m) => m.id === native?.permMode)?.label ?? "Ask"}
             </Button>
             <div className="flex-1" />
-            <Button variant="ghost" onClick={() => setAgentMenuOpen((v) => !v)} className="font-semibold">
-              <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
-              {agent?.model || agent?.name || "No agent"}
-              <span className="font-normal text-muted-foreground">{agent?.name ?? "install one"}</span>
+            <Button variant="ghost" title="Model" onClick={() => setModelMenuOpen((v) => !v)} className="font-semibold">
+              <StatusDot color={native?.color ?? "var(--muted-foreground)"} />
+              {selectedModel || "Default model"}
+              <span className="font-normal text-muted-foreground">Ryuzi</span>
               <ChevronDown aria-hidden size={12} strokeWidth={2} className="size-3" />
             </Button>
             <Button
@@ -213,8 +221,32 @@ export function HomeView() {
               <ArrowUp aria-hidden size={15} strokeWidth={2.2} className="size-[15px]" />
             </Button>
 
-            {agentMenuOpen && (
-              <AgentMenu value={agent?.id ?? nav.composerAgent} onPick={nav.setComposerAgent} onClose={() => setAgentMenuOpen(false)} />
+            {modelMenuOpen && (
+              <MenuPanel
+                onClose={() => setModelMenuOpen(false)}
+                className="bottom-11 right-[78px] z-40 max-h-[320px] w-[300px] overflow-y-auto"
+              >
+                <MenuSectionLabel>Model</MenuSectionLabel>
+                {modelOptions.length === 0 && (
+                  <div className="px-3 py-2 text-[12px] text-muted-foreground">
+                    No models available. Add a provider connection in Models.
+                  </div>
+                )}
+                {modelOptions.map((m) => (
+                  <MenuItem
+                    key={m}
+                    selected={m === selectedModel}
+                    onClick={() => {
+                      setComposerModel(m);
+                      if (projectId) void setProjectModel(projectId, m);
+                      setModelMenuOpen(false);
+                    }}
+                    className="font-mono text-[12px]"
+                  >
+                    <span className="min-w-0 flex-1 truncate">{m}</span>
+                  </MenuItem>
+                ))}
+              </MenuPanel>
             )}
           </div>
           {(attachments.length > 0 || contextRefs.length > 0) && (

@@ -6,7 +6,7 @@ import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
-import { chatRuntimeOf, useRuntimes } from "@/store-runtimes";
+import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { basename } from "@/lib/paths";
@@ -39,16 +39,17 @@ export function SessionView() {
   const runtimes = useRuntimes((s) => s.runtimes);
   const project = projects.find((p) => p.projectId === session?.projectId);
   const projectId = project?.projectId;
-  const runtimeId = project?.harness === "claude-code" ? "claude" : project?.harness;
-  const agent = chatRuntimeOf(runtimes, runtimeId);
-  const isNativeSession = runtimeId === "native";
+  // Ryuzi-only: every session runs the native runtime. Tolerant by
+  // construction — legacy rows still saying "claude-code" (restored DBs)
+  // are simply treated as native.
+  const agent = runtimeById(runtimes, "native");
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
 
   useEffect(() => {
-    if (projectId && isNativeSession) void loadCommands(projectId);
-  }, [projectId, isNativeSession, loadCommands]);
+    if (projectId) void loadCommands(projectId);
+  }, [projectId, loadCommands]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
@@ -56,9 +57,9 @@ export function SessionView() {
     return trimmed.slice(1).toLowerCase();
   }, [draft]);
   const slashMatches = useMemo(() => {
-    if (!isNativeSession || slashQuery === null) return [];
+    if (slashQuery === null) return [];
     return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
-  }, [isNativeSession, nativeCommands, slashQuery]);
+  }, [nativeCommands, slashQuery]);
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
   const contextQueryText = contextQuery?.query ?? null;
 
