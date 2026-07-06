@@ -947,7 +947,7 @@ keyMasked: string | null;
  * OAuth connections only: true once refresh has failed terminally and
  * the user needs to reconnect via the browser/paste flow again.
  */
-needsRelogin: boolean;
+needsRelogin: boolean; 
 /**
  * Anthropic OAuth only: enable full Claude Code-style request cloaking.
  */
