@@ -344,3 +344,42 @@ test("start forwards chat options so composer runtime, context, and attachments 
   listProjects.mockRestore();
   listSessions.mockRestore();
 });
+
+test("start forwards composer git options to IPC", async () => {
+  reset();
+  const start = spyOn(commands, "startSession").mockResolvedValue({
+    status: "ok",
+    data: {
+      sessionPk: "s2",
+      projectId: "p1",
+      agentSessionId: null,
+      worktreePath: null,
+      branch: "feat/login",
+      title: "go",
+      status: "running",
+      startedBy: "cockpit",
+      createdAt: 1,
+      lastActive: 1,
+      resumeAttempts: 0,
+      branchOwned: false,
+    },
+  });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await useStore.getState().start("p1", "go", {
+    git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
+  });
+
+  expect(start).toHaveBeenCalledWith("p1", "go", {
+    runtimeId: null,
+    model: null,
+    context: null,
+    attachments: [],
+    git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
+  });
+
+  start.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});

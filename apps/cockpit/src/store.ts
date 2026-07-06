@@ -8,6 +8,7 @@ import {
   type CoreEvent,
   type Message,
   type ChatRequestOptions,
+  type GitOptions,
   type PermMode,
 } from "./bindings";
 import { basename } from "./lib/paths";
@@ -24,6 +25,7 @@ export type ChatOptions = {
     references?: string[];
   } | null;
   attachments?: string[];
+  git?: GitOptions | null;
 };
 
 type State = {
@@ -78,7 +80,7 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
         }
       : null,
     attachments: options.attachments ?? [],
-    git: null,
+    git: options.git ?? null,
   };
 }
 
