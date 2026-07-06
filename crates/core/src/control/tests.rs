@@ -1384,7 +1384,7 @@ async fn provision_project_name_flow_creates_a_real_repo_with_head_and_binds_it(
 
     assert_eq!(project.name, "demo");
     assert_eq!(project.workdir, root.path().join("demo").to_string_lossy());
-    assert_eq!(project.harness, "claude-code");
+    assert_eq!(project.harness, "native");
     assert_eq!(project.perm_mode, crate::domain::PermMode::Default);
 
     // A real repo with a HEAD commit (worktrees need one).
@@ -1576,7 +1576,7 @@ async fn provision_project_uses_settings_defaults_when_none_given() {
     req.name = Some("defaulted".to_string());
     let project = cp.provision_project(req).await.unwrap();
 
-    assert_eq!(project.harness, "claude-code");
+    assert_eq!(project.harness, "native");
     assert_eq!(project.model.as_deref(), Some("opus"));
     assert_eq!(project.effort.as_deref(), Some("high"));
 }

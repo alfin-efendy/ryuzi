@@ -344,6 +344,57 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // Ryuzi-only sessions (spec: docs/superpowers/specs/
+        // 2026-07-06-cockpit-enhancement-batch-design.md, Workstream C):
+        // retire the claude-code default. One-time rewrite of existing rows;
+        // fresh DBs get 'native' from the seeds in `Store::open`. Idempotent:
+        // plain WHERE-guarded UPDATEs, and the CSV rewrite converges after
+        // one pass. The claude-code harness itself STAYS registered so an
+        // unrewritten row (restored DB) still resolves at session start.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            tx.execute(
+                "UPDATE projects SET harness='native' WHERE harness='claude-code'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE settings SET value='native' WHERE key='default_runtime' AND value='claude-code'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE settings SET value='native' WHERE key='default_agent' AND value='claude'",
+                [],
+            )?;
+            // enabled_runtimes is a CSV: swap 'claude-code' for 'native',
+            // dedupe, and ensure 'native' is present — Ryuzi-only sessions
+            // need the native runtime enabled.
+            let cur: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key='enabled_runtimes'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(cur) = cur {
+                let mut parts: Vec<&str> = Vec::new();
+                for p in cur.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    let p = if p == "claude-code" { "native" } else { p };
+                    if !parts.contains(&p) {
+                        parts.push(p);
+                    }
+                }
+                if !parts.contains(&"native") {
+                    parts.insert(0, "native");
+                }
+                let next = parts.join(",");
+                if next != cur {
+                    tx.execute(
+                        "UPDATE settings SET value=?1 WHERE key='enabled_runtimes'",
+                        params![next],
+                    )?;
+                }
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -455,8 +506,8 @@ impl Store {
         interact_on(&pool, |c| {
             c.execute_batch(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_gateways', 'discord');\
-                 INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_runtimes', 'claude-code');\
-                 INSERT OR IGNORE INTO settings(key, value) VALUES ('default_runtime', 'claude-code');",
+                 INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_runtimes', 'native');\
+                 INSERT OR IGNORE INTO settings(key, value) VALUES ('default_runtime', 'native');",
             )
         })
         .await?;
@@ -1735,7 +1786,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("claude-code")
+            Some("native")
         );
         assert_eq!(
             store
@@ -1743,7 +1794,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("claude-code")
+            Some("native")
         );
         // Upsert + empty string is a real value:
         store
@@ -1831,6 +1882,84 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("discord")
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_13_rewrites_claude_code_defaults_to_native() {
+        // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
+        // DB, seed the old values, then wind user_version back one so only
+        // the rewrite migration re-runs on the next open.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            c.pragma_update(None, "user_version", v - 1)
+        };
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        "INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p-old', 'old', '/w', 'claude-code');
+                         INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p-new', 'new', '/w2', 'native');
+                         UPDATE settings SET value='claude-code' WHERE key='default_runtime';
+                         UPDATE settings SET value='claude-code,codex' WHERE key='enabled_runtimes';
+                         INSERT INTO settings(key, value) VALUES ('default_agent', 'claude');",
+                    )?;
+                    rewind(c)
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(
+            store.get_project("p-old").await.unwrap().unwrap().harness,
+            "native",
+            "claude-code project rows must be rewritten to native"
+        );
+        assert_eq!(
+            store.get_project("p-new").await.unwrap().unwrap().harness,
+            "native"
+        );
+        assert_eq!(
+            store
+                .get_setting("default_runtime")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("native")
+        );
+        assert_eq!(
+            store.get_setting("default_agent").await.unwrap().as_deref(),
+            Some("native")
+        );
+        // CSV: claude-code swapped for native, other entries preserved.
+        assert_eq!(
+            store
+                .get_setting("enabled_runtimes")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("native,codex")
+        );
+
+        // Idempotent: winding back and re-running must not change anything
+        // (e.g. it must not duplicate 'native' in the CSV).
+        store.with_conn(rewind).await.unwrap();
+        drop(store);
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(
+            store
+                .get_setting("enabled_runtimes")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("native,codex")
+        );
+        assert_eq!(
+            store.get_project("p-old").await.unwrap().unwrap().harness,
+            "native"
         );
     }
 
