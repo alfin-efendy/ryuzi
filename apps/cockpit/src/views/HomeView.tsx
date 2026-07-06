@@ -3,13 +3,14 @@ import { ArrowUp, ChevronDown, CircleAlert, FileText, FolderOpen, GitBranch, Mic
 import { toast } from "sonner";
 import {
   Button,
+  Combobox,
   MenuPanel,
   MenuPanelItem as MenuItem,
   MenuPanelSection as MenuSectionLabel,
   MenuPanelSeparator as MenuSeparator,
   Textarea,
 } from "@ryuzi/ui";
-import { commands } from "@/bindings";
+import { commands, type BranchList } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
@@ -17,17 +18,17 @@ import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { basename } from "@/lib/paths";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
+import { composerGitOptions } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
 import { StatusDot } from "@/components/common/bits";
 import { startVoiceDictation } from "@/lib/voice";
 
 export function HomeView() {
-  const { projects, sessions, selectedProjectId, selectProject, start, addProject, setProjectModel } = useStore();
+  const { projects, selectedProjectId, selectProject, start, addProject, setProjectModel } = useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
-  const [branchMenuOpen, setBranchMenuOpen] = useState(false);
   const [attachments, setAttachments] = useState<string[]>([]);
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
@@ -55,10 +56,27 @@ export function HomeView() {
     setComposerModel(null);
   }, [projectId, setComposerModel]);
 
-  const branches = useMemo(() => {
-    const fromSessions = sessions.filter((s) => s.projectId === project?.projectId && s.branch).map((s) => s.branch as string);
-    return [...new Set(["main", ...fromSessions])];
-  }, [sessions, project?.projectId]);
+  const [branchList, setBranchList] = useState<BranchList | null>(null);
+  const setComposerBranch = nav.setComposerBranch;
+
+  useEffect(() => {
+    setBranchList(null);
+    setComposerBranch(null);
+    if (!projectId) return;
+    let cancelled = false;
+    void commands.listBranches(projectId).then((res) => {
+      if (cancelled) return;
+      if (res.status === "ok") {
+        setBranchList(res.data);
+        setComposerBranch(res.data.current);
+      } else {
+        toast.error("Couldn't list branches: " + res.error.message);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, setComposerBranch]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
@@ -132,6 +150,7 @@ export function HomeView() {
       model: nav.composerModel ?? null,
       context: { branch: nav.composerBranch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments,
+      git: composerGitOptions(branchList, nav.composerBranch, nav.composerUseWorktree, nav.composerCreateBranch),
     };
     setDraft("");
     setAttachments([]);
@@ -289,15 +308,52 @@ export function HomeView() {
               {project ? projectLabel(project) : "No project"}
               <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
             </Button>
+            <Combobox
+              aria-label="Branch"
+              options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
+              value={nav.composerBranch}
+              onValueChange={(v) => nav.setComposerBranch(v)}
+              allowCreate={nav.composerCreateBranch}
+              onCreate={(input) => {
+                nav.setComposerBranch(input);
+                nav.setComposerCreateBranch(true);
+              }}
+              placeholder="Branch"
+              trigger={
+                <Button variant="ghost" size="sm" className="gap-[7px] font-medium text-muted-foreground">
+                  <GitBranch aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                  {nav.composerBranch ?? "branch"}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+            />
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => setBranchMenuOpen((v) => !v)}
-              className="gap-[7px] font-medium text-muted-foreground"
+              aria-pressed={nav.composerUseWorktree}
+              title="Run the session in an isolated git worktree"
+              onClick={() => nav.setComposerUseWorktree(!nav.composerUseWorktree)}
+              className={`gap-[7px] font-medium ${nav.composerUseWorktree ? "" : "text-muted-foreground opacity-60"}`}
             >
-              <GitBranch aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-              {nav.composerBranch}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+              Worktree
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-pressed={nav.composerCreateBranch}
+              title="Create a new branch for this session"
+              onClick={() => {
+                const next = !nav.composerCreateBranch;
+                nav.setComposerCreateBranch(next);
+                // A free-typed (not-yet-existing) name is meaningless with
+                // "New branch" OFF — fall back to the repo's current branch.
+                if (!next && nav.composerBranch !== null && !(branchList?.branches ?? []).includes(nav.composerBranch)) {
+                  nav.setComposerBranch(branchList?.current ?? null);
+                }
+              }}
+              className={`gap-[7px] font-medium ${nav.composerCreateBranch ? "" : "text-muted-foreground opacity-60"}`}
+            >
+              New branch
             </Button>
 
             {projectMenuOpen && (
@@ -328,26 +384,6 @@ export function HomeView() {
                   <Plus aria-hidden size={13} strokeWidth={2} />
                   Open folder
                 </MenuItem>
-              </MenuPanel>
-            )}
-
-            {branchMenuOpen && (
-              <MenuPanel onClose={() => setBranchMenuOpen(false)} className="left-60 top-[42px] z-50 w-[220px]">
-                <MenuSectionLabel>Branch</MenuSectionLabel>
-                {branches.map((b) => (
-                  <MenuItem
-                    key={b}
-                    selected={b === nav.composerBranch}
-                    onClick={() => {
-                      nav.setComposerBranch(b);
-                      setBranchMenuOpen(false);
-                    }}
-                    className="font-mono text-[12.5px]"
-                  >
-                    <GitBranch aria-hidden size={12} strokeWidth={2} className="text-muted-foreground" />
-                    <span className="flex-1">{b}</span>
-                  </MenuItem>
-                ))}
               </MenuPanel>
             )}
           </div>
