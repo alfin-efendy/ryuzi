@@ -197,7 +197,19 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
                 aria-checked={checked}
                 aria-label={authMethodLabel(entry)}
                 variant={checked ? "secondary" : "outline"}
-                onClick={() => setSelectedId(entry.id)}
+                onClick={() => {
+                  // Switching sign-in method mid-flight (e.g. while an OAuth
+                  // connect is still waiting) must clear the in-flight state,
+                  // otherwise `saving`/`oauthWaiting` stay latched and the newly
+                  // chosen form is dead until the modal is reopened.
+                  if (entry.id === selected?.id) return;
+                  setSelectedId(entry.id);
+                  setSaving(false);
+                  setOauthWaiting(false);
+                  setOauthAuthorizeUrl("");
+                  setDeviceStep("form");
+                  setDeviceInfo(null);
+                }}
                 className="h-auto w-full justify-start gap-[11px] px-3 py-[11px] text-left"
               >
                 <Chip initial={entry.initial} color={entry.color} size={32} />

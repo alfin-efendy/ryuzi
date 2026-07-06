@@ -151,7 +151,10 @@ export function ConnectionDetailView({ id }: { id: string }) {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[860px]">
-        <BackButton label={conn.providerName} onClick={() => nav.navigate({ kind: "providerDetail", provider: providerFamily })} />
+        <BackButton
+          label={catalog.find((entry) => entry.id === providerFamily)?.name ?? conn.providerName}
+          onClick={() => nav.navigate({ kind: "providerDetail", provider: providerFamily })}
+        />
 
         <DetailHeader
           chip={<Chip initial={conn.initial} color={conn.color} size={44} />}

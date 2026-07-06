@@ -167,6 +167,28 @@ test("connecting subscription calls connectOauth with the oauth member id and tr
   expect(writeText).toHaveBeenCalledWith(authorizeUrl);
 });
 
+test("switching auth method mid-flight clears the latched OAuth waiting state", async () => {
+  render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
+
+  const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
+
+  // Pick the subscription (oauth) member and start a connect that never
+  // resolves (connectOauth is mocked as a never-resolving promise), latching
+  // `saving` + `oauthWaiting`.
+  fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
+  fireEvent.click(screen.getByRole("button", { name: /connect with browser/i }));
+  expect(connectOauth).toHaveBeenCalledTimes(1);
+  // The waiting UI has replaced the connect button.
+  expect(screen.queryByRole("button", { name: /connect with browser/i })).toBeNull();
+
+  // Switch back to the API-key member mid-flight — this must reset the
+  // in-flight state so the form isn't dead.
+  fireEvent.click(within(group).getByRole("radio", { name: /api key/i }));
+
+  const submit = screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement;
+  expect(submit.disabled).toBe(false);
+});
+
 test("single-member custom-openai family requires a base URL before it can be submitted", async () => {
   const onClose = mock(() => {});
   render(<AddConnectionModal open onClose={onClose} family="custom-openai" />);

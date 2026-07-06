@@ -385,7 +385,9 @@ test("connection detail back button routes to the account's vendor family, not i
   useConnections.setState({ catalog, connections: [claudeConnection], loaded: true });
   render(<ConnectionDetailView id="c3" />);
 
-  fireEvent.click(screen.getByRole("button", { name: "Claude Code" }));
+  // The back button is labelled with the family head's catalog name
+  // ("Anthropic"), not the member's own name ("Claude Code").
+  fireEvent.click(screen.getByRole("button", { name: "Anthropic" }));
   expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
 });
 
