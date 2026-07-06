@@ -1,4 +1,11 @@
 //! `bash` — run a shell command in the session worktree.
+//!
+//! Always `sh -c` (POSIX) on every platform. Windows has no ambient `sh`,
+//! so a cached resolver locates one: `RYUZI_SHELL` env override → `sh.exe`
+//! on PATH → Git for Windows (`git.exe`'s sibling `usr\bin\sh.exe`, then
+//! the default install roots). No `cmd.exe` fallback — the tool contract
+//! is POSIX sh, and model-emitted POSIX syntax must keep meaning what it
+//! says. If nothing resolves, the tool returns an actionable error.
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
@@ -52,7 +59,23 @@ impl Tool for Bash {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
 
-        let mut cmd = tokio::process::Command::new("sh");
+        #[cfg(windows)]
+        let shell: &Path = match resolved_sh() {
+            Some(p) => p,
+            None => {
+                return Ok(ToolOutput::error(
+                    "bash: no POSIX shell (`sh`) found on this machine. Install \
+                     Git for Windows (https://gitforwindows.org) — its \
+                     usr\\bin\\sh.exe is detected automatically — or set the \
+                     RYUZI_SHELL environment variable to a POSIX sh-compatible \
+                     executable, then restart the app.",
+                ));
+            }
+        };
+        #[cfg(not(windows))]
+        let shell: &Path = Path::new("sh");
+
+        let mut cmd = tokio::process::Command::new(shell);
         cmd.arg("-c")
             .arg(command)
             .current_dir(&ctx.work_dir)
@@ -60,6 +83,13 @@ impl Tool for Bash {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Repo-wide Windows spawn convention (see crate::mcp, crate::runtimes):
+        // never flash a console window when the Cockpit GUI runs a tool call.
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
 
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -176,6 +206,24 @@ fn resolve_sh_with(
     None
 }
 
+/// Windows: the POSIX shell the `bash` tool spawns, resolved once per
+/// process and cached (a `OnceLock` — changing the environment requires an
+/// app restart). `None` = nothing found; the tool returns an actionable
+/// error instead of spawning.
+#[cfg(windows)]
+fn resolved_sh() -> Option<&'static Path> {
+    static SH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SH.get_or_init(|| {
+        resolve_sh_with(
+            std::env::var_os("RYUZI_SHELL").map(PathBuf::from),
+            std::env::var_os("PATH"),
+            std::env::var_os("ProgramFiles").map(PathBuf::from),
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        )
+    })
+    .as_deref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::testutil::ctx_at;
@@ -226,6 +274,28 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.for_model.contains("interrupted"));
+    }
+
+    /// End-to-end on Windows: the resolver finds a shell even when `sh` is
+    /// not on the ambient PATH (e.g. tests launched from PowerShell, or the
+    /// Cockpit GUI), and the tool runs a command through it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_resolves_a_shell_and_runs_echo() {
+        let Some(sh) = resolved_sh() else {
+            // Machine without Git for Windows / RYUZI_SHELL: nothing to test.
+            eprintln!("skipping: no POSIX sh resolvable on this machine");
+            return;
+        };
+        assert!(sh.is_file(), "resolved sh missing: {}", sh.display());
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_at(dir.path()).await;
+        let out = Bash
+            .execute(&ctx, json!({"command": "echo hi"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.for_model);
+        assert!(out.for_model.contains("hi"));
     }
 }
 
