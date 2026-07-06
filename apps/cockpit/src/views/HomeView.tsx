@@ -1,15 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
-import {
-  Button,
-  Combobox,
-  MenuPanel,
-  MenuPanelItem as MenuItem,
-  MenuPanelSection as MenuSectionLabel,
-  MenuPanelSeparator as MenuSeparator,
-  Textarea,
-} from "@ryuzi/ui";
+import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
 import { commands, type BranchList } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
@@ -27,8 +19,6 @@ export function HomeView() {
   const { projects, selectedProjectId, selectProject, start, addProject, setProjectModel } = useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [attachments, setAttachments] = useState<string[]>([]);
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
@@ -221,12 +211,28 @@ export function HomeView() {
               {PERM_MODES.find((m) => m.id === native?.permMode)?.label ?? "Ask"}
             </Button>
             <div className="flex-1" />
-            <Button variant="ghost" title="Model" onClick={() => setModelMenuOpen((v) => !v)} className="font-semibold">
-              <StatusDot color={native?.color ?? "var(--muted-foreground)"} />
-              {selectedModel || "Default model"}
-              <span className="font-normal text-muted-foreground">Ryuzi</span>
-              <ChevronDown aria-hidden size={12} strokeWidth={2} className="size-3" />
-            </Button>
+            <Combobox
+              aria-label="Model"
+              options={modelOptions.map((m) => ({ value: m, label: m, mono: true }))}
+              value={selectedModel || null}
+              onValueChange={(m) => {
+                setComposerModel(m);
+                if (projectId) void setProjectModel(projectId, m);
+              }}
+              placeholder="Default model"
+              trigger={
+                <Button
+                  variant="ghost"
+                  title={modelOptions.length === 0 ? "No models available. Add a provider connection in Models." : "Model"}
+                  className="font-semibold"
+                >
+                  <StatusDot color={native?.color ?? "var(--muted-foreground)"} />
+                  {selectedModel || "Default model"}
+                  <span className="font-normal text-muted-foreground">Ryuzi</span>
+                  <ChevronDown aria-hidden size={12} strokeWidth={2} className="size-3" />
+                </Button>
+              }
+            />
             <Button
               variant="ghost"
               size="icon-sm"
@@ -239,34 +245,6 @@ export function HomeView() {
             <Button size="icon" title="Start session" onClick={() => void send()} className="rounded-full">
               <ArrowUp aria-hidden size={15} strokeWidth={2.2} className="size-[15px]" />
             </Button>
-
-            {modelMenuOpen && (
-              <MenuPanel
-                onClose={() => setModelMenuOpen(false)}
-                className="bottom-11 right-[78px] z-40 max-h-[320px] w-[300px] overflow-y-auto"
-              >
-                <MenuSectionLabel>Model</MenuSectionLabel>
-                {modelOptions.length === 0 && (
-                  <div className="px-3 py-2 text-[12px] text-muted-foreground">
-                    No models available. Add a provider connection in Models.
-                  </div>
-                )}
-                {modelOptions.map((m) => (
-                  <MenuItem
-                    key={m}
-                    selected={m === selectedModel}
-                    onClick={() => {
-                      setComposerModel(m);
-                      if (projectId) void setProjectModel(projectId, m);
-                      setModelMenuOpen(false);
-                    }}
-                    className="font-mono text-[12px]"
-                  >
-                    <span className="min-w-0 flex-1 truncate">{m}</span>
-                  </MenuItem>
-                ))}
-              </MenuPanel>
-            )}
           </div>
           {(attachments.length > 0 || contextRefs.length > 0) && (
             <div className="flex flex-wrap gap-1.5 px-3 pb-2">
@@ -303,11 +281,31 @@ export function HomeView() {
 
           {/* Context chips */}
           <div className="relative flex items-center gap-1.5 border-t border-border px-3 py-2">
-            <Button variant="ghost" size="sm" onClick={() => setProjectMenuOpen((v) => !v)} className="gap-[7px] font-semibold">
-              <FolderOpen aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-              {project ? projectLabel(project) : "No project"}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-            </Button>
+            <Combobox
+              aria-label="Project"
+              options={projects.map((p) => ({ value: p.projectId, label: projectLabel(p) }))}
+              value={project?.projectId ?? null}
+              onValueChange={(id) => selectProject(id)}
+              placeholder="No project"
+              trigger={
+                <Button variant="ghost" size="sm" className="gap-[7px] font-semibold">
+                  <FolderOpen aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                  {project ? projectLabel(project) : "No project"}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+              footer={
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void addProject()}
+                  className="w-full justify-start gap-2 font-medium text-muted-foreground hover:text-accent-foreground"
+                >
+                  <Plus aria-hidden size={13} strokeWidth={2} />
+                  Open folder
+                </Button>
+              }
+            />
             <Combobox
               aria-label="Branch"
               options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
@@ -355,37 +353,6 @@ export function HomeView() {
             >
               New branch
             </Button>
-
-            {projectMenuOpen && (
-              <MenuPanel onClose={() => setProjectMenuOpen(false)} className="left-3 top-[42px] z-50 w-60">
-                <MenuSectionLabel>Project</MenuSectionLabel>
-                {projects.map((p) => (
-                  <MenuItem
-                    key={p.projectId}
-                    selected={p.projectId === project?.projectId}
-                    onClick={() => {
-                      selectProject(p.projectId);
-                      setProjectMenuOpen(false);
-                    }}
-                    className="font-medium"
-                  >
-                    <FolderOpen aria-hidden size={13} strokeWidth={2} className="text-muted-foreground" />
-                    <span className="flex-1">{projectLabel(p)}</span>
-                  </MenuItem>
-                ))}
-                <MenuSeparator />
-                <MenuItem
-                  className="font-medium text-muted-foreground hover:text-accent-foreground"
-                  onClick={() => {
-                    setProjectMenuOpen(false);
-                    void addProject();
-                  }}
-                >
-                  <Plus aria-hidden size={13} strokeWidth={2} />
-                  Open folder
-                </MenuItem>
-              </MenuPanel>
-            )}
           </div>
         </div>
 
