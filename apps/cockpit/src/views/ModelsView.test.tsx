@@ -241,6 +241,17 @@ test("provider detail shows accounts for the selected provider", async () => {
   expect(screen.getByText("gpt-4.1")).toBeTruthy();
 });
 
+test("changing account routing opens a listbox and persists the picked strategy", async () => {
+  useConnections.setState({ catalog, connections: [connection, secondConnection], loaded: true });
+  render(<ProviderDetailView provider="openai" />);
+
+  await screen.findByText("2 active · By order");
+  fireEvent.click(screen.getByRole("combobox", { name: "Account routing" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Round robin" }));
+
+  expect(await screen.findByText("2 active · Round robin")).toBeTruthy();
+});
+
 test("Route tab lists model route aliases and their ordered targets", async () => {
   render(<ModelsView />);
 
