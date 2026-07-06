@@ -552,6 +552,12 @@ mod tests {
         let mut host = PluginHost::new();
         host.add(harness_only("native"));
 
+        // A fresh `Store` now seeds `enabled_runtimes = "native"` by default
+        // (migration #13, ryuzi-only defaults) — clear it first so the "off
+        // by default" half of this toggle test still holds, mirroring how
+        // `is_enabled_gateway_capability_follows_enabled_gateways` deliberately
+        // avoids the gateway seed default.
+        settings.set("enabled_runtimes", "").await.unwrap();
         assert!(!host.is_enabled(&settings, "native").await.unwrap());
         settings.set("enabled_runtimes", "native").await.unwrap();
         assert!(host.is_enabled(&settings, "native").await.unwrap());

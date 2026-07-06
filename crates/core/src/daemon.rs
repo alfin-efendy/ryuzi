@@ -1043,7 +1043,7 @@ mod tests {
         let store = Store::open(&db_path).await.unwrap();
         let mut regs = Registries::new();
         regs.harness
-            .register("claude-code", Arc::new(PermFakeHarnessFactory));
+            .register("native", Arc::new(PermFakeHarnessFactory));
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store().clone();

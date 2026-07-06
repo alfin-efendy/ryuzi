@@ -932,7 +932,8 @@ mod tests {
     }
 
     /// A `Router` wired to a fresh `ControlPlane`/`Store` (workdir_root set,
-    /// "claude-code" harness registered, a fake attachment fetcher so
+    /// "native" harness registered — the default runtime `connect_project`
+    /// resolves to since Plan C — a fake attachment fetcher so
     /// `with_attachments` never touches the network) with `FakeGateway`
     /// registered under "discord". Mirrors `router.rs`'s own
     /// `wired_control_plane` test helper.
@@ -948,7 +949,7 @@ mod tests {
         let store = Store::open(db_guard.path()).await.unwrap();
         let mut regs = Registries::new();
         regs.harness
-            .register("claude-code", Arc::new(OneShotHarnessFactory));
+            .register("native", Arc::new(OneShotHarnessFactory));
         let cp = ControlPlane::new_full(
             Arc::new(store),
             regs,
