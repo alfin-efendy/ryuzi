@@ -307,6 +307,10 @@ async fn handle_messages(
             }
             break;
         }
+        // Captured once per iteration so the `Failed` arm below can record a
+        // usage row for the failed attempt (the success branches capture their
+        // own `started` closer to the send).
+        let started = crate::paths::now_ms();
         let stream = body["stream"].as_bool().unwrap_or(false);
         let mut attempt_body = body.clone();
         attempt_body["model"] = json!(target.upstream_model);
@@ -374,6 +378,19 @@ async fn handle_messages(
             Ok(resp) => return resp,
             Err(AttemptError::Fatal(resp)) => return resp,
             Err(AttemptError::Failed(failure)) => {
+                // Record the failed HTTP attempt too, so per-account error
+                // visibility isn't lost when we fail over (or give up).
+                crate::llm_router::usage::record(
+                    &state.store,
+                    &target.conn.id,
+                    &target.conn.provider,
+                    &target.upstream_model,
+                    "anthropic",
+                    crate::llm_router::usage::Usage::default(),
+                    failure.status.unwrap_or(502),
+                    started,
+                    Some(failure.message.clone()),
+                );
                 let try_next = crate::llm_router::client::should_try_next_target(&failure);
                 failures.push(failure);
                 if try_next {
@@ -431,6 +448,10 @@ async fn handle_chat(
             }
             break;
         }
+        // Captured once per iteration so the `Failed` arm below can record a
+        // usage row for the failed attempt (the success branches capture their
+        // own `started` closer to the send).
+        let started = crate::paths::now_ms();
         let stream = body["stream"].as_bool().unwrap_or(false);
         let mut attempt_body = body.clone();
         attempt_body["model"] = json!(target.upstream_model);
@@ -498,6 +519,19 @@ async fn handle_chat(
             Ok(resp) => return resp,
             Err(AttemptError::Fatal(resp)) => return resp,
             Err(AttemptError::Failed(failure)) => {
+                // Record the failed HTTP attempt too, so per-account error
+                // visibility isn't lost when we fail over (or give up).
+                crate::llm_router::usage::record(
+                    &state.store,
+                    &target.conn.id,
+                    &target.conn.provider,
+                    &target.upstream_model,
+                    "openai",
+                    crate::llm_router::usage::Usage::default(),
+                    failure.status.unwrap_or(502),
+                    started,
+                    Some(failure.message.clone()),
+                );
                 let try_next = crate::llm_router::client::should_try_next_target(&failure);
                 failures.push(failure);
                 if try_next {
@@ -576,6 +610,19 @@ async fn handle_responses(
                 }
                 Err(AttemptError::Fatal(resp)) => return resp,
                 Err(AttemptError::Failed(failure)) => {
+                    // Record the failed HTTP attempt too, so per-account error
+                    // visibility isn't lost when we fail over (or give up).
+                    crate::llm_router::usage::record(
+                        &state.store,
+                        &target.conn.id,
+                        &target.conn.provider,
+                        &target.upstream_model,
+                        "responses",
+                        crate::llm_router::usage::Usage::default(),
+                        failure.status.unwrap_or(502),
+                        started,
+                        Some(failure.message.clone()),
+                    );
                     let try_next = crate::llm_router::client::should_try_next_target(&failure);
                     failures.push(failure);
                     if try_next {
@@ -635,6 +682,19 @@ async fn handle_responses(
             Ok(resp) => return resp,
             Err(AttemptError::Fatal(resp)) => return resp,
             Err(AttemptError::Failed(failure)) => {
+                // Record the failed HTTP attempt too, so per-account error
+                // visibility isn't lost when we fail over (or give up).
+                crate::llm_router::usage::record(
+                    &state.store,
+                    &target.conn.id,
+                    &target.conn.provider,
+                    &target.upstream_model,
+                    "responses",
+                    crate::llm_router::usage::Usage::default(),
+                    failure.status.unwrap_or(502),
+                    started,
+                    Some(failure.message.clone()),
+                );
                 let try_next = crate::llm_router::client::should_try_next_target(&failure);
                 failures.push(failure);
                 if try_next {
