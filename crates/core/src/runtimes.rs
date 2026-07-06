@@ -527,7 +527,7 @@ pub async fn session_defaults(store: &Store) -> anyhow::Result<SessionDefaults> 
     let default_id = store
         .get_setting("default_agent")
         .await?
-        .unwrap_or_else(|| "claude".to_string());
+        .unwrap_or_else(|| "native".to_string());
     session_defaults_for(store, &default_id).await
 }
 
@@ -643,12 +643,14 @@ mod tests {
         assert_eq!(d.model, None);
         assert_eq!(d.perm_mode, None);
 
+        // With no `default_agent` setting, the fallback is the NATIVE
+        // runtime (Ryuzi-only sessions) — its card config is what applies.
         upsert_config(
             &store,
             RuntimeConfig {
-                id: "claude".into(),
+                id: "native".into(),
                 enabled: true,
-                model: Some("claude-haiku-4-5".into()),
+                model: Some("openrouter/qwen3:free".into()),
                 perm_mode: "full".into(),
                 flags: String::new(),
             },
@@ -656,11 +658,27 @@ mod tests {
         .await
         .unwrap();
         let d = session_defaults(&store).await.unwrap();
-        assert_eq!(d.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(d.model.as_deref(), Some("openrouter/qwen3:free"));
         assert_eq!(d.perm_mode, Some(PermMode::BypassPermissions));
-    }
 
-    #[test]
+        // An explicit default_agent setting still wins over the fallback.
+        store.set_setting("default_agent", "claude").await.unwrap();
+        upsert_config(
+            &store,
+            RuntimeConfig {
+                id: "claude".into(),
+                enabled: true,
+                model: Some("claude-haiku-4-5".into()),
+                perm_mode: "ask".into(),
+                flags: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let d = session_defaults(&store).await.unwrap();
+        assert_eq!(d.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(d.perm_mode, Some(PermMode::Default));
+    }
     fn harness_maps_to_runtime_catalog_id() {
         assert_eq!(runtime_id_for_harness("claude-code"), "claude");
         assert_eq!(runtime_id_for_harness("native"), "native");
