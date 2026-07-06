@@ -145,3 +145,25 @@ test("groups render section labels and options stay selectable", async () => {
   fireEvent.click(screen.getByRole("option", { name: /Sonnet/ }));
   expect(onChange).toHaveBeenCalledWith("sonnet");
 });
+
+test('allowCreate surfaces Create "<input>" and calls onCreate, not onValueChange', async () => {
+  const onChange = mock((_: string) => {});
+  const onCreate = mock((_: string) => {});
+  render(<Combobox options={few} value={null} onValueChange={onChange} onCreate={onCreate} allowCreate aria-label="Branch" />);
+  await openCombobox("Branch");
+  // allowCreate forces the search input even below the threshold — creating requires typing.
+  const input = screen.getByPlaceholderText("Search…");
+  fireEvent.change(input, { target: { value: "feature/x" } });
+  const createOption = await screen.findByRole("option", { name: /Create "feature\/x"/ });
+  fireEvent.click(createOption);
+  expect(onCreate).toHaveBeenCalledWith("feature/x");
+  expect(onChange).not.toHaveBeenCalled();
+});
+
+test("allowCreate: no Create item when the text matches an existing option", async () => {
+  render(<Combobox options={few} value={null} onValueChange={() => {}} onCreate={() => {}} allowCreate aria-label="Branch" />);
+  await openCombobox("Branch");
+  fireEvent.change(screen.getByPlaceholderText("Search…"), { target: { value: "Apple" } });
+  await waitFor(() => expect(screen.getByRole("option", { name: /Apple/ })).toBeTruthy());
+  expect(screen.queryByRole("option", { name: /Create/ })).toBeNull();
+});

@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Combobox as ComboboxPrimitive } from "@base-ui/react/combobox";
-import { Check, ChevronsUpDown } from "lucide-react";
+import { Check, ChevronsUpDown, Plus } from "lucide-react";
 
 import { cn } from "../../lib/utils";
 import { buttonVariants } from "./button";
@@ -43,14 +43,17 @@ type ComboboxProps = {
   className?: string;
 };
 
+// Internal item shape handed to Base UI. `createInput` marks the synthetic
+// 'Create "<input>"' item in allowCreate mode.
+type ComboboxItemData = ComboboxOption & { createInput?: string };
 // Internal group shape handed to Base UI (its grouped-items contract is `{ items }`).
-type ComboboxGroupData = { label: string; items: ComboboxOption[] };
+type ComboboxGroupData = { label: string; items: ComboboxItemData[] };
 
 function isGrouped(options: ComboboxOption[] | ComboboxGroup[]): options is ComboboxGroup[] {
   return options.length > 0 && "options" in options[0];
 }
 
-function ComboboxItemView({ item }: { item: ComboboxOption }) {
+function ComboboxItemView({ item }: { item: ComboboxItemData }) {
   return (
     <ComboboxPrimitive.Item
       value={item}
@@ -61,7 +64,14 @@ function ComboboxItemView({ item }: { item: ComboboxOption }) {
       )}
     >
       <span className="col-start-1 min-w-0">
-        <span className={cn("block truncate", item.mono && "font-mono text-[12.5px]")}>{item.label}</span>
+        {item.createInput !== undefined ? (
+          <span className="flex items-center gap-1.5">
+            <Plus aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+            <span className="truncate">{item.label}</span>
+          </span>
+        ) : (
+          <span className={cn("block truncate", item.mono && "font-mono text-[12.5px]")}>{item.label}</span>
+        )}
         {item.description !== undefined && <span className="mt-0.5 block truncate text-xs text-muted-foreground">{item.description}</span>}
       </span>
       <ComboboxPrimitive.ItemIndicator data-slot="combobox-item-indicator" className="col-start-2">
@@ -78,30 +88,45 @@ function Combobox({
   placeholder = "Select…",
   disabled = false,
   "aria-label": ariaLabel,
+  allowCreate = false,
+  onCreate,
   searchThreshold = 6,
   className,
 }: ComboboxProps) {
   const [query, setQuery] = React.useState("");
 
   const flat = React.useMemo<ComboboxOption[]>(() => (isGrouped(options) ? options.flatMap((g) => g.options) : options), [options]);
-  const showSearch = flat.length > searchThreshold;
+  // allowCreate forces the input: creating requires typing.
+  const showSearch = allowCreate || flat.length > searchThreshold;
 
-  const items = React.useMemo<ComboboxOption[] | ComboboxGroupData[]>(() => {
+  const trimmed = query.trim();
+  const createItem = React.useMemo<ComboboxItemData | null>(() => {
+    if (!allowCreate || trimmed === "") return null;
+    const lowered = trimmed.toLowerCase();
+    const exists = flat.some((o) => o.label.trim().toLowerCase() === lowered || o.value.toLowerCase() === lowered);
+    // The label contains the typed text, so Base UI's contains-filter keeps it visible.
+    return exists ? null : { value: `__create__:${trimmed}`, label: `Create "${trimmed}"`, createInput: trimmed };
+  }, [allowCreate, trimmed, flat]);
+
+  const items = React.useMemo<ComboboxItemData[] | ComboboxGroupData[]>(() => {
     if (isGrouped(options)) {
-      return options.map((g) => ({ label: g.label, items: g.options }));
+      const groups: ComboboxGroupData[] = options.map((g) => ({ label: g.label, items: g.options }));
+      return createItem ? [...groups, { label: "", items: [createItem] }] : groups;
     }
-    return options;
-  }, [options]);
+    return createItem ? [...options, createItem] : options;
+  }, [options, createItem]);
 
-  const selected = React.useMemo<ComboboxOption | null>(() => flat.find((o) => o.value === value) ?? null, [flat, value]);
+  const selected = React.useMemo<ComboboxItemData | null>(() => flat.find((o) => o.value === value) ?? null, [flat, value]);
 
   return (
-    <ComboboxPrimitive.Root<ComboboxOption>
+    <ComboboxPrimitive.Root<ComboboxItemData>
       items={items}
       value={selected}
       isItemEqualToValue={(a, b) => a?.value === b?.value}
       onValueChange={(next) => {
-        if (next) onValueChange(next.value);
+        if (!next) return;
+        if (next.createInput !== undefined) onCreate?.(next.createInput);
+        else onValueChange(next.value);
       }}
       inputValue={query}
       onInputValueChange={setQuery}
@@ -148,10 +173,10 @@ function Combobox({
               data-slot="combobox-list"
               className="max-h-[min(60vh,380px)] overflow-y-auto overscroll-contain p-1.5 empty:p-0"
             >
-              {(entry: ComboboxOption | ComboboxGroupData) =>
+              {(entry: ComboboxItemData | ComboboxGroupData) =>
                 "items" in entry ? (
                   <ComboboxPrimitive.Group key={entry.label} items={entry.items} className="pb-1 last:pb-0">
-                    {/* Empty label = headingless group (Task 3 uses it for the Create item). */}
+                    {/* Empty label = headingless group (used for the synthetic Create item). */}
                     {entry.label !== "" && (
                       <ComboboxPrimitive.GroupLabel
                         data-slot="combobox-group-label"
@@ -161,7 +186,7 @@ function Combobox({
                       </ComboboxPrimitive.GroupLabel>
                     )}
                     <ComboboxPrimitive.Collection>
-                      {(item: ComboboxOption) => <ComboboxItemView key={item.value} item={item} />}
+                      {(item: ComboboxItemData) => <ComboboxItemView key={item.value} item={item} />}
                     </ComboboxPrimitive.Collection>
                   </ComboboxPrimitive.Group>
                 ) : (
