@@ -1,6 +1,6 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { Combobox, type ComboboxOption } from "../../index";
+import { Combobox, type ComboboxGroup, type ComboboxOption } from "../../index";
 
 // happy-dom lacks a couple of layout APIs Base UI touches when positioning
 // and scrolling the popup — stub them before anything renders.
@@ -123,4 +123,25 @@ test("selected label shows on the trigger; aria-label lands on trigger and input
   expect(trigger.textContent).toContain("Cherry");
   await openCombobox("Fruit");
   expect(screen.getByPlaceholderText("Search…").getAttribute("aria-label")).toBe("Fruit");
+});
+
+test("groups render section labels and options stay selectable", async () => {
+  const groups: ComboboxGroup[] = [
+    {
+      label: "Anthropic",
+      options: [
+        { value: "opus", label: "Opus" },
+        { value: "sonnet", label: "Sonnet" },
+      ],
+    },
+    { label: "Local", options: [{ value: "llama", label: "Llama" }] },
+  ];
+  const onChange = mock((_: string) => {});
+  render(<Combobox options={groups} value={null} onValueChange={onChange} aria-label="Model" />);
+  await openCombobox("Model");
+  expect(screen.getByText("Anthropic")).toBeTruthy();
+  expect(screen.getByText("Local")).toBeTruthy();
+  expect(screen.getAllByRole("option").length).toBe(3);
+  fireEvent.click(screen.getByRole("option", { name: /Sonnet/ }));
+  expect(onChange).toHaveBeenCalledWith("sonnet");
 });

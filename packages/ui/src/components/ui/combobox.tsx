@@ -43,6 +43,9 @@ type ComboboxProps = {
   className?: string;
 };
 
+// Internal group shape handed to Base UI (its grouped-items contract is `{ items }`).
+type ComboboxGroupData = { label: string; items: ComboboxOption[] };
+
 function isGrouped(options: ComboboxOption[] | ComboboxGroup[]): options is ComboboxGroup[] {
   return options.length > 0 && "options" in options[0];
 }
@@ -82,11 +85,19 @@ function Combobox({
 
   const flat = React.useMemo<ComboboxOption[]>(() => (isGrouped(options) ? options.flatMap((g) => g.options) : options), [options]);
   const showSearch = flat.length > searchThreshold;
+
+  const items = React.useMemo<ComboboxOption[] | ComboboxGroupData[]>(() => {
+    if (isGrouped(options)) {
+      return options.map((g) => ({ label: g.label, items: g.options }));
+    }
+    return options;
+  }, [options]);
+
   const selected = React.useMemo<ComboboxOption | null>(() => flat.find((o) => o.value === value) ?? null, [flat, value]);
 
   return (
     <ComboboxPrimitive.Root<ComboboxOption>
-      items={flat}
+      items={items}
       value={selected}
       isItemEqualToValue={(a, b) => a?.value === b?.value}
       onValueChange={(next) => {
@@ -137,7 +148,26 @@ function Combobox({
               data-slot="combobox-list"
               className="max-h-[min(60vh,380px)] overflow-y-auto overscroll-contain p-1.5 empty:p-0"
             >
-              {(item: ComboboxOption) => <ComboboxItemView key={item.value} item={item} />}
+              {(entry: ComboboxOption | ComboboxGroupData) =>
+                "items" in entry ? (
+                  <ComboboxPrimitive.Group key={entry.label} items={entry.items} className="pb-1 last:pb-0">
+                    {/* Empty label = headingless group (Task 3 uses it for the Create item). */}
+                    {entry.label !== "" && (
+                      <ComboboxPrimitive.GroupLabel
+                        data-slot="combobox-group-label"
+                        className="px-2.5 pb-[5px] pt-[7px] text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground"
+                      >
+                        {entry.label}
+                      </ComboboxPrimitive.GroupLabel>
+                    )}
+                    <ComboboxPrimitive.Collection>
+                      {(item: ComboboxOption) => <ComboboxItemView key={item.value} item={item} />}
+                    </ComboboxPrimitive.Collection>
+                  </ComboboxPrimitive.Group>
+                ) : (
+                  <ComboboxItemView key={entry.value} item={entry} />
+                )
+              }
             </ComboboxPrimitive.List>
           </ComboboxPrimitive.Popup>
         </ComboboxPrimitive.Positioner>
