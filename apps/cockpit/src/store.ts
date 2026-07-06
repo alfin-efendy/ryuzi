@@ -41,7 +41,6 @@ type State = {
   selectProject: (id: string | null) => void;
   refresh: () => Promise<void>;
   addProject: () => Promise<void>;
-  setProjectHarness: (projectId: string, harness: string) => Promise<void>;
   /** Pin (or clear, with null) the model future turns of this project use. */
   setProjectModel: (projectId: string, model: string | null) => Promise<void>;
   /** Change the permission mode future turns of this project run under. */
@@ -240,19 +239,6 @@ export const useStore = create<State>((set, get) => ({
       await get().refresh();
     } else if (res.status === "error") {
       toast.error("Couldn't add project: " + res.error.message);
-    }
-  },
-
-  // Switch which harness drives a project's future sessions (e.g. "native" vs
-  // "claude-code"). Preserves the project's current model/permMode.
-  setProjectHarness: async (projectId, harness) => {
-    const project = get().projects.find((p) => p.projectId === projectId);
-    if (!project || project.harness === harness) return;
-    const res = await commands.updateProject(projectId, project.model, project.permMode, harness);
-    if (res.status === "ok") {
-      await get().refresh();
-    } else if (res.status === "error") {
-      toast.error("Couldn't change harness: " + res.error.message);
     }
   },
 
