@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { ChevronDown, Folder, GitBranch, Server } from "lucide-react";
-import { useRuntimes } from "@/store-runtimes";
 import { useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
@@ -17,32 +16,27 @@ import {
   Textarea,
 } from "@ryuzi/ui";
 import { BackButton } from "@/components/common/DetailHeader";
-import { StatusDot } from "@/components/common/bits";
 import { ScheduleCard, type ScheduleValue } from "./JobDetailView";
 
 export function JobNewView() {
   const { createJob } = useScheduler();
   const nav = useNav();
   const projects = useStore((s) => s.projects);
-  const runtimes = useRuntimes((s) => s.runtimes);
   const { gateways, loaded: gwLoaded, hydrate: hydrateGw } = useGateways();
 
   const [prompt, setPrompt] = useState("");
-  const [agentId, setAgentId] = useState("claude");
   const [projectId, setProjectId] = useState<string | null>(null);
   const [gateway, setGateway] = useState("local");
   const [schedule, setSchedule] = useState<ScheduleValue>({ mode: "natural", natural: "", cron: "0 9 * * *" });
   const [notifySuccess, setNotifySuccess] = useState(false);
   const [notifyFail, setNotifyFail] = useState(true);
-  const [menu, setMenu] = useState<"agent" | "project" | "ws" | null>(null);
+  const [menu, setMenu] = useState<"project" | "ws" | null>(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!gwLoaded) void hydrateGw();
   }, [gwLoaded, hydrateGw]);
 
-  const runnableAgents = runtimes.filter((a) => a.enabled && a.binaryPath && a.runnable);
-  const agent = runtimes.find((a) => a.id === agentId) ?? runnableAgents[0];
   const project = projects.find((p) => p.projectId === projectId) ?? projects[0];
   const wsName = gateways.find((w) => w.id === gateway)?.name ?? gateway;
   const canCreate = prompt.trim().length > 0 && project !== undefined && !saving;
@@ -58,7 +52,8 @@ export function JobNewView() {
       cron: schedule.cron,
       projectId: project.projectId,
       branch: "main",
-      agent: agent?.id ?? "claude",
+      // Ryuzi-only sessions: jobs always run the native runtime.
+      agent: "native",
       gateway,
       prompt: prompt.trim(),
       notifySuccess,
@@ -92,11 +87,6 @@ export function JobNewView() {
             />
           </div>
           <div className="relative flex flex-wrap items-center gap-1.5 px-[18px] pb-3.5 pt-2">
-            <Button variant="outline" size="sm" onClick={() => setMenu(menu === "agent" ? null : "agent")}>
-              <StatusDot color={agent?.color ?? "var(--muted-foreground)"} size={7} />
-              {agent?.name ?? "No agent"}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-            </Button>
             <Button variant="outline" size="sm" onClick={() => setMenu(menu === "project" ? null : "project")}>
               <Folder aria-hidden size={12} strokeWidth={2} className="size-3" />
               {project?.name ?? "No project"}
@@ -111,29 +101,6 @@ export function JobNewView() {
               {wsName}
               <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
             </Button>
-            {menu === "agent" && (
-              <MenuPanel onClose={() => setMenu(null)} className="bottom-11 left-[18px] w-[280px]">
-                {runnableAgents.length === 0 && (
-                  <div className="px-2.5 py-2 text-[12.5px] text-muted-foreground">No runnable agents detected.</div>
-                )}
-                {runnableAgents.map((a) => (
-                  <MenuItem
-                    key={a.id}
-                    selected={a.id === agentId}
-                    onClick={() => {
-                      setAgentId(a.id);
-                      setMenu(null);
-                    }}
-                  >
-                    <StatusDot color={a.color} size={9} />
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-[13px] font-medium">{a.name}</span>
-                      <span className="block text-[11.5px] text-muted-foreground">{a.model || a.connection}</span>
-                    </span>
-                  </MenuItem>
-                ))}
-              </MenuPanel>
-            )}
             {menu === "project" && (
               <MenuPanel onClose={() => setMenu(null)} className="bottom-11 left-[140px] w-[220px]">
                 {projects.length === 0 && <div className="px-2.5 py-2 text-[12.5px] text-muted-foreground">No projects yet.</div>}
