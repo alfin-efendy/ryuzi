@@ -9,8 +9,8 @@ import { useNav } from "@/store-nav";
 import type { CatalogEntry, ConnectionInfo, ModelRouteInfo, ModelRouteStrategy } from "@/bindings";
 import {
   Button,
+  Combobox,
   Input,
-  NativeSelect,
   Segmented,
   SettingsCard as Card,
   SettingsCardHeader as CardHeader,
@@ -427,14 +427,16 @@ function RouteForm({
       </CardRow>
       <CardRow>
         <span className="w-24 shrink-0 text-[13px] font-medium">Strategy</span>
-        <NativeSelect
+        <Combobox
+          aria-label="Strategy"
+          options={[
+            { value: "fallback", label: "By order" },
+            { value: "round-robin", label: "Round robin" },
+          ]}
           value={draft.strategy}
-          onChange={(event) => setDraft((current) => ({ ...current, strategy: event.target.value as ModelRouteStrategy }))}
+          onValueChange={(v) => setDraft((current) => ({ ...current, strategy: v as ModelRouteStrategy }))}
           className="max-w-[180px]"
-        >
-          <option value="fallback">By order</option>
-          <option value="round-robin">Round robin</option>
-        </NativeSelect>
+        />
         <span className="min-w-0 flex-1 text-xs text-muted-foreground">Fallback and capability auto-switch are automatic.</span>
       </CardRow>
       <div className="border-b border-border px-[18px] py-3">
@@ -442,14 +444,17 @@ function RouteForm({
         <div className="flex flex-col gap-2">
           {draft.targets.map((target, index) => (
             <div key={`${index}-${targetKey(target)}`} className="flex items-center gap-2">
-              <NativeSelect value={targetKey(target)} onChange={(event) => setTarget(index, event.target.value)} className="min-w-0 flex-1">
-                {targetOptions.map((option) => (
-                  <option key={option.key} value={option.key}>
-                    {option.providerName} / {option.model} ({option.accountLabel}
-                    {option.enabled ? "" : ", disabled"})
-                  </option>
-                ))}
-              </NativeSelect>
+              <Combobox
+                aria-label={`Target ${index + 1}`}
+                options={targetOptions.map((option) => ({
+                  value: option.key,
+                  label: `${option.providerName} / ${option.model} (${option.accountLabel}${option.enabled ? "" : ", disabled"})`,
+                  mono: true,
+                }))}
+                value={targetKey(target)}
+                onValueChange={(key) => setTarget(index, key)}
+                className="min-w-0 flex-1"
+              />
               <Button
                 variant="ghost"
                 size="icon-sm"

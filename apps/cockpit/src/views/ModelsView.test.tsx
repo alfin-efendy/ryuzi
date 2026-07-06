@@ -263,6 +263,24 @@ test("Route tab lists model route aliases and their ordered targets", async () =
   expect(screen.getByRole("button", { name: "New route" })).toBeTruthy();
 });
 
+test("route form renders strategy and target comboboxes with option lists", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+
+  const strategy = await screen.findByRole("combobox", { name: "Strategy" });
+  fireEvent.click(strategy);
+  expect(await screen.findByRole("option", { name: "Round robin" })).toBeTruthy();
+  expect(screen.getByRole("option", { name: "By order" })).toBeTruthy();
+  // close the strategy popup before opening the target one
+  fireEvent.keyDown(strategy, { key: "Escape" });
+
+  const target = screen.getByRole("combobox", { name: "Target 1" });
+  fireEvent.click(target);
+  expect(await screen.findByRole("option", { name: "OpenAI / gpt-4.1 (Work OpenAI)" })).toBeTruthy();
+});
+
 test("connection detail back returns to its provider detail", () => {
   useConnections.setState({ catalog, connections: [connection], loaded: true });
   render(<ConnectionDetailView id="c1" />);
