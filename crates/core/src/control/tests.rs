@@ -465,6 +465,7 @@ async fn seed_session(
             created_at: Some(now),
             last_active: Some(now),
             resume_attempts: 0,
+            branch_owned: true,
         })
         .await
         .unwrap();

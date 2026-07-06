@@ -1607,6 +1607,7 @@ mod tests {
                 created_at: Some(0),
                 last_active: Some(0),
                 resume_attempts: 0,
+                branch_owned: true,
             })
             .await
             .unwrap();

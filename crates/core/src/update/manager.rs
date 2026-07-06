@@ -300,6 +300,7 @@ mod tests {
             created_at: None,
             last_active: None,
             resume_attempts: 0,
+            branch_owned: true,
         }
     }
 

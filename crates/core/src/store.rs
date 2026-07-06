@@ -395,6 +395,26 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // Branch controls (workstream B): which sessions own their branch.
+        // 1 (owned) is the legacy behavior — every pre-existing session's
+        // branch name was engine-generated, so teardown may delete it.
+        // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
+        // this migration on a DB that already has the column (e.g. the
+        // rewind-and-replay in `migration_13_rewrites_claude_code_defaults_to_native`,
+        // which now also re-runs this — the newest — migration) is a no-op
+        // instead of a "duplicate column" error.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let exists = tx
+                .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='branch_owned'")?
+                .exists([])?;
+            if !exists {
+                tx.execute(
+                    "ALTER TABLE sessions ADD COLUMN branch_owned INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -617,12 +637,12 @@ impl Store {
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
                     s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
-                    s.started_by, s.resume_attempts
+                    s.started_by, s.resume_attempts, s.branch_owned
                 ],
             )
         })
@@ -1266,7 +1286,7 @@ impl Store {
 }
 
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     let status: String = r.get(6)?;
@@ -1282,6 +1302,7 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
         last_active: r.get(8)?,
         started_by: r.get(9)?,
         resume_attempts: r.get(10)?,
+        branch_owned: r.get(11)?,
     })
 }
 
@@ -1366,6 +1387,7 @@ mod tests {
             created_at: Some(1),
             last_active: Some(1),
             resume_attempts: 0,
+            branch_owned: true,
         }
     }
 
@@ -1424,6 +1446,40 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_adds_sessions_branch_owned_defaulting_to_owned() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // A row inserted without the new column (as every pre-migration row
+        // was) must read back as engine-owned: legacy sessions keep today's
+        // delete-branch-on-teardown behavior.
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO sessions(session_pk, project_id) VALUES ('legacy', 'p1')",
+                    [],
+                )
+            })
+            .await
+            .unwrap();
+        let s = store.get_session("legacy").await.unwrap().unwrap();
+        assert!(s.branch_owned, "legacy rows must default to branch_owned=1");
+    }
+
+    #[tokio::test]
+    async fn insert_session_roundtrips_branch_owned_false() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let mut s = sample_session();
+        s.branch_owned = false;
+        store.insert_session(s).await.unwrap();
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert!(
+            !got.branch_owned,
+            "user-named branches persist as not-owned"
+        );
     }
 
     #[tokio::test]
@@ -1888,12 +1944,16 @@ mod tests {
     #[tokio::test]
     async fn migration_13_rewrites_claude_code_defaults_to_native() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back one so only
-        // the rewrite migration re-runs on the next open.
+        // DB, seed the old values, then wind user_version back two so both
+        // the rewrite migration (13) AND the migration appended after it
+        // (14, sessions.branch_owned — hook-guarded, so replaying it is a
+        // no-op) re-run on the next open. `Migrations` always fast-forwards
+        // to the latest defined version, so there is no way to replay 13
+        // alone once something is appended after it.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 1)
+            c.pragma_update(None, "user_version", v - 2)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();

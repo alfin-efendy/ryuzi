@@ -85,6 +85,10 @@ pub struct Session {
     pub created_at: Option<i64>,
     pub last_active: Option<i64>,
     pub resume_attempts: i64,
+    /// True when the engine auto-generated the branch name (`harness/{short}`).
+    /// `end_session` deletes the branch ONLY when this is set; user-named and
+    /// pre-existing branches survive teardown.
+    pub branch_owned: bool,
 }
 
 /// How a new session's git workspace is prepared (branch controls).

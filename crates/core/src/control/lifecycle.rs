@@ -86,6 +86,7 @@ impl ControlPlane {
             created_at: Some(now),
             last_active: Some(now),
             resume_attempts: 0,
+            branch_owned: true,
         };
         self.store.insert_session(session.clone()).await?;
         let _ = self.events.send(CoreEvent::SessionCreated {
