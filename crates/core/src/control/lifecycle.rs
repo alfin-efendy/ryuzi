@@ -70,7 +70,13 @@ impl ControlPlane {
         let short: String = session_pk.chars().take(8).collect();
         let branch = format!("harness/{short}");
         let worktree_path = worktree_path_for(&project.project_id, &session_pk);
-        worktree::create(Path::new(&project.workdir), &short, &branch, &worktree_path)?;
+        worktree::create(
+            Path::new(&project.workdir),
+            &short,
+            &branch,
+            &worktree_path,
+            None,
+        )?;
 
         let now = now_ms();
         let title: String = prompt.display.chars().take(80).collect();
