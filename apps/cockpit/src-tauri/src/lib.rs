@@ -274,6 +274,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::get_setting,
             commands::set_setting,
             commands::update_project,
+            commands::list_branches,
             runtimes_cmd::list_runtimes,
             runtimes_cmd::refresh_runtimes,
             runtimes_cmd::update_runtime_config,

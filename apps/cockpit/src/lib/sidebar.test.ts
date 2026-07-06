@@ -15,6 +15,7 @@ function sess(pk: string, projectId: string, title: string | null, lastActive = 
     createdAt: null,
     lastActive,
     resumeAttempts: 0,
+    branchOwned: true,
   };
 }
 

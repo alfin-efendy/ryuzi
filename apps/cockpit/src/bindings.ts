@@ -113,6 +113,14 @@ async updateProject(projectId: string, model: string | null, permMode: PermMode,
     else return { status: "error", error: e  as any };
 }
 },
+async listBranches(projectId: string) : Promise<Result<BranchList, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_branches", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_runtimes") };
@@ -930,9 +938,23 @@ export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
+export type BranchList = { 
+/**
+ * Local branch names — current first, then alphabetical.
+ */
+branches: string[]; 
+/**
+ * Branch checked out in the project workdir; a short commit id when
+ * HEAD is detached, "HEAD" when the repo has no commits yet.
+ */
+current: string; detached: boolean }
 export type CatalogEntry = { id: string; name: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
-export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[] }
+export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[]; 
+/**
+ * None => engine default (worktree ON, new engine-named branch from HEAD).
+ */
+git: GitOptions | null }
 export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
@@ -999,6 +1021,10 @@ kind: string; detail: string; metaLine: string;
  */
 status: string; latency: string | null; daemonVersion: string; uptime: string | null; lastSeenMs: number | null; resources: GatewayResourceInfo[]; fingerprint: string | null; fsMode: string; paths: string[] }
 export type GatewayResourceInfo = { label: string; sub: string; pct: number }
+/**
+ * Per-start git controls from the composer (behavior matrix, workstream B).
+ */
+export type GitOptions = { useWorktree: boolean; createBranch: boolean; branchName: string | null; baseBranch: string | null }
 export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
 export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
@@ -1099,7 +1125,13 @@ export type RuntimeInfo = { id: string; name: string; color: string; initial: st
  */
 runnable: boolean }
 export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
-export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number }
+export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
+/**
+ * True when the engine auto-generated the branch name (`harness/{short}`).
+ * `end_session` deletes the branch ONLY when this is set; user-named and
+ * pre-existing branches survive teardown.
+ */
+branchOwned: boolean }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 

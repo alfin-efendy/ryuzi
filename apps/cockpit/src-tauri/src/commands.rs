@@ -1,6 +1,9 @@
 use crate::error::CmdError;
+use ryuzi_core::branches::BranchList;
 use ryuzi_core::domain::AttachmentRef;
-use ryuzi_core::{ControlPlane, Message, PermMode, Project, Session, TurnPrompt};
+use ryuzi_core::{
+    ControlPlane, Message, PermMode, Project, Session, SessionGitOptions, TurnPrompt,
+};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::fmt::Write as _;
@@ -67,6 +70,27 @@ pub async fn connect_project(
         .await?)
 }
 
+#[tauri::command]
+#[specta::specta]
+pub async fn list_branches(cp: State<'_, Arc<ControlPlane>>, project_id: String) -> R<BranchList> {
+    let project = cp
+        .store()
+        .get_project(&project_id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown project: {project_id}"),
+        })?;
+    // git2 is blocking; keep it off the async runtime's worker thread.
+    let list = tokio::task::spawn_blocking(move || {
+        ryuzi_core::branches::list_branches(Path::new(&project.workdir))
+    })
+    .await
+    .map_err(|e| CmdError {
+        message: format!("list_branches task failed: {e}"),
+    })??;
+    Ok(list)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatContextArg {
@@ -74,6 +98,28 @@ pub struct ChatContextArg {
     pub voice_transcript: Option<String>,
     #[serde(default)]
     pub references: Vec<String>,
+}
+
+/// Per-start git controls from the composer (behavior matrix, workstream B).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GitOptions {
+    pub use_worktree: bool,
+    pub create_branch: bool,
+    pub branch_name: Option<String>,
+    pub base_branch: Option<String>,
+}
+
+impl From<GitOptions> for SessionGitOptions {
+    fn from(g: GitOptions) -> Self {
+        let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        SessionGitOptions {
+            use_worktree: g.use_worktree,
+            create_branch: g.create_branch,
+            branch_name: clean(g.branch_name),
+            base_branch: clean(g.base_branch),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
@@ -84,6 +130,8 @@ pub struct ChatRequestOptions {
     pub context: Option<ChatContextArg>,
     #[serde(default)]
     pub attachments: Vec<String>,
+    /// None => engine default (worktree ON, new engine-named branch from HEAD).
+    pub git: Option<GitOptions>,
 }
 
 /// Ryuzi-only sessions: every runtime id resolves to the native harness.
@@ -251,6 +299,7 @@ pub async fn start_session(
         options.model.as_deref(),
     )
     .await?;
+    let git: Option<SessionGitOptions> = options.git.clone().map(Into::into);
     let attachments = attachment_refs_from_paths(&options.attachments).await?;
     let agent_prompt = chat_agent_prompt(&prompt, options.context.as_ref());
     // `.inner()` -> &Arc<ControlPlane>: start/continue_session take `self: &Arc<Self>`.
@@ -264,6 +313,7 @@ pub async fn start_session(
             },
             "cockpit",
             &attachments,
+            git,
         )
         .await?)
 }
@@ -471,5 +521,44 @@ mod tests {
         );
         assert!(out.contains("- Referenced file: src/main.rs"));
         assert!(out.contains("- Referenced file: crates/core/src/lib.rs"));
+    }
+
+    #[test]
+    fn chat_request_options_git_defaults_to_none_and_deserializes() {
+        // Old payloads (no `git` key) keep parsing.
+        let opts: ChatRequestOptions =
+            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
+                .unwrap();
+        assert!(opts.git.is_none());
+
+        let opts: ChatRequestOptions = serde_json::from_value(serde_json::json!({
+            "git": {
+                "useWorktree": false,
+                "createBranch": true,
+                "branchName": "feat/x",
+                "baseBranch": null
+            }
+        }))
+        .unwrap();
+        let git = opts.git.unwrap();
+        assert!(!git.use_worktree);
+        assert!(git.create_branch);
+        assert_eq!(git.branch_name.as_deref(), Some("feat/x"));
+        assert_eq!(git.base_branch, None);
+    }
+
+    #[test]
+    fn git_options_convert_to_session_git_options_trimming_blanks() {
+        let core: ryuzi_core::SessionGitOptions = GitOptions {
+            use_worktree: true,
+            create_branch: false,
+            branch_name: Some("   ".into()),
+            base_branch: Some(" develop ".into()),
+        }
+        .into();
+        assert!(core.use_worktree);
+        assert!(!core.create_branch);
+        assert_eq!(core.branch_name, None, "blank names collapse to None");
+        assert_eq!(core.base_branch.as_deref(), Some("develop"));
     }
 }

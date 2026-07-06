@@ -78,6 +78,7 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
         }
       : null,
     attachments: options.attachments ?? [],
+    git: null,
   };
 }
 

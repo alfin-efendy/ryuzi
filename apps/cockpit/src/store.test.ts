@@ -277,6 +277,7 @@ const runningSession = (pk: string) => ({
   lastActive: null,
   startedBy: null,
   resumeAttempts: 0,
+  branchOwned: true,
 });
 
 test("result event flips the session status back to idle (so the composer leaves Stop mode)", () => {
@@ -317,6 +318,7 @@ test("start forwards chat options so composer runtime, context, and attachments 
       createdAt: 1,
       lastActive: 1,
       resumeAttempts: 0,
+      branchOwned: true,
     },
   });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
@@ -334,6 +336,7 @@ test("start forwards chat options so composer runtime, context, and attachments 
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
+    git: null,
   });
   expect(useStore.getState().focusedSessionPk).toBe("s1");
 
