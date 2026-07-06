@@ -1039,9 +1039,9 @@ mod tests {
             "delta": {"reasoning_content": " more"}}]})));
         evs.extend(s.feed(&json!({"choices": [{"index": 0,
             "delta": {"content": "answer"}}]})));
-        evs.extend(s.feed(
-            &json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
-        ));
+        evs.extend(
+            s.feed(&json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})),
+        );
         evs.extend(s.finish());
         let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(

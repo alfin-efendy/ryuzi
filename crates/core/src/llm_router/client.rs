@@ -441,7 +441,10 @@ fn native_client_can_drive(conn: &connections::ConnectionRow) -> bool {
     if !connections::is_oauth(conn) {
         return true;
     }
-    matches!(conn.provider.as_str(), "anthropic-oauth" | "kiro" | "openai-oauth")
+    matches!(
+        conn.provider.as_str(),
+        "anthropic-oauth" | "kiro" | "openai-oauth"
+    )
 }
 
 /// The models a native session can actually be pointed at, in the order the
@@ -509,7 +512,11 @@ pub async fn selectable_native_models(store: &Store) -> Vec<String> {
             push(format!("{}/{}", conn.provider, model), &mut out, &mut seen);
             if conn.provider == "openai-oauth" {
                 for effort in ["low", "medium", "high", "xhigh"] {
-                    push(format!("{}/{}-{effort}", conn.provider, model), &mut out, &mut seen);
+                    push(
+                        format!("{}/{}-{effort}", conn.provider, model),
+                        &mut out,
+                        &mut seen,
+                    );
                 }
             }
         }
@@ -1481,12 +1488,20 @@ async fn codex_stream(
     // below, which needs `&mut target`.
     let provider = target.conn.provider.clone();
     let fail = |e: String| UpstreamAttemptFailure {
-        provider: provider.clone(), message: e, status: None };
+        provider: provider.clone(),
+        message: e,
+        status: None,
+    };
     let chat = translate::anthropic_to_openai_request(body).map_err(|e| fail(e.to_string()))?;
     let mut responses = crate::llm_router::codex::openai_chat_to_responses_request(&chat);
     crate::llm_router::codex::normalize_codex_responses_body(
-        &mut responses, &target.upstream_model, None);
-    let resp = send_upstream(ctx, target, &responses).await.map_err(|e| fail(e.to_string()))?;
+        &mut responses,
+        &target.upstream_model,
+        None,
+    );
+    let resp = send_upstream(ctx, target, &responses)
+        .await
+        .map_err(|e| fail(e.to_string()))?;
     if !resp.status().is_success() {
         return Err(upstream_status_failure(target.conn.provider.clone(), resp).await);
     }
@@ -1495,7 +1510,9 @@ async fn codex_stream(
     let conn_id = target.conn.id.clone();
     let provider = target.conn.provider.clone();
     let model = target.upstream_model.clone();
-    tokio::spawn(async move { pump_codex(resp, model, tx, store, conn_id, provider, started).await; });
+    tokio::spawn(async move {
+        pump_codex(resp, model, tx, store, conn_id, provider, started).await;
+    });
     Ok(rx)
 }
 
@@ -1534,16 +1551,26 @@ async fn pump_codex(
             }
         };
         for ev in parser.feed(&chunk) {
-            let Ok(data) = serde_json::from_str::<Value>(&ev.data) else { continue };
+            let Ok(data) = serde_json::from_str::<Value>(&ev.data) else {
+                continue;
+            };
             let name = ev.event.clone().unwrap_or_default();
             for oai in dec.feed(&name, &data) {
-                if let Some(err) = oai.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-                    for (n, d) in tr.error_frame(err) { let _ = tx.send(Ok((n, d))).await; }
+                if let Some(err) = oai
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    for (n, d) in tr.error_frame(err) {
+                        let _ = tx.send(Ok((n, d))).await;
+                    }
                     errored = true;
                     break 'pump;
                 }
                 for (n, d) in tr.feed(&oai) {
-                    if tx.send(Ok((n, d))).await.is_err() { break 'pump; }
+                    if tx.send(Ok((n, d))).await.is_err() {
+                        break 'pump;
+                    }
                 }
             }
         }
@@ -1551,15 +1578,27 @@ async fn pump_codex(
     if !errored {
         if !dec.saw_terminal() {
             for oai in dec.finish() {
-                for (n, d) in tr.feed(&oai) { let _ = tx.send(Ok((n, d))).await; }
+                for (n, d) in tr.feed(&oai) {
+                    let _ = tx.send(Ok((n, d))).await;
+                }
             }
         }
-        for (n, d) in tr.finish() { let _ = tx.send(Ok((n, d))).await; }
+        for (n, d) in tr.finish() {
+            let _ = tx.send(Ok((n, d))).await;
+        }
     }
     let (input, output) = dec.usage();
-    crate::llm_router::usage::record(&store, &conn_id, &provider, &model, "native",
+    crate::llm_router::usage::record(
+        &store,
+        &conn_id,
+        &provider,
+        &model,
+        "native",
         crate::llm_router::usage::Usage { input, output },
-        if errored { 502 } else { 200 }, started, errored.then(|| "stream interrupted".to_string()));
+        if errored { 502 } else { 200 },
+        started,
+        errored.then(|| "stream interrupted".to_string()),
+    );
 }
 
 #[cfg(test)]
@@ -1967,17 +2006,39 @@ mod tests {
     #[tokio::test]
     async fn codex_is_offered_and_effort_variants_route_to_openai_oauth() {
         let ctx = test_ctx().await;
-        connections::add_connection(&ctx.store, mk_conn("cx", "openai-oauth", "oauth",
-            ConnectionData { access_token: Some("at".into()),
-                models_override: Some(vec!["gpt-5.2-codex".into()]), ..Default::default() })).await.unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "cx",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at".into()),
+                    models_override: Some(vec!["gpt-5.2-codex".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
 
         let models = selectable_native_models(&ctx.store).await;
-        assert!(models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex"), "got {models:?}");
-        assert!(models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex-high"), "effort variant missing: {models:?}");
+        assert!(
+            models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex"),
+            "got {models:?}"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m == "openai-oauth/gpt-5.2-codex-high"),
+            "effort variant missing: {models:?}"
+        );
 
         // The suffixed id routes to the openai-oauth connection.
         let t = route_model_for_anthropic_messages(&ctx.store, "openai-oauth/gpt-5.2-codex-high")
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(t.conn.provider, "openai-oauth");
         assert_eq!(t.upstream_model, "gpt-5.2-codex-high");
     }
@@ -2108,7 +2169,9 @@ mod tests {
             "got: {models:?}"
         );
         assert!(
-            models.iter().any(|m| m == "openai-oauth/gpt-5.2-codex-high"),
+            models
+                .iter()
+                .any(|m| m == "openai-oauth/gpt-5.2-codex-high"),
             "effort variant missing, got: {models:?}"
         );
         assert!(

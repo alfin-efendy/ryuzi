@@ -730,7 +730,10 @@ mod tests {
         .await
         .unwrap();
         let d = session_defaults_for(&store, "native").await.unwrap();
-        assert_eq!(d.model, None, "a blank model must not shadow the router default");
+        assert_eq!(
+            d.model, None,
+            "a blank model must not shadow the router default"
+        );
     }
 }
 

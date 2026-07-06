@@ -96,9 +96,7 @@ fn dev_sidecar_bundle() -> Option<String> {
         })
         .collect();
     bundles.sort();
-    bundles
-        .pop()
-        .map(|p| p.to_string_lossy().into_owned())
+    bundles.pop().map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Explicit PATH scan for a globally installed adapter (npm/bun global

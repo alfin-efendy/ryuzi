@@ -32,7 +32,12 @@ pub fn openai_chat_to_responses_request(chat: &Value) -> Value {
     }
 
     let mut instructions_set = false;
-    for msg in chat.get("messages").and_then(Value::as_array).into_iter().flatten() {
+    for msg in chat
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
         match role {
             "system" if !instructions_set => {
@@ -41,21 +46,39 @@ pub fn openai_chat_to_responses_request(chat: &Value) -> Value {
             }
             "system" => {
                 // A second system message becomes a developer message item.
-                out["input"].as_array_mut().expect("input is an array").push(json!({"type": "message", "role": "developer",
+                out["input"]
+                    .as_array_mut()
+                    .expect("input is an array")
+                    .push(json!({"type": "message", "role": "developer",
                     "content": [{"type": "input_text", "text": message_text(msg)}]}));
             }
             "tool" => {
-                let call_id = clamp_call_id(msg.get("tool_call_id").and_then(Value::as_str).unwrap_or(""));
-                out["input"].as_array_mut().expect("input is an array").push(json!({"type": "function_call_output",
+                let call_id = clamp_call_id(
+                    msg.get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                out["input"]
+                    .as_array_mut()
+                    .expect("input is an array")
+                    .push(json!({"type": "function_call_output",
                     "call_id": call_id, "output": message_text(msg)}));
             }
             "assistant" => {
                 let text = message_text(msg);
                 if !text.is_empty() {
-                    out["input"].as_array_mut().expect("input is an array").push(json!({"type": "message", "role": "assistant",
+                    out["input"]
+                        .as_array_mut()
+                        .expect("input is an array")
+                        .push(json!({"type": "message", "role": "assistant",
                         "content": [{"type": "output_text", "text": text}]}));
                 }
-                for tc in msg.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                for tc in msg
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
                     let call_id = clamp_call_id(tc.get("id").and_then(Value::as_str).unwrap_or(""));
                     let f = tc.get("function").cloned().unwrap_or(Value::Null);
                     out["input"].as_array_mut().expect("input is an array").push(json!({"type": "function_call", "call_id": call_id,
@@ -65,7 +88,10 @@ pub fn openai_chat_to_responses_request(chat: &Value) -> Value {
             }
             _ => {
                 // user (and any other) -> input_text/input_image message item.
-                out["input"].as_array_mut().expect("input is an array").push(json!({"type": "message", "role": "user",
+                out["input"]
+                    .as_array_mut()
+                    .expect("input is an array")
+                    .push(json!({"type": "message", "role": "user",
                     "content": message_content_parts(msg)}));
             }
         }
@@ -138,7 +164,11 @@ fn flatten_tool(tool: &Value) -> Option<Value> {
     let mut out = json!({"type": "function", "name": name,
         "parameters": f.get("parameters").cloned()
             .unwrap_or_else(|| json!({"type": "object", "properties": {}}))});
-    if let Some(desc) = f.get("description").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+    if let Some(desc) = f
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         out["description"] = json!(desc);
     }
     Some(out)
@@ -165,9 +195,16 @@ pub struct ResponsesToOpenAiStream {
 
 impl ResponsesToOpenAiStream {
     pub fn new(model: &str) -> Self {
-        Self { model: model.to_string(), tool_index: HashMap::new(),
-            tool_args_streamed: std::collections::HashSet::new(), next_index: 0,
-            has_tool_calls: false, finished: false, input_tokens: 0, output_tokens: 0 }
+        Self {
+            model: model.to_string(),
+            tool_index: HashMap::new(),
+            tool_args_streamed: std::collections::HashSet::new(),
+            next_index: 0,
+            has_tool_calls: false,
+            finished: false,
+            input_tokens: 0,
+            output_tokens: 0,
+        }
     }
 
     fn chunk(&self, delta: Value, finish: Option<&str>) -> Value {
@@ -203,20 +240,33 @@ impl ResponsesToOpenAiStream {
                     let emit_id = call_id.or(item_id).unwrap_or("").to_string();
                     let is_new = !self.tool_index.contains_key(&key);
                     let index = *self.tool_index.entry(key).or_insert_with(|| {
-                        let i = self.next_index; self.next_index += 1; i });
+                        let i = self.next_index;
+                        self.next_index += 1;
+                        i
+                    });
                     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
                     if is_new {
-                        out.push(self.chunk(json!({"tool_calls": [{"index": index, "id": emit_id,
-                            "type": "function", "function": {"name": name, "arguments": ""}}]}), None));
+                        out.push(self.chunk(
+                            json!({"tool_calls": [{"index": index, "id": emit_id,
+                            "type": "function", "function": {"name": name, "arguments": ""}}]}),
+                            None,
+                        ));
                     }
                     // Some responses carry the complete arguments string on the
                     // item itself (esp. on `.done`) rather than only via deltas.
                     // Emit it only if no deltas were streamed for this item, so
                     // we never double-count.
-                    if let Some(args) = item.get("arguments").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    if let Some(args) = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
                         if !self.tool_args_streamed.contains(&index) {
-                            out.push(self.chunk(json!({"tool_calls": [{"index": index,
-                                "function": {"arguments": args}}]}), None));
+                            out.push(self.chunk(
+                                json!({"tool_calls": [{"index": index,
+                                "function": {"arguments": args}}]}),
+                                None,
+                            ));
                         }
                     }
                 }
@@ -226,22 +276,28 @@ impl ResponsesToOpenAiStream {
                 if let Some(&index) = self.tool_index.get(id) {
                     if let Some(delta) = data.get("delta").and_then(Value::as_str) {
                         self.tool_args_streamed.insert(index);
-                        out.push(self.chunk(json!({"tool_calls": [{"index": index,
-                            "function": {"arguments": delta}}]}), None));
+                        out.push(self.chunk(
+                            json!({"tool_calls": [{"index": index,
+                            "function": {"arguments": delta}}]}),
+                            None,
+                        ));
                     }
                 }
             }
             "response.completed" | "response.incomplete" => {
                 if let Some(u) = data.get("response").and_then(|r| r.get("usage")) {
                     self.input_tokens = u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
-                    self.output_tokens = u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    self.output_tokens =
+                        u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
                 }
                 out.extend(self.terminal());
             }
             "response.failed" | "error" => {
-                let msg = data.pointer("/response/error/message")
+                let msg = data
+                    .pointer("/response/error/message")
                     .or_else(|| data.pointer("/error/message"))
-                    .and_then(Value::as_str).unwrap_or("codex upstream error");
+                    .and_then(Value::as_str)
+                    .unwrap_or("codex upstream error");
                 out.push(self.chunk(json!({"content": ""}), None));
                 out.push(json!({"error": {"message": msg}}));
                 self.finished = true;
@@ -252,9 +308,15 @@ impl ResponsesToOpenAiStream {
     }
 
     fn terminal(&mut self) -> Vec<Value> {
-        if self.finished { return vec![]; }
+        if self.finished {
+            return vec![];
+        }
         self.finished = true;
-        let finish = if self.has_tool_calls { "tool_calls" } else { "stop" };
+        let finish = if self.has_tool_calls {
+            "tool_calls"
+        } else {
+            "stop"
+        };
         let mut c = self.chunk(json!({}), Some(finish));
         c["usage"] = json!({"prompt_tokens": self.input_tokens,
             "completion_tokens": self.output_tokens});
@@ -263,9 +325,15 @@ impl ResponsesToOpenAiStream {
 
     /// Emit the terminal chunk if the stream closed (clean EOF) without a
     /// `response.completed`; a no-op if one was already emitted.
-    pub fn finish(&mut self) -> Vec<Value> { self.terminal() }
-    pub fn saw_terminal(&self) -> bool { self.finished }
-    pub fn usage(&self) -> (i64, i64) { (self.input_tokens, self.output_tokens) }
+    pub fn finish(&mut self) -> Vec<Value> {
+        self.terminal()
+    }
+    pub fn saw_terminal(&self) -> bool {
+        self.finished
+    }
+    pub fn usage(&self) -> (i64, i64) {
+        (self.input_tokens, self.output_tokens)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +512,11 @@ pub fn codex_virtual_model_to_upstream(model: &str) -> (String, Option<&'static 
     (upstream, None)
 }
 
-pub fn normalize_codex_responses_body(body: &mut Value, upstream_model: &str, cache_key: Option<&str>) {
+pub fn normalize_codex_responses_body(
+    body: &mut Value,
+    upstream_model: &str,
+    cache_key: Option<&str>,
+) {
     let (model, model_effort) = codex_virtual_model_to_upstream(upstream_model);
     body["model"] = json!(model);
     let input = body.get("input").cloned().unwrap_or(Value::Null);
@@ -548,9 +620,13 @@ mod tests {
         // shape and would otherwise silently drop it) and turns it into an
         // Anthropic error frame instead of swallowing it.
         let mut s = stream();
-        let out = s.feed("response.failed",
-            &json!({"response": {"error": {"message": "rate limited"}}}));
-        let err = out.iter().find(|el| el.get("error").is_some())
+        let out = s.feed(
+            "response.failed",
+            &json!({"response": {"error": {"message": "rate limited"}}}),
+        );
+        let err = out
+            .iter()
+            .find(|el| el.get("error").is_some())
             .expect("response.failed must yield an error element");
         assert_eq!(err["error"]["message"], "rate limited");
         assert!(s.saw_terminal());
@@ -565,20 +641,38 @@ mod tests {
         let mut s = stream();
         let mut out = s.feed("response.output_item.added",
             &json!({"item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "write"}}));
-        out.extend(s.feed("response.function_call_arguments.delta",
-            &json!({"item_id": "fc_1", "delta": "{\"path\":"})));
-        out.extend(s.feed("response.function_call_arguments.delta",
-            &json!({"item_id": "fc_1", "delta": "\"a.txt\"}"})));
-        out.extend(s.feed("response.completed",
-            &json!({"response": {"usage": {"input_tokens": 12, "output_tokens": 7}}})));
+        out.extend(s.feed(
+            "response.function_call_arguments.delta",
+            &json!({"item_id": "fc_1", "delta": "{\"path\":"}),
+        ));
+        out.extend(s.feed(
+            "response.function_call_arguments.delta",
+            &json!({"item_id": "fc_1", "delta": "\"a.txt\"}"}),
+        ));
+        out.extend(s.feed(
+            "response.completed",
+            &json!({"response": {"usage": {"input_tokens": 12, "output_tokens": 7}}}),
+        ));
         // Downstream tool_use carries the call_id (`call_1`), not the item id.
-        let start = out.iter().find(|c| c["choices"][0]["delta"]["tool_calls"][0]["id"] == "call_1").unwrap();
-        assert_eq!(start["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "write");
-        let args: String = out.iter()
-            .filter_map(|c| c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str())
+        let start = out
+            .iter()
+            .find(|c| c["choices"][0]["delta"]["tool_calls"][0]["id"] == "call_1")
+            .unwrap();
+        assert_eq!(
+            start["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "write"
+        );
+        let args: String = out
+            .iter()
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
             .collect();
         assert_eq!(args, "{\"path\":\"a.txt\"}");
-        assert_eq!(out.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            out.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
         assert!(s.saw_terminal());
         assert_eq!(s.usage(), (12, 7));
     }
@@ -707,7 +801,10 @@ mod tests {
         assert_eq!(fc["call_id"], "call_abc");
         assert_eq!(fc["name"], "write");
         assert_eq!(fc["arguments"], "{\"path\":\"a.txt\"}");
-        let fco = items.iter().find(|i| i["type"] == "function_call_output").unwrap();
+        let fco = items
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .unwrap();
         assert_eq!(fco["call_id"], "call_abc");
         assert_eq!(fco["output"], "wrote 5 bytes");
     }

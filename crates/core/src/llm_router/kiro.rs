@@ -1551,11 +1551,23 @@ mod tests {
             "toolUseEvent",
             json!({ "toolUseId": "t1", "name": "write", "input": "{\"path\":\"a.txt\"}" }),
         ));
-        out.extend(s.feed(&frame("toolUseEvent", json!({ "toolUseId": "t1", "name": "write", "stop": true }))));
-        assert!(!s.saw_terminal(), "not terminal until the metadata/stop event");
+        out.extend(s.feed(&frame(
+            "toolUseEvent",
+            json!({ "toolUseId": "t1", "name": "write", "stop": true }),
+        )));
+        assert!(
+            !s.saw_terminal(),
+            "not terminal until the metadata/stop event"
+        );
         out.extend(s.feed(&frame("metadataEvent", json!({ "stopReason": "TOOL_USE" }))));
-        assert!(s.saw_terminal(), "metadataEvent must terminate the tool-use turn");
-        assert_eq!(out.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+        assert!(
+            s.saw_terminal(),
+            "metadataEvent must terminate the tool-use turn"
+        );
+        assert_eq!(
+            out.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
     }
 
     #[test]
