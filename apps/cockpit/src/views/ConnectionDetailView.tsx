@@ -239,13 +239,11 @@ export function ConnectionDetailView({ id }: { id: string }) {
             <CardRow>
               <div className="min-w-0 flex-1">
                 <div className="text-[13px] font-medium">Cloaking</div>
-                <div className="mt-0.5 text-[11.5px] text-muted-foreground">Send Claude Code-style headers, metadata, billing block, and tool names.</div>
+                <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+                  Send Claude Code-style headers, metadata, billing block, and tool names.
+                </div>
               </div>
-              <Switch
-                on={claudeCloaking}
-                onToggle={() => setClaudeCloaking((value) => !value)}
-                label="Claude Code cloaking"
-              />
+              <Switch on={claudeCloaking} onToggle={() => setClaudeCloaking((value) => !value)} label="Claude Code cloaking" />
             </CardRow>
           </Card>
         )}

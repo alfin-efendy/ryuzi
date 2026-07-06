@@ -101,8 +101,15 @@ const usage: UsageSeries = {
 };
 
 const updateConnection = mock(
-  (_id: string, _label: string, _enabled: boolean, _apiKey: string | null, _baseUrl: string | null, _models: string[], _claudeCloaking: boolean | null) =>
-    Promise.resolve({ status: "ok" as const, data: [connection, secondConnection, claudeConnection] }),
+  (
+    _id: string,
+    _label: string,
+    _enabled: boolean,
+    _apiKey: string | null,
+    _baseUrl: string | null,
+    _models: string[],
+    _claudeCloaking: boolean | null,
+  ) => Promise.resolve({ status: "ok" as const, data: [connection, secondConnection, claudeConnection] }),
 );
 
 // Mock the Tauri IPC boundary before the component (and the stores it uses) load.
