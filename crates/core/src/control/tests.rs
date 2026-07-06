@@ -211,6 +211,46 @@ fn init_repo(dir: &std::path::Path) {
         .unwrap();
 }
 
+/// Add `name` with `content` to the index and commit on the current HEAD —
+/// dirty-tree tests need a TRACKED file to modify.
+fn commit_file(repo_dir: &std::path::Path, name: &str, content: &str) {
+    let repo = git2::Repository::open(repo_dir).unwrap();
+    std::fs::write(repo_dir.join(name), content).unwrap();
+    let mut idx = repo.index().unwrap();
+    idx.add_path(std::path::Path::new(name)).unwrap();
+    idx.write().unwrap();
+    let tree_id = idx.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let sig = git2::Signature::now("t", "t@t").unwrap();
+    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let parents: Vec<&git2::Commit> = parent.iter().collect();
+    repo.commit(Some("HEAD"), &sig, &sig, "add file", &tree, &parents)
+        .unwrap();
+}
+
+/// A ControlPlane whose fake harness is registered under BOTH runnable
+/// harness ids, so these tests don't care which default `connect_project`
+/// assigns.
+async fn fake_control_plane_any_harness() -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile)
+{
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let mut regs = Registries::new();
+    for id in ["native", "claude-code"] {
+        regs.harness.register(
+            id,
+            Arc::new(FakeHarnessFactory {
+                block_until_cancel: false,
+                counters: counters.clone(),
+            }),
+        );
+    }
+    let cp = ControlPlane::new(store, regs).await;
+    let store_ref = cp.store.clone();
+    (cp, store_ref, db_guard)
+}
+
 /// A fresh sqlite path backed by a `NamedTempFile` guard. The caller must
 /// keep the returned guard alive for as long as the path is in use —
 /// dropping it deletes the file — mirroring the inline
@@ -1930,4 +1970,171 @@ async fn db_configured_server_wins_over_a_same_named_plugin_server() {
         }
         other => panic!("expected a stdio transport, got: {other:?}"),
     }
+}
+
+fn git_opts(
+    use_worktree: bool,
+    create_branch: bool,
+    branch_name: Option<&str>,
+    base_branch: Option<&str>,
+) -> crate::domain::SessionGitOptions {
+    crate::domain::SessionGitOptions {
+        use_worktree,
+        create_branch,
+        branch_name: branch_name.map(str::to_string),
+        base_branch: base_branch.map(str::to_string),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn user_named_branch_survives_end_session() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _db) = fake_control_plane_any_harness().await;
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    let project = cp.connect_project(repo_dir.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session_with_prompt(
+            &project.project_id,
+            TurnPrompt {
+                agent: "go".into(),
+                display: "go".into(),
+            },
+            "test",
+            &[],
+            Some(git_opts(true, true, Some("keep/me"), None)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.branch.as_deref(), Some("keep/me"));
+    assert!(
+        !session.branch_owned,
+        "user-named branch is not engine-owned"
+    );
+
+    cp.end_session(&session.session_pk).await.unwrap();
+
+    let repo = git2::Repository::open(repo_dir.path()).unwrap();
+    assert!(
+        repo.find_branch("keep/me", git2::BranchType::Local).is_ok(),
+        "a user-named branch must survive teardown"
+    );
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.worktree_path.is_none(), "worktree path cleared");
+}
+
+#[tokio::test]
+#[serial]
+async fn engine_named_branch_is_deleted_on_end_session() {
+    let _guard = StateDirGuard::new();
+    let (cp, _store, _db) = fake_control_plane_any_harness().await;
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    let project = cp.connect_project(repo_dir.path(), "demo").await.unwrap();
+
+    // git: None => Default => exact legacy behavior.
+    let session = cp
+        .start_session_with_prompt(
+            &project.project_id,
+            TurnPrompt {
+                agent: "go".into(),
+                display: "go".into(),
+            },
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    let branch = session.branch.clone().unwrap();
+    assert!(branch.starts_with("harness/"));
+    assert!(session.branch_owned);
+
+    cp.end_session(&session.session_pk).await.unwrap();
+
+    let repo = git2::Repository::open(repo_dir.path()).unwrap();
+    assert!(
+        repo.find_branch(&branch, git2::BranchType::Local).is_err(),
+        "the engine-named branch must be deleted with its worktree"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _db) = fake_control_plane_any_harness().await;
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    let project = cp.connect_project(repo_dir.path(), "demo").await.unwrap();
+    let repo = git2::Repository::open(repo_dir.path()).unwrap();
+    let head_before = repo.head().unwrap().shorthand().unwrap().to_string();
+
+    let session = cp
+        .start_session_with_prompt(
+            &project.project_id,
+            TurnPrompt {
+                agent: "go".into(),
+                display: "go".into(),
+            },
+            "test",
+            &[],
+            Some(git_opts(false, false, None, None)),
+        )
+        .await
+        .unwrap();
+    assert!(session.worktree_path.is_none(), "no worktree for this cell");
+    assert_eq!(session.branch.as_deref(), Some(head_before.as_str()));
+
+    cp.end_session(&session.session_pk).await.unwrap();
+
+    assert_eq!(
+        repo.head().unwrap().shorthand().unwrap(),
+        head_before,
+        "teardown must never switch the user's checkout"
+    );
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Ended);
+}
+
+#[tokio::test]
+#[serial]
+async fn dirty_tree_refusal_aborts_before_a_session_row_exists() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _db) = fake_control_plane_any_harness().await;
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    commit_file(repo_dir.path(), "a.txt", "one");
+    let project = cp.connect_project(repo_dir.path(), "demo").await.unwrap();
+    // Unstaged modification to a tracked file = dirty.
+    std::fs::write(repo_dir.path().join("a.txt"), "changed").unwrap();
+
+    let result = cp
+        .start_session_with_prompt(
+            &project.project_id,
+            TurnPrompt {
+                agent: "go".into(),
+                display: "go".into(),
+            },
+            "test",
+            &[],
+            Some(git_opts(false, true, None, None)),
+        )
+        .await;
+
+    assert!(result.is_err(), "dirty in-place start must fail");
+    assert!(
+        store.list_sessions(None).await.unwrap().is_empty(),
+        "no half-created session row may exist after a matrix refusal"
+    );
 }

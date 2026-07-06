@@ -3,7 +3,7 @@
 
 use super::{ControlPlane, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
-use crate::domain::{AttachmentRef, CoreEvent, Project, Session, SessionStatus};
+use crate::domain::{AttachmentRef, CoreEvent, Project, Session, SessionGitOptions, SessionStatus};
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::settings::SettingsStore;
@@ -27,6 +27,7 @@ impl ControlPlane {
             },
             started_by,
             attachments,
+            None,
         )
         .await
     }
@@ -37,6 +38,7 @@ impl ControlPlane {
         prompt: TurnPrompt,
         started_by: &str,
         attachments: &[AttachmentRef],
+        git: Option<SessionGitOptions>,
     ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
@@ -67,16 +69,18 @@ impl ControlPlane {
         }
 
         let session_pk = new_id();
-        let short: String = session_pk.chars().take(8).collect();
-        let branch = format!("harness/{short}");
-        let worktree_path = worktree_path_for(&project.project_id, &session_pk);
-        worktree::create(
+        // Prepare the git workspace per the branch-controls matrix. Every
+        // failure (dirty tree, branch collision, bad name) returns HERE —
+        // before the Session row is inserted, so no half-created sessions.
+        let git = git.unwrap_or_default();
+        let worktree_candidate = worktree_path_for(&project.project_id, &session_pk);
+        let ws = crate::workspace::prepare_session_workspace(
             Path::new(&project.workdir),
-            &short,
-            &branch,
-            &worktree_path,
-            None,
+            &git,
+            &session_pk,
+            &worktree_candidate,
         )?;
+        let short: String = session_pk.chars().take(8).collect();
 
         let now = now_ms();
         let title: String = prompt.display.chars().take(80).collect();
@@ -84,15 +88,18 @@ impl ControlPlane {
             session_pk: session_pk.clone(),
             project_id: project.project_id.clone(),
             agent_session_id: None,
-            worktree_path: Some(worktree_path.to_string_lossy().into_owned()),
-            branch: Some(branch),
+            worktree_path: ws
+                .worktree_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            branch: Some(ws.branch.clone()),
             title: Some(title),
             status: SessionStatus::Running,
             started_by: Some(started_by.to_string()),
             created_at: Some(now),
             last_active: Some(now),
             resume_attempts: 0,
-            branch_owned: true,
+            branch_owned: ws.branch_owned,
         };
         self.store.insert_session(session.clone()).await?;
         let _ = self.events.send(CoreEvent::SessionCreated {
@@ -116,7 +123,7 @@ impl ControlPlane {
         // `stop_session` finds a live handle. The prompt is then driven in the
         // background so the cockpit can juggle many sessions concurrently.
         let handle = self
-            .start_harness_session(&project, &session_pk, &worktree_path, None)
+            .start_harness_session(&project, &session_pk, &ws.work_dir, None)
             .await?;
         let final_prompt = self
             .with_attachments(&session_pk, &prompt.agent, attachments)
@@ -573,10 +580,19 @@ impl ControlPlane {
             if let Some(project) = self.store.get_project(&session.project_id).await? {
                 if let Some(wt) = &session.worktree_path {
                     let short: String = session_pk.chars().take(8).collect();
+                    // Delete the branch only when the engine generated its
+                    // name; user-named and pre-existing branches survive.
+                    // No-worktree sessions never reach this block at all —
+                    // the user's checkout is never switched back.
+                    let owned_branch = if session.branch_owned {
+                        session.branch.as_deref()
+                    } else {
+                        None
+                    };
                     let _ = worktree::remove(
                         Path::new(&project.workdir),
                         &short,
-                        session.branch.as_deref(),
+                        owned_branch,
                         Path::new(wt),
                     );
                     // Forget the deleted path so a later continue cold-resumes
