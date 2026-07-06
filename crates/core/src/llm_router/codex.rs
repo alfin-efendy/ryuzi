@@ -28,7 +28,7 @@ pub fn openai_chat_to_responses_request(chat: &Value) -> Value {
         out["model"] = model.clone();
     }
     if let Some(tc) = chat.get("tool_choice") {
-        out["tool_choice"] = tc.clone();
+        out["tool_choice"] = flatten_tool_choice(tc);
     }
 
     let mut instructions_set = false;
@@ -112,6 +112,22 @@ fn message_content_parts(msg: &Value) -> Value {
         }
         _ => json!([{"type": "input_text", "text": message_text(msg)}]),
     }
+}
+
+/// OpenAI-chat `tool_choice` -> Responses `tool_choice`. String forms
+/// ("auto"/"required"/"none") pass through unchanged. A forced-tool OBJECT is
+/// the nested chat shape `{"type":"function","function":{"name":N}}` (as
+/// produced by `translate::anthropic_to_openai_request`); the Responses API
+/// wants it FLAT — `{"type":"function","name":N}` — so pull `.function.name`
+/// up to the top level. Any object already flat (or otherwise shaped) passes
+/// through unchanged.
+fn flatten_tool_choice(tc: &Value) -> Value {
+    if tc.get("type").and_then(Value::as_str) == Some("function") {
+        if let Some(name) = tc.pointer("/function/name") {
+            return json!({"type": "function", "name": name.clone()});
+        }
+    }
+    tc.clone()
 }
 
 /// chat tool {type:function, function:{name,description,parameters}} ->
@@ -565,6 +581,90 @@ mod tests {
         assert_eq!(out.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
         assert!(s.saw_terminal());
         assert_eq!(s.usage(), (12, 7));
+    }
+
+    #[test]
+    fn complete_args_on_done_without_deltas_emit_open_and_args_once() {
+        // A function_call whose COMPLETE arguments arrive on
+        // `response.output_item.done` with NO `function_call_arguments.delta`
+        // events must still emit the open tool_call (call_id + name) and
+        // exactly ONE args chunk carrying the full arguments.
+        let mut s = stream();
+        let out = s.feed(
+            "response.output_item.done",
+            &json!({"item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "write", "arguments": "{\"path\":\"a.txt\"}"}}),
+        );
+        // Exactly one open chunk, carrying the call_id (not the item id) + name.
+        let opens: Vec<&Value> = out
+            .iter()
+            .filter(|c| c["choices"][0]["delta"]["tool_calls"][0]["id"] == "call_1")
+            .collect();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(
+            opens[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "write"
+        );
+        // Exactly one args chunk, carrying the complete arguments verbatim.
+        let arg_chunks: Vec<&str> = out
+            .iter()
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(arg_chunks, vec!["{\"path\":\"a.txt\"}"]);
+    }
+
+    #[test]
+    fn done_args_are_suppressed_when_deltas_already_streamed() {
+        // When arguments arrive BOTH via a streamed delta AND again on
+        // `.done`, the delta path wins: the `.done` arguments are suppressed
+        // by the `tool_args_streamed` guard so they are never double-counted.
+        let mut s = stream();
+        let mut out = s.feed(
+            "response.output_item.added",
+            &json!({"item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "write"}}),
+        );
+        out.extend(s.feed(
+            "response.function_call_arguments.delta",
+            &json!({"item_id": "fc_1", "delta": "{\"path\":\"a.txt\"}"}),
+        ));
+        out.extend(s.feed(
+            "response.output_item.done",
+            &json!({"item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "write", "arguments": "{\"path\":\"a.txt\"}"}}),
+        ));
+        // The complete args string appears EXACTLY once across all chunks —
+        // the `.done` copy was suppressed.
+        let args: Vec<&str> = out
+            .iter()
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(args, vec!["{\"path\":\"a.txt\"}"]);
+    }
+
+    #[test]
+    fn tool_choice_string_passes_through_and_forced_tool_object_is_flattened() {
+        // String forms pass through verbatim.
+        let chat = json!({"model": "m", "messages": [], "tool_choice": "required"});
+        let out = openai_chat_to_responses_request(&chat);
+        assert_eq!(out["tool_choice"], "required");
+
+        // A forced-tool object from anthropic_to_openai_request is the nested
+        // OpenAI-chat shape {"type":"function","function":{"name":N}}; the
+        // Responses API wants it FLAT {"type":"function","name":N}.
+        let chat = json!({"model": "m", "messages": [],
+            "tool_choice": {"type": "function", "function": {"name": "write"}}});
+        let out = openai_chat_to_responses_request(&chat);
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type": "function", "name": "write"})
+        );
     }
 
     #[test]
