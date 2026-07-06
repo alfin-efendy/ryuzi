@@ -288,6 +288,18 @@ test("provider detail shows accounts for the selected provider", async () => {
   expect(screen.getByText("gpt-4.1")).toBeTruthy();
 });
 
+test("provider detail spans the vendor family across catalog auth methods", async () => {
+  useConnections.setState({ catalog, connections: [claudeConnection, anthropicApiConnection], loaded: true });
+  render(<ProviderDetailView provider="anthropic" />);
+
+  expect(screen.getByRole("heading", { level: 2, name: "Anthropic" })).toBeTruthy();
+  expect(await screen.findByText("2 accounts · 2 catalog models")).toBeTruthy();
+  expect(screen.getByText("Claude subscription")).toBeTruthy();
+  expect(screen.getByText("Team Anthropic")).toBeTruthy();
+  expect(screen.getByText("Subscription · no key · 1 model")).toBeTruthy();
+  expect(screen.getByText("API key · sk-…9f21 · 1 model")).toBeTruthy();
+});
+
 test("Route tab lists model route aliases and their ordered targets", async () => {
   render(<ModelsView />);
 
@@ -324,6 +336,14 @@ test("connection detail saves the Claude cloaking toggle", async () => {
   await waitFor(() =>
     expect(updateConnection).toHaveBeenCalledWith("c3", "Claude subscription", true, null, null, ["claude-opus-4-8"], false),
   );
+});
+
+test("connection detail back button routes to the account's vendor family, not its raw catalog id", () => {
+  useConnections.setState({ catalog, connections: [claudeConnection], loaded: true });
+  render(<ConnectionDetailView id="c3" />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Claude Code" }));
+  expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
 });
 
 test("warns when secrets fall back to a local file instead of the OS keychain", async () => {
