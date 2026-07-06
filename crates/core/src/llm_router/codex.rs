@@ -128,10 +128,154 @@ fn flatten_tool(tool: &Value) -> Option<Value> {
     Some(out)
 }
 
+use std::collections::HashMap;
+
+/// Decodes a Codex Responses SSE stream into OpenAI `chat.completion.chunk`s.
+/// Terminal on `response.completed` (or `finish()` for a clean EOF). Ported
+/// from 9router open-sse/executors/codex.js streaming handler.
+pub struct ResponsesToOpenAiStream {
+    model: String,
+    /// function_call item id -> tool_calls[] index, assigned first-seen.
+    tool_index: HashMap<String, usize>,
+    next_index: usize,
+    has_tool_calls: bool,
+    finished: bool,
+    input_tokens: i64,
+    output_tokens: i64,
+}
+
+impl ResponsesToOpenAiStream {
+    pub fn new(model: &str) -> Self {
+        Self { model: model.to_string(), tool_index: HashMap::new(), next_index: 0,
+            has_tool_calls: false, finished: false, input_tokens: 0, output_tokens: 0 }
+    }
+
+    fn chunk(&self, delta: Value, finish: Option<&str>) -> Value {
+        json!({"object": "chat.completion.chunk", "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+    }
+
+    pub fn feed(&mut self, event: &str, data: &Value) -> Vec<Value> {
+        let mut out = Vec::new();
+        match event {
+            "response.output_text.delta" => {
+                if let Some(t) = data.get("delta").and_then(Value::as_str) {
+                    out.push(self.chunk(json!({"content": t}), None));
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(t) = data.get("delta").and_then(Value::as_str) {
+                    out.push(self.chunk(json!({"reasoning_content": t}), None));
+                }
+            }
+            "response.output_item.added" => {
+                let item = data.get("item").cloned().unwrap_or(Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    self.has_tool_calls = true;
+                    let id = item.get("call_id").and_then(Value::as_str)
+                        .or_else(|| item.get("id").and_then(Value::as_str))
+                        .unwrap_or("").to_string();
+                    let index = *self.tool_index.entry(id.clone()).or_insert_with(|| {
+                        let i = self.next_index; self.next_index += 1; i });
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    out.push(self.chunk(json!({"tool_calls": [{"index": index, "id": id,
+                        "type": "function", "function": {"name": name, "arguments": ""}}]}), None));
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let id = data.get("item_id").and_then(Value::as_str).unwrap_or("");
+                if let Some(&index) = self.tool_index.get(id) {
+                    if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                        out.push(self.chunk(json!({"tool_calls": [{"index": index,
+                            "function": {"arguments": delta}}]}), None));
+                    }
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                if let Some(u) = data.get("response").and_then(|r| r.get("usage")) {
+                    self.input_tokens = u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    self.output_tokens = u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+                }
+                out.extend(self.terminal());
+            }
+            "response.failed" | "error" => {
+                let msg = data.pointer("/response/error/message")
+                    .or_else(|| data.pointer("/error/message"))
+                    .and_then(Value::as_str).unwrap_or("codex upstream error");
+                out.push(self.chunk(json!({"content": ""}), None));
+                out.push(json!({"error": {"message": msg}}));
+                self.finished = true;
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn terminal(&mut self) -> Vec<Value> {
+        if self.finished { return vec![]; }
+        self.finished = true;
+        let finish = if self.has_tool_calls { "tool_calls" } else { "stop" };
+        let mut c = self.chunk(json!({}), Some(finish));
+        c["usage"] = json!({"prompt_tokens": self.input_tokens,
+            "completion_tokens": self.output_tokens});
+        vec![c]
+    }
+
+    /// Emit the terminal chunk if the stream closed (clean EOF) without a
+    /// `response.completed`; a no-op if one was already emitted.
+    pub fn finish(&mut self) -> Vec<Value> { self.terminal() }
+    pub fn saw_terminal(&self) -> bool { self.finished }
+    pub fn usage(&self) -> (i64, i64) { (self.input_tokens, self.output_tokens) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn stream() -> ResponsesToOpenAiStream {
+        ResponsesToOpenAiStream::new("gpt-5.2-codex")
+    }
+
+    #[test]
+    fn output_text_delta_becomes_content_chunk() {
+        let mut s = stream();
+        let out = s.feed("response.output_text.delta", &json!({"delta": "Hello"}));
+        assert_eq!(out[0]["choices"][0]["delta"]["content"], "Hello");
+        assert!(!s.saw_terminal());
+    }
+
+    #[test]
+    fn streamed_function_call_accumulates_and_finishes_as_tool_calls() {
+        let mut s = stream();
+        let mut out = s.feed("response.output_item.added",
+            &json!({"item": {"type": "function_call", "call_id": "call_1", "name": "write"}}));
+        out.extend(s.feed("response.function_call_arguments.delta",
+            &json!({"item_id": "call_1", "delta": "{\"path\":"})));
+        out.extend(s.feed("response.function_call_arguments.delta",
+            &json!({"item_id": "call_1", "delta": "\"a.txt\"}"})));
+        out.extend(s.feed("response.completed",
+            &json!({"response": {"usage": {"input_tokens": 12, "output_tokens": 7}}})));
+        let start = out.iter().find(|c| c["choices"][0]["delta"]["tool_calls"][0]["id"] == "call_1").unwrap();
+        assert_eq!(start["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "write");
+        let args: String = out.iter()
+            .filter_map(|c| c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(args, "{\"path\":\"a.txt\"}");
+        assert_eq!(out.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+        assert!(s.saw_terminal());
+        assert_eq!(s.usage(), (12, 7));
+    }
+
+    #[test]
+    fn clean_eof_without_completed_still_finishes() {
+        let mut s = stream();
+        let _ = s.feed("response.output_text.delta", &json!({"delta": "hi"}));
+        assert!(!s.saw_terminal());
+        let out = s.finish();
+        assert_eq!(out.last().unwrap()["choices"][0]["finish_reason"], "stop");
+        assert!(s.saw_terminal());
+    }
 
     #[test]
     fn system_becomes_instructions_user_becomes_message_item() {
