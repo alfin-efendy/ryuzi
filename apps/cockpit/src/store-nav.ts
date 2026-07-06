@@ -102,7 +102,6 @@ type NavState = {
   bottomHeight: number;
   rightMaximized: boolean;
   searchQuery: string;
-  composerAgent: AgentId;
   composerBranch: string;
   /** Model the next composed session should run on; null = project/runtime default. */
   composerModel: string | null;
@@ -120,7 +119,6 @@ type NavState = {
   setBottomHeight: (px: number) => void;
   setRightMaximized: (v: boolean) => void;
   setSearchQuery: (q: string) => void;
-  setComposerAgent: (a: AgentId) => void;
   setComposerBranch: (b: string) => void;
   setComposerModel: (model: string | null) => void;
   setProjectSettingsFor: (id: string | null) => void;
@@ -140,7 +138,6 @@ export const useNav = create<NavState>((set, get) => ({
   ),
   rightMaximized: false,
   searchQuery: "",
-  composerAgent: "",
   composerBranch: "main",
   composerModel: null,
   projectSettingsFor: null,
@@ -186,7 +183,6 @@ export const useNav = create<NavState>((set, get) => ({
   },
   setRightMaximized: (v) => set({ rightMaximized: v }),
   setSearchQuery: (q) => set({ searchQuery: q }),
-  setComposerAgent: (a) => set({ composerAgent: a }),
   setComposerBranch: (b) => set({ composerBranch: b }),
   setComposerModel: (model) => set({ composerModel: model }),
   setProjectSettingsFor: (id) => set({ projectSettingsFor: id }),

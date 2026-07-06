@@ -73,10 +73,6 @@ test("readClampedPanelSize parses, defaults, and clamps a persisted size to the 
   expect(readClampedPanelSize("2000", 900, BOTTOM_HEIGHT)).toBe(540); // 60% of 900
 });
 
-test("composer runtime starts unset so new chat follows the configured default runtime", () => {
-  expect(useNav.getState().composerAgent).toBe("");
-});
-
 test("composer model starts unset and round-trips through setComposerModel", () => {
   expect(useNav.getState().composerModel).toBeNull();
   useNav.getState().setComposerModel("openrouter/qwen3:free");
