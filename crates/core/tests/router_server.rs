@@ -797,6 +797,211 @@ async fn served_request_records_usage() {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP endpoint multi-target failover (Tasks 5-8)
+// ---------------------------------------------------------------------------
+
+/// Mock ANTHROPIC-format upstream (`POST /v1/messages`) that always replies
+/// with a fixed status + JSON body and counts how many requests it received.
+/// Used to prove the endpoint handlers fail over from a failing upstream to
+/// the next connection in the family chain.
+async fn mock_counting_anthropic_upstream(
+    status: u16,
+    body: serde_json::Value,
+) -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicU32>,
+) {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::{routing::post, Json, Router};
+    let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let hits_for_handler = hits.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |Json(_body): Json<serde_json::Value>| {
+            let hits = hits_for_handler.clone();
+            let body = body.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (StatusCode::from_u16(status).unwrap(), Json(body)).into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, h, hits)
+}
+
+/// I(5-8)a: two api-key `anthropic` connections (family `anthropic`), both
+/// serving `mock-claude`. The FIRST-tried connection's upstream returns a
+/// retryable 429 (`quota exceeded`); the handler must fail over to the
+/// SECOND, healthy connection and return its 200 body — trying the first
+/// upstream exactly once.
+#[tokio::test]
+async fn messages_fails_over_to_next_connection_on_retryable_upstream_error() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+
+    let (quota_port, _h1, quota_hits) =
+        mock_counting_anthropic_upstream(429, json!({"error": {"message": "quota exceeded"}})).await;
+    let (ok_port, _h2, ok_hits) = mock_counting_anthropic_upstream(
+        200,
+        json!({
+            "id": "msg_ok", "type": "message", "role": "assistant", "model": "mock-claude",
+            "content": [{"type": "text", "text": "second wins"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    )
+    .await;
+
+    // The first-added connection is tried first (list order = priority ASC =
+    // insertion order), so the quota-limited mock leads and the router must
+    // fail over to the healthy one.
+    for (id, up_port) in [("c-quota", quota_port), ("c-ok", ok_port)] {
+        connections::add_connection(
+            &store,
+            connections::ConnectionRow {
+                id: id.into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: id.into(),
+                priority: 0,
+                enabled: true,
+                data: connections::ConnectionData {
+                    api_key: Some("sk-ant".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
+                    models_override: Some(vec!["mock-claude".into()]),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let key = keys::create_key(&store, "t").await.unwrap();
+    let srv = RouterServer::new(store.clone());
+    let port = srv.start(0).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", &key.key)
+        .json(&json!({"model": "anthropic/mock-claude", "max_tokens": 16,
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "expected failover to the healthy second connection"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "second wins");
+
+    assert_eq!(
+        quota_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the quota-limited upstream must be tried exactly once"
+    );
+    assert_eq!(
+        ok_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the healthy upstream must be tried exactly once"
+    );
+
+    srv.stop().await;
+}
+
+/// I(5-8)b: a NON-retryable upstream error (400 `invalid request format`)
+/// is returned to the client as-is; the handler must NOT fail over to the
+/// second connection (pins the `should_try_next_target` wiring).
+#[tokio::test]
+async fn messages_does_not_fail_over_on_non_retryable_upstream_error() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+
+    let (bad_port, _h1, bad_hits) = mock_counting_anthropic_upstream(
+        400,
+        json!({"error": {"message": "invalid request format"}}),
+    )
+    .await;
+    let (ok_port, _h2, ok_hits) = mock_counting_anthropic_upstream(
+        200,
+        json!({
+            "id": "msg_ok", "type": "message", "role": "assistant", "model": "mock-claude",
+            "content": [{"type": "text", "text": "should not reach me"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    )
+    .await;
+
+    for (id, up_port) in [("c-bad", bad_port), ("c-ok", ok_port)] {
+        connections::add_connection(
+            &store,
+            connections::ConnectionRow {
+                id: id.into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: id.into(),
+                priority: 0,
+                enabled: true,
+                data: connections::ConnectionData {
+                    api_key: Some("sk-ant".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
+                    models_override: Some(vec!["mock-claude".into()]),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let key = keys::create_key(&store, "t").await.unwrap();
+    let srv = RouterServer::new(store.clone());
+    let port = srv.start(0).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", &key.key)
+        .json(&json!({"model": "anthropic/mock-claude", "max_tokens": 16,
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        400,
+        "a non-retryable 400 must be returned, not failed over"
+    );
+    assert_eq!(
+        bad_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the failing upstream must be tried exactly once"
+    );
+    assert_eq!(
+        ok_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the second connection must not be tried on a non-retryable error"
+    );
+
+    srv.stop().await;
+}
+
+// ---------------------------------------------------------------------------
 // F2b: OAuth/free upstream auth + refresh wiring (Task 6)
 // ---------------------------------------------------------------------------
 
