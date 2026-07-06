@@ -3,6 +3,7 @@
 pub mod aws_stream;
 pub mod capabilities;
 pub mod client;
+pub mod codex;
 pub mod connections;
 pub mod keys;
 pub mod kiro;
