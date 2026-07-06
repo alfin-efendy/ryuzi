@@ -6,6 +6,7 @@ import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
 import {
   Button,
+  Combobox,
   MenuPanel,
   MenuPanelItem as MenuItem,
   SettingsCard as Card,
@@ -15,6 +16,8 @@ import {
   Switch,
   Textarea,
 } from "@ryuzi/ui";
+import { toast } from "sonner";
+import { commands, type BranchList } from "@/bindings";
 import { BackButton } from "@/components/common/DetailHeader";
 import { ScheduleCard, type ScheduleValue } from "./JobDetailView";
 
@@ -32,6 +35,8 @@ export function JobNewView() {
   const [notifyFail, setNotifyFail] = useState(true);
   const [menu, setMenu] = useState<"project" | "ws" | null>(null);
   const [saving, setSaving] = useState(false);
+  const [branch, setBranch] = useState<string | null>(null);
+  const [branchList, setBranchList] = useState<BranchList | null>(null);
 
   useEffect(() => {
     if (!gwLoaded) void hydrateGw();
@@ -39,6 +44,27 @@ export function JobNewView() {
 
   const project = projects.find((p) => p.projectId === projectId) ?? projects[0];
   const wsName = gateways.find((w) => w.id === gateway)?.name ?? gateway;
+
+  const branchProjectId = project?.projectId ?? null;
+  useEffect(() => {
+    setBranchList(null);
+    setBranch(null);
+    if (!branchProjectId) return;
+    let cancelled = false;
+    void commands.listBranches(branchProjectId).then((res) => {
+      if (cancelled) return;
+      if (res.status === "ok") {
+        setBranchList(res.data);
+        setBranch(res.data.current);
+      } else {
+        toast.error("Couldn't list branches: " + res.error.message);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [branchProjectId]);
+
   const canCreate = prompt.trim().length > 0 && project !== undefined && !saving;
   const goScheduler = () => nav.navigate({ kind: "scheduler" });
 
@@ -51,7 +77,7 @@ export function JobNewView() {
       natural: schedule.natural,
       cron: schedule.cron,
       projectId: project.projectId,
-      branch: "main",
+      branch: branch ?? "main",
       // Ryuzi-only sessions: jobs always run the native runtime.
       agent: "native",
       gateway,
@@ -92,10 +118,20 @@ export function JobNewView() {
               {project?.name ?? "No project"}
               <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
             </Button>
-            <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 font-mono text-[11.5px] text-muted-foreground">
-              <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
-              main
-            </span>
+            <Combobox
+              aria-label="Branch"
+              options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
+              value={branch}
+              onValueChange={setBranch}
+              placeholder="Branch"
+              trigger={
+                <Button variant="outline" size="sm" className="gap-[7px] font-mono text-[11.5px] text-muted-foreground">
+                  <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
+                  {branch ?? "main"}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+            />
             <Button variant="outline" size="sm" onClick={() => setMenu(menu === "ws" ? null : "ws")}>
               <Server aria-hidden size={12} strokeWidth={2} className="size-3" />
               {wsName}
