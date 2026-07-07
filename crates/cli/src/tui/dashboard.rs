@@ -478,17 +478,17 @@ mod tests {
     #[tokio::test]
     async fn config_toggle_runtime_keeps_default_valid() {
         let dir = tempfile::tempdir().unwrap();
-        let c = controller_in(dir.path()).await; // seeds: enabled_runtimes = claude-code, default = claude-code
+        let c = controller_in(dir.path()).await; // seeds: enabled_runtimes = native, default = native (ryuzi-only defaults)
         let mut d = DashboardState::new(&c).await;
         d.active = 3;
-        // move cursor to the claude-code runtime toggle row and Space it off:
-        let idx = d.selectable_index_of_runtime_toggle("claude-code").unwrap(); // small test helper on DashboardState
+        // move cursor to the native runtime toggle row and Space it off:
+        let idx = d.selectable_index_of_runtime_toggle("native").unwrap(); // small test helper on DashboardState
         d.config_cursor = idx;
         d.handle(Key::Space, &c).await;
         assert_eq!(c.enabled_runtimes().await, Vec::<String>::new());
         assert_eq!(c.default_runtime().await, "");
         d.handle(Key::Space, &c).await; // toggle back on
-        assert_eq!(c.default_runtime().await, "claude-code");
+        assert_eq!(c.default_runtime().await, "native");
     }
 
     #[tokio::test]
@@ -566,6 +566,7 @@ mod tests {
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
+                branch_owned: false,
                 title: Some("first".into()),
                 status: ryuzi_core::SessionStatus::Idle,
                 started_by: None,
@@ -583,6 +584,7 @@ mod tests {
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
+                branch_owned: false,
                 title: Some("second".into()),
                 status: ryuzi_core::SessionStatus::Running,
                 started_by: None,
@@ -617,6 +619,7 @@ mod tests {
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
+                branch_owned: false,
                 title: Some("first".into()),
                 status: ryuzi_core::SessionStatus::Idle,
                 started_by: None,
@@ -634,6 +637,7 @@ mod tests {
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
+                branch_owned: false,
                 title: Some("second".into()),
                 status: ryuzi_core::SessionStatus::Running,
                 started_by: None,

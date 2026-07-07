@@ -1,6 +1,6 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { CmdError, GatewayInfo, JobInfo, Result, RunInfo, RuntimeInfo } from "@/bindings";
+import type { CmdError, GatewayInfo, JobInfo, Result, RunInfo } from "@/bindings";
 
 // Mock the Tauri boundary before the view (and the stores it pulls in) load.
 let seededJobs: JobInfo[] = [];
@@ -20,28 +20,7 @@ mock.module("@/bindings", () => ({
 
 const { JobDetailView } = await import("./JobDetailView");
 const { useScheduler } = await import("@/store-scheduler");
-const { useRuntimes } = await import("@/store-runtimes");
 const { useGateways } = await import("@/store-gateways");
-
-const runtime: RuntimeInfo = {
-  id: "claude",
-  name: "Claude Code",
-  color: "#D97757",
-  initial: "C",
-  connection: "anthropic",
-  binaryPath: "/usr/local/bin/claude",
-  installedVersion: "1.0.0",
-  latestVersion: null,
-  npmPackage: null,
-  models: [],
-  enabled: true,
-  model: "opus",
-  permMode: "default",
-  flags: "",
-  tiers: [],
-  isDefault: true,
-  runnable: true,
-};
 
 const gateway: GatewayInfo = {
   id: "local",
@@ -87,7 +66,6 @@ function makeJob(overrides: Partial<JobInfo> = {}): JobInfo {
 function seed(jobs: JobInfo[]) {
   seededJobs = jobs;
   useScheduler.setState({ jobs, loaded: true });
-  useRuntimes.setState({ runtimes: [runtime] });
   useGateways.setState({ gateways: [gateway] });
 }
 
@@ -107,8 +85,8 @@ test("renders the job identity, prompt, and target chips from store data", () =>
   // Cron shows in the header pill and the schedule footer.
   expect(screen.getAllByText("0 2 * * *").length).toBeGreaterThanOrEqual(2);
   expect(screen.getByDisplayValue("Triage new issues and open a summary PR.")).toBeTruthy();
-  // Agent id resolves to the runtime name; gateway id resolves to its display name.
-  expect(screen.getByRole("button", { name: "Claude Code" })).toBeTruthy();
+  // Ryuzi-only: no agent picker; the target chips are project/branch/gateway.
+  expect(screen.queryByRole("button", { name: "Claude Code" })).toBeNull();
   expect(screen.getByText("ryuzi")).toBeTruthy();
   expect(screen.getByText("main")).toBeTruthy();
   expect(screen.getByText("Local host")).toBeTruthy();

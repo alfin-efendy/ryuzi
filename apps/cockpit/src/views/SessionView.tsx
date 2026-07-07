@@ -1,17 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
-import { Button, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
+import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
 import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
-import { chatRuntimeOf, useRuntimes } from "@/store-runtimes";
+import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { basename } from "@/lib/paths";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
-import { PERM_MODES, corePermToUi, uiPermToCore } from "@/constants";
+import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalPrompt } from "@/components/ApprovalPrompt";
 import { StatusDot } from "@/components/common/bits";
@@ -30,8 +30,6 @@ export function SessionView() {
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [permMenuOpen, setPermMenuOpen] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
@@ -39,16 +37,17 @@ export function SessionView() {
   const runtimes = useRuntimes((s) => s.runtimes);
   const project = projects.find((p) => p.projectId === session?.projectId);
   const projectId = project?.projectId;
-  const runtimeId = project?.harness === "claude-code" ? "claude" : project?.harness;
-  const agent = chatRuntimeOf(runtimes, runtimeId);
-  const isNativeSession = runtimeId === "native";
+  // Ryuzi-only: every session runs the native runtime. Tolerant by
+  // construction — legacy rows still saying "claude-code" (restored DBs)
+  // are simply treated as native.
+  const agent = runtimeById(runtimes, "native");
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
 
   useEffect(() => {
-    if (projectId && isNativeSession) void loadCommands(projectId);
-  }, [projectId, isNativeSession, loadCommands]);
+    if (projectId) void loadCommands(projectId);
+  }, [projectId, loadCommands]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
@@ -56,9 +55,9 @@ export function SessionView() {
     return trimmed.slice(1).toLowerCase();
   }, [draft]);
   const slashMatches = useMemo(() => {
-    if (!isNativeSession || slashQuery === null) return [];
+    if (slashQuery === null) return [];
     return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
-  }, [isNativeSession, nativeCommands, slashQuery]);
+  }, [nativeCommands, slashQuery]);
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
   const contextQueryText = contextQuery?.query ?? null;
 
@@ -236,73 +235,49 @@ export function SessionView() {
               >
                 <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
               </Button>
-              <div className="relative">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  title="Permission mode"
-                  onClick={() => setPermMenuOpen((v) => !v)}
-                  className="font-medium"
-                  style={{ color: permUi === "full" ? "#E8703A" : undefined }}
-                >
-                  <CircleAlert aria-hidden size={12} strokeWidth={2} className="size-3" />
-                  {permMeta.label}
-                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                </Button>
-                {permMenuOpen && (
-                  <MenuPanel onClose={() => setPermMenuOpen(false)} className="bottom-[38px] left-0 z-50 w-[280px]">
-                    <MenuSectionLabel>Permission mode</MenuSectionLabel>
-                    {PERM_MODES.map((m) => (
-                      <MenuItem
-                        key={m.id}
-                        selected={m.id === permUi}
-                        onClick={() => {
-                          if (projectId) void setProjectPermMode(projectId, uiPermToCore(m.id));
-                          setPermMenuOpen(false);
-                        }}
-                        className="flex-col items-start gap-0.5"
-                      >
-                        <span className="font-medium">{m.label}</span>
-                        <span className="text-[11px] text-muted-foreground">{m.desc}</span>
-                      </MenuItem>
-                    ))}
-                  </MenuPanel>
-                )}
-              </div>
-              <div className="flex-1" />
-              <div className="relative">
-                <Button variant="ghost" size="sm" title="Model" onClick={() => setModelMenuOpen((v) => !v)} className="font-semibold">
-                  <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
-                  {selectedModel || agent?.name || "No agent"}
-                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                </Button>
-                {modelMenuOpen && (
-                  <MenuPanel
-                    onClose={() => setModelMenuOpen(false)}
-                    className="bottom-[38px] right-0 z-50 max-h-[320px] w-[300px] overflow-y-auto"
+              <Combobox
+                aria-label="Permission mode"
+                options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
+                value={permUi}
+                onValueChange={(mode) => {
+                  if (projectId) void setProjectPermMode(projectId, uiPermToCore(mode as UiPermMode));
+                }}
+                trigger={
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    title="Permission mode"
+                    className="font-medium"
+                    style={{ color: permUi === "full" ? "#E8703A" : undefined }}
                   >
-                    <MenuSectionLabel>{agent ? `${agent.name} models` : "Models"}</MenuSectionLabel>
-                    {modelOptions.length === 0 && (
-                      <div className="px-3 py-2 text-[12px] text-muted-foreground">
-                        No models available. Add a provider connection in Models.
-                      </div>
-                    )}
-                    {modelOptions.map((m) => (
-                      <MenuItem
-                        key={m}
-                        selected={m === selectedModel}
-                        onClick={() => {
-                          if (projectId) void setProjectModel(projectId, m);
-                          setModelMenuOpen(false);
-                        }}
-                        className="font-mono text-[12px]"
-                      >
-                        <span className="min-w-0 flex-1 truncate">{m}</span>
-                      </MenuItem>
-                    ))}
-                  </MenuPanel>
-                )}
-              </div>
+                    <CircleAlert aria-hidden size={12} strokeWidth={2} className="size-3" />
+                    {permMeta.label}
+                    <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                  </Button>
+                }
+              />
+              <div className="flex-1" />
+              <Combobox
+                aria-label="Model"
+                options={modelOptions.map((m) => ({ value: m, label: m, mono: true }))}
+                value={selectedModel || null}
+                onValueChange={(m) => {
+                  if (projectId) void setProjectModel(projectId, m);
+                }}
+                disabled={modelOptions.length === 0}
+                trigger={
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    title={modelOptions.length === 0 ? "No models available. Add a provider connection in Models." : "Model"}
+                    className="font-semibold"
+                  >
+                    <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
+                    {selectedModel || agent?.name || "No agent"}
+                    <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                  </Button>
+                }
+              />
               <Button
                 variant="ghost"
                 size="icon-sm"

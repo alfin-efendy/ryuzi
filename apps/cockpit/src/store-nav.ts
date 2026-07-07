@@ -102,8 +102,14 @@ type NavState = {
   bottomHeight: number;
   rightMaximized: boolean;
   searchQuery: string;
-  composerAgent: AgentId;
-  composerBranch: string;
+  /** null until the selected project's branch list loads, then its current branch. */
+  composerBranch: string | null;
+  /** Run the session in an isolated git worktree (matrix column 1). */
+  composerUseWorktree: boolean;
+  /** Create a new branch for the session (matrix column 2). */
+  composerCreateBranch: boolean;
+  /** Model the next composed session should run on; null = project/runtime default. */
+  composerModel: string | null;
   projectSettingsFor: string | null;
   view: () => View;
   navigate: (view: View) => void;
@@ -118,8 +124,10 @@ type NavState = {
   setBottomHeight: (px: number) => void;
   setRightMaximized: (v: boolean) => void;
   setSearchQuery: (q: string) => void;
-  setComposerAgent: (a: AgentId) => void;
-  setComposerBranch: (b: string) => void;
+  setComposerBranch: (b: string | null) => void;
+  setComposerUseWorktree: (v: boolean) => void;
+  setComposerCreateBranch: (v: boolean) => void;
+  setComposerModel: (model: string | null) => void;
   setProjectSettingsFor: (id: string | null) => void;
 };
 
@@ -137,8 +145,10 @@ export const useNav = create<NavState>((set, get) => ({
   ),
   rightMaximized: false,
   searchQuery: "",
-  composerAgent: "",
-  composerBranch: "main",
+  composerBranch: null,
+  composerUseWorktree: true,
+  composerCreateBranch: true,
+  composerModel: null,
   projectSettingsFor: null,
 
   view: () => get().history.current,
@@ -182,7 +192,9 @@ export const useNav = create<NavState>((set, get) => ({
   },
   setRightMaximized: (v) => set({ rightMaximized: v }),
   setSearchQuery: (q) => set({ searchQuery: q }),
-  setComposerAgent: (a) => set({ composerAgent: a }),
   setComposerBranch: (b) => set({ composerBranch: b }),
+  setComposerUseWorktree: (v) => set({ composerUseWorktree: v }),
+  setComposerCreateBranch: (v) => set({ composerCreateBranch: v }),
+  setComposerModel: (model) => set({ composerModel: model }),
   setProjectSettingsFor: (id) => set({ projectSettingsFor: id }),
 }));

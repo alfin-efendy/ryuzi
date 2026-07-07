@@ -175,11 +175,23 @@ test("loads endpoint config status and enables Apply once server, key, and model
   expect(screen.getByText("Not configured")).toBeTruthy();
   expect(runtimeConfigStatus).toHaveBeenCalledWith("claude");
 
-  // Claude gets Opus/Sonnet/Haiku tier pickers plus the default-model picker,
-  // each offering the provider/model options from the enabled connection.
-  expect(screen.getByText("Opus")).toBeTruthy();
-  await waitFor(() => expect(screen.getAllByRole("option", { name: "anthropic/claude-sonnet-4" }).length).toBe(4));
+  // Claude gets Opus/Sonnet/Haiku tier pickers plus the default-model picker;
+  // each is a Combobox whose popup offers the enabled connection's models.
+  for (const name of ["Opus", "Sonnet", "Haiku", "Default model"]) {
+    expect(await screen.findByRole("combobox", { name })).toBeTruthy();
+  }
+  fireEvent.click(screen.getByRole("combobox", { name: "Opus" }));
+  expect(await screen.findByRole("option", { name: "anthropic/claude-sonnet-4" })).toBeTruthy();
   await waitFor(() => expect((screen.getByRole("button", { name: "Apply" }) as HTMLButtonElement).disabled).toBe(false));
+});
+
+test("tier picker offers runtime models plus the Route by task combo item", async () => {
+  await renderView();
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Smart model" }));
+  expect(await screen.findByRole("option", { name: "claude-opus-4" })).toBeTruthy();
+  expect(screen.getByRole("option", { name: "claude-sonnet-4" })).toBeTruthy();
+  expect(screen.getByRole("option", { name: "Route by task (combo)" })).toBeTruthy();
 });
 
 test("lists app access rows from store data with their access switches", async () => {

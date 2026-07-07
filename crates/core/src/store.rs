@@ -344,6 +344,77 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // Ryuzi-only sessions (spec: docs/superpowers/specs/
+        // 2026-07-06-cockpit-enhancement-batch-design.md, Workstream C):
+        // retire the claude-code default. One-time rewrite of existing rows;
+        // fresh DBs get 'native' from the seeds in `Store::open`. Idempotent:
+        // plain WHERE-guarded UPDATEs, and the CSV rewrite converges after
+        // one pass. The claude-code harness itself STAYS registered so an
+        // unrewritten row (restored DB) still resolves at session start.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            tx.execute(
+                "UPDATE projects SET harness='native' WHERE harness='claude-code'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE settings SET value='native' WHERE key='default_runtime' AND value='claude-code'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE settings SET value='native' WHERE key='default_agent' AND value='claude'",
+                [],
+            )?;
+            // enabled_runtimes is a CSV: swap 'claude-code' for 'native',
+            // dedupe, and ensure 'native' is present — Ryuzi-only sessions
+            // need the native runtime enabled.
+            let cur: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key='enabled_runtimes'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(cur) = cur {
+                let mut parts: Vec<&str> = Vec::new();
+                for p in cur.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    let p = if p == "claude-code" { "native" } else { p };
+                    if !parts.contains(&p) {
+                        parts.push(p);
+                    }
+                }
+                if !parts.contains(&"native") {
+                    parts.insert(0, "native");
+                }
+                let next = parts.join(",");
+                if next != cur {
+                    tx.execute(
+                        "UPDATE settings SET value=?1 WHERE key='enabled_runtimes'",
+                        params![next],
+                    )?;
+                }
+            }
+            Ok(())
+        }),
+        // Branch controls (workstream B): which sessions own their branch.
+        // 1 (owned) is the legacy behavior — every pre-existing session's
+        // branch name was engine-generated, so teardown may delete it.
+        // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
+        // this migration on a DB that already has the column (e.g. the
+        // rewind-and-replay in `migration_13_rewrites_claude_code_defaults_to_native`,
+        // which now also re-runs this — the newest — migration) is a no-op
+        // instead of a "duplicate column" error.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let exists = tx
+                .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='branch_owned'")?
+                .exists([])?;
+            if !exists {
+                tx.execute(
+                    "ALTER TABLE sessions ADD COLUMN branch_owned INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -455,8 +526,8 @@ impl Store {
         interact_on(&pool, |c| {
             c.execute_batch(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_gateways', 'discord');\
-                 INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_runtimes', 'claude-code');\
-                 INSERT OR IGNORE INTO settings(key, value) VALUES ('default_runtime', 'claude-code');",
+                 INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_runtimes', 'native');\
+                 INSERT OR IGNORE INTO settings(key, value) VALUES ('default_runtime', 'native');",
             )
         })
         .await?;
@@ -566,12 +637,12 @@ impl Store {
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
                     s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
-                    s.started_by, s.resume_attempts
+                    s.started_by, s.resume_attempts, s.branch_owned
                 ],
             )
         })
@@ -1215,7 +1286,7 @@ impl Store {
 }
 
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     let status: String = r.get(6)?;
@@ -1231,6 +1302,7 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
         last_active: r.get(8)?,
         started_by: r.get(9)?,
         resume_attempts: r.get(10)?,
+        branch_owned: r.get(11)?,
     })
 }
 
@@ -1315,6 +1387,7 @@ mod tests {
             created_at: Some(1),
             last_active: Some(1),
             resume_attempts: 0,
+            branch_owned: true,
         }
     }
 
@@ -1373,6 +1446,40 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_adds_sessions_branch_owned_defaulting_to_owned() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // A row inserted without the new column (as every pre-migration row
+        // was) must read back as engine-owned: legacy sessions keep today's
+        // delete-branch-on-teardown behavior.
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO sessions(session_pk, project_id) VALUES ('legacy', 'p1')",
+                    [],
+                )
+            })
+            .await
+            .unwrap();
+        let s = store.get_session("legacy").await.unwrap().unwrap();
+        assert!(s.branch_owned, "legacy rows must default to branch_owned=1");
+    }
+
+    #[tokio::test]
+    async fn insert_session_roundtrips_branch_owned_false() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let mut s = sample_session();
+        s.branch_owned = false;
+        store.insert_session(s).await.unwrap();
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert!(
+            !got.branch_owned,
+            "user-named branches persist as not-owned"
+        );
     }
 
     #[tokio::test]
@@ -1735,7 +1842,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("claude-code")
+            Some("native")
         );
         assert_eq!(
             store
@@ -1743,7 +1850,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("claude-code")
+            Some("native")
         );
         // Upsert + empty string is a real value:
         store
@@ -1831,6 +1938,88 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("discord")
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_13_rewrites_claude_code_defaults_to_native() {
+        // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
+        // DB, seed the old values, then wind user_version back two so both
+        // the rewrite migration (13) AND the migration appended after it
+        // (14, sessions.branch_owned — hook-guarded, so replaying it is a
+        // no-op) re-run on the next open. `Migrations` always fast-forwards
+        // to the latest defined version, so there is no way to replay 13
+        // alone once something is appended after it.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            c.pragma_update(None, "user_version", v - 2)
+        };
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        "INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p-old', 'old', '/w', 'claude-code');
+                         INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p-new', 'new', '/w2', 'native');
+                         UPDATE settings SET value='claude-code' WHERE key='default_runtime';
+                         UPDATE settings SET value='claude-code,codex' WHERE key='enabled_runtimes';
+                         INSERT INTO settings(key, value) VALUES ('default_agent', 'claude');",
+                    )?;
+                    rewind(c)
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(
+            store.get_project("p-old").await.unwrap().unwrap().harness,
+            "native",
+            "claude-code project rows must be rewritten to native"
+        );
+        assert_eq!(
+            store.get_project("p-new").await.unwrap().unwrap().harness,
+            "native"
+        );
+        assert_eq!(
+            store
+                .get_setting("default_runtime")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("native")
+        );
+        assert_eq!(
+            store.get_setting("default_agent").await.unwrap().as_deref(),
+            Some("native")
+        );
+        // CSV: claude-code swapped for native, other entries preserved.
+        assert_eq!(
+            store
+                .get_setting("enabled_runtimes")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("native,codex")
+        );
+
+        // Idempotent: winding back and re-running must not change anything
+        // (e.g. it must not duplicate 'native' in the CSV).
+        store.with_conn(rewind).await.unwrap();
+        drop(store);
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(
+            store
+                .get_setting("enabled_runtimes")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("native,codex")
+        );
+        assert_eq!(
+            store.get_project("p-old").await.unwrap().unwrap().harness,
+            "native"
         );
     }
 

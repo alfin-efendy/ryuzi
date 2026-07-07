@@ -7,7 +7,7 @@ import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
 import {
   Button,
-  NativeSelect,
+  Combobox,
   SettingsCard as Card,
   SettingsCardHeader as CardHeader,
   SettingsCardHint as CardHint,
@@ -292,16 +292,17 @@ export function ProviderDetailView({ provider }: { provider: string }) {
             </CardHint>
             <div className="ml-auto flex items-center gap-2">
               <span className="text-xs font-medium text-muted-foreground">Account routing</span>
-              <NativeSelect
+              <Combobox
                 aria-label="Account routing"
+                options={[
+                  { value: "fallback", label: "By order" },
+                  { value: "round-robin", label: "Round robin" },
+                ]}
                 value={accountStrategy}
-                onChange={(event) => void setStrategy(event.target.value as ModelRouteStrategy)}
+                onValueChange={(v) => void setStrategy(v as ModelRouteStrategy)}
                 disabled={savingStrategy}
                 className="w-[140px]"
-              >
-                <option value="fallback">By order</option>
-                <option value="round-robin">Round robin</option>
-              </NativeSelect>
+              />
               <Button onClick={() => setAddOpen(true)}>
                 <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
                 Add account

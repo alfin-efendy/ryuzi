@@ -553,6 +553,7 @@ mod tests {
                 created_at: Some(now),
                 last_active: Some(now),
                 resume_attempts: 0,
+                branch_owned: true,
             })
             .await
             .unwrap();
@@ -1043,7 +1044,7 @@ mod tests {
         let store = Store::open(&db_path).await.unwrap();
         let mut regs = Registries::new();
         regs.harness
-            .register("claude-code", Arc::new(PermFakeHarnessFactory));
+            .register("native", Arc::new(PermFakeHarnessFactory));
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store().clone();
@@ -1195,6 +1196,7 @@ mod tests {
                 created_at: Some(now),
                 last_active: Some(now),
                 resume_attempts: 0,
+                branch_owned: true,
             })
             .await
             .unwrap();

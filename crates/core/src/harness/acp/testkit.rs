@@ -1595,6 +1595,7 @@ pub async fn run_perm_mock_via_harness(
         created_at: None,
         last_active: None,
         resume_attempts: 0,
+        branch_owned: true,
     };
     store.insert_session(session).await.unwrap();
 

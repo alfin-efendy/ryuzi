@@ -73,6 +73,32 @@ test("readClampedPanelSize parses, defaults, and clamps a persisted size to the 
   expect(readClampedPanelSize("2000", 900, BOTTOM_HEIGHT)).toBe(540); // 60% of 900
 });
 
-test("composer runtime starts unset so new chat follows the configured default runtime", () => {
-  expect(useNav.getState().composerAgent).toBe("");
+test("composer model starts unset and round-trips through setComposerModel", () => {
+  expect(useNav.getState().composerModel).toBeNull();
+  useNav.getState().setComposerModel("openrouter/qwen3:free");
+  expect(useNav.getState().composerModel).toBe("openrouter/qwen3:free");
+  useNav.getState().setComposerModel(null);
+  expect(useNav.getState().composerModel).toBeNull();
+});
+
+test("composer git controls default to worktree ON, new branch ON, no branch until the list loads", () => {
+  const s = useNav.getState();
+  expect(s.composerBranch).toBeNull();
+  expect(s.composerUseWorktree).toBe(true);
+  expect(s.composerCreateBranch).toBe(true);
+});
+
+test("composer git setters update and reset state", () => {
+  useNav.getState().setComposerBranch("feature/x");
+  useNav.getState().setComposerUseWorktree(false);
+  useNav.getState().setComposerCreateBranch(false);
+  expect(useNav.getState().composerBranch).toBe("feature/x");
+  expect(useNav.getState().composerUseWorktree).toBe(false);
+  expect(useNav.getState().composerCreateBranch).toBe(false);
+  // setComposerBranch(null) clears the selection (project switch).
+  useNav.getState().setComposerBranch(null);
+  expect(useNav.getState().composerBranch).toBeNull();
+  // restore defaults for other tests in this file
+  useNav.getState().setComposerUseWorktree(true);
+  useNav.getState().setComposerCreateBranch(true);
 });

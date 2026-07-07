@@ -1,6 +1,9 @@
 use crate::error::CmdError;
+use ryuzi_core::branches::BranchList;
 use ryuzi_core::domain::AttachmentRef;
-use ryuzi_core::{ControlPlane, Message, PermMode, Project, Session, TurnPrompt};
+use ryuzi_core::{
+    ControlPlane, Message, PermMode, Project, Session, SessionGitOptions, TurnPrompt,
+};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::fmt::Write as _;
@@ -67,6 +70,27 @@ pub async fn connect_project(
         .await?)
 }
 
+#[tauri::command]
+#[specta::specta]
+pub async fn list_branches(cp: State<'_, Arc<ControlPlane>>, project_id: String) -> R<BranchList> {
+    let project = cp
+        .store()
+        .get_project(&project_id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown project: {project_id}"),
+        })?;
+    // git2 is blocking; keep it off the async runtime's worker thread.
+    let list = tokio::task::spawn_blocking(move || {
+        ryuzi_core::branches::list_branches(Path::new(&project.workdir))
+    })
+    .await
+    .map_err(|e| CmdError {
+        message: format!("list_branches task failed: {e}"),
+    })??;
+    Ok(list)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatContextArg {
@@ -74,6 +98,28 @@ pub struct ChatContextArg {
     pub voice_transcript: Option<String>,
     #[serde(default)]
     pub references: Vec<String>,
+}
+
+/// Per-start git controls from the composer (behavior matrix, workstream B).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GitOptions {
+    pub use_worktree: bool,
+    pub create_branch: bool,
+    pub branch_name: Option<String>,
+    pub base_branch: Option<String>,
+}
+
+impl From<GitOptions> for SessionGitOptions {
+    fn from(g: GitOptions) -> Self {
+        let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        SessionGitOptions {
+            use_worktree: g.use_worktree,
+            create_branch: g.create_branch,
+            branch_name: clean(g.branch_name),
+            base_branch: clean(g.base_branch),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
@@ -84,16 +130,16 @@ pub struct ChatRequestOptions {
     pub context: Option<ChatContextArg>,
     #[serde(default)]
     pub attachments: Vec<String>,
+    /// None => engine default (worktree ON, new engine-named branch from HEAD).
+    pub git: Option<GitOptions>,
 }
 
-fn harness_for_runtime(runtime_id: &str) -> Result<&'static str, CmdError> {
-    match runtime_id {
-        "native" => Ok("native"),
-        "claude" => Ok("claude-code"),
-        other => Err(CmdError {
-            message: format!("runtime '{other}' cannot run chat sessions yet"),
-        }),
-    }
+/// Ryuzi-only sessions: every runtime id resolves to the native harness.
+/// Legacy ids ("claude", "native") and anything else are accepted so old
+/// frontends or queued payloads can never error here; the Result shape is
+/// kept so call sites stay `?`-compatible.
+fn harness_for_runtime(_runtime_id: &str) -> Result<&'static str, CmdError> {
+    Ok("native")
 }
 
 async fn apply_runtime_choice(
@@ -125,11 +171,10 @@ async fn apply_runtime_choice(
         harness
     };
     let current_model = project.model.clone();
-    let next_model = if runtime_id.is_some() {
-        model
-    } else {
-        model.or_else(|| current_model.clone())
-    };
+    // Ryuzi-only: a runtime choice no longer implies a model reset — the
+    // composer always sends runtimeId "native", so `model: null` must keep
+    // the project's pinned model instead of clearing it.
+    let next_model = model.or_else(|| current_model.clone());
     if project.harness != next_harness || current_model != next_model {
         cp.store()
             .update_project(project_id, next_model, project.perm_mode, next_harness)
@@ -254,6 +299,7 @@ pub async fn start_session(
         options.model.as_deref(),
     )
     .await?;
+    let git: Option<SessionGitOptions> = options.git.clone().map(Into::into);
     let attachments = attachment_refs_from_paths(&options.attachments).await?;
     let agent_prompt = chat_agent_prompt(&prompt, options.context.as_ref());
     // `.inner()` -> &Arc<ControlPlane>: start/continue_session take `self: &Arc<Self>`.
@@ -267,6 +313,7 @@ pub async fn start_session(
             },
             "cockpit",
             &attachments,
+            git,
         )
         .await?)
 }
@@ -393,10 +440,50 @@ mod tests {
     }
 
     #[test]
-    fn harness_for_runtime_maps_chat_runtimes() {
+    fn harness_for_runtime_always_resolves_native() {
+        // Ryuzi-only sessions: any id — current, legacy, or unknown —
+        // resolves to the native harness instead of erroring.
         assert_eq!(harness_for_runtime("native").unwrap(), "native");
-        assert_eq!(harness_for_runtime("claude").unwrap(), "claude-code");
-        assert!(harness_for_runtime("codex").is_err());
+        assert_eq!(harness_for_runtime("claude").unwrap(), "native");
+        assert_eq!(harness_for_runtime("codex").unwrap(), "native");
+        assert_eq!(harness_for_runtime("anything-legacy").unwrap(), "native");
+    }
+
+    #[tokio::test]
+    async fn apply_runtime_choice_keeps_the_pinned_model_when_none_is_sent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
+        cp.store()
+            .insert_project(Project {
+                project_id: "p1".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                harness: "claude-code".into(),
+                model: Some("openrouter/qwen3:free".into()),
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+
+        // The composer always sends runtimeId "native"; model may be null.
+        apply_runtime_choice(&cp, "p1", Some("native"), None)
+            .await
+            .unwrap();
+
+        let got = cp.store().get_project("p1").await.unwrap().unwrap();
+        assert_eq!(
+            got.harness, "native",
+            "legacy harness migrates on next start"
+        );
+        assert_eq!(
+            got.model.as_deref(),
+            Some("openrouter/qwen3:free"),
+            "model:null must not clear the pinned model"
+        );
     }
 
     #[test]
@@ -434,5 +521,44 @@ mod tests {
         );
         assert!(out.contains("- Referenced file: src/main.rs"));
         assert!(out.contains("- Referenced file: crates/core/src/lib.rs"));
+    }
+
+    #[test]
+    fn chat_request_options_git_defaults_to_none_and_deserializes() {
+        // Old payloads (no `git` key) keep parsing.
+        let opts: ChatRequestOptions =
+            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
+                .unwrap();
+        assert!(opts.git.is_none());
+
+        let opts: ChatRequestOptions = serde_json::from_value(serde_json::json!({
+            "git": {
+                "useWorktree": false,
+                "createBranch": true,
+                "branchName": "feat/x",
+                "baseBranch": null
+            }
+        }))
+        .unwrap();
+        let git = opts.git.unwrap();
+        assert!(!git.use_worktree);
+        assert!(git.create_branch);
+        assert_eq!(git.branch_name.as_deref(), Some("feat/x"));
+        assert_eq!(git.base_branch, None);
+    }
+
+    #[test]
+    fn git_options_convert_to_session_git_options_trimming_blanks() {
+        let core: ryuzi_core::SessionGitOptions = GitOptions {
+            use_worktree: true,
+            create_branch: false,
+            branch_name: Some("   ".into()),
+            base_branch: Some(" develop ".into()),
+        }
+        .into();
+        assert!(core.use_worktree);
+        assert!(!core.create_branch);
+        assert_eq!(core.branch_name, None, "blank names collapse to None");
+        assert_eq!(core.base_branch.as_deref(), Some("develop"));
     }
 }

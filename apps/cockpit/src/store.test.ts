@@ -1,21 +1,6 @@
 import { test, expect, spyOn } from "bun:test";
 import { useStore } from "./store";
-import { commands, type Project } from "./bindings";
-
-function project(overrides: Partial<Project> = {}): Project {
-  return {
-    projectId: "p1",
-    name: "demo",
-    workdir: "/tmp/demo",
-    source: null,
-    harness: "claude-code",
-    model: "anthropic/claude-x",
-    effort: null,
-    permMode: "default",
-    createdAt: 1,
-    ...overrides,
-  };
-}
+import { commands } from "./bindings";
 
 function reset() {
   useStore.setState({
@@ -292,6 +277,7 @@ const runningSession = (pk: string) => ({
   lastActive: null,
   startedBy: null,
   resumeAttempts: 0,
+  branchOwned: true,
 });
 
 test("result event flips the session status back to idle (so the composer leaves Stop mode)", () => {
@@ -316,33 +302,6 @@ test("result event leaves other sessions' status untouched", () => {
   expect(byPk).toEqual({ s1: "idle", s2: "running" });
 });
 
-test("setProjectHarness calls updateProject with the chosen harness, preserving model/permMode", async () => {
-  reset();
-  useStore.setState({ projects: [project({ harness: "claude-code" })] });
-  const updated = project({ harness: "native" });
-  const update = spyOn(commands, "updateProject").mockResolvedValue({ status: "ok", data: updated });
-  const list = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [updated] });
-  const sessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
-
-  await useStore.getState().setProjectHarness("p1", "native");
-
-  expect(update).toHaveBeenCalledWith("p1", "anthropic/claude-x", "default", "native");
-  expect(useStore.getState().projects[0].harness).toBe("native");
-
-  update.mockRestore();
-  list.mockRestore();
-  sessions.mockRestore();
-});
-
-test("setProjectHarness is a no-op when the harness is unchanged", async () => {
-  reset();
-  useStore.setState({ projects: [project({ harness: "native" })] });
-  const update = spyOn(commands, "updateProject");
-  await useStore.getState().setProjectHarness("p1", "native");
-  expect(update).not.toHaveBeenCalled();
-  update.mockRestore();
-});
-
 test("start forwards chat options so composer runtime, context, and attachments reach IPC", async () => {
   reset();
   const start = spyOn(commands, "startSession").mockResolvedValue({
@@ -359,6 +318,7 @@ test("start forwards chat options so composer runtime, context, and attachments 
       createdAt: 1,
       lastActive: 1,
       resumeAttempts: 0,
+      branchOwned: true,
     },
   });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
@@ -376,8 +336,48 @@ test("start forwards chat options so composer runtime, context, and attachments 
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
+    git: null,
   });
   expect(useStore.getState().focusedSessionPk).toBe("s1");
+
+  start.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("start forwards composer git options to IPC", async () => {
+  reset();
+  const start = spyOn(commands, "startSession").mockResolvedValue({
+    status: "ok",
+    data: {
+      sessionPk: "s2",
+      projectId: "p1",
+      agentSessionId: null,
+      worktreePath: null,
+      branch: "feat/login",
+      title: "go",
+      status: "running",
+      startedBy: "cockpit",
+      createdAt: 1,
+      lastActive: 1,
+      resumeAttempts: 0,
+      branchOwned: false,
+    },
+  });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await useStore.getState().start("p1", "go", {
+    git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
+  });
+
+  expect(start).toHaveBeenCalledWith("p1", "go", {
+    runtimeId: null,
+    model: null,
+    context: null,
+    attachments: [],
+    git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
+  });
 
   start.mockRestore();
   listProjects.mockRestore();

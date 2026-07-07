@@ -288,6 +288,17 @@ test("provider detail shows accounts for the selected provider", async () => {
   expect(screen.getByText("gpt-4.1")).toBeTruthy();
 });
 
+test("changing account routing opens a listbox and persists the picked strategy", async () => {
+  useConnections.setState({ catalog, connections: [connection, secondConnection], loaded: true });
+  render(<ProviderDetailView provider="openai" />);
+
+  await screen.findByText("2 active · By order");
+  fireEvent.click(screen.getByRole("combobox", { name: "Account routing" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Round robin" }));
+
+  expect(await screen.findByText("2 active · Round robin")).toBeTruthy();
+});
+
 test("provider detail spans the vendor family across catalog auth methods", async () => {
   useConnections.setState({ catalog, connections: [claudeConnection, anthropicApiConnection], loaded: true });
   render(<ProviderDetailView provider="anthropic" />);
@@ -311,6 +322,24 @@ test("Route tab lists model route aliases and their ordered targets", async () =
   expect(screen.getByRole("button", { name: "New route" })).toBeTruthy();
 });
 
+test("route form renders strategy and target comboboxes with option lists", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+
+  const strategy = await screen.findByRole("combobox", { name: "Strategy" });
+  fireEvent.click(strategy);
+  expect(await screen.findByRole("option", { name: "Round robin" })).toBeTruthy();
+  expect(screen.getByRole("option", { name: "By order" })).toBeTruthy();
+  // close the strategy popup before opening the target one
+  fireEvent.keyDown(strategy, { key: "Escape" });
+
+  const target = screen.getByRole("combobox", { name: "Target 1" });
+  fireEvent.click(target);
+  expect(await screen.findByRole("option", { name: "OpenAI / gpt-4.1" })).toBeTruthy();
+});
+
 test("route target dropdown collapses multiple accounts of the same provider into one option per model", async () => {
   render(<ModelsView />);
 
@@ -319,7 +348,8 @@ test("route target dropdown collapses multiple accounts of the same provider int
 
   // connection and secondConnection are both `openai` accounts that both
   // serve gpt-4.1 — the dropdown must dedupe to a single family+model option.
-  expect(screen.getAllByRole("option", { name: "OpenAI / gpt-4.1" })).toHaveLength(1);
+  fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
+  expect(await screen.findAllByRole("option", { name: "OpenAI / gpt-4.1" })).toHaveLength(1);
 });
 
 test("route target dropdown collapses anthropic + anthropic-oauth accounts sharing a model into one Anthropic option", async () => {
@@ -337,7 +367,8 @@ test("route target dropdown collapses anthropic + anthropic-oauth accounts shari
   fireEvent.click(await screen.findByRole("button", { name: "Route" }));
   fireEvent.click(screen.getByRole("button", { name: "New route" }));
 
-  expect(screen.getAllByRole("option", { name: `Anthropic / ${sharedModel}` })).toHaveLength(1);
+  fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
+  expect(await screen.findAllByRole("option", { name: `Anthropic / ${sharedModel}` })).toHaveLength(1);
 });
 
 test("route form saves targets as {provider, model} scoped to the family, not the connection", async () => {

@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
-import { ArrowUpRight, Check, ChevronDown, CircleAlert, Clock, Folder, GitBranch, Play, Server, Trash2 } from "lucide-react";
+import { ArrowUpRight, Check, CircleAlert, Clock, Folder, GitBranch, Play, Server, Trash2 } from "lucide-react";
 import { commands } from "@/bindings";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { formatDuration, formatNextRun, formatStarted, jobById, toInput, useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
@@ -9,8 +8,6 @@ import { useStore } from "@/store";
 import {
   Button,
   Input,
-  MenuPanel,
-  MenuPanelItem as MenuItem,
   Segmented,
   SettingsCard as Card,
   SettingsCardHeader as CardHeader,
@@ -200,11 +197,9 @@ const RUN_META: Record<string, { color: string; label: string }> = {
 
 export function JobDetailView({ id }: { id: string }) {
   const { jobs, loaded, hydrate, toggle, updateJob, remove, runNow } = useScheduler();
-  const runtimes = useRuntimes((s) => s.runtimes);
   const gateways = useGateways((s) => s.gateways);
   const setFocused = useStore((s) => s.setFocused);
   const nav = useNav();
-  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   const [promptDraft, setPromptDraft] = useState<string | null>(null);
 
   useEffect(() => {
@@ -216,7 +211,6 @@ export function JobDetailView({ id }: { id: string }) {
     return <div className="flex flex-1 items-center justify-center text-[13px] text-muted-foreground">Job not found.</div>;
   }
 
-  const agent = runtimeById(runtimes, j.agent);
   const ws = gateways.find((w) => w.id === j.gateway);
   const wsName = ws?.name ?? j.gateway;
   const failedRuns = j.history.filter((r) => r.status === "failed").length;
@@ -276,11 +270,6 @@ export function JobDetailView({ id }: { id: string }) {
             />
           </div>
           <div className="relative flex flex-wrap items-center gap-1.5 px-[18px] pb-3.5 pt-2">
-            <Button variant="outline" size="sm" onClick={() => setAgentMenuOpen((v) => !v)}>
-              <StatusDot color={agent?.color ?? "var(--muted-foreground)"} size={7} />
-              {agent?.name ?? j.agent}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-            </Button>
             <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs font-medium text-muted-foreground">
               <Folder aria-hidden size={12} strokeWidth={2} className="shrink-0" />
               {j.projectName}
@@ -293,28 +282,6 @@ export function JobDetailView({ id }: { id: string }) {
               <Server aria-hidden size={12} strokeWidth={2} className="shrink-0" />
               {wsName}
             </span>
-            {agentMenuOpen && (
-              <MenuPanel onClose={() => setAgentMenuOpen(false)} className="bottom-11 left-[18px] w-[280px]">
-                {runtimes
-                  .filter((a) => a.enabled && a.binaryPath && a.runnable)
-                  .map((a) => (
-                    <MenuItem
-                      key={a.id}
-                      selected={a.id === j.agent}
-                      onClick={() => {
-                        patch({ agent: a.id });
-                        setAgentMenuOpen(false);
-                      }}
-                    >
-                      <StatusDot color={a.color} size={9} />
-                      <span className="min-w-0 flex-1">
-                        <span className="block text-[13px] font-medium">{a.name}</span>
-                        <span className="block text-[11.5px] text-muted-foreground">{a.model || a.connection}</span>
-                      </span>
-                    </MenuItem>
-                  ))}
-              </MenuPanel>
-            )}
           </div>
         </Card>
 

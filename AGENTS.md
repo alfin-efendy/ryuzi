@@ -130,10 +130,12 @@ Keep dependencies flowing inward:
 
 ### UI and Design System
 
-- Use `@ryuzi/ui` primitives — `Button`, `Input`, `Textarea`, `NativeSelect`,
+- Use `@ryuzi/ui` primitives — `Button`, `Input`, `Textarea`, `Combobox`,
   `FormField`, `Modal`, `ModalFooter`, `SettingsCard`, `MenuPanel`,
   `Segmented`, `Switch`, and friends. Do not write raw `<button>`, `<input>`,
   `<textarea>`, or `<select>` elements in Cockpit views or components.
+  Value selection uses `Combobox`; `MenuPanel` is only for action menus and
+  composer-anchored autocompletes.
 - Shared UI lives in `packages/ui/src`; Cockpit-specific composition lives in
   `apps/cockpit/src/components` and `apps/cockpit/src/views`.
 - Use lucide icons for icon buttons and controls when available.

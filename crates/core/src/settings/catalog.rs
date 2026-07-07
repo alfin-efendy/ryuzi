@@ -77,7 +77,7 @@ pub static CATALOG: ProviderCatalog = ProviderCatalog {
         },
         RuntimeDescriptor {
             id: "native",
-            label: "Native (ryuzi)",
+            label: "Ryuzi",
             description: "Ryuzi's built-in agent runtime — runs the loop and tools in-process, using your configured model providers",
             fields: &[],
         },

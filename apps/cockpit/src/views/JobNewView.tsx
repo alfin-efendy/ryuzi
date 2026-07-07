@@ -1,14 +1,12 @@
 import { useEffect, useState } from "react";
 import { ChevronDown, Folder, GitBranch, Server } from "lucide-react";
-import { useRuntimes } from "@/store-runtimes";
 import { useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
 import {
   Button,
-  MenuPanel,
-  MenuPanelItem as MenuItem,
+  Combobox,
   SettingsCard as Card,
   SettingsCardHeader as CardHeader,
   SettingsCardRow as CardRow,
@@ -16,36 +14,60 @@ import {
   Switch,
   Textarea,
 } from "@ryuzi/ui";
+import { toast } from "sonner";
+import { commands, type BranchList } from "@/bindings";
 import { BackButton } from "@/components/common/DetailHeader";
-import { StatusDot } from "@/components/common/bits";
 import { ScheduleCard, type ScheduleValue } from "./JobDetailView";
 
 export function JobNewView() {
   const { createJob } = useScheduler();
   const nav = useNav();
   const projects = useStore((s) => s.projects);
-  const runtimes = useRuntimes((s) => s.runtimes);
   const { gateways, loaded: gwLoaded, hydrate: hydrateGw } = useGateways();
 
   const [prompt, setPrompt] = useState("");
-  const [agentId, setAgentId] = useState("claude");
   const [projectId, setProjectId] = useState<string | null>(null);
   const [gateway, setGateway] = useState("local");
   const [schedule, setSchedule] = useState<ScheduleValue>({ mode: "natural", natural: "", cron: "0 9 * * *" });
   const [notifySuccess, setNotifySuccess] = useState(false);
   const [notifyFail, setNotifyFail] = useState(true);
-  const [menu, setMenu] = useState<"agent" | "project" | "ws" | null>(null);
   const [saving, setSaving] = useState(false);
+  const [branch, setBranch] = useState<string | null>(null);
+  const [branchList, setBranchList] = useState<BranchList | null>(null);
 
   useEffect(() => {
     if (!gwLoaded) void hydrateGw();
   }, [gwLoaded, hydrateGw]);
 
-  const runnableAgents = runtimes.filter((a) => a.enabled && a.binaryPath && a.runnable);
-  const agent = runtimes.find((a) => a.id === agentId) ?? runnableAgents[0];
   const project = projects.find((p) => p.projectId === projectId) ?? projects[0];
   const wsName = gateways.find((w) => w.id === gateway)?.name ?? gateway;
-  const canCreate = prompt.trim().length > 0 && project !== undefined && !saving;
+
+  const branchProjectId = project?.projectId ?? null;
+  useEffect(() => {
+    setBranchList(null);
+    setBranch(null);
+    if (!branchProjectId) return;
+    let cancelled = false;
+    void commands.listBranches(branchProjectId).then((res) => {
+      if (cancelled) return;
+      if (res.status === "ok") {
+        setBranchList(res.data);
+        // A detached HEAD's "current" is a short commit id, not a branch name —
+        // preselecting it would let the user unknowingly create a branch named
+        // after a commit id. Leave the selection null; the placeholder shows.
+        if (!res.data.detached) setBranch(res.data.current);
+      } else {
+        toast.error("Couldn't list branches: " + res.error.message);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [branchProjectId]);
+
+  // Gate on the branch list having resolved (preselected or user-picked) so the
+  // `branch ?? "main"` fallback below never fires while branches are still loading.
+  const canCreate = prompt.trim().length > 0 && project !== undefined && branch !== null && !saving;
   const goScheduler = () => nav.navigate({ kind: "scheduler" });
 
   const create = async () => {
@@ -57,8 +79,9 @@ export function JobNewView() {
       natural: schedule.natural,
       cron: schedule.cron,
       projectId: project.projectId,
-      branch: "main",
-      agent: agent?.id ?? "claude",
+      branch: branch ?? "main",
+      // Ryuzi-only sessions: jobs always run the native runtime.
+      agent: "native",
       gateway,
       prompt: prompt.trim(),
       notifySuccess,
@@ -92,93 +115,53 @@ export function JobNewView() {
             />
           </div>
           <div className="relative flex flex-wrap items-center gap-1.5 px-[18px] pb-3.5 pt-2">
-            <Button variant="outline" size="sm" onClick={() => setMenu(menu === "agent" ? null : "agent")}>
-              <StatusDot color={agent?.color ?? "var(--muted-foreground)"} size={7} />
-              {agent?.name ?? "No agent"}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => setMenu(menu === "project" ? null : "project")}>
-              <Folder aria-hidden size={12} strokeWidth={2} className="size-3" />
-              {project?.name ?? "No project"}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-            </Button>
-            <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 font-mono text-[11.5px] text-muted-foreground">
-              <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
-              main
-            </span>
-            <Button variant="outline" size="sm" onClick={() => setMenu(menu === "ws" ? null : "ws")}>
-              <Server aria-hidden size={12} strokeWidth={2} className="size-3" />
-              {wsName}
-              <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-            </Button>
-            {menu === "agent" && (
-              <MenuPanel onClose={() => setMenu(null)} className="bottom-11 left-[18px] w-[280px]">
-                {runnableAgents.length === 0 && (
-                  <div className="px-2.5 py-2 text-[12.5px] text-muted-foreground">No runnable agents detected.</div>
-                )}
-                {runnableAgents.map((a) => (
-                  <MenuItem
-                    key={a.id}
-                    selected={a.id === agentId}
-                    onClick={() => {
-                      setAgentId(a.id);
-                      setMenu(null);
-                    }}
-                  >
-                    <StatusDot color={a.color} size={9} />
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-[13px] font-medium">{a.name}</span>
-                      <span className="block text-[11.5px] text-muted-foreground">{a.model || a.connection}</span>
-                    </span>
-                  </MenuItem>
-                ))}
-              </MenuPanel>
-            )}
-            {menu === "project" && (
-              <MenuPanel onClose={() => setMenu(null)} className="bottom-11 left-[140px] w-[220px]">
-                {projects.length === 0 && <div className="px-2.5 py-2 text-[12.5px] text-muted-foreground">No projects yet.</div>}
-                {projects.map((p) => (
-                  <MenuItem
-                    key={p.projectId}
-                    selected={p.projectId === project?.projectId}
-                    onClick={() => {
-                      setProjectId(p.projectId);
-                      setMenu(null);
-                    }}
-                  >
-                    <span className="flex-1 font-medium">{p.name}</span>
-                  </MenuItem>
-                ))}
-              </MenuPanel>
-            )}
-            {menu === "ws" && (
-              <MenuPanel onClose={() => setMenu(null)} className="bottom-11 left-[300px] w-[280px]">
-                {gateways.map((w) => {
-                  const eligible = w.id === "local";
-                  return (
-                    <MenuItem
-                      key={w.id}
-                      selected={w.id === gateway}
-                      onClick={() => {
-                        if (!eligible) return;
-                        setGateway(w.id);
-                        setMenu(null);
-                      }}
-                    >
-                      <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md bg-muted">
-                        <span className="font-mono text-[9px] font-semibold text-muted-foreground">{w.badge}</span>
-                      </span>
-                      <span className={`min-w-0 flex-1 ${eligible ? "" : "opacity-50"}`}>
-                        <span className="block text-[13px] font-medium">{w.name}</span>
-                        <span className="block text-[11px] text-muted-foreground">
-                          {eligible ? w.detail : "Runs require the remote daemon (coming)"}
-                        </span>
-                      </span>
-                    </MenuItem>
-                  );
-                })}
-              </MenuPanel>
-            )}
+            <Combobox
+              aria-label="Project"
+              options={projects.map((p) => ({ value: p.projectId, label: p.name }))}
+              value={project?.projectId ?? null}
+              onValueChange={(id) => setProjectId(id)}
+              placeholder="No project"
+              trigger={
+                <Button variant="outline" size="sm">
+                  <Folder aria-hidden size={12} strokeWidth={2} className="size-3" />
+                  {project?.name ?? "No project"}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+            />
+            <Combobox
+              aria-label="Branch"
+              options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
+              value={branch}
+              onValueChange={setBranch}
+              placeholder="Branch"
+              trigger={
+                <Button variant="outline" size="sm" className="gap-[7px] font-mono text-[11.5px] text-muted-foreground">
+                  <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
+                  {branch ?? "main"}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+            />
+            <Combobox
+              aria-label="Workspace"
+              options={gateways.map((w) => ({
+                value: w.id,
+                label: w.name,
+                description: w.id === "local" ? w.detail : "Runs require the remote daemon (coming)",
+              }))}
+              value={gateway}
+              onValueChange={(id) => {
+                if (id === "local") setGateway(id);
+              }}
+              trigger={
+                <Button variant="outline" size="sm">
+                  <Server aria-hidden size={12} strokeWidth={2} className="size-3" />
+                  {wsName}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+            />
           </div>
         </Card>
 

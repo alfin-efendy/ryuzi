@@ -1,10 +1,7 @@
 import {
   Button,
+  Combobox,
   Input,
-  MenuPanel,
-  MenuPanelItem as MenuItem,
-  MenuPanelSeparator as MenuSeparator,
-  NativeSelect,
   Segmented,
   SettingsCard as Card,
   SettingsCardHeader as CardHeader,
@@ -29,7 +26,7 @@ import { useNav } from "@/store-nav";
 
 const WARN = "#F59E0B";
 
-// A single label + NativeSelect row for the endpoint-config card's model
+// A single label + Combobox row for the endpoint-config card's model
 // pickers — options come from the enabled connections' models.
 function ModelSelectRow({
   label,
@@ -45,14 +42,14 @@ function ModelSelectRow({
   return (
     <div className="flex items-center gap-2.5 px-[18px] py-[7px]">
       <span className="w-[100px] shrink-0 text-[12.5px] font-medium text-muted-foreground">{label}</span>
-      <NativeSelect value={value} onChange={(e) => onChange(e.target.value)} className="min-w-0 flex-1">
-        <option value="">— pick a model —</option>
-        {options.map((m) => (
-          <option key={m} value={m}>
-            {m}
-          </option>
-        ))}
-      </NativeSelect>
+      <Combobox
+        aria-label={label}
+        options={options.map((m) => ({ value: m, label: m, mono: true }))}
+        value={value || null}
+        onValueChange={onChange}
+        placeholder="— pick a model —"
+        className="min-w-0 flex-1"
+      />
     </div>
   );
 }
@@ -63,7 +60,6 @@ export function RuntimeDetailView({ id }: { id: string }) {
   const { runtimes, refreshing, refresh, update, setTier, setDefault, updating, updateLog, beginUpdate } = useRuntimes();
   const { apps, loaded: appsLoaded, hydrate: hydrateApps, toggleAgent: toggleAppAgent } = useApps();
   const navigate = useNav((s) => s.navigate);
-  const [openTierMenu, setOpenTierMenu] = useState<string | null>(null);
 
   // Endpoint-config card (spec §5): apply/reset native CLI configs pointed at
   // Ryuzi's local router, guarded on the server being up + a key existing.
@@ -240,40 +236,30 @@ export function RuntimeDetailView({ id }: { id: string }) {
                     <span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">Not set</span>
                   )}
                 </div>
-                <Button variant="outline" onClick={() => setOpenTierMenu((v) => (v === tier.id ? null : tier.id))}>
-                  Select model
-                </Button>
-                {openTierMenu === tier.id && (
-                  <MenuPanel onClose={() => setOpenTierMenu(null)} className="right-[18px] top-[42px] w-[240px]">
-                    {agent.models.length === 0 && (
-                      <div className="px-3 py-2 text-[12px] text-muted-foreground">
-                        No models detected{agent.id === "ollama" ? " — pull one with `ollama pull`" : ""}.
-                      </div>
-                    )}
-                    {agent.models.map((m) => (
-                      <MenuItem
-                        key={m}
-                        selected={!tier.combo && tier.value === m}
-                        onClick={() => {
-                          void setTier(agent.id, tier.id, m);
-                          setOpenTierMenu(null);
-                        }}
-                      >
-                        <span className="flex-1">{m}</span>
-                      </MenuItem>
-                    ))}
-                    <MenuSeparator />
-                    <MenuItem
-                      selected={tier.combo === true}
-                      onClick={() => {
-                        void setTier(agent.id, tier.id, "route by task", true);
-                        setOpenTierMenu(null);
-                      }}
+                <Combobox
+                  aria-label={`${tier.label} model`}
+                  options={[
+                    ...agent.models.map((m) => ({ value: m, label: m, mono: true })),
+                    { value: "__combo__", label: "Route by task (combo)" },
+                  ]}
+                  value={tier.combo ? "__combo__" : tier.value}
+                  onValueChange={(v) => {
+                    if (v === "__combo__") void setTier(agent.id, tier.id, "route by task", true);
+                    else void setTier(agent.id, tier.id, v);
+                  }}
+                  trigger={
+                    <Button
+                      variant="outline"
+                      title={
+                        agent.models.length === 0
+                          ? `No models detected${agent.id === "ollama" ? " — pull one with `ollama pull`" : ""}.`
+                          : undefined
+                      }
                     >
-                      <span className="flex-1">Route by task (combo)</span>
-                    </MenuItem>
-                  </MenuPanel>
-                )}
+                      Select model
+                    </Button>
+                  }
+                />
               </div>
             ))}
           <div className="h-2 border-b border-border" />
@@ -292,18 +278,16 @@ export function RuntimeDetailView({ id }: { id: string }) {
             <span className="w-[110px] shrink-0 text-[13px] font-medium">Default model</span>
             {isNative ? (
               agent.models.length > 0 ? (
-                <NativeSelect
+                <Combobox
+                  aria-label="Default model"
+                  options={[
+                    { value: "", label: "Router default (first usable provider)" },
+                    ...agent.models.map((m) => ({ value: m, label: m, mono: true })),
+                  ]}
                   value={agent.model || ""}
-                  onChange={(e) => void update(agent.id, { model: e.target.value })}
+                  onValueChange={(v) => void update(agent.id, { model: v })}
                   className="min-w-0 flex-1"
-                >
-                  <option value="">Router default (first usable provider)</option>
-                  {agent.models.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </NativeSelect>
+                />
               ) : (
                 <span className="flex-1 truncate text-xs text-muted-foreground">
                   Add an enabled provider connection in Models → Providers to pick a model.

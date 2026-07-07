@@ -74,7 +74,12 @@ impl Tool for Glob {
                         .ok()
                         .and_then(|m| m.modified().ok())
                         .unwrap_or(std::time::UNIX_EPOCH);
-                    hits.push((mtime, rel.to_string_lossy().to_string()));
+                    // Model-visible paths use forward slashes on every
+                    // platform (Windows PathBuf joins with `\`).
+                    let rel = rel.to_string_lossy().to_string();
+                    #[cfg(windows)]
+                    let rel = rel.replace('\\', "/");
+                    hits.push((mtime, rel));
                 }
             }
             // Newest first.

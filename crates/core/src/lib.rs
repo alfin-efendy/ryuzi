@@ -1,5 +1,6 @@
 pub mod approval;
 pub mod attachments;
+pub mod branches;
 pub mod connector;
 pub mod control;
 pub mod daemon;
@@ -26,13 +27,14 @@ pub mod sidecar;
 pub mod store;
 pub mod telemetry;
 pub mod update;
+pub mod workspace;
 pub mod worktree;
 
 pub use connector::{Connector, ConnectorCtx, ConnectorFactory, ConnectorRegistry};
 pub use control::{ControlPlane, ProvisionProjectRequest, ProvisionSettings};
 pub use domain::{
     Actor, ApprovalDecision, ApprovalRequest, CoreEvent, McpServerSpec, McpTransport, Message,
-    PermMode, Project, Session, SessionStatus, Surface,
+    PermMode, Project, Session, SessionGitOptions, SessionStatus, Surface,
 };
 pub use gateway::{Gateway, GatewayFactory, GatewayRegistry, MessageRef};
 pub use harness::acp::AcpAdapterDescriptor;

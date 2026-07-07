@@ -65,6 +65,10 @@ mod tests {
         run(p, &["init", "-q"]).await;
         run(p, &["config", "user.email", "t@t"]).await;
         run(p, &["config", "user.name", "t"]).await;
+        // Pin EOL handling: a global core.autocrlf=true (the Git for
+        // Windows default) would check "one\n" back out as "one\r\n" and
+        // break the byte-for-byte assertions below.
+        run(p, &["config", "core.autocrlf", "false"]).await;
         std::fs::write(p.join("a.txt"), "one\n").unwrap();
         run(p, &["add", "."]).await;
         run(p, &["commit", "-qm", "init"]).await;

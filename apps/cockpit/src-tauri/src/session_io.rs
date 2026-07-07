@@ -85,6 +85,8 @@ async fn apply_import(
         created_at: Some(now_ms()),
         last_active: Some(now_ms()),
         resume_attempts: 0,
+        // Imported sessions never own a branch to clean up on end.
+        branch_owned: false,
     };
     store.insert_session(session.clone()).await?;
     for m in export.messages {
@@ -251,6 +253,7 @@ mod tests {
                 created_at: Some(0),
                 last_active: Some(0),
                 resume_attempts: 0,
+                branch_owned: false,
             })
             .await
             .unwrap();

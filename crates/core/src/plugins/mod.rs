@@ -371,32 +371,32 @@ mod toggle_enabled_tests {
     async fn harness_capable_toggles_enabled_runtimes_csv_without_duplicating() {
         let (settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
-        // Deliberately not "claude-code" — a fresh store seeds
-        // `enabled_runtimes = "claude-code"`, which would defeat the "off by
+        // Deliberately not "native" — a fresh store seeds
+        // `enabled_runtimes = "native"`, which would defeat the "off by
         // default" half of this test.
-        host.add(harness_only("native"));
+        host.add(harness_only("claude-code"));
 
-        toggle_enabled(&host, &settings, "native", true)
+        toggle_enabled(&host, &settings, "claude-code", true)
             .await
             .unwrap();
         assert_eq!(
             settings.get("enabled_runtimes").await.unwrap().as_deref(),
-            Some("claude-code,native")
+            Some("native,claude-code")
         );
         // enabling again must not duplicate the entry
-        toggle_enabled(&host, &settings, "native", true)
+        toggle_enabled(&host, &settings, "claude-code", true)
             .await
             .unwrap();
         assert_eq!(
             settings.get("enabled_runtimes").await.unwrap().as_deref(),
-            Some("claude-code,native")
+            Some("native,claude-code")
         );
-        toggle_enabled(&host, &settings, "native", false)
+        toggle_enabled(&host, &settings, "claude-code", false)
             .await
             .unwrap();
         assert_eq!(
             settings.get("enabled_runtimes").await.unwrap().as_deref(),
-            Some("claude-code")
+            Some("native")
         );
     }
 
