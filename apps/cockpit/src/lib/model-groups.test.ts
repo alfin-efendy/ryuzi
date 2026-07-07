@@ -1,0 +1,64 @@
+import { expect, test } from "bun:test";
+import { groupModelOptions } from "./model-groups";
+import type { CatalogEntry, ConnectionInfo } from "../bindings";
+
+const entry = (id: string, family: string, name: string, models: string[] = []): CatalogEntry =>
+  ({
+    id,
+    name,
+    family,
+    color: "#000",
+    initial: name[0],
+    category: "llm",
+    format: "anthropic",
+    requiresBaseUrl: false,
+    models,
+  }) as CatalogEntry;
+const conn = (provider: string, models: string[], enabled = true): ConnectionInfo =>
+  ({
+    id: `c-${provider}`,
+    provider,
+    providerName: provider,
+    color: "#000",
+    initial: "x",
+    authType: "apiKey",
+    label: provider,
+    priority: 0,
+    enabled,
+    baseUrl: null,
+    models,
+    keyMasked: null,
+    needsRelogin: false,
+    claudeCloaking: false,
+  }) as ConnectionInfo;
+
+const catalog = [
+  entry("anthropic", "anthropic", "Anthropic", ["claude-fable-5"]),
+  entry("anthropic-oauth", "anthropic", "Anthropic (OAuth)", []),
+  entry("openai", "openai", "OpenAI", []),
+];
+
+test("groups runtime models by connected provider family", () => {
+  const groups = groupModelOptions(["claude-fable-5", "claude-opus-4-8", "gpt-5.5", "mystery-model"], catalog, [
+    conn("anthropic-oauth", ["claude-opus-4-8"]),
+    conn("openai", ["gpt-5.5"]),
+  ]);
+  expect(groups).toEqual([
+    {
+      label: "Anthropic",
+      options: [
+        { value: "claude-fable-5", label: "claude-fable-5", mono: true },
+        { value: "claude-opus-4-8", label: "claude-opus-4-8", mono: true },
+      ],
+    },
+    { label: "OpenAI", options: [{ value: "gpt-5.5", label: "gpt-5.5", mono: true }] },
+    { label: "Other", options: [{ value: "mystery-model", label: "mystery-model", mono: true }] },
+  ]);
+});
+
+test("disabled connections don't contribute; no catalog → flat list", () => {
+  const flat = groupModelOptions(["m1"], [], []);
+  expect(flat).toEqual([{ value: "m1", label: "m1", mono: true }]);
+  const noGroups = groupModelOptions(["gpt-5.5"], catalog, [conn("openai", ["gpt-5.5"], false)]);
+  expect(noGroups).toEqual([{ value: "gpt-5.5", label: "gpt-5.5", mono: true }]);
+});

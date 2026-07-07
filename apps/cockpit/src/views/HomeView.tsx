@@ -6,10 +6,12 @@ import { commands, type BranchList } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
+import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptions } from "@/lib/composer-git";
+import { groupModelOptions } from "@/lib/model-groups";
 import { projectLabel } from "@/lib/sidebar";
 import { StatusDot } from "@/components/common/bits";
 import { startVoiceDictation } from "@/lib/voice";
@@ -36,10 +38,18 @@ export function HomeView() {
   const setComposerModel = useNav((s) => s.setComposerModel);
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
+  const catalog = useConnections((s) => s.catalog);
+  const connections = useConnections((s) => s.connections);
+  const connectionsLoaded = useConnections((s) => s.loaded);
+  const hydrateConnections = useConnections((s) => s.hydrate);
 
   useEffect(() => {
     if (projectId) void loadCommands(projectId);
   }, [projectId, loadCommands]);
+
+  useEffect(() => {
+    if (!connectionsLoaded) void hydrateConnections();
+  }, [connectionsLoaded, hydrateConnections]);
 
   // A model picked for one project must not leak into the next one.
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
@@ -214,7 +224,7 @@ export function HomeView() {
             <div className="flex-1" />
             <Combobox
               aria-label="Model"
-              options={modelOptions.map((m) => ({ value: m, label: m, mono: true }))}
+              options={groupModelOptions(modelOptions, catalog, connections)}
               value={selectedModel || null}
               onValueChange={(m) => {
                 setComposerModel(m);

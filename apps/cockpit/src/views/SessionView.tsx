@@ -6,9 +6,11 @@ import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
+import { useConnections } from "@/store-connections";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
+import { groupModelOptions } from "@/lib/model-groups";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
@@ -45,10 +47,18 @@ export function SessionView() {
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
+  const catalog = useConnections((s) => s.catalog);
+  const connections = useConnections((s) => s.connections);
+  const connectionsLoaded = useConnections((s) => s.loaded);
+  const hydrateConnections = useConnections((s) => s.hydrate);
 
   useEffect(() => {
     if (projectId) void loadCommands(projectId);
   }, [projectId, loadCommands]);
+
+  useEffect(() => {
+    if (!connectionsLoaded) void hydrateConnections();
+  }, [connectionsLoaded, hydrateConnections]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
@@ -263,7 +273,7 @@ export function SessionView() {
               <div className="flex-1" />
               <Combobox
                 aria-label="Model"
-                options={modelOptions.map((m) => ({ value: m, label: m, mono: true }))}
+                options={groupModelOptions(modelOptions, catalog, connections)}
                 value={selectedModel || null}
                 onValueChange={(m) => {
                   if (projectId) void setProjectModel(projectId, m);
