@@ -138,6 +138,15 @@ const usage: UsageSeries = {
 
 const saveModelRoute = mock((_route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
 
+const refreshProviderModels = mock((_family: string) =>
+  Promise.resolve({
+    status: "ok" as const,
+    data: [
+      { connectionId: "c1", label: "Work OpenAI", ok: false, message: "Work OpenAI: model list request for openai failed with status 401" },
+    ],
+  }),
+);
+
 const updateConnection = mock(
   (
     _id: string,
@@ -159,6 +168,7 @@ mock.module("@/bindings", () => ({
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
     saveModelRoute,
+    refreshProviderModels,
     deleteModelRoute: (_id: string) => Promise.resolve({ status: "ok", data: [] }),
     providerAccountRoute: (provider: string) => Promise.resolve({ status: "ok", data: { provider, strategy: "fallback" } }),
     setProviderAccountRoute: (provider: string, strategy: string) => Promise.resolve({ status: "ok", data: { provider, strategy } }),
@@ -359,6 +369,17 @@ test("changing account routing opens a listbox and persists the picked strategy"
   fireEvent.click(await screen.findByRole("option", { name: "Round robin" }));
 
   expect(await screen.findByText("2 active · Round robin")).toBeTruthy();
+});
+
+test("Refresh models surfaces per-connection failures inline", async () => {
+  refreshProviderModels.mockClear();
+  useConnections.setState({ catalog, connections: [connection], loaded: true });
+  render(<ProviderDetailView provider="openai" />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Refresh models" }));
+
+  await waitFor(() => expect(refreshProviderModels).toHaveBeenCalledWith("openai"));
+  expect(await screen.findByText("Work OpenAI: model list request for openai failed with status 401")).toBeTruthy();
 });
 
 test("provider detail spans the vendor family across catalog auth methods", async () => {
