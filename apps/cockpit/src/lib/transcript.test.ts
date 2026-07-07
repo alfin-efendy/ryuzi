@@ -1,5 +1,14 @@
 import { test, expect } from "bun:test";
-import { buildTranscript, closeDanglingFence, formatTurnDuration, groupRows, messageToRow, turnDurationMs, type Row } from "./transcript";
+import {
+  buildTranscript,
+  closeDanglingFence,
+  editCardsForGroups,
+  formatTurnDuration,
+  groupRows,
+  messageToRow,
+  turnDurationMs,
+  type Row,
+} from "./transcript";
 
 const row = (partial: Partial<Row>): Row => ({
   seq: 0,
@@ -71,9 +80,68 @@ test("consecutive tool_call/status rows cluster into one activity group", () => 
   expect(groups.map((g) => g.type)).toEqual(["activity", "agent"]);
   if (groups[0].type !== "activity") throw new Error("expected activity group");
   expect(groups[0].items).toEqual([
-    { type: "tool", key: "s1", name: "Bash", kind: "execute", status: "completed", output: "ok" },
+    { type: "tool", key: "s1", name: "Bash", kind: "execute", status: "completed", output: "ok", path: null },
     { type: "status", key: "s2", text: "wrote a.txt" },
-    { type: "tool", key: "s4", name: "Tool", kind: null, status: "pending", output: null },
+    { type: "tool", key: "s4", name: "Tool", kind: null, status: "pending", output: null, path: null },
+  ]);
+});
+
+test("editCardsForGroups dedupes completed edit/delete/move targets", () => {
+  const rows: Row[] = [
+    row({
+      seq: 1,
+      role: "assistant",
+      blockType: "tool_call",
+      toolCallId: "t1",
+      toolName: "edit",
+      toolKind: "edit",
+      toolStatus: "completed",
+      toolPath: "src/a.ts",
+    }),
+    row({
+      seq: 2,
+      role: "assistant",
+      blockType: "tool_call",
+      toolCallId: "t2",
+      toolName: "edit",
+      toolKind: "edit",
+      toolStatus: "completed",
+      toolPath: "src/a.ts",
+    }),
+    row({
+      seq: 3,
+      role: "assistant",
+      blockType: "tool_call",
+      toolCallId: "t3",
+      toolName: "delete",
+      toolKind: "delete",
+      toolStatus: "completed",
+      toolPath: "src/b.ts",
+    }),
+    row({
+      seq: 4,
+      role: "assistant",
+      blockType: "tool_call",
+      toolCallId: "t4",
+      toolName: "edit",
+      toolKind: "edit",
+      toolStatus: "failed",
+      toolPath: "src/c.ts",
+    }),
+    row({
+      seq: 5,
+      role: "assistant",
+      blockType: "tool_call",
+      toolCallId: "t5",
+      toolName: "read",
+      toolKind: "read",
+      toolStatus: "completed",
+      toolPath: "src/d.ts",
+    }),
+  ];
+  expect(editCardsForGroups(groupRows(rows))).toEqual([
+    { path: "src/a.ts", kind: "edit" },
+    { path: "src/b.ts", kind: "delete" },
   ]);
 });
 
@@ -157,6 +225,12 @@ test("completed turn collapses thought+activity into one summary, text stays vis
   const summary = blocks[1] as Extract<(typeof blocks)[number], { type: "summary" }>;
   expect(summary.groups.map((g) => g.type)).toEqual(["thought", "activity"]);
   expect(summary.durationMs).toBe(36000);
+});
+
+test("summary blocks carry the turn's edit cards", () => {
+  const blocks = buildTranscript(turn, false);
+  const summary = blocks.find((b) => b.type === "summary") as Extract<(typeof blocks)[number], { type: "summary" }>;
+  expect(summary.editCards).toEqual([{ path: "src/a.ts", kind: "edit" }]);
 });
 
 test("the live last turn stays uncollapsed while running", () => {

@@ -178,7 +178,13 @@ export function SessionView() {
         <TodoPanel sessionPk={session.sessionPk} running={running} />
 
         {/* Transcript */}
-        <Transcript rows={rows} agentName={agent?.name ?? "Agent"} agentColor={agent?.color ?? "var(--muted-foreground)"} running={running}>
+        <Transcript
+          sessionPk={session.sessionPk}
+          rows={rows}
+          agentName={agent?.name ?? "Agent"}
+          agentColor={agent?.color ?? "var(--muted-foreground)"}
+          running={running}
+        >
           {hasApproval && <ApprovalPrompt sessionPk={session.sessionPk} />}
         </Transcript>
 

@@ -451,6 +451,17 @@ async searchFiles(projectId: string, query: string) : Promise<Result<string[], C
 }
 },
 /**
+ * Revert one file in the session workdir to HEAD (Undo on a file-edit card).
+ */
+async revertFile(sessionPk: string, path: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("revert_file", { sessionPk, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Open a shell in the session's worktree (or the project workdir).
  */
 async termOpen(sessionPk: string, cols: number, rows: number) : Promise<Result<string, CmdError>> {

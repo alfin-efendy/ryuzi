@@ -28,7 +28,7 @@ export type Row = {
 export type RowAttachment = { name: string; path: string; contentType: string | null; size: number };
 
 export type ActivityItem =
-  | { type: "tool"; key: string; name: string; kind: string | null; status: string | null; output: string | null }
+  | { type: "tool"; key: string; name: string; kind: string | null; status: string | null; output: string | null; path: string | null }
   | { type: "status"; key: string; text: string };
 
 export type Group =
@@ -38,7 +38,25 @@ export type Group =
   | { type: "activity"; key: string; items: ActivityItem[] }
   | { type: "error"; key: string; text: string };
 
-export type TurnBlock = Group | { type: "summary"; key: string; groups: Group[]; durationMs: number | null };
+export type EditCard = { path: string; kind: string };
+
+export type TurnBlock = Group | { type: "summary"; key: string; groups: Group[]; durationMs: number | null; editCards: EditCard[] };
+
+/** Distinct completed edit/delete/move/write tool targets, first-seen order,
+ *  latest kind wins per path. */
+export function editCardsForGroups(groups: Group[]): EditCard[] {
+  const seen = new Map<string, string>();
+  for (const g of groups) {
+    if (g.type !== "activity") continue;
+    for (const item of g.items) {
+      if (item.type !== "tool" || item.status !== "completed" || !item.path) continue;
+      if (item.kind === "edit" || item.kind === "delete" || item.kind === "move" || item.kind === "write") {
+        seen.set(item.path, item.kind);
+      }
+    }
+  }
+  return Array.from(seen, ([path, kind]) => ({ path, kind }));
+}
 
 function outputPreview(v: unknown): string | null {
   if (v === undefined || v === null) return null;
@@ -138,7 +156,15 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
     if (row.blockType === "tool_call" || row.blockType === "status") {
       const item: ActivityItem =
         row.blockType === "tool_call"
-          ? { type: "tool", key, name: row.toolName ?? "Tool", kind: row.toolKind, status: row.toolStatus, output: row.toolOutput }
+          ? {
+              type: "tool",
+              key,
+              name: row.toolName ?? "Tool",
+              kind: row.toolKind,
+              status: row.toolStatus,
+              output: row.toolOutput,
+              path: row.toolPath,
+            }
           : { type: "status", key, text: row.text };
       if (item.type === "status" && !item.text.trim()) return;
       const last = groups[groups.length - 1];
@@ -209,7 +235,13 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
     for (const g of groups) {
       if (g.type === "activity" || g.type === "thought") {
         if (g === collapsible[0]) {
-          out.push({ type: "summary", key: `sum-${g.key}`, groups: collapsible, durationMs: turnDurationMs(turnRows) });
+          out.push({
+            type: "summary",
+            key: `sum-${g.key}`,
+            groups: collapsible,
+            durationMs: turnDurationMs(turnRows),
+            editCards: editCardsForGroups(collapsible),
+          });
         }
       } else if (g === lastAgent && g.type === "agent") {
         out.push({ ...g, turnEnd: true });

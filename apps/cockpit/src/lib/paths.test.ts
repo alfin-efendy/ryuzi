@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { basename, fileBadge } from "./paths";
 import { joinPath } from "./paths";
+import { toRepoRelative } from "./paths";
 
 describe("basename", () => {
   test("posix paths", () => {
@@ -39,4 +40,10 @@ test("joinPath uses the workdir's separator", () => {
 test("joinPath tolerates trailing separators and empty segments", () => {
   expect(joinPath("C:\\work\\proj\\", "a.ts")).toBe("C:\\work\\proj\\a.ts");
   expect(joinPath("/home/u/proj/", "dir//b.ts")).toBe("/home/u/proj/dir/b.ts");
+});
+
+test("toRepoRelative strips the workdir prefix across separators", () => {
+  expect(toRepoRelative("C:\\work\\proj\\src\\a.ts", "C:\\work\\proj")).toBe("src/a.ts");
+  expect(toRepoRelative("/home/u/proj/src/a.ts", "/home/u/proj")).toBe("src/a.ts");
+  expect(toRepoRelative("src/a.ts", "C:\\work\\proj")).toBe("src/a.ts");
 });

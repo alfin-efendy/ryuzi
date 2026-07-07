@@ -119,6 +119,35 @@ pub async fn git_diff(workdir: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Revert one file to its HEAD state — the exact base [`git_diff`] renders,
+/// so this precisely undoes what a Review card shows. Tracked files are
+/// restored (staged + worktree); untracked files (a created file's "revert"
+/// is deletion) are removed. `rel_path` is repo-relative.
+pub async fn revert_file(workdir: &str, rel_path: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !rel_path.split(['/', '\\']).any(|c| c == ".."),
+        "invalid path: {rel_path}"
+    );
+    let tracked = tokio::process::Command::new("git")
+        .args(["-C", workdir, "ls-files", "--error-unmatch", "--", rel_path])
+        .output()
+        .await?;
+    if tracked.status.success() {
+        let out = tokio::process::Command::new("git")
+            .args(["-C", workdir, "restore", "--staged", "--worktree", "--", rel_path])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git restore failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return Ok(());
+    }
+    tokio::fs::remove_file(std::path::Path::new(workdir).join(rel_path)).await?;
+    Ok(())
+}
+
 /// Case-insensitive substring search over relative file paths (capped).
 pub fn search_files(root: &Path, query: &str, cap: usize) -> Vec<String> {
     let needle = query.to_lowercase();
@@ -159,6 +188,62 @@ pub fn search_files(root: &Path, query: &str, cap: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    /// Empty, unique scratch directory (recreated on reruns of the same pid).
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ryuzi-fsview-core-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Run git isolated from the developer's global/system config so commits
+    /// need no signing keys or hooks.
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=test", "-c", "user.email=test@test"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[tokio::test]
+    async fn revert_file_restores_a_tracked_file_to_head() {
+        let dir = fresh_dir("revert-tracked");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "base").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.join("a.txt"), "agent edit").unwrap();
+        revert_file(dir.to_str().unwrap(), "a.txt").await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "base");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_deletes_an_untracked_file() {
+        let dir = fresh_dir("revert-untracked");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("new.txt"), "created by agent").unwrap();
+        revert_file(dir.to_str().unwrap(), "new.txt").await.unwrap();
+        assert!(!dir.join("new.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_parent_traversal() {
+        let dir = fresh_dir("revert-traversal");
+        git(&dir, &["init", "-q"]);
+        assert!(revert_file(dir.to_str().unwrap(), "../outside.txt").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn tree() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();

@@ -8,6 +8,7 @@ import { Markdown } from "./Markdown";
 import { ThoughtBlock } from "./ThoughtBlock";
 import { ActivityCluster } from "./ToolChip";
 import { TurnSummary } from "./TurnSummary";
+import { FileChangeCards } from "./FileChangeCards";
 
 function MediaItem({ a, onOpenImage }: { a: RowAttachment; onOpenImage: (src: string) => void }) {
   const [failed, setFailed] = useState(false);
@@ -110,12 +111,14 @@ function WorkingPulse({ color }: { color: string }) {
 }
 
 export function Transcript({
+  sessionPk,
   rows,
   agentName,
   agentColor,
   running,
   children,
 }: {
+  sessionPk: string;
   rows: Row[];
   agentName: string;
   agentColor: string;
@@ -177,7 +180,12 @@ export function Transcript({
             case "error":
               return <ErrorRow key={g.key} text={g.text} />;
             case "summary":
-              return <TurnSummary key={g.key} groups={g.groups} durationMs={g.durationMs} />;
+              return (
+                <div key={g.key} className="flex flex-col gap-1.5">
+                  <TurnSummary groups={g.groups} durationMs={g.durationMs} />
+                  <FileChangeCards sessionPk={sessionPk} cards={g.editCards} />
+                </div>
+              );
             default:
               return null;
           }

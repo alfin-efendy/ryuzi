@@ -312,6 +312,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             fsview_cmd::worktree_dirty,
             fsview_cmd::git_diff,
             fsview_cmd::search_files,
+            fsview_cmd::revert_file,
             term::term_open,
             term::term_input,
             term::term_resize,
