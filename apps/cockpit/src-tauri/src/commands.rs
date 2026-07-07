@@ -307,10 +307,7 @@ pub async fn start_session(
         .inner()
         .start_session_with_prompt(
             &project_id,
-            TurnPrompt {
-                agent: agent_prompt,
-                display: prompt,
-            },
+            TurnPrompt::text(agent_prompt, prompt),
             "cockpit",
             &attachments,
             git,
@@ -334,10 +331,7 @@ pub async fn continue_session(
         .inner()
         .continue_session_with_prompt(
             &session_pk,
-            TurnPrompt {
-                agent: agent_prompt,
-                display: prompt,
-            },
+            TurnPrompt::text(agent_prompt, prompt),
             &attachments,
         )
         .await?)

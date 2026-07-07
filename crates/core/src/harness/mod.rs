@@ -49,7 +49,7 @@ pub trait Harness: Send + Sync {
 /// typed". `agent` is what's sent to the harness/agent (possibly
 /// manifest-decorated); `display` is the raw text to persist as the
 /// `"user"/"text"` transcript row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TurnPrompt {
     /// Sent to the harness/agent — may be decorated (e.g. with an attachment
     /// manifest).
@@ -57,6 +57,24 @@ pub struct TurnPrompt {
     /// Persisted as the durable `"user"/"text"` transcript row — the raw text
     /// the user actually typed.
     pub display: String,
+    /// Anthropic content blocks prepended before the text block in the user
+    /// turn (today: base64 image blocks built from attachments). Consumed by
+    /// the native runner; the ACP harness ignores them.
+    pub blocks: Vec<serde_json::Value>,
+    /// Display metadata persisted on the user transcript row —
+    /// `[{name, path, contentType, size}]` per saved attachment.
+    pub attachments: Vec<serde_json::Value>,
+}
+
+impl TurnPrompt {
+    /// A plain-text prompt with no attachment blocks/metadata.
+    pub fn text(agent: impl Into<String>, display: impl Into<String>) -> Self {
+        TurnPrompt {
+            agent: agent.into(),
+            display: display.into(),
+            ..Default::default()
+        }
+    }
 }
 
 /// A live session driven by a `Harness`. Output is emitted via `SessionCtx.events`.
@@ -157,10 +175,7 @@ mod tests {
         let session = harness.start_session(make_ctx().await).await.unwrap();
         assert!(session.agent_session_id().is_none());
         session
-            .send_prompt(TurnPrompt {
-                agent: "hello".into(),
-                display: "hello".into(),
-            })
+            .send_prompt(TurnPrompt::text("hello", "hello"))
             .await
             .unwrap();
     }

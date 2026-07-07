@@ -1027,10 +1027,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "please write out.txt".into(),
-                display: "please write out.txt".into(),
-            },
+            TurnPrompt::text("please write out.txt", "please write out.txt"),
             CancellationToken::new(),
         )
         .await
@@ -1096,16 +1093,9 @@ mod tests {
         )];
         let llm = Arc::new(ScriptedLlm::new(vec![turn]));
         let deps = deps_at(dir.path(), llm).await;
-        let err = run_turn(
-            &deps,
-            TurnPrompt {
-                agent: "x".into(),
-                display: "x".into(),
-            },
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
+        let err = run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("boom"));
     }
 
@@ -1142,10 +1132,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "where is the readme?".into(),
-                display: "where is the readme?".into(),
-            },
+            TurnPrompt::text("where is the readme?", "where is the readme?"),
             CancellationToken::new(),
         )
         .await
@@ -1393,10 +1380,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "go wide".into(),
-                display: "go wide".into(),
-            },
+            TurnPrompt::text("go wide", "go wide"),
             CancellationToken::new(),
         )
         .await
@@ -1475,10 +1459,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             CancellationToken::new(),
         )
         .await
@@ -1536,10 +1517,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             CancellationToken::new(),
         )
         .await
@@ -1614,10 +1592,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "fix login".into(),
-                display: "fix login".into(),
-            },
+            TurnPrompt::text("fix login", "fix login"),
             CancellationToken::new(),
         )
         .await
@@ -1641,10 +1616,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "/review".into(),
-                display: "/review".into(),
-            },
+            TurnPrompt::text("/review", "/review"),
             CancellationToken::new(),
         )
         .await
@@ -1674,11 +1646,10 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                display: "/review auth".into(),
-                agent: "/review auth\n\n[Chat context]\n- Branch: feature/auth\n\n[User attached 1 file - saved to disk:]"
-                    .into(),
-            },
+            TurnPrompt::text(
+                "/review auth\n\n[Chat context]\n- Branch: feature/auth\n\n[User attached 1 file - saved to disk:]",
+                "/review auth",
+            ),
             CancellationToken::new(),
         )
         .await
@@ -1701,16 +1672,9 @@ mod tests {
         let deps = deps_at(dir.path(), llm).await;
         let cancel = CancellationToken::new();
         cancel.cancel();
-        run_turn(
-            &deps,
-            TurnPrompt {
-                agent: "x".into(),
-                display: "x".into(),
-            },
-            cancel,
-        )
-        .await
-        .unwrap();
+        run_turn(&deps, TurnPrompt::text("x", "x"), cancel)
+            .await
+            .unwrap();
         // The user row was still persisted before the cancel check.
         let msgs = deps.store.list_messages("s1").await.unwrap();
         assert_eq!(msgs.len(), 1);

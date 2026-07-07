@@ -359,10 +359,7 @@ mod tests {
         assert_eq!(session.agent_session_id().as_deref(), Some("sess"));
 
         session
-            .send_prompt(TurnPrompt {
-                agent: "hi".into(),
-                display: "hi".into(),
-            })
+            .send_prompt(TurnPrompt::text("hi", "hi"))
             .await
             .unwrap();
 
