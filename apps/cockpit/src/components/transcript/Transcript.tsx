@@ -9,6 +9,7 @@ import { ThoughtBlock } from "./ThoughtBlock";
 import { ActivityCluster } from "./ToolChip";
 import { TurnSummary } from "./TurnSummary";
 import { FileChangeCards } from "./FileChangeCards";
+import { TurnActions } from "./TurnActions";
 
 function MediaItem({ a, onOpenImage }: { a: RowAttachment; onOpenImage: (src: string) => void }) {
   const [failed, setFailed] = useState(false);
@@ -166,12 +167,14 @@ export function Transcript({
               return <UserBubble key={g.key} text={g.text} attachments={g.attachments} onOpenImage={setLightbox} />;
             case "agent":
               return (
-                <AgentTurn
-                  key={g.key}
-                  markdown={streamingTail ? closeDanglingFence(g.markdown) : g.markdown}
-                  agentName={agentName}
-                  agentColor={agentColor}
-                />
+                <div key={g.key} className="flex flex-col">
+                  <AgentTurn
+                    markdown={streamingTail ? closeDanglingFence(g.markdown) : g.markdown}
+                    agentName={agentName}
+                    agentColor={agentColor}
+                  />
+                  {g.turnEnd === true && <TurnActions markdown={g.markdown} />}
+                </div>
               );
             case "thought":
               return <ThoughtBlock key={g.key} markdown={g.markdown} streaming={streamingTail} />;

@@ -8,6 +8,7 @@ import {
   messageToRow,
   turnDurationMs,
   type Row,
+  type TurnBlock,
 } from "./transcript";
 
 const row = (partial: Partial<Row>): Row => ({
@@ -289,4 +290,28 @@ test("transient (seq 0) rows in different turns get distinct keys", () => {
   const errorKeys = blocks.flatMap((b) => (b.type === "error" ? [b.key] : []));
   expect(errorKeys).toHaveLength(2);
   expect(errorKeys[0]).not.toBe(errorKeys[1]);
+});
+
+test("only the last agent text of a completed turn is flagged turnEnd", () => {
+  const rows: Row[] = [
+    row({ seq: 1, role: "user", blockType: "text", text: "q", createdAt: 1 }),
+    row({ seq: 2, role: "assistant", blockType: "text", text: "part 1", createdAt: 2 }),
+    row({
+      seq: 3,
+      role: "assistant",
+      blockType: "tool_call",
+      toolCallId: "t1",
+      toolName: "read",
+      toolKind: "read",
+      toolStatus: "completed",
+      createdAt: 3,
+    }),
+    row({ seq: 4, role: "assistant", blockType: "text", text: "part 2", createdAt: 4 }),
+  ];
+  const blocks = buildTranscript(rows, false);
+  const agents = blocks.filter((b): b is Extract<TurnBlock, { type: "agent" }> => b.type === "agent");
+  expect(agents.map((a) => a.turnEnd === true)).toEqual([false, true]);
+  // and never while the turn is live:
+  const live = buildTranscript(rows, true).filter((b) => b.type === "agent");
+  expect(live.every((a) => !("turnEnd" in a) || a.turnEnd !== true)).toBe(true);
 });
