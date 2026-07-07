@@ -20,6 +20,7 @@ import { Transcript } from "@/components/transcript/Transcript";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
+import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -163,6 +164,7 @@ export function SessionView() {
             </div>
           </div>
           <div className="flex-1" />
+          <OpenInMenu sessionPk={session.sessionPk} />
           <div className="mx-0.5 h-[18px] w-px bg-border" />
           <Button
             variant="ghost"
