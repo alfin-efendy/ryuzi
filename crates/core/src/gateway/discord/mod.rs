@@ -847,7 +847,7 @@ mod tests {
         }
     }
 
-    /// Never actually reached over the network: `with_attachments` only
+    /// Never actually reached over the network: `prepare_attachments` only
     /// calls the fetcher for a non-empty attachment list, and this test
     /// module never asserts on saved/skipped outcomes — only that routing
     /// with attachments present doesn't hang or panic.
@@ -934,7 +934,7 @@ mod tests {
     /// A `Router` wired to a fresh `ControlPlane`/`Store` (workdir_root set,
     /// "native" harness registered — the default runtime `connect_project`
     /// resolves to since Plan C — a fake attachment fetcher so
-    /// `with_attachments` never touches the network) with `FakeGateway`
+    /// `prepare_attachments` never touches the network) with `FakeGateway`
     /// registered under "discord". Mirrors `router.rs`'s own
     /// `wired_control_plane` test helper.
     async fn wired_router(

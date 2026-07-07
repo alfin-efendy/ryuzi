@@ -315,7 +315,7 @@ async fn fake_control_plane_with_telemetry(
 
 /// A fake `AttachmentFetcher`: returns the configured bytes for a known
 /// URL, or a 404 for anything else — no real network I/O, for
-/// `with_attachments` tests.
+/// `prepare_attachments` tests.
 struct FakeAttachmentFetcher {
     bodies: std::collections::HashMap<String, Vec<u8>>,
 }
@@ -345,7 +345,7 @@ impl crate::attachments::AttachmentFetcher for FakeAttachmentFetcher {
 }
 
 /// Like `fake_control_plane`, but wired via `new_full` with an injected
-/// attachment fetcher — for `with_attachments` tests that must not hit
+/// attachment fetcher — for `prepare_attachments` tests that must not hit
 /// the real network.
 async fn fake_control_plane_with_fetcher(
     fetcher: Arc<dyn crate::attachments::AttachmentFetcher>,
@@ -1998,10 +1998,7 @@ async fn user_named_branch_survives_end_session() {
     let session = cp
         .start_session_with_prompt(
             &project.project_id,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             "test",
             &[],
             Some(git_opts(true, true, Some("keep/me"), None)),
@@ -2042,10 +2039,7 @@ async fn engine_named_branch_is_deleted_on_end_session() {
     let session = cp
         .start_session_with_prompt(
             &project.project_id,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             "test",
             &[],
             None,
@@ -2079,10 +2073,7 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
     let session = cp
         .start_session_with_prompt(
             &project.project_id,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             "test",
             &[],
             Some(git_opts(false, false, None, None)),
@@ -2122,10 +2113,7 @@ async fn dirty_tree_refusal_aborts_before_a_session_row_exists() {
     let result = cp
         .start_session_with_prompt(
             &project.project_id,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             "test",
             &[],
             Some(git_opts(false, true, None, None)),

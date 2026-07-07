@@ -21,10 +21,7 @@ impl ControlPlane {
     ) -> anyhow::Result<Session> {
         self.start_session_with_prompt(
             project_id,
-            TurnPrompt {
-                agent: prompt.to_string(),
-                display: prompt.to_string(),
-            },
+            TurnPrompt::text(prompt, prompt),
             started_by,
             attachments,
             None,
@@ -125,15 +122,17 @@ impl ControlPlane {
         let handle = self
             .start_harness_session(&project, &session_pk, &ws.work_dir, None)
             .await?;
-        let final_prompt = self
-            .with_attachments(&session_pk, &prompt.agent, attachments)
+        let prepared = self
+            .prepare_attachments(&session_pk, &prompt.agent, attachments)
             .await;
         self.spawn_prompt(
             handle,
             session_pk.clone(),
             TurnPrompt {
-                agent: final_prompt,
+                agent: prepared.agent,
                 display: prompt.display,
+                blocks: prepared.image_blocks,
+                attachments: prepared.attachments_meta,
             },
         );
 
@@ -159,15 +158,8 @@ impl ControlPlane {
         prompt: &str,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<()> {
-        self.continue_session_with_prompt(
-            session_pk,
-            TurnPrompt {
-                agent: prompt.to_string(),
-                display: prompt.to_string(),
-            },
-            attachments,
-        )
-        .await
+        self.continue_session_with_prompt(session_pk, TurnPrompt::text(prompt, prompt), attachments)
+            .await
     }
 
     pub async fn continue_session_with_prompt(
@@ -245,15 +237,17 @@ impl ControlPlane {
         if let Ok(Some(project)) = self.store.get_project(&session.project_id).await {
             handle.set_perm_mode(project.perm_mode);
         }
-        let final_prompt = self
-            .with_attachments(session_pk, &prompt.agent, attachments)
+        let prepared = self
+            .prepare_attachments(session_pk, &prompt.agent, attachments)
             .await;
         self.spawn_prompt(
             handle,
             session_pk.to_string(),
             TurnPrompt {
-                agent: final_prompt,
+                agent: prepared.agent,
                 display: prompt.display,
+                blocks: prepared.image_blocks,
+                attachments: prepared.attachments_meta,
             },
         );
         Ok(())
@@ -336,10 +330,7 @@ impl ControlPlane {
                 self.spawn_prompt(
                     handle,
                     session_pk.to_string(),
-                    TurnPrompt {
-                        agent: RESUME_NUDGE.to_string(),
-                        display: RESUME_NUDGE.to_string(),
-                    },
+                    TurnPrompt::text(RESUME_NUDGE, RESUME_NUDGE),
                 );
                 Ok(())
             }

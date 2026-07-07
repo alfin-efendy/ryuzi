@@ -9,6 +9,7 @@ mod events;
 mod fsview_cmd;
 mod gateways_cmd;
 mod native_cmd;
+mod open_cmd;
 mod plugins_cmd;
 mod registry_cmd;
 mod runtimes_cmd;
@@ -268,6 +269,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::end_session,
             commands::resolve_approval,
             commands::read_file,
+            commands::stage_attachment,
+            commands::read_file_base64,
             commands::pick_directory,
             commands::pick_files,
             commands::backdrop_capability,
@@ -310,6 +313,9 @@ fn make_builder() -> Builder<tauri::Wry> {
             fsview_cmd::worktree_dirty,
             fsview_cmd::git_diff,
             fsview_cmd::search_files,
+            fsview_cmd::revert_file,
+            open_cmd::list_open_targets,
+            open_cmd::open_in,
             term::term_open,
             term::term_input,
             term::term_resize,
@@ -408,7 +414,7 @@ pub fn run() {
             builder.mount_events(app);
             // Build the engine inside the async runtime so Store::open (and any
             // harness setup) run within a Tokio context.
-            let cp = tauri::async_runtime::block_on(async move {
+            let (cp, attachments_root) = tauri::async_runtime::block_on(async move {
                 let store = Store::open(&ryuzi_core::paths::db_path())
                     .await
                     .expect("open ryuzi db");
@@ -418,8 +424,26 @@ pub fn run() {
                 // atomicity/idempotency/degraded-state contract.
                 ryuzi_core::llm_router::secrets::init_and_sweep(&store).await;
                 let registries = build_registries();
-                ControlPlane::new(store, registries).await
+                let cp = ControlPlane::new(store, registries).await;
+                // Computed here (rather than a second `block_on`) because the
+                // async runtime does not support nested `block_on` calls.
+                let attachments_root = cp.attachments_root().await;
+                (cp, attachments_root)
             });
+            // Media previews: serve attachment files to the webview via the
+            // asset protocol, scoped to the attachments root ONLY. The root
+            // derives from the runtime-configurable `workdir_root` setting,
+            // so the scope is extended here rather than in tauri.conf.json.
+            let _ = std::fs::create_dir_all(&attachments_root);
+            // Pasted files staged before a send belong to no session — clear
+            // leftovers from previous runs.
+            let _ = std::fs::remove_dir_all(attachments_root.join("staging"));
+            if let Err(e) = app
+                .asset_protocol_scope()
+                .allow_directory(&attachments_root, true)
+            {
+                eprintln!("[ryuzi] asset protocol scope: {e}");
+            }
             // Subscribe BEFORE manage() moves the Arc.
             let mut rx = cp.subscribe();
             // The scheduler loop fires enabled jobs for real (30s tick). Runs

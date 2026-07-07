@@ -1,25 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
-import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
+import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
 import { commands, type BranchList } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
+import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
-import { basename } from "@/lib/paths";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptions } from "@/lib/composer-git";
+import { groupModelOptions } from "@/lib/model-groups";
 import { projectLabel } from "@/lib/sidebar";
 import { StatusDot } from "@/components/common/bits";
 import { startVoiceDictation } from "@/lib/voice";
+import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
+import { AttachmentChips } from "@/components/composer/AttachmentChips";
 
 export function HomeView() {
   const { projects, selectedProjectId, selectProject, start, addProject, setProjectModel } = useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<string[]>([]);
+  const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
@@ -35,10 +38,18 @@ export function HomeView() {
   const setComposerModel = useNav((s) => s.setComposerModel);
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
+  const catalog = useConnections((s) => s.catalog);
+  const connections = useConnections((s) => s.connections);
+  const connectionsLoaded = useConnections((s) => s.loaded);
+  const hydrateConnections = useConnections((s) => s.hydrate);
 
   useEffect(() => {
     if (projectId) void loadCommands(projectId);
   }, [projectId, loadCommands]);
+
+  useEffect(() => {
+    if (!connectionsLoaded) void hydrateConnections();
+  }, [connectionsLoaded, hydrateConnections]);
 
   // A model picked for one project must not leak into the next one.
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
@@ -100,12 +111,6 @@ export function HomeView() {
     };
   }, [projectId, contextQueryText]);
 
-  const attachFiles = async () => {
-    const picked = await commands.pickFiles();
-    if (!picked.length) return;
-    setAttachments((cur) => Array.from(new Set([...cur, ...picked])));
-  };
-
   const pickContext = (path: string) => {
     setDraft((cur) => replaceActiveContextToken(cur, path));
     setContextRefs((cur) => uniqueContextRefs([...cur, path]));
@@ -137,16 +142,16 @@ export function HomeView() {
 
   const send = async () => {
     const t = draft.trim();
-    if ((!t && attachments.length === 0) || !project) return;
+    if ((!t && composerFiles.attachments.length === 0) || !project) return;
     const opts = {
       runtimeId: "native",
       model: nav.composerModel ?? null,
       context: { branch: nav.composerBranch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-      attachments,
-      git: composerGitOptions(branchList, nav.composerBranch, nav.composerUseWorktree, nav.composerCreateBranch),
+      attachments: composerFiles.attachments,
+      git: composerGitOptions(branchList, nav.composerBranch, nav.composerUseWorktree),
     };
     setDraft("");
-    setAttachments([]);
+    composerFiles.clear();
     setContextRefs([]);
     await start(project.projectId, t, opts);
     nav.navigate({ kind: "session" });
@@ -158,7 +163,9 @@ export function HomeView() {
         What should we build{project ? ` in ${projectLabel(project)}` : ""}?
       </h1>
       <div className="w-full max-w-[720px]">
-        <div className="acrylic-card relative rounded-2xl border border-border shadow-sm">
+        <div
+          className={`acrylic-card relative rounded-2xl border shadow-sm ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
+        >
           <Textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -168,6 +175,7 @@ export function HomeView() {
                 void send();
               }
             }}
+            onPaste={composerFiles.onPaste}
             placeholder="Do anything"
             rows={2}
             className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-[18px] pb-1 pt-4 text-[14.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[14.5px] dark:bg-transparent"
@@ -199,7 +207,7 @@ export function HomeView() {
               variant="ghost"
               size="icon-sm"
               title="Attach"
-              onClick={() => void attachFiles()}
+              onClick={() => void composerFiles.attachFiles()}
               className="rounded-full text-muted-foreground"
             >
               <Paperclip aria-hidden size={16} strokeWidth={2} />
@@ -216,7 +224,7 @@ export function HomeView() {
             <div className="flex-1" />
             <Combobox
               aria-label="Model"
-              options={modelOptions.map((m) => ({ value: m, label: m, mono: true }))}
+              options={groupModelOptions(modelOptions, catalog, connections)}
               value={selectedModel || null}
               onValueChange={(m) => {
                 setComposerModel(m);
@@ -250,7 +258,7 @@ export function HomeView() {
               <ArrowUp aria-hidden size={15} strokeWidth={2.2} className="size-[15px]" />
             </Button>
           </div>
-          {(attachments.length > 0 || contextRefs.length > 0) && (
+          {(composerFiles.attachments.length > 0 || contextRefs.length > 0) && (
             <div className="flex flex-wrap gap-1.5 px-3 pb-2">
               {contextRefs.map((path) => (
                 <Button
@@ -266,20 +274,7 @@ export function HomeView() {
                   <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
                 </Button>
               ))}
-              {attachments.map((path) => (
-                <Button
-                  key={path}
-                  variant="outline"
-                  size="sm"
-                  title={path}
-                  onClick={() => setAttachments((cur) => cur.filter((p) => p !== path))}
-                  className="max-w-[220px] rounded-full px-2 text-[12px] text-muted-foreground"
-                >
-                  <Paperclip aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
-                  <span className="truncate">{basename(path)}</span>
-                  <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
-                </Button>
-              ))}
+              <AttachmentChips attachments={composerFiles.attachments} onRemove={composerFiles.remove} />
             </div>
           )}
 
@@ -315,11 +310,9 @@ export function HomeView() {
               options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
               value={nav.composerBranch}
               onValueChange={(v) => nav.setComposerBranch(v)}
-              allowCreate={nav.composerCreateBranch}
-              onCreate={(input) => {
-                nav.setComposerBranch(input);
-                nav.setComposerCreateBranch(true);
-              }}
+              allowCreate
+              onCreate={(input) => nav.setComposerBranch(input)}
+              createHintLabel="Create and checkout new branch…"
               placeholder="Branch"
               trigger={
                 <Button variant="ghost" size="sm" className="gap-[7px] font-medium text-muted-foreground">
@@ -328,35 +321,19 @@ export function HomeView() {
                   <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
                 </Button>
               }
+              footer={
+                <div className="flex items-center justify-between gap-3 px-2.5 py-1.5">
+                  <span className="text-sm text-muted-foreground" title="Run the session in an isolated git worktree">
+                    Worktree
+                  </span>
+                  <Switch
+                    on={nav.composerUseWorktree}
+                    onToggle={() => nav.setComposerUseWorktree(!nav.composerUseWorktree)}
+                    label="Worktree"
+                  />
+                </div>
+              }
             />
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-pressed={nav.composerUseWorktree}
-              title="Run the session in an isolated git worktree"
-              onClick={() => nav.setComposerUseWorktree(!nav.composerUseWorktree)}
-              className={`gap-[7px] font-medium ${nav.composerUseWorktree ? "" : "text-muted-foreground opacity-60"}`}
-            >
-              Worktree
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-pressed={nav.composerCreateBranch}
-              title="Create a new branch for this session"
-              onClick={() => {
-                const next = !nav.composerCreateBranch;
-                nav.setComposerCreateBranch(next);
-                // A free-typed (not-yet-existing) name is meaningless with
-                // "New branch" OFF — fall back to the repo's current branch.
-                if (!next && nav.composerBranch !== null && !(branchList?.branches ?? []).includes(nav.composerBranch)) {
-                  nav.setComposerBranch(branchList?.current ?? null);
-                }
-              }}
-              className={`gap-[7px] font-medium ${nav.composerCreateBranch ? "" : "text-muted-foreground opacity-60"}`}
-            >
-              New branch
-            </Button>
           </div>
         </div>
 

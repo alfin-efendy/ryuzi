@@ -13,7 +13,7 @@ import {
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
-import type { Row } from "./lib/transcript";
+import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
 export type ChatOptions = {
@@ -61,12 +61,6 @@ function append(map: Record<string, Row[]>, pk: string, row: Row): Record<string
   return { ...map, [pk]: [...(map[pk] ?? []), row] };
 }
 
-function outputPreview(v: unknown): string | null {
-  if (v === undefined || v === null) return null;
-  if (typeof v === "string") return v;
-  return JSON.stringify(v, null, 2);
-}
-
 function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions | null {
   if (!options) return null;
   return {
@@ -81,44 +75,6 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
       : null,
     attachments: options.attachments ?? [],
     git: options.git ?? null,
-  };
-}
-
-// Projects a persisted/streamed message block onto the render Row shape.
-// Unknown block types fall through as text (forward compatibility).
-export function messageToRow(
-  seq: number,
-  role: string,
-  blockType: string,
-  payload: unknown,
-  toolCallId: string | null,
-  status: string | null,
-  toolKind: string | null,
-): Row {
-  const p = (payload ?? {}) as Record<string, unknown>;
-  const text = blockType === "status" ? String(p.summary ?? "") : blockType === "error" ? String(p.message ?? "") : String(p.text ?? "");
-  return {
-    seq,
-    role,
-    blockType,
-    text,
-    toolCallId,
-    toolStatus: status,
-    toolKind,
-    toolName: blockType === "tool_call" && typeof p.name === "string" && p.name ? p.name : null,
-    toolOutput: blockType === "tool_call" ? outputPreview(p.output) : null,
-  };
-}
-
-// A tool-update re-emit re-uses the original row's seq: merge by identity.
-function mergeToolRow(prev: Row, payload: unknown, status: string | null, toolKind: string | null): Row {
-  const p = (payload ?? {}) as Record<string, unknown>;
-  return {
-    ...prev,
-    toolStatus: status ?? prev.toolStatus,
-    toolKind: toolKind ?? prev.toolKind,
-    toolName: typeof p.name === "string" && p.name ? p.name : prev.toolName,
-    toolOutput: outputPreview(p.output) ?? prev.toolOutput,
   };
 }
 
@@ -155,7 +111,7 @@ export const useStore = create<State>((set, get) => ({
           }
           const prev = st.lastSeq[pk] ?? 0;
           if (e.seq <= prev) return {}; // stale/duplicate (covers reload/replay races)
-          const row = messageToRow(e.seq, e.role, e.block_type, e.payload, e.tool_call_id, e.status, e.tool_kind);
+          const row = messageToRow(e.seq, e.role, e.block_type, e.payload, e.tool_call_id, e.status, e.tool_kind, Date.now());
           return {
             transcripts: append(st.transcripts, pk, row),
             lastSeq: { ...st.lastSeq, [pk]: e.seq },
@@ -174,6 +130,9 @@ export const useStore = create<State>((set, get) => ({
               toolKind: null,
               toolName: null,
               toolOutput: null,
+              createdAt: Date.now(),
+              attachments: [],
+              toolPath: null,
             }),
           };
         case "approvalRequested":
@@ -209,7 +168,7 @@ export const useStore = create<State>((set, get) => ({
           const res = await commands.listMessages(pk);
           return res.status === "ok" ? res.data : [];
         })();
-    const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind));
+    const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind, m.createdAt));
     const maxSeq = rows.reduce((mx, m) => Math.max(mx, m.seq), 0);
     set((st) => {
       // Rows appended by applyCoreEvent while listMessages was in flight (fresher

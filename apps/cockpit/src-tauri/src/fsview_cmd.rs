@@ -18,7 +18,7 @@ pub struct DirEntryInfo {
     pub dir: bool,
 }
 
-async fn session_root(cp: &ControlPlane, session_pk: &str) -> anyhow::Result<PathBuf> {
+pub(crate) async fn session_root(cp: &ControlPlane, session_pk: &str) -> anyhow::Result<PathBuf> {
     let session = cp
         .store()
         .get_session(session_pk)
@@ -156,6 +156,18 @@ pub async fn search_files(
             message: e.to_string(),
         })?;
     Ok(hits)
+}
+
+/// Revert one file in the session workdir to HEAD (Undo on a file-edit card).
+#[tauri::command]
+#[specta::specta]
+pub async fn revert_file(
+    cp: State<'_, Arc<ControlPlane>>,
+    session_pk: String,
+    path: String,
+) -> R<()> {
+    let root = session_root(&cp, &session_pk).await?;
+    Ok(fsview::revert_file(&root.to_string_lossy(), &path).await?)
 }
 
 #[cfg(test)]

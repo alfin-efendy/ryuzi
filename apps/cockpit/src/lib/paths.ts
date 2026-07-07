@@ -31,3 +31,11 @@ export function joinPath(workdir: string, rel: string): string {
   const base = workdir.replace(/[\\/]+$/, "");
   return `${base}${sep}${rel.split("/").filter(Boolean).join(sep)}`;
 }
+
+/** Strip `workdir` from an absolute path, normalizing to forward slashes.
+ *  Already-relative paths pass through normalized. */
+export function toRepoRelative(path: string, workdir: string): string {
+  const norm = path.replace(/\\/g, "/");
+  const root = workdir.replace(/\\/g, "/").replace(/\/+$/, "");
+  return root && norm.toLowerCase().startsWith(`${root.toLowerCase()}/`) ? norm.slice(root.length + 1) : norm;
+}
