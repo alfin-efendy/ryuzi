@@ -46,21 +46,62 @@ function compareVersions(left: string, right: string): number {
 }
 
 function mergeVersions(existing: RegistryEntryVersion[], incoming: RegistryEntryVersion[]): RegistryEntryVersion[] {
-  const merged = [...existing];
-  const byVersion = new Map(existing.map((version) => [version.version, version]));
+  const byVersion = new Map<string, RegistryEntryVersion>();
+
+  for (const version of existing) {
+    byVersion.set(version.version, { ...version });
+  }
 
   for (const version of incoming) {
-    if (byVersion.has(version.version)) {
-      byVersion.set(version.version, { ...byVersion.get(version.version), ...version });
-      const idx = merged.findIndex((item) => item.version === version.version);
-      merged[idx] = byVersion.get(version.version)!;
-    } else {
-      byVersion.set(version.version, version);
-      merged.push(version);
+    const existingVersion = byVersion.get(version.version);
+
+    if (!existingVersion) {
+      byVersion.set(version.version, { ...version });
+      continue;
+    }
+
+    if (version.isLatest || !existingVersion.isLatest) {
+      byVersion.set(version.version, { ...version });
     }
   }
 
+  const merged = Array.from(byVersion.values());
+
+  merged.sort((left, right) => {
+    if (left.isLatest !== right.isLatest) {
+      return left.isLatest ? -1 : 1;
+    }
+
+    const versionCmp = compareVersions(right.version, left.version);
+    if (versionCmp !== 0) {
+      return versionCmp;
+    }
+
+    return right.version.localeCompare(left.version);
+  });
+
   return merged;
+}
+
+function pickTopLevelSource(existing: RegistryEntry, incoming: RegistryEntry, winningVersion: string): RegistryEntry | null {
+  if (incoming.version === winningVersion) return incoming;
+  if (existing.version === winningVersion) return existing;
+  return null;
+}
+
+function setTopLevelFromWinner(entry: RegistryEntry, winner: RegistryEntryVersion | undefined, source: RegistryEntry | null) {
+  if (!winner) return;
+
+  if (source) {
+    entry.name = source.name;
+    entry.desc = source.desc;
+    entry.publisher = source.publisher;
+    entry.kind = source.kind;
+  }
+
+  entry.version = winner.version;
+  entry.installTarget = winner.installTarget;
+  entry.website = winner.website;
 }
 
 export function mergeRegistryEntries(prev: RegistryEntry[], next: RegistryEntry[]): RegistryEntry[] {
@@ -76,20 +117,14 @@ export function mergeRegistryEntries(prev: RegistryEntry[], next: RegistryEntry[
       continue;
     }
 
-    const shouldUseIncomingTopLevel = compareVersions(entry.version, existing.version) > 0;
     const mergedVersions = mergeVersions(existing.versions, entry.versions);
-    const latest = shouldUseIncomingTopLevel ? entry : existing;
+    const winner = mergedVersions[0];
+    const winnerSource = pickTopLevelSource(existing, entry, winner.version);
 
     Object.assign(existing, {
       versions: mergedVersions,
-      version: latest.version,
-      name: latest.name,
-      desc: latest.desc,
-      publisher: latest.publisher,
-      kind: latest.kind,
-      installTarget: latest.installTarget,
-      website: latest.website,
     });
+    setTopLevelFromWinner(existing, winner, winnerSource);
   }
 
   return out;
