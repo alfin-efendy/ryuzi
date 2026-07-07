@@ -5,6 +5,7 @@ import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSectio
 import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
+import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
@@ -60,6 +61,18 @@ export function SessionView() {
   useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
   }, [connectionsLoaded, hydrateConnections]);
+
+  // Refresh edit-card diff stats after every turn, independent of the right
+  // panel (which only fetches while open/on its own "review" tab).
+  const fetchDiff = useDiff((s) => s.fetch);
+  const sessionRunning = session?.status === "running";
+  const prevSessionRunning = useRef(sessionRunning);
+  useEffect(() => {
+    if (prevSessionRunning.current && !sessionRunning && session?.sessionPk) {
+      void fetchDiff(session.sessionPk);
+    }
+    prevSessionRunning.current = sessionRunning;
+  }, [sessionRunning, session?.sessionPk, fetchDiff]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();

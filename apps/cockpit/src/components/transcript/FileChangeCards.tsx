@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { FolderInput, Pencil, RotateCcw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@ryuzi/ui";
@@ -15,11 +15,18 @@ const kindIcon = { edit: Pencil, write: Pencil, delete: Trash2, move: FolderInpu
  *  Review jumps the right panel to the file, Undo reverts it to HEAD. */
 export function FileChangeCards({ sessionPk, cards }: { sessionPk: string; cards: EditCard[] }) {
   const files = useDiff((s) => s.bySession[sessionPk]?.files ?? []);
+  const hasDiff = useDiff((s) => s.bySession[sessionPk] !== undefined);
   const fetchDiff = useDiff((s) => s.fetch);
   const setPendingReview = useDiff((s) => s.setPendingReview);
   const nav = useNav();
   const [confirming, setConfirming] = useState<EditCard | null>(null);
   const [reverted, setReverted] = useState<Record<string, true>>({});
+
+  // Cards render even when the right panel (the usual fetch trigger) is
+  // closed — fetch once so +adds/-dels aren't blank by default.
+  useEffect(() => {
+    if (cards.length > 0 && !hasDiff) void fetchDiff(sessionPk);
+  }, [cards.length, hasDiff, sessionPk, fetchDiff]);
 
   const review = (card: EditCard) => {
     setPendingReview({ sessionPk, path: card.path });
