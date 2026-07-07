@@ -6,7 +6,7 @@ use crate::error::CmdError;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::time::Duration;
 
 type R<T> = Result<T, CmdError>;
@@ -99,9 +99,9 @@ fn entry_publisher(item: &ServerListItem) -> Option<String> {
         })
 }
 
-fn entry_install_target(item: &ServerListItem) -> Option<String> {
+fn npm_install_target(item: &ServerListItem) -> Option<String> {
     let server = server_object(item);
-    let npm = server
+    server
         .get("packages")
         .and_then(|p| p.as_array())
         .and_then(|pkgs| {
@@ -116,16 +116,22 @@ fn entry_install_target(item: &ServerListItem) -> Option<String> {
                         .map(|s| s.to_string())
                 })?
             })
-        });
-    let remote = server
+        })
+}
+
+fn remote_install_target(item: &ServerListItem) -> Option<String> {
+    server_object(item)
         .get("remotes")
         .and_then(|r| r.as_array())
         .and_then(|rs| rs.first())
         .and_then(|r| r.get("url"))
         .and_then(|u| u.as_str())
-        .map(|s| s.to_string());
+        .filter(|url| !url.trim().is_empty())
+        .map(|s| s.to_string())
+}
 
-    match (npm, remote) {
+fn entry_install_target(item: &ServerListItem) -> Option<String> {
+    match (npm_install_target(item), remote_install_target(item)) {
         (Some(pkg), _) => Some(pkg),
         (None, Some(url)) => Some(url),
         (None, None) => None,
@@ -133,26 +139,9 @@ fn entry_install_target(item: &ServerListItem) -> Option<String> {
 }
 
 fn entry_kind(item: &ServerListItem) -> String {
-    let has_npm = entry_install_target(item).is_some_and(|_| {
-        server_object(item)
-            .get("packages")
-            .and_then(|packages| packages.as_array())
-            .is_some_and(|pkgs| {
-                pkgs.iter().any(|pkg| {
-                    pkg.get("registryType")
-                        .or_else(|| pkg.get("registry_type"))
-                        .and_then(|ty| ty.as_str())
-                        == Some("npm")
-                })
-            })
-    });
-    if has_npm {
+    if npm_install_target(item).is_some() {
         "stdio".to_string()
-    } else if server_object(item)
-        .get("remotes")
-        .and_then(|r| r.as_array())
-        .is_some()
-    {
+    } else if remote_install_target(item).is_some() {
         "http".to_string()
     } else {
         "unknown".to_string()
@@ -167,9 +156,8 @@ fn entry_website(item: &ServerListItem) -> Option<String> {
 }
 
 fn official_server_meta(item: &ServerListItem) -> Option<&serde_json::Value> {
-    server_object(item)
-        .get("_meta")
-        .or_else(|| item.get("_meta"))
+    item.get("_meta")
+        .or_else(|| server_object(item).get("_meta"))
         .and_then(|meta| meta.get("io.modelcontextprotocol.registry/official"))
 }
 
@@ -239,10 +227,18 @@ pub fn entry_key(item: &ServerListItem) -> String {
 
 /// Group server versions into installables with semantic-descending versions.
 pub fn group_entries(items: Vec<ServerListItem>) -> Vec<RegistryEntry> {
-    let mut grouped: BTreeMap<String, Vec<ServerListItem>> = BTreeMap::new();
+    let mut grouped: Vec<(String, Vec<ServerListItem>)> = Vec::new();
+    let mut positions: HashMap<String, usize> = HashMap::new();
+
     for item in items {
         let key = entry_key(&item);
-        grouped.entry(key).or_default().push(item);
+        if let Some(&idx) = positions.get(&key) {
+            grouped[idx].1.push(item);
+        } else {
+            let idx = grouped.len();
+            positions.insert(key.clone(), idx);
+            grouped.push((key, vec![item]));
+        }
     }
 
     let mut entries = Vec::with_capacity(grouped.len());
@@ -285,9 +281,8 @@ pub fn group_entries(items: Vec<ServerListItem>) -> Vec<RegistryEntry> {
 
 /// Map one registry response item to a raw server object.
 fn map_entry(item: &serde_json::Value) -> Option<ServerListItem> {
-    let server = server_object(item);
-    server.as_object()?;
-    Some(server.clone())
+    server_object(item).as_object()?;
+    Some(item.clone())
 }
 
 pub fn map_page(v: &serde_json::Value) -> RegistryPage {
@@ -468,5 +463,113 @@ mod tests {
         assert_eq!(entry.versions[1].version, "1.0.0");
         assert!(!entry.versions[1].is_latest);
         assert_eq!(entry.version, "1.1.0");
+    }
+
+    #[test]
+    fn wrapped_payloads_keep_top_level_meta_and_preserve_group_order() {
+        let v: serde_json::Value = serde_json::json!({
+            "servers": [
+                {
+                    "server": {
+                        "name": "io.github.alpha/first",
+                        "title": "Alpha",
+                        "description": "First plugin.",
+                        "version": "2.0.0",
+                        "packages": [{ "registryType": "npm", "identifier": "alpha@2.0.0" }]
+                    },
+                    "_meta": {
+                        "io.modelcontextprotocol.registry/official": {
+                            "id": "alpha-2.0.0",
+                            "isLatest": true
+                        }
+                    }
+                },
+                {
+                    "server": {
+                        "name": "io.github.example/legacy",
+                        "title": "Example MCP",
+                        "description": "Example MCP server.",
+                        "version": "1.0.0",
+                        "packages": [{ "registryType": "npm", "identifier": "example-server@1.0.0" }]
+                    },
+                    "_meta": {
+                        "io.modelcontextprotocol.registry/official": {
+                            "id": "id-legacy-1.0.0",
+                            "isLatest": false
+                        }
+                    }
+                },
+                {
+                    "server": {
+                        "name": "io.github.example/legacy",
+                        "title": "Example MCP",
+                        "description": "Example MCP server.",
+                        "version": "1.1.0",
+                        "packages": [{ "registryType": "npm", "identifier": "example-server@1.1.0" }]
+                    },
+                    "_meta": {
+                        "io.modelcontextprotocol.registry/official": {
+                            "id": "id-legacy-1.1.0",
+                            "isLatest": true
+                        }
+                    }
+                },
+                {
+                    "server": {
+                        "name": "io.github.beta/second",
+                        "title": "Beta",
+                        "description": "Second plugin.",
+                        "version": "1.0.0",
+                        "remotes": [{ "type": "streamable-http", "url": "https://beta.example.com/mcp" }]
+                    },
+                    "_meta": {
+                        "io.modelcontextprotocol.registry/official": {
+                            "id": "beta-1.0.0",
+                            "isLatest": true
+                        }
+                    }
+                }
+            ]
+        });
+
+        let page = map_page(&v);
+        let ids: Vec<&str> = page.entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "io.github.alpha/first",
+                "io.github.example/legacy",
+                "io.github.beta/second"
+            ]
+        );
+
+        let entry = page
+            .entries
+            .iter()
+            .find(|entry| entry.id == "io.github.example/legacy")
+            .expect("legacy entry");
+        assert_eq!(entry.versions.len(), 2);
+        assert_eq!(entry.version, "1.1.0");
+        assert_eq!(
+            entry.install_target.as_deref(),
+            Some("example-server@1.1.0")
+        );
+        assert_eq!(entry.versions[0].version, "1.1.0");
+        assert!(entry.versions[0].is_latest);
+        assert_eq!(entry.versions[1].version, "1.0.0");
+        assert!(!entry.versions[1].is_latest);
+    }
+
+    #[test]
+    fn remote_kind_requires_usable_url() {
+        let item: ServerListItem = serde_json::json!({
+            "name": "io.github.example/remote",
+            "title": "Remote",
+            "version": "1.0.0",
+            "remotes": [{ "type": "streamable-http", "url": "" }]
+        });
+
+        assert_eq!(entry_install_target(&item), None);
+        assert_eq!(entry_kind(&item), "unknown");
     }
 }

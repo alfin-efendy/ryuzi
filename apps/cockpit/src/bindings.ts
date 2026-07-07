@@ -1114,7 +1114,7 @@ export type RegistryEntry = {
 /**
  * Registry name, e.g. `io.github.owner/server`.
  */
-id: string; name: string; desc: string; version: string | null; publisher: string; 
+id: string; name: string; desc: string; version: string; publisher: string | null; 
 /**
  * stdio (npm package) | http (remote)
  */
@@ -1122,7 +1122,8 @@ kind: string;
 /**
  * npm identifier for stdio entries; URL for remotes.
  */
-installTarget: string | null; website: string | null }
+installTarget: string | null; website: string | null; versions: RegistryEntryVersion[] }
+export type RegistryEntryVersion = { version: string; installTarget: string | null; website: string | null; isLatest: boolean }
 export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
