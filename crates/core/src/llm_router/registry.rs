@@ -448,6 +448,91 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
     },
+    ProviderDescriptor {
+        id: "mimo-free",
+        name: "MiMo (free)",
+        family: "mimo-free",
+        color: "#FF6900",
+        initial: "M",
+        category: Free,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://api.xiaomimimo.com/api/free-ai/openai"),
+        auth: AuthScheme::None,
+        // No /models endpoint on this host (9router discovers via models.dev)
+        // — the live refresh 404s harmlessly and these seeds stand.
+        models: &["mimo-auto"],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: true,
+        device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: Some("/chat"),
+    },
+    ProviderDescriptor {
+        id: "nvidia",
+        name: "NVIDIA NIM",
+        family: "nvidia",
+        color: "#76B900",
+        initial: "N",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://integrate.api.nvidia.com/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: true,
+        risk_notice: false,
+        chat_path: None,
+    },
+    ProviderDescriptor {
+        id: "huggingface",
+        name: "Hugging Face",
+        family: "huggingface",
+        color: "#FFD21E",
+        initial: "H",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://router.huggingface.co/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: true,
+        risk_notice: false,
+        chat_path: None,
+    },
+    ProviderDescriptor {
+        id: "cloudflare-ai",
+        name: "Cloudflare Workers AI",
+        family: "cloudflare-ai",
+        color: "#F6821F",
+        initial: "CF",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        // User pastes https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1
+        base_url: None,
+        auth: AuthScheme::Bearer,
+        // The account URL has no OpenAI-compatible /models route — seed a
+        // few Workers AI text models; users can override per connection.
+        models: &[
+            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "@cf/openai/gpt-oss-120b",
+            "@cf/meta/llama-3.1-8b-instruct",
+        ],
+        requires_base_url: true,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: true,
+        risk_notice: false,
+        chat_path: None,
+    },
 ];
 
 pub fn descriptor(id: &str) -> Option<&'static ProviderDescriptor> {
@@ -606,6 +691,39 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn phase_a_free_and_free_tier_providers_are_wellformed() {
+        let mimo = descriptor("mimo-free").unwrap();
+        assert_eq!(mimo.category, ProviderCategory::Free);
+        assert!(mimo.no_auth);
+        assert_eq!(
+            mimo.base_url,
+            Some("https://api.xiaomimimo.com/api/free-ai/openai")
+        );
+        assert_eq!(mimo.chat_path, Some("/chat"));
+        assert_eq!(mimo.models, &["mimo-auto"]);
+
+        let nvidia = descriptor("nvidia").unwrap();
+        assert_eq!(nvidia.category, ProviderCategory::ApiKey);
+        assert!(nvidia.free_tier);
+        assert_eq!(nvidia.base_url, Some("https://integrate.api.nvidia.com/v1"));
+
+        let hf = descriptor("huggingface").unwrap();
+        assert!(hf.free_tier);
+        assert_eq!(hf.base_url, Some("https://router.huggingface.co/v1"));
+
+        let cf = descriptor("cloudflare-ai").unwrap();
+        assert!(cf.free_tier);
+        assert!(
+            cf.requires_base_url,
+            "user pastes the account-scoped /ai/v1 URL"
+        );
+        assert!(
+            !cf.models.is_empty(),
+            "no /models endpoint on the account URL — seeds required"
+        );
+    }
+
     fn free_tier_and_risk_notice_flags_mark_the_agreed_entries() {
         // Free-tier: API-key providers with a genuinely free usage path.
         for id in ["openrouter", "groq", "google"] {

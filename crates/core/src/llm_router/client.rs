@@ -2747,11 +2747,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_auth_headers_are_opencode_specific_not_generic() {
-        // A non-opencode no_auth provider must NOT get the opencode headers.
-        // Until mimo-free lands (next task) this asserts the helper directly.
-        let desc = registry::descriptor("opencode-free").unwrap();
-        assert_eq!(upstream_chat_path(desc), "/chat/completions");
+    async fn mimo_free_hits_nonstandard_chat_path_without_opencode_headers() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("mimo-free").unwrap();
+        let conn = mk_conn("c6", "mimo-free", "free", ConnectionData::default());
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "mimo-auto".into(),
+        };
+        let body = json!({"model": "mimo-auto", "messages": []});
+        let req = upstream_request(&ctx, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.xiaomimimo.com/api/free-ai/openai/chat"
+        );
+        assert!(req.headers().get("authorization").is_none());
+        assert!(req.headers().get("x-opencode-client").is_none());
     }
 
     #[tokio::test]
