@@ -173,13 +173,6 @@ fn official_server_meta(item: &ServerListItem) -> Option<&serde_json::Value> {
         .and_then(|meta| meta.get("io.modelcontextprotocol.registry/official"))
 }
 
-fn official_server_id(item: &ServerListItem) -> Option<String> {
-    official_server_meta(item)
-        .and_then(|official| official.get("id").or_else(|| official.get("serverId")))
-        .and_then(|id| id.as_str())
-        .map(str::to_string)
-}
-
 fn split_to_version_parts(version: &str) -> Vec<&str> {
     version.split('.').collect()
 }
@@ -235,15 +228,13 @@ pub fn map_version(item: &ServerListItem) -> RegistryEntryVersion {
 }
 
 /// Deterministic grouping key for a live registry list item.
-/// Prefer official registry id metadata, then normalized display name.
+/// Plugin identity is `server.name`, with display-name fallback only when missing.
 pub fn entry_key(item: &ServerListItem) -> String {
-    official_server_id(item).unwrap_or_else(|| {
-        server_object(item)
-            .get("name")
-            .and_then(|name| name.as_str())
-            .map(normalize_name)
-            .unwrap_or_else(|| normalize_name(&entry_name(item)))
-    })
+    server_object(item)
+        .get("name")
+        .and_then(|name| name.as_str())
+        .map(normalize_name)
+        .unwrap_or_else(|| normalize_name(&entry_name(item)))
 }
 
 /// Group server versions into installables with semantic-descending versions.
@@ -400,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_multiple_versions_for_official_server() {
+    fn groups_multiple_versions_for_plugin_identity() {
         let first: ServerListItem = serde_json::json!({
             "name": "io.github.example/legacy",
             "title": "Example MCP",
@@ -434,5 +425,48 @@ mod tests {
         assert!(entry.versions[0].is_latest);
         assert_eq!(entry.versions[1].version, "1.0.0");
         assert!(!entry.versions[1].is_latest);
+    }
+
+    #[test]
+    fn groups_by_server_name_not_official_metadata_id() {
+        let same_identity_first: ServerListItem = serde_json::json!({
+            "name": "io.github.example/legacy",
+            "title": "Example MCP",
+            "description": "Example MCP server.",
+            "version": "1.0.0",
+            "packages": [{ "registryType": "npm", "identifier": "example-server@1.0.0" }],
+            "_meta": {
+                "io.modelcontextprotocol.registry/official": {
+                    "isLatest": false,
+                    "id": "id-legacy-1.0.0",
+                },
+            }
+        });
+
+        let same_identity_second: ServerListItem = serde_json::json!({
+            "name": "io.github.example/legacy",
+            "title": "Example MCP",
+            "description": "Example MCP server.",
+            "version": "1.1.0",
+            "packages": [{ "registryType": "npm", "identifier": "example-server@1.1.0" }],
+            "_meta": {
+                "io.modelcontextprotocol.registry/official": {
+                    "isLatest": true,
+                    "id": "id-legacy-1.1.0",
+                },
+            }
+        });
+
+        let entries = group_entries(vec![same_identity_first, same_identity_second]);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.id, "io.github.example/legacy");
+        assert_eq!(entry.name, "Example MCP");
+        assert_eq!(entry.versions.len(), 2);
+        assert_eq!(entry.versions[0].version, "1.1.0");
+        assert!(entry.versions[0].is_latest);
+        assert_eq!(entry.versions[1].version, "1.0.0");
+        assert!(!entry.versions[1].is_latest);
+        assert_eq!(entry.version, "1.1.0");
     }
 }
