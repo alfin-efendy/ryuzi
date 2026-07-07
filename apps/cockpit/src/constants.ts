@@ -86,3 +86,8 @@ export const KIRO_IMPORT_SUCCESS = "Imported your Kiro sign-in";
 // protects them lives when it isn't the OS keychain.
 export const KEYCHAIN_FILE_FALLBACK_WARNING = "Secrets are stored in a local file, not the OS keychain.";
 export const KEYCHAIN_UNAVAILABLE_WARNING = "Secrets are stored unencrypted — no OS keychain available.";
+
+// Shown in the Add-account modal for catalog entries flagged `riskNotice`
+// (providers reached through unofficial/reverse-engineered endpoints).
+export const PROVIDER_RISK_NOTICE =
+  "Uses your provider account through unofficial endpoints. This may violate the provider's terms and can risk account suspension.";

@@ -23,6 +23,7 @@ mock.module("@/bindings", () => ({
 
 const { AddConnectionModal } = await import("./AddConnectionModal");
 const { useConnections } = await import("@/store-connections");
+const { PROVIDER_RISK_NOTICE } = await import("@/constants");
 
 // `anthropic` and `anthropic-oauth` share the "anthropic" family — the
 // modal offers a chooser between them (API key vs Claude subscription).
@@ -215,4 +216,27 @@ test("single-member custom-openai family requires a base URL before it can be su
   await screen.findByText("Add account");
   expect(addConnection).toHaveBeenCalledWith("custom-openai", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("auth-method options carry category badges", () => {
+  useConnections.setState({ catalog: [anthropic, claudeOauth], connections: [], loaded: true });
+  render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
+
+  const chooser = screen.getByRole("radiogroup", { name: "Sign-in method" });
+  expect(within(chooser).getByText("OAuth")).toBeTruthy();
+  expect(within(chooser).getAllByText("API key").length).toBeGreaterThan(0);
+});
+
+test("risk-notice providers show the account-suspension warning", () => {
+  useConnections.setState({ catalog: [kiroProvider], connections: [], loaded: true });
+  render(<AddConnectionModal open onClose={() => {}} family="kiro" />);
+
+  expect(screen.getByText(PROVIDER_RISK_NOTICE)).toBeTruthy();
+});
+
+test("no risk notice for ordinary providers", () => {
+  useConnections.setState({ catalog: [customOpenAi], connections: [], loaded: true });
+  render(<AddConnectionModal open onClose={() => {}} family="custom-openai" />);
+
+  expect(screen.queryByText(PROVIDER_RISK_NOTICE)).toBeNull();
 });
