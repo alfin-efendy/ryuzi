@@ -17,18 +17,97 @@ export type Row = {
   toolKind: string | null;
   toolName: string | null;
   toolOutput: string | null;
+  /** Wall-clock ms — from Message.createdAt on hydrate, Date.now() on live events. */
+  createdAt: number | null;
+  /** Saved attachment metadata (user rows only). */
+  attachments: RowAttachment[];
+  /** Target file of an edit/delete/move tool call, from its input. */
+  toolPath: string | null;
 };
+
+export type RowAttachment = { name: string; path: string; contentType: string | null; size: number };
 
 export type ActivityItem =
   | { type: "tool"; key: string; name: string; kind: string | null; status: string | null; output: string | null }
   | { type: "status"; key: string; text: string };
 
 export type Group =
-  | { type: "user"; key: string; text: string }
+  | { type: "user"; key: string; text: string; attachments: RowAttachment[] }
   | { type: "agent"; key: string; markdown: string }
   | { type: "thought"; key: string; markdown: string }
   | { type: "activity"; key: string; items: ActivityItem[] }
   | { type: "error"; key: string; text: string };
+
+function outputPreview(v: unknown): string | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v === "string") return v;
+  return JSON.stringify(v, null, 2);
+}
+
+function rowAttachments(p: Record<string, unknown>): RowAttachment[] {
+  if (!Array.isArray(p.attachments)) return [];
+  return (p.attachments as Record<string, unknown>[]).flatMap((a) =>
+    a && typeof a.path === "string"
+      ? [
+          {
+            name: typeof a.name === "string" && a.name ? a.name : a.path,
+            path: a.path,
+            contentType: typeof a.contentType === "string" ? a.contentType : null,
+            size: typeof a.size === "number" ? a.size : 0,
+          },
+        ]
+      : [],
+  );
+}
+
+function toolPathOf(p: Record<string, unknown>): string | null {
+  const input = (p.input ?? {}) as Record<string, unknown>;
+  if (typeof input.path === "string" && input.path) return input.path;
+  if (typeof input.file_path === "string" && input.file_path) return input.file_path;
+  return null;
+}
+
+// Projects a persisted/streamed message block onto the render Row shape.
+// Unknown block types fall through as text (forward compatibility).
+export function messageToRow(
+  seq: number,
+  role: string,
+  blockType: string,
+  payload: unknown,
+  toolCallId: string | null,
+  status: string | null,
+  toolKind: string | null,
+  createdAt: number | null,
+): Row {
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const text = blockType === "status" ? String(p.summary ?? "") : blockType === "error" ? String(p.message ?? "") : String(p.text ?? "");
+  return {
+    seq,
+    role,
+    blockType,
+    text,
+    toolCallId,
+    toolStatus: status,
+    toolKind,
+    toolName: blockType === "tool_call" && typeof p.name === "string" && p.name ? p.name : null,
+    toolOutput: blockType === "tool_call" ? outputPreview(p.output) : null,
+    createdAt,
+    attachments: rowAttachments(p),
+    toolPath: blockType === "tool_call" ? toolPathOf(p) : null,
+  };
+}
+
+// A tool-update re-emit re-uses the original row's seq: merge by identity.
+export function mergeToolRow(prev: Row, payload: unknown, status: string | null, toolKind: string | null): Row {
+  const p = (payload ?? {}) as Record<string, unknown>;
+  return {
+    ...prev,
+    toolStatus: status ?? prev.toolStatus,
+    toolKind: toolKind ?? prev.toolKind,
+    toolName: typeof p.name === "string" && p.name ? p.name : prev.toolName,
+    toolOutput: outputPreview(p.output) ?? prev.toolOutput,
+  };
+}
 
 const keyOf = (row: Row, i: number) => (row.seq > 0 ? `s${row.seq}` : `i${i}`);
 
@@ -45,7 +124,7 @@ export function groupRows(rows: Row[]): Group[] {
   rows.forEach((row, i) => {
     const key = keyOf(row, i);
     if (row.role === "user") {
-      if (row.text.trim()) groups.push({ type: "user", key, text: row.text });
+      if (row.text.trim() || row.attachments.length > 0) groups.push({ type: "user", key, text: row.text, attachments: row.attachments });
       return;
     }
     if (row.blockType === "error") {

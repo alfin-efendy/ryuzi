@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { closeDanglingFence, groupRows, type Row } from "./transcript";
+import { closeDanglingFence, groupRows, messageToRow, type Row } from "./transcript";
 
 const row = (partial: Partial<Row>): Row => ({
   seq: 0,
@@ -11,6 +11,9 @@ const row = (partial: Partial<Row>): Row => ({
   toolKind: null,
   toolName: null,
   toolOutput: null,
+  createdAt: null,
+  attachments: [],
+  toolPath: null,
   ...partial,
 });
 
@@ -89,4 +92,44 @@ test("closeDanglingFence closes an odd number of line-start fences and leaves ba
   expect(closeDanglingFence("```ts\nx\n```")).toBe("```ts\nx\n```");
   expect(closeDanglingFence("inline ``` mention")).toBe("inline ``` mention");
   expect(closeDanglingFence("no fences")).toBe("no fences");
+});
+
+test("messageToRow extracts attachments metadata from user payloads", () => {
+  const row = messageToRow(
+    3,
+    "user",
+    "text",
+    { text: "look", attachments: [{ name: "a.png", path: "C:\\att\\a.png", contentType: "image/png", size: 42 }] },
+    null,
+    null,
+    null,
+    1700000000000,
+  );
+  expect(row.text).toBe("look");
+  expect(row.createdAt).toBe(1700000000000);
+  expect(row.attachments).toEqual([{ name: "a.png", path: "C:\\att\\a.png", contentType: "image/png", size: 42 }]);
+});
+
+test("messageToRow tolerates missing/malformed attachments", () => {
+  expect(messageToRow(1, "user", "text", { text: "hi" }, null, null, null, null).attachments).toEqual([]);
+  expect(messageToRow(1, "user", "text", { text: "hi", attachments: "junk" }, null, null, null, null).attachments).toEqual([]);
+  expect(messageToRow(1, "user", "text", { text: "hi", attachments: [{ nope: true }] }, null, null, null, null).attachments).toEqual([]);
+});
+
+test("messageToRow extracts the tool target path from tool_call input", () => {
+  const row = messageToRow(2, "assistant", "tool_call", { name: "edit", input: { path: "src/app.ts" } }, "t1", "completed", "edit", null);
+  expect(row.toolPath).toBe("src/app.ts");
+  const alt = messageToRow(
+    2,
+    "assistant",
+    "tool_call",
+    { name: "edit", input: { file_path: "src/b.ts" } },
+    "t1",
+    "completed",
+    "edit",
+    null,
+  );
+  expect(alt.toolPath).toBe("src/b.ts");
+  const none = messageToRow(2, "assistant", "tool_call", { name: "bash", input: { command: "ls" } }, "t1", "completed", "execute", null);
+  expect(none.toolPath).toBeNull();
 });
