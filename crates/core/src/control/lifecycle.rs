@@ -122,13 +122,18 @@ impl ControlPlane {
         let handle = self
             .start_harness_session(&project, &session_pk, &ws.work_dir, None)
             .await?;
-        let final_prompt = self
-            .with_attachments(&session_pk, &prompt.agent, attachments)
+        let prepared = self
+            .prepare_attachments(&session_pk, &prompt.agent, attachments)
             .await;
         self.spawn_prompt(
             handle,
             session_pk.clone(),
-            TurnPrompt::text(final_prompt, prompt.display),
+            TurnPrompt {
+                agent: prepared.agent,
+                display: prompt.display,
+                blocks: prepared.image_blocks,
+                attachments: prepared.attachments_meta,
+            },
         );
 
         Ok(session)
@@ -232,13 +237,18 @@ impl ControlPlane {
         if let Ok(Some(project)) = self.store.get_project(&session.project_id).await {
             handle.set_perm_mode(project.perm_mode);
         }
-        let final_prompt = self
-            .with_attachments(session_pk, &prompt.agent, attachments)
+        let prepared = self
+            .prepare_attachments(session_pk, &prompt.agent, attachments)
             .await;
         self.spawn_prompt(
             handle,
             session_pk.to_string(),
-            TurnPrompt::text(final_prompt, prompt.display),
+            TurnPrompt {
+                agent: prepared.agent,
+                display: prompt.display,
+                blocks: prepared.image_blocks,
+                attachments: prepared.attachments_meta,
+            },
         );
         Ok(())
     }

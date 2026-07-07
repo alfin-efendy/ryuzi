@@ -8,9 +8,28 @@ use crate::settings::{expand_home, SettingsStore};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// What a turn's attachments contribute to the outgoing prompt: the
+/// (possibly manifest-decorated) agent text, Anthropic image blocks for
+/// eligible images, and display metadata for the user transcript row.
+pub(super) struct PreparedPrompt {
+    pub agent: String,
+    pub image_blocks: Vec<serde_json::Value>,
+    pub attachments_meta: Vec<serde_json::Value>,
+}
+
+impl PreparedPrompt {
+    fn text_only(agent: String) -> Self {
+        PreparedPrompt {
+            agent,
+            image_blocks: Vec::new(),
+            attachments_meta: Vec::new(),
+        }
+    }
+}
+
 impl ControlPlane {
     /// `{expand_home(workdir_root)}/.harness-attachments/{session_pk}` — the
-    /// dest dir attachments are downloaded into (`with_attachments`) and torn
+    /// dest dir attachments are downloaded into (`prepare_attachments`) and torn
     /// down from (`end_session`). Reads `workdir_root` fresh each call: it's
     /// a rarely-changed setting, and this avoids caching it on `ControlPlane`.
     pub(super) async fn attachment_dest_dir(&self, session_pk: &str) -> PathBuf {
@@ -28,15 +47,16 @@ impl ControlPlane {
 
     /// Materializes any Discord-supplied attachments into
     /// `.harness-attachments/{session_pk}` and folds the resulting manifest
-    /// into the prompt.
-    pub(super) async fn with_attachments(
+    /// into the prompt, alongside any Anthropic vision blocks and display
+    /// metadata the eligible saved images contribute.
+    pub(super) async fn prepare_attachments(
         &self,
         session_pk: &str,
         prompt: &str,
         attachments: &[AttachmentRef],
-    ) -> String {
+    ) -> PreparedPrompt {
         if attachments.is_empty() {
-            return prompt.to_string();
+            return PreparedPrompt::text_only(prompt.to_string());
         }
         let settings = SettingsStore::new(Arc::clone(&self.store));
         let max_count: i64 = settings
@@ -48,11 +68,11 @@ impl ControlPlane {
             .unwrap_or(10);
         if max_count <= 0 {
             // feature disabled
-            return if prompt.is_empty() {
+            return PreparedPrompt::text_only(if prompt.is_empty() {
                 "User sent attachments, but attachment support is disabled.".to_string()
             } else {
                 prompt.to_string()
-            };
+            });
         }
 
         let dest_dir = self.attachment_dest_dir(session_pk).await;
@@ -84,25 +104,32 @@ impl ControlPlane {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    return if !prompt.is_empty() {
+                    return PreparedPrompt::text_only(if !prompt.is_empty() {
                         format!("{prompt}\n\n⚠️ Could not process attachments: {e}")
                     } else {
                         format!("User sent attachments, but they could not be processed: {e}")
-                    };
+                    });
                 }
             };
 
+        let image_blocks = crate::attachments::image_blocks_for(&result.saved).await;
+        let attachments_meta = crate::attachments::attachment_display_meta(&result.saved);
         let manifest = build_manifest(&result);
-        if manifest.is_empty() {
-            return prompt.to_string();
-        }
-        if prompt.is_empty() {
-            return if !result.saved.is_empty() {
+        let agent = if manifest.is_empty() {
+            prompt.to_string()
+        } else if prompt.is_empty() {
+            if !result.saved.is_empty() {
                 format!("User sent attachments with no message text.\n\n{manifest}")
             } else {
                 format!("User sent attachments but none could be processed:\n{manifest}")
-            };
+            }
+        } else {
+            format!("{prompt}\n\n{manifest}")
+        };
+        PreparedPrompt {
+            agent,
+            image_blocks,
+            attachments_meta,
         }
-        format!("{prompt}\n\n{manifest}")
     }
 }

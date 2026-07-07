@@ -108,7 +108,7 @@ pub async fn run_turn(
         deps,
         "user",
         "text",
-        json!({ "text": prompt.display }),
+        user_row_payload(&prompt),
         None,
         None,
         None,
@@ -118,7 +118,7 @@ pub async fn run_turn(
     // 2. Load history and append the user turn to the ledger.
     let mut ledger = Ledger::load(deps.store.clone(), &deps.session_pk).await?;
     ledger
-        .append_user(json!([{ "type": "text", "text": agent_text }]))
+        .append_user(user_content_blocks(&prompt.blocks, &agent_text))
         .await?;
 
     // 3. Drive the loop with a spawner available for the `task` tool.
@@ -132,6 +132,23 @@ pub async fn run_turn(
     // 4. Best-effort: give a fresh session a generated title.
     maybe_generate_title(deps, &prompt.display).await;
     Ok(())
+}
+
+/// The persisted user-row payload: `{text}` plus `attachments` display
+/// metadata when the turn carried any.
+pub(crate) fn user_row_payload(prompt: &TurnPrompt) -> Value {
+    let mut payload = json!({ "text": prompt.display });
+    if !prompt.attachments.is_empty() {
+        payload["attachments"] = Value::Array(prompt.attachments.clone());
+    }
+    payload
+}
+
+/// The Anthropic user-content array: image blocks first, then the text block.
+pub(crate) fn user_content_blocks(blocks: &[Value], agent_text: &str) -> Value {
+    let mut content = blocks.to_vec();
+    content.push(json!({ "type": "text", "text": agent_text }));
+    Value::Array(content)
 }
 
 fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
@@ -1662,6 +1679,30 @@ mod tests {
         assert!(user_text.contains("[Chat context]"));
         assert!(user_text.contains("feature/auth"));
         assert!(user_text.contains("[User attached 1 file"));
+    }
+
+    #[test]
+    fn user_row_payload_omits_attachments_when_empty_and_includes_them_when_present() {
+        let plain = TurnPrompt::text("hi", "hi");
+        assert_eq!(user_row_payload(&plain), json!({ "text": "hi" }));
+
+        let with = TurnPrompt {
+            attachments: vec![json!({ "name": "a.png", "path": "/x/a.png", "contentType": "image/png", "size": 4 })],
+            ..TurnPrompt::text("hi", "hi")
+        };
+        let payload = user_row_payload(&with);
+        assert_eq!(payload["text"], "hi");
+        assert_eq!(payload["attachments"][0]["name"], "a.png");
+    }
+
+    #[test]
+    fn user_content_blocks_prepends_image_blocks_before_the_text_block() {
+        let img = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } });
+        let content = user_content_blocks(std::slice::from_ref(&img), "look at this");
+        let arr = content.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], img);
+        assert_eq!(arr[1], json!({ "type": "text", "text": "look at this" }));
     }
 
     #[tokio::test]

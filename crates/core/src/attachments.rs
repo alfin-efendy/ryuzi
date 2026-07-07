@@ -465,6 +465,68 @@ pub fn build_manifest(result: &MaterializeResult) -> String {
     lines.join("\n")
 }
 
+/// Images at or under this size become inline vision blocks; larger ones stay
+/// manifest-only (the model can still Read them from disk).
+pub const IMAGE_BLOCK_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// At most this many images become vision blocks per message.
+pub const IMAGE_BLOCK_MAX_COUNT: usize = 10;
+
+/// Anthropic-supported raster media types (vision block eligibility).
+pub fn image_block_media_type(content_type: Option<&str>) -> Option<&'static str> {
+    match content_type? {
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Build Anthropic `{type:"image", source:{type:"base64",…}}` blocks for the
+/// eligible saved images (supported media type, within the size cap), up to
+/// the count cap. Files that fail to read are skipped — the manifest still
+/// lists every saved file either way.
+pub async fn image_blocks_for(saved: &[SavedAttachment]) -> Vec<serde_json::Value> {
+    use base64::Engine as _;
+    let mut blocks = Vec::new();
+    for f in saved {
+        if blocks.len() >= IMAGE_BLOCK_MAX_COUNT {
+            break;
+        }
+        let Some(media_type) = image_block_media_type(f.content_type.as_deref()) else {
+            continue;
+        };
+        if f.size > IMAGE_BLOCK_MAX_BYTES {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(&f.path).await else {
+            continue;
+        };
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        blocks.push(serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": data }
+        }));
+    }
+    blocks
+}
+
+/// Display metadata persisted on the user transcript row so the cockpit can
+/// re-render previews after reload: `{name, path, contentType, size}`.
+pub fn attachment_display_meta(saved: &[SavedAttachment]) -> Vec<serde_json::Value> {
+    saved
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.name,
+                "path": f.path.to_string_lossy(),
+                "contentType": f.content_type,
+                "size": f.size,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,5 +968,52 @@ mod tests {
         let res = materialize_attachments(&[r], &opts, fetcher).await.unwrap();
         assert_eq!(res.saved.len(), 0);
         assert!(res.skipped[0].reason.contains("exceeds"));
+    }
+
+    #[test]
+    fn image_block_media_types_cover_the_anthropic_raster_set() {
+        assert_eq!(image_block_media_type(Some("image/png")), Some("image/png"));
+        assert_eq!(image_block_media_type(Some("image/jpeg")), Some("image/jpeg"));
+        assert_eq!(image_block_media_type(Some("image/gif")), Some("image/gif"));
+        assert_eq!(image_block_media_type(Some("image/webp")), Some("image/webp"));
+        assert_eq!(image_block_media_type(Some("application/pdf")), None);
+        assert_eq!(image_block_media_type(None), None);
+    }
+
+    #[tokio::test]
+    async fn image_blocks_encode_eligible_files_and_skip_oversized_and_nonimage() {
+        let dir = std::env::temp_dir().join(format!("ryuzi-imgblk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("a.png");
+        std::fs::write(&png, [0x89, 0x50, 0x4E, 0x47]).unwrap();
+        let saved = vec![
+            SavedAttachment { path: png.clone(), name: "a.png".into(), content_type: Some("image/png".into()), size: 4 },
+            SavedAttachment { path: dir.join("b.mp4"), name: "b.mp4".into(), content_type: Some("video/mp4".into()), size: 4 },
+            SavedAttachment { path: dir.join("huge.png"), name: "huge.png".into(), content_type: Some("image/png".into()), size: IMAGE_BLOCK_MAX_BYTES + 1 },
+        ];
+        let blocks = image_blocks_for(&saved).await;
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[0]["source"]["data"], "iVBORw==");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attachment_display_meta_maps_saved_files() {
+        let saved = vec![SavedAttachment {
+            path: PathBuf::from("/tmp/x/a.png"),
+            name: "a.png".into(),
+            content_type: Some("image/png".into()),
+            size: 12,
+        }];
+        let meta = attachment_display_meta(&saved);
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0]["name"], "a.png");
+        assert_eq!(meta[0]["contentType"], "image/png");
+        assert_eq!(meta[0]["size"], 12);
+        assert!(meta[0]["path"].as_str().unwrap().ends_with("a.png"));
     }
 }
