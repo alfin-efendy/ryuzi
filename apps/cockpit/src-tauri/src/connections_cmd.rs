@@ -37,6 +37,8 @@ pub struct CatalogEntry {
     pub format: String,
     pub requires_base_url: bool,
     pub models: Vec<String>,
+    pub free_tier: bool,
+    pub risk_notice: bool,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -252,6 +254,8 @@ pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
             },
             requires_base_url: d.requires_base_url,
             models: d.models.iter().map(|s| s.to_string()).collect(),
+            free_tier: d.free_tier,
+            risk_notice: d.risk_notice,
         })
         .collect())
 }
@@ -1341,4 +1345,24 @@ pub async fn import_kiro_token(
     // `remove_dead_kiro_connections`.
     remove_dead_kiro_connections(&cp, &new_id).await?;
     Ok(assemble(&cp).await?)
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn catalog_exposes_free_tier_and_risk_notice() {
+        let catalog = list_provider_catalog().await.unwrap();
+        let by_id = |id: &str| catalog.iter().find(|e| e.id == id).unwrap();
+        assert!(by_id("openrouter").free_tier);
+        assert!(by_id("nvidia").free_tier);
+        assert!(!by_id("anthropic").free_tier);
+        assert!(by_id("kiro").risk_notice);
+        assert!(!by_id("openai").risk_notice);
+        // serde camelCase contract the frontend relies on
+        let v = serde_json::to_value(by_id("kiro")).unwrap();
+        assert_eq!(v["riskNotice"], serde_json::Value::Bool(true));
+        assert_eq!(v["freeTier"], serde_json::Value::Bool(false));
+    }
 }

@@ -36,6 +36,8 @@ const anthropic: CatalogEntry = {
   format: "anthropic",
   requiresBaseUrl: false,
   models: ["claude-sonnet-4-5"],
+  freeTier: false,
+  riskNotice: false,
 };
 
 const claudeOauth: CatalogEntry = {
@@ -48,6 +50,8 @@ const claudeOauth: CatalogEntry = {
   format: "anthropic",
   requiresBaseUrl: false,
   models: [],
+  freeTier: false,
+  riskNotice: false,
 };
 
 // A single-member family (custom-openai) — used to confirm the base-URL
@@ -62,6 +66,8 @@ const customOpenAi: CatalogEntry = {
   format: "openai",
   requiresBaseUrl: true,
   models: [],
+  freeTier: false,
+  riskNotice: false,
 };
 
 // `kiro` is the one catalog entry with a "device" category — a free provider
@@ -78,6 +84,8 @@ const kiroProvider: CatalogEntry = {
   format: "openai",
   requiresBaseUrl: false,
   models: [],
+  freeTier: false,
+  riskNotice: true,
 };
 
 beforeEach(() => {

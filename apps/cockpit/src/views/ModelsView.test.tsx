@@ -83,6 +83,8 @@ const catalog: CatalogEntry[] = [
     format: "openai",
     requiresBaseUrl: false,
     models: ["gpt-4.1", "o3"],
+    freeTier: false,
+    riskNotice: false,
   },
   {
     id: "anthropic",
@@ -94,6 +96,8 @@ const catalog: CatalogEntry[] = [
     format: "anthropic",
     requiresBaseUrl: false,
     models: ["claude-sonnet-4-5"],
+    freeTier: false,
+    riskNotice: false,
   },
   {
     id: "anthropic-oauth",
@@ -105,6 +109,8 @@ const catalog: CatalogEntry[] = [
     format: "anthropic",
     requiresBaseUrl: false,
     models: ["claude-opus-4-8"],
+    freeTier: false,
+    riskNotice: false,
   },
 ];
 
