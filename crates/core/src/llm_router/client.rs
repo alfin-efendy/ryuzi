@@ -517,6 +517,19 @@ fn claude_cloak_map_for(target: &RouteTarget, body: &Value) -> claude_cloak::Too
 // `&AppState` retargeted to `&UpstreamCtx`)
 // ---------------------------------------------------------------------------
 
+/// Chat-generation path appended to the effective base URL. Most providers
+/// follow their wire format's standard path; `chat_path` overrides it for
+/// endpoints with nonstandard shapes.
+fn upstream_chat_path(desc: &ProviderDescriptor) -> &'static str {
+    if let Some(path) = desc.chat_path {
+        return path;
+    }
+    match desc.format {
+        ApiFormat::OpenAi => "/chat/completions",
+        ApiFormat::Anthropic => "/messages",
+    }
+}
+
 pub(crate) fn upstream_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
@@ -530,10 +543,7 @@ pub(crate) fn upstream_request(
     }
     let base = connections::effective_base_url(target.desc, &target.conn)
         .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
-    let path = match target.desc.format {
-        ApiFormat::OpenAi => "/chat/completions",
-        ApiFormat::Anthropic => "/messages",
-    };
+    let path = upstream_chat_path(target.desc);
     let mut req = ctx.http.post(format!("{base}{path}")).json(body);
     let key = target.conn.data.api_key.clone().unwrap_or_default();
     req = match target.desc.auth {
@@ -621,8 +631,9 @@ fn oauth_upstream_request(
     }
 }
 
-/// Free-tier passthrough (opencode-free): no real credential, just the
-/// wire's own placeholder bearer + client-id header.
+/// Free-tier passthrough: no real credential. opencode-free additionally
+/// wants its wire's placeholder bearer + client-id header; other no_auth
+/// providers (mimo-free) get a bare JSON POST.
 fn free_upstream_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
@@ -630,16 +641,14 @@ fn free_upstream_request(
 ) -> anyhow::Result<reqwest::RequestBuilder> {
     let base = connections::effective_base_url(target.desc, &target.conn)
         .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
-    let path = match target.desc.format {
-        ApiFormat::OpenAi => "/chat/completions",
-        ApiFormat::Anthropic => "/messages",
-    };
-    Ok(ctx
-        .http
-        .post(format!("{base}{path}"))
-        .json(body)
-        .header("authorization", "Bearer public")
-        .header("x-opencode-client", "desktop"))
+    let path = upstream_chat_path(target.desc);
+    let mut req = ctx.http.post(format!("{base}{path}")).json(body);
+    if target.conn.provider == "opencode-free" {
+        req = req
+            .header("authorization", "Bearer public")
+            .header("x-opencode-client", "desktop");
+    }
+    Ok(req)
 }
 
 /// Build + send the upstream request; on a 401/403 from an OAuth-backed
@@ -2735,6 +2744,14 @@ mod tests {
         );
         assert_eq!(req.headers().get("authorization").unwrap(), "Bearer public");
         assert_eq!(req.headers().get("x-opencode-client").unwrap(), "desktop");
+    }
+
+    #[tokio::test]
+    async fn no_auth_headers_are_opencode_specific_not_generic() {
+        // A non-opencode no_auth provider must NOT get the opencode headers.
+        // Until mimo-free lands (next task) this asserts the helper directly.
+        let desc = registry::descriptor("opencode-free").unwrap();
+        assert_eq!(upstream_chat_path(desc), "/chat/completions");
     }
 
     #[tokio::test]

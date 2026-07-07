@@ -63,6 +63,10 @@ pub struct ProviderDescriptor {
     /// Reuses a consumer subscription/quota through unofficial endpoints —
     /// the UI must warn that this can risk account suspension.
     pub risk_notice: bool,
+    /// Nonstandard chat-generation path appended to the base URL instead of
+    /// the wire format's default (`/chat/completions` | `/messages`).
+    /// mimo-free's endpoint ends at `/chat`.
+    pub chat_path: Option<&'static str>,
 }
 
 /// How the OAuth redirect (loopback) listener is bound.
@@ -140,6 +144,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "openai",
@@ -158,6 +163,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "openrouter",
@@ -176,6 +182,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: true,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "groq",
@@ -194,6 +201,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: true,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "deepseek",
@@ -212,6 +220,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "mistral",
@@ -230,6 +239,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "xai",
@@ -248,6 +258,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "google",
@@ -266,6 +277,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: true,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "ollama",
@@ -284,6 +296,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "custom-openai",
@@ -302,6 +315,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "custom-anthropic",
@@ -320,6 +334,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
     // Not connectable in F1 (add_connection refuses non-ApiKey categories).
@@ -356,6 +371,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "openai-oauth",
@@ -382,6 +398,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
         // NOTE: openai-oauth upstream is chatgpt.com/backend-api/codex/responses
         // (Responses wire) — applied in server.rs, not via base_url here.
     },
@@ -410,6 +427,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: Some(KIRO_DEVICE_FLOW),
         free_tier: false,
         risk_notice: true,
+        chat_path: None,
     },
     ProviderDescriptor {
         id: "opencode-free",
@@ -428,6 +446,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_flow: None,
         free_tier: false,
         risk_notice: false,
+        chat_path: None,
     },
 ];
 
