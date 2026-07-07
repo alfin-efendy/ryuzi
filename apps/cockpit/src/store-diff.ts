@@ -7,22 +7,33 @@ import { parseUnifiedDiff, type ReviewFile } from "@/lib/diff";
 
 export type SessionDiff = { files: ReviewFile[]; loading: boolean; error: string | null };
 
-const EMPTY: SessionDiff = { files: [], loading: false, error: null };
+export const EMPTY: SessionDiff = { files: [], loading: false, error: null };
+
+export type PendingReview = { sessionPk: string; path: string };
 
 type DiffState = {
   bySession: Record<string, SessionDiff>;
-  /** File the Review tab should select on next render (set by edit cards). */
-  pendingReviewPath: string | null;
+  /** File the Review tab should select on next render (set by edit cards).
+   *  Scoped to a session so a jump queued in one session never selects a
+   *  same-suffix file in another. */
+  pendingReview: PendingReview | null;
   fetch: (sessionPk: string) => Promise<void>;
-  setPendingReviewPath: (path: string | null) => void;
+  setPendingReview: (pending: PendingReview | null) => void;
 };
+
+// Per-session fetch counter: concurrent fetches would otherwise race
+// last-resolve-wins, so only the newest call may write its result back.
+const fetchGeneration = new Map<string, number>();
 
 export const useDiff = create<DiffState>((set) => ({
   bySession: {},
-  pendingReviewPath: null,
+  pendingReview: null,
   fetch: async (sessionPk) => {
+    const gen = (fetchGeneration.get(sessionPk) ?? 0) + 1;
+    fetchGeneration.set(sessionPk, gen);
     set((s) => ({ bySession: { ...s.bySession, [sessionPk]: { ...(s.bySession[sessionPk] ?? EMPTY), loading: true } } }));
     const res = await commands.gitDiff(sessionPk);
+    if (fetchGeneration.get(sessionPk) !== gen) return; // superseded — the newer call owns the state
     set((s) => ({
       bySession: {
         ...s.bySession,
@@ -33,7 +44,7 @@ export const useDiff = create<DiffState>((set) => ({
       },
     }));
   },
-  setPendingReviewPath: (path) => set({ pendingReviewPath: path }),
+  setPendingReview: (pending) => set({ pendingReview: pending }),
 }));
 
 /** Index of `path` in the review list — matches repo-relative paths and

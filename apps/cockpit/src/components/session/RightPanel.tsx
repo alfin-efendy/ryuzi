@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ChevronRight, FileText, Maximize2, Minimize2, RotateCw, Search, SquareCheck, X } from "lucide-react";
 import { useUi } from "@/store-ui";
 import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav";
-import { useDiff, reviewFileIndex } from "@/store-diff";
+import { useDiff, reviewFileIndex, EMPTY } from "@/store-diff";
 import { commands } from "@/bindings";
 import { diffLineStyle, type ReviewFile } from "@/lib/diff";
 import { basename, joinPath } from "@/lib/paths";
@@ -19,10 +19,10 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
   const [pathDraft, setPathDraft] = useState("");
   const [treeFilter, setTreeFilter] = useState("");
   const [treeRefresh, setTreeRefresh] = useState(0);
-  const diff = useDiff((s) => s.bySession[sessionPk]) ?? { files: [], loading: false, error: null };
+  const diff = useDiff((s) => s.bySession[sessionPk]) ?? EMPTY;
   const fetchDiff = useDiff((s) => s.fetch);
-  const pendingReviewPath = useDiff((s) => s.pendingReviewPath);
-  const setPendingReviewPath = useDiff((s) => s.setPendingReviewPath);
+  const pendingReview = useDiff((s) => s.pendingReview);
+  const setPendingReview = useDiff((s) => s.setPendingReview);
 
   const activeFileTab = ui.tabs.find((t) => t.id === ui.activeTabId) ?? ui.tabs[0];
 
@@ -41,15 +41,16 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
   }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk]);
 
   // Consume a pending jump from a transcript edit card: select the file once
-  // it appears in this session's diff, then clear the intent.
+  // it appears in this session's diff, then clear the intent. A pending jump
+  // for another session is left alone — its own panel consumes it.
   useEffect(() => {
-    if (pendingReviewPath === null) return;
-    const idx = reviewFileIndex(diff.files, pendingReviewPath);
+    if (pendingReview === null || pendingReview.sessionPk !== sessionPk) return;
+    const idx = reviewFileIndex(diff.files, pendingReview.path);
     if (idx >= 0) {
       setReviewFile(idx);
-      setPendingReviewPath(null);
+      setPendingReview(null);
     }
-  }, [pendingReviewPath, diff.files, setPendingReviewPath]);
+  }, [pendingReview, diff.files, setPendingReview, sessionPk]);
 
   useEffect(() => {
     if (!nav.rightMaximized) return;

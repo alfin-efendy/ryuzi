@@ -322,8 +322,8 @@ export function SessionView() {
       </div>
 
       {/* Right panel — keyed by session so switching sessions remounts it: per-session
-          review/file state resets and in-flight gitDiff responses from the previous
-          session land on an unmounted component instead of clobbering the new diff. */}
+          review/file state resets, while diff data lives in the useDiff store keyed
+          by sessionPk so sessions never see each other's results. */}
       {nav.rightOpen && (
         <RightPanel key={session.sessionPk} sessionPk={session.sessionPk} branch={session.branch ?? null} running={running} />
       )}
