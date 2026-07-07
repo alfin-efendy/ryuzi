@@ -139,8 +139,27 @@ pub async fn revert_file(workdir: &str, rel_path: &str) -> anyhow::Result<()> {
         )),
         "invalid path: {rel_path}"
     );
+    // Reject empty/"."-only paths too: both pass the component guard above
+    // (a bare "." yields a single CurDir component, not ParentDir/RootDir/
+    // Prefix) but would otherwise widen the git calls below to the whole
+    // worktree instead of one file.
+    anyhow::ensure!(
+        !rel_path.trim().is_empty() && rel_path.trim() != ".",
+        "invalid path: {rel_path}"
+    );
+    // `:(literal)` disables pathspec globbing so an agent-controlled
+    // `rel_path` containing `*`/`?`/`[...]` can only ever match its own
+    // literal name, never widen the revert to other files.
+    let literal_pathspec = format!(":(literal){rel_path}");
     let tracked = tokio::process::Command::new("git")
-        .args(["-C", workdir, "ls-files", "--error-unmatch", "--", rel_path])
+        .args([
+            "-C",
+            workdir,
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            &literal_pathspec,
+        ])
         .output()
         .await?;
     if tracked.status.success() {
@@ -152,7 +171,7 @@ pub async fn revert_file(workdir: &str, rel_path: &str) -> anyhow::Result<()> {
                 "--staged",
                 "--worktree",
                 "--",
-                rel_path,
+                &literal_pathspec,
             ])
             .output()
             .await?;
@@ -307,6 +326,44 @@ mod tests {
         assert!(revert_file(dir.to_str().unwrap(), "\\abs.txt")
             .await
             .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_dot_and_empty_paths() {
+        // "." and "" pass the component guard (a bare "." is a single CurDir
+        // component, not ParentDir/RootDir/Prefix) but would otherwise widen
+        // the git calls to the whole worktree instead of one file.
+        let dir = fresh_dir("revert-dot-empty");
+        git(&dir, &["init", "-q"]);
+        assert!(revert_file(dir.to_str().unwrap(), ".").await.is_err());
+        assert!(revert_file(dir.to_str().unwrap(), "").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_treats_glob_characters_as_literal() {
+        // Both files committed then modified; "a*.txt" must NOT expand to a
+        // glob (which would match both) — the literal pathspec means it
+        // matches nothing, so the call errors and both files keep their edits.
+        let dir = fresh_dir("revert-glob-literal");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "base-a").unwrap();
+        std::fs::write(dir.join("ab.txt"), "base-ab").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.join("a.txt"), "agent edit a").unwrap();
+        std::fs::write(dir.join("ab.txt"), "agent edit ab").unwrap();
+
+        assert!(revert_file(dir.to_str().unwrap(), "a*.txt").await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "agent edit a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ab.txt")).unwrap(),
+            "agent edit ab"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
