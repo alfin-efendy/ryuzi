@@ -199,3 +199,20 @@ test("formatTurnDuration", () => {
   expect(formatTurnDuration(239000)).toBe("3m 59s");
   expect(formatTurnDuration(null)).toBe("");
 });
+
+test("transient (seq 0) rows in different turns get distinct keys", () => {
+  // Both error rows sit at local index 1 of their turn slice; without an
+  // absolute offset their fallback keys would both be "i1" and collide.
+  const chat: Row[] = [
+    row({ seq: 1, role: "user", blockType: "text", text: "first", createdAt: 1 }),
+    row({ seq: 0, role: "system", blockType: "error", text: "boom one" }),
+    row({ seq: 2, role: "user", blockType: "text", text: "second", createdAt: 2 }),
+    row({ seq: 0, role: "system", blockType: "error", text: "boom two" }),
+  ];
+  const blocks = buildTranscript(chat, false);
+  const keys = blocks.map((b) => b.key);
+  expect(new Set(keys).size).toBe(keys.length);
+  const errorKeys = blocks.flatMap((b) => (b.type === "error" ? [b.key] : []));
+  expect(errorKeys).toHaveLength(2);
+  expect(errorKeys[0]).not.toBe(errorKeys[1]);
+});

@@ -120,11 +120,13 @@ const keyOf = (row: Row, i: number) => (row.seq > 0 ? `s${row.seq}` : `i${i}`);
  * - consecutive tool_call/status rows cluster into one activity group;
  * - user/error rows break runs.
  * Order-based only: no seq-contiguity assumptions (the event bridge may drop).
+ * `indexOffset` shifts the fallback keys of transient (seq 0) rows so callers
+ * grouping slices of a larger row array (buildTranscript) keep keys unique.
  */
-export function groupRows(rows: Row[]): Group[] {
+export function groupRows(rows: Row[], indexOffset = 0): Group[] {
   const groups: Group[] = [];
   rows.forEach((row, i) => {
-    const key = keyOf(row, i);
+    const key = keyOf(row, i + indexOffset);
     if (row.role === "user") {
       if (row.text.trim() || row.attachments.length > 0) groups.push({ type: "user", key, text: row.text, attachments: row.attachments });
       return;
@@ -190,8 +192,12 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
   if (cur.length > 0) turns.push(cur);
 
   const out: TurnBlock[] = [];
+  let rowOffset = 0;
   turns.forEach((turnRows, t) => {
-    const groups = groupRows(turnRows);
+    // Absolute row offset keeps transient (seq 0) fallback keys globally unique
+    // even though each turn slice is grouped independently.
+    const groups = groupRows(turnRows, rowOffset);
+    rowOffset += turnRows.length;
     const live = running && t === turns.length - 1;
     if (live) {
       out.push(...groups);
