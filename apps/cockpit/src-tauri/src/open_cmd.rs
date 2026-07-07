@@ -63,7 +63,12 @@ fn resolve_targets(
     lookup: &dyn Fn(&str) -> Option<PathBuf>,
     exists: &dyn Fn(&PathBuf) -> bool,
 ) -> Vec<ResolvedTarget> {
-    fn builtin(id: &'static str, name: &'static str, program: &str, args: &'static [&'static str]) -> ResolvedTarget {
+    fn builtin(
+        id: &'static str,
+        name: &'static str,
+        program: &str,
+        args: &'static [&'static str],
+    ) -> ResolvedTarget {
         ResolvedTarget {
             id,
             name,
@@ -74,48 +79,117 @@ fn resolve_targets(
     let mut out = Vec::new();
 
     if cfg!(target_os = "windows") {
-        out.push(builtin("explorer", "File Explorer", "explorer.exe", &["{dir}"]));
+        out.push(builtin(
+            "explorer",
+            "File Explorer",
+            "explorer.exe",
+            &["{dir}"],
+        ));
         if let Some(p) = lookup("wt") {
-            out.push(ResolvedTarget { id: "terminal", name: "Terminal", program: p, args: &["-d", "{dir}"] });
+            out.push(ResolvedTarget {
+                id: "terminal",
+                name: "Terminal",
+                program: p,
+                args: &["-d", "{dir}"],
+            });
         }
         let code_fallback = local_app_data().join("Programs/Microsoft VS Code/bin/code.cmd");
-        if let Some(p) = lookup("code").or_else(|| exists(&code_fallback).then(|| code_fallback.clone())) {
-            out.push(ResolvedTarget { id: "vscode", name: "Visual Studio Code", program: p, args: &["{dir}"] });
+        if let Some(p) =
+            lookup("code").or_else(|| exists(&code_fallback).then(|| code_fallback.clone()))
+        {
+            out.push(ResolvedTarget {
+                id: "vscode",
+                name: "Visual Studio Code",
+                program: p,
+                args: &["{dir}"],
+            });
         }
         let cursor_fallback = local_app_data().join("Programs/cursor/resources/app/bin/cursor.cmd");
-        if let Some(p) = lookup("cursor").or_else(|| exists(&cursor_fallback).then(|| cursor_fallback.clone())) {
-            out.push(ResolvedTarget { id: "cursor", name: "Cursor", program: p, args: &["{dir}"] });
+        if let Some(p) =
+            lookup("cursor").or_else(|| exists(&cursor_fallback).then(|| cursor_fallback.clone()))
+        {
+            out.push(ResolvedTarget {
+                id: "cursor",
+                name: "Cursor",
+                program: p,
+                args: &["{dir}"],
+            });
         }
-        for base in ["C:/Program Files/Git/git-bash.exe", "C:/Program Files (x86)/Git/git-bash.exe"] {
+        for base in [
+            "C:/Program Files/Git/git-bash.exe",
+            "C:/Program Files (x86)/Git/git-bash.exe",
+        ] {
             let p = PathBuf::from(base);
             if exists(&p) {
-                out.push(ResolvedTarget { id: "git-bash", name: "Git Bash", program: p, args: &["--cd={dir}"] });
+                out.push(ResolvedTarget {
+                    id: "git-bash",
+                    name: "Git Bash",
+                    program: p,
+                    args: &["--cd={dir}"],
+                });
                 break;
             }
         }
         if let Some(p) = lookup("wsl") {
-            out.push(ResolvedTarget { id: "wsl", name: "WSL", program: p, args: &["--cd", "{dir}"] });
+            out.push(ResolvedTarget {
+                id: "wsl",
+                name: "WSL",
+                program: p,
+                args: &["--cd", "{dir}"],
+            });
         }
     } else if cfg!(target_os = "macos") {
         out.push(builtin("finder", "Finder", "open", &["{dir}"]));
-        out.push(builtin("terminal", "Terminal", "open", &["-a", "Terminal", "{dir}"]));
-        if exists(&PathBuf::from("/Applications/Visual Studio Code.app")) || lookup("code").is_some() {
-            out.push(builtin("vscode", "Visual Studio Code", "open", &["-a", "Visual Studio Code", "{dir}"]));
+        out.push(builtin(
+            "terminal",
+            "Terminal",
+            "open",
+            &["-a", "Terminal", "{dir}"],
+        ));
+        if exists(&PathBuf::from("/Applications/Visual Studio Code.app"))
+            || lookup("code").is_some()
+        {
+            out.push(builtin(
+                "vscode",
+                "Visual Studio Code",
+                "open",
+                &["-a", "Visual Studio Code", "{dir}"],
+            ));
         }
         if exists(&PathBuf::from("/Applications/Cursor.app")) || lookup("cursor").is_some() {
-            out.push(builtin("cursor", "Cursor", "open", &["-a", "Cursor", "{dir}"]));
+            out.push(builtin(
+                "cursor",
+                "Cursor",
+                "open",
+                &["-a", "Cursor", "{dir}"],
+            ));
         }
     } else {
         out.push(builtin("files", "Files", "xdg-open", &["{dir}"]));
         if let Some(p) = lookup("code") {
-            out.push(ResolvedTarget { id: "vscode", name: "Visual Studio Code", program: p, args: &["{dir}"] });
+            out.push(ResolvedTarget {
+                id: "vscode",
+                name: "Visual Studio Code",
+                program: p,
+                args: &["{dir}"],
+            });
         }
         if let Some(p) = lookup("cursor") {
-            out.push(ResolvedTarget { id: "cursor", name: "Cursor", program: p, args: &["{dir}"] });
+            out.push(ResolvedTarget {
+                id: "cursor",
+                name: "Cursor",
+                program: p,
+                args: &["{dir}"],
+            });
         }
         for term in ["x-terminal-emulator", "gnome-terminal", "konsole"] {
             if let Some(p) = lookup(term) {
-                out.push(ResolvedTarget { id: "terminal", name: "Terminal", program: p, args: &["--working-directory={dir}"] });
+                out.push(ResolvedTarget {
+                    id: "terminal",
+                    name: "Terminal",
+                    program: p,
+                    args: &["--working-directory={dir}"],
+                });
                 break;
             }
         }
@@ -157,7 +231,11 @@ pub async fn open_in(
         .ok_or_else(|| CmdError {
             message: format!("unknown open target: {target_id}"),
         })?;
-    let args: Vec<String> = target.args.iter().map(|a| a.replace("{dir}", &dir)).collect();
+    let args: Vec<String> = target
+        .args
+        .iter()
+        .map(|a| a.replace("{dir}", &dir))
+        .collect();
     // Detached fire-and-forget: the spawned app outlives any turn.
     std::process::Command::new(&target.program)
         .args(&args)
@@ -181,7 +259,9 @@ mod tests {
         let targets = resolve_targets(&lookup, &exists);
         // Every OS branch has a builtin file manager plus the faked VS Code.
         assert!(targets.iter().any(|t| t.id == "vscode"));
-        assert!(targets.iter().any(|t| matches!(t.id, "explorer" | "finder" | "files")));
+        assert!(targets
+            .iter()
+            .any(|t| matches!(t.id, "explorer" | "finder" | "files")));
         assert!(!targets.iter().any(|t| t.id == "cursor"));
     }
 
@@ -193,7 +273,11 @@ mod tests {
             program: PathBuf::from("x"),
             args: &["--cd", "{dir}"],
         };
-        let args: Vec<String> = t.args.iter().map(|a| a.replace("{dir}", "C:\\work")).collect();
+        let args: Vec<String> = t
+            .args
+            .iter()
+            .map(|a| a.replace("{dir}", "C:\\work"))
+            .collect();
         assert_eq!(args, vec!["--cd".to_string(), "C:\\work".to_string()]);
     }
 }

@@ -1687,7 +1687,9 @@ mod tests {
         assert_eq!(user_row_payload(&plain), json!({ "text": "hi" }));
 
         let with = TurnPrompt {
-            attachments: vec![json!({ "name": "a.png", "path": "/x/a.png", "contentType": "image/png", "size": 4 })],
+            attachments: vec![
+                json!({ "name": "a.png", "path": "/x/a.png", "contentType": "image/png", "size": 4 }),
+            ],
             ..TurnPrompt::text("hi", "hi")
         };
         let payload = user_row_payload(&with);

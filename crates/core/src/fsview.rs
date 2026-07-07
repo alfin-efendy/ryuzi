@@ -145,7 +145,15 @@ pub async fn revert_file(workdir: &str, rel_path: &str) -> anyhow::Result<()> {
         .await?;
     if tracked.status.success() {
         let out = tokio::process::Command::new("git")
-            .args(["-C", workdir, "restore", "--staged", "--worktree", "--", rel_path])
+            .args([
+                "-C",
+                workdir,
+                "restore",
+                "--staged",
+                "--worktree",
+                "--",
+                rel_path,
+            ])
             .output()
             .await?;
         anyhow::ensure!(
@@ -212,7 +220,8 @@ mod tests {
 
     /// Empty, unique scratch directory (recreated on reruns of the same pid).
     fn fresh_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ryuzi-fsview-core-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ryuzi-fsview-core-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -260,7 +269,9 @@ mod tests {
     async fn revert_file_rejects_parent_traversal() {
         let dir = fresh_dir("revert-traversal");
         git(&dir, &["init", "-q"]);
-        assert!(revert_file(dir.to_str().unwrap(), "../outside.txt").await.is_err());
+        assert!(revert_file(dir.to_str().unwrap(), "../outside.txt")
+            .await
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -275,9 +286,11 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q"]);
         let outside_abs = parent.join("outside.txt");
-        assert!(revert_file(repo.to_str().unwrap(), outside_abs.to_str().unwrap())
-            .await
-            .is_err());
+        assert!(
+            revert_file(repo.to_str().unwrap(), outside_abs.to_str().unwrap())
+                .await
+                .is_err()
+        );
         assert!(outside_abs.exists(), "outside file must survive");
         let _ = std::fs::remove_dir_all(&parent);
     }
@@ -288,8 +301,12 @@ mod tests {
         // Windows "\abs.txt"-style rooted paths would re-root Path::join).
         let dir = fresh_dir("revert-rooted");
         git(&dir, &["init", "-q"]);
-        assert!(revert_file(dir.to_str().unwrap(), "/abs.txt").await.is_err());
-        assert!(revert_file(dir.to_str().unwrap(), "\\abs.txt").await.is_err());
+        assert!(revert_file(dir.to_str().unwrap(), "/abs.txt")
+            .await
+            .is_err());
+        assert!(revert_file(dir.to_str().unwrap(), "\\abs.txt")
+            .await
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

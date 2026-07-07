@@ -973,9 +973,15 @@ mod tests {
     #[test]
     fn image_block_media_types_cover_the_anthropic_raster_set() {
         assert_eq!(image_block_media_type(Some("image/png")), Some("image/png"));
-        assert_eq!(image_block_media_type(Some("image/jpeg")), Some("image/jpeg"));
+        assert_eq!(
+            image_block_media_type(Some("image/jpeg")),
+            Some("image/jpeg")
+        );
         assert_eq!(image_block_media_type(Some("image/gif")), Some("image/gif"));
-        assert_eq!(image_block_media_type(Some("image/webp")), Some("image/webp"));
+        assert_eq!(
+            image_block_media_type(Some("image/webp")),
+            Some("image/webp")
+        );
         assert_eq!(image_block_media_type(Some("application/pdf")), None);
         assert_eq!(image_block_media_type(None), None);
     }
@@ -988,9 +994,24 @@ mod tests {
         let png = dir.join("a.png");
         std::fs::write(&png, [0x89, 0x50, 0x4E, 0x47]).unwrap();
         let saved = vec![
-            SavedAttachment { path: png.clone(), name: "a.png".into(), content_type: Some("image/png".into()), size: 4 },
-            SavedAttachment { path: dir.join("b.mp4"), name: "b.mp4".into(), content_type: Some("video/mp4".into()), size: 4 },
-            SavedAttachment { path: dir.join("huge.png"), name: "huge.png".into(), content_type: Some("image/png".into()), size: IMAGE_BLOCK_MAX_BYTES + 1 },
+            SavedAttachment {
+                path: png.clone(),
+                name: "a.png".into(),
+                content_type: Some("image/png".into()),
+                size: 4,
+            },
+            SavedAttachment {
+                path: dir.join("b.mp4"),
+                name: "b.mp4".into(),
+                content_type: Some("video/mp4".into()),
+                size: 4,
+            },
+            SavedAttachment {
+                path: dir.join("huge.png"),
+                name: "huge.png".into(),
+                content_type: Some("image/png".into()),
+                size: IMAGE_BLOCK_MAX_BYTES + 1,
+            },
         ];
         let blocks = image_blocks_for(&saved).await;
         assert_eq!(blocks.len(), 1);
