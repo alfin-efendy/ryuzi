@@ -67,6 +67,11 @@ pub struct ProviderDescriptor {
     /// the wire format's default (`/chat/completions` | `/messages`).
     /// mimo-free's endpoint ends at `/chat`.
     pub chat_path: Option<&'static str>,
+    /// Whether this provider exposes an OpenAI-compatible /models list endpoint
+    /// we can fetch. False for providers that only ship a seeded model list
+    /// (their /models route 404s), so the refresh path must not treat the
+    /// absence of a live catalog as an error.
+    pub has_models_endpoint: bool,
 }
 
 /// How the OAuth redirect (loopback) listener is bound.
@@ -145,6 +150,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "openai",
@@ -164,6 +170,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "openrouter",
@@ -183,6 +190,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: true,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "groq",
@@ -202,6 +210,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: true,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "deepseek",
@@ -221,6 +230,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "mistral",
@@ -240,6 +250,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "xai",
@@ -259,6 +270,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "google",
@@ -278,6 +290,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: true,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "ollama",
@@ -297,6 +310,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "custom-openai",
@@ -316,6 +330,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "custom-anthropic",
@@ -335,6 +350,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
     // Not connectable in F1 (add_connection refuses non-ApiKey categories).
@@ -372,6 +388,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "openai-oauth",
@@ -399,6 +416,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
         // NOTE: openai-oauth upstream is chatgpt.com/backend-api/codex/responses
         // (Responses wire) — applied in server.rs, not via base_url here.
     },
@@ -428,6 +446,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: true,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "opencode-free",
@@ -447,6 +466,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "mimo-free",
@@ -468,6 +488,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: Some("/chat"),
+        has_models_endpoint: false,
     },
     ProviderDescriptor {
         id: "nvidia",
@@ -487,6 +508,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: true,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "huggingface",
@@ -506,6 +528,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: true,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "cloudflare-ai",
@@ -532,6 +555,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: true,
         risk_notice: false,
         chat_path: None,
+        has_models_endpoint: false,
     },
 ];
 
@@ -736,6 +760,13 @@ mod tests {
             "mistral",
             "xai",
             "ollama",
+            "custom-openai",
+            "custom-anthropic",
+            "anthropic-oauth",
+            "openai-oauth",
+            "kiro",
+            "opencode-free",
+            "mimo-free",
         ] {
             assert!(
                 !descriptor(id).unwrap().free_tier,
@@ -746,5 +777,12 @@ mod tests {
         assert!(descriptor("kiro").unwrap().risk_notice);
         assert!(!descriptor("anthropic").unwrap().risk_notice);
         assert!(!descriptor("opencode-free").unwrap().risk_notice);
+    }
+
+    #[test]
+    fn only_seed_only_providers_lack_a_models_endpoint() {
+        assert!(!descriptor("mimo-free").unwrap().has_models_endpoint);
+        assert!(!descriptor("cloudflare-ai").unwrap().has_models_endpoint);
+        assert!(descriptor("openai").unwrap().has_models_endpoint);
     }
 }

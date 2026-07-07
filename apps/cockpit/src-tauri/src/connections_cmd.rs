@@ -246,6 +246,25 @@ async fn remove_dead_kiro_connections(cp: &ControlPlane, keep_id: &str) -> anyho
     Ok(())
 }
 
+/// True if this connection should be refreshed for `family`: it belongs to the
+/// family (via family_of, falling back to a direct provider==family match for
+/// single-member families) AND is enabled.
+fn is_refresh_target(row: &ConnectionRow, family: &str) -> bool {
+    let in_family =
+        registry::family_of(&row.provider).map_or(row.provider == family, |f| f == family);
+    in_family && row.enabled
+}
+
+/// Display label for a refresh outcome: the connection's label, or its provider
+/// id when the label is empty.
+fn refresh_label(row: &ConnectionRow) -> String {
+    if row.label.is_empty() {
+        row.provider.clone()
+    } else {
+        row.label.clone()
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
@@ -675,17 +694,21 @@ pub async fn refresh_provider_models(
     let rows = connections::list_connections(cp.store()).await?;
     let mut out = Vec::new();
     for mut row in rows {
-        let in_family = registry::family_of(&row.provider)
-            .map(|f| f == family)
-            .unwrap_or(row.provider == family);
-        if !in_family || !row.enabled {
+        if !is_refresh_target(&row, &family) {
             continue;
         }
-        let label = if row.label.is_empty() {
-            row.provider.clone()
-        } else {
-            row.label.clone()
-        };
+        let label = refresh_label(&row);
+        let has_endpoint =
+            registry::descriptor(&row.provider).is_none_or(|d| d.has_models_endpoint);
+        if !has_endpoint {
+            out.push(RefreshModelsResult {
+                connection_id: row.id.clone(),
+                label,
+                ok: true,
+                message: "Uses a seeded model list — no live catalog endpoint".to_string(),
+            });
+            continue;
+        }
         let outcome = models::refresh_connection_models(cp.store(), &http, &mut row)
             .await
             .map(|models| models.len())
@@ -1000,6 +1023,53 @@ mod tests {
                 "Work OpenAI: model list request for openai failed with status 401".to_string()
             )
         );
+    }
+
+    fn connection_row(id: &str, provider: &str, label: &str, enabled: bool) -> ConnectionRow {
+        ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: "api_key".into(),
+            label: label.into(),
+            priority: 0,
+            enabled,
+            data: ConnectionData::default(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// `refresh_provider_models` must refresh only enabled, in-family
+    /// connections: a disabled in-family row, an enabled row from a different
+    /// family, and an enabled row with an unrecognized provider id must all be
+    /// skipped.
+    #[test]
+    fn refresh_targets_filter_by_family_and_enabled() {
+        let in_family_enabled = connection_row("c1", "anthropic-oauth", "Claude", true);
+        let in_family_disabled = connection_row("c2", "anthropic-oauth", "Claude (off)", false);
+        let other_family_enabled = connection_row("c3", "openai", "Work OpenAI", true);
+        let unrecognized_provider_enabled =
+            connection_row("c4", "not-a-real-provider", "Mystery", true);
+
+        assert!(is_refresh_target(&in_family_enabled, "anthropic"));
+        assert!(!is_refresh_target(&in_family_disabled, "anthropic"));
+        assert!(!is_refresh_target(&other_family_enabled, "anthropic"));
+        assert!(!is_refresh_target(
+            &unrecognized_provider_enabled,
+            "anthropic"
+        ));
+    }
+
+    #[test]
+    fn refresh_label_falls_back_to_provider_when_label_is_empty() {
+        let row = connection_row("c1", "openai", "", true);
+        assert_eq!(refresh_label(&row), "openai");
+    }
+
+    #[test]
+    fn refresh_label_uses_the_connection_label_when_present() {
+        let row = connection_row("c1", "openai", "Work OpenAI", true);
+        assert_eq!(refresh_label(&row), "Work OpenAI");
     }
 }
 

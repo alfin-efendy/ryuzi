@@ -310,8 +310,8 @@ function ProviderRow({ row }: { row: ProviderRowInfo }) {
     >
       <Chip initial={row.initial} color={row.color} size={34} />
       <span className="min-w-0 flex-1">
-        <span className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-          {row.name}
+        <span className="flex min-w-0 flex-wrap items-center gap-1.5 text-sm font-semibold text-foreground">
+          <span className="truncate">{row.name}</span>
           {row.badges.map((badge) => (
             <CategoryBadge key={badge} category={badge} />
           ))}
