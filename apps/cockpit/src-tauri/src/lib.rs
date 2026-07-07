@@ -437,7 +437,10 @@ pub fn run() {
             // Pasted files staged before a send belong to no session — clear
             // leftovers from previous runs.
             let _ = std::fs::remove_dir_all(attachments_root.join("staging"));
-            if let Err(e) = app.asset_protocol_scope().allow_directory(&attachments_root, true) {
+            if let Err(e) = app
+                .asset_protocol_scope()
+                .allow_directory(&attachments_root, true)
+            {
                 eprintln!("[ryuzi] asset protocol scope: {e}");
             }
             // Subscribe BEFORE manage() moves the Arc.
