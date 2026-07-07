@@ -16,9 +16,8 @@ import { RuntimeDetailView } from "./views/RuntimeDetailView";
 import { SchedulerView } from "./views/SchedulerView";
 import { JobDetailView } from "./views/JobDetailView";
 import { JobNewView } from "./views/JobNewView";
-import { AppsView } from "./views/AppsView";
+import { PluginsView } from "./views/PluginsView";
 import { AppDetailView } from "./views/AppDetailView";
-import { RegistryView } from "./views/RegistryView";
 import { GatewaysView } from "./views/GatewaysView";
 import { GatewayDetailView } from "./views/GatewayDetailView";
 import { PluginDetailView } from "./views/PluginDetailView";
@@ -48,12 +47,10 @@ function MainView() {
       return <JobDetailView id={view.id} />;
     case "jobNew":
       return <JobNewView />;
-    case "apps":
-      return <AppsView />;
+    case "plugins":
+      return <PluginsView />;
     case "appDetail":
       return <AppDetailView id={view.id} />;
-    case "registry":
-      return <RegistryView />;
     case "gateways":
       return <GatewaysView />;
     case "gatewayDetail":

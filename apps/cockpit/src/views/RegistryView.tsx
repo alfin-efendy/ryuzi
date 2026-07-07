@@ -194,7 +194,7 @@ export function RegistryView() {
       color: colorFor(entry.id),
     });
     setInstalling(null);
-    if (ok) toast.success(`${entry.name} installed — check its status in Apps`);
+    if (ok) toast.success(`${entry.name} installed — check its status in Plugins`);
   };
 
   const installedNames = new Set(apps.map((a) => a.name.toLowerCase()));
@@ -202,11 +202,11 @@ export function RegistryView() {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[860px]">
-        <BackButton label="Apps" onClick={() => nav.navigate({ kind: "apps" })} />
+        <BackButton label="Plugins" onClick={() => nav.navigate({ kind: "plugins" })} />
 
         <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">Registry</h2>
         <p className="m-0 mb-4 text-[13px] text-muted-foreground">
-          Live search of the official MCP registry. Installing adds the server to Apps and connects immediately.
+          Live search of the official MCP registry. Installing adds the server to Plugins and connects immediately.
         </p>
 
         <div className="mb-3 flex h-[34px] w-full max-w-[380px] items-center gap-2 rounded-md border border-input bg-background px-3 text-muted-foreground">

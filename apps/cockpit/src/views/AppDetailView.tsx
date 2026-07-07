@@ -24,7 +24,7 @@ export function AppDetailView({ id }: { id: string }) {
   const { apps, loaded, hydrate, probing, probe, remove, setScope, setToolPerm, toggleAgent } = useApps();
   const runtimes = useRuntimes((s) => s.runtimes);
   const gateways = useGateways((s) => s.gateways);
-  const goApps = () => nav.navigate({ kind: "apps" });
+  const goApps = () => nav.navigate({ kind: "plugins" });
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -44,7 +44,7 @@ export function AppDetailView({ id }: { id: string }) {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[720px]">
-        <BackButton label="Apps" onClick={goApps} />
+        <BackButton label="Plugins" onClick={goApps} />
 
         <DetailHeader
           chip={<Chip initial={app.initial} color={app.color} size={44} mono />}

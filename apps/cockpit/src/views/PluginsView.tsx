@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Minus, Plus, Store } from "lucide-react";
+import { Check, Minus, Plus, Search } from "lucide-react";
 import { Badge, Button, Combobox, Segmented, SettingsCard as Card, Switch } from "@ryuzi/ui";
 import { Chip, IconChip, Pill, PluginStatusBadge, StatusDot } from "@/components/common/bits";
 import type { AppInfo, PluginInfo } from "@/bindings";
@@ -61,7 +61,7 @@ function CatalogCard({ plugin, onOpen, onToggle }: { plugin: PluginInfo; onOpen:
   );
 }
 
-export function AppsView() {
+export function PluginsView() {
   const nav = useNav();
   const { apps, loaded, hydrate, toggleAgent } = useApps();
   const runtimes = useRuntimes((s) => s.runtimes);
@@ -94,7 +94,7 @@ export function AppsView() {
       <div className="mx-auto max-w-[860px]">
         <div className="mb-5 flex items-start gap-3">
           <div className="min-w-0 flex-1">
-            <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">Apps</h2>
+            <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">Plugins</h2>
             <p className="m-0 text-[13px] text-muted-foreground">
               Tools and MCP servers your agents can call — attached to every session they're allowed in.
             </p>
@@ -103,9 +103,9 @@ export function AppsView() {
             <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             Add app
           </Button>
-          <Button onClick={() => nav.navigate({ kind: "registry" })}>
-            <Store aria-hidden size={14} strokeWidth={2} className="size-3.5" />
-            Browse registry
+          <Button onClick={() => setTab("catalog")}>
+            <Search aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+            Browse plugins
           </Button>
         </div>
 
@@ -123,7 +123,7 @@ export function AppsView() {
 
         {tab !== "catalog" && loaded && apps.length === 0 && (
           <Card className="p-6 text-center text-[13px] text-muted-foreground">
-            No apps installed yet. Add an MCP server by hand or browse the registry.
+            No plugins installed yet. Add an MCP server by hand or browse the catalog.
           </Card>
         )}
 
