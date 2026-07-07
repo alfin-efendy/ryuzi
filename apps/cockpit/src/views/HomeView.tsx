@@ -8,18 +8,19 @@ import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
 import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
-import { basename } from "@/lib/paths";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptions } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
 import { StatusDot } from "@/components/common/bits";
 import { startVoiceDictation } from "@/lib/voice";
+import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
+import { AttachmentChips } from "@/components/composer/AttachmentChips";
 
 export function HomeView() {
   const { projects, selectedProjectId, selectProject, start, addProject, setProjectModel } = useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<string[]>([]);
+  const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
@@ -100,12 +101,6 @@ export function HomeView() {
     };
   }, [projectId, contextQueryText]);
 
-  const attachFiles = async () => {
-    const picked = await commands.pickFiles();
-    if (!picked.length) return;
-    setAttachments((cur) => Array.from(new Set([...cur, ...picked])));
-  };
-
   const pickContext = (path: string) => {
     setDraft((cur) => replaceActiveContextToken(cur, path));
     setContextRefs((cur) => uniqueContextRefs([...cur, path]));
@@ -137,16 +132,16 @@ export function HomeView() {
 
   const send = async () => {
     const t = draft.trim();
-    if ((!t && attachments.length === 0) || !project) return;
+    if ((!t && composerFiles.attachments.length === 0) || !project) return;
     const opts = {
       runtimeId: "native",
       model: nav.composerModel ?? null,
       context: { branch: nav.composerBranch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-      attachments,
+      attachments: composerFiles.attachments,
       git: composerGitOptions(branchList, nav.composerBranch, nav.composerUseWorktree),
     };
     setDraft("");
-    setAttachments([]);
+    composerFiles.clear();
     setContextRefs([]);
     await start(project.projectId, t, opts);
     nav.navigate({ kind: "session" });
@@ -158,7 +153,9 @@ export function HomeView() {
         What should we build{project ? ` in ${projectLabel(project)}` : ""}?
       </h1>
       <div className="w-full max-w-[720px]">
-        <div className="acrylic-card relative rounded-2xl border border-border shadow-sm">
+        <div
+          className={`acrylic-card relative rounded-2xl border shadow-sm ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
+        >
           <Textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -168,6 +165,7 @@ export function HomeView() {
                 void send();
               }
             }}
+            onPaste={composerFiles.onPaste}
             placeholder="Do anything"
             rows={2}
             className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-[18px] pb-1 pt-4 text-[14.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[14.5px] dark:bg-transparent"
@@ -199,7 +197,7 @@ export function HomeView() {
               variant="ghost"
               size="icon-sm"
               title="Attach"
-              onClick={() => void attachFiles()}
+              onClick={() => void composerFiles.attachFiles()}
               className="rounded-full text-muted-foreground"
             >
               <Paperclip aria-hidden size={16} strokeWidth={2} />
@@ -250,7 +248,7 @@ export function HomeView() {
               <ArrowUp aria-hidden size={15} strokeWidth={2.2} className="size-[15px]" />
             </Button>
           </div>
-          {(attachments.length > 0 || contextRefs.length > 0) && (
+          {(composerFiles.attachments.length > 0 || contextRefs.length > 0) && (
             <div className="flex flex-wrap gap-1.5 px-3 pb-2">
               {contextRefs.map((path) => (
                 <Button
@@ -266,20 +264,7 @@ export function HomeView() {
                   <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
                 </Button>
               ))}
-              {attachments.map((path) => (
-                <Button
-                  key={path}
-                  variant="outline"
-                  size="sm"
-                  title={path}
-                  onClick={() => setAttachments((cur) => cur.filter((p) => p !== path))}
-                  className="max-w-[220px] rounded-full px-2 text-[12px] text-muted-foreground"
-                >
-                  <Paperclip aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
-                  <span className="truncate">{basename(path)}</span>
-                  <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
-                </Button>
-              ))}
+              <AttachmentChips attachments={composerFiles.attachments} onRemove={composerFiles.remove} />
             </div>
           )}
 

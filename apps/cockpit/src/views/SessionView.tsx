@@ -9,7 +9,6 @@ import { useNative } from "@/store-native";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
-import { basename } from "@/lib/paths";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
@@ -20,13 +19,15 @@ import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
 import { startVoiceDictation } from "@/lib/voice";
+import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
+import { AttachmentChips } from "@/components/composer/AttachmentChips";
 
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
     useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<string[]>([]);
+  const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
@@ -94,20 +95,14 @@ export function SessionView() {
 
   const submit = () => {
     const t = draft.trim();
-    if (!t && attachments.length === 0) return;
+    if (!t && composerFiles.attachments.length === 0) return;
     setDraft("");
-    setAttachments([]);
+    composerFiles.clear();
     setContextRefs([]);
     void send(session.sessionPk, t, {
       context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-      attachments,
+      attachments: composerFiles.attachments,
     });
-  };
-
-  const attachFiles = async () => {
-    const picked = await commands.pickFiles();
-    if (!picked.length) return;
-    setAttachments((cur) => Array.from(new Set([...cur, ...picked])));
   };
 
   const pickContext = (path: string) => {
@@ -189,7 +184,9 @@ export function SessionView() {
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
-          <div className="acrylic-card relative rounded-2xl border border-border shadow-xs">
+          <div
+            className={`acrylic-card relative rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
+          >
             <Textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
@@ -199,6 +196,7 @@ export function SessionView() {
                   submit();
                 }
               }}
+              onPaste={composerFiles.onPaste}
               placeholder="Ask for follow-up changes"
               rows={1}
               className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
@@ -230,7 +228,7 @@ export function SessionView() {
                 variant="ghost"
                 size="icon-sm"
                 title="Attach"
-                onClick={() => void attachFiles()}
+                onClick={() => void composerFiles.attachFiles()}
                 className="rounded-full text-muted-foreground"
               >
                 <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
@@ -297,7 +295,7 @@ export function SessionView() {
                 </Button>
               )}
             </div>
-            {(attachments.length > 0 || contextRefs.length > 0) && (
+            {(composerFiles.attachments.length > 0 || contextRefs.length > 0) && (
               <div className="flex flex-wrap gap-1.5 px-2.5 pb-2">
                 {contextRefs.map((path) => (
                   <Button
@@ -313,20 +311,7 @@ export function SessionView() {
                     <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
                   </Button>
                 ))}
-                {attachments.map((path) => (
-                  <Button
-                    key={path}
-                    variant="outline"
-                    size="sm"
-                    title={path}
-                    onClick={() => setAttachments((cur) => cur.filter((p) => p !== path))}
-                    className="max-w-[220px] rounded-full px-2 text-[12px] text-muted-foreground"
-                  >
-                    <Paperclip aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
-                    <span className="truncate">{basename(path)}</span>
-                    <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
-                  </Button>
-                ))}
+                <AttachmentChips attachments={composerFiles.attachments} onRemove={composerFiles.remove} />
               </div>
             )}
           </div>
