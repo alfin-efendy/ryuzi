@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { closeDanglingFence, groupRows, messageToRow, type Row } from "./transcript";
+import { buildTranscript, closeDanglingFence, formatTurnDuration, groupRows, messageToRow, turnDurationMs, type Row } from "./transcript";
 
 const row = (partial: Partial<Row>): Row => ({
   seq: 0,
@@ -132,4 +132,70 @@ test("messageToRow extracts the tool target path from tool_call input", () => {
   expect(alt.toolPath).toBe("src/b.ts");
   const none = messageToRow(2, "assistant", "tool_call", { name: "bash", input: { command: "ls" } }, "t1", "completed", "execute", null);
   expect(none.toolPath).toBeNull();
+});
+
+const turn: Row[] = [
+  row({ seq: 1, role: "user", blockType: "text", text: "do it", createdAt: 1000 }),
+  row({ seq: 2, role: "assistant", blockType: "thought", text: "hmm", createdAt: 2000 }),
+  row({
+    seq: 3,
+    role: "assistant",
+    blockType: "tool_call",
+    toolCallId: "t1",
+    toolName: "edit",
+    toolKind: "edit",
+    toolStatus: "completed",
+    toolPath: "src/a.ts",
+    createdAt: 3000,
+  }),
+  row({ seq: 4, role: "assistant", blockType: "text", text: "done!", createdAt: 37000 }),
+];
+
+test("completed turn collapses thought+activity into one summary, text stays visible", () => {
+  const blocks = buildTranscript(turn, false);
+  expect(blocks.map((b) => b.type)).toEqual(["user", "summary", "agent"]);
+  const summary = blocks[1] as Extract<(typeof blocks)[number], { type: "summary" }>;
+  expect(summary.groups.map((g) => g.type)).toEqual(["thought", "activity"]);
+  expect(summary.durationMs).toBe(36000);
+});
+
+test("the live last turn stays uncollapsed while running", () => {
+  const blocks = buildTranscript(turn, true);
+  expect(blocks.map((b) => b.type)).toEqual(["user", "thought", "activity", "agent"]);
+});
+
+test("earlier turns collapse even while a later turn runs", () => {
+  const second = [
+    row({ seq: 5, role: "user", blockType: "text", text: "more", createdAt: 40000 }),
+    row({
+      seq: 6,
+      role: "assistant",
+      blockType: "tool_call",
+      toolCallId: "t2",
+      toolName: "read",
+      toolKind: "read",
+      toolStatus: "in_progress",
+      createdAt: 41000,
+    }),
+  ];
+  const blocks = buildTranscript([...turn, ...second], true);
+  expect(blocks.map((b) => b.type)).toEqual(["user", "summary", "agent", "user", "activity"]);
+});
+
+test("a turn with no activity has no summary", () => {
+  const chat: Row[] = [
+    row({ seq: 1, role: "user", blockType: "text", text: "hi", createdAt: 1 }),
+    row({ seq: 2, role: "assistant", blockType: "text", text: "hello", createdAt: 2 }),
+  ];
+  expect(buildTranscript(chat, false).map((b) => b.type)).toEqual(["user", "agent"]);
+});
+
+test("turn duration is null without timestamps", () => {
+  expect(turnDurationMs([row({ seq: 1, role: "user", blockType: "text", createdAt: null })])).toBeNull();
+});
+
+test("formatTurnDuration", () => {
+  expect(formatTurnDuration(36000)).toBe("36s");
+  expect(formatTurnDuration(239000)).toBe("3m 59s");
+  expect(formatTurnDuration(null)).toBe("");
 });

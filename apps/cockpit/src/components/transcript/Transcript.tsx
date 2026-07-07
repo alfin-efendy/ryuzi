@@ -1,12 +1,13 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AudioLines, Paperclip } from "lucide-react";
-import { closeDanglingFence, groupRows, type Row, type RowAttachment } from "@/lib/transcript";
+import { buildTranscript, closeDanglingFence, type Row, type RowAttachment } from "@/lib/transcript";
 import { mediaKindForContentType } from "@/lib/attachments";
 import { StatusDot } from "@/components/common/bits";
 import { Markdown } from "./Markdown";
 import { ThoughtBlock } from "./ThoughtBlock";
 import { ActivityCluster } from "./ToolChip";
+import { TurnSummary } from "./TurnSummary";
 
 function MediaItem({ a, onOpenImage }: { a: RowAttachment; onOpenImage: (src: string) => void }) {
   const [failed, setFailed] = useState(false);
@@ -127,7 +128,7 @@ export function Transcript({
   const stickRef = useRef(true);
   const [lightbox, setLightbox] = useState<string | null>(null);
 
-  const groups = useMemo(() => groupRows(rows), [rows]);
+  const groups = useMemo(() => buildTranscript(rows, running), [rows, running]);
   const tail = groups[groups.length - 1];
   // Growth signal for the tail group: coalesced text grows by length, an
   // activity cluster grows by item count — either must re-pin the scroll.
@@ -175,6 +176,8 @@ export function Transcript({
               return <ActivityCluster key={g.key} items={g.items} />;
             case "error":
               return <ErrorRow key={g.key} text={g.text} />;
+            case "summary":
+              return <TurnSummary key={g.key} groups={g.groups} durationMs={g.durationMs} />;
             default:
               return null;
           }

@@ -33,10 +33,12 @@ export type ActivityItem =
 
 export type Group =
   | { type: "user"; key: string; text: string; attachments: RowAttachment[] }
-  | { type: "agent"; key: string; markdown: string }
+  | { type: "agent"; key: string; markdown: string; turnEnd?: boolean }
   | { type: "thought"; key: string; markdown: string }
   | { type: "activity"; key: string; items: ActivityItem[] }
   | { type: "error"; key: string; text: string };
+
+export type TurnBlock = Group | { type: "summary"; key: string; groups: Group[]; durationMs: number | null };
 
 function outputPreview(v: unknown): string | null {
   if (v === undefined || v === null) return null;
@@ -151,6 +153,66 @@ export function groupRows(rows: Row[]): Group[] {
   // Whitespace-only chunks stay inside runs (they are paragraph separators),
   // but a run that never got visible content is dropped entirely.
   return groups.filter((g) => (g.type !== "agent" && g.type !== "thought") || g.markdown.trim().length > 0);
+}
+
+/** Last-row minus user-row timestamps; null when either is missing. */
+export function turnDurationMs(turnRows: Row[]): number | null {
+  const start = turnRows.find((r) => r.role === "user")?.createdAt ?? null;
+  const end = turnRows[turnRows.length - 1]?.createdAt ?? null;
+  return start !== null && end !== null && end >= start ? end - start : null;
+}
+
+/** "36s" under a minute, then "3m 59s". Null → "". */
+export function formatTurnDuration(ms: number | null): string {
+  if (ms === null) return "";
+  const secs = Math.max(0, Math.round(ms / 1000));
+  if (secs < 60) return `${secs}s`;
+  return `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, "0")}s`;
+}
+
+/**
+ * Splits rows into user turns and collapses each COMPLETED turn's activity
+ * (thought/tool/status groups) into one summary block placed where the first
+ * collapsed group appeared. Agent text and errors stay inline; the last agent
+ * text of a completed turn is flagged `turnEnd` (action bar anchor). The last
+ * turn stays uncollapsed while `running` so live activity streams.
+ */
+export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
+  const turns: Row[][] = [];
+  let cur: Row[] = [];
+  for (const r of rows) {
+    if (r.role === "user" && cur.length > 0) {
+      turns.push(cur);
+      cur = [];
+    }
+    cur.push(r);
+  }
+  if (cur.length > 0) turns.push(cur);
+
+  const out: TurnBlock[] = [];
+  turns.forEach((turnRows, t) => {
+    const groups = groupRows(turnRows);
+    const live = running && t === turns.length - 1;
+    if (live) {
+      out.push(...groups);
+      return;
+    }
+    const agentGroups = groups.filter((g) => g.type === "agent");
+    const lastAgent = agentGroups[agentGroups.length - 1];
+    const collapsible = groups.filter((g) => g.type === "activity" || g.type === "thought");
+    for (const g of groups) {
+      if (g.type === "activity" || g.type === "thought") {
+        if (g === collapsible[0]) {
+          out.push({ type: "summary", key: `sum-${g.key}`, groups: collapsible, durationMs: turnDurationMs(turnRows) });
+        }
+      } else if (g === lastAgent && g.type === "agent") {
+        out.push({ ...g, turnEnd: true });
+      } else {
+        out.push(g);
+      }
+    }
+  });
+  return out;
 }
 
 /**
