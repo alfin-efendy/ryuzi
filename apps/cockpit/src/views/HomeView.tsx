@@ -143,7 +143,7 @@ export function HomeView() {
       model: nav.composerModel ?? null,
       context: { branch: nav.composerBranch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments,
-      git: composerGitOptions(branchList, nav.composerBranch, nav.composerUseWorktree, nav.composerCreateBranch),
+      git: composerGitOptions(branchList, nav.composerBranch, nav.composerUseWorktree),
     };
     setDraft("");
     setAttachments([]);
