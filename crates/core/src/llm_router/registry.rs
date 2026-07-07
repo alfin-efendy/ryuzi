@@ -57,6 +57,12 @@ pub struct ProviderDescriptor {
     /// Set for providers that authenticate via an AWS SSO-OIDC device-code
     /// flow (Kiro) rather than redirect+PKCE OAuth or a static API key.
     pub device_flow: Option<DeviceFlowConfig>,
+    /// API-key provider with a genuinely free usage path (free-tier key).
+    /// Drives the "Free tier" badge in the UI; orthogonal to `category`.
+    pub free_tier: bool,
+    /// Reuses a consumer subscription/quota through unofficial endpoints —
+    /// the UI must warn that this can risk account suspension.
+    pub risk_notice: bool,
 }
 
 /// How the OAuth redirect (loopback) listener is bound.
@@ -132,6 +138,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "openai",
@@ -148,6 +156,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "openrouter",
@@ -164,6 +174,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: true,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "groq",
@@ -180,6 +192,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: true,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "deepseek",
@@ -196,6 +210,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "mistral",
@@ -212,6 +228,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "xai",
@@ -228,6 +246,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "google",
@@ -244,6 +264,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: true,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "ollama",
@@ -260,6 +282,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "custom-openai",
@@ -276,6 +300,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "custom-anthropic",
@@ -292,6 +318,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
     // Not connectable in F1 (add_connection refuses non-ApiKey categories).
@@ -326,6 +354,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         }),
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
     ProviderDescriptor {
         id: "openai-oauth",
@@ -350,6 +380,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         }),
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
         // NOTE: openai-oauth upstream is chatgpt.com/backend-api/codex/responses
         // (Responses wire) — applied in server.rs, not via base_url here.
     },
@@ -376,6 +408,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: Some(KIRO_DEVICE_FLOW),
+        free_tier: false,
+        risk_notice: true,
     },
     ProviderDescriptor {
         id: "opencode-free",
@@ -392,6 +426,8 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: true,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
     },
 ];
 
@@ -536,5 +572,30 @@ mod tests {
         assert_eq!(family_of("kiro"), Some("kiro"));
         assert_eq!(family_of("custom-openai"), Some("custom-openai"));
         assert_eq!(family_of("nope"), None);
+    }
+
+    #[test]
+    fn free_tier_and_risk_notice_flags_mark_the_agreed_entries() {
+        // Free-tier: API-key providers with a genuinely free usage path.
+        for id in ["openrouter", "groq", "google"] {
+            assert!(descriptor(id).unwrap().free_tier, "{id} must be free_tier");
+        }
+        for id in [
+            "anthropic",
+            "openai",
+            "deepseek",
+            "mistral",
+            "xai",
+            "ollama",
+        ] {
+            assert!(
+                !descriptor(id).unwrap().free_tier,
+                "{id} must NOT be free_tier"
+            );
+        }
+        // Risk notice: subscription/quota reuse through unofficial endpoints.
+        assert!(descriptor("kiro").unwrap().risk_notice);
+        assert!(!descriptor("anthropic").unwrap().risk_notice);
+        assert!(!descriptor("opencode-free").unwrap().risk_notice);
     }
 }
