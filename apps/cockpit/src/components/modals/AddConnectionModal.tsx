@@ -3,7 +3,7 @@ import { Copy, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
 import { events, type CatalogEntry, type DeviceFlowInfo } from "@/bindings";
-import { Chip } from "@/components/common/bits";
+import { CategoryBadge, Chip } from "@/components/common/bits";
 import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
 import {
   KIRO_DEVICE_CODE_HINT,
@@ -13,6 +13,7 @@ import {
   KIRO_SIGNIN_ACTION,
   KIRO_SIGNIN_SUBTITLE,
   KIRO_WAITING_HINT,
+  PROVIDER_RISK_NOTICE,
 } from "@/constants";
 
 type DeviceStep = "form" | "waiting";
@@ -20,6 +21,10 @@ type DeviceStep = "form" | "waiting";
 const SUBSCRIPTION_LABELS: Record<string, string> = {
   "anthropic-oauth": "Claude subscription",
   "openai-oauth": "ChatGPT subscription",
+};
+
+const BASE_URL_PLACEHOLDERS: Record<string, string> = {
+  "cloudflare-ai": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
 };
 
 function authMethodLabel(entry: CatalogEntry): string {
@@ -214,7 +219,10 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
               >
                 <Chip initial={entry.initial} color={entry.color} size={32} />
                 <span className="min-w-0">
-                  <span className="block font-semibold">{authMethodLabel(entry)}</span>
+                  <span className="flex items-center gap-1.5 font-semibold">
+                    {authMethodLabel(entry)}
+                    <CategoryBadge category={entry.freeTier ? "free_tier" : entry.category} />
+                  </span>
                   <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11px] font-normal text-muted-foreground">
                     {entry.name}
                   </span>
@@ -223,6 +231,12 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
             );
           })}
         </div>
+      )}
+
+      {selected?.riskNotice && (
+        <p className="mt-3 rounded-md border border-border px-3 py-2 text-[11.5px]" style={{ color: "#F59E0B" }}>
+          {PROVIDER_RISK_NOTICE}
+        </p>
       )}
 
       {selected?.category === "oauth" ? (
@@ -319,7 +333,11 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
                     )
                   }
                 >
-                  <Input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://host/v1" />
+                  <Input
+                    value={baseUrl}
+                    onChange={(event) => setBaseUrl(event.target.value)}
+                    placeholder={BASE_URL_PLACEHOLDERS[selected?.id ?? ""] ?? "https://host/v1"}
+                  />
                 </FormField>
               </>
             )}

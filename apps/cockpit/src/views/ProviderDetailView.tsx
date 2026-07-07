@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronRight, Plus, TestTube2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronRight, Plus, RefreshCw, TestTube2 } from "lucide-react";
 import { toast } from "sonner";
 import { commands, type ConnectionInfo, type ModelRouteStrategy, type UsageSeries } from "@/bindings";
 import { useConnections } from "@/store-connections";
@@ -136,8 +136,19 @@ function AccountRow({ conn, index, count }: { conn: ConnectionInfo; index: numbe
   );
 }
 
-function ProviderModelsCard({ connections, catalogModels }: { connections: ConnectionInfo[]; catalogModels: string[] }) {
+function ProviderModelsCard({
+  family,
+  connections,
+  catalogModels,
+}: {
+  family: string;
+  connections: ConnectionInfo[];
+  catalogModels: string[];
+}) {
   const [testingModel, setTestingModel] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshErrors, setRefreshErrors] = useState<Array<{ connectionId: string; message: string }>>([]);
+  const hydrate = useConnections((s) => s.hydrate);
   const models = useMemo(() => {
     const set = new Set<string>();
     for (const conn of connections) {
@@ -164,12 +175,42 @@ function ProviderModelsCard({ connections, catalogModels }: { connections: Conne
     toast.error(`Model test failed: ${result.error.message}`);
   };
 
+  const runRefresh = async () => {
+    setRefreshing(true);
+    setRefreshErrors([]);
+    const result = await commands.refreshProviderModels(family);
+    setRefreshing(false);
+    if (result.status !== "ok") {
+      toast.error(`Refresh failed: ${result.error.message}`);
+      return;
+    }
+    const failures = result.data.filter((item) => !item.ok);
+    setRefreshErrors(failures.map((item) => ({ connectionId: item.connectionId, message: item.message })));
+    if (failures.length === 0) toast.success("Models refreshed");
+    await hydrate();
+  };
+
   return (
     <Card className="mt-3">
       <CardHeader>
         <CardTitle>Models</CardTitle>
         <CardHint>{modelLabel(models.length)}</CardHint>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void runRefresh()}
+          disabled={refreshing || connections.length === 0}
+          className="ml-auto"
+        >
+          <RefreshCw aria-hidden size={12} strokeWidth={2} className="size-3" />
+          {refreshing ? "Refreshing..." : "Refresh models"}
+        </Button>
       </CardHeader>
+      {refreshErrors.map((err) => (
+        <div key={err.connectionId} className="border-b border-border px-[18px] py-2 text-xs last:border-b-0" style={{ color: "#EF4444" }}>
+          {err.message}
+        </div>
+      ))}
       {models.map((model) => (
         <div key={model} className="flex min-h-11 items-center gap-2 border-b border-border px-[18px] py-2.5 last:border-b-0">
           <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{model}</span>
@@ -334,7 +375,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
           </div>
         </Card>
 
-        <ProviderModelsCard connections={providerConnections} catalogModels={catalogModels} />
+        <ProviderModelsCard family={provider} connections={providerConnections} catalogModels={catalogModels} />
       </div>
       <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} family={provider} />
     </div>

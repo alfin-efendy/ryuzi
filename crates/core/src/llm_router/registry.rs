@@ -57,6 +57,21 @@ pub struct ProviderDescriptor {
     /// Set for providers that authenticate via an AWS SSO-OIDC device-code
     /// flow (Kiro) rather than redirect+PKCE OAuth or a static API key.
     pub device_flow: Option<DeviceFlowConfig>,
+    /// API-key provider with a genuinely free usage path (free-tier key).
+    /// Drives the "Free tier" badge in the UI; orthogonal to `category`.
+    pub free_tier: bool,
+    /// Reuses a consumer subscription/quota through unofficial endpoints —
+    /// the UI must warn that this can risk account suspension.
+    pub risk_notice: bool,
+    /// Nonstandard chat-generation path appended to the base URL instead of
+    /// the wire format's default (`/chat/completions` | `/messages`).
+    /// mimo-free's endpoint ends at `/chat`.
+    pub chat_path: Option<&'static str>,
+    /// Whether this provider exposes an OpenAI-compatible /models list endpoint
+    /// we can fetch. False for providers that only ship a seeded model list
+    /// (their /models route 404s), so the refresh path must not treat the
+    /// absence of a live catalog as an error.
+    pub has_models_endpoint: bool,
 }
 
 /// How the OAuth redirect (loopback) listener is bound.
@@ -132,6 +147,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "openai",
@@ -148,6 +167,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "openrouter",
@@ -164,6 +187,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: true,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "groq",
@@ -180,6 +207,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: true,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "deepseek",
@@ -196,6 +227,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "mistral",
@@ -212,6 +247,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "xai",
@@ -228,6 +267,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "google",
@@ -244,6 +287,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: true,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "ollama",
@@ -260,6 +307,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "custom-openai",
@@ -276,6 +327,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "custom-anthropic",
@@ -292,6 +347,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
     // Not connectable in F1 (add_connection refuses non-ApiKey categories).
@@ -326,6 +385,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         }),
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "openai-oauth",
@@ -337,7 +400,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         format: ApiFormat::OpenAi,
         base_url: Some("https://api.openai.com/v1"),
         auth: AuthScheme::Bearer,
-        models: &[],
+        models: &["gpt-5.2-codex", "gpt-5.2", "o5-mini"],
         requires_base_url: false,
         oauth: Some(OAuthConfig {
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
@@ -350,6 +413,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         }),
         no_auth: false,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
         // NOTE: openai-oauth upstream is chatgpt.com/backend-api/codex/responses
         // (Responses wire) — applied in server.rs, not via base_url here.
     },
@@ -376,6 +443,10 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: false,
         device_flow: Some(KIRO_DEVICE_FLOW),
+        free_tier: false,
+        risk_notice: true,
+        chat_path: None,
+        has_models_endpoint: true,
     },
     ProviderDescriptor {
         id: "opencode-free",
@@ -392,6 +463,99 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         oauth: None,
         no_auth: true,
         device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
+    },
+    ProviderDescriptor {
+        id: "mimo-free",
+        name: "MiMo (free)",
+        family: "mimo-free",
+        color: "#FF6900",
+        initial: "M",
+        category: Free,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://api.xiaomimimo.com/api/free-ai/openai"),
+        auth: AuthScheme::None,
+        // No /models endpoint on this host (9router discovers via models.dev)
+        // — the live refresh 404s harmlessly and these seeds stand.
+        models: &["mimo-auto"],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: true,
+        device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: Some("/chat"),
+        has_models_endpoint: false,
+    },
+    ProviderDescriptor {
+        id: "nvidia",
+        name: "NVIDIA NIM",
+        family: "nvidia",
+        color: "#76B900",
+        initial: "N",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://integrate.api.nvidia.com/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: true,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
+    },
+    ProviderDescriptor {
+        id: "huggingface",
+        name: "Hugging Face",
+        family: "huggingface",
+        color: "#FFD21E",
+        initial: "H",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        base_url: Some("https://router.huggingface.co/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: true,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: true,
+    },
+    ProviderDescriptor {
+        id: "cloudflare-ai",
+        name: "Cloudflare Workers AI",
+        family: "cloudflare-ai",
+        color: "#F6821F",
+        initial: "CF",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        // User pastes https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1
+        base_url: None,
+        auth: AuthScheme::Bearer,
+        // The account URL has no OpenAI-compatible /models route — seed a
+        // few Workers AI text models; users can override per connection.
+        models: &[
+            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "@cf/openai/gpt-oss-120b",
+            "@cf/meta/llama-3.1-8b-instruct",
+        ],
+        requires_base_url: true,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: true,
+        risk_notice: false,
+        chat_path: None,
+        has_models_endpoint: false,
     },
 ];
 
@@ -482,6 +646,18 @@ mod tests {
     }
 
     #[test]
+    fn openai_oauth_has_seed_models_when_live_discovery_is_unavailable() {
+        let d = descriptor("openai-oauth").unwrap();
+        assert!(
+            !d.models.is_empty(),
+            "empty seed makes an OAuth-only OpenAI family contribute zero models"
+        );
+        assert!(d.models.contains(&"gpt-5.2-codex"));
+        assert!(d.models.contains(&"gpt-5.2"));
+        assert!(d.models.contains(&"o5-mini"));
+    }
+
+    #[test]
     fn opencode_free_is_no_auth_free() {
         let d = descriptor("opencode-free").unwrap();
         assert_eq!(d.category, ProviderCategory::Free);
@@ -536,5 +712,77 @@ mod tests {
         assert_eq!(family_of("kiro"), Some("kiro"));
         assert_eq!(family_of("custom-openai"), Some("custom-openai"));
         assert_eq!(family_of("nope"), None);
+    }
+
+    #[test]
+    fn phase_a_free_and_free_tier_providers_are_wellformed() {
+        let mimo = descriptor("mimo-free").unwrap();
+        assert_eq!(mimo.category, ProviderCategory::Free);
+        assert!(mimo.no_auth);
+        assert_eq!(
+            mimo.base_url,
+            Some("https://api.xiaomimimo.com/api/free-ai/openai")
+        );
+        assert_eq!(mimo.chat_path, Some("/chat"));
+        assert_eq!(mimo.models, &["mimo-auto"]);
+
+        let nvidia = descriptor("nvidia").unwrap();
+        assert_eq!(nvidia.category, ProviderCategory::ApiKey);
+        assert!(nvidia.free_tier);
+        assert_eq!(nvidia.base_url, Some("https://integrate.api.nvidia.com/v1"));
+
+        let hf = descriptor("huggingface").unwrap();
+        assert!(hf.free_tier);
+        assert_eq!(hf.base_url, Some("https://router.huggingface.co/v1"));
+
+        let cf = descriptor("cloudflare-ai").unwrap();
+        assert!(cf.free_tier);
+        assert!(
+            cf.requires_base_url,
+            "user pastes the account-scoped /ai/v1 URL"
+        );
+        assert!(
+            !cf.models.is_empty(),
+            "no /models endpoint on the account URL — seeds required"
+        );
+    }
+
+    #[test]
+    fn free_tier_and_risk_notice_flags_mark_the_agreed_entries() {
+        // Free-tier: API-key providers with a genuinely free usage path.
+        for id in ["openrouter", "groq", "google"] {
+            assert!(descriptor(id).unwrap().free_tier, "{id} must be free_tier");
+        }
+        for id in [
+            "anthropic",
+            "openai",
+            "deepseek",
+            "mistral",
+            "xai",
+            "ollama",
+            "custom-openai",
+            "custom-anthropic",
+            "anthropic-oauth",
+            "openai-oauth",
+            "kiro",
+            "opencode-free",
+            "mimo-free",
+        ] {
+            assert!(
+                !descriptor(id).unwrap().free_tier,
+                "{id} must NOT be free_tier"
+            );
+        }
+        // Risk notice: subscription/quota reuse through unofficial endpoints.
+        assert!(descriptor("kiro").unwrap().risk_notice);
+        assert!(!descriptor("anthropic").unwrap().risk_notice);
+        assert!(!descriptor("opencode-free").unwrap().risk_notice);
+    }
+
+    #[test]
+    fn only_seed_only_providers_lack_a_models_endpoint() {
+        assert!(!descriptor("mimo-free").unwrap().has_models_endpoint);
+        assert!(!descriptor("cloudflare-ai").unwrap().has_models_endpoint);
+        assert!(descriptor("openai").unwrap().has_models_endpoint);
     }
 }

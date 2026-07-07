@@ -37,6 +37,8 @@ pub struct CatalogEntry {
     pub format: String,
     pub requires_base_url: bool,
     pub models: Vec<String>,
+    pub free_tier: bool,
+    pub risk_notice: bool,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -67,6 +69,24 @@ pub struct ConnectionInfo {
 pub struct TestResult {
     pub ok: bool,
     pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshModelsResult {
+    pub connection_id: String,
+    pub label: String,
+    pub ok: bool,
+    pub message: String,
+}
+
+/// One outcome line per refreshed connection — pure so it's testable
+/// without a Store or network.
+fn refresh_message(label: &str, outcome: &Result<usize, String>) -> (bool, String) {
+    match outcome {
+        Ok(n) => (true, format!("{n} models discovered")),
+        Err(e) => (false, format!("{label}: {e}")),
+    }
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -226,6 +246,25 @@ async fn remove_dead_kiro_connections(cp: &ControlPlane, keep_id: &str) -> anyho
     Ok(())
 }
 
+/// True if this connection should be refreshed for `family`: it belongs to the
+/// family (via family_of, falling back to a direct provider==family match for
+/// single-member families) AND is enabled.
+fn is_refresh_target(row: &ConnectionRow, family: &str) -> bool {
+    let in_family =
+        registry::family_of(&row.provider).map_or(row.provider == family, |f| f == family);
+    in_family && row.enabled
+}
+
+/// Display label for a refresh outcome: the connection's label, or its provider
+/// id when the label is empty.
+fn refresh_label(row: &ConnectionRow) -> String {
+    if row.label.is_empty() {
+        row.provider.clone()
+    } else {
+        row.label.clone()
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
@@ -252,6 +291,8 @@ pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
             },
             requires_base_url: d.requires_base_url,
             models: d.models.iter().map(|s| s.to_string()).collect(),
+            free_tier: d.free_tier,
+            risk_notice: d.risk_notice,
         })
         .collect())
 }
@@ -640,6 +681,49 @@ pub async fn test_connection_model(
     Ok(result)
 }
 
+/// Re-fetch the live model list for every enabled connection in a vendor
+/// family, persisting discoveries. Unlike the add/update-time best-effort
+/// refresh, failures are returned to the UI instead of being swallowed.
+#[tauri::command]
+#[specta::specta]
+pub async fn refresh_provider_models(
+    cp: State<'_, Arc<ControlPlane>>,
+    family: String,
+) -> R<Vec<RefreshModelsResult>> {
+    let http = quota_http_client()?;
+    let rows = connections::list_connections(cp.store()).await?;
+    let mut out = Vec::new();
+    for mut row in rows {
+        if !is_refresh_target(&row, &family) {
+            continue;
+        }
+        let label = refresh_label(&row);
+        let has_endpoint =
+            registry::descriptor(&row.provider).is_none_or(|d| d.has_models_endpoint);
+        if !has_endpoint {
+            out.push(RefreshModelsResult {
+                connection_id: row.id.clone(),
+                label,
+                ok: true,
+                message: "Uses a seeded model list — no live catalog endpoint".to_string(),
+            });
+            continue;
+        }
+        let outcome = models::refresh_connection_models(cp.store(), &http, &mut row)
+            .await
+            .map(|models| models.len())
+            .map_err(|e| e.to_string());
+        let (ok, message) = refresh_message(&label, &outcome);
+        out.push(RefreshModelsResult {
+            connection_id: row.id.clone(),
+            label,
+            ok,
+            message,
+        });
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn connection_provider_quota(
@@ -921,6 +1005,71 @@ mod tests {
             kiro_row("healthy-2", Some(false)),
         ];
         assert!(dead_kiro_connection_ids(&rows, "healthy-1").is_empty());
+    }
+
+    #[test]
+    fn refresh_message_reports_count_or_error() {
+        assert_eq!(
+            refresh_message("Work OpenAI", &Ok(12)),
+            (true, "12 models discovered".to_string())
+        );
+        assert_eq!(
+            refresh_message(
+                "Work OpenAI",
+                &Err("model list request for openai failed with status 401".to_string())
+            ),
+            (
+                false,
+                "Work OpenAI: model list request for openai failed with status 401".to_string()
+            )
+        );
+    }
+
+    fn connection_row(id: &str, provider: &str, label: &str, enabled: bool) -> ConnectionRow {
+        ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: "api_key".into(),
+            label: label.into(),
+            priority: 0,
+            enabled,
+            data: ConnectionData::default(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// `refresh_provider_models` must refresh only enabled, in-family
+    /// connections: a disabled in-family row, an enabled row from a different
+    /// family, and an enabled row with an unrecognized provider id must all be
+    /// skipped.
+    #[test]
+    fn refresh_targets_filter_by_family_and_enabled() {
+        let in_family_enabled = connection_row("c1", "anthropic-oauth", "Claude", true);
+        let in_family_disabled = connection_row("c2", "anthropic-oauth", "Claude (off)", false);
+        let other_family_enabled = connection_row("c3", "openai", "Work OpenAI", true);
+        let unrecognized_provider_enabled =
+            connection_row("c4", "not-a-real-provider", "Mystery", true);
+
+        assert!(is_refresh_target(&in_family_enabled, "anthropic"));
+        assert!(!is_refresh_target(&in_family_disabled, "anthropic"));
+        assert!(!is_refresh_target(&other_family_enabled, "anthropic"));
+        assert!(!is_refresh_target(
+            &unrecognized_provider_enabled,
+            "anthropic"
+        ));
+    }
+
+    #[test]
+    fn refresh_label_falls_back_to_provider_when_label_is_empty() {
+        let row = connection_row("c1", "openai", "", true);
+        assert_eq!(refresh_label(&row), "openai");
+    }
+
+    #[test]
+    fn refresh_label_uses_the_connection_label_when_present() {
+        let row = connection_row("c1", "openai", "Work OpenAI", true);
+        assert_eq!(refresh_label(&row), "Work OpenAI");
     }
 }
 
@@ -1341,4 +1490,24 @@ pub async fn import_kiro_token(
     // `remove_dead_kiro_connections`.
     remove_dead_kiro_connections(&cp, &new_id).await?;
     Ok(assemble(&cp).await?)
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn catalog_exposes_free_tier_and_risk_notice() {
+        let catalog = list_provider_catalog().await.unwrap();
+        let by_id = |id: &str| catalog.iter().find(|e| e.id == id).unwrap();
+        assert!(by_id("openrouter").free_tier);
+        assert!(by_id("nvidia").free_tier);
+        assert!(!by_id("anthropic").free_tier);
+        assert!(by_id("kiro").risk_notice);
+        assert!(!by_id("openai").risk_notice);
+        // serde camelCase contract the frontend relies on
+        let v = serde_json::to_value(by_id("kiro")).unwrap();
+        assert_eq!(v["riskNotice"], serde_json::Value::Bool(true));
+        assert_eq!(v["freeTier"], serde_json::Value::Bool(false));
+    }
 }

@@ -396,6 +396,24 @@ mod tests {
         assert!(!is_oauth(&r));
     }
 
+    #[test]
+    fn openai_oauth_connection_without_fetched_models_still_serves_seeds() {
+        let desc = crate::llm_router::registry::descriptor("openai-oauth").unwrap();
+        let row = ConnectionRow {
+            id: "c-oauth".into(),
+            provider: "openai-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "ChatGPT".into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData::default(), // no models_override yet
+            created_at: 0,
+            updated_at: 0,
+        };
+        let models = effective_models(desc, &row);
+        assert!(models.contains(&"gpt-5.2-codex".to_string()));
+    }
+
     #[tokio::test]
     async fn at_rest_data_is_ciphertext() {
         secrets::use_test_key_file();
