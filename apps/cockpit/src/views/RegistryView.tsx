@@ -2,7 +2,7 @@ import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { Check, CircleAlert, Search } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Input, SettingsCard as Card } from "@ryuzi/ui";
-import { commands, type RegistryEntry } from "@/bindings";
+import { commands, type RegistryEntry, type RegistryEntryVersion } from "@/bindings";
 import { BackButton } from "@/components/common/DetailHeader";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { useApps } from "@/store-apps";
@@ -10,6 +10,90 @@ import { useNav } from "@/store-nav";
 
 // Curated quick searches against the live registry (it has no category API).
 const QUICK_SEARCHES = ["All", "github", "database", "browser", "docs", "monitoring", "payments", "deploy"];
+
+function parseVersionPart(part: string): { kind: "numeric"; value: number } | { kind: "string"; value: string } {
+  if (/^\d+$/.test(part)) {
+    return { kind: "numeric", value: Number(part) };
+  }
+  return { kind: "string", value: part };
+}
+
+function compareVersions(left: string, right: string): number {
+  const leftParts = left.split(".");
+  const rightParts = right.split(".");
+  const maxParts = Math.max(leftParts.length, rightParts.length);
+
+  for (let i = 0; i < maxParts; i++) {
+    const leftRaw = leftParts[i] ?? "0";
+    const rightRaw = rightParts[i] ?? "0";
+    const leftParsed = parseVersionPart(leftRaw);
+    const rightParsed = parseVersionPart(rightRaw);
+
+    if (leftParsed.kind === "numeric" && rightParsed.kind === "numeric") {
+      if (leftParsed.value !== rightParsed.value) {
+        return leftParsed.value - rightParsed.value;
+      }
+      continue;
+    }
+
+    const leftValue = leftParsed.kind === "numeric" ? String(leftParsed.value) : leftParsed.value;
+    const rightValue = rightParsed.kind === "numeric" ? String(rightParsed.value) : rightParsed.value;
+    if (leftValue === rightValue) continue;
+    return leftValue < rightValue ? -1 : 1;
+  }
+
+  return 0;
+}
+
+function mergeVersions(existing: RegistryEntryVersion[], incoming: RegistryEntryVersion[]): RegistryEntryVersion[] {
+  const merged = [...existing];
+  const byVersion = new Map(existing.map((version) => [version.version, version]));
+
+  for (const version of incoming) {
+    if (byVersion.has(version.version)) {
+      byVersion.set(version.version, { ...byVersion.get(version.version), ...version });
+      const idx = merged.findIndex((item) => item.version === version.version);
+      merged[idx] = byVersion.get(version.version)!;
+    } else {
+      byVersion.set(version.version, version);
+      merged.push(version);
+    }
+  }
+
+  return merged;
+}
+
+export function mergeRegistryEntries(prev: RegistryEntry[], next: RegistryEntry[]): RegistryEntry[] {
+  const out = [...prev.map((entry) => ({ ...entry, versions: [...entry.versions] }))];
+  const entryById = new Map<string, RegistryEntry>(out.map((entry) => [entry.id, entry]));
+
+  for (const entry of next) {
+    const existing = entryById.get(entry.id);
+
+    if (!existing) {
+      out.push({ ...entry, versions: [...entry.versions] });
+      entryById.set(entry.id, out[out.length - 1]);
+      continue;
+    }
+
+    const shouldUseIncomingTopLevel = compareVersions(entry.version, existing.version) > 0;
+    const mergedVersions = mergeVersions(existing.versions, entry.versions);
+    const latest = shouldUseIncomingTopLevel ? entry : existing;
+
+    Object.assign(existing, {
+      versions: mergedVersions,
+      version: latest.version,
+      name: latest.name,
+      desc: latest.desc,
+      publisher: latest.publisher,
+      kind: latest.kind,
+      installTarget: latest.installTarget,
+      website: latest.website,
+    });
+  }
+
+  return out;
+}
 
 function colorFor(id: string): string {
   const palette = ["#6C5FC7", "#0FA47F", "#E01E5A", "#3ECF8E", "#A259FF", "#635BFF", "#F46800", "#4285F4"];
@@ -38,7 +122,7 @@ export function RegistryView() {
       setError(res.error.message);
       return;
     }
-    setEntries((prev) => (cursor ? [...prev, ...res.data.entries] : res.data.entries));
+    setEntries((prev) => (cursor ? mergeRegistryEntries(prev, res.data.entries) : mergeRegistryEntries([], res.data.entries)));
     setNextCursor(res.data.nextCursor);
   }, []);
 
