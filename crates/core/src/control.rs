@@ -51,7 +51,7 @@ pub struct ControlPlane {
     /// up `Console`/OTLP via `new_with_telemetry`.
     telemetry: Arc<dyn Telemetry>,
     /// Downloads Discord (or other gateway) message attachments for
-    /// `with_attachments`. Real network I/O (`UreqFetcher`) unless a test
+    /// `prepare_attachments`. Real network I/O (`UreqFetcher`) unless a test
     /// injects a fake via `new_full`.
     attachment_fetcher: Arc<dyn AttachmentFetcher>,
     /// One-way latch set by `drain` — once true, `start_session`/

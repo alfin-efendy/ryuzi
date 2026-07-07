@@ -315,7 +315,7 @@ async fn fake_control_plane_with_telemetry(
 
 /// A fake `AttachmentFetcher`: returns the configured bytes for a known
 /// URL, or a 404 for anything else — no real network I/O, for
-/// `with_attachments` tests.
+/// `prepare_attachments` tests.
 struct FakeAttachmentFetcher {
     bodies: std::collections::HashMap<String, Vec<u8>>,
 }
@@ -345,7 +345,7 @@ impl crate::attachments::AttachmentFetcher for FakeAttachmentFetcher {
 }
 
 /// Like `fake_control_plane`, but wired via `new_full` with an injected
-/// attachment fetcher — for `with_attachments` tests that must not hit
+/// attachment fetcher — for `prepare_attachments` tests that must not hit
 /// the real network.
 async fn fake_control_plane_with_fetcher(
     fetcher: Arc<dyn crate::attachments::AttachmentFetcher>,

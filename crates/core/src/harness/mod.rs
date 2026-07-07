@@ -43,7 +43,7 @@ pub trait Harness: Send + Sync {
 
 /// One turn's prompt, split into the agent-visible and display strings.
 ///
-/// `with_attachments` may decorate the raw user text with an attachment
+/// `prepare_attachments` may decorate the raw user text with an attachment
 /// manifest before it reaches the agent — but that decorated text must never
 /// be what durable history (and thus the cockpit UI) shows as "what the user
 /// typed". `agent` is what's sent to the harness/agent (possibly
