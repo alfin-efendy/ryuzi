@@ -73,6 +73,24 @@ pub struct TestResult {
 
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct RefreshModelsResult {
+    pub connection_id: String,
+    pub label: String,
+    pub ok: bool,
+    pub message: String,
+}
+
+/// One outcome line per refreshed connection — pure so it's testable
+/// without a Store or network.
+fn refresh_message(label: &str, outcome: &Result<usize, String>) -> (bool, String) {
+    match outcome {
+        Ok(n) => (true, format!("{n} models discovered")),
+        Err(e) => (false, format!("{label}: {e}")),
+    }
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ManualStartInfo {
     pub authorize_url: String,
     pub verifier: String,
@@ -644,6 +662,45 @@ pub async fn test_connection_model(
     Ok(result)
 }
 
+/// Re-fetch the live model list for every enabled connection in a vendor
+/// family, persisting discoveries. Unlike the add/update-time best-effort
+/// refresh, failures are returned to the UI instead of being swallowed.
+#[tauri::command]
+#[specta::specta]
+pub async fn refresh_provider_models(
+    cp: State<'_, Arc<ControlPlane>>,
+    family: String,
+) -> R<Vec<RefreshModelsResult>> {
+    let http = quota_http_client()?;
+    let rows = connections::list_connections(cp.store()).await?;
+    let mut out = Vec::new();
+    for mut row in rows {
+        let in_family = registry::family_of(&row.provider)
+            .map(|f| f == family)
+            .unwrap_or(row.provider == family);
+        if !in_family || !row.enabled {
+            continue;
+        }
+        let label = if row.label.is_empty() {
+            row.provider.clone()
+        } else {
+            row.label.clone()
+        };
+        let outcome = models::refresh_connection_models(cp.store(), &http, &mut row)
+            .await
+            .map(|models| models.len())
+            .map_err(|e| e.to_string());
+        let (ok, message) = refresh_message(&label, &outcome);
+        out.push(RefreshModelsResult {
+            connection_id: row.id.clone(),
+            label,
+            ok,
+            message,
+        });
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn connection_provider_quota(
@@ -925,6 +982,24 @@ mod tests {
             kiro_row("healthy-2", Some(false)),
         ];
         assert!(dead_kiro_connection_ids(&rows, "healthy-1").is_empty());
+    }
+
+    #[test]
+    fn refresh_message_reports_count_or_error() {
+        assert_eq!(
+            refresh_message("Work OpenAI", &Ok(12)),
+            (true, "12 models discovered".to_string())
+        );
+        assert_eq!(
+            refresh_message(
+                "Work OpenAI",
+                &Err("model list request for openai failed with status 401".to_string())
+            ),
+            (
+                false,
+                "Work OpenAI: model list request for openai failed with status 401".to_string()
+            )
+        );
     }
 }
 

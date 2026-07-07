@@ -619,6 +619,19 @@ async testConnectionModel(id: string, model: string) : Promise<Result<TestResult
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Re-fetch the live model list for every enabled connection in a vendor
+ * family, persisting discoveries. Unlike the add/update-time best-effort
+ * refresh, failures are returned to the UI instead of being swallowed.
+ */
+async refreshProviderModels(family: string) : Promise<Result<RefreshModelsResult[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_provider_models", { family }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async connectionProviderQuota(id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { id }) };
@@ -1110,6 +1123,7 @@ export type Project = { projectId: string; name: string; workdir: string; source
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
+export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RegistryEntry = { 
 /**
  * Registry name, e.g. `io.github.owner/server`.
