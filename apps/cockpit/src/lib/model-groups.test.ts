@@ -62,3 +62,31 @@ test("disabled connections don't contribute; no catalog → flat list", () => {
   const noGroups = groupModelOptions(["gpt-5.5"], catalog, [conn("openai", ["gpt-5.5"], false)]);
   expect(noGroups).toEqual([{ value: "gpt-5.5", label: "gpt-5.5", mono: true }]);
 });
+
+test("family-prefixed runtime ids group by prefix with trimmed labels", () => {
+  const groups = groupModelOptions(["anthropic/claude-fable-5", "openai/gpt-5.2", "low_task"], catalog, [
+    conn("anthropic-oauth", ["claude-opus-4-8"]),
+    conn("openai", ["gpt-5.5"]),
+  ]);
+  expect(groups).toEqual([
+    {
+      label: "Anthropic",
+      options: [{ value: "anthropic/claude-fable-5", label: "claude-fable-5", mono: true }],
+    },
+    { label: "OpenAI", options: [{ value: "openai/gpt-5.2", label: "gpt-5.2", mono: true }] },
+    { label: "Other", options: [{ value: "low_task", label: "low_task", mono: true }] },
+  ]);
+});
+
+test("unknown prefix lands in Other with the full id as label", () => {
+  const groups = groupModelOptions(["anthropic/claude-fable-5", "mystery/whatever"], catalog, [
+    conn("anthropic-oauth", ["claude-opus-4-8"]),
+  ]);
+  expect(groups).toEqual([
+    {
+      label: "Anthropic",
+      options: [{ value: "anthropic/claude-fable-5", label: "claude-fable-5", mono: true }],
+    },
+    { label: "Other", options: [{ value: "mystery/whatever", label: "mystery/whatever", mono: true }] },
+  ]);
+});

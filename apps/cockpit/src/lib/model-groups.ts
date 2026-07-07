@@ -2,19 +2,22 @@ import type { CatalogEntry, ConnectionInfo } from "../bindings";
 import type { ComboboxGroup, ComboboxOption } from "@ryuzi/ui";
 
 /** Group the composer's runtime model ids by provider family (PR #70 data).
- *  Only families with an ENABLED connection contribute; a model claimed by a
- *  connection's model list or its catalog entry belongs to that family.
- *  Unmatched ids land in "Other". No usable data → flat list unchanged. */
+ *  Runtime ids may be family-prefixed ("anthropic/claude-fable-5"): a known
+ *  prefix wins and the label is trimmed to the part after it. Bare ids fall
+ *  back to connection/catalog model lists, where only families with an
+ *  ENABLED connection contribute. Unmatched ids land in "Other". No usable
+ *  data → flat list unchanged. Values are always the raw runtime ids. */
 export function groupModelOptions(
   models: string[],
   catalog: CatalogEntry[],
   connections: ConnectionInfo[],
 ): ComboboxOption[] | ComboboxGroup[] {
-  const opt = (m: string): ComboboxOption => ({ value: m, label: m, mono: true });
-  if (models.length === 0 || catalog.length === 0) return models.map(opt);
+  const opt = (m: string, label = m): ComboboxOption => ({ value: m, label, mono: true });
+  if (models.length === 0 || catalog.length === 0) return models.map((m) => opt(m));
 
   const entryById = new Map(catalog.map((e) => [e.id, e]));
   const headByFamily = new Map(catalog.filter((e) => e.id === e.family).map((e) => [e.family, e]));
+  const knownFamilies = new Set(catalog.map((e) => e.family));
 
   // Families with at least one ENABLED connection.
   const connectedFamilies = new Set<string>();
@@ -46,6 +49,19 @@ export function groupModelOptions(
   const byFamily = new Map<string, ComboboxOption[]>();
   const other: ComboboxOption[] = [];
   for (const m of models) {
+    // Family-prefixed runtime id ("anthropic/claude-fable-5"): the prefix path
+    // trusts the runtime list (it only contains connected providers' models by
+    // construction), so the connected-families gate applies only to the
+    // bare-id fallback below. The value stays the full raw id — only the
+    // label is trimmed.
+    const slash = m.indexOf("/");
+    const prefix = slash > 0 ? m.slice(0, slash) : null;
+    if (prefix !== null && knownFamilies.has(prefix)) {
+      const list = byFamily.get(prefix) ?? [];
+      list.push(opt(m, m.slice(slash + 1)));
+      byFamily.set(prefix, list);
+      continue;
+    }
     const family = familyByModel.get(m);
     if (family === undefined) {
       other.push(opt(m));
@@ -55,7 +71,7 @@ export function groupModelOptions(
     list.push(opt(m));
     byFamily.set(family, list);
   }
-  if (byFamily.size === 0) return models.map(opt);
+  if (byFamily.size === 0) return models.map((m) => opt(m));
 
   const groups: ComboboxGroup[] = Array.from(byFamily, ([family, options]) => ({
     label: headByFamily.get(family)?.name ?? family,
