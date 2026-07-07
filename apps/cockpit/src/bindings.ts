@@ -461,6 +461,17 @@ async revertFile(sessionPk: string, path: string) : Promise<Result<null, CmdErro
     else return { status: "error", error: e  as any };
 }
 },
+async listOpenTargets() : Promise<OpenTarget[]> {
+    return await TAURI_INVOKE("list_open_targets");
+},
+async openIn(sessionPk: string, targetId: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_in", { sessionPk, targetId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Open a shell in the session's worktree (or the project workdir).
  */
@@ -1107,6 +1118,7 @@ export type ModelRouteTarget = {
  */
 provider: string; model: string }
 export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
+export type OpenTarget = { id: string; name: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PluginAuthInfo = { 
 /**

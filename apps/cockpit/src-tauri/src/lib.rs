@@ -9,6 +9,7 @@ mod events;
 mod fsview_cmd;
 mod gateways_cmd;
 mod native_cmd;
+mod open_cmd;
 mod plugins_cmd;
 mod registry_cmd;
 mod runtimes_cmd;
@@ -313,6 +314,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             fsview_cmd::git_diff,
             fsview_cmd::search_files,
             fsview_cmd::revert_file,
+            open_cmd::list_open_targets,
+            open_cmd::open_in,
             term::term_open,
             term::term_input,
             term::term_resize,
