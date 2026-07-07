@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { CatalogEntry, ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, ModelRouteInfo, UsageSeries } from "@/bindings";
 
 const status: EndpointStatusInfo = {
@@ -252,6 +252,62 @@ test("providers tab groups anthropic + anthropic-oauth accounts into one Anthrop
 
   fireEvent.click(anthropicRow);
   expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
+});
+
+test("provider rows show one category badge per auth method in the family", async () => {
+  useConnections.setState({ catalog, connections: [], loaded: true });
+  render(<ModelsView />);
+
+  const anthropicRow = await screen.findByRole("button", { name: "Anthropic No accounts 2 catalog models" });
+  expect(within(anthropicRow).getByText("API key")).toBeTruthy();
+  expect(within(anthropicRow).getByText("OAuth")).toBeTruthy();
+
+  const openaiRow = screen.getByRole("button", { name: "OpenAI No accounts 2 catalog models" });
+  expect(within(openaiRow).getByText("API key")).toBeTruthy();
+  expect(within(openaiRow).queryByText("OAuth")).toBeNull();
+});
+
+test("free-tier providers get a Free tier badge and device maps to Free", async () => {
+  useConnections.setState({
+    catalog: [
+      ...catalog,
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        family: "openrouter",
+        color: "#6E56CF",
+        initial: "R",
+        category: "api_key",
+        format: "openai",
+        requiresBaseUrl: false,
+        models: [],
+        freeTier: true,
+        riskNotice: false,
+      },
+      {
+        id: "kiro",
+        name: "Kiro (free tier)",
+        family: "kiro",
+        color: "#7C3AED",
+        initial: "K",
+        category: "device",
+        format: "openai",
+        requiresBaseUrl: false,
+        models: ["claude-sonnet-5"],
+        freeTier: false,
+        riskNotice: true,
+      },
+    ],
+    connections: [],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  const openrouterRow = await screen.findByRole("button", { name: /OpenRouter/ });
+  expect(within(openrouterRow).getByText("Free tier")).toBeTruthy();
+  const kiroRow = screen.getByRole("button", { name: /Kiro/ });
+  expect(within(kiroRow).getByText("Free")).toBeTruthy();
+  expect(within(kiroRow).queryByText("device")).toBeNull();
 });
 
 test("seeds the settings form from the hydrated endpoint status", async () => {
