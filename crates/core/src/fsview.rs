@@ -124,8 +124,19 @@ pub async fn git_diff(workdir: &str) -> anyhow::Result<String> {
 /// restored (staged + worktree); untracked files (a created file's "revert"
 /// is deletion) are removed. `rel_path` is repo-relative.
 pub async fn revert_file(workdir: &str, rel_path: &str) -> anyhow::Result<()> {
+    // Reject parent traversal AND absolute/rooted paths up front: `toolPath`
+    // is agent-controlled, and on Windows `Path::join` REPLACES the base for
+    // drive-absolute (`C:\x`) or rooted (`\x`) components — without this an
+    // absolute path would skip the tracked branch (outside the repo) and fall
+    // into the delete branch pointed at an arbitrary file.
+    let rel = std::path::Path::new(rel_path);
     anyhow::ensure!(
-        !rel_path.split(['/', '\\']).any(|c| c == ".."),
+        !rel.components().any(|c| matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )),
         "invalid path: {rel_path}"
     );
     let tracked = tokio::process::Command::new("git")
@@ -144,7 +155,15 @@ pub async fn revert_file(workdir: &str, rel_path: &str) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    tokio::fs::remove_file(std::path::Path::new(workdir).join(rel_path)).await?;
+    // Untracked → delete, but only after proving the resolved target really
+    // lives under the workdir (canonicalize both sides: symlinks resolve, and
+    // Windows `\\?\` prefixes compare consistently). A missing file errors at
+    // canonicalize — acceptable, it surfaces as a toast.
+    let abs = std::path::Path::new(workdir).join(rel);
+    let canon = tokio::fs::canonicalize(&abs).await?;
+    let root = tokio::fs::canonicalize(workdir).await?;
+    anyhow::ensure!(canon.starts_with(&root), "path escapes workdir: {rel_path}");
+    tokio::fs::remove_file(&canon).await?;
     Ok(())
 }
 
@@ -242,6 +261,35 @@ mod tests {
         let dir = fresh_dir("revert-traversal");
         git(&dir, &["init", "-q"]);
         assert!(revert_file(dir.to_str().unwrap(), "../outside.txt").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_an_absolute_path_outside_the_repo() {
+        // Repo nested one level down; the target lives in the PARENT dir. On
+        // Windows Path::join replaces the base for absolute components, so an
+        // unguarded delete branch would remove the outside file.
+        let parent = fresh_dir("revert-absolute");
+        std::fs::write(parent.join("outside.txt"), "precious").unwrap();
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        let outside_abs = parent.join("outside.txt");
+        assert!(revert_file(repo.to_str().unwrap(), outside_abs.to_str().unwrap())
+            .await
+            .is_err());
+        assert!(outside_abs.exists(), "outside file must survive");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_a_rooted_path() {
+        // "/abs.txt" carries a RootDir component on every platform (and on
+        // Windows "\abs.txt"-style rooted paths would re-root Path::join).
+        let dir = fresh_dir("revert-rooted");
+        git(&dir, &["init", "-q"]);
+        assert!(revert_file(dir.to_str().unwrap(), "/abs.txt").await.is_err());
+        assert!(revert_file(dir.to_str().unwrap(), "\\abs.txt").await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
