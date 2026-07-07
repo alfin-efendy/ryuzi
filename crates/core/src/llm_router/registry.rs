@@ -367,7 +367,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         format: ApiFormat::OpenAi,
         base_url: Some("https://api.openai.com/v1"),
         auth: AuthScheme::Bearer,
-        models: &[],
+        models: &["gpt-5.2-codex", "gpt-5.2", "o5-mini"],
         requires_base_url: false,
         oauth: Some(OAuthConfig {
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
@@ -515,6 +515,18 @@ mod tests {
         assert!(d.models.contains(&"claude-opus-4-8"));
         assert!(d.models.contains(&"claude-sonnet-4-6"));
         assert!(d.models.contains(&"claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn openai_oauth_has_seed_models_when_live_discovery_is_unavailable() {
+        let d = descriptor("openai-oauth").unwrap();
+        assert!(
+            !d.models.is_empty(),
+            "empty seed makes an OAuth-only OpenAI family contribute zero models"
+        );
+        assert!(d.models.contains(&"gpt-5.2-codex"));
+        assert!(d.models.contains(&"gpt-5.2"));
+        assert!(d.models.contains(&"o5-mini"));
     }
 
     #[test]
