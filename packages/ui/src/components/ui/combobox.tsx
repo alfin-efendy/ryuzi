@@ -47,6 +47,9 @@ type ComboboxProps = {
    */
   trigger?: React.ReactNode;
   className?: string;
+  /** Pinned "+ <label>" row below the list that clears + focuses the search
+   *  input — an affordance for allowCreate (typing a new name creates it). */
+  createHintLabel?: string;
 };
 
 // Internal item shape handed to Base UI. `createInput` marks the synthetic
@@ -100,8 +103,10 @@ function Combobox({
   footer,
   trigger,
   className,
+  createHintLabel,
 }: ComboboxProps) {
   const [query, setQuery] = React.useState("");
+  const inputRef = React.useRef<HTMLInputElement>(null);
 
   const flat = React.useMemo<ComboboxOption[]>(() => (isGrouped(options) ? options.flatMap((g) => g.options) : options), [options]);
   // allowCreate forces the input: creating requires typing.
@@ -186,6 +191,7 @@ function Combobox({
             {showSearch && (
               <div data-slot="combobox-search" className="border-b border-border p-1.5">
                 <ComboboxPrimitive.Input
+                  ref={inputRef}
                   data-slot="combobox-input"
                   aria-label={ariaLabel}
                   placeholder="Search…"
@@ -221,6 +227,21 @@ function Combobox({
                 )
               }
             </ComboboxPrimitive.List>
+            {createHintLabel !== undefined && (
+              <div data-slot="combobox-create-hint" className="border-t border-border p-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setQuery("");
+                    inputRef.current?.focus();
+                  }}
+                  className="flex w-full cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm text-muted-foreground outline-none hover:bg-accent hover:text-accent-foreground"
+                >
+                  <Plus aria-hidden className="size-3.5 shrink-0" />
+                  {createHintLabel}
+                </button>
+              </div>
+            )}
             {footer !== undefined && (
               <div data-slot="combobox-footer" className="border-t border-border p-1.5">
                 {footer}

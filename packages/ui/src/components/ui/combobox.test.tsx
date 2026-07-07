@@ -253,3 +253,26 @@ test("an interactive element trigger becomes the trigger itself — no nested <b
   fireEvent.click(trigger);
   await screen.findByRole("listbox");
 });
+
+test("createHintLabel renders a pinned row that clears and focuses the search input", async () => {
+  render(
+    <Combobox
+      options={few}
+      value={null}
+      onValueChange={() => {}}
+      onCreate={() => {}}
+      allowCreate
+      createHintLabel="Create and checkout new branch…"
+      aria-label="Branch"
+    />,
+  );
+  await openCombobox("Branch");
+  const input = screen.getByPlaceholderText("Search…");
+  fireEvent.change(input, { target: { value: "left" } });
+  const hint = screen.getByRole("button", { name: /Create and checkout new branch…/ });
+  fireEvent.click(hint);
+  await waitFor(() => {
+    expect((input as HTMLInputElement).value).toBe("");
+    expect(document.activeElement).toBe(input);
+  });
+});
