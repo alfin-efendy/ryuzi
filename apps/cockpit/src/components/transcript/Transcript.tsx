@@ -159,42 +159,44 @@ export function Transcript({
 
   return (
     <>
-      <div ref={scrollRef} onScroll={onScroll} className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-6 py-5">
-        {groups.map((g, i) => {
-          const streamingTail = running && i === groups.length - 1;
-          switch (g.type) {
-            case "user":
-              return <UserBubble key={g.key} text={g.text} attachments={g.attachments} onOpenImage={setLightbox} />;
-            case "agent":
-              return (
-                <div key={g.key} className="flex flex-col">
-                  <AgentTurn
-                    markdown={streamingTail ? closeDanglingFence(g.markdown) : g.markdown}
-                    agentName={agentName}
-                    agentColor={agentColor}
-                  />
-                  {g.turnEnd === true && <TurnActions markdown={g.markdown} />}
-                </div>
-              );
-            case "thought":
-              return <ThoughtBlock key={g.key} markdown={g.markdown} streaming={streamingTail} />;
-            case "activity":
-              return <ActivityCluster key={g.key} items={g.items} />;
-            case "error":
-              return <ErrorRow key={g.key} text={g.text} />;
-            case "summary":
-              return (
-                <div key={g.key} className="flex flex-col gap-1.5">
-                  <TurnSummary groups={g.groups} durationMs={g.durationMs} />
-                  <FileChangeCards sessionPk={sessionPk} cards={g.editCards} />
-                </div>
-              );
-            default:
-              return null;
-          }
-        })}
-        {running && <WorkingPulse color={agentColor} />}
-        {children}
+      <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-3.5">
+          {groups.map((g, i) => {
+            const streamingTail = running && i === groups.length - 1;
+            switch (g.type) {
+              case "user":
+                return <UserBubble key={g.key} text={g.text} attachments={g.attachments} onOpenImage={setLightbox} />;
+              case "agent":
+                return (
+                  <div key={g.key} className="flex flex-col">
+                    <AgentTurn
+                      markdown={streamingTail ? closeDanglingFence(g.markdown) : g.markdown}
+                      agentName={agentName}
+                      agentColor={agentColor}
+                    />
+                    {g.turnEnd === true && <TurnActions markdown={g.markdown} />}
+                  </div>
+                );
+              case "thought":
+                return <ThoughtBlock key={g.key} markdown={g.markdown} streaming={streamingTail} />;
+              case "activity":
+                return <ActivityCluster key={g.key} items={g.items} />;
+              case "error":
+                return <ErrorRow key={g.key} text={g.text} />;
+              case "summary":
+                return (
+                  <div key={g.key} className="flex flex-col gap-1.5">
+                    <TurnSummary groups={g.groups} durationMs={g.durationMs} />
+                    <FileChangeCards sessionPk={sessionPk} cards={g.editCards} />
+                  </div>
+                );
+              default:
+                return null;
+            }
+          })}
+          {running && <WorkingPulse color={agentColor} />}
+          {children}
+        </div>
       </div>
       {lightbox !== null && (
         <div

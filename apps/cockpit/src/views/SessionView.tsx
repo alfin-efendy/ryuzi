@@ -191,7 +191,7 @@ export function SessionView() {
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
           <div
-            className={`acrylic-card relative rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
+            className={`acrylic-card relative mx-auto w-full max-w-3xl rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
           >
             <Textarea
               value={draft}
