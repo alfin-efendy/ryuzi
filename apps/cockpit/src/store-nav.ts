@@ -106,8 +106,6 @@ type NavState = {
   composerBranch: string | null;
   /** Run the session in an isolated git worktree (matrix column 1). */
   composerUseWorktree: boolean;
-  /** Create a new branch for the session (matrix column 2). */
-  composerCreateBranch: boolean;
   /** Model the next composed session should run on; null = project/runtime default. */
   composerModel: string | null;
   projectSettingsFor: string | null;
@@ -126,7 +124,6 @@ type NavState = {
   setSearchQuery: (q: string) => void;
   setComposerBranch: (b: string | null) => void;
   setComposerUseWorktree: (v: boolean) => void;
-  setComposerCreateBranch: (v: boolean) => void;
   setComposerModel: (model: string | null) => void;
   setProjectSettingsFor: (id: string | null) => void;
 };
@@ -147,7 +144,6 @@ export const useNav = create<NavState>((set, get) => ({
   searchQuery: "",
   composerBranch: null,
   composerUseWorktree: true,
-  composerCreateBranch: true,
   composerModel: null,
   projectSettingsFor: null,
 
@@ -194,7 +190,6 @@ export const useNav = create<NavState>((set, get) => ({
   setSearchQuery: (q) => set({ searchQuery: q }),
   setComposerBranch: (b) => set({ composerBranch: b }),
   setComposerUseWorktree: (v) => set({ composerUseWorktree: v }),
-  setComposerCreateBranch: (v) => set({ composerCreateBranch: v }),
   setComposerModel: (model) => set({ composerModel: model }),
   setProjectSettingsFor: (id) => set({ projectSettingsFor: id }),
 }));

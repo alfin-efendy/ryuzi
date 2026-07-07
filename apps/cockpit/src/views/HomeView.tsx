@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
-import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
+import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
 import { commands, type BranchList } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
@@ -315,11 +315,9 @@ export function HomeView() {
               options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
               value={nav.composerBranch}
               onValueChange={(v) => nav.setComposerBranch(v)}
-              allowCreate={nav.composerCreateBranch}
-              onCreate={(input) => {
-                nav.setComposerBranch(input);
-                nav.setComposerCreateBranch(true);
-              }}
+              allowCreate
+              onCreate={(input) => nav.setComposerBranch(input)}
+              createHintLabel="Create and checkout new branch…"
               placeholder="Branch"
               trigger={
                 <Button variant="ghost" size="sm" className="gap-[7px] font-medium text-muted-foreground">
@@ -328,35 +326,19 @@ export function HomeView() {
                   <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
                 </Button>
               }
+              footer={
+                <div className="flex items-center justify-between gap-3 px-2.5 py-1.5">
+                  <span className="text-sm text-muted-foreground" title="Run the session in an isolated git worktree">
+                    Worktree
+                  </span>
+                  <Switch
+                    on={nav.composerUseWorktree}
+                    onToggle={() => nav.setComposerUseWorktree(!nav.composerUseWorktree)}
+                    label="Worktree"
+                  />
+                </div>
+              }
             />
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-pressed={nav.composerUseWorktree}
-              title="Run the session in an isolated git worktree"
-              onClick={() => nav.setComposerUseWorktree(!nav.composerUseWorktree)}
-              className={`gap-[7px] font-medium ${nav.composerUseWorktree ? "" : "text-muted-foreground opacity-60"}`}
-            >
-              Worktree
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-pressed={nav.composerCreateBranch}
-              title="Create a new branch for this session"
-              onClick={() => {
-                const next = !nav.composerCreateBranch;
-                nav.setComposerCreateBranch(next);
-                // A free-typed (not-yet-existing) name is meaningless with
-                // "New branch" OFF — fall back to the repo's current branch.
-                if (!next && nav.composerBranch !== null && !(branchList?.branches ?? []).includes(nav.composerBranch)) {
-                  nav.setComposerBranch(branchList?.current ?? null);
-                }
-              }}
-              className={`gap-[7px] font-medium ${nav.composerCreateBranch ? "" : "text-muted-foreground opacity-60"}`}
-            >
-              New branch
-            </Button>
           </div>
         </div>
 
