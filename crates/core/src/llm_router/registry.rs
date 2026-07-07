@@ -691,7 +691,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn phase_a_free_and_free_tier_providers_are_wellformed() {
         let mimo = descriptor("mimo-free").unwrap();
         assert_eq!(mimo.category, ProviderCategory::Free);
@@ -724,6 +723,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn free_tier_and_risk_notice_flags_mark_the_agreed_entries() {
         // Free-tier: API-key providers with a genuinely free usage path.
         for id in ["openrouter", "groq", "google"] {
