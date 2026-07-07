@@ -80,6 +80,31 @@ async readFile(path: string) : Promise<Result<string, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Write pasted bytes into the attachments staging area and return the
+ * absolute path — from there the file flows through the normal attachment
+ * pipeline on send. Staging is wiped on app start (see lib.rs setup).
+ */
+async stageAttachment(name: string, dataBase64: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stage_attachment", { name, dataBase64 }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read a media file as base64 for composer thumbnails (arbitrary user paths
+ * sit outside the asset-protocol scope, so previews go through this instead).
+ */
+async readFileBase64(path: string) : Promise<Result<MediaFile, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_file_base64", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async pickDirectory() : Promise<string | null> {
     return await TAURI_INVOKE("pick_directory");
 },
@@ -1056,6 +1081,7 @@ export type KeychainStatus =
  */
 "unavailable"
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
+export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
  */

@@ -28,11 +28,11 @@ impl PreparedPrompt {
 }
 
 impl ControlPlane {
-    /// `{expand_home(workdir_root)}/.harness-attachments/{session_pk}` — the
-    /// dest dir attachments are downloaded into (`prepare_attachments`) and torn
-    /// down from (`end_session`). Reads `workdir_root` fresh each call: it's
-    /// a rarely-changed setting, and this avoids caching it on `ControlPlane`.
-    pub(super) async fn attachment_dest_dir(&self, session_pk: &str) -> PathBuf {
+    /// `{expand_home(workdir_root)}/.harness-attachments` — the root all
+    /// per-session attachment dirs (and the paste staging area) live under.
+    /// Public: the cockpit shell scopes the asset protocol to it and stages
+    /// pasted files into `{root}/staging/`.
+    pub async fn attachments_root(&self) -> PathBuf {
         let settings = SettingsStore::new(Arc::clone(&self.store));
         let root_raw = settings
             .get("workdir_root")
@@ -40,9 +40,14 @@ impl ControlPlane {
             .ok()
             .flatten()
             .unwrap_or_default();
-        expand_home(&root_raw)
-            .join(".harness-attachments")
-            .join(session_pk)
+        expand_home(&root_raw).join(".harness-attachments")
+    }
+
+    /// `{attachments_root()}/{session_pk}` — the dest dir attachments are
+    /// downloaded into (`prepare_attachments`) and torn down from
+    /// (`end_session`).
+    pub(super) async fn attachment_dest_dir(&self, session_pk: &str) -> PathBuf {
+        self.attachments_root().await.join(session_pk)
     }
 
     /// Materializes any Discord-supplied attachments into

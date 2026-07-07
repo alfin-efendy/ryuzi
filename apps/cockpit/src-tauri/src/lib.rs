@@ -268,6 +268,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::end_session,
             commands::resolve_approval,
             commands::read_file,
+            commands::stage_attachment,
+            commands::read_file_base64,
             commands::pick_directory,
             commands::pick_files,
             commands::backdrop_capability,

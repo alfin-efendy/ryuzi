@@ -51,6 +51,7 @@ specta-typescript = "0.0.9"
 anyhow.workspace = true
 dirs.workspace = true
 chrono.workspace = true
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true
