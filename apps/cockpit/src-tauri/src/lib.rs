@@ -366,6 +366,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::start_kiro_device_flow,
             connections_cmd::await_kiro_device_flow,
             connections_cmd::import_kiro_token,
+            connections_cmd::start_device_flow,
+            connections_cmd::await_device_flow,
         ])
         .events(collect_events![
             events::CoreEventMsg,

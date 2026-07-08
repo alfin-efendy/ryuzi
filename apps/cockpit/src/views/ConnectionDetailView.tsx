@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { commands, type ProviderQuotaInfo } from "@/bindings";
 import { useConnections } from "@/store-connections";
 import { useNav } from "@/store-nav";
+import { usesDeviceSignin } from "@/components/modals/deviceSignin";
 import {
   Button,
   Input,
@@ -121,6 +122,10 @@ export function ConnectionDetailView({ id }: { id: string }) {
   // (sign in again or re-import from the Kiro IDE) instead of trying, and
   // failing, to reuse the redirect-based reconnect.
   const isKiro = conn.provider === "kiro";
+  const catalogEntry = catalog.find((entry) => entry.id === conn.provider);
+  // Kiro (device flow) AND device-grant providers (qwen, github-copilot) sign in
+  // via a device code, not the redirect+PKCE flow reconnectOauth drives.
+  const deviceSignin = catalogEntry ? usesDeviceSignin(catalogEntry) : isKiro;
 
   const reconnect = async () => {
     setReconnecting(true);
@@ -143,9 +148,13 @@ export function ConnectionDetailView({ id }: { id: string }) {
     toast.error(`Reset credit failed: ${result.error.message}`);
   };
 
-  const reconnectKiro = () => {
+  const reconnectDevice = () => {
     nav.navigate({ kind: "models" });
-    toast("Reconnect Kiro from Add connection — sign in again or import from the Kiro IDE.");
+    toast(
+      isKiro
+        ? "Reconnect Kiro from Add connection — sign in again or import from the Kiro IDE."
+        : `Reconnect ${conn.providerName} from Add connection — sign in again.`,
+    );
   };
 
   return (
@@ -171,12 +180,12 @@ export function ConnectionDetailView({ id }: { id: string }) {
           titleExtra={needsRelogin ? <Pill variant="warn">Needs re-login</Pill> : undefined}
           sub={conn.providerName}
         >
-          {needsRelogin && isKiro && (
-            <Button onClick={reconnectKiro} className="shrink-0">
+          {needsRelogin && deviceSignin && (
+            <Button onClick={reconnectDevice} className="shrink-0">
               Reconnect via Add connection
             </Button>
           )}
-          {needsRelogin && !isKiro && (
+          {needsRelogin && !deviceSignin && (
             <Button onClick={() => void reconnect()} disabled={reconnecting} className="shrink-0">
               {reconnecting ? "Reconnecting…" : "Reconnect"}
             </Button>
