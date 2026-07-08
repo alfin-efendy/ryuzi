@@ -48,6 +48,8 @@ type ConnectionsState = {
   startKiroDevice: () => Promise<DeviceFlowInfo | null>;
   awaitKiroDevice: (label: string, flowId: string) => Promise<boolean>;
   importKiro: (label: string) => Promise<boolean>;
+  startDeviceFlow: (provider: string) => Promise<DeviceFlowInfo | null>;
+  awaitDeviceFlow: (provider: string, label: string, flowId: string) => Promise<boolean>;
 };
 
 function apply(set: (p: Partial<ConnectionsState>) => void, res: Result<ConnectionInfo[], CmdError>, action: string): boolean {
@@ -105,4 +107,11 @@ export const useConnections = create<ConnectionsState>((set) => ({
   },
   awaitKiroDevice: async (label, flowId) => apply(set, await commands.awaitKiroDeviceFlow(label, flowId), KIRO_SIGNIN_ACTION),
   importKiro: async (label) => apply(set, await commands.importKiroToken(label), KIRO_IMPORT_ACTION),
+  startDeviceFlow: async (provider) => {
+    const res = await commands.startDeviceFlow(provider);
+    if (res.status === "ok") return res.data;
+    toast.error(`Sign in failed: ${res.error.message}`);
+    return null;
+  },
+  awaitDeviceFlow: async (provider, label, flowId) => apply(set, await commands.awaitDeviceFlow(provider, label, flowId), "Sign in"),
 }));
