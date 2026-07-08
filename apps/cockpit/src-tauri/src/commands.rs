@@ -71,6 +71,18 @@ pub async fn connect_project(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn clone_project(
+    cp: State<'_, Arc<ControlPlane>>,
+    url: String,
+    dest_parent: String,
+) -> R<Project> {
+    Ok(cp
+        .clone_project(&url, std::path::Path::new(&dest_parent))
+        .await?)
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn list_branches(cp: State<'_, Arc<ControlPlane>>, project_id: String) -> R<BranchList> {
     let project = cp
         .store()

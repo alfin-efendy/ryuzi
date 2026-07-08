@@ -37,6 +37,14 @@ async connectProject(workdir: string, name: string) : Promise<Result<Project, Cm
     else return { status: "error", error: e  as any };
 }
 },
+async cloneProject(url: string, destParent: string) : Promise<Result<Project, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clone_project", { url, destParent }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async startSession(projectId: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("start_session", { projectId, prompt, options }) };
