@@ -420,7 +420,9 @@ test("route form renders strategy and target comboboxes with option lists", asyn
 
   const target = screen.getByRole("combobox", { name: "Target 1" });
   fireEvent.click(target);
-  expect(await screen.findByRole("option", { name: "OpenAI / gpt-4.1" })).toBeTruthy();
+  // Grouped presentation: provider family as the group header, model-only labels.
+  expect(await screen.findByRole("option", { name: "gpt-4.1" })).toBeTruthy();
+  expect(screen.getByText("OpenAI")).toBeTruthy();
 });
 
 test("route target dropdown collapses multiple accounts of the same provider into one option per model", async () => {
@@ -432,7 +434,7 @@ test("route target dropdown collapses multiple accounts of the same provider int
   // connection and secondConnection are both `openai` accounts that both
   // serve gpt-4.1 — the dropdown must dedupe to a single family+model option.
   fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
-  expect(await screen.findAllByRole("option", { name: "OpenAI / gpt-4.1" })).toHaveLength(1);
+  expect(await screen.findAllByRole("option", { name: "gpt-4.1" })).toHaveLength(1);
 });
 
 test("route target dropdown collapses anthropic + anthropic-oauth accounts sharing a model into one Anthropic option", async () => {
@@ -451,7 +453,8 @@ test("route target dropdown collapses anthropic + anthropic-oauth accounts shari
   fireEvent.click(screen.getByRole("button", { name: "New route" }));
 
   fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
-  expect(await screen.findAllByRole("option", { name: `Anthropic / ${sharedModel}` })).toHaveLength(1);
+  expect(await screen.findAllByRole("option", { name: sharedModel })).toHaveLength(1);
+  expect(screen.getByText("Anthropic")).toBeTruthy();
 });
 
 test("route form saves targets as {provider, model} scoped to the family, not the connection", async () => {

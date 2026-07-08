@@ -19,6 +19,7 @@ import {
   SettingsCardTitle as CardTitle,
   Switch,
 } from "@ryuzi/ui";
+import type { ComboboxGroup, ComboboxOption } from "@ryuzi/ui";
 import { CategoryBadge, Chip, Pill, StatusDot } from "@/components/common/bits";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
@@ -375,6 +376,24 @@ function routeTargetOptions(catalog: CatalogEntry[], connections: ConnectionInfo
   return Array.from(options.values());
 }
 
+// Grouped presentation for the route-targets picker (same look as the
+// composer's model picker): one group per provider family, model-only
+// labels. Values stay the composite `provider::model` target keys, and the
+// source stays connections-only — routes are excluded by construction.
+function groupedTargetOptions(targetOptions: TargetOption[]): ComboboxGroup[] {
+  const byProvider = new Map<string, ComboboxOption[]>();
+  for (const option of targetOptions) {
+    const list = byProvider.get(option.providerName) ?? [];
+    list.push({
+      value: option.key,
+      label: `${option.model}${option.enabled ? "" : " (no enabled account)"}`,
+      mono: true,
+    });
+    byProvider.set(option.providerName, list);
+  }
+  return Array.from(byProvider, ([label, options]) => ({ label, options }));
+}
+
 function newRoute(targets: TargetOption[]): ModelRouteInfo {
   const first = targets[0];
   return {
@@ -406,6 +425,7 @@ function RouteForm({
   onSave: (route: ModelRouteInfo) => void;
 }) {
   const [draft, setDraft] = useState(value);
+  const groupedTargets = useMemo(() => groupedTargetOptions(targetOptions), [targetOptions]);
 
   useEffect(() => {
     setDraft(value);
@@ -480,11 +500,7 @@ function RouteForm({
             <div key={`${index}-${targetKey(target)}`} className="flex items-center gap-2">
               <Combobox
                 aria-label={`Target ${index + 1}`}
-                options={targetOptions.map((option) => ({
-                  value: option.key,
-                  label: `${option.providerName} / ${option.model}${option.enabled ? "" : " (no enabled account)"}`,
-                  mono: true,
-                }))}
+                options={groupedTargets}
                 value={targetKey(target)}
                 onValueChange={(key) => setTarget(index, key)}
                 className="min-w-0 flex-1"
