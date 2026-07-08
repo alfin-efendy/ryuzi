@@ -340,6 +340,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::test_connection,
             connections_cmd::test_connection_model,
             connections_cmd::refresh_provider_models,
+            connections_cmd::list_model_statuses,
             connections_cmd::connection_provider_quota,
             connections_cmd::reset_codex_credit,
             connections_cmd::list_model_routes,

@@ -10,6 +10,7 @@ use ryuzi_core::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderCate
 use ryuzi_core::llm_router::routes::{
     self, ModelRouteInfo, ModelRouteStrategy, ProviderAccountRouteInfo,
 };
+use ryuzi_core::store::ModelStatusRow;
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -67,7 +68,11 @@ pub struct ConnectionInfo {
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TestResult {
+    /// Legacy pass/fail, kept for existing call sites (connection-level
+    /// test, toasts). Always derived: `status == "valid"`.
     pub ok: bool,
+    /// Tri-state probe verdict: "valid" | "invalid" | "unknown".
+    pub status: String,
     pub message: String,
 }
 
@@ -78,6 +83,16 @@ pub struct RefreshModelsResult {
     pub label: String,
     pub ok: bool,
     pub message: String,
+}
+
+/// One persisted probe verdict row for the provider Models card.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatusInfo {
+    pub model: String,
+    pub status: String,
+    pub message: String,
+    pub tested_at: i64,
 }
 
 /// One outcome line per refreshed connection — pure so it's testable
@@ -419,24 +434,21 @@ pub async fn move_connection(
 /// Map the probe response to the user-facing verdict: 2xx passes, 401/403
 /// blames the API key, any other status is surfaced as-is, and a transport
 /// failure (`Err` carries its display text) reads as network trouble.
+/// The tri-state `status` comes from `models::probe_status` (tested in core).
 fn probe_outcome(resp: Result<reqwest::StatusCode, String>) -> TestResult {
-    match resp {
-        Ok(s) if s.is_success() => TestResult {
-            ok: true,
-            message: "Connection OK".into(),
-        },
-        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => TestResult {
-            ok: false,
-            message: "Rejected: the API key looks invalid for this provider.".into(),
-        },
-        Ok(s) => TestResult {
-            ok: false,
-            message: format!("Upstream returned HTTP {s}"),
-        },
-        Err(e) => TestResult {
-            ok: false,
-            message: format!("Network error: {e}"),
-        },
+    let status = models::probe_status(resp.as_ref().ok().map(|s| s.as_u16()));
+    let message = match &resp {
+        Ok(s) if s.is_success() => "Connection OK".to_string(),
+        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => {
+            "Rejected: the API key looks invalid for this provider.".to_string()
+        }
+        Ok(s) => format!("Upstream returned HTTP {s}"),
+        Err(e) => format!("Network error: {e}"),
+    };
+    TestResult {
+        ok: status == models::ProbeStatus::Valid,
+        status: status.as_str().to_string(),
+        message,
     }
 }
 
@@ -458,23 +470,19 @@ fn model_probe_body(format: ApiFormat, model: &str) -> Value {
 }
 
 fn model_probe_outcome(model: &str, resp: Result<reqwest::StatusCode, String>) -> TestResult {
-    match resp {
-        Ok(s) if s.is_success() => TestResult {
-            ok: true,
-            message: format!("Model {model} OK"),
-        },
-        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => TestResult {
-            ok: false,
-            message: format!("Model {model} was rejected by provider credentials."),
-        },
-        Ok(s) => TestResult {
-            ok: false,
-            message: format!("Model {model} returned HTTP {s}"),
-        },
-        Err(e) => TestResult {
-            ok: false,
-            message: format!("Model {model} network error: {e}"),
-        },
+    let status = models::probe_status(resp.as_ref().ok().map(|s| s.as_u16()));
+    let message = match &resp {
+        Ok(s) if s.is_success() => format!("Model {model} OK"),
+        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => {
+            format!("Model {model} was rejected by provider credentials.")
+        }
+        Ok(s) => format!("Model {model} returned HTTP {s}"),
+        Err(e) => format!("Model {model} network error: {e}"),
+    };
+    TestResult {
+        ok: status == models::ProbeStatus::Valid,
+        status: status.as_str().to_string(),
+        message,
     }
 }
 
@@ -660,6 +668,7 @@ pub async fn test_connection_model(
     if model.is_empty() {
         return Ok(TestResult {
             ok: false,
+            status: "invalid".into(),
             message: "Model id is empty".into(),
         });
     }
@@ -678,7 +687,40 @@ pub async fn test_connection_model(
             |e| model_probe_outcome(&model, Err(e.to_string())),
             |status| model_probe_outcome(&model, Ok(status)),
         );
+    // Best-effort persistence of definitive verdicts; upsert_model_status
+    // ignores "unknown" so rate limits / outages never clobber a stored
+    // valid/invalid record, and a store hiccup must not fail the probe.
+    let _ = cp
+        .store()
+        .upsert_model_status(ModelStatusRow {
+            family: desc.family.to_string(),
+            model: model.clone(),
+            status: result.status.clone(),
+            message: result.message.clone(),
+            tested_at: ryuzi_core::paths::now_ms(),
+        })
+        .await;
     Ok(result)
+}
+
+/// Persisted per-model probe verdicts for a vendor family — hydrates the
+/// provider Models card so earlier Test All results show immediately.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_model_statuses(
+    cp: State<'_, Arc<ControlPlane>>,
+    family: String,
+) -> R<Vec<ModelStatusInfo>> {
+    let rows = cp.store().list_model_statuses(&family).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ModelStatusInfo {
+            model: row.model,
+            status: row.status,
+            message: row.message,
+            tested_at: row.tested_at,
+        })
+        .collect())
 }
 
 /// Re-fetch the live model list for every enabled connection in a vendor

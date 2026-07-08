@@ -679,6 +679,18 @@ async refreshProviderModels(family: string) : Promise<Result<RefreshModelsResult
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Persisted per-model probe verdicts for a vendor family — hydrates the
+ * provider Models card so earlier Test All results show immediately.
+ */
+async listModelStatuses(family: string) : Promise<Result<ModelStatusInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_model_statuses", { family }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async connectionProviderQuota(id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { id }) };
@@ -1130,6 +1142,10 @@ export type ModelRouteTarget = {
  * the family serving `model`, at request time.
  */
 provider: string; model: string }
+/**
+ * One persisted probe verdict row for the provider Models card.
+ */
+export type ModelStatusInfo = { model: string; status: string; message: string; testedAt: number }
 export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
 export type OpenTarget = { id: string; name: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
@@ -1213,7 +1229,16 @@ export type TermOutputMsg = { id: string;
  * UTF-8 chunk (lossy) of PTY output.
  */
 data: string }
-export type TestResult = { ok: boolean; message: string }
+export type TestResult = { 
+/**
+ * Legacy pass/fail, kept for existing call sites (connection-level
+ * test, toasts). Always derived: `status == "valid"`.
+ */
+ok: boolean; 
+/**
+ * Tri-state probe verdict: "valid" | "invalid" | "unknown".
+ */
+status: string; message: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type TodoItem = { content: string; status: string }
 export type ToolInfo = { name: string; desc: string; perm: string }
