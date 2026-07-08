@@ -16,7 +16,7 @@ Implemented the Cockpit Skills tab with a new Zustand-backed skills store, a cur
 
 ## Commit(s)
 
-- `35fed0e` — `Add Cockpit skills tab UI`
+- `b16b4d4` — `Add Cockpit skills tab UI`
 
 ## Tests Run / Results
 
