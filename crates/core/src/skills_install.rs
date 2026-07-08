@@ -298,6 +298,7 @@ fn install_single_skill(
             installed_at: installed_at.clone(),
         },
     )?;
+    remove_stale_plugin_pack_artifacts_for_single_install(roots, &skill.normalized_name)?;
     Ok(installed_single_skill_pack(
         &skill,
         &source.repo,
@@ -343,6 +344,8 @@ fn install_plugin_pack(
             remove_checked_dir(&roots.skills_root, &stale)?;
         }
     }
+
+    remove_stale_single_skill_artifact_for_plugin_install(roots, &pack.plugin_id)?;
 
     Ok(installed_plugin_pack(
         &pack,
@@ -392,6 +395,24 @@ fn installed_plugin_pack(
         installed_at,
         skills,
     }
+}
+
+fn remove_stale_plugin_pack_artifacts_for_single_install(
+    roots: &InstallRoots,
+    skill_id: &str,
+) -> Result<()> {
+    remove_checked_dir(&roots.plugins_root, skill_id)?;
+    for materialized_skill_id in materialized_skill_ids_for_plugin(roots, skill_id)? {
+        remove_checked_dir(&roots.skills_root, &materialized_skill_id)?;
+    }
+    Ok(())
+}
+
+fn remove_stale_single_skill_artifact_for_plugin_install(
+    roots: &InstallRoots,
+    plugin_id: &str,
+) -> Result<()> {
+    remove_checked_dir(&roots.skills_root, plugin_id)
 }
 
 fn parse_skill_source(source: &str) -> Result<ParsedSkillSource> {
@@ -1198,6 +1219,22 @@ path = "skills/brainstorming"
                 name: "superpowers".to_string(),
             }]
         );
+        assert!(!roots.plugins_root.join("superpowers").exists());
+        assert!(!roots
+            .skills_root
+            .join("superpowers--brainstorming")
+            .exists());
+        assert!(roots
+            .skills_root
+            .join("superpowers")
+            .join("SKILL.md")
+            .is_file());
+
+        let listed = list_installed_skills_in(&roots).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "superpowers");
+        assert_eq!(listed[0].plugin_id, None);
+        assert_eq!(listed[0].skill_count, 1);
     }
 
     #[tokio::test]
@@ -1260,6 +1297,19 @@ path = "skills/brainstorming"
                 name: "brainstorming".to_string(),
             }]
         );
+        assert!(!roots.skills_root.join("superpowers").exists());
+        assert!(roots.plugins_root.join("superpowers").exists());
+        assert!(roots
+            .skills_root
+            .join("superpowers--brainstorming")
+            .join("SKILL.md")
+            .is_file());
+
+        let listed = list_installed_skills_in(&roots).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "superpowers");
+        assert_eq!(listed[0].plugin_id.as_deref(), Some("superpowers"));
+        assert_eq!(listed[0].skill_count, 1);
     }
 
     #[tokio::test]
