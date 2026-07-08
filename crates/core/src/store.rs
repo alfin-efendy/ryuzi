@@ -852,6 +852,27 @@ impl Store {
         Ok(())
     }
 
+    /// Backfill the workspace columns once background startup has prepared
+    /// the git workspace (session-first start returns a provisional row).
+    pub async fn update_session_workspace(
+        &self,
+        pk: &str,
+        worktree_path: Option<String>,
+        branch: &str,
+        branch_owned: bool,
+    ) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let branch = branch.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET worktree_path=?2, branch=?3, branch_owned=?4 WHERE session_pk=?1",
+                params![pk, worktree_path, branch, branch_owned],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
     /// Set `status` and `resume_attempts` together — used by `resume_session`
     /// to atomically bump the attempt counter as it re-drives a turn.
     pub async fn update_resume(

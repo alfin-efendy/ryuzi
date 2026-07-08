@@ -65,38 +65,41 @@ impl ControlPlane {
             }
         }
 
-        let session_pk = new_id();
-        // Prepare the git workspace per the branch-controls matrix. Every
-        // failure (dirty tree, branch collision, bad name) returns HERE —
-        // before the Session row is inserted, so no half-created sessions.
+        // Cheap validation only — the session row must be returnable
+        // immediately. Anything disk- or process-heavy runs in the background
+        // startup task below and surfaces failures in the transcript.
+        if self.registries.harness.get(&project.harness).is_none() {
+            anyhow::bail!(
+                "unknown harness '{}' (registered: {:?})",
+                project.harness,
+                self.registries.harness.names()
+            );
+        }
         let git = git.unwrap_or_default();
-        let worktree_candidate = worktree_path_for(&project.project_id, &session_pk);
-        let ws = crate::workspace::prepare_session_workspace(
-            Path::new(&project.workdir),
-            &git,
-            &session_pk,
-            &worktree_candidate,
-        )?;
-        let short: String = session_pk.chars().take(8).collect();
+        if let Some(name) = git.branch_name.as_deref() {
+            crate::workspace::validate_branch_name(name)?;
+        }
 
+        let session_pk = new_id();
+        let short: String = session_pk.chars().take(8).collect();
         let now = now_ms();
         let title: String = prompt.display.chars().take(80).collect();
+        // Workspace columns are provisional: the background git prep
+        // backfills the real values (engine-generated names, current-branch
+        // resolution) via `update_session_workspace`.
         let session = Session {
             session_pk: session_pk.clone(),
             project_id: project.project_id.clone(),
             agent_session_id: None,
-            worktree_path: ws
-                .worktree_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            branch: Some(ws.branch.clone()),
+            worktree_path: None,
+            branch: git.branch_name.clone().or_else(|| git.base_branch.clone()),
             title: Some(title),
             status: SessionStatus::Running,
             started_by: Some(started_by.to_string()),
             created_at: Some(now),
             last_active: Some(now),
             resume_attempts: 0,
-            branch_owned: ws.branch_owned,
+            branch_owned: git.create_branch && git.branch_name.is_none(),
         };
         self.store.insert_session(session.clone()).await?;
         let _ = self.events.send(CoreEvent::SessionCreated {
@@ -116,25 +119,14 @@ impl ControlPlane {
         )
         .await;
 
-        // Resolve + start the harness session synchronously so an immediate
-        // `stop_session` finds a live handle. The prompt is then driven in the
-        // background so the cockpit can juggle many sessions concurrently.
-        let handle = self
-            .start_harness_session(&project, &session_pk, &ws.work_dir, None)
-            .await?;
-        let prepared = self
-            .prepare_attachments(&session_pk, &prompt.agent, attachments)
-            .await;
-        self.spawn_prompt(
-            handle,
-            session_pk.clone(),
-            TurnPrompt {
-                agent: prepared.agent,
-                display: prompt.display,
-                blocks: prepared.image_blocks,
-                attachments: prepared.attachments_meta,
-            },
-        );
+        // Everything slow — git prep, harness + MCP startup, the first prompt
+        // — runs in the background, streaming progress into the transcript.
+        let me = Arc::clone(self);
+        let attachments = attachments.to_vec();
+        tokio::spawn(async move {
+            me.run_session_startup(project, session_pk, git, prompt, attachments)
+                .await;
+        });
 
         Ok(session)
     }
@@ -270,6 +262,161 @@ impl ControlPlane {
                 tool_kind: None,
             });
         }
+    }
+
+    /// Persist a user-visible error row (role=system, block_type=error) and
+    /// broadcast it so live subscribers render it immediately.
+    async fn emit_error(&self, session_pk: &str, text: &str) {
+        let payload = serde_json::json!({ "message": text });
+        let msg = crate::domain::NewMessage::block(session_pk, "system", "error", payload.clone());
+        if let Ok(seq) = self.store.insert_message(msg).await {
+            let _ = self.events.send(CoreEvent::Message {
+                session_pk: session_pk.to_string(),
+                seq,
+                role: "system".to_string(),
+                block_type: "error".to_string(),
+                payload,
+                tool_call_id: None,
+                status: None,
+                tool_kind: None,
+            });
+        }
+    }
+
+    /// Background half of `start_session_with_prompt`.
+    async fn run_session_startup(
+        self: Arc<Self>,
+        project: Project,
+        session_pk: String,
+        git: SessionGitOptions,
+        prompt: TurnPrompt,
+        attachments: Vec<AttachmentRef>,
+    ) {
+        self.startup_phases(&project, &session_pk, git, prompt, attachments)
+            .await;
+    }
+
+    /// The startup phases proper: git prep → harness + MCP → first prompt,
+    /// streaming progress into the transcript as status rows. The copy
+    /// varies by git cell — an in-place or existing-branch session must not
+    /// claim a worktree/branch was created. Failures emit an error row,
+    /// demote the session to Idle, and broadcast the bus-terminal error —
+    /// the row persists so the user can retry from the same chat.
+    async fn startup_phases(
+        self: &Arc<Self>,
+        project: &Project,
+        session_pk: &str,
+        git: SessionGitOptions,
+        prompt: TurnPrompt,
+        attachments: Vec<AttachmentRef>,
+    ) {
+        // Captured before `git` moves into the spawn_blocking closure below.
+        let (use_worktree, create_branch) = (git.use_worktree, git.create_branch);
+        self.emit_status(
+            session_pk,
+            match (use_worktree, create_branch) {
+                (true, _) => "Creating worktree…",
+                (false, true) => "Creating branch…",
+                (false, false) => "Preparing workspace…",
+            },
+        )
+        .await;
+        let worktree_candidate = worktree_path_for(&project.project_id, session_pk);
+        let repo_dir = std::path::PathBuf::from(&project.workdir);
+        let prep_pk = session_pk.to_string();
+        let prep_git = git;
+        // git2 is synchronous, disk-heavy work — keep it off the async runtime.
+        let prep = tokio::task::spawn_blocking(move || {
+            crate::workspace::prepare_session_workspace(
+                &repo_dir,
+                &prep_git,
+                &prep_pk,
+                &worktree_candidate,
+            )
+        })
+        .await;
+        let ws = match prep {
+            Ok(Ok(ws)) => ws,
+            Ok(Err(e)) => {
+                self.fail_startup(
+                    session_pk,
+                    &format!("Couldn't prepare the git workspace: {e}"),
+                )
+                .await;
+                return;
+            }
+            Err(e) => {
+                self.fail_startup(session_pk, &format!("Workspace preparation failed: {e}"))
+                    .await;
+                return;
+            }
+        };
+        let _ = self
+            .store
+            .update_session_workspace(
+                session_pk,
+                ws.worktree_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                &ws.branch,
+                ws.branch_owned,
+            )
+            .await;
+        self.emit_status(
+            session_pk,
+            &match (use_worktree, create_branch) {
+                (_, true) => format!("Created and checked out branch {}", ws.branch),
+                (true, false) => format!("Checked out branch {}", ws.branch),
+                (false, false) => format!("Using branch {}", ws.branch),
+            },
+        )
+        .await;
+
+        self.emit_status(session_pk, "Connecting tools…").await;
+        let handle = match self
+            .start_harness_session(project, session_pk, &ws.work_dir, None)
+            .await
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.fail_startup(session_pk, &format!("Couldn't start the agent: {e}"))
+                    .await;
+                return;
+            }
+        };
+
+        let prepared = self
+            .prepare_attachments(session_pk, &prompt.agent, &attachments)
+            .await;
+        self.spawn_prompt(
+            handle,
+            session_pk.to_string(),
+            TurnPrompt {
+                agent: prepared.agent,
+                display: prompt.display,
+                blocks: prepared.image_blocks,
+                attachments: prepared.attachments_meta,
+            },
+        );
+    }
+
+    /// Startup failed: surface it in the transcript, release the session
+    /// back to Idle so the user can retry, and broadcast the bus-terminal
+    /// `CoreEvent::Error` (mirroring `spawn_prompt`'s error arm). The
+    /// broadcast is load-bearing: the orchestrator's `watch_session` and the
+    /// scheduler's run watcher finish only on `Result`/`Error` for the
+    /// session, so without it they would hang to their 2h deadline instead
+    /// of reporting the real git/harness error. `demote_if_running` (not a
+    /// blind status write) so a stop that already marked it Interrupted
+    /// wins; it runs before the broadcast so a lagged watcher that falls
+    /// back to consulting the session row never reads a stale Running.
+    async fn fail_startup(&self, session_pk: &str, message: &str) {
+        self.emit_error(session_pk, message).await;
+        let _ = self.store.demote_if_running(session_pk, now_ms()).await;
+        let _ = self.events.send(CoreEvent::Error {
+            session_pk: session_pk.to_string(),
+            message: message.to_string(),
+        });
     }
 
     /// Re-drive an interrupted turn after a restart, guarded by the attempts
