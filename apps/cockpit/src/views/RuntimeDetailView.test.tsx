@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AppInfo, ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, RuntimeConfigStatusInfo, RuntimeInfo } from "@/bindings";
+import type {
+  AppInfo,
+  CatalogEntry,
+  ConnectionInfo,
+  EndpointKeyInfo,
+  EndpointStatusInfo,
+  RuntimeConfigStatusInfo,
+  RuntimeInfo,
+} from "@/bindings";
 
 // Fixtures shaped after the generated Tauri bindings. The runtime carries an
 // available update (latest !== installed) so the update banner renders.
@@ -25,6 +33,23 @@ const claudeRuntime: RuntimeInfo = {
   ],
   isDefault: false,
   runnable: true,
+};
+
+// Native runtime: in-process, no tiers; its models mix a bare route alias
+// ("smart") with a family-prefixed connection model.
+const nativeRuntime: RuntimeInfo = {
+  ...claudeRuntime,
+  id: "native",
+  name: "Ryuzi",
+  connection: "In-process",
+  binaryPath: "in-process",
+  installedVersion: "0.5.0",
+  latestVersion: null,
+  npmPackage: null,
+  models: ["smart", "anthropic/claude-opus-4"],
+  model: "",
+  tiers: [],
+  isDefault: true,
 };
 
 const githubApp: AppInfo = {
@@ -82,6 +107,24 @@ const configStatus: RuntimeConfigStatusInfo = {
   supported: true,
 };
 
+// Catalog with the anthropic family head so the grouped pickers can resolve
+// bare ("claude-opus-4") and prefixed ("anthropic/…") model ids to a family.
+const catalogEntries: CatalogEntry[] = [
+  {
+    id: "anthropic",
+    name: "Anthropic",
+    family: "anthropic",
+    color: "#D97757",
+    initial: "A",
+    category: "api_key",
+    format: "anthropic",
+    requiresBaseUrl: false,
+    models: ["claude-opus-4", "claude-sonnet-4"],
+    freeTier: false,
+    riskNotice: false,
+  },
+];
+
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 
 const runtimeConfigStatus = mock((_id: string) => ok(configStatus));
@@ -97,7 +140,7 @@ mock.module("@/bindings", () => ({
     updateRuntimeConfig,
     endpointStatus: () => ok(endpointUp),
     listEndpointKeys: () => ok([endpointKey]),
-    listProviderCatalog: () => ok([]),
+    listProviderCatalog: () => ok(catalogEntries),
     listConnections: () => ok([anthropicConnection]),
     listModelRoutes: () => ok([]),
     listApps: () => ok([githubApp]),
@@ -181,17 +224,23 @@ test("loads endpoint config status and enables Apply once server, key, and model
     expect(await screen.findByRole("combobox", { name })).toBeTruthy();
   }
   fireEvent.click(screen.getByRole("combobox", { name: "Opus" }));
-  expect(await screen.findByRole("option", { name: "anthropic/claude-sonnet-4" })).toBeTruthy();
+  // The provider-prefixed id ("anthropic/claude-sonnet-4") renders under its
+  // family group with the prefix trimmed off the label; the value is unchanged.
+  expect(await screen.findByRole("option", { name: "claude-sonnet-4" })).toBeTruthy();
   await waitFor(() => expect((screen.getByRole("button", { name: "Apply" }) as HTMLButtonElement).disabled).toBe(false));
 });
 
-test("tier picker offers runtime models plus the Route by task combo item", async () => {
+test("tier picker groups runtime models by family with the combo sentinel first", async () => {
   await renderView();
 
   fireEvent.click(screen.getByRole("combobox", { name: "Smart model" }));
-  expect(await screen.findByRole("option", { name: "claude-opus-4" })).toBeTruthy();
+  const options = await screen.findAllByRole("option");
+  // The sentinel is an ungrouped (headingless) leading item, before the groups.
+  expect(options[0]?.textContent).toBe("Route by task (combo)");
+  expect(screen.getByRole("option", { name: "claude-opus-4" })).toBeTruthy();
   expect(screen.getByRole("option", { name: "claude-sonnet-4" })).toBeTruthy();
-  expect(screen.getByRole("option", { name: "Route by task (combo)" })).toBeTruthy();
+  // Family group header, resolved from the hydrated catalog.
+  expect(screen.getByText("Anthropic")).toBeTruthy();
 });
 
 test("lists app access rows from store data with their access switches", async () => {
@@ -218,4 +267,19 @@ test("switching the permission mode calls updateRuntimeConfig and updates the de
   await waitFor(() => expect(updateRuntimeConfig).toHaveBeenCalledWith("claude", true, "sonnet", "full", ""));
   expect(await screen.findByText("Full access — no approval prompts.")).toBeTruthy();
   expect(screen.queryByText("Asks before edits and shell commands.")).toBeNull();
+});
+
+test("native default-model picker groups models with the Router default sentinel first", async () => {
+  useRuntimes.setState({ runtimes: [claudeRuntime, nativeRuntime], loaded: true, refreshing: false, updating: {}, updateLog: {} });
+  await renderView("native");
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Default model" }));
+  const options = await screen.findAllByRole("option");
+  expect(options[0]?.textContent).toBe("Router default (first usable provider)");
+  // Bare route alias lands in the Route group, pinned first among groups.
+  expect(screen.getByRole("option", { name: "smart" })).toBeTruthy();
+  expect(screen.getByText("Route")).toBeTruthy();
+  // Family-prefixed id renders trimmed under its family group.
+  expect(screen.getByRole("option", { name: "claude-opus-4" })).toBeTruthy();
+  expect(screen.getByText("Anthropic")).toBeTruthy();
 });
