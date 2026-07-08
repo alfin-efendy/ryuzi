@@ -95,3 +95,10 @@ export const KEYCHAIN_UNAVAILABLE_WARNING = "Secrets are stored unencrypted — 
 // (providers reached through unofficial/reverse-engineered endpoints).
 export const PROVIDER_RISK_NOTICE =
   "Uses your provider account through unofficial endpoints. This may violate the provider's terms and can risk account suspension.";
+
+// Device sign-in copy for RFC 8628 device-grant providers (qwen, github-copilot).
+export const DEVICE_SIGNIN_ACTION = "Sign in";
+export const PROVIDER_DEVICE_SUBTITLE: Record<string, string> = {
+  qwen: "Free — sign in with your Qwen account. No API key needed.",
+  "github-copilot": "Sign in with your GitHub account to use your Copilot subscription.",
+};

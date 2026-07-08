@@ -978,6 +978,35 @@ async importKiroToken(label: string) : Promise<Result<ConnectionInfo[], CmdError
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Start an RFC 8628 device-authorization grant for a device-grant provider
+ * (Qwen, GitHub Copilot): request a device code, open the verification URL,
+ * and stash in-flight state under a fresh `flow_id` for `await_device_flow`.
+ * Errors for providers that are not device-grant (e.g. `kiro`, which uses
+ * `start_kiro_device_flow`).
+ */
+async startDeviceFlow(provider: string) : Promise<Result<DeviceFlowInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_device_flow", { provider }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Poll a device-grant flow started by `start_device_flow` until completion,
+ * then persist the connection with `auth_type = "oauth"`. GitHub Copilot runs
+ * the Copilot-token exchange (leg 2) before persisting; Qwen captures its
+ * shard `resource_url`.
+ */
+async awaitDeviceFlow(provider: string, label: string, flowId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("await_device_flow", { provider, label, flowId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -1033,7 +1062,7 @@ export type CatalogEntry = { id: string; name: string;
  * Vendor family id (a catalog id). Entries sharing a family render as one
  * provider card; the entry whose id == family is the display head.
  */
-family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean }
+family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
 export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**

@@ -40,6 +40,7 @@ pub struct CatalogEntry {
     pub models: Vec<String>,
     pub free_tier: bool,
     pub risk_notice: bool,
+    pub uses_device_grant: bool,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -144,6 +145,24 @@ fn flows() -> &'static Mutex<HashMap<String, KiroFlowState>> {
     FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// In-flight RFC 8628 device-grant state (Qwen, GitHub Copilot), stashed
+/// between `start_device_flow` and `await_device_flow`. Separate from Kiro's
+/// `FLOWS` (AWS SSO-OIDC) so Kiro's shipped path is untouched.
+struct GrantFlowState {
+    provider: String,
+    device_code: String,
+    /// PKCE verifier — `Some` only for providers with `use_pkce` (Qwen).
+    verifier: Option<String>,
+    interval: i64,
+    deadline_ms: i64,
+}
+
+static GRANT_FLOWS: OnceLock<Mutex<HashMap<String, GrantFlowState>>> = OnceLock::new();
+
+fn grant_flows() -> &'static Mutex<HashMap<String, GrantFlowState>> {
+    GRANT_FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Mask a secret for display: first 3 + last 4 chars, elided in between.
 /// Defensive for short keys: the brief's naive head(3)/tail(4) slicing
 /// overlaps (and can echo the *entire* key back) once `key.len() < 7`, so
@@ -227,6 +246,17 @@ fn provider_http_client() -> R<reqwest::Client> {
         })
 }
 
+/// Ids of OTHER connections for `provider` that are dead
+/// (`needs_relogin == Some(true)`) and should be cleared once a fresh one
+/// (`keep_id`) is persisted. Never selects `keep_id`, a healthy row, or a row
+/// for a different provider.
+fn dead_connection_ids(rows: &[ConnectionRow], provider: &str, keep_id: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.provider == provider && r.id != keep_id && r.data.needs_relogin == Some(true))
+        .map(|r| r.id.clone())
+        .collect()
+}
+
 /// Pick out the ids of OTHER kiro connections that are dead
 /// (`needs_relogin == Some(true)`) and should be cleared once a fresh kiro
 /// connection (`keep_id`) has been persisted. Split out from
@@ -235,10 +265,7 @@ fn provider_http_client() -> R<reqwest::Client> {
 /// `Store`. Never selects `keep_id` itself, never selects a healthy kiro row
 /// (`needs_relogin` `None`/`false`), and never selects a non-kiro row.
 fn dead_kiro_connection_ids(rows: &[ConnectionRow], keep_id: &str) -> Vec<String> {
-    rows.iter()
-        .filter(|r| r.provider == "kiro" && r.id != keep_id && r.data.needs_relogin == Some(true))
-        .map(|r| r.id.clone())
-        .collect()
+    dead_connection_ids(rows, "kiro", keep_id)
 }
 
 /// After persisting a fresh kiro connection (`keep_id`) via
@@ -256,6 +283,21 @@ fn dead_kiro_connection_ids(rows: &[ConnectionRow], keep_id: &str) -> Vec<String
 async fn remove_dead_kiro_connections(cp: &ControlPlane, keep_id: &str) -> anyhow::Result<()> {
     let rows = connections::list_connections(cp.store()).await?;
     for id in dead_kiro_connection_ids(&rows, keep_id) {
+        connections::remove_connection(cp.store(), &id).await?;
+    }
+    Ok(())
+}
+
+/// After persisting a fresh `provider` connection (`keep_id`), remove any OTHER
+/// `provider` row still flagged `needs_relogin` (see
+/// [`remove_dead_kiro_connections`] for why this shadow cleanup is required).
+async fn remove_dead_connections(
+    cp: &ControlPlane,
+    provider: &str,
+    keep_id: &str,
+) -> anyhow::Result<()> {
+    let rows = connections::list_connections(cp.store()).await?;
+    for id in dead_connection_ids(&rows, provider, keep_id) {
         connections::remove_connection(cp.store(), &id).await?;
     }
     Ok(())
@@ -308,6 +350,7 @@ pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
             models: d.models.iter().map(|s| s.to_string()).collect(),
             free_tier: d.free_tier,
             risk_notice: d.risk_notice,
+            uses_device_grant: d.device_grant.is_some(),
         })
         .collect())
 }
@@ -1113,6 +1156,68 @@ mod tests {
         let row = connection_row("c1", "openai", "Work OpenAI", true);
         assert_eq!(refresh_label(&row), "Work OpenAI");
     }
+
+    #[test]
+    fn dead_connection_ids_selects_by_provider() {
+        let mk = |id: &str, provider: &str, relogin: Option<bool>| ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: "oauth".into(),
+            label: String::new(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                needs_relogin: relogin,
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        };
+        let rows = vec![
+            mk("keep", "qwen", Some(true)),            // keep_id — excluded
+            mk("dead", "qwen", Some(true)),            // selected
+            mk("healthy", "qwen", None),               // healthy — excluded
+            mk("other", "github-copilot", Some(true)), // other provider — excluded
+        ];
+        assert_eq!(
+            dead_connection_ids(&rows, "qwen", "keep"),
+            vec!["dead".to_string()]
+        );
+        assert_eq!(
+            dead_connection_ids(&rows, "github-copilot", "x"),
+            vec!["other".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_marks_device_grant_providers() {
+        let cat = list_provider_catalog().await.unwrap();
+        let qwen = cat.iter().find(|e| e.id == "qwen").unwrap();
+        assert_eq!(qwen.category, "oauth");
+        assert!(qwen.uses_device_grant);
+        let anth = cat.iter().find(|e| e.id == "anthropic-oauth").unwrap();
+        assert!(!anth.uses_device_grant);
+    }
+
+    #[tokio::test]
+    async fn build_device_grant_data_qwen_captures_resource_url() {
+        let cfg = registry::device_grant_config("qwen").unwrap();
+        let http = reqwest::Client::new();
+        let tokens = oauth::device_grant::GrantTokens {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: 123,
+            raw: serde_json::json!({ "resource_url": "dashscope.aliyuncs.com" }),
+        };
+        let data = build_device_grant_data(cfg, tokens, &http).await.unwrap();
+        assert_eq!(data.access_token.as_deref(), Some("at"));
+        assert_eq!(data.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(data.expires_at, Some(123));
+        assert_eq!(
+            data.provider_specific.unwrap()["resource_url"],
+            "dashscope.aliyuncs.com"
+        );
+    }
 }
 
 /// Drive the full interactive OAuth flow: binds a loopback listener, opens
@@ -1532,6 +1637,201 @@ pub async fn import_kiro_token(
     // `remove_dead_kiro_connections`.
     remove_dead_kiro_connections(&cp, &new_id).await?;
     Ok(assemble(&cp).await?)
+}
+
+/// Start an RFC 8628 device-authorization grant for a device-grant provider
+/// (Qwen, GitHub Copilot): request a device code, open the verification URL,
+/// and stash in-flight state under a fresh `flow_id` for `await_device_flow`.
+/// Errors for providers that are not device-grant (e.g. `kiro`, which uses
+/// `start_kiro_device_flow`).
+#[tauri::command]
+#[specta::specta]
+pub async fn start_device_flow(
+    _cp: State<'_, Arc<ControlPlane>>,
+    app: tauri::AppHandle,
+    provider: String,
+) -> R<DeviceFlowInfo> {
+    let cfg = registry::device_grant_config(&provider).ok_or_else(|| CmdError {
+        message: format!("{provider} is not a device-grant provider"),
+    })?;
+    let http = reqwest::Client::new();
+    let pkce = if cfg.use_pkce {
+        Some(oauth::pkce::generate())
+    } else {
+        None
+    };
+    let auth = oauth::device_grant::request_device_code(&http, cfg, pkce.as_ref())
+        .await
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
+
+    let flow_id = ryuzi_core::paths::new_id();
+    let deadline_ms = ryuzi_core::paths::now_ms() + auth.expires_in * 1000;
+    grant_flows()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            flow_id.clone(),
+            GrantFlowState {
+                provider: provider.clone(),
+                device_code: auth.device_code.clone(),
+                verifier: pkce.map(|p| p.verifier),
+                interval: auth.interval,
+                deadline_ms,
+            },
+        );
+
+    let _ = app
+        .opener()
+        .open_url(auth.verification_uri_complete.clone(), None::<&str>);
+
+    Ok(DeviceFlowInfo {
+        flow_id,
+        user_code: auth.user_code,
+        verification_uri: auth.verification_uri,
+        verification_uri_complete: auth.verification_uri_complete,
+        expires_in: auth.expires_in,
+        interval: auth.interval,
+    })
+}
+
+/// Poll a device-grant flow started by `start_device_flow` until completion,
+/// then persist the connection with `auth_type = "oauth"`. GitHub Copilot runs
+/// the Copilot-token exchange (leg 2) before persisting; Qwen captures its
+/// shard `resource_url`.
+#[tauri::command]
+#[specta::specta]
+pub async fn await_device_flow(
+    cp: State<'_, Arc<ControlPlane>>,
+    provider: String,
+    label: String,
+    flow_id: String,
+) -> R<Vec<ConnectionInfo>> {
+    let GrantFlowState {
+        provider: flow_provider,
+        device_code,
+        verifier,
+        mut interval,
+        deadline_ms,
+    } = grant_flows()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&flow_id)
+        .ok_or_else(|| CmdError {
+            message: "device sign-in flow not found — start again".into(),
+        })?;
+    if flow_provider != provider {
+        return Err(CmdError {
+            message: "device flow provider mismatch".into(),
+        });
+    }
+    let cfg = registry::device_grant_config(&provider).ok_or_else(|| CmdError {
+        message: format!("{provider} is not a device-grant provider"),
+    })?;
+    let pkce = verifier.map(|v| oauth::pkce::Pkce {
+        verifier: v,
+        challenge: String::new(),
+        state: String::new(),
+    });
+    let http = reqwest::Client::new();
+
+    let tokens = loop {
+        if ryuzi_core::paths::now_ms() > deadline_ms {
+            return Err(CmdError {
+                message: "device code expired — start again".into(),
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(interval.max(1) as u64)).await;
+        match oauth::device_grant::poll_token_once(&http, cfg, &device_code, pkce.as_ref())
+            .await
+            .map_err(|e| CmdError {
+                message: e.to_string(),
+            })? {
+            oauth::device_grant::GrantPoll::Pending => continue,
+            oauth::device_grant::GrantPoll::SlowDown => {
+                interval = (interval + 5).min(30);
+                continue;
+            }
+            oauth::device_grant::GrantPoll::Denied => {
+                return Err(CmdError {
+                    message: "sign-in was denied".into(),
+                });
+            }
+            oauth::device_grant::GrantPoll::Expired => {
+                return Err(CmdError {
+                    message: "device code expired — start again".into(),
+                });
+            }
+            oauth::device_grant::GrantPoll::Ready(t) => break t,
+        }
+    };
+
+    let data = build_device_grant_data(cfg, tokens, &http)
+        .await
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
+
+    let now = ryuzi_core::paths::now_ms();
+    let new_id = ryuzi_core::paths::new_id();
+    connections::add_connection(
+        cp.store(),
+        ConnectionRow {
+            id: new_id.clone(),
+            provider: provider.clone(),
+            auth_type: "oauth".into(),
+            label,
+            priority: 0,
+            enabled: true,
+            data,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await?;
+    remove_dead_connections(&cp, &provider, &new_id).await?;
+    Ok(assemble(&cp).await?)
+}
+
+/// Build `ConnectionData` from a completed device grant. GitHub Copilot swaps
+/// the GitHub token for a Copilot token (stored as `access_token`, GitHub token
+/// kept as the durable `refresh_token`). Qwen keeps the grant tokens and its
+/// `resource_url`.
+async fn build_device_grant_data(
+    cfg: &registry::DeviceGrantConfig,
+    tokens: oauth::device_grant::GrantTokens,
+    http: &reqwest::Client,
+) -> anyhow::Result<ConnectionData> {
+    if let Some(exchange) = cfg.token_exchange.as_ref() {
+        let gh_token = tokens.access_token;
+        let copilot = oauth::github::exchange_copilot_token(http, &gh_token, exchange.url).await?;
+        let mut provider_specific = None;
+        if let Some(gh_refresh) = tokens.refresh_token {
+            provider_specific = Some(serde_json::json!({ "gh_refresh": gh_refresh }));
+        }
+        Ok(ConnectionData {
+            access_token: Some(copilot.token),
+            refresh_token: Some(gh_token),
+            expires_at: Some(copilot.expires_at_ms),
+            provider_specific,
+            ..Default::default()
+        })
+    } else {
+        let resource_url = tokens
+            .raw
+            .get("resource_url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| serde_json::json!({ "resource_url": s }));
+        Ok(ConnectionData {
+            access_token: Some(tokens.access_token),
+            refresh_token: tokens.refresh_token,
+            expires_at: Some(tokens.expires_at),
+            provider_specific: resource_url,
+            ..Default::default()
+        })
+    }
 }
 
 #[cfg(test)]
