@@ -35,6 +35,38 @@ pub fn inject_claude_code_system_prompt(body: &mut Value) {
     body["system"] = new_system;
 }
 
+/// Tri-state verdict for a single-model probe. `Unknown` covers transient
+/// failures (rate limits, server errors, network) that must never be
+/// persisted as a definitive verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeStatus {
+    Valid,
+    Invalid,
+    Unknown,
+}
+
+impl ProbeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeStatus::Valid => "valid",
+            ProbeStatus::Invalid => "invalid",
+            ProbeStatus::Unknown => "unknown",
+        }
+    }
+}
+
+/// Map a probe's HTTP status (`None` = transport error/timeout) to the
+/// tri-state verdict: 2xx proves the model works, 400/401/403/404 are
+/// deterministic rejections, everything else (429, 5xx, network) is
+/// transient and stays `Unknown`.
+pub fn probe_status(http_status: Option<u16>) -> ProbeStatus {
+    match http_status {
+        Some(s) if (200..300).contains(&s) => ProbeStatus::Valid,
+        Some(400 | 401 | 403 | 404) => ProbeStatus::Invalid,
+        _ => ProbeStatus::Unknown,
+    }
+}
+
 fn raw_models(data: &Value) -> Vec<&Value> {
     if let Value::Array(items) = data {
         return items.iter().collect();
@@ -330,6 +362,30 @@ mod tests {
         assert_eq!(body["system"][0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
         assert_eq!(body["system"][1]["text"], "custom");
         assert_eq!(body["system"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn probe_status_tri_state_mapping() {
+        use super::ProbeStatus::*;
+        assert_eq!(probe_status(Some(200)), Valid);
+        assert_eq!(probe_status(Some(201)), Valid);
+        assert_eq!(probe_status(Some(400)), Invalid);
+        assert_eq!(probe_status(Some(401)), Invalid);
+        assert_eq!(probe_status(Some(403)), Invalid);
+        assert_eq!(probe_status(Some(404)), Invalid);
+        // Transient failures must never read as invalid — rate limits would
+        // otherwise poison the hide-invalid filter.
+        assert_eq!(probe_status(Some(429)), Unknown);
+        assert_eq!(probe_status(Some(500)), Unknown);
+        assert_eq!(probe_status(Some(503)), Unknown);
+        assert_eq!(probe_status(None), Unknown);
+    }
+
+    #[test]
+    fn probe_status_as_str_matches_persisted_labels() {
+        assert_eq!(ProbeStatus::Valid.as_str(), "valid");
+        assert_eq!(ProbeStatus::Invalid.as_str(), "invalid");
+        assert_eq!(ProbeStatus::Unknown.as_str(), "unknown");
     }
 
     #[test]
