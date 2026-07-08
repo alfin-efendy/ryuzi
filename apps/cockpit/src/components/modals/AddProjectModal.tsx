@@ -75,8 +75,7 @@ export function AddProjectModal({ open, onClose }: { open: boolean; onClose: () 
       {mode === "folder" ? (
         <>
           <p className="mt-3.5 text-[12.5px] text-muted-foreground">
-            Add an existing folder as a project. Folders without a git repository work too — git features are disabled
-            for them.
+            Add an existing folder as a project. Folders without a git repository work too — git features are disabled for them.
           </p>
           <Button size="lg" onClick={() => void openFolder()} disabled={busy} className="mt-3.5 w-full">
             {busy ? "Opening..." : "Choose folder"}
@@ -90,30 +89,14 @@ export function AddProjectModal({ open, onClose }: { open: boolean; onClose: () 
             </FormField>
             <FormField label="Destination" hint="Clones into a folder named after the repository inside this directory.">
               <div className="flex min-w-0 gap-2">
-                <Input
-                  value={dest}
-                  onChange={(e) => setDest(e.target.value)}
-                  placeholder="Projects folder"
-                  className="min-w-0 flex-1"
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  aria-label="Browse"
-                  onClick={() => void browseDest()}
-                  className="shrink-0"
-                >
+                <Input value={dest} onChange={(e) => setDest(e.target.value)} placeholder="Projects folder" className="min-w-0 flex-1" />
+                <Button type="button" variant="outline" aria-label="Browse" onClick={() => void browseDest()} className="shrink-0">
                   Browse
                 </Button>
               </div>
             </FormField>
           </div>
-          <Button
-            size="lg"
-            onClick={() => void clone()}
-            disabled={busy || !url.trim() || !dest.trim()}
-            className="mt-3.5 w-full"
-          >
+          <Button size="lg" onClick={() => void clone()} disabled={busy || !url.trim() || !dest.trim()} className="mt-3.5 w-full">
             {busy ? "Cloning..." : "Clone"}
           </Button>
         </>

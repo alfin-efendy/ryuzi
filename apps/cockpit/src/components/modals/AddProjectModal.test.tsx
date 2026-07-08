@@ -61,9 +61,7 @@ test("clone mode defaults the destination from the projects_root setting and sub
   render(<AddProjectModal open onClose={onClose} />);
 
   fireEvent.click(screen.getByRole("radio", { name: "Clone from URL" }));
-  await waitFor(() =>
-    expect((screen.getByPlaceholderText("Projects folder") as HTMLInputElement).value).toBe("C:\\proj"),
-  );
+  await waitFor(() => expect((screen.getByPlaceholderText("Projects folder") as HTMLInputElement).value).toBe("C:\\proj"));
 
   const clone = screen.getByRole("button", { name: "Clone" }) as HTMLButtonElement;
   expect(clone.disabled).toBe(true); // no URL yet
@@ -82,13 +80,9 @@ test("Browse overrides the clone destination for this clone only", async () => {
   render(<AddProjectModal open onClose={() => {}} />);
 
   fireEvent.click(screen.getByRole("radio", { name: "Clone from URL" }));
-  await waitFor(() =>
-    expect((screen.getByPlaceholderText("Projects folder") as HTMLInputElement).value).toBe("C:\\proj"),
-  );
+  await waitFor(() => expect((screen.getByPlaceholderText("Projects folder") as HTMLInputElement).value).toBe("C:\\proj"));
 
   pickDirectory.mockResolvedValueOnce("D:\\elsewhere");
   fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  await waitFor(() =>
-    expect((screen.getByPlaceholderText("Projects folder") as HTMLInputElement).value).toBe("D:\\elsewhere"),
-  );
+  await waitFor(() => expect((screen.getByPlaceholderText("Projects folder") as HTMLInputElement).value).toBe("D:\\elsewhere"));
 });
