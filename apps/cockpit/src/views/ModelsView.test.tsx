@@ -177,7 +177,8 @@ mock.module("@/bindings", () => ({
     updateConnection,
     moveConnection: () => Promise.resolve({ status: "ok", data: [secondConnection, connection] }),
     testConnection: () => Promise.resolve({ status: "ok", data: { ok: true, message: "Connection OK" } }),
-    testConnectionModel: () => Promise.resolve({ status: "ok", data: { ok: true, message: "Model OK" } }),
+    testConnectionModel: () => Promise.resolve({ status: "ok", data: { ok: true, status: "valid", message: "Model OK" } }),
+    listModelStatuses: () => Promise.resolve({ status: "ok", data: [] }),
     connectionProviderQuota: () =>
       Promise.resolve({
         status: "ok",
