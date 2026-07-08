@@ -14,6 +14,7 @@ mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
 mod session_io;
+mod skills_cmd;
 mod term;
 
 use ryuzi_core::harness::acp::claude_code_plugin_with_resolver;
@@ -348,6 +349,10 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_agents,
             native_cmd::native_commands,
             native_cmd::session_todos,
+            skills_cmd::list_skills,
+            skills_cmd::install_skill,
+            skills_cmd::remove_skill,
+            skills_cmd::refresh_skill,
             plugins_cmd::list_plugins,
             plugins_cmd::plugin_detail,
             plugins_cmd::set_plugin_enabled,

@@ -771,6 +771,38 @@ async sessionTodos(sessionPk: string) : Promise<Result<TodoItem[], CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+async listSkills() : Promise<Result<InstalledSkillInfo[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_skills") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async installSkill(source: string) : Promise<Result<InstalledSkillPack, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_skill", { source }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeSkill(id: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_skill", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async refreshSkill(id: string) : Promise<Result<InstalledSkillPack, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_skill", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listPlugins() : Promise<Result<PluginInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_plugins") };
@@ -1056,6 +1088,9 @@ export type GatewayResourceInfo = { label: string; sub: string; pct: number }
  * Per-start git controls from the composer (behavior matrix, workstream B).
  */
 export type GitOptions = { useWorktree: boolean; createBranch: boolean; branchName: string | null; baseBranch: string | null }
+export type InstalledSkillEntry = { id: string; name: string }
+export type InstalledSkillInfo = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skillCount: number }
+export type InstalledSkillPack = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skills: InstalledSkillEntry[] }
 export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
 export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>

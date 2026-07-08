@@ -24,6 +24,7 @@ pub mod scheduler;
 pub mod serve;
 pub mod settings;
 pub mod sidecar;
+pub mod skills_install;
 pub mod store;
 pub mod telemetry;
 pub mod update;
