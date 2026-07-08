@@ -383,3 +383,50 @@ test("start forwards composer git options to IPC", async () => {
   listProjects.mockRestore();
   listSessions.mockRestore();
 });
+
+test("start resolves and focuses the session without waiting for refresh", async () => {
+  reset();
+  const start = spyOn(commands, "startSession").mockResolvedValue({
+    status: "ok",
+    data: {
+      sessionPk: "s3",
+      projectId: "p1",
+      agentSessionId: null,
+      worktreePath: null,
+      branch: null,
+      title: "go",
+      status: "running",
+      startedBy: "cockpit",
+      createdAt: 1,
+      lastActive: 1,
+      resumeAttempts: 0,
+      branchOwned: true,
+    },
+  });
+  // refresh() must not gate start(): these never resolve during the test.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
+
+  const ok = await useStore.getState().start("p1", "go", null);
+
+  expect(ok).toBe(true);
+  expect(useStore.getState().focusedSessionPk).toBe("s3");
+  // The returned row is seeded so the session view renders immediately.
+  expect(useStore.getState().sessions.map((s) => s.sessionPk)).toContain("s3");
+
+  start.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("start returns false and does not focus on backend error", async () => {
+  reset();
+  const start = spyOn(commands, "startSession").mockResolvedValue({
+    status: "error",
+    error: { message: "boom" },
+  });
+  const ok = await useStore.getState().start("p1", "go", null);
+  expect(ok).toBe(false);
+  expect(useStore.getState().focusedSessionPk).toBeNull();
+  start.mockRestore();
+});

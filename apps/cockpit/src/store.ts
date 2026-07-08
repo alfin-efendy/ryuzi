@@ -47,7 +47,9 @@ type State = {
   setProjectModel: (projectId: string, model: string | null) => Promise<void>;
   /** Change the permission mode future turns of this project run under. */
   setProjectPermMode: (projectId: string, permMode: PermMode) => Promise<void>;
-  start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
+  /** Resolves true as soon as the backend accepts — navigate immediately;
+   *  the session list refresh completes in the background. */
+  start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
   send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
   stop: (sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
@@ -230,13 +232,16 @@ export const useStore = create<State>((set, get) => ({
 
   start: async (projectId, prompt, options) => {
     const res = await commands.startSession(projectId, prompt, toChatRequestOptions(options));
-    if (res.status === "ok") {
-      const pk = res.data.sessionPk;
-      set({ focusedSessionPk: pk });
-      await get().refresh();
-    } else if (res.status === "error") {
+    if (res.status === "error") {
       toast.error("Couldn't start session: " + res.error.message);
+      return false;
     }
+    // Optimistic navigation: the backend returns the session row before its
+    // git/harness startup finishes. Seed and focus it now; the full refresh
+    // catches up in the background.
+    set({ focusedSessionPk: res.data.sessionPk, sessions: [...get().sessions, res.data] });
+    void get().refresh();
+    return true;
   },
   send: async (sessionPk, prompt, options) => {
     const res = await commands.continueSession(sessionPk, prompt, toChatRequestOptions(options));

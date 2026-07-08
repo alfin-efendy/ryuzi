@@ -155,8 +155,8 @@ export function HomeView() {
     setDraft("");
     composerFiles.clear();
     setContextRefs([]);
-    await start(project.projectId, t, opts);
-    nav.navigate({ kind: "session" });
+    const ok = await start(project.projectId, t, opts);
+    if (ok) nav.navigate({ kind: "session" });
   };
 
   return (
