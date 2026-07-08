@@ -4578,6 +4578,7 @@ dependencies = [
  "croner",
  "deadpool-sqlite",
  "dirs 5.0.1",
+ "dunce",
  "futures",
  "git2",
  "globset",
