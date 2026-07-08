@@ -213,7 +213,11 @@ async fn refresh_installed_skill_with(
     cloner: &impl RepoCloner,
 ) -> Result<InstalledSkillPack> {
     let installed = read_installed_pack(roots, id)?;
-    install_skill_source_with(&installed.source, roots, cloner).await
+    let refreshed = install_skill_source_with(&installed.source, roots, cloner).await?;
+    if installed.plugin_id.is_none() && refreshed.id != installed.id {
+        remove_checked_dir(&roots.skills_root, &installed.id)?;
+    }
+    Ok(refreshed)
 }
 
 fn list_installed_skills_in(roots: &InstallRoots) -> Result<Vec<InstalledSkillInfo>> {
@@ -400,33 +404,38 @@ fn discover_plugin_pack_from_plugin_json(
     if existing_manifest_path.is_file() {
         let text = std::fs::read_to_string(&existing_manifest_path)?;
         let manifest_dir = existing_manifest_path.parent().unwrap_or(repo_dir);
-        if let Ok(mut manifest) = ryuzi_plugin_sdk::PluginManifest::from_toml(&text) {
-            if manifest.skills.is_empty() {
-                let default_skill_root = plugin_json.skills.as_deref().unwrap_or("./skills/");
-                let default_skills = discover_skill_descriptors(repo_dir, default_skill_root)?;
-                manifest.skills = manifest_skill_defs(repo_dir, &default_skills)?;
-                let manifest_text = toml::to_string_pretty(&manifest)?;
-                return Ok(PackDescriptor {
-                    plugin_id: manifest.id.clone(),
-                    repo_dir: repo_dir.to_path_buf(),
-                    manifest,
-                    manifest_to_write: Some(manifest_text),
-                });
-            }
-            let materialized = materialized_skills_from_manifest(manifest_dir, &manifest)?;
-            if materialized.is_empty() {
-                bail!(
-                    "plugin manifest at {} does not resolve any installable skills",
+        let mut manifest =
+            ryuzi_plugin_sdk::PluginManifest::from_toml(&text).with_context(|| {
+                format!(
+                    "invalid preserved plugin manifest at {}",
                     existing_manifest_path.display()
-                );
-            }
+                )
+            })?;
+        if manifest.skills.is_empty() {
+            let default_skill_root = plugin_json.skills.as_deref().unwrap_or("./skills/");
+            let default_skills = discover_skill_descriptors(repo_dir, default_skill_root)?;
+            manifest.skills = manifest_skill_defs(repo_dir, &default_skills)?;
+            let manifest_text = toml::to_string_pretty(&manifest)?;
             return Ok(PackDescriptor {
                 plugin_id: manifest.id.clone(),
                 repo_dir: repo_dir.to_path_buf(),
                 manifest,
-                manifest_to_write: None,
+                manifest_to_write: Some(manifest_text),
             });
         }
+        let materialized = materialized_skills_from_manifest(manifest_dir, &manifest)?;
+        if materialized.is_empty() {
+            bail!(
+                "plugin manifest at {} does not resolve any installable skills",
+                existing_manifest_path.display()
+            );
+        }
+        return Ok(PackDescriptor {
+            plugin_id: manifest.id.clone(),
+            repo_dir: repo_dir.to_path_buf(),
+            manifest,
+            manifest_to_write: None,
+        });
     }
 
     let default_skill_root = plugin_json.skills.as_deref().unwrap_or("./skills/");
@@ -1089,6 +1098,79 @@ path = "bundled/brainstorming"
     }
 
     #[tokio::test]
+    async fn invalid_preserved_manifest_blocks_plugin_json_fallback_install() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".codex-plugin")).unwrap();
+        std::fs::write(
+            repo.path().join(".codex-plugin/plugin.json"),
+            serde_json::json!({
+                "name": "superpowers",
+                "skills": "./skills/",
+                "interface": { "displayName": "Superpowers" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_skill(
+            &repo.path().join("skills/brainstorming"),
+            "brainstorming",
+            "Explore ideas",
+            "Default layout.",
+        );
+        write_skill(
+            &repo.path().join("bundled/test-driven-development"),
+            "test-driven-development",
+            "Write tests first",
+            "Custom layout.",
+        );
+        std::fs::write(
+            repo.path().join("ryuzi-plugin.toml"),
+            r#"
+contract = 1
+id = "superpowers"
+name = "Superpowers"
+
+[[skills]]
+name = "test-driven-development"
+description = "Write tests first"
+path = 123
+"#
+            .trim_start(),
+        )
+        .unwrap();
+
+        let source = parse_skill_source("superpowers").unwrap();
+        let discovery_err = discover_plugin_pack_from_plugin_json(
+            repo.path(),
+            &source,
+            &repo.path().join(".codex-plugin/plugin.json"),
+        )
+        .expect_err("invalid preserved manifest should be authoritative");
+        assert!(discovery_err.to_string().contains("ryuzi-plugin.toml"));
+
+        let mut repos = BTreeMap::new();
+        repos.insert(source.repo.clone(), repo.path().to_path_buf());
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner { repos };
+
+        let install_err = install_skill_source_with("superpowers", &roots, &cloner)
+            .await
+            .expect_err("install should fail when preserved manifest is invalid");
+        assert!(install_err.to_string().contains("ryuzi-plugin.toml"));
+        assert!(list_installed_skills_in(&roots).unwrap().is_empty());
+        assert!(!roots.plugins_root.join("superpowers").exists());
+        assert!(!roots
+            .skills_root
+            .join("superpowers--brainstorming")
+            .exists());
+        assert!(!roots
+            .skills_root
+            .join("superpowers--test-driven-development")
+            .exists());
+    }
+
+    #[tokio::test]
     async fn install_bare_plugin_pack_discovers_skills_root_entries() {
         let config = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -1192,6 +1274,40 @@ path = "bundled/brainstorming"
             .join("superpowers--test-driven-development")
             .join("SKILL.md")
             .is_file());
+    }
+
+    #[tokio::test]
+    async fn refresh_single_skill_removes_old_id_when_skill_name_changes() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "Brainstorming", "Explore ideas", "v1");
+
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/acme/skill-pack".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner { repos };
+
+        let installed = install_skill_source_with("acme/skill-pack", &roots, &cloner)
+            .await
+            .unwrap();
+        assert_eq!(installed.id, "brainstorming");
+        assert!(roots.skills_root.join("brainstorming").exists());
+
+        write_skill(repo.path(), "Fresh Ideas", "Explore ideas", "v2");
+
+        let refreshed = refresh_installed_skill_with("brainstorming", &roots, &cloner)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.id, "fresh-ideas");
+        assert!(roots.skills_root.join("fresh-ideas").exists());
+        assert!(!roots.skills_root.join("brainstorming").exists());
+
+        let listed = list_installed_skills_in(&roots).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "fresh-ideas");
     }
 
     #[tokio::test]
