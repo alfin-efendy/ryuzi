@@ -17,12 +17,14 @@ import { StatusDot } from "@/components/common/bits";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
+import { AddProjectModal } from "@/components/modals/AddProjectModal";
 import { BranchNameModal } from "@/components/modals/BranchNameModal";
 
 export function HomeView() {
-  const { projects, selectedProjectId, selectProject, start, addProject, setProjectModel } = useStore();
+  const { projects, selectedProjectId, selectProject, start, setProjectModel } = useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
+  const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
@@ -299,11 +301,11 @@ export function HomeView() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => void addProject()}
+                  onClick={() => setAddProjectOpen(true)}
                   className="w-full justify-start gap-2 font-medium text-muted-foreground hover:text-accent-foreground"
                 >
                   <Plus aria-hidden size={13} strokeWidth={2} />
-                  Open folder
+                  New project
                 </Button>
               }
             />
@@ -354,6 +356,7 @@ export function HomeView() {
           onCreate={(name) => nav.setComposerBranch(name)}
         />
       </div>
+      <AddProjectModal open={addProjectOpen} onClose={() => setAddProjectOpen(false)} />
     </div>
   );
 }

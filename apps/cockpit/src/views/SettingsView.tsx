@@ -3,6 +3,8 @@ import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
+import { commands } from "@/bindings";
+import { PROJECTS_ROOT_KEY } from "@/constants";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
 // Canonical brand assets (assets/brand/README.md). Explicit light/dark variants:
 // the app theme is class-driven, so the prefers-color-scheme adaptive SVG can't follow it.
@@ -207,6 +209,21 @@ export function SettingsView() {
     });
   };
 
+  const [projectsRoot, setProjectsRoot] = useState("");
+  useEffect(() => {
+    void commands.getSetting(PROJECTS_ROOT_KEY).then((res) => {
+      if (res.status === "ok") setProjectsRoot(res.data ?? "");
+    });
+  }, []);
+
+  const pickProjectsRoot = async () => {
+    const dir = await commands.pickDirectory();
+    if (!dir) return;
+    setProjectsRoot(dir);
+    const res = await commands.setSetting(PROJECTS_ROOT_KEY, dir);
+    if (res.status === "error") toast.error("Couldn't save projects folder: " + res.error.message);
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
       <div className="mx-auto max-w-[640px]">
@@ -240,6 +257,20 @@ export function SettingsView() {
               <div className="mt-0.5 text-[12.5px] text-muted-foreground">Start Cockpit when you sign in.</div>
             </div>
             <Switch on={openAtLogin === true} onToggle={toggleOpenAtLogin} label="Open at login" />
+          </div>
+        </Card>
+
+        <Card className="mt-3">
+          <div className="flex items-center gap-3.5 px-[18px] py-4">
+            <div className="min-w-0 flex-1">
+              <div className="text-[13.5px] font-semibold">Projects folder</div>
+              <div className="mt-0.5 truncate text-[12.5px] text-muted-foreground">
+                {projectsRoot || "Default destination for projects cloned from a URL."}
+              </div>
+            </div>
+            <Button variant="outline" onClick={() => void pickProjectsRoot()}>
+              Browse
+            </Button>
           </div>
         </Card>
 
