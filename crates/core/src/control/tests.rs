@@ -1432,7 +1432,6 @@ async fn continue_during_startup_waits_and_reuses_the_startup_handle() {
         }),
     );
     let cp = ControlPlane::new(store, regs).await;
-    let store = cp.store().clone();
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
