@@ -38,14 +38,19 @@ fn lock_for(id: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// Resolve the proactive refresh lead (ms) for `provider` generically:
 /// redirect-based OAuth providers (anthropic/openai) carry it on their
 /// `OAuthConfig`; device-flow providers (kiro) carry it on their
-/// `DeviceFlowConfig` instead — kiro has no `OAuthConfig` at all. Falls back
-/// to a 5-minute buffer if neither is found.
+/// `DeviceFlowConfig` instead; device-grant providers (qwen, github-copilot)
+/// carry it on their `DeviceGrantConfig` — none of these providers have more
+/// than one of the three configs. Falls back to a 5-minute buffer if none is
+/// found.
 fn refresh_lead_ms(provider: &str) -> i64 {
     if let Some(cfg) = registry::oauth_config(provider) {
         return cfg.refresh_lead_ms;
     }
     if let Some(df) = registry::device_flow_config(provider) {
         return df.refresh_lead_ms;
+    }
+    if let Some(dg) = registry::device_grant_config(provider) {
+        return dg.refresh_lead_ms;
     }
     300_000
 }
@@ -184,6 +189,12 @@ async fn refresh_at_impl(
 
     if conn.provider == "kiro" {
         return refresh_kiro(store, http, conn, token_url).await;
+    }
+    if conn.provider == "qwen" {
+        return refresh_qwen(store, http, conn).await;
+    }
+    if conn.provider == "github-copilot" {
+        return refresh_github_copilot(store, http, conn).await;
     }
 
     let refresh_token = match conn.data.refresh_token.clone() {
@@ -380,6 +391,104 @@ async fn refresh_kiro_at(
     persist(store, conn).await
 }
 
+/// Qwen Code refresh: `grant_type=refresh_token` form POST to the device-grant
+/// token endpoint. Re-captures `resource_url` (Qwen tokens are shard-bound).
+/// Ported from 9router (MIT, (c) 2024-2026 decolua and contributors).
+async fn refresh_qwen(
+    store: &Arc<Store>,
+    http: &reqwest::Client,
+    conn: &mut ConnectionRow,
+) -> Result<()> {
+    let cfg = registry::device_grant_config("qwen")
+        .ok_or_else(|| anyhow!("qwen device grant not configured"))?;
+    let Some(refresh_token) = conn.data.refresh_token.clone() else {
+        conn.data.needs_relogin = Some(true);
+        persist(store, conn).await?;
+        return Err(anyhow!("re-login required for qwen: no refresh token"));
+    };
+    let resp = http
+        .post(cfg.token_url)
+        .header("accept", "application/json")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", cfg.client_id),
+        ])
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    let error_code = body.get("error").and_then(|v| v.as_str());
+    let is_terminal = matches!(error_code, Some(code) if TERMINAL_ERRORS.contains(&code));
+    if is_terminal || !status.is_success() {
+        conn.data.needs_relogin = Some(true);
+        persist(store, conn).await?;
+        return Err(anyhow!("qwen refresh failed: {status}"));
+    }
+    let Some(access) = body.get("access_token").and_then(|v| v.as_str()) else {
+        conn.data.needs_relogin = Some(true);
+        persist(store, conn).await?;
+        return Err(anyhow!("qwen refresh response missing access_token"));
+    };
+    let expires_in = body.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(0);
+    conn.data.access_token = Some(access.to_string());
+    if let Some(rt) = body.get("refresh_token").and_then(|v| v.as_str()) {
+        conn.data.refresh_token = Some(rt.to_string());
+    }
+    if let Some(ru) = body
+        .get("resource_url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        merge_provider_specific(&mut conn.data, "resource_url", serde_json::json!(ru));
+    }
+    conn.data.expires_at = Some(now_ms() + expires_in * 1000);
+    conn.data.last_refresh_at = Some(now_ms());
+    conn.data.needs_relogin = Some(false);
+    persist(store, conn).await
+}
+
+/// GitHub Copilot refresh: re-derive the short-lived Copilot token from the
+/// durable GitHub token (stored in the `refresh_token` slot). The classic
+/// `Iv1` GitHub token doesn't itself expire, so there is no GitHub-token
+/// refresh leg. Ported from 9router (MIT, (c) 2024-2026 decolua and
+/// contributors).
+async fn refresh_github_copilot(
+    store: &Arc<Store>,
+    http: &reqwest::Client,
+    conn: &mut ConnectionRow,
+) -> Result<()> {
+    let cfg = registry::device_grant_config("github-copilot")
+        .ok_or_else(|| anyhow!("github-copilot device grant not configured"))?;
+    let exchange = cfg
+        .token_exchange
+        .as_ref()
+        .ok_or_else(|| anyhow!("github-copilot has no token exchange"))?;
+    let Some(gh_token) = conn.data.refresh_token.clone() else {
+        conn.data.needs_relogin = Some(true);
+        persist(store, conn).await?;
+        return Err(anyhow!(
+            "re-login required for github-copilot: no github token"
+        ));
+    };
+    match crate::llm_router::oauth::github::exchange_copilot_token(http, &gh_token, exchange.url)
+        .await
+    {
+        Ok(tok) => {
+            conn.data.access_token = Some(tok.token);
+            conn.data.expires_at = Some(tok.expires_at_ms);
+            conn.data.last_refresh_at = Some(now_ms());
+            conn.data.needs_relogin = Some(false);
+            persist(store, conn).await
+        }
+        Err(e) => {
+            conn.data.needs_relogin = Some(true);
+            persist(store, conn).await?;
+            Err(anyhow!("github-copilot token exchange failed: {e}"))
+        }
+    }
+}
+
 /// Insert `val` under `key` into `data.provider_specific`, creating the JSON
 /// object if it doesn't exist yet instead of clobbering any existing keys.
 fn merge_provider_specific(data: &mut ConnectionData, key: &str, val: serde_json::Value) {
@@ -412,6 +521,14 @@ mod tests {
         d.expires_at = Some(now + 100 * 24 * 3600 * 1000);
         d.last_refresh_at = Some(now - 9 * 24 * 3600 * 1000); // 9d > 8d max
         assert!(needs_refresh("openai-oauth", &d, now));
+    }
+
+    #[test]
+    fn refresh_lead_ms_reads_device_grant_config() {
+        assert_eq!(super::refresh_lead_ms("qwen"), 1_200_000);
+        assert_eq!(super::refresh_lead_ms("github-copilot"), 300_000);
+        // Unknown provider still falls back to the 5-minute default.
+        assert_eq!(super::refresh_lead_ms("nope"), 300_000);
     }
 
     #[test]
