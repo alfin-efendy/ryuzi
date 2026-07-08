@@ -169,3 +169,10 @@ test("shows a not-found placeholder for an unknown job id", () => {
 
   expect(screen.getByText("Job not found.")).toBeTruthy();
 });
+
+test("a branchless (non-git) job hides the branch chip", () => {
+  seed([makeJob({ branch: "" })]);
+  render(<JobDetailView id="job-1" />);
+  expect(screen.getByText("ryuzi")).toBeTruthy();
+  expect(screen.queryByText("main")).toBeNull();
+});

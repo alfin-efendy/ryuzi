@@ -13,7 +13,17 @@ import { FileTreePane } from "@/components/FileTreePane";
 import { DiffStat } from "@/components/common/bits";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
 
-export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; branch: string | null; running: boolean }) {
+export function RightPanel({
+  sessionPk,
+  branch,
+  running,
+  isGit,
+}: {
+  sessionPk: string;
+  branch: string | null;
+  running: boolean;
+  isGit: boolean;
+}) {
   const nav = useNav();
   const ui = useUi();
   const [reviewFile, setReviewFile] = useState(0);
@@ -38,10 +48,11 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
   }, [running]);
 
   // Auto-fetch when the tab opens and when a running turn finishes.
+  // Non-git projects have no diff to fetch (git_diff would just error).
   useEffect(() => {
-    if (!nav.rightOpen || nav.rightTab !== "review" || running) return;
+    if (!nav.rightOpen || nav.rightTab !== "review" || running || !isGit) return;
     void fetchDiff(sessionPk);
-  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk]);
+  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit]);
 
   // Consume a pending jump from a transcript edit card: select the file once
   // it appears in this session's diff, then clear the intent. A pending jump
@@ -125,8 +136,15 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
         </Button>
       </div>
 
+      {/* Review tab — non-git projects get an explicit empty state */}
+      {nav.rightTab === "review" && !isGit && (
+        <div className="flex flex-1 items-center justify-center px-6 text-center font-sans text-[12.5px] text-muted-foreground">
+          Not a git repository — the Review tab shows diffs for projects under version control.
+        </div>
+      )}
+
       {/* Review tab — the worktree's real git diff */}
-      {nav.rightTab === "review" && (
+      {nav.rightTab === "review" && isGit && (
         <>
           <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-4 py-2.5">
             <span className="font-mono text-xs text-muted-foreground">main → {branch ?? "worktree"}</span>

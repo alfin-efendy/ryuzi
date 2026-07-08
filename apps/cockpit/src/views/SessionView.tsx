@@ -356,7 +356,13 @@ export function SessionView() {
           review/file state resets, while diff data lives in the useDiff store keyed
           by sessionPk so sessions never see each other's results. */}
       {nav.rightOpen && (
-        <RightPanel key={session.sessionPk} sessionPk={session.sessionPk} branch={session.branch ?? null} running={running} />
+        <RightPanel
+          key={session.sessionPk}
+          sessionPk={session.sessionPk}
+          branch={session.branch ?? null}
+          running={running}
+          isGit={project?.isGit ?? true}
+        />
       )}
     </div>
   );

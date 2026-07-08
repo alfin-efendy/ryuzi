@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { composerGitOptions, newBranchNameError } from "./composer-git";
+import { composerGitOptions, composerGitOptionsForProject, newBranchNameError } from "./composer-git";
 import type { BranchList } from "../bindings";
 
 const list: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
@@ -64,4 +64,18 @@ test("newBranchNameError: empty, whitespace, existing, valid", () => {
   expect(newBranchNameError("has\ttab", ["main"])).toBe("Branch names can't contain spaces");
   expect(newBranchNameError("main", ["main", "develop"])).toBe('Branch "main" already exists');
   expect(newBranchNameError("feat/x", ["main", "develop"])).toBeNull();
+});
+
+test("non-git project → null (GitOptions are never sent)", () => {
+  expect(composerGitOptionsForProject(false, list, "develop", true)).toBeNull();
+  expect(composerGitOptionsForProject(false, null, null, true)).toBeNull();
+});
+
+test("git project → delegates to composerGitOptions", () => {
+  expect(composerGitOptionsForProject(true, list, "develop", false)).toEqual({
+    useWorktree: false,
+    createBranch: false,
+    branchName: null,
+    baseBranch: "develop",
+  });
 });

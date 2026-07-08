@@ -274,10 +274,12 @@ export function JobDetailView({ id }: { id: string }) {
               <Folder aria-hidden size={12} strokeWidth={2} className="shrink-0" />
               {j.projectName}
             </span>
-            <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 font-mono text-[11.5px] text-muted-foreground">
-              <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
-              {j.branch}
-            </span>
+            {j.branch !== "" && (
+              <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 font-mono text-[11.5px] text-muted-foreground">
+                <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
+                {j.branch}
+              </span>
+            )}
             <span className="flex h-7 items-center gap-[7px] rounded-md border border-border px-2.5 text-xs font-medium text-muted-foreground">
               <Server aria-hidden size={12} strokeWidth={2} className="shrink-0" />
               {wsName}

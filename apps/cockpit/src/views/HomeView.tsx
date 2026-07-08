@@ -10,7 +10,7 @@ import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
-import { composerGitOptions } from "@/lib/composer-git";
+import { composerGitOptionsForProject } from "@/lib/composer-git";
 import { groupModelOptions } from "@/lib/model-groups";
 import { projectLabel } from "@/lib/sidebar";
 import { StatusDot } from "@/components/common/bits";
@@ -33,6 +33,7 @@ export function HomeView() {
 
   const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
   const projectId = project?.projectId;
+  const isGit = project?.isGit ?? false;
   const runtimes = useRuntimes((s) => s.runtimes);
   // Ryuzi-only: every session runs the native runtime; the user picks a model.
   const native = runtimeById(runtimes, "native");
@@ -67,7 +68,9 @@ export function HomeView() {
   useEffect(() => {
     setBranchList(null);
     setComposerBranch(null);
-    if (!projectId) return;
+    // Non-git projects have no branches — never call list_branches for them
+    // (it errors "not a git repository").
+    if (!projectId || !isGit) return;
     let cancelled = false;
     void commands.listBranches(projectId).then((res) => {
       if (cancelled) return;
@@ -84,7 +87,7 @@ export function HomeView() {
     return () => {
       cancelled = true;
     };
-  }, [projectId, setComposerBranch]);
+  }, [projectId, isGit, setComposerBranch]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
@@ -150,9 +153,9 @@ export function HomeView() {
     const opts = {
       runtimeId: "native",
       model: nav.composerModel ?? null,
-      context: { branch: nav.composerBranch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
+      context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
-      git: composerGitOptions(branchList, nav.composerBranch, nav.composerUseWorktree),
+      git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
     };
     setDraft("");
     composerFiles.clear();
@@ -309,36 +312,38 @@ export function HomeView() {
                 </Button>
               }
             />
-            <Combobox
-              aria-label="Branch"
-              options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
-              value={nav.composerBranch}
-              onValueChange={(v) => nav.setComposerBranch(v)}
-              allowCreate
-              onCreate={(input) => nav.setComposerBranch(input)}
-              createHintLabel="New Branch"
-              onCreateHint={() => setBranchModalOpen(true)}
-              placeholder="Branch"
-              trigger={
-                <Button variant="ghost" size="sm" className="gap-[7px] font-medium text-muted-foreground">
-                  <GitBranch aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-                  {nav.composerBranch ?? "branch"}
-                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                </Button>
-              }
-              footer={
-                <div className="flex items-center justify-between gap-3 px-2.5 py-1.5">
-                  <span className="text-sm text-muted-foreground" title="Run the session in an isolated git worktree">
-                    Worktree
-                  </span>
-                  <Switch
-                    on={nav.composerUseWorktree}
-                    onToggle={() => nav.setComposerUseWorktree(!nav.composerUseWorktree)}
-                    label="Worktree"
-                  />
-                </div>
-              }
-            />
+            {isGit && (
+              <Combobox
+                aria-label="Branch"
+                options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
+                value={nav.composerBranch}
+                onValueChange={(v) => nav.setComposerBranch(v)}
+                allowCreate
+                onCreate={(input) => nav.setComposerBranch(input)}
+                createHintLabel="New Branch"
+                onCreateHint={() => setBranchModalOpen(true)}
+                placeholder="Branch"
+                trigger={
+                  <Button variant="ghost" size="sm" className="gap-[7px] font-medium text-muted-foreground">
+                    <GitBranch aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                    {nav.composerBranch ?? "branch"}
+                    <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                  </Button>
+                }
+                footer={
+                  <div className="flex items-center justify-between gap-3 px-2.5 py-1.5">
+                    <span className="text-sm text-muted-foreground" title="Run the session in an isolated git worktree">
+                      Worktree
+                    </span>
+                    <Switch
+                      on={nav.composerUseWorktree}
+                      onToggle={() => nav.setComposerUseWorktree(!nav.composerUseWorktree)}
+                      label="Worktree"
+                    />
+                  </div>
+                }
+              />
+            )}
           </div>
         </div>
 

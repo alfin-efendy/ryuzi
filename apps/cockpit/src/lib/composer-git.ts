@@ -18,6 +18,18 @@ export function composerGitOptions(list: BranchList | null, selected: string | n
   return { useWorktree, createBranch: true, branchName: null, baseBranch: null };
 }
 
+/** Project-aware wrapper: non-git projects must never send GitOptions —
+ *  the backend then skips workspace prep and runs in the project workdir. */
+export function composerGitOptionsForProject(
+  isGit: boolean,
+  list: BranchList | null,
+  selected: string | null,
+  useWorktree: boolean,
+): GitOptions | null {
+  if (!isGit) return null;
+  return composerGitOptions(list, selected, useWorktree);
+}
+
 /** Client-side validation for the New Branch modal: non-empty, no
  *  whitespace, not an existing branch. Returns a user-facing error, or null
  *  when the name is acceptable. (Full git ref-name rules are enforced by the
