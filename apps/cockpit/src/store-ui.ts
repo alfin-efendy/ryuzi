@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { basename } from "./lib/paths";
+import type { ViewMode } from "./lib/preview";
 
-export type DockTab = { id: string; kind: "file"; path: string; title: string };
+export type DockTab = { id: string; kind: "file"; path: string; title: string; mode?: ViewMode };
 
 function titleOf(path: string): string {
   return basename(path) || path;
@@ -21,6 +22,10 @@ export function closeTab(tabs: DockTab[], activeTabId: string | null, id: string
   if (next.length === 0) return { tabs: next, activeTabId: null };
   const neighbor = next[Math.min(idx, next.length - 1)];
   return { tabs: next, activeTabId: neighbor.id };
+}
+
+export function setTabMode(tabs: DockTab[], id: string, mode: ViewMode): DockTab[] {
+  return tabs.map((t) => (t.id === id ? { ...t, mode } : t));
 }
 
 const KEY = {
@@ -82,6 +87,7 @@ type UiState = {
   openFile: (path: string) => void;
   closeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
+  setTabMode: (id: string, mode: ViewMode) => void;
   togglePin: (sessionPk: string) => void;
   toggleArchive: (sessionPk: string) => void;
   /** Idempotent write — archive flows must not race a pure toggle. */
@@ -138,6 +144,11 @@ export const useUi = create<UiState>((set, get) => ({
   setActiveTab: (id) => {
     persist(KEY.active, id);
     set({ activeTabId: id });
+  },
+  setTabMode: (id, mode) => {
+    const tabs = setTabMode(get().tabs, id, mode);
+    persist(KEY.tabs, JSON.stringify(tabs));
+    set({ tabs });
   },
   togglePin: (sessionPk) => {
     const pinned = toggleKey(get().pinned, sessionPk);
