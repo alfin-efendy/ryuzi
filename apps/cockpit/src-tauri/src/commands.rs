@@ -526,6 +526,7 @@ mod tests {
                 effort: None,
                 perm_mode: PermMode::Default,
                 created_at: None,
+                is_git: false,
             })
             .await
             .unwrap();

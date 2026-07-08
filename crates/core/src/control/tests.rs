@@ -571,6 +571,7 @@ async fn seed_project(store: &Store, project_id: &str) {
             effort: None,
             perm_mode: PermMode::Default,
             created_at: Some(now_ms()),
+            is_git: false,
         })
         .await
         .unwrap();

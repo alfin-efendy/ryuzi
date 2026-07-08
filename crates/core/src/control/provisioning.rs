@@ -102,6 +102,7 @@ impl ControlPlane {
             effort: None,
             perm_mode: PermMode::Default,
             created_at: Some(now_ms()),
+            is_git: true,
         };
         self.store.insert_project(project.clone()).await?;
         Ok(project)
@@ -205,6 +206,7 @@ impl ControlPlane {
             effort: s.effort.clone().or(default_effort),
             perm_mode,
             created_at: Some(now_ms()),
+            is_git: true,
         };
         self.store.insert_project(project.clone()).await?;
         self.store

@@ -441,10 +441,14 @@ pub struct Store {
 
 fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
     let perm: String = r.get(7)?;
+    let workdir: String = r.get(2)?;
     Ok(Project {
         project_id: r.get(0)?,
         name: r.get(1)?,
-        workdir: r.get(2)?,
+        // Read-time git-ness: cheap repo-open probe. Runs on the store's
+        // blocking connection thread, so sync git2 is fine here.
+        is_git: git2::Repository::open(&workdir).is_ok(),
+        workdir,
         source: r.get(3)?,
         harness: r.get(4)?,
         model: r.get(5)?,
@@ -1447,6 +1451,7 @@ mod tests {
             effort: None,
             perm_mode: PermMode::Default,
             created_at: Some(123),
+            is_git: false,
         }
     }
 
@@ -1463,6 +1468,36 @@ mod tests {
 
         assert!(store.get_project("missing").await.unwrap().is_none());
         assert_eq!(store.list_projects().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_is_git_is_computed_at_read_time() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        // sample_project points at /tmp/demo — not a git repo on this machine.
+        store.insert_project(sample_project()).await.unwrap();
+        assert!(!store.get_project("p1").await.unwrap().unwrap().is_git);
+
+        // A workdir that IS a repo reports is_git=true on read — even though
+        // the flag is never persisted (it self-corrects after `git init`).
+        let repo_dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo_dir.path()).unwrap();
+        let mut p = sample_project();
+        p.project_id = "p2".into();
+        p.workdir = repo_dir.path().to_string_lossy().into_owned();
+        // Later created_at than sample_project's Some(123): list_projects
+        // sorts by `ORDER BY created_at` alone (store.rs:627), so a tie would
+        // leave the [false, true] assertion below to unspecified SQL ordering.
+        p.created_at = Some(456);
+        store.insert_project(p).await.unwrap();
+        assert!(store.get_project("p2").await.unwrap().unwrap().is_git);
+        let listed = store.list_projects().await.unwrap();
+        assert_eq!(
+            listed.iter().map(|p| p.is_git).collect::<Vec<_>>(),
+            vec![false, true],
+            "list_projects must compute the flag per row"
+        );
     }
 
     fn sample_session() -> Session {
