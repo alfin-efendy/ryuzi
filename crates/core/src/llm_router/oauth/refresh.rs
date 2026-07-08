@@ -1295,6 +1295,7 @@ mod tests {
             .await
             .unwrap();
 
+        let before = crate::paths::now_ms();
         refresh_qwen_at(
             &store,
             &http,
@@ -1315,6 +1316,9 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("https://shard.example.com")
         );
+        let expires_at = conn.data.expires_at.expect("expires_at set");
+        assert!(expires_at >= before + 3600 * 1000);
+        assert!(expires_at <= before + 3600 * 1000 + 5000);
         let stored = crate::llm_router::connections::get_connection(&store, "qwen-1")
             .await
             .unwrap()
