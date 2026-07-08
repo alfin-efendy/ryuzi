@@ -13,6 +13,38 @@ pub struct CopilotToken {
     pub expires_at_ms: i64,
 }
 
+/// Why [`exchange_copilot_token`] failed. Callers that refresh an existing
+/// connection (`refresh_github_copilot_at`) need to tell these apart: only
+/// `Unauthorized` means the durable GitHub token is actually dead and the
+/// connection should be marked `needs_relogin`; a `Transient` failure (a
+/// network hiccup, a non-2xx that isn't 401/403, or a body that didn't
+/// parse) is worth retrying later and must not force a re-login.
+#[derive(Debug)]
+pub enum CopilotExchangeError {
+    /// GitHub rejected the durable token outright (HTTP 401/403) — it's
+    /// revoked or invalid, no retry will help.
+    Unauthorized,
+    /// Anything else: network error, a non-2xx status other than 401/403,
+    /// or a response body that failed to parse.
+    Transient(anyhow::Error),
+}
+
+impl std::fmt::Display for CopilotExchangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CopilotExchangeError::Unauthorized => {
+                write!(
+                    f,
+                    "copilot token exchange unauthorized: github token rejected"
+                )
+            }
+            CopilotExchangeError::Transient(e) => write!(f, "copilot token exchange failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CopilotExchangeError {}
+
 fn parse_copilot_token(json: &Value) -> Result<CopilotToken> {
     let token = json
         .get("token")
@@ -31,12 +63,16 @@ fn parse_copilot_token(json: &Value) -> Result<CopilotToken> {
 }
 
 /// Exchange a GitHub token for a Copilot token. `url` is
-/// `copilot_internal/v2/token`.
+/// `copilot_internal/v2/token`. Returns [`CopilotExchangeError::Unauthorized`]
+/// on a 401/403 (the GitHub token is dead — genuine re-login needed) and
+/// [`CopilotExchangeError::Transient`] for everything else (network error,
+/// other non-2xx status, or an unparseable body) so callers can retry later
+/// instead of forcing a re-login.
 pub async fn exchange_copilot_token(
     http: &reqwest::Client,
     gh_token: &str,
     url: &str,
-) -> Result<CopilotToken> {
+) -> Result<CopilotToken, CopilotExchangeError> {
     let resp = http
         .get(url)
         .header("authorization", format!("token {gh_token}"))
@@ -46,14 +82,23 @@ pub async fn exchange_copilot_token(
         .header("x-github-api-version", "2025-04-01")
         .header("accept", "application/json")
         .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("copilot token exchange failed ({status}): {text}"));
+        .await
+        .map_err(|e| CopilotExchangeError::Transient(e.into()))?;
+    let status = resp.status();
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(CopilotExchangeError::Unauthorized);
     }
-    let json: Value = resp.json().await?;
-    parse_copilot_token(&json)
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(CopilotExchangeError::Transient(anyhow!(
+            "copilot token exchange failed ({status}): {text}"
+        )));
+    }
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| CopilotExchangeError::Transient(e.into()))?;
+    parse_copilot_token(&json).map_err(CopilotExchangeError::Transient)
 }
 
 #[cfg(test)]

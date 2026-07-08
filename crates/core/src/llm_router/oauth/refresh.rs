@@ -435,14 +435,15 @@ async fn refresh_qwen_at(
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     let error_code = body.get("error").and_then(|v| v.as_str());
     let is_terminal = matches!(error_code, Some(code) if TERMINAL_ERRORS.contains(&code));
-    if is_terminal || !status.is_success() {
+    if is_terminal {
         conn.data.needs_relogin = Some(true);
         persist(store, conn).await?;
+        return Err(anyhow!("re-login required for qwen"));
+    }
+    if !status.is_success() {
         return Err(anyhow!("qwen refresh failed: {status}"));
     }
     let Some(access) = body.get("access_token").and_then(|v| v.as_str()) else {
-        conn.data.needs_relogin = Some(true);
-        persist(store, conn).await?;
         return Err(anyhow!("qwen refresh response missing access_token"));
     };
     let expires_in = body.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -510,9 +511,17 @@ async fn refresh_github_copilot_at(
             conn.data.needs_relogin = Some(false);
             persist(store, conn).await
         }
-        Err(e) => {
+        // The GitHub token itself was rejected (revoked/invalid) — no retry
+        // will help, this is a genuine re-login.
+        Err(crate::llm_router::oauth::github::CopilotExchangeError::Unauthorized) => {
             conn.data.needs_relogin = Some(true);
             persist(store, conn).await?;
+            Err(anyhow!("re-login required for github-copilot"))
+        }
+        // Network hiccup, non-401/403 non-2xx, or a malformed body — worth
+        // retrying later, so `needs_relogin` must NOT be touched (matches
+        // the generic and qwen refresh paths' transient-failure handling).
+        Err(e @ crate::llm_router::oauth::github::CopilotExchangeError::Transient(_)) => {
             Err(anyhow!("github-copilot token exchange failed: {e}"))
         }
     }
@@ -1326,10 +1335,10 @@ mod tests {
         assert_eq!(stored.data.access_token.as_deref(), Some("at-new"));
     }
 
-    /// Qwen refresh failure: a non-2xx response from the token endpoint must
+    /// Qwen refresh failure on a TERMINAL error code (`invalid_grant`): must
     /// set `needs_relogin`, persist it, and return `Err`.
     #[tokio::test]
-    async fn refresh_qwen_at_sets_needs_relogin_on_non_2xx() {
+    async fn refresh_qwen_at_sets_needs_relogin_on_terminal_error() {
         use axum::{
             extract::Form, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
         };
@@ -1375,13 +1384,76 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("qwen refresh failed"));
+        assert!(err.to_string().contains("re-login required"));
         assert_eq!(conn.data.needs_relogin, Some(true));
         let stored = crate::llm_router::connections::get_connection(&store, "qwen-2")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored.data.needs_relogin, Some(true));
+    }
+
+    /// Qwen refresh failure on a TRANSIENT (non-terminal) error — a 5xx with
+    /// no allowlisted `error` code — must return `Err` WITHOUT setting
+    /// `needs_relogin` or persisting, mirroring the generic OAuth refresh
+    /// path: a transient hiccup must not permanently drop the connection
+    /// from routing (`connection_has_required_credentials` excludes any
+    /// connection with `needs_relogin == Some(true)`). The reactive 401 path
+    /// gets a second chance at it instead.
+    #[tokio::test]
+    async fn refresh_qwen_at_does_not_set_needs_relogin_on_transient_5xx() {
+        use axum::{
+            extract::Form, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
+        };
+        use std::collections::HashMap;
+        let app = Router::new().route(
+            "/token",
+            post(|Form(_b): Form<HashMap<String, String>>| async move {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "temporarily_unavailable"})),
+                )
+                    .into_response()
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let http = reqwest::Client::new();
+        let now = crate::paths::now_ms();
+        let mut conn = qwen_conn(
+            "qwen-3",
+            ConnectionData {
+                access_token: Some("at-old".into()),
+                refresh_token: Some("rt-old".into()),
+                expires_at: Some(now - 1),
+                ..Default::default()
+            },
+        );
+        crate::llm_router::connections::add_connection(&store, conn.clone())
+            .await
+            .unwrap();
+
+        let err = refresh_qwen_at(
+            &store,
+            &http,
+            &mut conn,
+            &format!("http://127.0.0.1:{port}/token"),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.to_string().contains("re-login required"));
+        assert_ne!(conn.data.needs_relogin, Some(true));
+        let stored = crate::llm_router::connections::get_connection(&store, "qwen-3")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored.data.needs_relogin, Some(true));
     }
 
     fn github_copilot_conn(id: &str, data: ConnectionData) -> ConnectionRow {
@@ -1462,10 +1534,11 @@ mod tests {
         assert_eq!(stored.data.access_token.as_deref(), Some("cop-tok-new"));
     }
 
-    /// GitHub Copilot refresh failure: a non-2xx response from the exchange
-    /// endpoint must set `needs_relogin`, persist it, and return `Err`.
+    /// GitHub Copilot refresh failure on a TERMINAL auth rejection (401):
+    /// the durable GitHub token is dead, so this must set `needs_relogin`,
+    /// persist it, and return `Err`.
     #[tokio::test]
-    async fn refresh_github_copilot_at_sets_needs_relogin_on_non_2xx() {
+    async fn refresh_github_copilot_at_sets_needs_relogin_on_401() {
         use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
         let app = Router::new().route(
             "/copilot_internal/v2/token",
@@ -1502,12 +1575,68 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("token exchange failed"));
+        assert!(err.to_string().contains("re-login required"));
         assert_eq!(conn.data.needs_relogin, Some(true));
         let stored = crate::llm_router::connections::get_connection(&store, "ghc-2")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored.data.needs_relogin, Some(true));
+    }
+
+    /// GitHub Copilot refresh failure on a TRANSIENT error (a 500 from the
+    /// exchange endpoint, not a 401/403) must return `Err` WITHOUT setting
+    /// `needs_relogin` or persisting — the durable GitHub token might still
+    /// be perfectly valid, this could just be an upstream hiccup, and
+    /// forcing re-login here would permanently drop the connection from
+    /// routing (`connection_has_required_credentials` excludes any
+    /// connection with `needs_relogin == Some(true)`).
+    #[tokio::test]
+    async fn refresh_github_copilot_at_does_not_set_needs_relogin_on_transient_5xx() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
+        let app = Router::new().route(
+            "/copilot_internal/v2/token",
+            get(|| async move {
+                (StatusCode::INTERNAL_SERVER_ERROR, "upstream hiccup").into_response()
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let http = reqwest::Client::new();
+        let now = crate::paths::now_ms();
+        let mut conn = github_copilot_conn(
+            "ghc-3",
+            ConnectionData {
+                access_token: Some("cop-tok-old".into()),
+                refresh_token: Some("gh-durable-token".into()),
+                expires_at: Some(now - 1),
+                ..Default::default()
+            },
+        );
+        crate::llm_router::connections::add_connection(&store, conn.clone())
+            .await
+            .unwrap();
+
+        let err = refresh_github_copilot_at(
+            &store,
+            &http,
+            &mut conn,
+            &format!("http://127.0.0.1:{port}/copilot_internal/v2/token"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("token exchange failed"));
+        assert_ne!(conn.data.needs_relogin, Some(true));
+        let stored = crate::llm_router::connections::get_connection(&store, "ghc-3")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored.data.needs_relogin, Some(true));
     }
 }
