@@ -62,6 +62,7 @@ fn parse_www_authenticate_params(header: &str) -> Vec<(String, String)> {
     let bytes = header.as_bytes();
     let mut pairs = Vec::new();
     let mut i = 0usize;
+    let mut skip_scheme = true;
 
     while i < bytes.len() {
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
@@ -84,11 +85,25 @@ fn parse_www_authenticate_params(header: &str) -> Vec<(String, String)> {
             continue;
         }
         let key = header[key_start..i].trim().to_ascii_lowercase();
+        let is_likely_scheme = skip_scheme
+            && pairs.is_empty()
+            && !key.is_empty()
+            && key.as_bytes().iter().all(|byte| byte.is_ascii_alphabetic());
 
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
         if i >= bytes.len() || bytes[i] != b'=' {
+            if is_likely_scheme {
+                if i < bytes.len() && bytes[i] == b',' {
+                    i += 1;
+                }
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                skip_scheme = false;
+                continue;
+            }
             while i < bytes.len() && bytes[i] != b',' {
                 i += 1;
             }
@@ -131,6 +146,7 @@ fn parse_www_authenticate_params(header: &str) -> Vec<(String, String)> {
             header[value_start..i].trim().to_string()
         };
         pairs.push((key, value));
+        skip_scheme = false;
     }
 
     pairs
@@ -177,6 +193,24 @@ mod tests {
         assert_eq!(
             parse_www_authenticate_resource(header).as_deref(),
             Some("https://api.example.test/.well-known/oauth-protected-resource")
+        );
+    }
+
+    #[test]
+    fn parse_www_authenticate_prefers_resource_metadata_when_prefixed_by_bearer() {
+        let header = r#"Bearer resource_metadata="https://api.example.test/.well-known/oauth-protected-resource""#;
+        assert_eq!(
+            parse_www_authenticate_resource(header).as_deref(),
+            Some("https://api.example.test/.well-known/oauth-protected-resource")
+        );
+    }
+
+    #[test]
+    fn parse_www_authenticate_reads_unprefixed_resource() {
+        let header = r#"Bearer resource="https://api.example.test""#;
+        assert_eq!(
+            parse_www_authenticate_resource(header).as_deref(),
+            Some("https://api.example.test")
         );
     }
 
