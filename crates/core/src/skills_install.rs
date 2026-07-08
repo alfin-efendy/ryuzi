@@ -229,16 +229,17 @@ fn remove_stale_refresh_artifacts(
     ) {
         (Some(previous_plugin_id), Some(refreshed_plugin_id)) => {
             if previous_plugin_id != refreshed_plugin_id {
-                remove_checked_dir(&roots.plugins_root, previous_plugin_id)?;
-                for skill in &installed.skills {
-                    remove_checked_dir(&roots.skills_root, &skill.id)?;
-                }
+                remove_all_artifacts_for_identity(roots, previous_plugin_id)?;
             }
         }
         (Some(previous_plugin_id), None) => {
-            remove_checked_dir(&roots.plugins_root, previous_plugin_id)?;
-            for skill in &installed.skills {
-                remove_checked_dir(&roots.skills_root, &skill.id)?;
+            if previous_plugin_id == refreshed.id {
+                remove_checked_dir(&roots.plugins_root, previous_plugin_id)?;
+                for skill_id in materialized_skill_ids_for_plugin(roots, previous_plugin_id)? {
+                    remove_checked_dir(&roots.skills_root, &skill_id)?;
+                }
+            } else {
+                remove_all_artifacts_for_identity(roots, previous_plugin_id)?;
             }
         }
         (None, Some(_)) => {
@@ -246,7 +247,7 @@ fn remove_stale_refresh_artifacts(
         }
         (None, None) => {
             if refreshed.id != installed.id {
-                remove_checked_dir(&roots.skills_root, &installed.id)?;
+                remove_all_artifacts_for_identity(roots, &installed.id)?;
             }
         }
     }
@@ -271,15 +272,8 @@ fn list_installed_skills_in(roots: &InstallRoots) -> Result<Vec<InstalledSkillIn
 }
 
 fn remove_installed_skill_in(roots: &InstallRoots, id: &str) -> Result<()> {
-    let installed = read_installed_pack(roots, id)?;
-    if let Some(plugin_id) = &installed.plugin_id {
-        remove_checked_dir(&roots.plugins_root, plugin_id)?;
-        for skill in &installed.skills {
-            remove_checked_dir(&roots.skills_root, &skill.id)?;
-        }
-        return Ok(());
-    }
-    remove_checked_dir(&roots.skills_root, &installed.id)
+    read_installed_pack(roots, id)?;
+    remove_all_artifacts_for_identity(roots, id)
 }
 
 fn install_single_skill(
@@ -853,6 +847,15 @@ fn materialized_skill_ids_for_plugin(roots: &InstallRoots, plugin_id: &str) -> R
     Ok(ids)
 }
 
+fn remove_all_artifacts_for_identity(roots: &InstallRoots, id: &str) -> Result<()> {
+    remove_checked_dir(&roots.plugins_root, id)?;
+    remove_checked_dir(&roots.skills_root, id)?;
+    for materialized_skill_id in materialized_skill_ids_for_plugin(roots, id)? {
+        remove_checked_dir(&roots.skills_root, &materialized_skill_id)?;
+    }
+    Ok(())
+}
+
 fn plugin_display_name(roots: &InstallRoots, plugin_id: &str) -> Option<String> {
     let manifest_path = roots.plugins_root.join(plugin_id).join("ryuzi-plugin.toml");
     let text = std::fs::read_to_string(manifest_path).ok()?;
@@ -1012,6 +1015,18 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
         )
         .unwrap();
+    }
+
+    fn write_installed_skill(
+        roots: &InstallRoots,
+        id: &str,
+        name: &str,
+        body: &str,
+        provenance: SkillInstallProvenance,
+    ) {
+        let dir = roots.skills_root.join(id);
+        write_skill(&dir, name, "Installed skill", body);
+        write_provenance(&dir.join(PROVENANCE_FILE), &provenance).unwrap();
     }
 
     #[test]
@@ -1896,5 +1911,156 @@ path = 123
             .join("superpowers--brainstorming")
             .exists());
         assert!(list_installed_skills_in(&roots).unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_installed_skill_deletes_hidden_mixed_generation_artifacts() {
+        let config = tempfile::tempdir().unwrap();
+        let roots = InstallRoots::new(config.path().to_path_buf());
+
+        std::fs::create_dir_all(roots.plugins_root.join("superpowers")).unwrap();
+        std::fs::write(
+            roots
+                .plugins_root
+                .join("superpowers")
+                .join("ryuzi-plugin.toml"),
+            r#"
+contract = 1
+id = "superpowers"
+name = "Superpowers"
+
+[[skills]]
+name = "focus"
+description = "Stay on target"
+path = "skills/focus"
+"#
+            .trim_start(),
+        )
+        .unwrap();
+        write_installed_skill(
+            &roots,
+            "superpowers",
+            "superpowers",
+            "Stale single generation.",
+            SkillInstallProvenance {
+                source: "https://github.com/obra/superpowers".to_string(),
+                plugin_id: None,
+                installed_at: "2026-01-01T00:00:00.000Z".to_string(),
+            },
+        );
+        write_installed_skill(
+            &roots,
+            "superpowers--focus",
+            "focus",
+            "Current pack generation.",
+            SkillInstallProvenance {
+                source: "https://github.com/obra/superpowers".to_string(),
+                plugin_id: Some("superpowers".to_string()),
+                installed_at: "2026-02-01T00:00:00.000Z".to_string(),
+            },
+        );
+
+        let listed = list_installed_skills_in(&roots).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "superpowers");
+        assert_eq!(listed[0].plugin_id.as_deref(), Some("superpowers"));
+
+        remove_installed_skill_in(&roots, "superpowers").unwrap();
+
+        assert!(!roots.plugins_root.join("superpowers").exists());
+        assert!(!roots.skills_root.join("superpowers").exists());
+        assert!(!roots.skills_root.join("superpowers--focus").exists());
+        assert!(list_installed_skills_in(&roots).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_plugin_pack_plugin_id_change_deletes_hidden_old_identity_artifacts() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".codex-plugin")).unwrap();
+        std::fs::write(
+            repo.path().join(".codex-plugin/plugin.json"),
+            serde_json::json!({
+                "name": "superpowers",
+                "skills": "./skills/",
+                "interface": { "displayName": "Superpowers" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_skill(
+            &repo.path().join("skills/brainstorming"),
+            "brainstorming",
+            "Explore ideas",
+            "v1",
+        );
+
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/obra/superpowers".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner { repos };
+
+        install_skill_source_with("superpowers", &roots, &cloner)
+            .await
+            .unwrap();
+
+        write_installed_skill(
+            &roots,
+            "superpowers",
+            "superpowers",
+            "Hidden stale single generation.",
+            SkillInstallProvenance {
+                source: "https://github.com/obra/superpowers".to_string(),
+                plugin_id: None,
+                installed_at: "2025-12-31T23:59:59.999Z".to_string(),
+            },
+        );
+        write_installed_skill(
+            &roots,
+            "superpowers--focus",
+            "focus",
+            "Hidden stale old-id pack skill.",
+            SkillInstallProvenance {
+                source: "https://github.com/obra/superpowers".to_string(),
+                plugin_id: Some("superpowers".to_string()),
+                installed_at: "2025-12-31T23:59:59.999Z".to_string(),
+            },
+        );
+
+        std::fs::write(
+            repo.path().join(".codex-plugin/plugin.json"),
+            serde_json::json!({
+                "name": "mindpowers",
+                "skills": "./skills/",
+                "interface": { "displayName": "Mindpowers" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(repo.path().join("skills/brainstorming")).unwrap();
+        write_skill(
+            &repo.path().join("skills/focus"),
+            "focus",
+            "Stay on target",
+            "v2",
+        );
+
+        let refreshed = refresh_installed_skill_with("superpowers", &roots, &cloner)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed.id, "mindpowers");
+        assert!(!roots.plugins_root.join("superpowers").exists());
+        assert!(!roots.skills_root.join("superpowers").exists());
+        assert!(!roots
+            .skills_root
+            .join("superpowers--brainstorming")
+            .exists());
+        assert!(!roots.skills_root.join("superpowers--focus").exists());
+        assert!(roots.plugins_root.join("mindpowers").exists());
+        assert!(roots.skills_root.join("mindpowers--focus").exists());
     }
 }
