@@ -616,7 +616,13 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5) \
                  ON CONFLICT(family, model) DO UPDATE SET \
                     status=excluded.status, message=excluded.message, tested_at=excluded.tested_at",
-                params![row.family, row.model, row.status, row.message, row.tested_at],
+                params![
+                    row.family,
+                    row.model,
+                    row.status,
+                    row.message,
+                    row.tested_at
+                ],
             )
             .map(|_| ())
         })
@@ -1636,7 +1642,11 @@ mod tests {
         assert_eq!(rows[0].status, "invalid");
         assert_eq!(rows[0].tested_at, 200);
         assert_eq!(store.list_model_statuses("openai").await.unwrap().len(), 1);
-        assert!(store.list_model_statuses("mistral").await.unwrap().is_empty());
+        assert!(store
+            .list_model_statuses("mistral")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

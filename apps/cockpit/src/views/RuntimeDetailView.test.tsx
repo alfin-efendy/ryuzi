@@ -122,6 +122,7 @@ const catalogEntries: CatalogEntry[] = [
     models: ["claude-opus-4", "claude-sonnet-4"],
     freeTier: false,
     riskNotice: false,
+    usesDeviceGrant: false,
   },
 ];
 

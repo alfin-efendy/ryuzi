@@ -1094,8 +1094,14 @@ async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
         .await
         .unwrap();
     // The row is returned BEFORE git prep: workspace columns are provisional.
-    assert_eq!(session.worktree_path, None, "provisional row: no worktree yet");
-    assert_eq!(session.branch, None, "provisional row: engine name unknown yet");
+    assert_eq!(
+        session.worktree_path, None,
+        "provisional row: no worktree yet"
+    );
+    assert_eq!(
+        session.branch, None,
+        "provisional row: engine name unknown yet"
+    );
     assert_eq!(session.status, SessionStatus::Running);
 
     // Background prep backfills the workspace columns…
@@ -1153,8 +1159,7 @@ async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
         .await
         .expect("start must succeed; git errors surface in the transcript");
 
-    let err_row =
-        wait_for_message(&store, &session.session_pk, |m| m.block_type == "error").await;
+    let err_row = wait_for_message(&store, &session.session_pk, |m| m.block_type == "error").await;
     let message = err_row.payload["message"].as_str().unwrap_or("");
     assert!(message.contains("uncommitted changes"), "got: {message}");
 
@@ -1447,7 +1452,10 @@ async fn continue_during_startup_waits_and_reuses_the_startup_handle() {
     }
     assert_eq!(counters.starts.load(Ordering::SeqCst), 1);
     assert!(
-        cp.starting.lock().unwrap().contains_key(&session.session_pk),
+        cp.starting
+            .lock()
+            .unwrap()
+            .contains_key(&session.session_pk),
         "startup must still be in flight"
     );
 
