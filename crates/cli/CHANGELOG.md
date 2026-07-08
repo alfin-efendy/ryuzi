@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/alfin-efendy/ryuzi/compare/v0.5.0...v0.6.0) (2026-07-08)
+
+
+### Features
+
+* **cockpit:** UI polish batch — solid overlays, Route groups, file viewer View/Code, Windows attachments, model Test All, instant sessions, git-URL/non-git projects ([#78](https://github.com/alfin-efendy/ryuzi/issues/78)) ([0cc9077](https://github.com/alfin-efendy/ryuzi/commit/0cc90770f35dcd6bf818d37f1003157ca3925d1a))
+* **cockpit:** Windows bash fix, Ryuzi-only sessions, real branch controls, Combobox migration ([#72](https://github.com/alfin-efendy/ryuzi/issues/72)) ([9eb076d](https://github.com/alfin-efendy/ryuzi/commit/9eb076d315c1cdf237febd87a69d9b0a917ed0eb))
+
 ## [0.5.0](https://github.com/alfin-efendy/ryuzi/compare/v0.4.0...v0.5.0) (2026-07-06)
 
 
