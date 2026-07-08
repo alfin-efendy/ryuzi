@@ -396,13 +396,14 @@ fn discover_plugin_pack_from_plugin_json(
         serde_json::from_str(&std::fs::read_to_string(plugin_json_path)?)
             .with_context(|| format!("invalid plugin.json at {}", plugin_json_path.display()))?;
 
-    let default_skill_root = plugin_json.skills.as_deref().unwrap_or("./skills/");
-    let default_skills = discover_skill_descriptors(repo_dir, default_skill_root)?;
     let existing_manifest_path = repo_dir.join("ryuzi-plugin.toml");
     if existing_manifest_path.is_file() {
         let text = std::fs::read_to_string(&existing_manifest_path)?;
+        let manifest_dir = existing_manifest_path.parent().unwrap_or(repo_dir);
         if let Ok(mut manifest) = ryuzi_plugin_sdk::PluginManifest::from_toml(&text) {
             if manifest.skills.is_empty() {
+                let default_skill_root = plugin_json.skills.as_deref().unwrap_or("./skills/");
+                let default_skills = discover_skill_descriptors(repo_dir, default_skill_root)?;
                 manifest.skills = manifest_skill_defs(repo_dir, &default_skills)?;
                 let manifest_text = toml::to_string_pretty(&manifest)?;
                 return Ok(PackDescriptor {
@@ -412,7 +413,7 @@ fn discover_plugin_pack_from_plugin_json(
                     manifest_to_write: Some(manifest_text),
                 });
             }
-            let materialized = materialized_skills_from_manifest(repo_dir, &manifest)?;
+            let materialized = materialized_skills_from_manifest(manifest_dir, &manifest)?;
             if materialized.is_empty() {
                 bail!(
                     "plugin manifest at {} does not resolve any installable skills",
@@ -427,6 +428,9 @@ fn discover_plugin_pack_from_plugin_json(
             });
         }
     }
+
+    let default_skill_root = plugin_json.skills.as_deref().unwrap_or("./skills/");
+    let default_skills = discover_skill_descriptors(repo_dir, default_skill_root)?;
 
     let plugin_id = normalize_name(
         plugin_json
@@ -1019,6 +1023,116 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "superpowers");
         assert_eq!(listed[0].skill_count, 2);
+    }
+
+    #[tokio::test]
+    async fn install_plugin_pack_preserves_existing_manifest_with_custom_skill_paths() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".codex-plugin")).unwrap();
+        std::fs::write(
+            repo.path().join(".codex-plugin/plugin.json"),
+            serde_json::json!({
+                "name": "superpowers",
+                "skills": "./skills/",
+                "interface": { "displayName": "Superpowers" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_skill(
+            &repo.path().join("bundled/brainstorming"),
+            "brainstorming",
+            "Explore ideas",
+            "Custom layout.",
+        );
+        let preserved_manifest = r#"
+contract = 1
+id = "superpowers"
+name = "Superpowers"
+
+[[skills]]
+name = "brainstorming"
+description = "Explore ideas"
+path = "bundled/brainstorming"
+"#
+        .trim_start();
+        std::fs::write(repo.path().join("ryuzi-plugin.toml"), preserved_manifest).unwrap();
+
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/obra/superpowers".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner { repos };
+
+        let pack = install_skill_source_with("superpowers", &roots, &cloner)
+            .await
+            .unwrap();
+
+        assert_eq!(pack.id, "superpowers");
+        assert_eq!(pack.skills.len(), 1);
+        assert_eq!(pack.skills[0].id, "superpowers--brainstorming");
+
+        let plugin_dir = roots.plugins_root.join("superpowers");
+        assert_eq!(
+            std::fs::read_to_string(plugin_dir.join("ryuzi-plugin.toml")).unwrap(),
+            preserved_manifest
+        );
+        assert!(plugin_dir.join("bundled/brainstorming/SKILL.md").is_file());
+        assert!(roots
+            .skills_root
+            .join("superpowers--brainstorming")
+            .join("SKILL.md")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn install_bare_plugin_pack_discovers_skills_root_entries() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(
+            &repo.path().join("skills/alpha"),
+            "alpha",
+            "First skill",
+            "Alpha body.",
+        );
+        write_skill(
+            &repo.path().join("skills/beta"),
+            "beta",
+            "Second skill",
+            "Beta body.",
+        );
+
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/acme/toolbox".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner { repos };
+
+        let pack = install_skill_source_with("acme/toolbox", &roots, &cloner)
+            .await
+            .unwrap();
+
+        assert_eq!(pack.id, "toolbox");
+        assert_eq!(pack.skills.len(), 2);
+        assert!(roots
+            .plugins_root
+            .join("toolbox/ryuzi-plugin.toml")
+            .is_file());
+        assert!(roots
+            .skills_root
+            .join("toolbox--alpha")
+            .join("SKILL.md")
+            .is_file());
+        assert!(roots
+            .skills_root
+            .join("toolbox--beta")
+            .join("SKILL.md")
+            .is_file());
     }
 
     #[tokio::test]
