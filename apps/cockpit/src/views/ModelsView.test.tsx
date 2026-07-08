@@ -85,6 +85,7 @@ const catalog: CatalogEntry[] = [
     models: ["gpt-4.1", "o3"],
     freeTier: false,
     riskNotice: false,
+    usesDeviceGrant: false,
   },
   {
     id: "anthropic",
@@ -98,6 +99,7 @@ const catalog: CatalogEntry[] = [
     models: ["claude-sonnet-4-5"],
     freeTier: false,
     riskNotice: false,
+    usesDeviceGrant: false,
   },
   {
     id: "anthropic-oauth",
@@ -111,6 +113,7 @@ const catalog: CatalogEntry[] = [
     models: ["claude-opus-4-8"],
     freeTier: false,
     riskNotice: false,
+    usesDeviceGrant: false,
   },
 ];
 
@@ -293,6 +296,7 @@ test("free-tier providers get a Free tier badge and device maps to Free", async 
         models: [],
         freeTier: true,
         riskNotice: false,
+        usesDeviceGrant: false,
       },
       {
         id: "kiro",
@@ -306,6 +310,7 @@ test("free-tier providers get a Free tier badge and device maps to Free", async 
         models: ["claude-sonnet-5"],
         freeTier: false,
         riskNotice: true,
+        usesDeviceGrant: false,
       },
     ],
     connections: [],
