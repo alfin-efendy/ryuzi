@@ -1464,11 +1464,11 @@ impl Store {
             else {
                 return Ok(());
             };
-            let mut object =
-                parse_plugin_oauth_token_json(&raw).map_err(|err| from_sql_json_error(0, err))?;
-            object.insert("reconnect_required".to_string(), Value::Bool(true));
+            let mut token = decode_plugin_oauth_token(&plugin_id, &raw)
+                .map_err(|err| from_sql_json_error(0, err))?;
+            token.reconnect_required = true;
             let token_json =
-                serde_json::to_string(&Value::Object(object)).map_err(to_sql_json_error)?;
+                upsert_plugin_oauth_token_json(Some(&raw), &token).map_err(to_sql_json_error)?;
             c.execute(
                 "UPDATE plugin_oauth_tokens SET token_json=?2, updated_at=?3 WHERE plugin_id=?1",
                 params![plugin_id, token_json, updated_at],
@@ -2406,6 +2406,63 @@ mod tests {
             raw_value["resource_metadata"],
             "https://example.test/.well-known/oauth-protected-resource"
         );
+    }
+
+    #[tokio::test]
+    async fn mark_plugin_oauth_reconnect_required_normalizes_legacy_plaintext_tokens() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let raw_json = serde_json::json!({
+            "plugin_id": "acme",
+            "access_token": "legacy-access-secret",
+            "refresh_token": "legacy-refresh-secret",
+            "token_type": "Bearer",
+            "expires_at": 1_700_000_000_000_i64,
+            "scopes": ["repo"],
+            "reconnect_required": false,
+            "resource_metadata": "https://example.test/.well-known/oauth-protected-resource"
+        })
+        .to_string();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "INSERT INTO plugin_oauth_tokens(plugin_id, token_json, updated_at) VALUES (?1, ?2, ?3)",
+                    params!["acme", raw_json, now_ms()],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        store
+            .mark_plugin_oauth_reconnect_required("acme")
+            .await
+            .unwrap();
+
+        let raw_json = raw_plugin_oauth_token_json(&store, "acme").await;
+        assert!(
+            !raw_json.contains("legacy-access-secret"),
+            "access token must not remain in plaintext: {raw_json}"
+        );
+        assert!(
+            !raw_json.contains("legacy-refresh-secret"),
+            "refresh token must not remain in plaintext: {raw_json}"
+        );
+
+        let raw_value: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(
+            raw_value["resource_metadata"],
+            "https://example.test/.well-known/oauth-protected-resource"
+        );
+
+        let roundtrip = store.get_plugin_oauth_token("acme").await.unwrap().unwrap();
+        assert_eq!(roundtrip.access_token, "legacy-access-secret");
+        assert_eq!(
+            roundtrip.refresh_token.as_deref(),
+            Some("legacy-refresh-secret")
+        );
+        assert!(roundtrip.reconnect_required);
     }
 
     #[tokio::test]
