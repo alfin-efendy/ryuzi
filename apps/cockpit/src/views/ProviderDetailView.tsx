@@ -204,18 +204,26 @@ function ProviderModelsCard({
     const conn = connFor(model);
     if (!conn) return null;
     setInFlight((prev) => new Set(prev).add(model));
-    const result = await commands.testConnectionModel(conn.id, model);
-    const entry: ModelTestEntry =
-      result.status === "ok"
-        ? { status: result.data.status as ModelTestStatus, message: result.data.message }
-        : { status: "unknown", message: `Model test failed: ${result.error.message}` };
-    setInFlight((prev) => {
-      const next = new Set(prev);
-      next.delete(model);
-      return next;
-    });
-    setResults((prev) => new Map(prev).set(model, entry));
-    return entry;
+    try {
+      let entry: ModelTestEntry;
+      try {
+        const result = await commands.testConnectionModel(conn.id, model);
+        entry =
+          result.status === "ok"
+            ? { status: result.data.status as ModelTestStatus, message: result.data.message }
+            : { status: "unknown", message: `Model test failed: ${result.error.message}` };
+      } catch (e) {
+        entry = { status: "unknown", message: e instanceof Error ? e.message : String(e) };
+      }
+      setResults((prev) => new Map(prev).set(model, entry));
+      return entry;
+    } finally {
+      setInFlight((prev) => {
+        const next = new Set(prev);
+        next.delete(model);
+        return next;
+      });
+    }
   };
 
   const runModelTest = async (model: string) => {
@@ -229,12 +237,15 @@ function ProviderModelsCard({
     const targets = models.filter((model) => connFor(model));
     if (targets.length === 0) return;
     setBatch({ done: 0, total: targets.length });
-    // Cap of 3: every probe is a real billed inference call.
-    await runPool(targets, 3, async (model) => {
-      await testOne(model);
-      setBatch((prev) => (prev ? { done: prev.done + 1, total: prev.total } : prev));
-    });
-    setBatch(null);
+    try {
+      // Cap of 3: every probe is a real billed inference call.
+      await runPool(targets, 3, async (model) => {
+        await testOne(model);
+        setBatch((prev) => (prev ? { done: prev.done + 1, total: prev.total } : prev));
+      });
+    } finally {
+      setBatch(null);
+    }
   };
 
   const runRefresh = async () => {
