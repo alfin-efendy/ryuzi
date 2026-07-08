@@ -73,12 +73,60 @@ const registrySearch = mock(async (_query: string | null, _cursor: string | null
   },
 }));
 
-mock.module("@/bindings", () => ({
-  commands: {
-    registrySearch,
+const listSkills = mock(async () => ({
+  status: "ok" as const,
+  data: [
+    {
+      id: "superpowers",
+      name: "Superpowers",
+      source: "superpowers",
+      pluginId: null,
+      installedAt: "2026-07-08T10:00:00Z",
+      skillCount: 12,
+    },
+  ],
+}));
+
+const installSkill = mock(async (_source: string) => ({
+  status: "ok" as const,
+  data: {
+    id: "superpowers",
+    name: "Superpowers",
+    source: "superpowers",
+    pluginId: null,
+    installedAt: "2026-07-08T10:00:00Z",
+    skills: [{ id: "superpowers:brainstorming", name: "brainstorming" }],
   },
 }));
 
+const removeSkill = mock(async (_id: string) => ({
+  status: "ok" as const,
+  data: null,
+}));
+
+const refreshSkill = mock(async (_id: string) => ({
+  status: "ok" as const,
+  data: {
+    id: "superpowers",
+    name: "Superpowers",
+    source: "superpowers",
+    pluginId: null,
+    installedAt: "2026-07-08T10:00:00Z",
+    skills: [{ id: "superpowers:brainstorming", name: "brainstorming" }],
+  },
+}));
+
+mock.module("@/bindings", () => ({
+  commands: {
+    registrySearch,
+    listSkills,
+    installSkill,
+    removeSkill,
+    refreshSkill,
+  },
+}));
+
+const { useSkills } = await import("../store-skills");
 const { filterByCategory, mergeRegistryEntries, PluginsView } = await import("./PluginsView");
 
 function plugin(id: string, categories: string[]): PluginInfo {
@@ -134,6 +182,11 @@ const all = [github, notion, builtin];
 beforeEach(() => {
   add.mockClear();
   registrySearch.mockClear();
+  listSkills.mockClear();
+  installSkill.mockClear();
+  removeSkill.mockClear();
+  refreshSkill.mockClear();
+  useSkills.setState({ skills: [], loading: false, error: null });
 });
 
 afterEach(() => {
@@ -179,6 +232,30 @@ test("registry install uses the selected version install target from browse", as
       }),
     ),
   );
+});
+
+test("skills tab renders installed skills from listSkills", async () => {
+  render(<PluginsView />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+
+  await waitFor(() => expect(listSkills).toHaveBeenCalledTimes(1));
+  expect((await screen.findAllByText("Superpowers")).length).toBeGreaterThan(0);
+  expect(screen.getByText("superpowers")).toBeTruthy();
+  expect(screen.getByText("12 skills")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Refresh Superpowers" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Remove Superpowers" })).toBeTruthy();
+});
+
+test("skills tab installs Superpowers from the curated action", async () => {
+  render(<PluginsView />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+  await screen.findByText("Superpowers");
+
+  fireEvent.click(screen.getByRole("button", { name: "Install Superpowers" }));
+
+  await waitFor(() => expect(installSkill).toHaveBeenCalledWith("superpowers"));
 });
 
 test("filterByCategory passes every plugin through for the default all category", () => {

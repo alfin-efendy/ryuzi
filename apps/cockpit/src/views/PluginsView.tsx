@@ -1,5 +1,5 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
-import { Check, CircleAlert, Minus, Plus, Search } from "lucide-react";
+import { Check, CircleAlert, Minus, Plus, RefreshCw, Search, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge, Button, Combobox, Input, Segmented, SettingsCard as Card, Switch } from "@ryuzi/ui";
 import { commands, type AppInfo, type PluginInfo, type RegistryEntry, type RegistryEntryVersion } from "@/bindings";
@@ -8,6 +8,7 @@ import { agentAllowed, useApps } from "@/store-apps";
 import { useRuntimes } from "@/store-runtimes";
 import { useGateways } from "@/store-gateways";
 import { catalogPlugins, usePlugins } from "@/store-plugins";
+import { useSkills } from "@/store-skills";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { AddAppModal } from "@/components/modals/AddAppModal";
 import { useNav } from "@/store-nav";
@@ -296,6 +297,13 @@ export function PluginsView() {
   const runtimes = useRuntimes((s) => s.runtimes);
   const gateways = useGateways((s) => s.gateways);
   const { plugins, loaded: pluginsLoaded, load: loadPlugins, setEnabled: setPluginEnabled } = usePlugins();
+  const skills = useSkills((state) => state.skills);
+  const skillsLoading = useSkills((state) => state.loading);
+  const skillsError = useSkills((state) => state.error);
+  const refreshSkills = useSkills((state) => state.refresh);
+  const installSkillSource = useSkills((state) => state.installSource);
+  const refreshSkillPack = useSkills((state) => state.refreshSkillPack);
+  const removeSkillPack = useSkills((state) => state.remove);
   const [tab, setTab] = useState<PluginsTab>("installed");
   const [category, setCategory] = useState("all");
   const [browseSource, setBrowseSource] = useState<BrowseSource>("all");
@@ -309,6 +317,8 @@ export function PluginsView() {
   const [selectedVersions, setSelectedVersions] = useState<Record<string, string>>({});
   const [registryActivated, setRegistryActivated] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [skillInstallSource, setSkillInstallSource] = useState("");
+  const [skillsActivated, setSkillsActivated] = useState(false);
 
   useEffect(() => {
     void hydrate();
@@ -351,6 +361,14 @@ export function PluginsView() {
 
     return () => clearTimeout(timeout);
   }, [loadRegistry, query, quick, registryActivated, tab]);
+
+  useEffect(() => {
+    if (tab !== "skills") return;
+    if (skillsActivated) return;
+
+    setSkillsActivated(true);
+    void refreshSkills();
+  }, [refreshSkills, skillsActivated, tab]);
 
   const catalog = catalogPlugins(plugins);
   const categories = Array.from(new Set(catalog.flatMap((p) => p.categories))).sort();
@@ -395,6 +413,11 @@ export function PluginsView() {
     if (ok) {
       toast.success(`${entry.name} installed — check its status in Plugins`);
     }
+  };
+
+  const installCuratedSkill = async (source: string) => {
+    await installSkillSource(source);
+    setSkillInstallSource("");
   };
 
   return (
@@ -645,12 +668,95 @@ export function PluginsView() {
         )}
 
         {tab === "skills" && (
-          <Card className="p-6">
-            <div className="mb-1 text-sm font-semibold">Skills</div>
-            <p className="m-0 text-[13px] text-muted-foreground">
-              Skill management is landing here next. For now this tab is wired up so the route and shell stay stable.
-            </p>
-          </Card>
+          <div className="flex flex-col gap-3">
+            <Card className="px-[18px] py-4">
+              <div className="flex items-center gap-3">
+                <IconChip icon={Sparkles} size={38} />
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-semibold">Superpowers</div>
+                  <div className="text-[11.5px] text-muted-foreground">Curated workflow and development skills</div>
+                </div>
+                <Button size="sm" onClick={() => void installCuratedSkill("superpowers")} disabled={skillsLoading} aria-label="Install Superpowers">
+                  Install
+                </Button>
+              </div>
+            </Card>
+
+            <Card className="px-[18px] py-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="min-w-0 flex-1 text-sm font-semibold">Install source</div>
+                <Button variant="outline" size="sm" onClick={() => void refreshSkills()} disabled={skillsLoading}>
+                  <RefreshCw aria-hidden size={13} strokeWidth={2} />
+                  Refresh list
+                </Button>
+              </div>
+              <div className="mt-3 flex items-center gap-2">
+                <Input
+                  value={skillInstallSource}
+                  onChange={(event) => setSkillInstallSource(event.target.value)}
+                  placeholder="superpowers or owner/repo"
+                  aria-label="Skill source"
+                  className="flex-1"
+                />
+                <Button onClick={() => void installCuratedSkill(skillInstallSource)} disabled={skillsLoading || skillInstallSource.trim() === ""}>
+                  Install source
+                </Button>
+              </div>
+            </Card>
+
+            {skillsError && (
+              <div className="flex items-center gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]" style={{ color: "#F59E0B" }}>
+                <CircleAlert aria-hidden size={14} strokeWidth={2} className="shrink-0" />
+                {skillsError}
+              </div>
+            )}
+
+            <Card className="px-[18px] py-4">
+              <div className="mb-3 flex items-center gap-2">
+                <div className="min-w-0 flex-1 text-sm font-semibold">Installed</div>
+                {skillsLoading && <div className="text-[11.5px] text-muted-foreground">Loading…</div>}
+              </div>
+
+              {skills.length === 0 && !skillsLoading ? (
+                <div className="text-[12.5px] text-muted-foreground">No skill packs installed.</div>
+              ) : (
+                <div className="flex flex-col">
+                  {skills.map((skill) => (
+                    <div key={skill.id} className="flex items-center gap-3 border-t border-border py-3 first:border-t-0 first:pt-0 last:pb-0">
+                      <Chip initial={skill.name.charAt(0).toUpperCase()} color={colorFor(skill.id)} size={34} mono />
+                      <div className="min-w-0 flex-1">
+                        <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[13px] font-medium">{skill.name}</div>
+                        <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[11.5px] text-muted-foreground">
+                          {skill.source}
+                        </div>
+                      </div>
+                      <div className="shrink-0 text-[11.5px] text-muted-foreground">{skill.skillCount} skills</div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void refreshSkillPack(skill.id)}
+                        disabled={skillsLoading}
+                        aria-label={`Refresh ${skill.name}`}
+                      >
+                        <RefreshCw aria-hidden size={13} strokeWidth={2} />
+                        Refresh
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void removeSkillPack(skill.id)}
+                        disabled={skillsLoading}
+                        aria-label={`Remove ${skill.name}`}
+                      >
+                        <Trash2 aria-hidden size={13} strokeWidth={2} />
+                        Remove
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Card>
+          </div>
         )}
       </div>
       {addOpen && <AddAppModal onClose={() => setAddOpen(false)} />}
