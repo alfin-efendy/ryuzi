@@ -812,6 +812,30 @@ async setPluginSetting(key: string, value: string) : Promise<Result<null, CmdErr
     else return { status: "error", error: e  as any };
 }
 },
+async beginPluginOauth(pluginId: string) : Promise<Result<PluginOauthBeginResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("begin_plugin_oauth", { pluginId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async completePluginOauth(pluginId: string, code: string, stateToken: string) : Promise<Result<PluginAuthInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("complete_plugin_oauth", { pluginId, code, stateToken }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async disconnectPluginOauth(pluginId: string) : Promise<Result<PluginAuthInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("disconnect_plugin_oauth", { pluginId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async pluginModels(id: string) : Promise<Result<string[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("plugin_models", { id }) };
@@ -908,12 +932,14 @@ export const events = __makeEvents__<{
 accentChangedMsg: AccentChangedMsg,
 coreEventMsg: CoreEventMsg,
 oauthAuthorizeUrlMsg: OauthAuthorizeUrlMsg,
+pluginOauthAuthorizeUrlMsg: PluginOauthAuthorizeUrlMsg,
 termExitMsg: TermExitMsg,
 termOutputMsg: TermOutputMsg
 }>({
 accentChangedMsg: "accent-changed-msg",
 coreEventMsg: "core-event-msg",
 oauthAuthorizeUrlMsg: "oauth-authorize-url-msg",
+pluginOauthAuthorizeUrlMsg: "plugin-oauth-authorize-url-msg",
 termExitMsg: "term-exit-msg",
 termOutputMsg: "term-output-msg"
 })
@@ -1080,7 +1106,7 @@ kind: string; setting: string | null; env: string | null; helpUrl: string | null
  * A persisted (non-empty) row exists for `setting`, OR `env` is set in
  * the process environment. Never reveals the value itself.
  */
-configured: boolean }
+configured: boolean; oauthConnectAvailable: boolean; oauthConnectError: string | null; oauthTokenStored: boolean; oauthReconnectRequired: boolean }
 export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; menuLabel: string | null; homepage: string | null; publisher: string }
 export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean; 
 /**
@@ -1106,6 +1132,8 @@ transport: string;
  * `${auth}` substitution, matching `ryuzi plugins info`'s output.
  */
 commandOrUrl: string }
+export type PluginOauthAuthorizeUrlMsg = { pluginId: string; authorizeUrl: string }
+export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string; redirectUri: string }
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }

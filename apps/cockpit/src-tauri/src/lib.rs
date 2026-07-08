@@ -352,6 +352,9 @@ fn make_builder() -> Builder<tauri::Wry> {
             plugins_cmd::plugin_detail,
             plugins_cmd::set_plugin_enabled,
             plugins_cmd::set_plugin_setting,
+            plugins_cmd::begin_plugin_oauth,
+            plugins_cmd::complete_plugin_oauth,
+            plugins_cmd::disconnect_plugin_oauth,
             plugins_cmd::plugin_models,
             session_io::export_session,
             session_io::import_session,
@@ -363,6 +366,7 @@ fn make_builder() -> Builder<tauri::Wry> {
         .events(collect_events![
             events::CoreEventMsg,
             events::OauthAuthorizeUrlMsg,
+            events::PluginOauthAuthorizeUrlMsg,
             accent::AccentChangedMsg,
             term::TermOutputMsg,
             term::TermExitMsg

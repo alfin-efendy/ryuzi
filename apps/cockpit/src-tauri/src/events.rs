@@ -14,3 +14,10 @@ pub struct OauthAuthorizeUrlMsg {
     pub provider: String,
     pub authorize_url: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginOauthAuthorizeUrlMsg {
+    pub plugin_id: String,
+    pub authorize_url: String,
+}

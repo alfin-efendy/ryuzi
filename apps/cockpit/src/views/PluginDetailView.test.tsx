@@ -26,6 +26,10 @@ const githubDetail: PluginDetail = {
     env: "GITHUB_PERSONAL_ACCESS_TOKEN",
     helpUrl: "https://github.com/settings/tokens",
     configured: false,
+    oauthConnectAvailable: false,
+    oauthConnectError: null,
+    oauthTokenStored: false,
+    oauthReconnectRequired: false,
   },
   settings: [],
   mcp: [{ name: "github", transport: "http", commandOrUrl: "https://api.githubcopilot.com/mcp/" }],
@@ -88,22 +92,81 @@ const sandboxDetail: PluginDetail = {
   publisher: "Vercel (no MCP surface)",
 };
 
+const oauthDetail: PluginDetail = {
+  info: {
+    id: "acme-oauth",
+    name: "Acme OAuth",
+    description: "HTTP MCP plugin authenticated through OAuth.",
+    icon: "shield",
+    categories: ["issues"],
+    verified: true,
+    experimental: false,
+    enabled: true,
+    source: "catalog",
+    capabilities: ["connector"],
+  },
+  auth: {
+    kind: "oauth",
+    setting: null,
+    env: null,
+    helpUrl: "https://acme.example.com/help",
+    configured: false,
+    oauthConnectAvailable: true,
+    oauthTokenStored: false,
+    oauthReconnectRequired: false,
+  },
+  settings: [],
+  mcp: [{ name: "acme", transport: "http", commandOrUrl: "https://api.acme.example.com/mcp" }],
+  models: [],
+  menuLabel: "Acme",
+  homepage: "https://acme.example.com",
+  publisher: "Acme",
+};
+
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 const err = (message: string) => Promise.resolve({ status: "error" as const, error: { message } });
 
 const pluginDetail = mock((id: string) => {
   if (id === "github") return ok(githubDetail);
   if (id === "ollama") return ok(ollamaDetail);
+  if (id === "acme-oauth") return ok(oauthDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
   return err("unknown plugin");
 });
 const setPluginEnabled = mock((_id: string, _enabled: boolean) => ok(null));
 const setPluginSetting = mock((_key: string, _value: string) => ok(null));
+const beginPluginOauth = mock((_pluginId: string) =>
+  ok({
+    stateToken: "state-123",
+    authorizeUrl: "https://acme.example.com/oauth/authorize?client_id=acme-client",
+    redirectUri: "http://127.0.0.1:8976/plugin-oauth/acme-oauth/callback",
+  }),
+);
+const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken: string) =>
+  ok(oauthDetail.auth),
+);
+const disconnectPluginOauth = mock((_pluginId: string) =>
+  ok({ ...oauthDetail.auth, configured: false, oauthTokenStored: false }),
+);
 const listPlugins = mock(() => ok([]));
 const openUrl = mock(async (_url: string) => {});
+const pluginOauthAuthorizeUrlMsgListen = mock(async (_cb: (event: { payload: { pluginId: string; authorizeUrl: string } }) => void) => () => {});
 
 mock.module("@/bindings", () => ({
-  commands: { pluginDetail, setPluginEnabled, setPluginSetting, listPlugins },
+  events: {
+    pluginOauthAuthorizeUrlMsg: {
+      listen: pluginOauthAuthorizeUrlMsgListen,
+    },
+  },
+  commands: {
+    pluginDetail,
+    setPluginEnabled,
+    setPluginSetting,
+    beginPluginOauth,
+    completePluginOauth,
+    disconnectPluginOauth,
+    listPlugins,
+  },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
 
@@ -114,6 +177,10 @@ beforeEach(() => {
   pluginDetail.mockClear();
   setPluginEnabled.mockClear();
   setPluginSetting.mockClear();
+  beginPluginOauth.mockClear();
+  completePluginOauth.mockClear();
+  disconnectPluginOauth.mockClear();
+  pluginOauthAuthorizeUrlMsgListen.mockClear();
   listPlugins.mockClear();
   openUrl.mockClear();
   usePlugins.setState({ plugins: [], loaded: false });
@@ -162,6 +229,14 @@ test("opens the auth help link through the shared openUrl mechanism", async () =
 
   fireEvent.click(screen.getByRole("button", { name: "Help" }));
   expect(openUrl).toHaveBeenCalledWith("https://github.com/settings/tokens");
+});
+
+test("oauth plugins start Cockpit sign-in through beginPluginOauth", async () => {
+  render(<PluginDetailView id="acme-oauth" />);
+  await screen.findByText("Acme OAuth");
+
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  await waitFor(() => expect(beginPluginOauth).toHaveBeenCalledWith("acme-oauth"));
 });
 
 test("lists MCP servers with their transport and endpoint", async () => {

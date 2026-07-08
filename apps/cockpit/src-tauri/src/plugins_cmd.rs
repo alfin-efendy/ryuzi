@@ -17,14 +17,20 @@
 //! persisted (or an auth env var is set), never the value itself.
 
 use crate::error::CmdError;
+use crate::events::PluginOauthAuthorizeUrlMsg;
+use reqwest::Url;
+use ryuzi_core::plugins::oauth::{generate_pkce_verifier, pkce_challenge_s256, PluginOauthToken};
 use ryuzi_core::plugins::providers;
 use ryuzi_core::settings::SettingsStore;
 use ryuzi_core::{ControlPlane, CorePlugin, PluginSource, Store};
 use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, SettingField};
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use std::sync::Arc;
-use tauri::State;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use tauri::{AppHandle, State};
+use tauri_plugin_opener::OpenerExt;
+use tauri_specta::Event as _;
 
 type R<T> = Result<T, CmdError>;
 
@@ -56,6 +62,18 @@ pub struct PluginAuthInfo {
     /// A persisted (non-empty) row exists for `setting`, OR `env` is set in
     /// the process environment. Never reveals the value itself.
     pub configured: bool,
+    pub oauth_connect_available: bool,
+    pub oauth_connect_error: Option<String>,
+    pub oauth_token_stored: bool,
+    pub oauth_reconnect_required: bool,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginOauthBeginResult {
+    pub state_token: String,
+    pub authorize_url: String,
+    pub redirect_uri: String,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -92,6 +110,28 @@ pub struct PluginDetail {
     pub menu_label: Option<String>,
     pub homepage: Option<String>,
     pub publisher: String,
+}
+
+#[derive(Clone)]
+struct PluginOauthFlowState {
+    verifier: String,
+    redirect_uri: String,
+    requested_scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginOauthTokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    token_type: Option<String>,
+    expires_in: Option<i64>,
+    scope: Option<String>,
+}
+
+static PLUGIN_OAUTH_FLOWS: OnceLock<Mutex<HashMap<String, PluginOauthFlowState>>> = OnceLock::new();
+
+fn plugin_oauth_flows() -> &'static Mutex<HashMap<String, PluginOauthFlowState>> {
+    PLUGIN_OAUTH_FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn source_label(source: &PluginSource) -> &'static str {
@@ -131,6 +171,121 @@ fn auth_kind_label(kind: AuthKind) -> &'static str {
     }
 }
 
+fn plugin_oauth_flow_key(plugin_id: &str, state_token: &str) -> String {
+    format!("{plugin_id}:{state_token}")
+}
+
+fn plugin_oauth_redirect_uri(plugin_id: &str) -> String {
+    format!("http://127.0.0.1:8976/plugin-oauth/{plugin_id}/callback")
+}
+
+fn plugin_oauth_requested_scopes(auth: &AuthSpec) -> Vec<String> {
+    auth.scopes.clone()
+}
+
+fn plugin_oauth_prereq_error(
+    plugin_id: &str,
+    auth: &AuthSpec,
+    client_id_value: Option<&str>,
+) -> Option<String> {
+    let mut missing = Vec::new();
+    if auth.authorize_url.as_deref().is_none_or(str::is_empty) {
+        missing.push("auth.authorize_url".to_string());
+    }
+    if auth.token_url.as_deref().is_none_or(str::is_empty) {
+        missing.push("auth.token_url".to_string());
+    }
+    match auth.client_id_setting.as_deref() {
+        Some(key) => {
+            if client_id_value.is_none_or(str::is_empty) {
+                missing.push(format!("saved value for {key}"));
+            }
+        }
+        None => missing.push("auth.client_id_setting".to_string()),
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{plugin_id} OAuth sign-in isn't ready in Cockpit yet: missing {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+async fn plugin_oauth_client_id(store: &Store, auth: &AuthSpec) -> anyhow::Result<Option<String>> {
+    let Some(key) = auth.client_id_setting.as_deref() else {
+        return Ok(None);
+    };
+    Ok(store
+        .get_setting_raw(key)
+        .await?
+        .filter(|value| !value.is_empty()))
+}
+
+async fn plugin_oauth_client_secret(
+    store: &Store,
+    auth: &AuthSpec,
+) -> anyhow::Result<Option<String>> {
+    let Some(key) = auth.client_secret_setting.as_deref() else {
+        return Ok(None);
+    };
+    Ok(store
+        .get_setting_raw(key)
+        .await?
+        .filter(|value| !value.is_empty()))
+}
+
+async fn build_plugin_oauth_begin_result(
+    store: &Store,
+    plugin_id: &str,
+    auth: &AuthSpec,
+    verifier: &str,
+    state_token: &str,
+) -> anyhow::Result<PluginOauthBeginResult> {
+    let client_id = plugin_oauth_client_id(store, auth).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}",
+            plugin_oauth_prereq_error(plugin_id, auth, None)
+                .unwrap_or_else(|| format!("{plugin_id} OAuth sign-in isn't ready"))
+        )
+    })?;
+    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, Some(client_id.as_str())) {
+        anyhow::bail!(message);
+    }
+
+    let authorize_url = auth.authorize_url.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("{plugin_id} OAuth sign-in is missing auth.authorize_url")
+    })?;
+    let redirect_uri = plugin_oauth_redirect_uri(plugin_id);
+    let requested_scopes = plugin_oauth_requested_scopes(auth);
+    let mut url = Url::parse(authorize_url)?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("response_type", "code");
+        query.append_pair("client_id", &client_id);
+        query.append_pair("redirect_uri", &redirect_uri);
+        query.append_pair("state", state_token);
+        query.append_pair("code_challenge", &pkce_challenge_s256(verifier));
+        query.append_pair("code_challenge_method", "S256");
+        if !requested_scopes.is_empty() {
+            query.append_pair("scope", &requested_scopes.join(" "));
+        }
+        if let Some(resource) = auth.resource.as_deref().filter(|value| !value.is_empty()) {
+            query.append_pair("resource", resource);
+        }
+        for (key, value) in &auth.extra_authorize_params {
+            query.append_pair(key, value);
+        }
+    }
+
+    Ok(PluginOauthBeginResult {
+        state_token: state_token.to_string(),
+        authorize_url: url.into(),
+        redirect_uri,
+    })
+}
+
 /// Whether an auth block's credential is configured: a persisted, non-empty
 /// value under `auth.setting`, or — fallback — the `auth.env` var set in the
 /// process environment. Pure so it's testable without a `Store` or a real
@@ -140,7 +295,11 @@ fn auth_configured(setting_value: Option<&str>, env_is_set: bool) -> bool {
     setting_value.is_some_and(|v| !v.is_empty()) || env_is_set
 }
 
-async fn build_auth_info(store: &Store, auth: &AuthSpec) -> anyhow::Result<PluginAuthInfo> {
+async fn build_auth_info(
+    store: &Store,
+    plugin_id: &str,
+    auth: &AuthSpec,
+) -> anyhow::Result<PluginAuthInfo> {
     let setting_value = match &auth.setting {
         Some(key) => store.get_setting_raw(key).await?,
         None => None,
@@ -149,12 +308,39 @@ async fn build_auth_info(store: &Store, auth: &AuthSpec) -> anyhow::Result<Plugi
         .env
         .as_deref()
         .is_some_and(|e| std::env::var_os(e).is_some());
+    let client_id_value = if auth.kind == AuthKind::Oauth {
+        plugin_oauth_client_id(store, auth).await?
+    } else {
+        None
+    };
+    let oauth_token = if auth.kind == AuthKind::Oauth {
+        store.get_plugin_oauth_token(plugin_id).await?
+    } else {
+        None
+    };
+    let oauth_reconnect_required = oauth_token
+        .as_ref()
+        .is_some_and(|token| token.reconnect_required);
+    let oauth_token_stored = oauth_token.is_some();
+    let oauth_connect_error = if auth.kind == AuthKind::Oauth {
+        plugin_oauth_prereq_error(plugin_id, auth, client_id_value.as_deref())
+    } else {
+        None
+    };
     Ok(PluginAuthInfo {
         kind: auth_kind_label(auth.kind).to_string(),
         setting: auth.setting.clone(),
         env: auth.env.clone(),
         help_url: auth.help_url.clone(),
-        configured: auth_configured(setting_value.as_deref(), env_is_set),
+        configured: if auth.kind == AuthKind::Oauth {
+            oauth_token_stored && !oauth_reconnect_required
+        } else {
+            auth_configured(setting_value.as_deref(), env_is_set)
+        },
+        oauth_connect_available: auth.kind == AuthKind::Oauth && oauth_connect_error.is_none(),
+        oauth_connect_error,
+        oauth_token_stored,
+        oauth_reconnect_required,
     })
 }
 
@@ -204,6 +390,114 @@ fn mcp_info(server: &McpServerDef) -> PluginMcpInfo {
     }
 }
 
+fn plugin_oauth_auth(cp: &ControlPlane, plugin_id: &str) -> anyhow::Result<AuthSpec> {
+    let plugin = cp
+        .plugins()
+        .get(plugin_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown plugin: {plugin_id}"))?;
+    let auth = plugin
+        .manifest
+        .auth
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{plugin_id} does not declare an auth block"))?;
+    if auth.kind != AuthKind::Oauth {
+        anyhow::bail!("{plugin_id} does not use OAuth")
+    }
+    Ok(auth.clone())
+}
+
+async fn exchange_plugin_oauth_code(
+    store: &Store,
+    plugin_id: &str,
+    auth: &AuthSpec,
+    flow: &PluginOauthFlowState,
+    code: &str,
+) -> anyhow::Result<PluginOauthToken> {
+    let client_id = plugin_oauth_client_id(store, auth).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}",
+            plugin_oauth_prereq_error(plugin_id, auth, None)
+                .unwrap_or_else(|| format!("{plugin_id} OAuth sign-in isn't ready"))
+        )
+    })?;
+    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, Some(client_id.as_str())) {
+        anyhow::bail!(message);
+    }
+
+    let token_url = auth
+        .token_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{plugin_id} OAuth sign-in is missing auth.token_url"))?;
+    let client_secret = plugin_oauth_client_secret(store, auth).await?;
+    let mut form = vec![
+        ("grant_type".to_string(), "authorization_code".to_string()),
+        ("code".to_string(), code.to_string()),
+        ("redirect_uri".to_string(), flow.redirect_uri.clone()),
+        ("client_id".to_string(), client_id),
+        ("code_verifier".to_string(), flow.verifier.clone()),
+    ];
+    if !flow.requested_scopes.is_empty() {
+        form.push(("scope".to_string(), flow.requested_scopes.join(" ")));
+    }
+    if let Some(resource) = auth.resource.as_deref().filter(|value| !value.is_empty()) {
+        form.push(("resource".to_string(), resource.to_string()));
+    }
+    if let Some(secret) = client_secret {
+        form.push(("client_secret".to_string(), secret));
+    }
+    for (key, value) in &auth.extra_token_params {
+        form.push((key.clone(), value.clone()));
+    }
+
+    let http = reqwest::Client::new();
+    let response = http.post(token_url).form(&form).send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let detail = body.trim();
+        if detail.is_empty() {
+            anyhow::bail!("{plugin_id} OAuth token exchange failed with HTTP {status}");
+        }
+        anyhow::bail!("{plugin_id} OAuth token exchange failed with HTTP {status}: {detail}");
+    }
+
+    let payload: PluginOauthTokenResponse = response.json().await?;
+    let access_token = payload
+        .access_token
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("{plugin_id} OAuth token response is missing access_token")
+        })?;
+    let token_type = payload
+        .token_type
+        .filter(|token_type| !token_type.is_empty())
+        .unwrap_or_else(|| "Bearer".to_string());
+    let scopes = payload
+        .scope
+        .map(|scope| {
+            scope
+                .split_whitespace()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|scopes| !scopes.is_empty())
+        .unwrap_or_else(|| flow.requested_scopes.clone());
+    let expires_at = payload
+        .expires_in
+        .map(|seconds| ryuzi_core::paths::now_ms() + seconds.saturating_mul(1000));
+
+    Ok(PluginOauthToken {
+        plugin_id: plugin_id.to_string(),
+        access_token,
+        refresh_token: payload.refresh_token.filter(|token| !token.is_empty()),
+        token_type,
+        expires_at,
+        scopes,
+        reconnect_required: false,
+    })
+}
+
 async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let settings = SettingsStore::new(cp.store().clone());
     let mut out = Vec::new();
@@ -226,7 +520,7 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
     let m = &plugin.manifest;
 
     let auth = match &m.auth {
-        Some(auth) => Some(build_auth_info(cp.store(), auth).await?),
+        Some(auth) => Some(build_auth_info(cp.store(), id, auth).await?),
         None => None,
     };
     let settings_info = build_settings_info(cp.store(), &m.settings).await?;
@@ -288,6 +582,74 @@ pub async fn set_plugin_setting(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn begin_plugin_oauth(
+    app: AppHandle,
+    cp: State<'_, Arc<ControlPlane>>,
+    plugin_id: String,
+) -> R<PluginOauthBeginResult> {
+    let auth = plugin_oauth_auth(&cp, &plugin_id)?;
+    let verifier = generate_pkce_verifier();
+    let state_token = ryuzi_core::paths::new_id();
+    let begin =
+        build_plugin_oauth_begin_result(cp.store(), &plugin_id, &auth, &verifier, &state_token)
+            .await?;
+    plugin_oauth_flows()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(
+            plugin_oauth_flow_key(&plugin_id, &state_token),
+            PluginOauthFlowState {
+                verifier,
+                redirect_uri: begin.redirect_uri.clone(),
+                requested_scopes: plugin_oauth_requested_scopes(&auth),
+            },
+        );
+    let _ = PluginOauthAuthorizeUrlMsg {
+        plugin_id: plugin_id.clone(),
+        authorize_url: begin.authorize_url.clone(),
+    }
+    .emit(&app);
+    let _ = app
+        .opener()
+        .open_url(begin.authorize_url.clone(), None::<&str>);
+    Ok(begin)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn complete_plugin_oauth(
+    cp: State<'_, Arc<ControlPlane>>,
+    plugin_id: String,
+    code: String,
+    state_token: String,
+) -> R<PluginAuthInfo> {
+    let auth = plugin_oauth_auth(&cp, &plugin_id)?;
+    let flow = plugin_oauth_flows()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&plugin_oauth_flow_key(&plugin_id, &state_token))
+        .ok_or_else(|| CmdError {
+            message: "plugin sign-in flow not found — start again".into(),
+        })?;
+    let token =
+        exchange_plugin_oauth_code(cp.store(), &plugin_id, &auth, &flow, code.trim()).await?;
+    cp.store().upsert_plugin_oauth_token(&token).await?;
+    Ok(build_auth_info(cp.store(), &plugin_id, &auth).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn disconnect_plugin_oauth(
+    cp: State<'_, Arc<ControlPlane>>,
+    plugin_id: String,
+) -> R<PluginAuthInfo> {
+    let auth = plugin_oauth_auth(&cp, &plugin_id)?;
+    cp.store().delete_plugin_oauth_token(&plugin_id).await?;
+    Ok(build_auth_info(cp.store(), &plugin_id, &auth).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn plugin_models(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<String>> {
     Ok(providers::list_models(cp.store(), &id).await?)
 }
@@ -300,7 +662,8 @@ mod tests {
     use ryuzi_core::gateway::{Gateway, GatewayFactory};
     use ryuzi_core::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
     use ryuzi_core::Registries;
-    use ryuzi_plugin_sdk::{ModelDef, PluginManifest, ProviderMeta, RuntimeMeta};
+    use ryuzi_plugin_sdk::{AuthSpec, ModelDef, PluginManifest, ProviderMeta, RuntimeMeta};
+    use std::collections::BTreeMap;
 
     // ---- minimal fakes, self-contained to this test module ----
 
@@ -581,6 +944,69 @@ mod tests {
     fn auth_configured_false_when_neither_setting_nor_env_present() {
         assert!(!auth_configured(None, false));
         assert!(!auth_configured(Some(""), false));
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_authorize_url_uses_pkce_scopes_and_client_id_from_settings() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        store
+            .set_setting_raw("plugin.acme.client_id", "acme-client-123")
+            .await
+            .unwrap();
+
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            authorize_url: Some("https://acme.example.com/oauth/authorize".into()),
+            token_url: Some("https://acme.example.com/oauth/token".into()),
+            scopes: vec!["repo".into(), "issues:read".into()],
+            client_id_setting: Some("plugin.acme.client_id".into()),
+            extra_authorize_params: BTreeMap::from([("prompt".into(), "consent".into())]),
+            ..Default::default()
+        };
+
+        let begin = build_plugin_oauth_begin_result(
+            &store,
+            "acme-oauth",
+            &auth,
+            "verifier-test-123",
+            "state-test-123",
+        )
+        .await
+        .unwrap();
+
+        let url = reqwest::Url::parse(&begin.authorize_url).unwrap();
+        let query: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            url.as_str().split('?').next().unwrap(),
+            "https://acme.example.com/oauth/authorize"
+        );
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("acme-client-123")
+        );
+        assert_eq!(
+            query.get("code_challenge").map(String::as_str),
+            Some(ryuzi_core::plugins::oauth::pkce_challenge_s256("verifier-test-123").as_str())
+        );
+        assert_eq!(
+            query.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(
+            query.get("state").map(String::as_str),
+            Some("state-test-123")
+        );
+        assert_eq!(
+            query.get("scope").map(String::as_str),
+            Some("repo issues:read")
+        );
+        assert_eq!(query.get("prompt").map(String::as_str), Some("consent"));
+        assert_eq!(
+            query.get("redirect_uri").map(String::as_str),
+            Some(begin.redirect_uri.as_str())
+        );
     }
 
     // ---------- field_value_set ----------
