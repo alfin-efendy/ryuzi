@@ -528,6 +528,7 @@ mod tests {
                 effort: None,
                 perm_mode: PermMode::Default,
                 created_at: Some(crate::paths::now_ms()),
+                is_git: false,
             })
             .await
             .unwrap();

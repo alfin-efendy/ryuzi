@@ -43,10 +43,13 @@ export function JobNewView() {
   const wsName = gateways.find((w) => w.id === gateway)?.name ?? gateway;
 
   const branchProjectId = project?.projectId ?? null;
+  const isGit = project?.isGit ?? false;
   useEffect(() => {
     setBranchList(null);
     setBranch(null);
-    if (!branchProjectId) return;
+    // Non-git projects have no branches — never call list_branches for them
+    // (it errors "not a git repository").
+    if (!branchProjectId || !isGit) return;
     let cancelled = false;
     void commands.listBranches(branchProjectId).then((res) => {
       if (cancelled) return;
@@ -63,11 +66,13 @@ export function JobNewView() {
     return () => {
       cancelled = true;
     };
-  }, [branchProjectId]);
+  }, [branchProjectId, isGit]);
 
   // Gate on the branch list having resolved (preselected or user-picked) so the
-  // `branch ?? "main"` fallback below never fires while branches are still loading.
-  const canCreate = prompt.trim().length > 0 && project !== undefined && branch !== null && !saving;
+  // `branch ?? "main"` fallback below never fires while branches are still
+  // loading. Non-git projects have no branch list to wait for — they create
+  // branchless jobs.
+  const canCreate = prompt.trim().length > 0 && project !== undefined && (branch !== null || !isGit) && !saving;
   const goScheduler = () => nav.navigate({ kind: "scheduler" });
 
   const create = async () => {
@@ -79,7 +84,9 @@ export function JobNewView() {
       natural: schedule.natural,
       cron: schedule.cron,
       projectId: project.projectId,
-      branch: branch ?? "main",
+      // Branchless for non-git projects — the scheduler runner never reads
+      // job.branch when starting a run (scheduler.rs:536, no git options).
+      branch: isGit ? (branch ?? "main") : "",
       // Ryuzi-only sessions: jobs always run the native runtime.
       agent: "native",
       gateway,
@@ -129,20 +136,22 @@ export function JobNewView() {
                 </Button>
               }
             />
-            <Combobox
-              aria-label="Branch"
-              options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
-              value={branch}
-              onValueChange={setBranch}
-              placeholder="Branch"
-              trigger={
-                <Button variant="outline" size="sm" className="gap-[7px] font-mono text-[11.5px] text-muted-foreground">
-                  <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
-                  {branch ?? "main"}
-                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                </Button>
-              }
-            />
+            {isGit && (
+              <Combobox
+                aria-label="Branch"
+                options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
+                value={branch}
+                onValueChange={setBranch}
+                placeholder="Branch"
+                trigger={
+                  <Button variant="outline" size="sm" className="gap-[7px] font-mono text-[11.5px] text-muted-foreground">
+                    <GitBranch aria-hidden size={12} strokeWidth={2} className="shrink-0" />
+                    {branch ?? "main"}
+                    <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                  </Button>
+                }
+              />
+            )}
             <Combobox
               aria-label="Workspace"
               options={gateways.map((w) => ({

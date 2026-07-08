@@ -1,6 +1,10 @@
 // Pure UI copy and presentation constants. Anything stateful lives in the
 // domain stores backed by real IPC — nothing here is data.
 
+// Backend settings-table key: default destination for "Clone from URL"
+// (SettingsView "Projects folder"). Same storage mechanism as workdir_root.
+export const PROJECTS_ROOT_KEY = "projects_root";
+
 export type UiPermMode = "plan" | "ask" | "edit" | "full";
 
 export const PERM_MODES: { id: UiPermMode; label: string; desc: string }[] = [

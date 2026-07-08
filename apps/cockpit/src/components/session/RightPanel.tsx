@@ -6,13 +6,24 @@ import { useDiff, reviewFileIndex, EMPTY } from "@/store-diff";
 import { commands } from "@/bindings";
 import { diffLineStyle, type ReviewFile } from "@/lib/diff";
 import { basename, joinPath } from "@/lib/paths";
-import { Button, Input } from "@ryuzi/ui";
+import { Button, Input, Segmented } from "@ryuzi/ui";
 import { FileViewer } from "@/components/FileViewer";
+import { defaultModeForPath, previewKindForPath, type ViewMode } from "@/lib/preview";
 import { FileTreePane } from "@/components/FileTreePane";
 import { DiffStat } from "@/components/common/bits";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
 
-export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; branch: string | null; running: boolean }) {
+export function RightPanel({
+  sessionPk,
+  branch,
+  running,
+  isGit,
+}: {
+  sessionPk: string;
+  branch: string | null;
+  running: boolean;
+  isGit: boolean;
+}) {
   const nav = useNav();
   const ui = useUi();
   const [reviewFile, setReviewFile] = useState(0);
@@ -25,6 +36,8 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
   const setPendingReview = useDiff((s) => s.setPendingReview);
 
   const activeFileTab = ui.tabs.find((t) => t.id === ui.activeTabId) ?? ui.tabs[0];
+  // Explicit per-tab choice wins; otherwise previewable files default to View.
+  const fileMode: ViewMode = activeFileTab ? (activeFileTab.mode ?? defaultModeForPath(activeFileTab.path)) : "code";
 
   // Auto-refresh the file tree when a running turn ends — the agent may have
   // created or removed files while it was running.
@@ -35,10 +48,11 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
   }, [running]);
 
   // Auto-fetch when the tab opens and when a running turn finishes.
+  // Non-git projects have no diff to fetch (git_diff would just error).
   useEffect(() => {
-    if (!nav.rightOpen || nav.rightTab !== "review" || running) return;
+    if (!nav.rightOpen || nav.rightTab !== "review" || running || !isGit) return;
     void fetchDiff(sessionPk);
-  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk]);
+  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit]);
 
   // Consume a pending jump from a transcript edit card: select the file once
   // it appears in this session's diff, then clear the intent. A pending jump
@@ -122,8 +136,15 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
         </Button>
       </div>
 
+      {/* Review tab — non-git projects get an explicit empty state */}
+      {nav.rightTab === "review" && !isGit && (
+        <div className="flex flex-1 items-center justify-center px-6 text-center font-sans text-[12.5px] text-muted-foreground">
+          Not a git repository — the Review tab shows diffs for projects under version control.
+        </div>
+      )}
+
       {/* Review tab — the worktree's real git diff */}
-      {nav.rightTab === "review" && (
+      {nav.rightTab === "review" && isGit && (
         <>
           <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-4 py-2.5">
             <span className="font-mono text-xs text-muted-foreground">main → {branch ?? "worktree"}</span>
@@ -211,15 +232,28 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
                     </span>
                   ))}
                 <span className="font-semibold text-foreground">{basename(activeFileTab.path)}</span>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  title="Close file"
-                  className="ml-auto text-muted-foreground"
-                  onClick={() => ui.closeTab(activeFileTab.id)}
-                >
-                  <X aria-hidden size={12} strokeWidth={2} />
-                </Button>
+                <div className="ml-auto flex items-center gap-1.5">
+                  {previewKindForPath(activeFileTab.path) !== null && (
+                    <Segmented
+                      size="sm"
+                      options={[
+                        { id: "view", label: "View" },
+                        { id: "code", label: "Code" },
+                      ]}
+                      value={fileMode}
+                      onChange={(m) => ui.setTabMode(activeFileTab.id, m)}
+                    />
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    title="Close file"
+                    className="text-muted-foreground"
+                    onClick={() => ui.closeTab(activeFileTab.id)}
+                  >
+                    <X aria-hidden size={12} strokeWidth={2} />
+                  </Button>
+                </div>
               </>
             ) : (
               <form
@@ -274,10 +308,10 @@ export function RightPanel({ sessionPk, branch, running }: { sessionPk: string; 
               })}
             </div>
           )}
-          <div className="flex min-h-0 flex-1">
-            <div className="flex min-w-0 flex-1 flex-col overflow-auto text-xs">
+          <div className="flex min-h-0 flex-1 overflow-hidden">
+            <div className="flex min-w-0 flex-1 flex-col overflow-hidden text-xs">
               {activeFileTab ? (
-                <FileViewer path={activeFileTab.path} />
+                <FileViewer path={activeFileTab.path} mode={fileMode} />
               ) : (
                 <div className="flex flex-1 items-center justify-center font-sans text-[12.5px] text-muted-foreground">
                   Select a file from the tree.

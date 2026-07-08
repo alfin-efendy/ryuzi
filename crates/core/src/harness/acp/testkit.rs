@@ -1570,6 +1570,7 @@ pub async fn run_perm_mock_via_harness(
         effort: None,
         perm_mode: PermMode::Default,
         created_at: None,
+        is_git: false,
     };
     store.insert_project(project).await.unwrap();
 

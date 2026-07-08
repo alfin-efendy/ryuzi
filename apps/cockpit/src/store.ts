@@ -42,12 +42,17 @@ type State = {
   setFocused: (pk: string | null) => void;
   selectProject: (id: string | null) => void;
   refresh: () => Promise<void>;
-  addProject: () => Promise<void>;
+  /** Native folder picker → connect_project. True when a project was added. */
+  addProject: () => Promise<boolean>;
+  /** Clone `url` into `<destParent>/<repo-name>` via the backend. */
+  cloneProject: (url: string, destParent: string) => Promise<boolean>;
   /** Pin (or clear, with null) the model future turns of this project use. */
   setProjectModel: (projectId: string, model: string | null) => Promise<void>;
   /** Change the permission mode future turns of this project run under. */
   setProjectPermMode: (projectId: string, permMode: PermMode) => Promise<void>;
-  start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
+  /** Resolves true as soon as the backend accepts — navigate immediately;
+   *  the session list refresh completes in the background. */
+  start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
   send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
   stop: (sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
@@ -145,6 +150,10 @@ export const useStore = create<State>((set, get) => ({
         case "result":
           // Turn finished — the session is alive but awaiting input. Flip it out of "running"
           // so the composer leaves Stop mode and the user can reply.
+          // Also: turn-end guarantees the background git/harness prep (branch, worktreePath)
+          // has already backfilled the DB row — refresh now so the UI picks it up instead
+          // of waiting for some unrelated action to call refresh().
+          void get().refresh();
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
         case "sessionEnded":
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "ended" as const } : s)) };
@@ -194,14 +203,25 @@ export const useStore = create<State>((set, get) => ({
 
   addProject: async () => {
     const dir = await commands.pickDirectory();
-    if (!dir) return;
+    if (!dir) return false;
     const name = basename(dir) || "project";
     const res = await commands.connectProject(dir, name);
     if (res.status === "ok") {
       await get().refresh();
-    } else if (res.status === "error") {
-      toast.error("Couldn't add project: " + res.error.message);
+      return true;
     }
+    toast.error("Couldn't add project: " + res.error.message);
+    return false;
+  },
+
+  cloneProject: async (url, destParent) => {
+    const res = await commands.cloneProject(url, destParent);
+    if (res.status === "ok") {
+      await get().refresh();
+      return true;
+    }
+    toast.error("Couldn't clone project: " + res.error.message);
+    return false;
   },
 
   setProjectModel: async (projectId, model) => {
@@ -230,13 +250,16 @@ export const useStore = create<State>((set, get) => ({
 
   start: async (projectId, prompt, options) => {
     const res = await commands.startSession(projectId, prompt, toChatRequestOptions(options));
-    if (res.status === "ok") {
-      const pk = res.data.sessionPk;
-      set({ focusedSessionPk: pk });
-      await get().refresh();
-    } else if (res.status === "error") {
+    if (res.status === "error") {
       toast.error("Couldn't start session: " + res.error.message);
+      return false;
     }
+    // Optimistic navigation: the backend returns the session row before its
+    // git/harness startup finishes. Seed and focus it now; the full refresh
+    // catches up in the background.
+    set({ focusedSessionPk: res.data.sessionPk, sessions: [...get().sessions, res.data] });
+    void get().refresh();
+    return true;
   },
   send: async (sessionPk, prompt, options) => {
     const res = await commands.continueSession(sessionPk, prompt, toChatRequestOptions(options));

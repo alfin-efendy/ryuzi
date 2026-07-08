@@ -9,7 +9,7 @@
 use anyhow::Context;
 use std::collections::HashSet;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use crate::domain::AttachmentRef;
@@ -117,6 +117,17 @@ impl AttachmentFetcher for UreqFetcher {
         }
         Ok(FetchOutcome::Ok(buf))
     }
+}
+
+/// Builds a `file://` URL that [`UreqFetcher::fetch_capped`]'s
+/// `Url::to_file_path()` round-trip accepts. On Windows,
+/// `fs::canonicalize` returns verbatim paths (`\\?\C:\...`) that
+/// `Url::from_file_path` turns into URLs `to_file_path()` rejects;
+/// `dunce::simplified` strips the prefix first (no-op on non-Windows
+/// and on already-plain paths).
+pub fn file_url_for_path(path: &Path) -> anyhow::Result<url::Url> {
+    url::Url::from_file_path(dunce::simplified(path))
+        .map_err(|_| anyhow::anyhow!("not an absolute file path: {}", path.display()))
 }
 
 struct Signature {
@@ -853,6 +864,26 @@ mod tests {
             UreqFetcher.fetch_capped(&url, 4).unwrap(),
             FetchOutcome::TooBig
         ));
+    }
+
+    #[test]
+    fn file_url_for_path_round_trips_plain_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note with space.txt");
+        let url = file_url_for_path(&path).unwrap();
+        assert_eq!(url.scheme(), "file");
+        assert_eq!(url.to_file_path().unwrap(), path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_url_for_path_strips_windows_verbatim_prefix() {
+        let url = file_url_for_path(std::path::Path::new(r"\\?\C:\x\a.png")).unwrap();
+        assert_eq!(url.as_str(), "file:///C:/x/a.png");
+        assert_eq!(
+            url.to_file_path().unwrap(),
+            std::path::PathBuf::from(r"C:\x\a.png")
+        );
     }
 
     #[tokio::test]

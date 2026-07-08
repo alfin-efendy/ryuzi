@@ -37,6 +37,14 @@ async connectProject(workdir: string, name: string) : Promise<Result<Project, Cm
     else return { status: "error", error: e  as any };
 }
 },
+async cloneProject(url: string, destParent: string) : Promise<Result<Project, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clone_project", { url, destParent }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async startSession(projectId: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("start_session", { projectId, prompt, options }) };
@@ -679,6 +687,18 @@ async refreshProviderModels(family: string) : Promise<Result<RefreshModelsResult
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Persisted per-model probe verdicts for a vendor family — hydrates the
+ * provider Models card so earlier Test All results show immediately.
+ */
+async listModelStatuses(family: string) : Promise<Result<ModelStatusInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_model_statuses", { family }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async connectionProviderQuota(id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { id }) };
@@ -1159,6 +1179,10 @@ export type ModelRouteTarget = {
  * the family serving `model`, at request time.
  */
 provider: string; model: string }
+/**
+ * One persisted probe verdict row for the provider Models card.
+ */
+export type ModelStatusInfo = { model: string; status: string; message: string; testedAt: number }
 export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
 export type OpenTarget = { id: string; name: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
@@ -1197,7 +1221,12 @@ transport: string;
  * `${auth}` substitution, matching `ryuzi plugins info`'s output.
  */
 commandOrUrl: string }
-export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
+export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
+/**
+ * Computed at read time (`git2::Repository::open` probe on `workdir`) —
+ * NOT a DB column. Self-corrects if the user later runs `git init`.
+ */
+isGit: boolean }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
@@ -1242,7 +1271,16 @@ export type TermOutputMsg = { id: string;
  * UTF-8 chunk (lossy) of PTY output.
  */
 data: string }
-export type TestResult = { ok: boolean; message: string }
+export type TestResult = { 
+/**
+ * Legacy pass/fail, kept for existing call sites (connection-level
+ * test, toasts). Always derived: `status == "valid"`.
+ */
+ok: boolean; 
+/**
+ * Tri-state probe verdict: "valid" | "invalid" | "unknown".
+ */
+status: string; message: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type TodoItem = { content: string; status: string }
 export type ToolInfo = { name: string; desc: string; perm: string }

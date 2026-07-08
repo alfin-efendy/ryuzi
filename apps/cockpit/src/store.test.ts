@@ -283,8 +283,35 @@ const runningSession = (pk: string) => ({
 test("result event flips the session status back to idle (so the composer leaves Stop mode)", () => {
   reset();
   useStore.setState({ sessions: [runningSession("s1")] });
+  // result also fires a fire-and-forget refresh(); stub its IPC calls (never resolving,
+  // like the "start" tests do) so nothing hits the real Tauri binding after this test ends.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
   useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
   expect(useStore.getState().sessions[0].status).toBe("idle");
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("result event triggers a refresh so the git/harness backfill (branch, worktreePath) lands in the UI", async () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const backfilled = { ...runningSession("s1"), status: "idle" as const, branch: "harness/s1", worktreePath: "C:\\wt\\s1" };
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [backfilled] });
+
+  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
+  // refresh() is fire-and-forget; let its microtasks flush.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(listProjects).toHaveBeenCalled();
+  expect(listSessions).toHaveBeenCalled();
+  expect(useStore.getState().sessions[0].branch).toBe("harness/s1");
+  expect(useStore.getState().sessions[0].worktreePath).toBe("C:\\wt\\s1");
+
+  listProjects.mockRestore();
+  listSessions.mockRestore();
 });
 
 test("sessionEnded event marks the session ended", () => {
@@ -297,9 +324,15 @@ test("sessionEnded event marks the session ended", () => {
 test("result event leaves other sessions' status untouched", () => {
   reset();
   useStore.setState({ sessions: [runningSession("s1"), runningSession("s2")] });
+  // result also fires a fire-and-forget refresh(); stub its IPC calls (never resolving,
+  // like the "start" tests do) so nothing hits the real Tauri binding after this test ends.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
   useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
   const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
   expect(byPk).toEqual({ s1: "idle", s2: "running" });
+  listProjects.mockRestore();
+  listSessions.mockRestore();
 });
 
 test("start forwards chat options so composer runtime, context, and attachments reach IPC", async () => {
@@ -380,6 +413,84 @@ test("start forwards composer git options to IPC", async () => {
   });
 
   start.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("start resolves and focuses the session without waiting for refresh", async () => {
+  reset();
+  const start = spyOn(commands, "startSession").mockResolvedValue({
+    status: "ok",
+    data: {
+      sessionPk: "s3",
+      projectId: "p1",
+      agentSessionId: null,
+      worktreePath: null,
+      branch: null,
+      title: "go",
+      status: "running",
+      startedBy: "cockpit",
+      createdAt: 1,
+      lastActive: 1,
+      resumeAttempts: 0,
+      branchOwned: true,
+    },
+  });
+  // refresh() must not gate start(): these never resolve during the test.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
+
+  const ok = await useStore.getState().start("p1", "go", null);
+
+  expect(ok).toBe(true);
+  expect(useStore.getState().focusedSessionPk).toBe("s3");
+  // The returned row is seeded so the session view renders immediately.
+  expect(useStore.getState().sessions.map((s) => s.sessionPk)).toContain("s3");
+
+  start.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("start returns false and does not focus on backend error", async () => {
+  reset();
+  const start = spyOn(commands, "startSession").mockResolvedValue({
+    status: "error",
+    error: { message: "boom" },
+  });
+  const ok = await useStore.getState().start("p1", "go", null);
+  expect(ok).toBe(false);
+  expect(useStore.getState().focusedSessionPk).toBeNull();
+  start.mockRestore();
+});
+
+test("cloneProject clones via IPC and refreshes on success", async () => {
+  reset();
+  const clone = spyOn(commands, "cloneProject").mockResolvedValue({
+    status: "ok",
+    data: {
+      projectId: "p9",
+      name: "repo",
+      workdir: "C:\\proj\\repo",
+      source: "https://github.com/user/repo.git",
+      harness: "native",
+      model: null,
+      effort: null,
+      permMode: "default",
+      createdAt: 1,
+      isGit: true,
+    },
+  });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  const ok = await useStore.getState().cloneProject("https://github.com/user/repo.git", "C:\\proj");
+
+  expect(ok).toBe(true);
+  expect(clone).toHaveBeenCalledWith("https://github.com/user/repo.git", "C:\\proj");
+  expect(listProjects).toHaveBeenCalled();
+
+  clone.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
 });

@@ -1365,6 +1365,7 @@ mod tests {
                 effort: None,
                 perm_mode: crate::domain::PermMode::Default,
                 created_at: Some(0),
+                is_git: true,
             })
             .await
             .unwrap();
@@ -1475,6 +1476,7 @@ mod tests {
                 effort: None,
                 perm_mode: crate::domain::PermMode::Default,
                 created_at: Some(0),
+                is_git: false,
             })
             .await
             .unwrap();

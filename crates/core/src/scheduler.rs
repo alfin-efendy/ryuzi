@@ -568,7 +568,6 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
     };
 
     let session_pk = session.session_pk.clone();
-    let worktree = session.worktree_path.clone();
     let job_id = job.id.clone();
     let job_name = job.name.clone();
     let gateway = job.gateway.clone();
@@ -601,6 +600,18 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
             }
         }
         let (status, error) = outcome;
+        // Session-first start returns a provisional row (worktree_path: None,
+        // backfilled during background startup) — re-read the stored row so
+        // diff stats see the real worktree path. By the time the terminal
+        // Result lands, the backfill is long done: it precedes harness start,
+        // which precedes the first turn.
+        let worktree = cp2
+            .store()
+            .get_session(&session_pk)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.worktree_path);
         let (add, del) = match &worktree {
             Some(wt) if status == "success" => diff_totals(wt).await.unwrap_or((0, 0)),
             _ => (0, 0),

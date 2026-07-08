@@ -401,7 +401,7 @@ fn migrations() -> Migrations<'static> {
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
         // rewind-and-replay in `migration_13_rewrites_claude_code_defaults_to_native`,
-        // which now also re-runs this — the newest — migration) is a no-op
+        // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
             let exists = tx
@@ -415,6 +415,23 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // Provider model probe verdicts (design: docs/design/
+        // 2026-07-08-cockpit-ui-polish-batch-design.md §5): one row per
+        // (family, model), written only on a definitive valid/invalid probe
+        // so transient failures never clobber a known verdict. IF NOT EXISTS
+        // for the same reason branch_owned above is hook-guarded: the
+        // rewind-and-replay test re-runs appended migrations on a DB that
+        // already has this table, and that replay must be a no-op.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS model_status (\
+                family TEXT NOT NULL,\
+                model TEXT NOT NULL,\
+                status TEXT NOT NULL,\
+                message TEXT NOT NULL DEFAULT '',\
+                tested_at INTEGER NOT NULL,\
+                PRIMARY KEY (family, model)\
+            );",
+        ),
     ])
 }
 
@@ -424,10 +441,14 @@ pub struct Store {
 
 fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
     let perm: String = r.get(7)?;
+    let workdir: String = r.get(2)?;
     Ok(Project {
         project_id: r.get(0)?,
         name: r.get(1)?,
-        workdir: r.get(2)?,
+        // Read-time git-ness: cheap repo-open probe. Runs on the store's
+        // blocking connection thread, so sync git2 is fine here.
+        is_git: git2::Repository::open(&workdir).is_ok(),
+        workdir,
         source: r.get(3)?,
         harness: r.get(4)?,
         model: r.get(5)?,
@@ -470,6 +491,16 @@ pub struct UsageTotalRow {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelStatusRow {
+    pub family: String,
+    pub model: String,
+    /// "valid" | "invalid" — "unknown" is transient and never stored.
+    pub status: String,
+    pub message: String,
+    pub tested_at: i64,
 }
 
 /// UTC calendar day (YYYY-MM-DD) for a millisecond timestamp.
@@ -568,6 +599,55 @@ impl Store {
                 params![key, value],
             )
             .map(|_| ())
+        })
+        .await
+    }
+
+    /// Persist a definitive model probe verdict. "unknown" (rate limit /
+    /// server error / network) is transient and must never clobber a stored
+    /// verdict, so it is a no-op here.
+    pub async fn upsert_model_status(&self, row: ModelStatusRow) -> anyhow::Result<()> {
+        if row.status == "unknown" {
+            return Ok(());
+        }
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO model_status(family, model, status, message, tested_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(family, model) DO UPDATE SET \
+                    status=excluded.status, message=excluded.message, tested_at=excluded.tested_at",
+                params![
+                    row.family,
+                    row.model,
+                    row.status,
+                    row.message,
+                    row.tested_at
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn list_model_statuses(&self, family: &str) -> anyhow::Result<Vec<ModelStatusRow>> {
+        let family = family.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT family, model, status, message, tested_at FROM model_status \
+                 WHERE family=?1 ORDER BY model",
+            )?;
+            let items = stmt
+                .query_map(params![family], |r| {
+                    Ok(ModelStatusRow {
+                        family: r.get(0)?,
+                        model: r.get(1)?,
+                        status: r.get(2)?,
+                        message: r.get(3)?,
+                        tested_at: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
         })
         .await
     }
@@ -780,6 +860,27 @@ impl Store {
         })
         .await?;
         Ok(())
+    }
+
+    /// Backfill the workspace columns once background startup has prepared
+    /// the git workspace (session-first start returns a provisional row).
+    pub async fn update_session_workspace(
+        &self,
+        pk: &str,
+        worktree_path: Option<String>,
+        branch: &str,
+        branch_owned: bool,
+    ) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let branch = branch.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET worktree_path=?2, branch=?3, branch_owned=?4 WHERE session_pk=?1",
+                params![pk, worktree_path, branch, branch_owned],
+            )
+            .map(|_| ())
+        })
+        .await
     }
 
     /// Set `status` and `resume_attempts` together — used by `resume_session`
@@ -1356,6 +1457,7 @@ mod tests {
             effort: None,
             perm_mode: PermMode::Default,
             created_at: Some(123),
+            is_git: false,
         }
     }
 
@@ -1372,6 +1474,36 @@ mod tests {
 
         assert!(store.get_project("missing").await.unwrap().is_none());
         assert_eq!(store.list_projects().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_is_git_is_computed_at_read_time() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        // sample_project points at /tmp/demo — not a git repo on this machine.
+        store.insert_project(sample_project()).await.unwrap();
+        assert!(!store.get_project("p1").await.unwrap().unwrap().is_git);
+
+        // A workdir that IS a repo reports is_git=true on read — even though
+        // the flag is never persisted (it self-corrects after `git init`).
+        let repo_dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo_dir.path()).unwrap();
+        let mut p = sample_project();
+        p.project_id = "p2".into();
+        p.workdir = repo_dir.path().to_string_lossy().into_owned();
+        // Later created_at than sample_project's Some(123): list_projects
+        // sorts by `ORDER BY created_at` alone (store.rs:627), so a tie would
+        // leave the [false, true] assertion below to unspecified SQL ordering.
+        p.created_at = Some(456);
+        store.insert_project(p).await.unwrap();
+        assert!(store.get_project("p2").await.unwrap().unwrap().is_git);
+        let listed = store.list_projects().await.unwrap();
+        assert_eq!(
+            listed.iter().map(|p| p.is_git).collect::<Vec<_>>(),
+            vec![false, true],
+            "list_projects must compute the flag per row"
+        );
     }
 
     fn sample_session() -> Session {
@@ -1466,6 +1598,99 @@ mod tests {
             .unwrap();
         let s = store.get_session("legacy").await.unwrap().unwrap();
         assert!(s.branch_owned, "legacy rows must default to branch_owned=1");
+    }
+
+    #[tokio::test]
+    async fn model_status_upserts_and_lists_by_family() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "anthropic".into(),
+                model: "claude-x".into(),
+                status: "valid".into(),
+                message: "Model claude-x OK".into(),
+                tested_at: 100,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "openai".into(),
+                model: "gpt-x".into(),
+                status: "invalid".into(),
+                message: "Model gpt-x returned HTTP 404".into(),
+                tested_at: 101,
+            })
+            .await
+            .unwrap();
+        // A re-test overwrites the previous verdict for the same (family, model).
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "anthropic".into(),
+                model: "claude-x".into(),
+                status: "invalid".into(),
+                message: "Model claude-x returned HTTP 404".into(),
+                tested_at: 200,
+            })
+            .await
+            .unwrap();
+
+        let rows = store.list_model_statuses("anthropic").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "claude-x");
+        assert_eq!(rows[0].status, "invalid");
+        assert_eq!(rows[0].tested_at, 200);
+        assert_eq!(store.list_model_statuses("openai").await.unwrap().len(), 1);
+        assert!(store
+            .list_model_statuses("mistral")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_status_unknown_never_overwrites_or_inserts() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "anthropic".into(),
+                model: "claude-x".into(),
+                status: "valid".into(),
+                message: "Model claude-x OK".into(),
+                tested_at: 100,
+            })
+            .await
+            .unwrap();
+        // A transient failure (429/5xx/network) must not clobber the verdict…
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "anthropic".into(),
+                model: "claude-x".into(),
+                status: "unknown".into(),
+                message: "Model claude-x network error: timeout".into(),
+                tested_at: 200,
+            })
+            .await
+            .unwrap();
+        // …and must not create a row for a never-validated model either.
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "anthropic".into(),
+                model: "claude-y".into(),
+                status: "unknown".into(),
+                message: "Model claude-y returned HTTP 429".into(),
+                tested_at: 201,
+            })
+            .await
+            .unwrap();
+
+        let rows = store.list_model_statuses("anthropic").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "claude-x");
+        assert_eq!(rows[0].status, "valid");
+        assert_eq!(rows[0].tested_at, 100);
     }
 
     #[tokio::test]
@@ -1944,16 +2169,17 @@ mod tests {
     #[tokio::test]
     async fn migration_13_rewrites_claude_code_defaults_to_native() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back two so both
-        // the rewrite migration (13) AND the migration appended after it
-        // (14, sessions.branch_owned — hook-guarded, so replaying it is a
-        // no-op) re-run on the next open. `Migrations` always fast-forwards
-        // to the latest defined version, so there is no way to replay 13
-        // alone once something is appended after it.
+        // DB, seed the old values, then wind user_version back three so the
+        // rewrite migration (13) AND every migration appended after it
+        // (14 sessions.branch_owned — hook-guarded; 15 model_status —
+        // CREATE TABLE IF NOT EXISTS; both no-ops on replay) re-run on the
+        // next open. `Migrations` always fast-forwards to the latest defined
+        // version, so there is no way to replay 13 alone once something is
+        // appended after it.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 2)
+            c.pragma_update(None, "user_version", v - 3)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
