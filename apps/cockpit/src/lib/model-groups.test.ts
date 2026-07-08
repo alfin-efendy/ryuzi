@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { groupModelOptions } from "./model-groups";
+import { groupModelOptions, withLeadingOption } from "./model-groups";
 import type { CatalogEntry, ConnectionInfo } from "../bindings";
 
 const entry = (id: string, family: string, name: string, models: string[] = []): CatalogEntry =>
@@ -100,5 +100,23 @@ test("catalog-entry-id prefix resolves to its family with a trimmed label", () =
       label: "Anthropic",
       options: [{ value: "anthropic-oauth/claude-opus-4-8", label: "claude-opus-4-8", mono: true }],
     },
+  ]);
+});
+
+test("withLeadingOption prepends a bare option to a flat list", () => {
+  const sentinel = { value: "", label: "Router default (first usable provider)" };
+  expect(withLeadingOption(sentinel, [{ value: "m1", label: "m1", mono: true }])).toEqual([
+    sentinel,
+    { value: "m1", label: "m1", mono: true },
+  ]);
+  expect(withLeadingOption(sentinel, [])).toEqual([sentinel]);
+});
+
+test("withLeadingOption wraps the sentinel in a headingless group ahead of a grouped list", () => {
+  const sentinel = { value: "__combo__", label: "Route by task (combo)" };
+  const groups = groupModelOptions(["anthropic/claude-fable-5"], catalog, []);
+  expect(withLeadingOption(sentinel, groups)).toEqual([
+    { label: "", options: [sentinel] },
+    { label: "Anthropic", options: [{ value: "anthropic/claude-fable-5", label: "claude-fable-5", mono: true }] },
   ]);
 });

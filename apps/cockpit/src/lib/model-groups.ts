@@ -94,3 +94,19 @@ export function groupModelOptions(
   if (other.length > 0) groups.push({ label: "Other", options: other });
   return groups;
 }
+
+/** Prepend a sentinel option (e.g. "Router default…", the combo item) ahead
+ *  of a picker's option list. `Combobox` accepts only homogeneous arrays, so
+ *  ahead of a grouped list the sentinel is wrapped as a headingless
+ *  one-option group (an empty group label renders no header row). */
+export function withLeadingOption(
+  leading: ComboboxOption,
+  options: ComboboxOption[] | ComboboxGroup[],
+): ComboboxOption[] | ComboboxGroup[] {
+  return isGrouped(options) ? [{ label: "", options: [leading] }, ...options] : [leading, ...options];
+}
+
+function isGrouped(options: ComboboxOption[] | ComboboxGroup[]): options is ComboboxGroup[] {
+  const first = options[0];
+  return first !== undefined && "options" in first;
+}
