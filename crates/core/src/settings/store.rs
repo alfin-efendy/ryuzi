@@ -73,6 +73,10 @@ impl SettingsStore {
         Self { store }
     }
 
+    pub(crate) fn store(&self) -> Arc<Store> {
+        self.store.clone()
+    }
+
     /// The persisted row, if any (even an empty string); else the field's
     /// schema default.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -199,8 +203,7 @@ mod tests {
             auth: Some(AuthSpec {
                 kind: AuthKind::Token,
                 setting: Some(format!("plugin.{id}.token")),
-                env: None,
-                help_url: None,
+                ..Default::default()
             }),
             settings: vec![SettingField {
                 key: format!("plugin.{id}.host"),

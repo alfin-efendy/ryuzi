@@ -14,7 +14,7 @@ import {
   SettingsCardTitle as CardTitle,
   Switch,
 } from "@ryuzi/ui";
-import { commands, type PluginDetail } from "@/bindings";
+import { commands, events, type PluginDetail } from "@/bindings";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { pluginIcon } from "@/lib/plugin-icons";
@@ -78,6 +78,11 @@ export function PluginDetailView({ id }: { id: string }) {
   const [savingAuth, setSavingAuth] = useState(false);
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
   const [savingField, setSavingField] = useState<string | null>(null);
+  const [oauthStateToken, setOauthStateToken] = useState<string | null>(null);
+  const [oauthAuthorizeUrl, setOauthAuthorizeUrl] = useState("");
+  const [oauthRedirectUri, setOauthRedirectUri] = useState("");
+  const [oauthCode, setOauthCode] = useState("");
+  const [oauthBusy, setOauthBusy] = useState<"begin" | "complete" | "disconnect" | null>(null);
 
   const load = useCallback(async () => {
     const res = await commands.pluginDetail(id);
@@ -91,8 +96,33 @@ export function PluginDetailView({ id }: { id: string }) {
     setLoaded(false);
     setAuthValue("");
     setFieldValues({});
+    setOauthStateToken(null);
+    setOauthAuthorizeUrl("");
+    setOauthRedirectUri("");
+    setOauthCode("");
+    setOauthBusy(null);
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    void events.pluginOauthAuthorizeUrlMsg
+      .listen((event) => {
+        if (!active || event.payload.pluginId !== id) return;
+        setOauthAuthorizeUrl(event.payload.authorizeUrl);
+      })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [id]);
 
   if (!loaded || !detail) {
     return (
@@ -144,6 +174,65 @@ export function PluginDetailView({ id }: { id: string }) {
     await reloadPlugins();
   };
 
+  const startOauth = async () => {
+    if (!detail?.auth || oauthBusy) return;
+    setOauthBusy("begin");
+    const res = await commands.beginPluginOauth(id);
+    if (res.status === "error") {
+      toast.error(res.error.message);
+      setOauthBusy(null);
+      return;
+    }
+    setOauthStateToken(res.data.stateToken);
+    setOauthAuthorizeUrl(res.data.authorizeUrl);
+    setOauthRedirectUri(res.data.redirectUri);
+    setOauthCode("");
+    setOauthBusy(null);
+  };
+
+  const completeOauth = async () => {
+    if (!oauthStateToken || oauthCode.trim().length === 0 || oauthBusy) return;
+    setOauthBusy("complete");
+    const res = await commands.completePluginOauth(id, oauthCode.trim(), oauthStateToken);
+    if (res.status === "error") {
+      toast.error(res.error.message);
+      setOauthBusy(null);
+      return;
+    }
+    toast.success("Connected");
+    setOauthStateToken(null);
+    setOauthAuthorizeUrl("");
+    setOauthRedirectUri("");
+    setOauthCode("");
+    setOauthBusy(null);
+    await load();
+    await reloadPlugins();
+  };
+
+  const disconnectOauth = async () => {
+    if (!detail?.auth?.oauthTokenStored || oauthBusy) return;
+    setOauthBusy("disconnect");
+    const res = await commands.disconnectPluginOauth(id);
+    if (res.status === "error") toast.error(res.error.message);
+    else {
+      toast.success("Disconnected");
+      setOauthStateToken(null);
+      setOauthAuthorizeUrl("");
+      setOauthRedirectUri("");
+      setOauthCode("");
+      await load();
+      await reloadPlugins();
+    }
+    setOauthBusy(null);
+  };
+
+  const cancelOauth = () => {
+    setOauthStateToken(null);
+    setOauthAuthorizeUrl("");
+    setOauthRedirectUri("");
+    setOauthCode("");
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[720px]">
@@ -188,10 +277,90 @@ export function PluginDetailView({ id }: { id: string }) {
             <CardHeader>
               <CardTitle>Authentication</CardTitle>
               <Pill variant={detail.auth.configured ? "primary" : "secondary"}>
-                {detail.auth.configured ? "Configured" : "Not configured"}
+                {detail.auth.kind === "oauth" && detail.auth.oauthReconnectRequired
+                  ? "Reconnect required"
+                  : detail.auth.configured
+                    ? "Configured"
+                    : "Not configured"}
               </Pill>
             </CardHeader>
-            {detail.auth.setting ? (
+            {detail.auth.kind === "oauth" ? (
+              <>
+                <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
+                  {detail.auth.oauthConnectAvailable
+                    ? detail.auth.oauthReconnectRequired
+                      ? "Cockpit has a saved token for this plugin, but it needs to be reconnected."
+                      : detail.auth.oauthTokenStored
+                        ? "Cockpit has a saved OAuth token for this plugin."
+                        : "Cockpit can start OAuth for this plugin. After the browser redirects, paste the returned code below to finish connecting."
+                    : (detail.auth.oauthConnectError ??
+                      "Cockpit needs an authorize URL, token URL, and a saved client ID before it can start OAuth for this plugin.")}
+                </div>
+                {detail.auth.oauthConnectAvailable && (
+                  <div className="border-t border-border px-[18px] py-3">
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      {detail.auth.oauthTokenStored && (
+                        <Button variant="outline" size="sm" onClick={() => void disconnectOauth()} disabled={oauthBusy !== null}>
+                          {oauthBusy === "disconnect" ? "Disconnecting…" : "Disconnect"}
+                        </Button>
+                      )}
+                      <Button size="sm" onClick={() => void startOauth()} disabled={oauthBusy !== null}>
+                        {oauthBusy === "begin"
+                          ? "Opening…"
+                          : detail.auth.oauthReconnectRequired || detail.auth.oauthTokenStored
+                            ? "Reconnect"
+                            : "Connect"}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+                {oauthStateToken && (
+                  <>
+                    <div className="border-t border-border px-[18px] py-3">
+                      <FormField label="Login URL">
+                        <div className="flex min-w-0 gap-2">
+                          <Input
+                            readOnly
+                            value={oauthAuthorizeUrl}
+                            onFocus={(event) => event.currentTarget.select()}
+                            className="min-w-0 font-mono text-[11.5px]"
+                          />
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => void openUrl(oauthAuthorizeUrl)}
+                            disabled={oauthAuthorizeUrl.length === 0 || oauthBusy !== null}
+                            className="shrink-0"
+                          >
+                            Open
+                          </Button>
+                        </div>
+                      </FormField>
+                      <div className="mt-3">
+                        <FormField label="Authorization code">
+                          <Input
+                            value={oauthCode}
+                            onChange={(event) => setOauthCode(event.target.value)}
+                            placeholder="Paste the code value from the callback URL"
+                          />
+                        </FormField>
+                      </div>
+                      <p className="m-0 mt-1.5 text-xs text-muted-foreground">
+                        Callback URL: <span className="font-mono text-[11px]">{oauthRedirectUri}</span>
+                      </p>
+                    </div>
+                    <div className="flex justify-end gap-2 border-t border-border px-[18px] py-3">
+                      <Button variant="outline" size="sm" onClick={cancelOauth} disabled={oauthBusy !== null}>
+                        Cancel
+                      </Button>
+                      <Button size="sm" onClick={() => void completeOauth()} disabled={oauthBusy !== null || oauthCode.trim().length === 0}>
+                        {oauthBusy === "complete" ? "Connecting…" : "Finish connect"}
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </>
+            ) : detail.auth.setting ? (
               <FieldRow
                 label="Credential"
                 help={detail.auth.env ? `Falls back to the ${detail.auth.env} environment variable if unset.` : undefined}
@@ -205,13 +374,12 @@ export function PluginDetailView({ id }: { id: string }) {
               />
             ) : (
               <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
-                {detail.auth.kind === "oauth" && "Sign-in for this plugin isn't wired in Cockpit yet — use the help link below."}
-                {detail.auth.kind !== "oauth" && detail.auth.env && (
+                {detail.auth.env && (
                   <>
                     Set the <span className="font-mono text-xs">{detail.auth.env}</span> environment variable.
                   </>
                 )}
-                {detail.auth.kind !== "oauth" && !detail.auth.env && "No credential required beyond enabling the plugin."}
+                {!detail.auth.env && "No credential required beyond enabling the plugin."}
               </div>
             )}
             {detail.auth.helpUrl && (

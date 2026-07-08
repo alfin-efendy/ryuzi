@@ -4,7 +4,7 @@ Ryuzi's extension points — model providers, CLI-agent runtimes, the Discord
 gateway, and third-party integrations (GitHub, Notion, Slack, memory
 backends, sandboxes, deploy platforms...) — are all **plugins**: one manifest
 each, surfaced identically through `ryuzi plugins`, `GET /plugins`, and
-Cockpit's sidebar + Apps → Catalog tab.
+Cockpit's Plugins hub.
 
 This guide covers the manifest format, how to author and install your own
 plugin, and how the built-in fleet is organized. It documents what is
@@ -67,6 +67,38 @@ hot-reload.
 
 ---
 
+## Cockpit Plugins hub
+
+Cockpit's plugin UI now lives under the dedicated **Plugins** screen
+(`apps/cockpit/src/views/PluginsView.tsx`) plus the per-plugin detail screen
+(`PluginDetailView.tsx`), not the old Apps-only catalog flow. The screen is
+split into four tabs backed by thin Tauri commands:
+
+- **Installed** — DB-backed MCP apps already added to the local machine
+  (`apps_cmd.rs` / `useApps`).
+- **Access** — which runtimes are allowed to call each installed app.
+- **Browse** — a combined browser for the embedded **catalog** manifests and
+  the live MCP **registry** (`registry_cmd.rs`).
+- **Skills** — Ryuzi-native skill-pack install / refresh / removal
+  (`skills_cmd.rs`, backed by `crates/core/src/skills_install.rs`).
+
+The Browse tab intentionally mixes two sources in one place:
+
+- **Catalog** cards come from `list_plugins` filtered to non-builtin plugins.
+- **Registry** cards come from `registry_search`, which queries
+  `https://registry.modelcontextprotocol.io/v0/servers`.
+
+Registry results are grouped by logical server identity (`server.name`), not
+raw response row, so multiple published versions render as one card with a
+version picker. The entry marked `isLatest` wins the top-level install target
+when the registry exposes several versions for the same plugin; otherwise the
+newest semantic-ish version sorts first. Installing a registry entry still
+creates a normal DB-backed app row (`npx -y <package>` for stdio, URL for
+remote HTTP), so after install it behaves the same as any hand-added MCP
+server.
+
+---
+
 ## Manifest reference
 
 One plugin = one manifest, `ryuzi-plugin.toml` for catalog/user plugins.
@@ -101,6 +133,15 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `setting` | string \| null | `None` | Settings-store key holding the secret (e.g. `plugin.github.token`). |
 | `env` | string \| null | `None` | Fallback environment variable, read if `setting` is unset/empty. |
 | `help_url` | string \| null | `None` | Where to obtain a credential; surfaced in error messages. |
+| `authorize-url` | string \| null | `None` | OAuth authorize endpoint, required for Cockpit's native plugin sign-in flow. |
+| `token-url` | string \| null | `None` | OAuth token endpoint, required for Cockpit's native plugin sign-in flow. |
+| `resource` | string \| null | `None` | Optional OAuth resource/audience parameter added to both authorize and token requests. |
+| `scopes` | string[] | `[]` | Requested OAuth scopes. |
+| `client-id-setting` | string \| null | `None` | Settings-store key that holds the OAuth client id. |
+| `client-secret-setting` | string \| null | `None` | Optional settings-store key for the OAuth client secret. |
+| `dynamic-registration` | bool | `false` | Parsed and preserved in the manifest today; Cockpit's v1 plugin sign-in still expects a saved client id. |
+| `extra-authorize-params` | table (string → string) | `{}` | Extra query params appended to the authorize URL. |
+| `extra-token-params` | table (string → string) | `{}` | Extra form fields appended to the token exchange request. |
 
 ### `[[settings]]`
 
@@ -255,11 +296,12 @@ an integration's auth tier is described by `[auth].kind`, not by category.
   substitution to draw from.
 - `api-key` / `token` — a secret read from the settings store
   (`auth.setting`) with an environment-variable fallback (`auth.env`).
-- `oauth` — for model providers this delegates to `llm_router`'s existing
-  OAuth machinery (unchanged by the plugin SDK); for remote MCP servers v1
-  has no broker — the manifest carries `help_url` only (e.g. `atlassian`,
-  `notion`, `figma`, `slack`, `sentry`, `cloudflare`, `vercel` all ship with
-  `kind = "oauth"` and no `setting`/`env`).
+- `oauth` — two distinct paths exist now:
+  - **Model providers** still use `llm_router`'s provider-specific OAuth
+    machinery.
+  - **Plugin connectors** can use Cockpit's native plugin OAuth flow when the
+    manifest declares `authorize-url`, `token-url`, and `client-id-setting`
+    (plus any optional scopes/resource/extra params).
 
 ### Resolution order
 
@@ -311,6 +353,36 @@ parse error. Nothing surfaces to the CLI or Cockpit UI mid-session beyond
 that log line, so check `ryuzi plugins info <id>`'s `auth:`/`setting:`
 lines (or the Cockpit plugin detail screen) *before* enabling a plugin,
 rather than relying on a session-time warning.
+
+### Cockpit plugin OAuth sign-in
+
+When a plugin detail screen sees `auth.kind = "oauth"`, Cockpit asks the Tauri
+backend for a richer `PluginAuthInfo`:
+
+- `oauthConnectAvailable = true` only when the manifest has enough metadata
+  for Cockpit to start the flow, currently `authorize-url`, `token-url`, and a
+  non-empty saved value under `client-id-setting`.
+- `begin_plugin_oauth` builds a PKCE authorize URL, opens it in the browser,
+  emits `plugin-oauth-authorize-url-msg`, and shows the callback URL Cockpit
+  expects (`http://127.0.0.1:8976/plugin-oauth/<id>/callback`).
+- `complete_plugin_oauth` exchanges the pasted authorization code for a token
+  and persists it in the store as a `PluginOauthToken`.
+- `disconnect_plugin_oauth` deletes the saved token and returns the plugin to
+  an unconfigured state.
+
+Today this native sign-in path is available to plugin manifests whose
+`auth.kind = "oauth"` block carries the full OAuth metadata and points at a
+saved client id, regardless of MCP transport. Declarative HTTP MCP entries use
+the stored token automatically as an `Authorization: Bearer ...` header; other
+transports still need their manifests or provider-specific host support to map
+the stored credential into the runtime process.
+
+For declarative HTTP MCP entries, the connector checks token expiry before
+injecting the bearer. If the token is due and a refresh token is available, it
+refreshes against `token-url` and stores the new token before building the MCP
+server spec. If refresh is impossible, or the provider returns a terminal OAuth
+error such as `invalid_grant`, the token row is marked reconnect-required so
+Cockpit can ask the user to sign in again.
 
 ---
 
@@ -382,6 +454,20 @@ name = "github-triage"
 description = "Triage issues into labeled buckets"
 path = "skills/github-triage"   # relative to this manifest's own directory
 ```
+
+The separate Cockpit **Skills** tab uses a different install path from
+manifest-authored user plugins. `crates/core/src/skills_install.rs` installs:
+
+- **Single native skill repos** to `~/.config/ryuzi/skills/<skill-id>/`
+- **Plugin skill packs** to `~/.config/ryuzi/plugins/<plugin-id>/`
+- Then materializes each bundled skill into
+  `~/.config/ryuzi/skills/<plugin-id>--<skill-id>/` so native sessions can
+  discover the skills immediately without waiting for plugin manifest loading
+  inside a separate process
+
+Every materialized install gets a `.ryuzi-skill.json` provenance file so
+refresh/remove can clean up both the plugin copy and the generated skill
+directories without guessing.
 
 ---
 
@@ -460,12 +546,12 @@ ryuzi plugins enable github
 ryuzi plugins disable github
 ```
 
-- **Cockpit**: the Apps view's **Catalog** tab (`Apps` → `Catalog` segmented
-  tab) lists every catalog/user plugin with a category filter and an
-  enable/disable `Switch` per card (disabled — greyed out — for
+- **Cockpit**: the dedicated **Plugins** screen's **Browse** tab lists every
+  catalog/user plugin with source and category filters plus an
+  enable/disable `Switch` per catalog card (disabled — greyed out — for
   `experimental` entries, since there's nothing to enable); the plugin
   detail screen (reached from the sidebar's Plugins section or the
-  Catalog card's "Configure" button) has the same switch.
+  Browse card's "Configure" button) has the same switch.
 - **Settings keys directly**: `enabled_runtimes`/`enabled_gateways` are CSV
   strings (add/remove `id`, preserving order, no duplicates —
   `toggle_enabled`'s `toggle_csv` helper); everything else is

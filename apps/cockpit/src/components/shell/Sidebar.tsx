@@ -45,7 +45,7 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
   { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail", "connectionDetail"] },
   { label: "Runtime", icon: Bot, view: { kind: "runtime" }, group: ["runtime", "runtimeDetail"] },
   { label: "Scheduler", icon: CalendarClock, view: { kind: "scheduler" }, group: ["scheduler", "jobDetail", "jobNew"] },
-  { label: "Apps", icon: LayoutGrid, view: { kind: "apps" }, group: ["apps", "appDetail", "registry"] },
+  { label: "Plugins", icon: LayoutGrid, view: { kind: "plugins" }, group: ["plugins", "appDetail", "pluginDetail"] },
   { label: "Settings", icon: Settings, view: { kind: "settings" }, group: ["settings"] },
 ];
 
@@ -197,7 +197,9 @@ export function Sidebar() {
           when no plugin qualifies so it never reserves empty space. */}
       {menuPlugins.length > 0 && (
         <div className="box-border flex w-[260px] flex-col gap-[2px] px-2.5 pb-1">
-          <div className="px-2.5 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Plugins</div>
+          <div className="px-2.5 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">
+            Enabled plugins
+          </div>
           {menuPlugins.map((plugin) => {
             const active = view.kind === "pluginDetail" && view.id === plugin.id;
             const Icon = pluginIcon(plugin.icon);

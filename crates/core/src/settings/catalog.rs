@@ -137,8 +137,7 @@ mod tests {
             auth: Some(AuthSpec {
                 kind: AuthKind::Token,
                 setting: Some(format!("plugin.{id}.token")),
-                env: None,
-                help_url: None,
+                ..Default::default()
             }),
             settings: vec![],
             mcp: vec![],

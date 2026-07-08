@@ -16,9 +16,8 @@ export type View =
   | { kind: "scheduler" }
   | { kind: "jobDetail"; id: string }
   | { kind: "jobNew" }
-  | { kind: "apps" }
+  | { kind: "plugins" }
   | { kind: "appDetail"; id: string }
-  | { kind: "registry" }
   | { kind: "gateways" }
   | { kind: "gatewayDetail"; id: string }
   | { kind: "pluginDetail"; id: string }

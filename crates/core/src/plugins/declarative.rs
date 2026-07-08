@@ -10,11 +10,25 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ryuzi_plugin_sdk::subst::{resolve, Resolver};
 use ryuzi_plugin_sdk::{AuthKind, McpServerDef, McpTransportDef, PluginManifest};
+use serde::Deserialize;
 
 use crate::connector::{Connector, ConnectorCtx};
 use crate::domain::{McpServerSpec, McpTransport};
+use crate::plugins::oauth::{needs_refresh, PluginOauthToken};
 
 use super::host::{CorePlugin, PluginSource};
+
+const TERMINAL_OAUTH_REFRESH_ERRORS: &[&str] =
+    &["invalid_grant", "refresh_token_reused", "invalid_request"];
+
+#[derive(Debug, Deserialize)]
+struct PluginOauthRefreshResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    token_type: Option<String>,
+    expires_in: Option<i64>,
+    scope: Option<String>,
+}
 
 /// Build a `CorePlugin` from a manifest. Harness and gateway capability can
 /// never come from a manifest alone (those require Rust code — see
@@ -67,7 +81,9 @@ impl Connector for DeclarativeConnector {
             // (`resolve_auth`, below) may still resolve a value from those
             // sources and inject it into an `[[mcp]]` entry. "none" is about
             // the gate, not about whether a value exists.
-            if auth.kind != AuthKind::None && self.resolve_auth(ctx).await?.is_none() {
+            if auth.kind == AuthKind::Oauth && self.uses_http_oauth() {
+                self.resolve_http_oauth_bearer_token(ctx).await?;
+            } else if auth.kind != AuthKind::None && self.resolve_auth(ctx).await?.is_none() {
                 let id = &self.manifest.id;
                 match &auth.help_url {
                     Some(url) => anyhow::bail!("configure {id}: see {url}"),
@@ -151,20 +167,214 @@ impl DeclarativeConnector {
     /// `${env:VAR}` needs no pre-fetch since `std::env::var` is sync.
     async fn resolver(&self, ctx: &ConnectorCtx) -> anyhow::Result<PreloadedResolver> {
         let auth = self.resolve_auth(ctx).await?;
+        let oauth_bearer_token = self.resolve_http_oauth_bearer_token(ctx).await?;
         let mut settings = HashMap::new();
         for key in setting_keys(&self.manifest.mcp) {
             if let Some(v) = ctx.settings.get(&key).await? {
                 settings.insert(key, v);
             }
         }
-        Ok(PreloadedResolver { auth, settings })
+        Ok(PreloadedResolver {
+            auth,
+            oauth_bearer_token,
+            settings,
+        })
     }
+
+    fn uses_http_oauth(&self) -> bool {
+        self.manifest
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.kind == AuthKind::Oauth)
+            && self
+                .manifest
+                .mcp
+                .iter()
+                .any(|server| server.transport == McpTransportDef::Http)
+    }
+
+    async fn resolve_http_oauth_bearer_token(
+        &self,
+        ctx: &ConnectorCtx,
+    ) -> anyhow::Result<Option<String>> {
+        if !self.uses_http_oauth() {
+            return Ok(None);
+        }
+        let id = &self.manifest.id;
+        let Some(token) = ctx.settings.store().get_plugin_oauth_token(id).await? else {
+            return Err(self.http_oauth_auth_required_error(false));
+        };
+        if token.reconnect_required {
+            return Err(self.http_oauth_auth_required_error(true));
+        }
+        if !needs_refresh(crate::paths::now_ms(), token.expires_at) {
+            return Ok(Some(token.access_token));
+        }
+        let refreshed = self.refresh_http_oauth_token(ctx, token).await?;
+        Ok(Some(refreshed.access_token))
+    }
+
+    async fn refresh_http_oauth_token(
+        &self,
+        ctx: &ConnectorCtx,
+        token: PluginOauthToken,
+    ) -> anyhow::Result<PluginOauthToken> {
+        let id = &self.manifest.id;
+        let store = ctx.settings.store();
+        let Some(auth) = self.manifest.auth.as_ref() else {
+            return Ok(token);
+        };
+        let Some(refresh_token) = token
+            .refresh_token
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            store.mark_plugin_oauth_reconnect_required(id).await?;
+            return Err(self.http_oauth_auth_required_error(true));
+        };
+        let Some(token_url) = auth.token_url.as_deref().filter(|value| !value.is_empty()) else {
+            store.mark_plugin_oauth_reconnect_required(id).await?;
+            return Err(self.http_oauth_auth_required_error(true));
+        };
+
+        let mut form = vec![
+            ("grant_type".to_string(), "refresh_token".to_string()),
+            ("refresh_token".to_string(), refresh_token.to_string()),
+        ];
+        self.push_refresh_setting(
+            &mut form,
+            ctx,
+            auth.client_id_setting.as_deref(),
+            "client_id",
+        )
+        .await?;
+        self.push_refresh_setting(
+            &mut form,
+            ctx,
+            auth.client_secret_setting.as_deref(),
+            "client_secret",
+        )
+        .await?;
+        if let Some(resource) = auth.resource.as_deref().filter(|value| !value.is_empty()) {
+            form.push(("resource".to_string(), resource.to_string()));
+        }
+        for (key, value) in &auth.extra_token_params {
+            form.push((key.clone(), value.clone()));
+        }
+
+        let http = reqwest::Client::new();
+        let response = http.post(token_url).form(&form).send().await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if is_terminal_oauth_refresh_error(&body) {
+                store.mark_plugin_oauth_reconnect_required(id).await?;
+                return Err(self.http_oauth_auth_required_error(true));
+            }
+            let detail = body.trim();
+            if detail.is_empty() {
+                anyhow::bail!("{id} OAuth token refresh failed with HTTP {status}");
+            }
+            anyhow::bail!("{id} OAuth token refresh failed with HTTP {status}: {detail}");
+        }
+
+        let payload: PluginOauthRefreshResponse = serde_json::from_str(&body)?;
+        let access_token = payload
+            .access_token
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("{id} OAuth token refresh response is missing access_token")
+            })?;
+        let scopes = payload
+            .scope
+            .map(|scope| {
+                scope
+                    .split_whitespace()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|scopes| !scopes.is_empty())
+            .unwrap_or_else(|| token.scopes.clone());
+        let refreshed = PluginOauthToken {
+            plugin_id: token.plugin_id.clone(),
+            access_token,
+            refresh_token: payload
+                .refresh_token
+                .filter(|refresh_token| !refresh_token.is_empty())
+                .or(token.refresh_token.clone()),
+            token_type: payload
+                .token_type
+                .filter(|token_type| !token_type.is_empty())
+                .unwrap_or_else(|| token.token_type.clone()),
+            expires_at: payload
+                .expires_in
+                .map(|seconds| crate::paths::now_ms() + seconds.saturating_mul(1000)),
+            scopes,
+            reconnect_required: false,
+        };
+        store.upsert_plugin_oauth_token(&refreshed).await?;
+        Ok(refreshed)
+    }
+
+    async fn push_refresh_setting(
+        &self,
+        form: &mut Vec<(String, String)>,
+        ctx: &ConnectorCtx,
+        key: Option<&str>,
+        form_key: &str,
+    ) -> anyhow::Result<()> {
+        let Some(key) = key else {
+            return Ok(());
+        };
+        match ctx.settings.get(key).await? {
+            Some(value) if !value.is_empty() => form.push((form_key.to_string(), value)),
+            _ => {
+                ctx.settings
+                    .store()
+                    .mark_plugin_oauth_reconnect_required(&self.manifest.id)
+                    .await?;
+                return Err(self.http_oauth_auth_required_error(true));
+            }
+        }
+        Ok(())
+    }
+
+    fn http_oauth_auth_required_error(&self, reconnect_required: bool) -> anyhow::Error {
+        let id = &self.manifest.id;
+        let help_url = self
+            .manifest
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.help_url.as_deref());
+        match (reconnect_required, help_url) {
+            (true, Some(url)) => {
+                anyhow::anyhow!("configure {id}: reconnect OAuth access — see {url}")
+            }
+            (true, None) => anyhow::anyhow!("configure {id}: reconnect OAuth access"),
+            (false, Some(url)) => {
+                anyhow::anyhow!("configure {id}: OAuth login required — see {url}")
+            }
+            (false, None) => anyhow::anyhow!("configure {id}: OAuth login required"),
+        }
+    }
+}
+
+fn is_terminal_oauth_refresh_error(body: &str) -> bool {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    matches!(
+        json.get("error").and_then(serde_json::Value::as_str),
+        Some(code) if TERMINAL_OAUTH_REFRESH_ERRORS.contains(&code)
+    )
 }
 
 /// A `Resolver` backed by values fetched ahead of time (see
 /// `DeclarativeConnector::resolver`'s doc for why).
 struct PreloadedResolver {
     auth: Option<String>,
+    oauth_bearer_token: Option<String>,
     settings: HashMap<String, String>,
 }
 
@@ -221,7 +431,10 @@ fn collect_setting_keys(s: &str, keys: &mut HashSet<String>) {
 
 /// Map one `McpServerDef` to its live `McpServerSpec`, substituting
 /// placeholders into args, env values, header values, and url.
-fn build_spec(server: &McpServerDef, resolver: &dyn Resolver) -> anyhow::Result<McpServerSpec> {
+fn build_spec(
+    server: &McpServerDef,
+    resolver: &PreloadedResolver,
+) -> anyhow::Result<McpServerSpec> {
     let transport = match server.transport {
         McpTransportDef::Stdio => {
             let command = server
@@ -249,6 +462,16 @@ fn build_spec(server: &McpServerDef, resolver: &dyn Resolver) -> anyhow::Result<
             for (k, v) in &server.headers {
                 headers.push((k.clone(), resolve(v, resolver)?));
             }
+            if let Some(token) = resolver.oauth_bearer_token.as_deref() {
+                let bearer = format!("Bearer {token}");
+                match headers
+                    .iter_mut()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("Authorization"))
+                {
+                    Some((_, value)) => *value = bearer,
+                    None => headers.push(("Authorization".to_string(), bearer)),
+                }
+            }
             McpTransport::Http { url, headers }
         }
     };
@@ -264,6 +487,8 @@ mod tests {
     use super::*;
     use crate::connector::ConnectorCtx;
     use crate::domain::McpTransport;
+    use crate::llm_router::secrets::use_test_key_file;
+    use crate::plugins::oauth::PluginOauthToken;
     use crate::settings::SettingsStore;
     use crate::store::Store;
     use ryuzi_plugin_sdk::PluginManifest;
@@ -393,6 +618,41 @@ name = "acme-required"
 transport = "http"
 url = "https://mcp.acme.example.com"
 headers = { Authorization = "Bearer ${auth}", X-Acme-User = "${setting:plugin.acme-required.user}" }
+"#;
+
+    const ACME_HTTP_OAUTH_MANIFEST: &str = r#"
+contract = 1
+id = "acme-http-oauth"
+name = "Acme HTTP OAuth"
+
+[auth]
+kind = "oauth"
+help_url = "https://acme.example.com/oauth"
+
+[[mcp]]
+name = "svc"
+transport = "http"
+url = "https://api.acme.dev/mcp"
+headers = { Authorization = "Basic stale", X-Trace = "trace-123" }
+"#;
+
+    const GOOGLE_STYLE_STDIO_OAUTH_MANIFEST: &str = r#"
+contract = 1
+id = "google-workspace"
+name = "Google Workspace"
+
+[auth]
+kind = "oauth"
+setting = "plugin.google-workspace.client_id"
+env = "GOOGLE_OAUTH_CLIENT_ID"
+help_url = "https://github.com/taylorwilsdon/google_workspace_mcp"
+
+[[mcp]]
+name = "google-workspace"
+transport = "stdio"
+command = "uvx"
+args = ["workspace-mcp"]
+env = { GOOGLE_OAUTH_CLIENT_ID = "${auth}" }
 "#;
 
     #[tokio::test]
@@ -550,6 +810,306 @@ headers = { Authorization = "Bearer ${auth}" }
                 );
             }
             other => panic!("expected http transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_oauth_manifest_injects_bearer_token_from_stored_plugin_oauth_token() {
+        use_test_key_file();
+        let (store, settings, _tmp) = open_settings().await;
+        store
+            .upsert_plugin_oauth_token(&PluginOauthToken {
+                plugin_id: "acme-http-oauth".into(),
+                access_token: "oauth-secret".into(),
+                refresh_token: None,
+                token_type: "Bearer".into(),
+                expires_at: Some(crate::paths::now_ms() + 60 * 60 * 1000),
+                scopes: vec![],
+                reconnect_required: false,
+            })
+            .await
+            .unwrap();
+
+        let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
+        assert_eq!(servers.len(), 1);
+        match &servers[0].transport {
+            McpTransport::Http { url, headers } => {
+                let header_map: HashMap<String, String> = headers.iter().cloned().collect();
+                assert_eq!(url, "https://api.acme.dev/mcp");
+                assert_eq!(
+                    header_map.get("Authorization"),
+                    Some(&"Bearer oauth-secret".to_string())
+                );
+                assert_eq!(header_map.get("X-Trace"), Some(&"trace-123".to_string()));
+                assert_eq!(header_map.len(), 2);
+            }
+            other => panic!("expected http transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_oauth_manifest_refreshes_expired_token_before_injecting_bearer() {
+        use axum::{extract::Form, routing::post, Json, Router};
+        use serde_json::json;
+
+        use_test_key_file();
+        let app = Router::new().route(
+            "/token",
+            post(|Form(form): Form<HashMap<String, String>>| async move {
+                assert_eq!(
+                    form.get("grant_type").map(String::as_str),
+                    Some("refresh_token")
+                );
+                assert_eq!(
+                    form.get("refresh_token").map(String::as_str),
+                    Some("refresh-old")
+                );
+                Json(json!({
+                    "access_token": "oauth-new",
+                    "refresh_token": "refresh-new",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "read write"
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_url = format!("http://{}/token", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (store, settings, _tmp) = open_settings().await;
+        store
+            .upsert_plugin_oauth_token(&PluginOauthToken {
+                plugin_id: "acme-http-oauth".into(),
+                access_token: "oauth-old".into(),
+                refresh_token: Some("refresh-old".into()),
+                token_type: "Bearer".into(),
+                expires_at: Some(crate::paths::now_ms() - 1),
+                scopes: vec!["read".into()],
+                reconnect_required: false,
+            })
+            .await
+            .unwrap();
+
+        let toml = ACME_HTTP_OAUTH_MANIFEST.replace(
+            "help_url = \"https://acme.example.com/oauth\"",
+            &format!("help_url = \"https://acme.example.com/oauth\"\ntoken-url = \"{token_url}\""),
+        );
+        let manifest = PluginManifest::from_toml(&toml).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
+        match &servers[0].transport {
+            McpTransport::Http { headers, .. } => {
+                let header_map: HashMap<String, String> = headers.iter().cloned().collect();
+                assert_eq!(
+                    header_map.get("Authorization"),
+                    Some(&"Bearer oauth-new".to_string())
+                );
+            }
+            other => panic!("expected http transport, got {other:?}"),
+        }
+
+        let refreshed = store
+            .get_plugin_oauth_token("acme-http-oauth")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.access_token, "oauth-new");
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("refresh-new"));
+        assert_eq!(
+            refreshed.scopes,
+            vec!["read".to_string(), "write".to_string()]
+        );
+        assert!(!refreshed.reconnect_required);
+        assert!(refreshed.expires_at.unwrap() > crate::paths::now_ms());
+    }
+
+    #[tokio::test]
+    async fn http_oauth_manifest_marks_expired_token_without_refresh_as_reconnect_required() {
+        use_test_key_file();
+        let (store, settings, _tmp) = open_settings().await;
+        store
+            .upsert_plugin_oauth_token(&PluginOauthToken {
+                plugin_id: "acme-http-oauth".into(),
+                access_token: "oauth-old".into(),
+                refresh_token: None,
+                token_type: "Bearer".into(),
+                expires_at: Some(crate::paths::now_ms() - 1),
+                scopes: vec![],
+                reconnect_required: false,
+            })
+            .await
+            .unwrap();
+        let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        let err = connector.mcp_servers(&ctx(settings)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reconnect"),
+            "message should explain that the plugin needs reconnecting: {msg}"
+        );
+        let stale = store
+            .get_plugin_oauth_token("acme-http-oauth")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stale.reconnect_required);
+    }
+
+    #[tokio::test]
+    async fn http_oauth_manifest_marks_terminal_refresh_error_as_reconnect_required() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+        use serde_json::json;
+
+        use_test_key_file();
+        let app = Router::new().route(
+            "/token",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_grant" })),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_url = format!("http://{}/token", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (store, settings, _tmp) = open_settings().await;
+        store
+            .upsert_plugin_oauth_token(&PluginOauthToken {
+                plugin_id: "acme-http-oauth".into(),
+                access_token: "oauth-old".into(),
+                refresh_token: Some("refresh-old".into()),
+                token_type: "Bearer".into(),
+                expires_at: Some(crate::paths::now_ms() - 1),
+                scopes: vec![],
+                reconnect_required: false,
+            })
+            .await
+            .unwrap();
+
+        let toml = ACME_HTTP_OAUTH_MANIFEST.replace(
+            "help_url = \"https://acme.example.com/oauth\"",
+            &format!("help_url = \"https://acme.example.com/oauth\"\ntoken-url = \"{token_url}\""),
+        );
+        let manifest = PluginManifest::from_toml(&toml).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reconnect"),
+            "message should explain that the plugin needs reconnecting: {msg}"
+        );
+        let stale = store
+            .get_plugin_oauth_token("acme-http-oauth")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stale.reconnect_required);
+    }
+
+    #[tokio::test]
+    async fn http_oauth_manifest_requires_stored_plugin_token_for_ensure_auth_and_mcp_servers() {
+        let (_store, settings, _tmp) = open_settings().await;
+        let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        let err = connector
+            .ensure_auth(&ctx(settings.clone()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("configure acme-http-oauth"),
+            "message should name the plugin id: {msg}"
+        );
+        assert!(
+            msg.contains("https://acme.example.com/oauth"),
+            "message should include help_url: {msg}"
+        );
+
+        let err = connector.mcp_servers(&ctx(settings)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("configure acme-http-oauth"),
+            "message should name the plugin id: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_oauth_manifest_requires_reconnect_when_stored_plugin_token_is_marked_stale() {
+        use_test_key_file();
+        let (store, settings, _tmp) = open_settings().await;
+        store
+            .upsert_plugin_oauth_token(&PluginOauthToken {
+                plugin_id: "acme-http-oauth".into(),
+                access_token: "oauth-secret".into(),
+                refresh_token: Some("refresh-secret".into()),
+                token_type: "Bearer".into(),
+                expires_at: None,
+                scopes: vec![],
+                reconnect_required: true,
+            })
+            .await
+            .unwrap();
+        let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        let err = connector.ensure_auth(&ctx(settings)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("configure acme-http-oauth"),
+            "message should name the plugin id: {msg}"
+        );
+        assert!(
+            msg.contains("reconnect"),
+            "message should explain that the plugin needs reconnecting: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_oauth_manifest_still_resolves_auth_placeholder_from_setting() {
+        let (store, settings, _tmp) = open_settings().await;
+        store
+            .set_setting_raw("plugin.google-workspace.client_id", "client-id-123")
+            .await
+            .unwrap();
+
+        let manifest = PluginManifest::from_toml(GOOGLE_STYLE_STDIO_OAUTH_MANIFEST).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        connector.ensure_auth(&ctx(settings.clone())).await.unwrap();
+        let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
+        match &servers[0].transport {
+            McpTransport::Stdio { env, .. } => {
+                assert_eq!(
+                    env,
+                    &vec![(
+                        "GOOGLE_OAUTH_CLIENT_ID".to_string(),
+                        "client-id-123".to_string()
+                    )]
+                );
+            }
+            other => panic!("expected stdio transport, got {other:?}"),
         }
     }
 

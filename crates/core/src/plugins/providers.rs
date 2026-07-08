@@ -52,9 +52,7 @@ fn auth_spec(auth: AuthScheme) -> AuthSpec {
     };
     AuthSpec {
         kind,
-        setting: None,
-        env: None,
-        help_url: None,
+        ..Default::default()
     }
 }
 

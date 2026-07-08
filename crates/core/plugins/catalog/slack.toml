@@ -12,6 +12,7 @@ verified = true
 [auth]
 kind = "oauth"
 help_url = "https://api.slack.com/apps"
+resource = "https://mcp.slack.com/mcp"
 
 [[mcp]]
 name = "slack"

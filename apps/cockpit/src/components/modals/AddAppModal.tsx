@@ -46,7 +46,7 @@ export function AddAppModal({ onClose }: { onClose: () => void }) {
     <Modal onClose={onClose} width={480}>
       <div className="mb-1 flex items-center gap-2.5">
         <LayoutGrid aria-hidden size={16} strokeWidth={2} className="text-muted-foreground" />
-        <span className="text-[15px] font-semibold tracking-[-0.01em]">Add app</span>
+        <span className="text-[15px] font-semibold tracking-[-0.01em]">Add MCP server</span>
       </div>
       <p className="mb-[18px] mt-0 text-[12.5px] text-muted-foreground">
         Point Cockpit at an MCP server. It connects immediately to verify and discover the tool list.

@@ -23,6 +23,7 @@ pub mod builtin;
 pub mod catalog;
 pub mod declarative;
 pub mod host;
+pub mod oauth;
 pub mod providers;
 pub mod runtimes_meta;
 
