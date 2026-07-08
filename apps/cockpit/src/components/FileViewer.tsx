@@ -6,6 +6,7 @@ import { CircleAlert } from "lucide-react";
 import { commands } from "@/bindings";
 import { basename } from "@/lib/paths";
 import { languageFor } from "@/lib/language";
+import { cockpitCodeTheme } from "@/lib/codemirror-theme";
 
 export function FileViewer({ path }: { path: string }) {
   const [content, setContent] = useState("");
@@ -47,7 +48,12 @@ export function FileViewer({ path }: { path: string }) {
   }
   return (
     <div className="flex-1 overflow-auto">
-      <CodeMirror value={content} editable={false} extensions={lang ? [EditorView.lineWrapping, lang] : [EditorView.lineWrapping]} />
+      <CodeMirror
+        value={content}
+        editable={false}
+        theme={cockpitCodeTheme}
+        extensions={lang ? [EditorView.lineWrapping, lang] : [EditorView.lineWrapping]}
+      />
     </div>
   );
 }
