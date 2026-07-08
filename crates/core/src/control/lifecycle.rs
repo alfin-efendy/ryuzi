@@ -76,30 +76,41 @@ impl ControlPlane {
             );
         }
         let git = git.unwrap_or_default();
-        if let Some(name) = git.branch_name.as_deref() {
-            crate::workspace::validate_branch_name(name)?;
+        // Git options (branch name / worktree) only apply to git projects; a
+        // plain folder runs in-place with no branch, so skip the branch-name
+        // check for it.
+        if project.is_git {
+            if let Some(name) = git.branch_name.as_deref() {
+                crate::workspace::validate_branch_name(name)?;
+            }
         }
 
         let session_pk = new_id();
         let short: String = session_pk.chars().take(8).collect();
         let now = now_ms();
         let title: String = prompt.display.chars().take(80).collect();
-        // Workspace columns are provisional: the background git prep
-        // backfills the real values (engine-generated names, current-branch
-        // resolution) via `update_session_workspace`.
+        // Workspace columns are provisional: for a git project the background
+        // git prep backfills the real values (engine-generated names,
+        // current-branch resolution) via `update_session_workspace`. A non-git
+        // project skips prep entirely and carries no branch/worktree regardless
+        // of any git options passed.
         let session = Session {
             session_pk: session_pk.clone(),
             project_id: project.project_id.clone(),
             agent_session_id: None,
             worktree_path: None,
-            branch: git.branch_name.clone().or_else(|| git.base_branch.clone()),
+            branch: if project.is_git {
+                git.branch_name.clone().or_else(|| git.base_branch.clone())
+            } else {
+                None
+            },
             title: Some(title),
             status: SessionStatus::Running,
             started_by: Some(started_by.to_string()),
             created_at: Some(now),
             last_active: Some(now),
             resume_attempts: 0,
-            branch_owned: git.create_branch && git.branch_name.is_none(),
+            branch_owned: project.is_git && git.create_branch && git.branch_name.is_none(),
         };
         self.store.insert_session(session.clone()).await?;
         let _ = self.events.send(CoreEvent::SessionCreated {
@@ -330,78 +341,86 @@ impl ControlPlane {
         attachments: Vec<AttachmentRef>,
         cancel: &tokio_util::sync::CancellationToken,
     ) {
-        // Captured before `git` moves into the spawn_blocking closure below.
-        let (use_worktree, create_branch) = (git.use_worktree, git.create_branch);
-        self.emit_status(
-            session_pk,
-            match (use_worktree, create_branch) {
-                (true, _) => "Creating worktree…",
-                (false, true) => "Creating branch…",
-                (false, false) => "Preparing workspace…",
-            },
-        )
-        .await;
-        let worktree_candidate = worktree_path_for(&project.project_id, session_pk);
-        let repo_dir = std::path::PathBuf::from(&project.workdir);
-        let prep_pk = session_pk.to_string();
-        let prep_git = git;
-        // git2 is synchronous, disk-heavy work — keep it off the async runtime.
-        let prep = tokio::task::spawn_blocking(move || {
-            crate::workspace::prepare_session_workspace(
-                &repo_dir,
-                &prep_git,
-                &prep_pk,
-                &worktree_candidate,
-            )
-        })
-        .await;
-        let ws = match prep {
-            Ok(Ok(ws)) => ws,
-            Ok(Err(e)) => {
-                self.fail_startup(
-                    session_pk,
-                    &format!("Couldn't prepare the git workspace: {e}"),
-                )
-                .await;
-                return;
-            }
-            Err(e) => {
-                self.fail_startup(session_pk, &format!("Workspace preparation failed: {e}"))
-                    .await;
-                return;
-            }
-        };
-        let _ = self
-            .store
-            .update_session_workspace(
+        // Non-git projects skip all git prep — no worktree, no branch — and run
+        // the harness directly in the project workdir. Git projects run the
+        // full branch-controls prep and backfill the workspace columns.
+        let work_dir = if project.is_git {
+            // Captured before `git` moves into the spawn_blocking closure below.
+            let (use_worktree, create_branch) = (git.use_worktree, git.create_branch);
+            self.emit_status(
                 session_pk,
-                ws.worktree_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned()),
-                &ws.branch,
-                ws.branch_owned,
+                match (use_worktree, create_branch) {
+                    (true, _) => "Creating worktree…",
+                    (false, true) => "Creating branch…",
+                    (false, false) => "Preparing workspace…",
+                },
             )
             .await;
-        // Cancelled during git prep: the workspace columns are persisted, so
-        // the end_session that cancelled us (it waits for this task to unwind
-        // before teardown) reads the real worktree path and cleans it up; a
-        // plain stop leaves the workspace in place for a later retry or end.
-        if cancel.is_cancelled() {
-            return;
-        }
-        self.emit_status(
-            session_pk,
-            &match (use_worktree, create_branch) {
-                (_, true) => format!("Created and checked out branch {}", ws.branch),
-                (true, false) => format!("Checked out branch {}", ws.branch),
-                (false, false) => format!("Using branch {}", ws.branch),
-            },
-        )
-        .await;
+            let worktree_candidate = worktree_path_for(&project.project_id, session_pk);
+            let repo_dir = std::path::PathBuf::from(&project.workdir);
+            let prep_pk = session_pk.to_string();
+            let prep_git = git;
+            // git2 is synchronous, disk-heavy work — keep it off the async runtime.
+            let prep = tokio::task::spawn_blocking(move || {
+                crate::workspace::prepare_session_workspace(
+                    &repo_dir,
+                    &prep_git,
+                    &prep_pk,
+                    &worktree_candidate,
+                )
+            })
+            .await;
+            let ws = match prep {
+                Ok(Ok(ws)) => ws,
+                Ok(Err(e)) => {
+                    self.fail_startup(
+                        session_pk,
+                        &format!("Couldn't prepare the git workspace: {e}"),
+                    )
+                    .await;
+                    return;
+                }
+                Err(e) => {
+                    self.fail_startup(session_pk, &format!("Workspace preparation failed: {e}"))
+                        .await;
+                    return;
+                }
+            };
+            let _ = self
+                .store
+                .update_session_workspace(
+                    session_pk,
+                    ws.worktree_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    &ws.branch,
+                    ws.branch_owned,
+                )
+                .await;
+            // Cancelled during git prep: the workspace columns are persisted, so
+            // the end_session that cancelled us (it waits for this task to unwind
+            // before teardown) reads the real worktree path and cleans it up; a
+            // plain stop leaves the workspace in place for a later retry or end.
+            if cancel.is_cancelled() {
+                return;
+            }
+            self.emit_status(
+                session_pk,
+                &match (use_worktree, create_branch) {
+                    (_, true) => format!("Created and checked out branch {}", ws.branch),
+                    (true, false) => format!("Checked out branch {}", ws.branch),
+                    (false, false) => format!("Using branch {}", ws.branch),
+                },
+            )
+            .await;
+            ws.work_dir
+        } else {
+            std::path::PathBuf::from(&project.workdir)
+        };
 
         self.emit_status(session_pk, "Connecting tools…").await;
         let handle = match self
-            .start_harness_session(project, session_pk, &ws.work_dir, None)
+            .start_harness_session(project, session_pk, &work_dir, None)
             .await
         {
             Ok(handle) => handle,

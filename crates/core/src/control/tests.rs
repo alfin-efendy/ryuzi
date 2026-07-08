@@ -710,6 +710,58 @@ async fn connect_project_defaults_to_the_native_harness() {
 }
 
 #[tokio::test]
+async fn connect_project_on_plain_folder_succeeds_with_is_git_false() {
+    let (cp, store, _db_guard) = provisioning_control_plane().await;
+
+    // Deliberately NOT a git repo.
+    let dir = tempfile::tempdir().unwrap();
+    let project = cp.connect_project(dir.path(), "plain").await.unwrap();
+    assert!(!project.is_git);
+    let got = store
+        .get_project(&project.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!got.is_git, "read-time recompute must also say non-git");
+
+    // A real repo still connects with is_git=true.
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    let gitty = cp.connect_project(repo_dir.path(), "gitty").await.unwrap();
+    assert!(gitty.is_git);
+}
+
+#[tokio::test]
+async fn start_session_on_non_git_project_skips_workspace_prep() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+
+    // A plain folder — no repo, so no branch and no worktree.
+    let dir = tempfile::tempdir().unwrap();
+    let project = cp.connect_project(dir.path(), "plain").await.unwrap();
+    assert!(!project.is_git);
+
+    let session = cp
+        .start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+    assert_eq!(session.branch, None, "non-git sessions carry no branch");
+    assert_eq!(session.worktree_path, None);
+    assert!(!session.branch_owned);
+
+    // Wait for background startup to register the live handle (git prep is
+    // skipped, so the harness starts directly in project.workdir), then confirm
+    // the persisted row kept the same no-branch/no-worktree shape.
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let got = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.branch, None);
+    assert_eq!(got.worktree_path, None);
+}
+
+#[tokio::test]
 #[serial]
 async fn stop_immediately_after_start_is_registered() {
     let _guard = StateDirGuard::new();

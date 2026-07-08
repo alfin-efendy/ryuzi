@@ -73,25 +73,25 @@ async fn run_git(args: &[&str]) -> anyhow::Result<()> {
 }
 
 impl ControlPlane {
-    /// Connect an existing local git repo as a project driven by the default
-    /// `native` (Ryuzi) harness. Prefer [`connect_project_with_harness`] to
-    /// select a runtime.
+    /// Connect an existing local folder (git repo or not) as a project driven
+    /// by the default `native` (Ryuzi) harness. Prefer
+    /// [`connect_project_with_harness`] to select a runtime.
     pub async fn connect_project(&self, workdir: &Path, name: &str) -> anyhow::Result<Project> {
         self.connect_project_with_harness(workdir, name, "native")
             .await
     }
 
-    /// Connect an existing local git repo as a project driven by `harness`
-    /// (e.g. `"native"` or `"claude-code"`).
+    /// Connect an existing local folder as a project driven by `harness`
+    /// (e.g. `"native"` or `"claude-code"`). Non-git folders are allowed —
+    /// git features (branches, worktrees, review diffs) are disabled for
+    /// them in the UI, and the flag self-corrects after a later `git init`.
     pub async fn connect_project_with_harness(
         &self,
         workdir: &Path,
         name: &str,
         harness: &str,
     ) -> anyhow::Result<Project> {
-        // Must be an existing git repo (worktrees need a HEAD commit).
-        git2::Repository::open(workdir)
-            .map_err(|_| anyhow::anyhow!("not a git repository: {}", workdir.display()))?;
+        let is_git = git2::Repository::open(workdir).is_ok();
         let project = Project {
             project_id: new_id(),
             name: name.to_string(),
@@ -102,7 +102,7 @@ impl ControlPlane {
             effort: None,
             perm_mode: PermMode::Default,
             created_at: Some(now_ms()),
-            is_git: true,
+            is_git,
         };
         self.store.insert_project(project.clone()).await?;
         Ok(project)
