@@ -86,7 +86,7 @@ export function FileChangeCards({ sessionPk, cards }: { sessionPk: string; cards
       })}
       {confirming !== null && (
         <div role="dialog" aria-label="Confirm revert" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="acrylic-card flex w-[380px] flex-col gap-3 rounded-xl border border-border p-4 shadow-lg">
+          <div className="bg-popover flex w-[380px] flex-col gap-3 rounded-xl border border-border p-4 shadow-lg">
             <div className="text-sm font-semibold">Revert {basename(confirming.path)}?</div>
             <div className="text-[12.5px] leading-relaxed text-muted-foreground">
               This restores <span className="font-mono">{confirming.path}</span> to its last committed state (new files are deleted).
