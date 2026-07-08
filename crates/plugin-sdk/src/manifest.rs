@@ -57,24 +57,33 @@ pub struct PluginManifest {
 /// How a plugin authenticates. `none` needs no credential; `api-key` and
 /// `token` read a secret (via `setting` and/or `env` fallback); `oauth`
 /// delegates to provider-specific machinery elsewhere (e.g. `llm_router`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthKind {
+    #[default]
     None,
     ApiKey,
     Token,
     Oauth,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct AuthSpec {
     pub kind: AuthKind,
-    #[serde(default)]
     pub setting: Option<String>,
-    #[serde(default)]
     pub env: Option<String>,
-    #[serde(default)]
+    #[serde(alias = "help_url")]
     pub help_url: Option<String>,
+    pub authorize_url: Option<String>,
+    pub token_url: Option<String>,
+    pub resource: Option<String>,
+    pub scopes: Vec<String>,
+    pub client_id_setting: Option<String>,
+    pub client_secret_setting: Option<String>,
+    pub dynamic_registration: bool,
+    pub extra_authorize_params: BTreeMap<String, String>,
+    pub extra_token_params: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -422,6 +431,110 @@ default_model = "claude-opus-4-5"
             Some("@anthropic-ai/claude-code")
         );
         assert_eq!(runtime.default_model.as_deref(), Some("claude-opus-4-5"));
+    }
+
+    #[test]
+    fn parses_oauth_auth_metadata() {
+        let toml_str = r#"
+contract = 1
+id = "acme-oauth"
+name = "Acme OAuth"
+
+[auth]
+kind = "oauth"
+setting = "plugin.acme.oauth_setting"
+env = "ACME_OAUTH"
+help_url = "https://acme.example.com/help"
+authorize-url = "https://acme.example.com/oauth/authorize"
+token-url = "https://acme.example.com/oauth/token"
+resource = "acme://api"
+scopes = ["repo", "issues:read"]
+client-id-setting = "plugin.acme.client_id"
+client-secret-setting = "plugin.acme.client_secret"
+dynamic-registration = true
+extra-authorize-params = { prompt = "consent", access_type = "offline" }
+extra-token-params = { audience = "acme", tenant = "engineering" }
+"#;
+        let manifest = PluginManifest::from_toml(toml_str).expect("should parse and validate");
+
+        let auth = manifest.auth.expect("auth block");
+        assert_eq!(auth.kind, AuthKind::Oauth);
+        assert_eq!(auth.setting.as_deref(), Some("plugin.acme.oauth_setting"));
+        assert_eq!(auth.env.as_deref(), Some("ACME_OAUTH"));
+        assert_eq!(
+            auth.help_url.as_deref(),
+            Some("https://acme.example.com/help")
+        );
+        assert_eq!(
+            auth.authorize_url.as_deref(),
+            Some("https://acme.example.com/oauth/authorize")
+        );
+        assert_eq!(
+            auth.token_url.as_deref(),
+            Some("https://acme.example.com/oauth/token")
+        );
+        assert_eq!(auth.resource.as_deref(), Some("acme://api"));
+        assert_eq!(
+            auth.scopes,
+            vec!["repo".to_string(), "issues:read".to_string()]
+        );
+        assert_eq!(
+            auth.client_id_setting.as_deref(),
+            Some("plugin.acme.client_id")
+        );
+        assert_eq!(
+            auth.client_secret_setting.as_deref(),
+            Some("plugin.acme.client_secret")
+        );
+        assert!(auth.dynamic_registration);
+        assert_eq!(
+            auth.extra_authorize_params
+                .get("prompt")
+                .map(String::as_str),
+            Some("consent")
+        );
+        assert_eq!(
+            auth.extra_authorize_params
+                .get("access_type")
+                .map(String::as_str),
+            Some("offline")
+        );
+        assert_eq!(
+            auth.extra_token_params.get("audience").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            auth.extra_token_params.get("tenant").map(String::as_str),
+            Some("engineering")
+        );
+    }
+
+    #[test]
+    fn parses_oauth_with_only_kind_for_backwards_compatibility() {
+        let toml_str = r#"
+contract = 1
+id = "acme-oauth-legacy"
+name = "Acme OAuth Legacy"
+
+[auth]
+kind = "oauth"
+"#;
+        let manifest = PluginManifest::from_toml(toml_str).expect("should parse and validate");
+
+        let auth = manifest.auth.expect("auth block");
+        assert_eq!(auth.kind, AuthKind::Oauth);
+        assert_eq!(auth.setting, None);
+        assert_eq!(auth.env, None);
+        assert_eq!(auth.help_url, None);
+        assert_eq!(auth.authorize_url, None);
+        assert_eq!(auth.token_url, None);
+        assert_eq!(auth.resource, None);
+        assert_eq!(auth.scopes, Vec::<String>::new());
+        assert_eq!(auth.client_id_setting, None);
+        assert_eq!(auth.client_secret_setting, None);
+        assert!(!auth.dynamic_registration);
+        assert_eq!(auth.extra_authorize_params, BTreeMap::new());
+        assert_eq!(auth.extra_token_params, BTreeMap::new());
     }
 
     fn minimal_manifest(extra: &str) -> String {
