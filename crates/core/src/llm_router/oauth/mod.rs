@@ -6,6 +6,7 @@ pub mod callback;
 pub mod device;
 pub mod device_grant;
 pub mod flow;
+pub mod github;
 pub mod import;
 pub mod pkce;
 pub mod refresh;
