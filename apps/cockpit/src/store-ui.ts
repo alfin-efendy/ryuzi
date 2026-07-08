@@ -35,6 +35,7 @@ const KEY = {
   active: "cockpit.ui.activeTab",
   pinned: "cockpit.ui.pinned",
   archived: "cockpit.ui.archived",
+  hideInvalidModels: "cockpit.ui.hideInvalidModels",
 };
 
 function readBool(key: string, fallback: boolean): boolean {
@@ -80,6 +81,8 @@ type UiState = {
   activeTabId: string | null;
   pinned: Record<string, true>;
   archived: Record<string, true>;
+  /** Provider Models card: hide rows with a persisted "invalid" verdict. */
+  hideInvalidModels: boolean;
   toggleLeft: () => void;
   toggleRight: () => void;
   setLeft: (open: boolean) => void;
@@ -92,6 +95,7 @@ type UiState = {
   toggleArchive: (sessionPk: string) => void;
   /** Idempotent write — archive flows must not race a pure toggle. */
   setArchived: (sessionPk: string, on: boolean) => void;
+  toggleHideInvalidModels: () => void;
 };
 
 export const useUi = create<UiState>((set, get) => ({
@@ -101,6 +105,7 @@ export const useUi = create<UiState>((set, get) => ({
   activeTabId: normalizeActive(typeof localStorage !== "undefined" ? localStorage.getItem(KEY.active) : null),
   pinned: readSet(KEY.pinned),
   archived: readSet(KEY.archived),
+  hideInvalidModels: readBool(KEY.hideInvalidModels, false),
   toggleLeft: () =>
     set((s) => {
       const v = !s.leftPanelOpen;
@@ -167,4 +172,10 @@ export const useUi = create<UiState>((set, get) => ({
     persist(KEY.archived, JSON.stringify(archived));
     set({ archived });
   },
+  toggleHideInvalidModels: () =>
+    set((s) => {
+      const v = !s.hideInvalidModels;
+      persist(KEY.hideInvalidModels, v ? "1" : "0");
+      return { hideInvalidModels: v };
+    }),
 }));

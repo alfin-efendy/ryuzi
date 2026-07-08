@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { openFileTab, closeTab, normalizeActive, setTabMode, type DockTab } from "./store-ui";
+import { openFileTab, closeTab, normalizeActive, setTabMode, useUi, type DockTab } from "./store-ui";
 
 const fileTab = (path: string): DockTab => ({ id: path, kind: "file", path, title: path.split("/").pop() ?? path });
 
@@ -65,4 +65,16 @@ test("tabs persisted before the mode field stay valid and can adopt a mode", () 
   const legacy = JSON.parse('[{"id":"/a.md","kind":"file","path":"/a.md","title":"a.md"}]') as DockTab[];
   expect(legacy[0].mode).toBeUndefined();
   expect(setTabMode(legacy, "/a.md", "view")[0].mode).toBe("view");
+});
+
+test("hideInvalidModels toggle flips state and persists to localStorage", () => {
+  // happy-dom preload (bunfig.toml) gives a fresh localStorage, so the
+  // store initialized with the false default at module load.
+  expect(useUi.getState().hideInvalidModels).toBe(false);
+  useUi.getState().toggleHideInvalidModels();
+  expect(useUi.getState().hideInvalidModels).toBe(true);
+  expect(localStorage.getItem("cockpit.ui.hideInvalidModels")).toBe("1");
+  useUi.getState().toggleHideInvalidModels();
+  expect(useUi.getState().hideInvalidModels).toBe(false);
+  expect(localStorage.getItem("cockpit.ui.hideInvalidModels")).toBe("0");
 });
