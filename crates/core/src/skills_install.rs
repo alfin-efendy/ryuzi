@@ -287,6 +287,7 @@ fn install_single_skill(
     source: &ParsedSkillSource,
     skill: SkillDescriptor,
 ) -> Result<InstalledSkillPack> {
+    let installed_at = now_rfc3339();
     let target = checked_child(&roots.skills_root, &skill.normalized_name)?;
     replace_dir_from(&skill.source_dir, &target)?;
     write_provenance(
@@ -294,10 +295,14 @@ fn install_single_skill(
         &SkillInstallProvenance {
             source: source.repo.clone(),
             plugin_id: None,
-            installed_at: now_rfc3339(),
+            installed_at: installed_at.clone(),
         },
     )?;
-    read_installed_pack(roots, &skill.normalized_name)
+    Ok(installed_single_skill_pack(
+        &skill,
+        &source.repo,
+        installed_at,
+    ))
 }
 
 fn install_plugin_pack(
@@ -319,7 +324,7 @@ fn install_plugin_pack(
         .collect::<HashSet<_>>();
     let installed_at = now_rfc3339();
 
-    for skill in materialized {
+    for skill in &materialized {
         let target_id = format!("{}--{}", pack.plugin_id, skill.normalized_name);
         let target = checked_child(&roots.skills_root, &target_id)?;
         replace_dir_from(&skill.source_dir, &target)?;
@@ -339,7 +344,54 @@ fn install_plugin_pack(
         }
     }
 
-    read_installed_pack(roots, &pack.plugin_id)
+    Ok(installed_plugin_pack(
+        &pack,
+        &source.repo,
+        &materialized,
+        installed_at,
+    ))
+}
+
+fn installed_single_skill_pack(
+    skill: &SkillDescriptor,
+    source: &str,
+    installed_at: String,
+) -> InstalledSkillPack {
+    InstalledSkillPack {
+        id: skill.normalized_name.clone(),
+        name: skill.display_name.clone(),
+        source: source.to_string(),
+        plugin_id: None,
+        installed_at,
+        skills: vec![InstalledSkillEntry {
+            id: skill.normalized_name.clone(),
+            name: skill.display_name.clone(),
+        }],
+    }
+}
+
+fn installed_plugin_pack(
+    pack: &PackDescriptor,
+    source: &str,
+    materialized: &[SkillDescriptor],
+    installed_at: String,
+) -> InstalledSkillPack {
+    let mut skills = materialized
+        .iter()
+        .map(|skill| InstalledSkillEntry {
+            id: format!("{}--{}", pack.plugin_id, skill.normalized_name),
+            name: skill.display_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    skills.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    InstalledSkillPack {
+        id: pack.plugin_id.clone(),
+        name: pack.manifest.name.clone(),
+        source: source.to_string(),
+        plugin_id: Some(pack.plugin_id.clone()),
+        installed_at,
+        skills,
+    }
 }
 
 fn parse_skill_source(source: &str) -> Result<ParsedSkillSource> {
@@ -1078,6 +1130,136 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "superpowers");
         assert_eq!(listed[0].skill_count, 2);
+    }
+
+    #[tokio::test]
+    async fn install_single_skill_returns_fresh_shape_when_same_id_pack_artifacts_exist() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "superpowers", "Explore ideas", "Fresh single.");
+
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        std::fs::create_dir_all(roots.plugins_root.join("superpowers")).unwrap();
+        std::fs::write(
+            roots
+                .plugins_root
+                .join("superpowers")
+                .join("ryuzi-plugin.toml"),
+            r#"
+contract = 1
+id = "superpowers"
+name = "Superpowers"
+
+[[skills]]
+name = "brainstorming"
+description = "Explore ideas"
+path = "skills/brainstorming"
+"#
+            .trim_start(),
+        )
+        .unwrap();
+        write_skill(
+            &roots.skills_root.join("superpowers--brainstorming"),
+            "brainstorming",
+            "Explore ideas",
+            "Stale pack skill.",
+        );
+        write_provenance(
+            &roots
+                .skills_root
+                .join("superpowers--brainstorming")
+                .join(PROVENANCE_FILE),
+            &SkillInstallProvenance {
+                source: "https://github.com/obra/superpowers".to_string(),
+                plugin_id: Some("superpowers".to_string()),
+                installed_at: "9999-12-31T23:59:59.999Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/obra/superpowers".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let cloner = FakeRepoCloner { repos };
+
+        let pack = install_skill_source_with("superpowers", &roots, &cloner)
+            .await
+            .unwrap();
+
+        assert_eq!(pack.id, "superpowers");
+        assert_eq!(pack.plugin_id, None);
+        assert_eq!(pack.skills.len(), 1);
+        assert_eq!(
+            pack.skills,
+            vec![InstalledSkillEntry {
+                id: "superpowers".to_string(),
+                name: "superpowers".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_plugin_pack_returns_fresh_shape_when_same_id_single_artifact_exists() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".codex-plugin")).unwrap();
+        std::fs::write(
+            repo.path().join(".codex-plugin/plugin.json"),
+            serde_json::json!({
+                "name": "superpowers",
+                "skills": "./skills/",
+                "interface": { "displayName": "Superpowers" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_skill(
+            &repo.path().join("skills/brainstorming"),
+            "brainstorming",
+            "Explore ideas",
+            "Fresh pack skill.",
+        );
+
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        write_skill(
+            &roots.skills_root.join("superpowers"),
+            "superpowers",
+            "Explore ideas",
+            "Stale single skill.",
+        );
+        write_provenance(
+            &roots.skills_root.join("superpowers").join(PROVENANCE_FILE),
+            &SkillInstallProvenance {
+                source: "https://github.com/obra/superpowers".to_string(),
+                plugin_id: None,
+                installed_at: "9999-12-31T23:59:59.999Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/obra/superpowers".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let cloner = FakeRepoCloner { repos };
+
+        let pack = install_skill_source_with("superpowers", &roots, &cloner)
+            .await
+            .unwrap();
+
+        assert_eq!(pack.id, "superpowers");
+        assert_eq!(pack.plugin_id.as_deref(), Some("superpowers"));
+        assert_eq!(pack.name, "Superpowers");
+        assert_eq!(
+            pack.skills,
+            vec![InstalledSkillEntry {
+                id: "superpowers--brainstorming".to_string(),
+                name: "brainstorming".to_string(),
+            }]
+        );
     }
 
     #[tokio::test]
