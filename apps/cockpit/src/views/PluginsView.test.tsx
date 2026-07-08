@@ -1,28 +1,21 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AppInfo, PluginInfo, RegistryEntry } from "@/bindings";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { AddAppInput, AppInfo, PluginInfo, RegistryEntry } from "@/bindings";
 
-const add = mock(async (_input: unknown) => true);
-let mockApps: AppInfo[] = [];
-
-mock.module("@/store-apps", () => ({
-  useApps: () => ({
-    apps: mockApps,
-    loaded: true,
-    hydrate: async () => {},
-    add,
-    toggleAgent: async () => {},
-  }),
-  agentAllowed: () => false,
-}));
-
-mock.module("@/store-runtimes", () => ({
-  useRuntimes: (selector: (state: { runtimes: { id: string; name: string; color: string }[] }) => unknown) => selector({ runtimes: [] }),
-}));
-
-mock.module("@/store-gateways", () => ({
-  useGateways: (selector: (state: { gateways: { id: string; name: string }[] }) => unknown) => selector({ gateways: [] }),
-}));
+function plugin(id: string, categories: string[]): PluginInfo {
+  return {
+    id,
+    name: id,
+    description: "",
+    icon: null,
+    categories,
+    verified: true,
+    experimental: false,
+    enabled: false,
+    source: "catalog",
+    capabilities: ["connector"],
+  };
+}
 
 const github = plugin("github", ["vcs", "issues"]);
 const notion = plugin("notion", ["docs", "wiki", "productivity"]);
@@ -31,21 +24,38 @@ const builtin = {
   source: "builtin" as const,
 };
 
-mock.module("@/store-plugins", () => ({
-  usePlugins: () => ({
-    plugins: [github, notion, builtin] as PluginInfo[],
-    loaded: true,
-    load: async () => {},
-    setEnabled: async () => {},
-  }),
-  catalogPlugins: (plugins: PluginInfo[]) => plugins.filter((plugin) => plugin.source !== "builtin"),
-}));
+const githubApp: AppInfo = {
+  id: "github",
+  name: "GitHub",
+  kind: "MCP server",
+  initial: "G",
+  color: "#111827",
+  desc: "GitHub tools",
+  transport: "stdio",
+  command: "npx",
+  args: ["-y", "@modelcontextprotocol/server-github"],
+  url: null,
+  scope: "global",
+  scopeGateways: [],
+  status: "connected",
+  statusDetail: null,
+  version: "1.0.0",
+  publisher: "Acme",
+  authKind: "none",
+  authDetail: null,
+  tools: [],
+  agentAccess: [],
+};
 
-mock.module("@/store-nav", () => ({
-  useNav: () => ({
-    navigate: () => {},
-  }),
-}));
+// Mutable fixture read by the `listApps` mock at call time. PluginsView's
+// `hydrate` effect (unlike other views) is unconditional, so it always
+// re-fetches on mount — tests set this before rendering instead of seeding
+// `useApps` state directly (which hydrate would immediately overwrite).
+let appsFixture: AppInfo[] = [];
+
+const listApps = mock(async () => ({ status: "ok" as const, data: appsFixture }));
+const addApp = mock(async (_input: AddAppInput) => ({ status: "ok" as const, data: appsFixture }));
+const listPlugins = mock(async () => ({ status: "ok" as const, data: [github, notion, builtin] as PluginInfo[] }));
 
 const registrySearch = mock(async (_query: string | null, _cursor: string | null) => ({
   status: "ok" as const,
@@ -131,8 +141,14 @@ const refreshSkill = mock(async (_id: string) => ({
   },
 }));
 
+// Mock the Tauri IPC boundary before the component (and the real stores it
+// pulls in) resolve "@/bindings"; the stores themselves are real zustand
+// singletons, seeded/reset around each test below.
 mock.module("@/bindings", () => ({
   commands: {
+    listApps,
+    addApp,
+    listPlugins,
     registrySearch,
     listSkills,
     installSkill,
@@ -142,22 +158,12 @@ mock.module("@/bindings", () => ({
 }));
 
 const { useSkills } = await import("../store-skills");
+const { useApps } = await import("@/store-apps");
+const { usePlugins } = await import("@/store-plugins");
+const { useRuntimes } = await import("@/store-runtimes");
+const { useGateways } = await import("@/store-gateways");
+const { useNav } = await import("@/store-nav");
 const { filterByCategory, mergeRegistryEntries, PluginsView } = await import("./PluginsView");
-
-function plugin(id: string, categories: string[]): PluginInfo {
-  return {
-    id,
-    name: id,
-    description: "",
-    icon: null,
-    categories,
-    verified: true,
-    experimental: false,
-    enabled: false,
-    source: "catalog",
-    capabilities: ["connector"],
-  };
-}
 
 function entry(
   id: string,
@@ -194,23 +200,44 @@ function entry(
 
 const all = [github, notion, builtin];
 
+// Render and flush the mount-effect hydrates (apps via `hydrate`, skills
+// store reset) inside act so their setState calls do not fire mid-assertion.
+async function renderView() {
+  render(<PluginsView />);
+  await act(async () => {});
+}
+
 beforeEach(() => {
-  mockApps = [];
-  add.mockClear();
+  appsFixture = [];
+  listApps.mockClear();
+  addApp.mockClear();
+  listPlugins.mockClear();
   registrySearch.mockClear();
   listSkills.mockClear();
   installSkill.mockClear();
   removeSkill.mockClear();
   refreshSkill.mockClear();
+  useApps.setState({ apps: [], loaded: false, probing: null });
+  usePlugins.setState({ plugins: [github, notion, builtin], loaded: true });
+  useRuntimes.setState({ runtimes: [], loaded: false, refreshing: false, updating: {}, updateLog: {} });
+  useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
+  useNav.setState({ history: { back: [], current: { kind: "plugins" }, forward: [] } });
   useSkills.setState({ skills: [], loading: false, error: null });
 });
 
+// Reset the shared zustand singletons on the way out too: a later test file
+// in the same bun process would otherwise inherit this file's fixtures.
 afterEach(() => {
   cleanup();
+  useApps.setState({ apps: [], loaded: false, probing: null });
+  usePlugins.setState({ plugins: [], loaded: false });
+  useRuntimes.setState({ runtimes: [], loaded: false, refreshing: false, updating: {}, updateLog: {} });
+  useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
+  useNav.setState({ history: { back: [], current: { kind: "home" }, forward: [] } });
 });
 
-test("renders the plugins heading and browse action", () => {
-  render(<PluginsView />);
+test("renders the plugins heading and browse action", async () => {
+  await renderView();
 
   expect(screen.getByRole("heading", { name: "Plugins" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Add MCP server" })).toBeTruthy();
@@ -218,33 +245,9 @@ test("renders the plugins heading and browse action", () => {
   expect(screen.getByText("No plugins installed yet. Add an MCP server by hand or browse plugins.")).toBeTruthy();
 });
 
-test("access tab uses plugin wording for installed MCP server controls", () => {
-  mockApps = [
-    {
-      id: "github",
-      name: "GitHub",
-      kind: "MCP server",
-      initial: "G",
-      color: "#111827",
-      desc: "GitHub tools",
-      transport: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-github"],
-      url: null,
-      scope: "global",
-      scopeGateways: [],
-      status: "connected",
-      statusDetail: null,
-      version: "1.0.0",
-      publisher: "Acme",
-      authKind: "none",
-      authDetail: null,
-      tools: [],
-      agentAccess: [],
-    },
-  ];
-
-  render(<PluginsView />);
+test("access tab uses plugin wording for installed MCP server controls", async () => {
+  appsFixture = [githubApp];
+  await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Access" }));
 
@@ -255,7 +258,7 @@ test("access tab uses plugin wording for installed MCP server controls", () => {
 });
 
 test("browse combines catalog cards with live registry results from the same view", async () => {
-  render(<PluginsView />);
+  await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Browse" }));
 
@@ -267,7 +270,7 @@ test("browse combines catalog cards with live registry results from the same vie
 });
 
 test("registry install uses the selected version install target from browse", async () => {
-  render(<PluginsView />);
+  await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Browse" }));
   await screen.findByText("Alpha Server");
@@ -277,7 +280,7 @@ test("registry install uses the selected version install target from browse", as
   fireEvent.click(screen.getByRole("button", { name: "Install Alpha Server" }));
 
   await waitFor(() =>
-    expect(add).toHaveBeenCalledWith(
+    expect(addApp).toHaveBeenCalledWith(
       expect.objectContaining({
         name: "Alpha Server",
         version: "1.0.0",
@@ -289,7 +292,7 @@ test("registry install uses the selected version install target from browse", as
 });
 
 test("skills tab renders installed skills from listSkills", async () => {
-  render(<PluginsView />);
+  await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Skills" }));
 
@@ -302,7 +305,7 @@ test("skills tab renders installed skills from listSkills", async () => {
 });
 
 test("skills tab installs Superpowers from the curated action", async () => {
-  render(<PluginsView />);
+  await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Skills" }));
   await screen.findByText("Superpowers");
@@ -318,7 +321,7 @@ test("manual skill install preserves the typed source after a failed attempt", a
     error: "network down",
   }));
 
-  render(<PluginsView />);
+  await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Skills" }));
   await screen.findByText("Superpowers");
@@ -332,7 +335,7 @@ test("manual skill install preserves the typed source after a failed attempt", a
 });
 
 test("manual skill install clears the typed source after a successful attempt", async () => {
-  render(<PluginsView />);
+  await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Skills" }));
   await screen.findByText("Superpowers");
