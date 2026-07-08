@@ -173,6 +173,17 @@ impl ControlPlane {
             .update_status(session_pk, SessionStatus::Running, None)
             .await?;
 
+        // A session still in background startup has no live handle yet, and its
+        // FIRST prompt hasn't been driven. Cold-resuming now would spawn a
+        // SECOND harness (in `project.workdir` while `worktree_path` is still
+        // provisional), run this follow-up ahead of the first prompt, and
+        // orphan the handle the startup task later registers. Wait for startup
+        // to settle, then fall through to the fast path onto its live handle
+        // (or, if startup failed, the normal cold-resume/error path below).
+        if self.starting.lock().unwrap().contains_key(session_pk) {
+            self.wait_for_startup(session_pk).await;
+        }
+
         // Fast path: reuse the live ACP session if its handle is still in the
         // `running` map. The live adapter already holds context, so no new
         // adapter is spawned and no `session/load` replay happens.
@@ -283,7 +294,9 @@ impl ControlPlane {
         }
     }
 
-    /// Background half of `start_session_with_prompt`.
+    /// Background half of `start_session_with_prompt`. Registers a
+    /// cancellation token in `starting` for the duration of the phases so a
+    /// stop/end that lands mid-startup can abort them cleanly.
     async fn run_session_startup(
         self: Arc<Self>,
         project: Project,
@@ -292,8 +305,14 @@ impl ControlPlane {
         prompt: TurnPrompt,
         attachments: Vec<AttachmentRef>,
     ) {
-        self.startup_phases(&project, &session_pk, git, prompt, attachments)
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.starting
+            .lock()
+            .unwrap()
+            .insert(session_pk.clone(), cancel.clone());
+        self.startup_phases(&project, &session_pk, git, prompt, attachments, &cancel)
             .await;
+        self.starting.lock().unwrap().remove(&session_pk);
     }
 
     /// The startup phases proper: git prep → harness + MCP → first prompt,
@@ -309,6 +328,7 @@ impl ControlPlane {
         git: SessionGitOptions,
         prompt: TurnPrompt,
         attachments: Vec<AttachmentRef>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) {
         // Captured before `git` moves into the spawn_blocking closure below.
         let (use_worktree, create_branch) = (git.use_worktree, git.create_branch);
@@ -362,6 +382,13 @@ impl ControlPlane {
                 ws.branch_owned,
             )
             .await;
+        // Cancelled during git prep: the workspace columns are persisted, so
+        // the end_session that cancelled us (it waits for this task to unwind
+        // before teardown) reads the real worktree path and cleans it up; a
+        // plain stop leaves the workspace in place for a later retry or end.
+        if cancel.is_cancelled() {
+            return;
+        }
         self.emit_status(
             session_pk,
             &match (use_worktree, create_branch) {
@@ -385,6 +412,12 @@ impl ControlPlane {
             }
         };
 
+        // Stopped while the harness was starting: the handle stays parked in
+        // `running` (the normal post-stop state) — just don't drive the turn.
+        if cancel.is_cancelled() {
+            let _ = handle.cancel().await;
+            return;
+        }
         let prepared = self
             .prepare_attachments(session_pk, &prompt.agent, &attachments)
             .await;
@@ -692,7 +725,29 @@ impl ControlPlane {
         });
     }
 
+    /// Bounded wait (2 min — covers even a slow worktree checkout) for a
+    /// session's in-flight background startup task to deregister from
+    /// `starting`. The startup task always deregisters on every path (its
+    /// phases return rather than panic), so this normally returns promptly; if
+    /// it is somehow wedged we return best-effort rather than blocking the
+    /// caller forever. Callers that need the startup ABORTED must cancel its
+    /// token first (see `end_session`); `continue_session_with_prompt` instead
+    /// lets it finish so the follow-up lands on the live handle it registers.
+    async fn wait_for_startup(&self, session_pk: &str) {
+        for _ in 0..2400 {
+            if !self.starting.lock().unwrap().contains_key(session_pk) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     pub async fn stop_session(&self, session_pk: &str) -> anyhow::Result<()> {
+        // A session still in background startup has no live handle yet —
+        // cancel its startup task; it checks the token between phases.
+        if let Some(token) = self.starting.lock().unwrap().get(session_pk) {
+            token.cancel();
+        }
         let handle = self.running.lock().unwrap().get(session_pk).cloned();
         if let Some(handle) = handle {
             let _ = handle.cancel().await;
@@ -707,6 +762,16 @@ impl ControlPlane {
     /// handle is removed from `running` and `end()`ed (graceful ACP teardown),
     /// after which the worktree is cleaned up and the session marked `Ended`.
     pub async fn end_session(&self, session_pk: &str) -> anyhow::Result<()> {
+        // Abort any in-flight background startup and WAIT for it to unwind
+        // before tearing down: the teardown below must read the FINAL
+        // workspace columns (git prep backfills them at its checkpoint), or
+        // an end that races git prep would see worktree_path=NULL, skip the
+        // worktree cleanup, and leak the just-created directory + branch.
+        let starting_token = self.starting.lock().unwrap().get(session_pk).cloned();
+        if let Some(token) = starting_token {
+            token.cancel();
+            self.wait_for_startup(session_pk).await;
+        }
         let handle = self.running.lock().unwrap().remove(session_pk);
         if let Some(handle) = handle {
             // Interrupt any in-flight turn first so teardown doesn't race a

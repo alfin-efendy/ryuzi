@@ -47,6 +47,11 @@ pub struct ControlPlane {
     /// handle returned by `Harness::start_session`, used to drive prompts and to
     /// `cancel`/`end` the session.
     running: Mutex<HashMap<String, Arc<dyn HarnessSession>>>,
+    /// Cancellation tokens for sessions still in background startup (git prep
+    /// + harness start), keyed by `session_pk`. `stop_session`/`end_session`
+    /// cancel the token; the startup task checks it between phases and aborts
+    /// cleanly — so a stop that lands before the harness exists still wins.
+    starting: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
     /// Telemetry seam (see `crate::telemetry`) — `Noop` unless a daemon wires
     /// up `Console`/OTLP via `new_with_telemetry`.
     telemetry: Arc<dyn Telemetry>,
@@ -101,6 +106,7 @@ impl ControlPlane {
             events,
             approvals: Arc::new(ApprovalHub::new()),
             running: Mutex::new(HashMap::new()),
+            starting: Mutex::new(HashMap::new()),
             telemetry,
             attachment_fetcher,
             draining: std::sync::atomic::AtomicBool::new(false),
