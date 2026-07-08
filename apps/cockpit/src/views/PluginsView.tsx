@@ -18,7 +18,7 @@ type BrowseSource = "all" | "catalog" | "registry";
 
 const QUICK_SEARCHES = ["All", "github", "database", "browser", "docs", "monitoring", "payments", "deploy"];
 
-// App name column + one centered toggle column per agent.
+// Plugin name column + one centered toggle column per agent.
 const matrixGrid = (n: number) => `minmax(0,1fr) repeat(${n}, 72px)`;
 
 function appStatus(app: AppInfo): { color: string; label: string } {
@@ -434,7 +434,7 @@ export function PluginsView() {
           </div>
           <Button variant="outline" onClick={() => setAddOpen(true)}>
             <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
-            Add app
+            Add MCP server
           </Button>
           <Button onClick={() => setTab("browse")}>
             <Search aria-hidden size={14} strokeWidth={2} className="size-3.5" />
@@ -502,7 +502,7 @@ export function PluginsView() {
                 className="grid items-center border-b border-border px-[18px] py-2.5"
                 style={{ gridTemplateColumns: matrixGrid(runtimes.length) }}
               >
-                <span className="text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">App</span>
+                <span className="text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Plugin</span>
                 {runtimes.map((a) => (
                   <span key={a.id} className="flex items-center justify-center gap-1.5 text-[11.5px] font-semibold">
                     <StatusDot color={a.color} />
@@ -544,7 +544,7 @@ export function PluginsView() {
               ))}
             </Card>
             <p className="mx-0.5 mb-0 mt-2.5 text-xs text-muted-foreground">
-              Access here applies before per-tool permissions — a blocked agent never sees the app’s tools.
+              Access here applies before per-tool permissions — a blocked agent never sees the plugin's tools.
             </p>
           </>
         )}

@@ -3,10 +3,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import type { AppInfo, PluginInfo, RegistryEntry } from "@/bindings";
 
 const add = mock(async (_input: unknown) => true);
+let mockApps: AppInfo[] = [];
 
 mock.module("@/store-apps", () => ({
   useApps: () => ({
-    apps: [] as AppInfo[],
+    apps: mockApps,
     loaded: true,
     hydrate: async () => {},
     add,
@@ -198,6 +199,7 @@ function entry(
 const all = [github, notion, builtin];
 
 beforeEach(() => {
+  mockApps = [];
   add.mockClear();
   registrySearch.mockClear();
   listSkills.mockClear();
@@ -215,8 +217,45 @@ test("renders the plugins heading and browse action", () => {
   render(<PluginsView />);
 
   expect(screen.getByRole("heading", { name: "Plugins" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Add MCP server" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Browse plugins" })).toBeTruthy();
   expect(screen.getByText("No plugins installed yet. Add an MCP server by hand or browse plugins.")).toBeTruthy();
+});
+
+test("access tab uses plugin wording for installed MCP server controls", () => {
+  mockApps = [
+    {
+      id: "github",
+      name: "GitHub",
+      kind: "MCP server",
+      initial: "G",
+      color: "#111827",
+      desc: "GitHub tools",
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-github"],
+      url: null,
+      scope: "global",
+      scopeGateways: [],
+      status: "connected",
+      statusDetail: null,
+      version: "1.0.0",
+      publisher: "Acme",
+      authKind: "none",
+      authDetail: null,
+      tools: [],
+      agentAccess: [],
+    },
+  ];
+
+  render(<PluginsView />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Access" }));
+
+  expect(screen.getByText("Plugin")).toBeTruthy();
+  expect(screen.getByText("Access here applies before per-tool permissions — a blocked agent never sees the plugin's tools.")).toBeTruthy();
+  expect(screen.queryByText("App")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Add app" })).toBeNull();
 });
 
 test("browse combines catalog cards with live registry results from the same view", async () => {

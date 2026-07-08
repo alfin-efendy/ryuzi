@@ -624,15 +624,25 @@ pub async fn complete_plugin_oauth(
     state_token: String,
 ) -> R<PluginAuthInfo> {
     let auth = plugin_oauth_auth(&cp, &plugin_id)?;
+    let flow_key = plugin_oauth_flow_key(&plugin_id, &state_token);
     let flow = plugin_oauth_flows()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .remove(&plugin_oauth_flow_key(&plugin_id, &state_token))
+        .remove(&flow_key)
         .ok_or_else(|| CmdError {
             message: "plugin sign-in flow not found — start again".into(),
         })?;
     let token =
-        exchange_plugin_oauth_code(cp.store(), &plugin_id, &auth, &flow, code.trim()).await?;
+        match exchange_plugin_oauth_code(cp.store(), &plugin_id, &auth, &flow, code.trim()).await {
+            Ok(token) => token,
+            Err(err) => {
+                plugin_oauth_flows()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(flow_key, flow);
+                return Err(err.into());
+            }
+        };
     cp.store().upsert_plugin_oauth_token(&token).await?;
     Ok(build_auth_info(cp.store(), &plugin_id, &auth).await?)
 }

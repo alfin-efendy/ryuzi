@@ -133,15 +133,15 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `setting` | string \| null | `None` | Settings-store key holding the secret (e.g. `plugin.github.token`). |
 | `env` | string \| null | `None` | Fallback environment variable, read if `setting` is unset/empty. |
 | `help_url` | string \| null | `None` | Where to obtain a credential; surfaced in error messages. |
-| `authorize_url` | string \| null | `None` | OAuth authorize endpoint, required for Cockpit's native plugin sign-in flow. |
-| `token_url` | string \| null | `None` | OAuth token endpoint, required for Cockpit's native plugin sign-in flow. |
+| `authorize-url` | string \| null | `None` | OAuth authorize endpoint, required for Cockpit's native plugin sign-in flow. |
+| `token-url` | string \| null | `None` | OAuth token endpoint, required for Cockpit's native plugin sign-in flow. |
 | `resource` | string \| null | `None` | Optional OAuth resource/audience parameter added to both authorize and token requests. |
 | `scopes` | string[] | `[]` | Requested OAuth scopes. |
-| `client_id_setting` | string \| null | `None` | Settings-store key that holds the OAuth client id. |
-| `client_secret_setting` | string \| null | `None` | Optional settings-store key for the OAuth client secret. |
-| `dynamic_registration` | bool | `false` | Parsed and preserved in the manifest today; Cockpit's v1 plugin sign-in still expects a saved client id. |
-| `extra_authorize_params` | table (string → string) | `{}` | Extra query params appended to the authorize URL. |
-| `extra_token_params` | table (string → string) | `{}` | Extra form fields appended to the token exchange request. |
+| `client-id-setting` | string \| null | `None` | Settings-store key that holds the OAuth client id. |
+| `client-secret-setting` | string \| null | `None` | Optional settings-store key for the OAuth client secret. |
+| `dynamic-registration` | bool | `false` | Parsed and preserved in the manifest today; Cockpit's v1 plugin sign-in still expects a saved client id. |
+| `extra-authorize-params` | table (string → string) | `{}` | Extra query params appended to the authorize URL. |
+| `extra-token-params` | table (string → string) | `{}` | Extra form fields appended to the token exchange request. |
 
 ### `[[settings]]`
 
@@ -300,7 +300,7 @@ an integration's auth tier is described by `[auth].kind`, not by category.
   - **Model providers** still use `llm_router`'s provider-specific OAuth
     machinery.
   - **Plugin connectors** can use Cockpit's native plugin OAuth flow when the
-    manifest declares `authorize_url`, `token_url`, and `client_id_setting`
+    manifest declares `authorize-url`, `token-url`, and `client-id-setting`
     (plus any optional scopes/resource/extra params).
 
 ### Resolution order
@@ -360,8 +360,8 @@ When a plugin detail screen sees `auth.kind = "oauth"`, Cockpit asks the Tauri
 backend for a richer `PluginAuthInfo`:
 
 - `oauthConnectAvailable = true` only when the manifest has enough metadata
-  for Cockpit to start the flow, currently `authorize_url`, `token_url`, and a
-  non-empty saved value under `client_id_setting`.
+  for Cockpit to start the flow, currently `authorize-url`, `token-url`, and a
+  non-empty saved value under `client-id-setting`.
 - `begin_plugin_oauth` builds a PKCE authorize URL, opens it in the browser,
   emits `plugin-oauth-authorize-url-msg`, and shows the callback URL Cockpit
   expects (`http://127.0.0.1:8976/plugin-oauth/<id>/callback`).
@@ -376,6 +376,13 @@ saved client id, regardless of MCP transport. Declarative HTTP MCP entries use
 the stored token automatically as an `Authorization: Bearer ...` header; other
 transports still need their manifests or provider-specific host support to map
 the stored credential into the runtime process.
+
+For declarative HTTP MCP entries, the connector checks token expiry before
+injecting the bearer. If the token is due and a refresh token is available, it
+refreshes against `token-url` and stores the new token before building the MCP
+server spec. If refresh is impossible, or the provider returns a terminal OAuth
+error such as `invalid_grant`, the token row is marked reconnect-required so
+Cockpit can ask the user to sign in again.
 
 ---
 

@@ -101,7 +101,7 @@ export function AppDetailView({ id }: { id: string }) {
         <Card className="mb-3">
           <CardHeader>
             <CardTitle>Scope</CardTitle>
-            <CardHint>Where this app is attached</CardHint>
+            <CardHint>Where this plugin is attached</CardHint>
             <span className="flex-1" />
             <Segmented
               options={[
@@ -170,7 +170,7 @@ export function AppDetailView({ id }: { id: string }) {
         <Card>
           <CardHeader>
             <CardTitle>Agent access</CardTitle>
-            <CardHint>Which agents may call this app</CardHint>
+            <CardHint>Which agents may call this plugin</CardHint>
           </CardHeader>
           {runtimes.map((agent) => (
             <div key={agent.id} className="flex items-center gap-3 border-b border-border px-[18px] py-[11px] last:border-b-0">

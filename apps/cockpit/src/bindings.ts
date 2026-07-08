@@ -1177,7 +1177,7 @@ export type RegistryEntry = {
 /**
  * Registry name, e.g. `io.github.owner/server`.
  */
-id: string; name: string; desc: string; version: string; publisher: string | null; 
+id: string; name: string; desc: string; version: string; publisher: string | null;
 /**
  * stdio (npm package) | http (remote)
  */
