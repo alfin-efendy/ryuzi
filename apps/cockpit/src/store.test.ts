@@ -430,3 +430,34 @@ test("start returns false and does not focus on backend error", async () => {
   expect(useStore.getState().focusedSessionPk).toBeNull();
   start.mockRestore();
 });
+
+test("cloneProject clones via IPC and refreshes on success", async () => {
+  reset();
+  const clone = spyOn(commands, "cloneProject").mockResolvedValue({
+    status: "ok",
+    data: {
+      projectId: "p9",
+      name: "repo",
+      workdir: "C:\\proj\\repo",
+      source: "https://github.com/user/repo.git",
+      harness: "native",
+      model: null,
+      effort: null,
+      permMode: "default",
+      createdAt: 1,
+      isGit: true,
+    },
+  });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  const ok = await useStore.getState().cloneProject("https://github.com/user/repo.git", "C:\\proj");
+
+  expect(ok).toBe(true);
+  expect(clone).toHaveBeenCalledWith("https://github.com/user/repo.git", "C:\\proj");
+  expect(listProjects).toHaveBeenCalled();
+
+  clone.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});

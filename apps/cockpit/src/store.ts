@@ -42,7 +42,10 @@ type State = {
   setFocused: (pk: string | null) => void;
   selectProject: (id: string | null) => void;
   refresh: () => Promise<void>;
-  addProject: () => Promise<void>;
+  /** Native folder picker → connect_project. True when a project was added. */
+  addProject: () => Promise<boolean>;
+  /** Clone `url` into `<destParent>/<repo-name>` via the backend. */
+  cloneProject: (url: string, destParent: string) => Promise<boolean>;
   /** Pin (or clear, with null) the model future turns of this project use. */
   setProjectModel: (projectId: string, model: string | null) => Promise<void>;
   /** Change the permission mode future turns of this project run under. */
@@ -196,14 +199,25 @@ export const useStore = create<State>((set, get) => ({
 
   addProject: async () => {
     const dir = await commands.pickDirectory();
-    if (!dir) return;
+    if (!dir) return false;
     const name = basename(dir) || "project";
     const res = await commands.connectProject(dir, name);
     if (res.status === "ok") {
       await get().refresh();
-    } else if (res.status === "error") {
-      toast.error("Couldn't add project: " + res.error.message);
+      return true;
     }
+    toast.error("Couldn't add project: " + res.error.message);
+    return false;
+  },
+
+  cloneProject: async (url, destParent) => {
+    const res = await commands.cloneProject(url, destParent);
+    if (res.status === "ok") {
+      await get().refresh();
+      return true;
+    }
+    toast.error("Couldn't clone project: " + res.error.message);
+    return false;
   },
 
   setProjectModel: async (projectId, model) => {
