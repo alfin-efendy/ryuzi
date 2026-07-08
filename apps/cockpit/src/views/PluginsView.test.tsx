@@ -47,10 +47,6 @@ mock.module("@/store-nav", () => ({
   }),
 }));
 
-mock.module("@/components/modals/AddAppModal", () => ({
-  AddAppModal: () => null,
-}));
-
 const registrySearch = mock(async (_query: string | null, _cursor: string | null) => ({
   status: "ok" as const,
   data: {
