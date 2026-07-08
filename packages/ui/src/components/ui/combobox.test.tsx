@@ -276,3 +276,23 @@ test("createHintLabel renders a pinned row that clears and focuses the search in
     expect(document.activeElement).toBe(input);
   });
 });
+
+test("onCreateHint: clicking the hint row closes the popup and calls the callback", async () => {
+  const onCreateHint = mock(() => {});
+  render(
+    <Combobox
+      options={few}
+      value={null}
+      onValueChange={() => {}}
+      onCreate={() => {}}
+      allowCreate
+      createHintLabel="New Branch"
+      onCreateHint={onCreateHint}
+      aria-label="Branch"
+    />,
+  );
+  await openCombobox("Branch");
+  fireEvent.click(screen.getByRole("button", { name: /New Branch/ }));
+  expect(onCreateHint).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+});

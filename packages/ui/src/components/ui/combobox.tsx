@@ -50,6 +50,9 @@ type ComboboxProps = {
   /** Pinned "+ <label>" row below the list that clears + focuses the search
    *  input — an affordance for allowCreate (typing a new name creates it). */
   createHintLabel?: string;
+  /** When set, clicking the create-hint row closes the popup and calls this
+   *  instead of the clear-and-focus default (e.g. to open a naming dialog). */
+  onCreateHint?: () => void;
 };
 
 // Internal item shape handed to Base UI. `createInput` marks the synthetic
@@ -104,8 +107,11 @@ function Combobox({
   trigger,
   className,
   createHintLabel,
+  onCreateHint,
 }: ComboboxProps) {
   const [query, setQuery] = React.useState("");
+  // Controlled open state so the create-hint row can close the popup itself.
+  const [open, setOpen] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
 
   const flat = React.useMemo<ComboboxOption[]>(() => (isGrouped(options) ? options.flatMap((g) => g.options) : options), [options]);
@@ -151,7 +157,9 @@ function Combobox({
       }}
       inputValue={query}
       onInputValueChange={setQuery}
+      open={open}
       onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
         if (!nextOpen) setQuery("");
       }}
       disabled={disabled}
@@ -232,6 +240,11 @@ function Combobox({
                 <button
                   type="button"
                   onClick={() => {
+                    if (onCreateHint) {
+                      setOpen(false);
+                      onCreateHint();
+                      return;
+                    }
                     setQuery("");
                     inputRef.current?.focus();
                   }}
