@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { composerGitOptions } from "./composer-git";
+import { composerGitOptions, newBranchNameError } from "./composer-git";
 import type { BranchList } from "../bindings";
 
 const list: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
@@ -47,4 +47,21 @@ test("no branch list loaded → typed value still creates", () => {
     branchName: "feat/y",
     baseBranch: null,
   });
+});
+
+test("modal-created name (not in list) derives create intent — the New Branch modal path", () => {
+  expect(composerGitOptions(list, "feat/from-modal", true)).toEqual({
+    useWorktree: true,
+    createBranch: true,
+    branchName: "feat/from-modal",
+    baseBranch: null,
+  });
+});
+
+test("newBranchNameError: empty, whitespace, existing, valid", () => {
+  expect(newBranchNameError("", ["main"])).toBe("Branch name is required");
+  expect(newBranchNameError("has space", ["main"])).toBe("Branch names can't contain spaces");
+  expect(newBranchNameError("has\ttab", ["main"])).toBe("Branch names can't contain spaces");
+  expect(newBranchNameError("main", ["main", "develop"])).toBe('Branch "main" already exists');
+  expect(newBranchNameError("feat/x", ["main", "develop"])).toBeNull();
 });
