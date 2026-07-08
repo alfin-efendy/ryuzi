@@ -2167,6 +2167,70 @@ async fn provision_project_git_clone_treats_option_like_url_as_a_literal_repo_pa
 }
 
 #[tokio::test]
+async fn clone_project_derives_name_records_source_and_needs_no_settings() {
+    // Gateway-free: no workdir_root, no gateway binding — a bare store.
+    let (cp, store, _db_guard) = provisioning_control_plane().await;
+    let dest = tempfile::tempdir().unwrap();
+
+    let upstream_root = tempfile::tempdir().unwrap();
+    let upstream_dir = upstream_root.path().join("upstream-repo");
+    std::fs::create_dir_all(&upstream_dir).unwrap();
+    init_repo(&upstream_dir);
+
+    // Forward slashes on purpose: `basename_of` splits on `/` only, and git
+    // accepts forward-slash local paths on Windows too. (The `\`-separated
+    // form is exactly what makes provision_project_git_url_flow_* fail on
+    // Windows dev boxes.)
+    let git_url = format!("{}/.git", upstream_dir.display()).replace('\\', "/");
+    let project = cp.clone_project(&git_url, dest.path()).await.unwrap();
+
+    assert_eq!(project.name, "upstream-repo");
+    assert_eq!(project.source.as_deref(), Some(git_url.as_str()));
+    assert_eq!(project.harness, "native");
+    assert!(project.is_git);
+    assert_eq!(
+        project.workdir,
+        dest.path().join("upstream-repo").to_string_lossy()
+    );
+    let repo = git2::Repository::open(&project.workdir).unwrap();
+    assert!(repo.head().is_ok(), "clone must produce a repo with a HEAD");
+    assert!(store
+        .get_project(&project.project_id)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn clone_project_rolls_back_on_failure_and_refuses_existing_dest() {
+    let (cp, store, _db_guard) = provisioning_control_plane().await;
+    let dest = tempfile::tempdir().unwrap();
+
+    let err = cp
+        .clone_project("/no/such/upstream/repo.git", dest.path())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("git"), "got: {err}");
+    assert!(
+        !dest.path().join("repo").exists(),
+        "a failed clone must not leave a partial dir behind"
+    );
+    assert!(
+        store.list_projects().await.unwrap().is_empty(),
+        "no project row on failure"
+    );
+
+    // A pre-existing destination is refused BEFORE any git call — the
+    // rollback below must never be able to delete user data.
+    std::fs::create_dir_all(dest.path().join("taken")).unwrap();
+    let err = cp
+        .clone_project("https://example.invalid/taken.git", dest.path())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "got: {err}");
+}
+
+#[tokio::test]
 #[serial]
 async fn provision_project_gates_bypass_permissions_for_non_admin() {
     let _guard = StateDirGuard::new();

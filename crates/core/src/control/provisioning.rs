@@ -108,6 +108,50 @@ impl ControlPlane {
         Ok(project)
     }
 
+    /// Clone `url` into `<dest_parent>/<repo-name>` and register it as a
+    /// project on the default `native` harness — the Cockpit "New project →
+    /// Clone from URL" flow. Unlike [`provision_project`] this is
+    /// gateway-free: no `workdir_root` setting, no admin gating, no
+    /// workspace binding.
+    pub async fn clone_project(&self, url: &str, dest_parent: &Path) -> anyhow::Result<Project> {
+        // Strip a trailing `.git` and extract the directory name.
+        let url_path = url.strip_suffix(".git").unwrap_or(url);
+        let mut name = basename_of(url_path);
+        if name.is_empty() {
+            // Fallback: if basename is empty, use the parent directory name.
+            name = basename_of(strip_one_trailing_slash(url_path));
+        }
+        validate_project_name(&name)?;
+        let workdir = dest_parent.join(&name);
+        // Refuse to clone over anything that exists — the rollback below
+        // removes `workdir`, which must never delete user data.
+        if workdir.exists() {
+            anyhow::bail!("destination already exists: {}", workdir.display());
+        }
+        tokio::fs::create_dir_all(dest_parent).await?;
+        let wd = workdir.to_string_lossy().into_owned();
+        // `--` separates options from positionals so an untrusted `url`
+        // can never be parsed by git as a flag (see `provision_project`).
+        if let Err(e) = run_git(&["clone", "--quiet", "--", url, &wd]).await {
+            let _ = tokio::fs::remove_dir_all(&workdir).await;
+            return Err(e);
+        }
+        let project = Project {
+            project_id: new_id(),
+            name,
+            workdir: wd,
+            source: Some(url.to_string()),
+            harness: "native".to_string(),
+            model: None,
+            effort: None,
+            perm_mode: PermMode::Default,
+            created_at: Some(now_ms()),
+            is_git: true,
+        };
+        self.store.insert_project(project.clone()).await?;
+        Ok(project)
+    }
+
     /// Discord-driven (or any gateway's) project provisioning: create a
     /// brand-new git repo under `workdir_root`, or clone an existing one,
     /// then bind it to the gateway workspace that triggered it.
