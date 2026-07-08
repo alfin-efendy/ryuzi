@@ -1758,8 +1758,7 @@ fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CoreP
         auth: Some(AuthSpec {
             kind: AuthKind::Token,
             setting: Some(format!("plugin.{id}.token")),
-            env: None,
-            help_url: None,
+            ..Default::default()
         }),
         settings: vec![],
         mcp: vec![McpServerDef {

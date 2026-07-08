@@ -510,6 +510,25 @@ extra-token-params = { audience = "acme", tenant = "engineering" }
     }
 
     #[test]
+    fn parses_canonical_help_url_key() {
+        let toml_str = r#"
+contract = 1
+id = "acme-oauth-help-url"
+name = "Acme OAuth Help URL"
+
+[auth]
+kind = "oauth"
+help-url = "https://acme.example.com/help"
+"#;
+        let manifest = PluginManifest::from_toml(toml_str).expect("should parse and validate");
+        let auth = manifest.auth.expect("auth block");
+        assert_eq!(
+            auth.help_url.as_deref(),
+            Some("https://acme.example.com/help")
+        );
+    }
+
+    #[test]
     fn parses_oauth_with_only_kind_for_backwards_compatibility() {
         let toml_str = r#"
 contract = 1
