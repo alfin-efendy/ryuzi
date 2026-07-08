@@ -73,7 +73,9 @@ struct PackDescriptor {
 #[derive(Debug, Clone)]
 enum Discovery {
     Single(SkillDescriptor),
-    Pack(PackDescriptor),
+    // Boxed: PackDescriptor is ~800 bytes vs Single's ~72
+    // (clippy::large_enum_variant).
+    Pack(Box<PackDescriptor>),
 }
 
 #[derive(Debug, Clone)]
@@ -203,7 +205,7 @@ async fn install_skill_source_with(
     let discovered = discover_install_target(&repo_dir, &source)?;
     match discovered {
         Discovery::Single(skill) => install_single_skill(roots, &source, skill),
-        Discovery::Pack(pack) => install_plugin_pack(roots, &source, pack),
+        Discovery::Pack(pack) => install_plugin_pack(roots, &source, *pack),
     }
 }
 
@@ -475,11 +477,9 @@ fn canonical_github_repo(repo: &str) -> Result<String> {
 fn discover_install_target(repo_dir: &Path, source: &ParsedSkillSource) -> Result<Discovery> {
     let plugin_json_path = repo_dir.join(".codex-plugin/plugin.json");
     if plugin_json_path.is_file() {
-        return Ok(Discovery::Pack(discover_plugin_pack_from_plugin_json(
-            repo_dir,
-            source,
-            &plugin_json_path,
-        )?));
+        return Ok(Discovery::Pack(Box::new(
+            discover_plugin_pack_from_plugin_json(repo_dir, source, &plugin_json_path)?,
+        )));
     }
 
     if repo_dir.join("SKILL.md").is_file() {
@@ -488,9 +488,9 @@ fn discover_install_target(repo_dir: &Path, source: &ParsedSkillSource) -> Resul
 
     let skills = scan_skill_root(&repo_dir.join("skills"))?;
     if !skills.is_empty() {
-        return Ok(Discovery::Pack(discover_bare_plugin_pack(
+        return Ok(Discovery::Pack(Box::new(discover_bare_plugin_pack(
             repo_dir, source, skills,
-        )?));
+        )?)));
     }
 
     bail!("no installable skill found in repo — checked .codex-plugin/plugin.json, SKILL.md, and skills/*/SKILL.md")
