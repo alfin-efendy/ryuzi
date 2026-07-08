@@ -9,3 +9,14 @@ Verification:
 
 - `bun test apps/cockpit/src/views/PluginsView.test.tsx`
 - `bun run --cwd apps/cockpit build`
+
+Follow-up (Task 2 review finding):
+
+- Fixed `apps/cockpit/src/views/RuntimeDetailView.tsx` copy to replace the stale
+  user-facing phrase with `Plugins`:  
+  `No plugins installed yet — add MCP servers from the Plugins screen.`
+- Did a narrow scan for remaining direct `Apps screen` / `Apps` nav copy fallout in
+  Cockpit views; found only this runtime-detail string plus a test fixture copy in
+  `RuntimeDetailView.test.tsx` and an unrelated confirmation copy in
+  `ModelsView.tsx` (`Apps using it`), which were not part of the Apps-navigation
+  rename.

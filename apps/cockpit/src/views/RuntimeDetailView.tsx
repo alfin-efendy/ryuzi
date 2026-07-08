@@ -381,7 +381,7 @@ export function RuntimeDetailView({ id }: { id: string }) {
           </CardHeader>
           {apps.length === 0 && (
             <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">
-              No apps installed yet — add MCP servers from the Apps screen.
+              No plugins installed yet — add MCP servers from the Plugins screen.
             </div>
           )}
           {apps.map((app) => (
