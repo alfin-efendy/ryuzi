@@ -2,10 +2,13 @@ use crate::domain::{
     Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionStatus,
     Surface,
 };
+use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
+use crate::plugins::oauth::PluginOauthToken;
 use deadpool_sqlite::{Config, Pool, Runtime};
 use rusqlite::{params, OptionalExtension, Row};
 use rusqlite_migration::{Migrations, M};
+use serde_json::{Map, Number, Value};
 use std::path::{Path, PathBuf};
 
 fn migrations() -> Migrations<'static> {
@@ -415,6 +418,13 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_oauth_tokens (\
+                plugin_id TEXT PRIMARY KEY NOT NULL,\
+                token_json TEXT NOT NULL,\
+                updated_at INTEGER NOT NULL\
+            )",
+        ),
     ])
 }
 
@@ -478,6 +488,114 @@ fn day_of(ts_ms: i64) -> String {
         .unwrap_or_default()
         .format("%Y-%m-%d")
         .to_string()
+}
+
+fn from_sql_json_error(
+    index: usize,
+    err: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, err.into())
+}
+
+fn to_sql_json_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(err.into())
+}
+
+fn parse_plugin_oauth_token_json(raw: &str) -> anyhow::Result<Map<String, Value>> {
+    let value: Value = serde_json::from_str(raw)?;
+    let object = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("plugin oauth token json must be an object"))?;
+    Ok(object)
+}
+
+fn upsert_plugin_oauth_token_json(
+    existing: Option<&str>,
+    token: &PluginOauthToken,
+) -> anyhow::Result<String> {
+    let mut object = match existing {
+        Some(raw) => parse_plugin_oauth_token_json(raw)?,
+        None => Map::new(),
+    };
+    object.insert(
+        "plugin_id".to_string(),
+        Value::String(token.plugin_id.clone()),
+    );
+    object.insert(
+        "access_token".to_string(),
+        Value::String(encrypt_field(&token.access_token)),
+    );
+    object.insert(
+        "refresh_token".to_string(),
+        token
+            .refresh_token
+            .as_deref()
+            .map(encrypt_field)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "token_type".to_string(),
+        Value::String(token.token_type.clone()),
+    );
+    object.insert(
+        "expires_at".to_string(),
+        token
+            .expires_at
+            .map(Number::from)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "scopes".to_string(),
+        Value::Array(token.scopes.iter().cloned().map(Value::String).collect()),
+    );
+    object.insert(
+        "reconnect_required".to_string(),
+        Value::Bool(token.reconnect_required),
+    );
+    Ok(serde_json::to_string(&Value::Object(object))?)
+}
+
+fn decode_plugin_oauth_token(plugin_id: &str, raw: &str) -> anyhow::Result<PluginOauthToken> {
+    let object = parse_plugin_oauth_token_json(raw)?;
+    let access_token = object
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("plugin oauth token missing access_token"))?;
+    let token_type = object
+        .get("token_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("plugin oauth token missing token_type"))?;
+    let expires_at = object.get("expires_at").and_then(Value::as_i64);
+    let scopes = object
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let reconnect_required = object
+        .get("reconnect_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(PluginOauthToken {
+        plugin_id: plugin_id.to_string(),
+        access_token: decrypt_field(access_token)?,
+        refresh_token: match object.get("refresh_token").and_then(Value::as_str) {
+            Some(refresh_token) => Some(decrypt_field(refresh_token)?),
+            None => None,
+        },
+        token_type: token_type.to_string(),
+        expires_at,
+        scopes,
+        reconnect_required,
+    })
 }
 
 /// Check out a pooled connection and run `f` on its dedicated blocking
@@ -1283,6 +1401,94 @@ impl Store {
         })
         .await
     }
+
+    pub async fn upsert_plugin_oauth_token(&self, token: &PluginOauthToken) -> anyhow::Result<()> {
+        let token = token.clone();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let existing: Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM plugin_oauth_tokens WHERE plugin_id=?1",
+                    params![&token.plugin_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let token_json = upsert_plugin_oauth_token_json(existing.as_deref(), &token)
+                .map_err(to_sql_json_error)?;
+            c.execute(
+                "INSERT INTO plugin_oauth_tokens(plugin_id, token_json, updated_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(plugin_id) DO UPDATE SET \
+                   token_json=excluded.token_json, \
+                   updated_at=excluded.updated_at",
+                params![token.plugin_id, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_plugin_oauth_token(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<PluginOauthToken>> {
+        let plugin_id_owned = plugin_id.to_string();
+        let raw: Option<String> = self
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM plugin_oauth_tokens WHERE plugin_id=?1",
+                    params![plugin_id_owned],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await?;
+        raw.map(|raw| decode_plugin_oauth_token(plugin_id, &raw))
+            .transpose()
+    }
+
+    pub async fn mark_plugin_oauth_reconnect_required(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let Some(raw): Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM plugin_oauth_tokens WHERE plugin_id=?1",
+                    params![&plugin_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+            else {
+                return Ok(());
+            };
+            let mut object =
+                parse_plugin_oauth_token_json(&raw).map_err(|err| from_sql_json_error(0, err))?;
+            object.insert("reconnect_required".to_string(), Value::Bool(true));
+            let token_json =
+                serde_json::to_string(&Value::Object(object)).map_err(to_sql_json_error)?;
+            c.execute(
+                "UPDATE plugin_oauth_tokens SET token_json=?2, updated_at=?3 WHERE plugin_id=?1",
+                params![plugin_id, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn delete_plugin_oauth_token(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM plugin_oauth_tokens WHERE plugin_id=?1",
+                params![plugin_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
 }
 
 const SESSION_COLS: &str =
@@ -1344,6 +1550,8 @@ mod tests {
     use super::*;
     use crate::domain::{NewMessage, PermMode, Project};
     use crate::domain::{Session, SessionStatus};
+    use crate::llm_router::secrets::use_test_key_file;
+    use crate::plugins::oauth::PluginOauthToken;
 
     fn sample_project() -> Project {
         Project {
@@ -2103,5 +2311,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows[0].requests, 1);
+    }
+
+    async fn raw_plugin_oauth_token_json(store: &Store, plugin_id: &str) -> String {
+        let plugin_id = plugin_id.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM plugin_oauth_tokens WHERE plugin_id=?1",
+                    params![plugin_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_token_roundtrip_encrypts_at_rest() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = PluginOauthToken {
+            plugin_id: "acme".into(),
+            access_token: "access-secret".into(),
+            refresh_token: Some("refresh-secret".into()),
+            token_type: "Bearer".into(),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["repo".into(), "issues:read".into()],
+            reconnect_required: false,
+        };
+
+        store.upsert_plugin_oauth_token(&token).await.unwrap();
+
+        let raw_json = raw_plugin_oauth_token_json(&store, "acme").await;
+        assert!(
+            !raw_json.contains("access-secret"),
+            "access token must not be stored in plaintext: {raw_json}"
+        );
+        assert!(
+            !raw_json.contains("refresh-secret"),
+            "refresh token must not be stored in plaintext: {raw_json}"
+        );
+
+        let roundtrip = store.get_plugin_oauth_token("acme").await.unwrap().unwrap();
+        assert_eq!(roundtrip.plugin_id, "acme");
+        assert_eq!(roundtrip.access_token, "access-secret");
+        assert_eq!(roundtrip.refresh_token.as_deref(), Some("refresh-secret"));
+        assert_eq!(roundtrip.token_type, "Bearer");
+        assert_eq!(roundtrip.expires_at, Some(1_700_000_000_000));
+        assert_eq!(roundtrip.scopes, vec!["repo", "issues:read"]);
+        assert!(!roundtrip.reconnect_required);
+    }
+
+    #[tokio::test]
+    async fn mark_plugin_oauth_reconnect_required_updates_flag_without_dropping_other_fields() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = PluginOauthToken {
+            plugin_id: "acme".into(),
+            access_token: "access-secret".into(),
+            refresh_token: Some("refresh-secret".into()),
+            token_type: "Bearer".into(),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["repo".into()],
+            reconnect_required: false,
+        };
+        store.upsert_plugin_oauth_token(&token).await.unwrap();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE plugin_oauth_tokens SET token_json = json_set(token_json, '$.resource_metadata', 'https://example.test/.well-known/oauth-protected-resource')",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        store
+            .mark_plugin_oauth_reconnect_required("acme")
+            .await
+            .unwrap();
+
+        let roundtrip = store.get_plugin_oauth_token("acme").await.unwrap().unwrap();
+        assert!(roundtrip.reconnect_required);
+        assert_eq!(roundtrip.access_token, "access-secret");
+        assert_eq!(roundtrip.refresh_token.as_deref(), Some("refresh-secret"));
+
+        let raw_json = raw_plugin_oauth_token_json(&store, "acme").await;
+        let raw_value: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(
+            raw_value["resource_metadata"],
+            "https://example.test/.well-known/oauth-protected-resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_plugin_oauth_token_preserves_unknown_json_fields() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = PluginOauthToken {
+            plugin_id: "acme".into(),
+            access_token: "access-secret".into(),
+            refresh_token: Some("refresh-secret".into()),
+            token_type: "Bearer".into(),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["repo".into()],
+            reconnect_required: false,
+        };
+        store.upsert_plugin_oauth_token(&token).await.unwrap();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE plugin_oauth_tokens SET token_json = json_set(token_json, '$.resource_metadata', 'https://example.test/.well-known/oauth-protected-resource')",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        store
+            .upsert_plugin_oauth_token(&PluginOauthToken {
+                access_token: "access-secret-2".into(),
+                refresh_token: None,
+                reconnect_required: true,
+                ..token
+            })
+            .await
+            .unwrap();
+
+        let raw_json = raw_plugin_oauth_token_json(&store, "acme").await;
+        let raw_value: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(
+            raw_value["resource_metadata"],
+            "https://example.test/.well-known/oauth-protected-resource"
+        );
+
+        let roundtrip = store.get_plugin_oauth_token("acme").await.unwrap().unwrap();
+        assert_eq!(roundtrip.access_token, "access-secret-2");
+        assert_eq!(roundtrip.refresh_token, None);
+        assert!(roundtrip.reconnect_required);
+    }
+
+    #[tokio::test]
+    async fn delete_plugin_oauth_token_removes_the_row() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = PluginOauthToken {
+            plugin_id: "acme".into(),
+            access_token: "access-secret".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scopes: vec![],
+            reconnect_required: false,
+        };
+        store.upsert_plugin_oauth_token(&token).await.unwrap();
+        assert!(store
+            .get_plugin_oauth_token("acme")
+            .await
+            .unwrap()
+            .is_some());
+
+        store.delete_plugin_oauth_token("acme").await.unwrap();
+
+        assert!(store
+            .get_plugin_oauth_token("acme")
+            .await
+            .unwrap()
+            .is_none());
     }
 }
