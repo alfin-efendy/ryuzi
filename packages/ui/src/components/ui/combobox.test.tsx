@@ -253,3 +253,61 @@ test("an interactive element trigger becomes the trigger itself — no nested <b
   fireEvent.click(trigger);
   await screen.findByRole("listbox");
 });
+
+test("createHintLabel renders a pinned row that clears and focuses the search input", async () => {
+  render(
+    <Combobox
+      options={few}
+      value={null}
+      onValueChange={() => {}}
+      onCreate={() => {}}
+      allowCreate
+      createHintLabel="Create and checkout new branch…"
+      aria-label="Branch"
+    />,
+  );
+  await openCombobox("Branch");
+  const input = screen.getByPlaceholderText("Search…");
+  fireEvent.change(input, { target: { value: "left" } });
+  const hint = screen.getByRole("button", { name: /Create and checkout new branch…/ });
+  fireEvent.click(hint);
+  await waitFor(() => {
+    expect((input as HTMLInputElement).value).toBe("");
+    expect(document.activeElement).toBe(input);
+  });
+});
+
+test("onCreateHint: clicking the hint row closes the popup, calls the callback, and skips the clear+focus fallback", async () => {
+  const onCreateHint = mock(() => {});
+  render(
+    <Combobox
+      options={few}
+      value={null}
+      onValueChange={() => {}}
+      onCreate={() => {}}
+      allowCreate
+      createHintLabel="New Branch"
+      onCreateHint={onCreateHint}
+      aria-label="Branch"
+    />,
+  );
+  await openCombobox("Branch");
+  const input = screen.getByPlaceholderText("Search…") as HTMLInputElement;
+  fireEvent.change(input, { target: { value: "left" } });
+  // Spy directly on the search input's focus() method. The fallback branch
+  // (no onCreateHint, see the test above) calls `inputRef.current?.focus()`
+  // synchronously in the same click handler, before the popup unmounts — so
+  // a spy call here proves the handler fell through to that branch instead
+  // of returning right after onCreateHint(). Note: document.activeElement /
+  // the input's value can't be used for this — Base UI unmounts the popup
+  // synchronously on close and resets its own inputValue to "" as part of
+  // that (independent of this component's code), which masks both signals
+  // regardless of whether the fallback ran.
+  const focusSpy = mock(() => {});
+  input.focus = focusSpy;
+  fireEvent.click(screen.getByRole("button", { name: /New Branch/ }));
+  expect(onCreateHint).toHaveBeenCalledTimes(1);
+  expect(focusSpy).not.toHaveBeenCalled();
+  await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+  expect(focusSpy).not.toHaveBeenCalled();
+});

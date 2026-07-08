@@ -73,25 +73,25 @@ async fn run_git(args: &[&str]) -> anyhow::Result<()> {
 }
 
 impl ControlPlane {
-    /// Connect an existing local git repo as a project driven by the default
-    /// `native` (Ryuzi) harness. Prefer [`connect_project_with_harness`] to
-    /// select a runtime.
+    /// Connect an existing local folder (git repo or not) as a project driven
+    /// by the default `native` (Ryuzi) harness. Prefer
+    /// [`connect_project_with_harness`] to select a runtime.
     pub async fn connect_project(&self, workdir: &Path, name: &str) -> anyhow::Result<Project> {
         self.connect_project_with_harness(workdir, name, "native")
             .await
     }
 
-    /// Connect an existing local git repo as a project driven by `harness`
-    /// (e.g. `"native"` or `"claude-code"`).
+    /// Connect an existing local folder as a project driven by `harness`
+    /// (e.g. `"native"` or `"claude-code"`). Non-git folders are allowed —
+    /// git features (branches, worktrees, review diffs) are disabled for
+    /// them in the UI, and the flag self-corrects after a later `git init`.
     pub async fn connect_project_with_harness(
         &self,
         workdir: &Path,
         name: &str,
         harness: &str,
     ) -> anyhow::Result<Project> {
-        // Must be an existing git repo (worktrees need a HEAD commit).
-        git2::Repository::open(workdir)
-            .map_err(|_| anyhow::anyhow!("not a git repository: {}", workdir.display()))?;
+        let is_git = git2::Repository::open(workdir).is_ok();
         let project = Project {
             project_id: new_id(),
             name: name.to_string(),
@@ -102,6 +102,51 @@ impl ControlPlane {
             effort: None,
             perm_mode: PermMode::Default,
             created_at: Some(now_ms()),
+            is_git,
+        };
+        self.store.insert_project(project.clone()).await?;
+        Ok(project)
+    }
+
+    /// Clone `url` into `<dest_parent>/<repo-name>` and register it as a
+    /// project on the default `native` harness — the Cockpit "New project →
+    /// Clone from URL" flow. Unlike [`provision_project`] this is
+    /// gateway-free: no `workdir_root` setting, no admin gating, no
+    /// workspace binding.
+    pub async fn clone_project(&self, url: &str, dest_parent: &Path) -> anyhow::Result<Project> {
+        // Strip a trailing `.git` and extract the directory name.
+        let url_path = url.strip_suffix(".git").unwrap_or(url);
+        let mut name = basename_of(url_path);
+        if name.is_empty() {
+            // Fallback: if basename is empty, use the parent directory name.
+            name = basename_of(strip_one_trailing_slash(url_path));
+        }
+        validate_project_name(&name)?;
+        let workdir = dest_parent.join(&name);
+        // Refuse to clone over anything that exists — the rollback below
+        // removes `workdir`, which must never delete user data.
+        if workdir.exists() {
+            anyhow::bail!("destination already exists: {}", workdir.display());
+        }
+        tokio::fs::create_dir_all(dest_parent).await?;
+        let wd = workdir.to_string_lossy().into_owned();
+        // `--` separates options from positionals so an untrusted `url`
+        // can never be parsed by git as a flag (see `provision_project`).
+        if let Err(e) = run_git(&["clone", "--quiet", "--", url, &wd]).await {
+            let _ = tokio::fs::remove_dir_all(&workdir).await;
+            return Err(e);
+        }
+        let project = Project {
+            project_id: new_id(),
+            name,
+            workdir: wd,
+            source: Some(url.to_string()),
+            harness: "native".to_string(),
+            model: None,
+            effort: None,
+            perm_mode: PermMode::Default,
+            created_at: Some(now_ms()),
+            is_git: true,
         };
         self.store.insert_project(project.clone()).await?;
         Ok(project)
@@ -205,6 +250,7 @@ impl ControlPlane {
             effort: s.effort.clone().or(default_effort),
             perm_mode,
             created_at: Some(now_ms()),
+            is_git: true,
         };
         self.store.insert_project(project.clone()).await?;
         self.store

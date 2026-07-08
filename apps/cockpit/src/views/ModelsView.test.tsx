@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { CatalogEntry, ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, ModelRouteInfo, UsageSeries } from "@/bindings";
 
 const status: EndpointStatusInfo = {
@@ -83,6 +83,9 @@ const catalog: CatalogEntry[] = [
     format: "openai",
     requiresBaseUrl: false,
     models: ["gpt-4.1", "o3"],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
   },
   {
     id: "anthropic",
@@ -94,6 +97,9 @@ const catalog: CatalogEntry[] = [
     format: "anthropic",
     requiresBaseUrl: false,
     models: ["claude-sonnet-4-5"],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
   },
   {
     id: "anthropic-oauth",
@@ -105,6 +111,9 @@ const catalog: CatalogEntry[] = [
     format: "anthropic",
     requiresBaseUrl: false,
     models: ["claude-opus-4-8"],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
   },
 ];
 
@@ -132,6 +141,15 @@ const usage: UsageSeries = {
 
 const saveModelRoute = mock((_route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
 
+const refreshProviderModels = mock((_family: string) =>
+  Promise.resolve({
+    status: "ok" as const,
+    data: [
+      { connectionId: "c1", label: "Work OpenAI", ok: false, message: "Work OpenAI: model list request for openai failed with status 401" },
+    ],
+  }),
+);
+
 const updateConnection = mock(
   (
     _id: string,
@@ -153,6 +171,7 @@ mock.module("@/bindings", () => ({
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
     saveModelRoute,
+    refreshProviderModels,
     deleteModelRoute: (_id: string) => Promise.resolve({ status: "ok", data: [] }),
     providerAccountRoute: (provider: string) => Promise.resolve({ status: "ok", data: { provider, strategy: "fallback" } }),
     setProviderAccountRoute: (provider: string, strategy: string) => Promise.resolve({ status: "ok", data: { provider, strategy } }),
@@ -161,7 +180,8 @@ mock.module("@/bindings", () => ({
     updateConnection,
     moveConnection: () => Promise.resolve({ status: "ok", data: [secondConnection, connection] }),
     testConnection: () => Promise.resolve({ status: "ok", data: { ok: true, message: "Connection OK" } }),
-    testConnectionModel: () => Promise.resolve({ status: "ok", data: { ok: true, message: "Model OK" } }),
+    testConnectionModel: () => Promise.resolve({ status: "ok", data: { ok: true, status: "valid", message: "Model OK" } }),
+    listModelStatuses: () => Promise.resolve({ status: "ok", data: [] }),
     connectionProviderQuota: () =>
       Promise.resolve({
         status: "ok",
@@ -248,6 +268,64 @@ test("providers tab groups anthropic + anthropic-oauth accounts into one Anthrop
   expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
 });
 
+test("provider rows show one category badge per auth method in the family", async () => {
+  useConnections.setState({ catalog, connections: [], loaded: true });
+  render(<ModelsView />);
+
+  const anthropicRow = await screen.findByRole("button", { name: "Anthropic No accounts 2 catalog models" });
+  expect(within(anthropicRow).getByText("API key")).toBeTruthy();
+  expect(within(anthropicRow).getByText("OAuth")).toBeTruthy();
+
+  const openaiRow = screen.getByRole("button", { name: "OpenAI No accounts 2 catalog models" });
+  expect(within(openaiRow).getByText("API key")).toBeTruthy();
+  expect(within(openaiRow).queryByText("OAuth")).toBeNull();
+});
+
+test("free-tier providers get a Free tier badge and device maps to Free", async () => {
+  useConnections.setState({
+    catalog: [
+      ...catalog,
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        family: "openrouter",
+        color: "#6E56CF",
+        initial: "R",
+        category: "api_key",
+        format: "openai",
+        requiresBaseUrl: false,
+        models: [],
+        freeTier: true,
+        riskNotice: false,
+        usesDeviceGrant: false,
+      },
+      {
+        id: "kiro",
+        name: "Kiro (free tier)",
+        family: "kiro",
+        color: "#7C3AED",
+        initial: "K",
+        category: "device",
+        format: "openai",
+        requiresBaseUrl: false,
+        models: ["claude-sonnet-5"],
+        freeTier: false,
+        riskNotice: true,
+        usesDeviceGrant: false,
+      },
+    ],
+    connections: [],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  const openrouterRow = await screen.findByRole("button", { name: /OpenRouter/ });
+  expect(within(openrouterRow).getByText("Free tier")).toBeTruthy();
+  const kiroRow = screen.getByRole("button", { name: /Kiro/ });
+  expect(within(kiroRow).getByText("Free")).toBeTruthy();
+  expect(within(kiroRow).queryByText("device")).toBeNull();
+});
+
 test("seeds the settings form from the hydrated endpoint status", async () => {
   render(<ModelsView />);
 
@@ -299,6 +377,17 @@ test("changing account routing opens a listbox and persists the picked strategy"
   expect(await screen.findByText("2 active · Round robin")).toBeTruthy();
 });
 
+test("Refresh models surfaces per-connection failures inline", async () => {
+  refreshProviderModels.mockClear();
+  useConnections.setState({ catalog, connections: [connection], loaded: true });
+  render(<ProviderDetailView provider="openai" />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Refresh models" }));
+
+  await waitFor(() => expect(refreshProviderModels).toHaveBeenCalledWith("openai"));
+  expect(await screen.findByText("Work OpenAI: model list request for openai failed with status 401")).toBeTruthy();
+});
+
 test("provider detail spans the vendor family across catalog auth methods", async () => {
   useConnections.setState({ catalog, connections: [claudeConnection, anthropicApiConnection], loaded: true });
   render(<ProviderDetailView provider="anthropic" />);
@@ -337,7 +426,9 @@ test("route form renders strategy and target comboboxes with option lists", asyn
 
   const target = screen.getByRole("combobox", { name: "Target 1" });
   fireEvent.click(target);
-  expect(await screen.findByRole("option", { name: "OpenAI / gpt-4.1" })).toBeTruthy();
+  // Grouped presentation: provider family as the group header, model-only labels.
+  expect(await screen.findByRole("option", { name: "gpt-4.1" })).toBeTruthy();
+  expect(screen.getByText("OpenAI")).toBeTruthy();
 });
 
 test("route target dropdown collapses multiple accounts of the same provider into one option per model", async () => {
@@ -349,7 +440,7 @@ test("route target dropdown collapses multiple accounts of the same provider int
   // connection and secondConnection are both `openai` accounts that both
   // serve gpt-4.1 — the dropdown must dedupe to a single family+model option.
   fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
-  expect(await screen.findAllByRole("option", { name: "OpenAI / gpt-4.1" })).toHaveLength(1);
+  expect(await screen.findAllByRole("option", { name: "gpt-4.1" })).toHaveLength(1);
 });
 
 test("route target dropdown collapses anthropic + anthropic-oauth accounts sharing a model into one Anthropic option", async () => {
@@ -368,7 +459,8 @@ test("route target dropdown collapses anthropic + anthropic-oauth accounts shari
   fireEvent.click(screen.getByRole("button", { name: "New route" }));
 
   fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
-  expect(await screen.findAllByRole("option", { name: `Anthropic / ${sharedModel}` })).toHaveLength(1);
+  expect(await screen.findAllByRole("option", { name: sharedModel })).toHaveLength(1);
+  expect(screen.getByText("Anthropic")).toBeTruthy();
 });
 
 test("route form saves targets as {provider, model} scoped to the family, not the connection", async () => {

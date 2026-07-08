@@ -69,6 +69,9 @@ pub struct Project {
     pub effort: Option<String>,
     pub perm_mode: PermMode,
     pub created_at: Option<i64>,
+    /// Computed at read time (`git2::Repository::open` probe on `workdir`) —
+    /// NOT a DB column. Self-corrects if the user later runs `git init`.
+    pub is_git: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]

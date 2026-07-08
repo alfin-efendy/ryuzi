@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { basename } from "./lib/paths";
+import type { ViewMode } from "./lib/preview";
 
-export type DockTab = { id: string; kind: "file"; path: string; title: string };
+export type DockTab = { id: string; kind: "file"; path: string; title: string; mode?: ViewMode };
 
 function titleOf(path: string): string {
   return basename(path) || path;
@@ -23,6 +24,10 @@ export function closeTab(tabs: DockTab[], activeTabId: string | null, id: string
   return { tabs: next, activeTabId: neighbor.id };
 }
 
+export function setTabMode(tabs: DockTab[], id: string, mode: ViewMode): DockTab[] {
+  return tabs.map((t) => (t.id === id ? { ...t, mode } : t));
+}
+
 const KEY = {
   left: "cockpit.ui.leftOpen",
   right: "cockpit.ui.rightOpen",
@@ -30,6 +35,7 @@ const KEY = {
   active: "cockpit.ui.activeTab",
   pinned: "cockpit.ui.pinned",
   archived: "cockpit.ui.archived",
+  hideInvalidModels: "cockpit.ui.hideInvalidModels",
 };
 
 function readBool(key: string, fallback: boolean): boolean {
@@ -75,6 +81,8 @@ type UiState = {
   activeTabId: string | null;
   pinned: Record<string, true>;
   archived: Record<string, true>;
+  /** Provider Models card: hide rows with a persisted "invalid" verdict. */
+  hideInvalidModels: boolean;
   toggleLeft: () => void;
   toggleRight: () => void;
   setLeft: (open: boolean) => void;
@@ -82,10 +90,12 @@ type UiState = {
   openFile: (path: string) => void;
   closeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
+  setTabMode: (id: string, mode: ViewMode) => void;
   togglePin: (sessionPk: string) => void;
   toggleArchive: (sessionPk: string) => void;
   /** Idempotent write — archive flows must not race a pure toggle. */
   setArchived: (sessionPk: string, on: boolean) => void;
+  toggleHideInvalidModels: () => void;
 };
 
 export const useUi = create<UiState>((set, get) => ({
@@ -95,6 +105,7 @@ export const useUi = create<UiState>((set, get) => ({
   activeTabId: normalizeActive(typeof localStorage !== "undefined" ? localStorage.getItem(KEY.active) : null),
   pinned: readSet(KEY.pinned),
   archived: readSet(KEY.archived),
+  hideInvalidModels: readBool(KEY.hideInvalidModels, false),
   toggleLeft: () =>
     set((s) => {
       const v = !s.leftPanelOpen;
@@ -139,6 +150,11 @@ export const useUi = create<UiState>((set, get) => ({
     persist(KEY.active, id);
     set({ activeTabId: id });
   },
+  setTabMode: (id, mode) => {
+    const tabs = setTabMode(get().tabs, id, mode);
+    persist(KEY.tabs, JSON.stringify(tabs));
+    set({ tabs });
+  },
   togglePin: (sessionPk) => {
     const pinned = toggleKey(get().pinned, sessionPk);
     persist(KEY.pinned, JSON.stringify(pinned));
@@ -156,4 +172,10 @@ export const useUi = create<UiState>((set, get) => ({
     persist(KEY.archived, JSON.stringify(archived));
     set({ archived });
   },
+  toggleHideInvalidModels: () =>
+    set((s) => {
+      const v = !s.hideInvalidModels;
+      persist(KEY.hideInvalidModels, v ? "1" : "0");
+      return { hideInvalidModels: v };
+    }),
 }));

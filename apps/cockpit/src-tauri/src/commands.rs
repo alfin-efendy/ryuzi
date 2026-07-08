@@ -6,7 +6,6 @@ use ryuzi_core::{
 };
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
@@ -67,6 +66,18 @@ pub async fn connect_project(
 ) -> R<Project> {
     Ok(cp
         .connect_project(std::path::Path::new(&workdir), &name)
+        .await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn clone_project(
+    cp: State<'_, Arc<ControlPlane>>,
+    url: String,
+    dest_parent: String,
+) -> R<Project> {
+    Ok(cp
+        .clone_project(&url, std::path::Path::new(&dest_parent))
         .await?)
 }
 
@@ -221,26 +232,6 @@ fn chat_agent_prompt(prompt: &str, context: Option<&ChatContextArg>) -> String {
     }
 }
 
-fn percent_encode_file_path(path: &str) -> String {
-    let mut out = String::new();
-    for b in path.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(*b, b'/' | b':' | b'.' | b'-' | b'_' | b'~') {
-            out.push(*b as char);
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-    }
-    out
-}
-
-fn file_url_from_abs_path(path: &Path) -> String {
-    let mut normalized = path.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) && !normalized.starts_with('/') {
-        normalized = format!("/{normalized}");
-    }
-    format!("file://{}", percent_encode_file_path(&normalized))
-}
-
 fn content_type_for_path(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
     match ext.as_str() {
@@ -252,6 +243,16 @@ fn content_type_for_path(path: &Path) -> Option<String> {
         "gif" => Some("image/gif".to_string()),
         "pdf" => Some("application/pdf".to_string()),
         "zip" => Some("application/zip".to_string()),
+        "webp" => Some("image/webp".to_string()),
+        "mp4" => Some("video/mp4".to_string()),
+        "webm" => Some("video/webm".to_string()),
+        "mov" => Some("video/quicktime".to_string()),
+        "mkv" => Some("video/x-matroska".to_string()),
+        "mp3" => Some("audio/mpeg".to_string()),
+        "wav" => Some("audio/wav".to_string()),
+        "ogg" => Some("audio/ogg".to_string()),
+        "m4a" => Some("audio/mp4".to_string()),
+        "flac" => Some("audio/flac".to_string()),
         _ => None,
     }
 }
@@ -275,7 +276,7 @@ async fn attachment_refs_from_paths(paths: &[String]) -> R<Vec<AttachmentRef>> {
             .unwrap_or_else(|| "file".to_string());
         out.push(AttachmentRef {
             name,
-            url: file_url_from_abs_path(&path),
+            url: ryuzi_core::attachments::file_url_for_path(&path)?.to_string(),
             content_type: content_type_for_path(&path),
             size: meta.len(),
         });
@@ -307,10 +308,7 @@ pub async fn start_session(
         .inner()
         .start_session_with_prompt(
             &project_id,
-            TurnPrompt {
-                agent: agent_prompt,
-                display: prompt,
-            },
+            TurnPrompt::text(agent_prompt, prompt),
             "cockpit",
             &attachments,
             git,
@@ -334,10 +332,7 @@ pub async fn continue_session(
         .inner()
         .continue_session_with_prompt(
             &session_pk,
-            TurnPrompt {
-                agent: agent_prompt,
-                display: prompt,
-            },
+            TurnPrompt::text(agent_prompt, prompt),
             &attachments,
         )
         .await?)
@@ -381,6 +376,84 @@ pub async fn read_file(path: String) -> R<String> {
     let meta = tokio::fs::metadata(&path).await?;
     check_read_size(meta.len())?;
     Ok(tokio::fs::read_to_string(&path).await?)
+}
+
+/// Largest pasted attachment accepted from the webview (decoded size).
+const MAX_STAGE_BYTES: usize = 25 * 1024 * 1024;
+/// Largest media file inlined as a composer preview.
+const MAX_MEDIA_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Keep only the final path segment and strip characters unsafe in a file name.
+fn sanitize_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("file");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Write pasted bytes into the attachments staging area and return the
+/// absolute path — from there the file flows through the normal attachment
+/// pipeline on send. Staging is wiped on app start (see lib.rs setup).
+#[tauri::command]
+#[specta::specta]
+pub async fn stage_attachment(
+    cp: State<'_, Arc<ControlPlane>>,
+    name: String,
+    data_base64: String,
+) -> R<String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|e| CmdError {
+            message: format!("invalid attachment data: {e}"),
+        })?;
+    if bytes.len() > MAX_STAGE_BYTES {
+        return Err(CmdError {
+            message: format!("attachment too large ({} bytes)", bytes.len()),
+        });
+    }
+    let dir = cp
+        .attachments_root()
+        .await
+        .join("staging")
+        .join(ryuzi_core::paths::new_id());
+    tokio::fs::create_dir_all(&dir).await?;
+    let path = dir.join(sanitize_file_name(&name));
+    tokio::fs::write(&path, &bytes).await?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaFile {
+    pub data_base64: String,
+    pub content_type: Option<String>,
+}
+
+/// Read a media file as base64 for composer thumbnails (arbitrary user paths
+/// sit outside the asset-protocol scope, so previews go through this instead).
+#[tauri::command]
+#[specta::specta]
+pub async fn read_file_base64(path: String) -> R<MediaFile> {
+    use base64::Engine as _;
+    let meta = tokio::fs::metadata(&path).await?;
+    if meta.len() > MAX_MEDIA_READ_BYTES {
+        return Err(CmdError {
+            message: format!("file too large ({} bytes)", meta.len()),
+        });
+    }
+    let bytes = tokio::fs::read(&path).await?;
+    Ok(MediaFile {
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        content_type: content_type_for_path(Path::new(&path)),
+    })
 }
 
 #[tauri::command]
@@ -465,6 +538,7 @@ mod tests {
                 effort: None,
                 perm_mode: PermMode::Default,
                 created_at: None,
+                is_git: false,
             })
             .await
             .unwrap();
@@ -560,5 +634,24 @@ mod tests {
         assert!(!core.create_branch);
         assert_eq!(core.branch_name, None, "blank names collapse to None");
         assert_eq!(core.base_branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn sanitize_file_name_strips_directories_and_unsafe_chars() {
+        assert_eq!(sanitize_file_name("shot.png"), "shot.png");
+        // rsplit keeps only the last path segment — traversal collapses away.
+        assert_eq!(sanitize_file_name("..\\..\\evil.exe"), "evil.exe");
+        assert_eq!(sanitize_file_name("a/b/c.png"), "c.png");
+        assert_eq!(sanitize_file_name("we|ird?.png"), "weird.png");
+        assert_eq!(sanitize_file_name("   "), "file");
+    }
+
+    #[test]
+    fn media_content_types_cover_video_and_audio() {
+        let ct = |p: &str| content_type_for_path(Path::new(p));
+        assert_eq!(ct("a.webp").as_deref(), Some("image/webp"));
+        assert_eq!(ct("a.mp4").as_deref(), Some("video/mp4"));
+        assert_eq!(ct("a.mp3").as_deref(), Some("audio/mpeg"));
+        assert_eq!(ct("a.wav").as_deref(), Some("audio/wav"));
     }
 }

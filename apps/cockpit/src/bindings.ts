@@ -37,6 +37,14 @@ async connectProject(workdir: string, name: string) : Promise<Result<Project, Cm
     else return { status: "error", error: e  as any };
 }
 },
+async cloneProject(url: string, destParent: string) : Promise<Result<Project, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clone_project", { url, destParent }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async startSession(projectId: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("start_session", { projectId, prompt, options }) };
@@ -75,6 +83,31 @@ async resolveApproval(requestId: string, allow: boolean) : Promise<boolean> {
 async readFile(path: string) : Promise<Result<string, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("read_file", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Write pasted bytes into the attachments staging area and return the
+ * absolute path — from there the file flows through the normal attachment
+ * pipeline on send. Staging is wiped on app start (see lib.rs setup).
+ */
+async stageAttachment(name: string, dataBase64: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stage_attachment", { name, dataBase64 }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read a media file as base64 for composer thumbnails (arbitrary user paths
+ * sit outside the asset-protocol scope, so previews go through this instead).
+ */
+async readFileBase64(path: string) : Promise<Result<MediaFile, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_file_base64", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -426,6 +459,28 @@ async searchFiles(projectId: string, query: string) : Promise<Result<string[], C
 }
 },
 /**
+ * Revert one file in the session workdir to HEAD (Undo on a file-edit card).
+ */
+async revertFile(sessionPk: string, path: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("revert_file", { sessionPk, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listOpenTargets() : Promise<OpenTarget[]> {
+    return await TAURI_INVOKE("list_open_targets");
+},
+async openIn(sessionPk: string, targetId: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_in", { sessionPk, targetId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Open a shell in the session's worktree (or the project workdir).
  */
 async termOpen(sessionPk: string, cols: number, rows: number) : Promise<Result<string, CmdError>> {
@@ -619,6 +674,31 @@ async testConnectionModel(id: string, model: string) : Promise<Result<TestResult
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Re-fetch the live model list for every enabled connection in a vendor
+ * family, persisting discoveries. Unlike the add/update-time best-effort
+ * refresh, failures are returned to the UI instead of being swallowed.
+ */
+async refreshProviderModels(family: string) : Promise<Result<RefreshModelsResult[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_provider_models", { family }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Persisted per-model probe verdicts for a vendor family — hydrates the
+ * provider Models card so earlier Test All results show immediately.
+ */
+async listModelStatuses(family: string) : Promise<Result<ModelStatusInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_model_statuses", { family }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async connectionProviderQuota(id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { id }) };
@@ -771,38 +851,6 @@ async sessionTodos(sessionPk: string) : Promise<Result<TodoItem[], CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async listSkills() : Promise<Result<InstalledSkillInfo[], string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("list_skills") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async installSkill(source: string) : Promise<Result<InstalledSkillPack, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("install_skill", { source }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async removeSkill(id: string) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("remove_skill", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async refreshSkill(id: string) : Promise<Result<InstalledSkillPack, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("refresh_skill", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async listPlugins() : Promise<Result<PluginInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_plugins") };
@@ -839,30 +887,6 @@ async setPluginEnabled(id: string, enabled: boolean) : Promise<Result<null, CmdE
 async setPluginSetting(key: string, value: string) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_plugin_setting", { key, value }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async beginPluginOauth(pluginId: string) : Promise<Result<PluginOauthBeginResult, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("begin_plugin_oauth", { pluginId }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async completePluginOauth(pluginId: string, code: string, stateToken: string) : Promise<Result<PluginAuthInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("complete_plugin_oauth", { pluginId, code, stateToken }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async disconnectPluginOauth(pluginId: string) : Promise<Result<PluginAuthInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("disconnect_plugin_oauth", { pluginId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -954,6 +978,35 @@ async importKiroToken(label: string) : Promise<Result<ConnectionInfo[], CmdError
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Start an RFC 8628 device-authorization grant for a device-grant provider
+ * (Qwen, GitHub Copilot): request a device code, open the verification URL,
+ * and stash in-flight state under a fresh `flow_id` for `await_device_flow`.
+ * Errors for providers that are not device-grant (e.g. `kiro`, which uses
+ * `start_kiro_device_flow`).
+ */
+async startDeviceFlow(provider: string) : Promise<Result<DeviceFlowInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_device_flow", { provider }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Poll a device-grant flow started by `start_device_flow` until completion,
+ * then persist the connection with `auth_type = "oauth"`. GitHub Copilot runs
+ * the Copilot-token exchange (leg 2) before persisting; Qwen captures its
+ * shard `resource_url`.
+ */
+async awaitDeviceFlow(provider: string, label: string, flowId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("await_device_flow", { provider, label, flowId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -964,14 +1017,12 @@ export const events = __makeEvents__<{
 accentChangedMsg: AccentChangedMsg,
 coreEventMsg: CoreEventMsg,
 oauthAuthorizeUrlMsg: OauthAuthorizeUrlMsg,
-pluginOauthAuthorizeUrlMsg: PluginOauthAuthorizeUrlMsg,
 termExitMsg: TermExitMsg,
 termOutputMsg: TermOutputMsg
 }>({
 accentChangedMsg: "accent-changed-msg",
 coreEventMsg: "core-event-msg",
 oauthAuthorizeUrlMsg: "oauth-authorize-url-msg",
-pluginOauthAuthorizeUrlMsg: "plugin-oauth-authorize-url-msg",
 termExitMsg: "term-exit-msg",
 termOutputMsg: "term-output-msg"
 })
@@ -1011,7 +1062,7 @@ export type CatalogEntry = { id: string; name: string;
  * Vendor family id (a catalog id). Entries sharing a family render as one
  * provider card; the entry whose id == family is the display head.
  */
-family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[] }
+family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
 export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**
@@ -1088,9 +1139,6 @@ export type GatewayResourceInfo = { label: string; sub: string; pct: number }
  * Per-start git controls from the composer (behavior matrix, workstream B).
  */
 export type GitOptions = { useWorktree: boolean; createBranch: boolean; branchName: string | null; baseBranch: string | null }
-export type InstalledSkillEntry = { id: string; name: string }
-export type InstalledSkillInfo = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skillCount: number }
-export type InstalledSkillPack = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skills: InstalledSkillEntry[] }
 export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
 export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
@@ -1117,6 +1165,7 @@ export type KeychainStatus =
  */
 "unavailable"
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
+export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
  */
@@ -1130,7 +1179,12 @@ export type ModelRouteTarget = {
  * the family serving `model`, at request time.
  */
 provider: string; model: string }
+/**
+ * One persisted probe verdict row for the provider Models card.
+ */
+export type ModelStatusInfo = { model: string; status: string; message: string; testedAt: number }
 export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
+export type OpenTarget = { id: string; name: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PluginAuthInfo = { 
 /**
@@ -1141,7 +1195,7 @@ kind: string; setting: string | null; env: string | null; helpUrl: string | null
  * A persisted (non-empty) row exists for `setting`, OR `env` is set in
  * the process environment. Never reveals the value itself.
  */
-configured: boolean; oauthConnectAvailable: boolean; oauthConnectError: string | null; oauthTokenStored: boolean; oauthReconnectRequired: boolean }
+configured: boolean }
 export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; menuLabel: string | null; homepage: string | null; publisher: string }
 export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean; 
 /**
@@ -1167,17 +1221,21 @@ transport: string;
  * `${auth}` substitution, matching `ryuzi plugins info`'s output.
  */
 commandOrUrl: string }
-export type PluginOauthAuthorizeUrlMsg = { pluginId: string; authorizeUrl: string }
-export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string; redirectUri: string }
-export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null }
+export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
+/**
+ * Computed at read time (`git2::Repository::open` probe on `workdir`) —
+ * NOT a DB column. Self-corrects if the user later runs `git init`.
+ */
+isGit: boolean }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
+export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RegistryEntry = { 
 /**
  * Registry name, e.g. `io.github.owner/server`.
  */
-id: string; name: string; desc: string; version: string; publisher: string | null;
+id: string; name: string; desc: string; version: string | null; publisher: string; 
 /**
  * stdio (npm package) | http (remote)
  */
@@ -1185,8 +1243,7 @@ kind: string;
 /**
  * npm identifier for stdio entries; URL for remotes.
  */
-installTarget: string | null; website: string | null; versions: RegistryEntryVersion[] }
-export type RegistryEntryVersion = { version: string; installTarget: string | null; website: string | null; isLatest: boolean }
+installTarget: string | null; website: string | null }
 export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
@@ -1214,7 +1271,16 @@ export type TermOutputMsg = { id: string;
  * UTF-8 chunk (lossy) of PTY output.
  */
 data: string }
-export type TestResult = { ok: boolean; message: string }
+export type TestResult = { 
+/**
+ * Legacy pass/fail, kept for existing call sites (connection-level
+ * test, toasts). Always derived: `status == "valid"`.
+ */
+ok: boolean; 
+/**
+ * Tri-state probe verdict: "valid" | "invalid" | "unknown".
+ */
+status: string; message: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type TodoItem = { content: string; status: string }
 export type ToolInfo = { name: string; desc: string; perm: string }

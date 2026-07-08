@@ -19,7 +19,8 @@ import {
   SettingsCardTitle as CardTitle,
   Switch,
 } from "@ryuzi/ui";
-import { Chip, Pill, StatusDot } from "@/components/common/bits";
+import type { ComboboxGroup, ComboboxOption } from "@ryuzi/ui";
+import { CategoryBadge, Chip, Pill, StatusDot } from "@/components/common/bits";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
 
@@ -30,7 +31,7 @@ type ProviderRowInfo = {
   name: string;
   color: string;
   initial: string;
-  category: string;
+  badges: string[];
   accounts: ConnectionInfo[];
   catalogModels: number;
   modelCount: number;
@@ -52,6 +53,17 @@ function modelLabel(count: number, catalog = false): string {
   return `${count} ${catalog ? "catalog " : ""}model${count === 1 ? "" : "s"}`;
 }
 
+const BADGE_ORDER = ["free", "free_tier", "oauth", "api_key"];
+
+function badgeKeys(entries: CatalogEntry[]): string[] {
+  const keys = new Set<string>();
+  for (const entry of entries) {
+    keys.add(entry.category === "device" ? "free" : entry.category);
+    if (entry.freeTier) keys.add("free_tier");
+  }
+  return Array.from(keys).sort((a, b) => BADGE_ORDER.indexOf(a) - BADGE_ORDER.indexOf(b));
+}
+
 function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[]): ProviderRowInfo[] {
   const rows = new Map<string, ProviderRowInfo>();
   const familyByProvider = new Map(catalog.map((entry) => [entry.id, entry.family]));
@@ -67,12 +79,15 @@ function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[
         name: head.name,
         color: head.color,
         initial: head.initial,
-        category: head.category,
+        badges: [],
         accounts: [],
         catalogModels: 0,
         modelCount: 0,
       });
     }
+  }
+  for (const [family, row] of rows) {
+    row.badges = badgeKeys(catalog.filter((entry) => entry.family === family));
   }
   for (const [family, models] of catalogModelsByFamily) {
     const row = rows.get(family);
@@ -90,7 +105,7 @@ function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[
         name: conn.providerName,
         color: conn.color,
         initial: conn.initial,
-        category: conn.authType,
+        badges: [conn.authType === "oauth" ? "oauth" : conn.authType === "free" ? "free" : "api_key"],
         accounts: [],
         catalogModels: 0,
         modelCount: 0,
@@ -296,13 +311,15 @@ function ProviderRow({ row }: { row: ProviderRowInfo }) {
     >
       <Chip initial={row.initial} color={row.color} size={34} />
       <span className="min-w-0 flex-1">
-        <span className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-          {row.name}
+        <span className="flex min-w-0 flex-wrap items-center gap-1.5 text-sm font-semibold text-foreground">
+          <span className="truncate">{row.name}</span>
+          {row.badges.map((badge) => (
+            <CategoryBadge key={badge} category={badge} />
+          ))}
           {activeCount > 0 && <Pill variant="primary">{activeCount} active</Pill>}
         </span>
         <span className="block text-xs font-normal text-muted-foreground">
           {accountLabel(row.accounts.length)} · {modelText}
-          {row.accounts.length === 0 ? ` · ${row.category.replace("_", " ")}` : ""}
         </span>
       </span>
       <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5 text-muted-foreground" />
@@ -359,6 +376,24 @@ function routeTargetOptions(catalog: CatalogEntry[], connections: ConnectionInfo
   return Array.from(options.values());
 }
 
+// Grouped presentation for the route-targets picker (same look as the
+// composer's model picker): one group per provider family, model-only
+// labels. Values stay the composite `provider::model` target keys, and the
+// source stays connections-only — routes are excluded by construction.
+function groupedTargetOptions(targetOptions: TargetOption[]): ComboboxGroup[] {
+  const byProvider = new Map<string, ComboboxOption[]>();
+  for (const option of targetOptions) {
+    const list = byProvider.get(option.providerName) ?? [];
+    list.push({
+      value: option.key,
+      label: `${option.model}${option.enabled ? "" : " (no enabled account)"}`,
+      mono: true,
+    });
+    byProvider.set(option.providerName, list);
+  }
+  return Array.from(byProvider, ([label, options]) => ({ label, options }));
+}
+
 function newRoute(targets: TargetOption[]): ModelRouteInfo {
   const first = targets[0];
   return {
@@ -390,6 +425,7 @@ function RouteForm({
   onSave: (route: ModelRouteInfo) => void;
 }) {
   const [draft, setDraft] = useState(value);
+  const groupedTargets = useMemo(() => groupedTargetOptions(targetOptions), [targetOptions]);
 
   useEffect(() => {
     setDraft(value);
@@ -464,11 +500,7 @@ function RouteForm({
             <div key={`${index}-${targetKey(target)}`} className="flex items-center gap-2">
               <Combobox
                 aria-label={`Target ${index + 1}`}
-                options={targetOptions.map((option) => ({
-                  value: option.key,
-                  label: `${option.providerName} / ${option.model}${option.enabled ? "" : " (no enabled account)"}`,
-                  mono: true,
-                }))}
+                options={groupedTargets}
                 value={targetKey(target)}
                 onValueChange={(key) => setTarget(index, key)}
                 className="min-w-0 flex-1"

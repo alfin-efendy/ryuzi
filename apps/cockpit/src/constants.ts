@@ -1,6 +1,10 @@
 // Pure UI copy and presentation constants. Anything stateful lives in the
 // domain stores backed by real IPC — nothing here is data.
 
+// Backend settings-table key: default destination for "Clone from URL"
+// (SettingsView "Projects folder"). Same storage mechanism as workdir_root.
+export const PROJECTS_ROOT_KEY = "projects_root";
+
 export type UiPermMode = "plan" | "ask" | "edit" | "full";
 
 export const PERM_MODES: { id: UiPermMode; label: string; desc: string }[] = [
@@ -86,3 +90,15 @@ export const KIRO_IMPORT_SUCCESS = "Imported your Kiro sign-in";
 // protects them lives when it isn't the OS keychain.
 export const KEYCHAIN_FILE_FALLBACK_WARNING = "Secrets are stored in a local file, not the OS keychain.";
 export const KEYCHAIN_UNAVAILABLE_WARNING = "Secrets are stored unencrypted — no OS keychain available.";
+
+// Shown in the Add-account modal for catalog entries flagged `riskNotice`
+// (providers reached through unofficial/reverse-engineered endpoints).
+export const PROVIDER_RISK_NOTICE =
+  "Uses your provider account through unofficial endpoints. This may violate the provider's terms and can risk account suspension.";
+
+// Device sign-in copy for RFC 8628 device-grant providers (qwen, github-copilot).
+export const DEVICE_SIGNIN_ACTION = "Sign in";
+export const PROVIDER_DEVICE_SUBTITLE: Record<string, string> = {
+  qwen: "Free — sign in with your Qwen account. No API key needed.",
+  "github-copilot": "Sign in with your GitHub account to use your Copilot subscription.",
+};

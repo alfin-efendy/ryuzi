@@ -182,6 +182,91 @@ impl HarnessFactory for FakeHarnessFactory {
     }
 }
 
+/// A harness whose `start_session` parks until `release` is notified —
+/// freezes a session's background startup at the harness phase so a test can
+/// stop it deterministically mid-startup.
+struct GatedHarness {
+    release: Arc<tokio::sync::Notify>,
+    counters: Counters,
+}
+
+#[async_trait]
+impl Harness for GatedHarness {
+    async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+        self.release.notified().await;
+        self.counters.starts.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(FakeSession {
+            store: ctx.store.clone(),
+            events: ctx.events.clone(),
+            session_pk: ctx.session_pk.clone(),
+            block_until_cancel: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            send_count: self.counters.sends.clone(),
+            ended: self.counters.ended.clone(),
+            prompts: self.counters.prompts.clone(),
+        }))
+    }
+}
+
+struct GatedHarnessFactory {
+    release: Arc<tokio::sync::Notify>,
+    counters: Counters,
+}
+
+impl HarnessFactory for GatedHarnessFactory {
+    fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+        Ok(Arc::new(GatedHarness {
+            release: self.release.clone(),
+            counters: self.counters.clone(),
+        }))
+    }
+}
+
+/// Like `GatedHarness`, but the gate is a latch that releases ALL waiters
+/// (current *and* future) once `open` flips true, and `starts` is incremented
+/// on EVERY `start_session` attempt *before* the gate. A follow-up issued
+/// while startup is in flight must NOT cold-resume into a second harness, so
+/// counting each attempt up-front lets a test assert `starts == 1` even while
+/// everyone is still parked (a cold-resume shows `2` immediately).
+struct LatchGatedHarness {
+    open: Arc<AtomicBool>,
+    counters: Counters,
+}
+
+#[async_trait]
+impl Harness for LatchGatedHarness {
+    async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+        self.counters.starts.fetch_add(1, Ordering::SeqCst);
+        while !self.open.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        Ok(Box::new(FakeSession {
+            store: ctx.store.clone(),
+            events: ctx.events.clone(),
+            session_pk: ctx.session_pk.clone(),
+            block_until_cancel: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            send_count: self.counters.sends.clone(),
+            ended: self.counters.ended.clone(),
+            prompts: self.counters.prompts.clone(),
+        }))
+    }
+}
+
+struct LatchGatedHarnessFactory {
+    open: Arc<AtomicBool>,
+    counters: Counters,
+}
+
+impl HarnessFactory for LatchGatedHarnessFactory {
+    fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+        Ok(Arc::new(LatchGatedHarness {
+            open: self.open.clone(),
+            counters: self.counters.clone(),
+        }))
+    }
+}
+
 /// Build a `Registries` with a `native` harness backed by the fake.
 fn registries(block_until_cancel: bool) -> Registries {
     registries_with(block_until_cancel, Counters::default())
@@ -315,7 +400,7 @@ async fn fake_control_plane_with_telemetry(
 
 /// A fake `AttachmentFetcher`: returns the configured bytes for a known
 /// URL, or a 404 for anything else — no real network I/O, for
-/// `with_attachments` tests.
+/// `prepare_attachments` tests.
 struct FakeAttachmentFetcher {
     bodies: std::collections::HashMap<String, Vec<u8>>,
 }
@@ -345,7 +430,7 @@ impl crate::attachments::AttachmentFetcher for FakeAttachmentFetcher {
 }
 
 /// Like `fake_control_plane`, but wired via `new_full` with an injected
-/// attachment fetcher — for `with_attachments` tests that must not hit
+/// attachment fetcher — for `prepare_attachments` tests that must not hit
 /// the real network.
 async fn fake_control_plane_with_fetcher(
     fetcher: Arc<dyn crate::attachments::AttachmentFetcher>,
@@ -407,10 +492,19 @@ async fn start_session_emits_session_run_count_and_harness_run_span() {
         .start_session(&project.project_id, "go", "test", &[])
         .await
         .unwrap();
-    // Let the background prompt task (spawn_prompt) finish the turn.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let parsed = parse_telemetry_lines(&lines);
+    // Background startup + the prompt turn finish asynchronously — poll for
+    // the harness.run span instead of racing a fixed sleep.
+    let mut parsed = parse_telemetry_lines(&lines);
+    for _ in 0..400 {
+        if parsed
+            .iter()
+            .any(|v| v["kind"] == "span" && v["name"] == "harness.run")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        parsed = parse_telemetry_lines(&lines);
+    }
     assert!(
         parsed
             .iter()
@@ -477,6 +571,7 @@ async fn seed_project(store: &Store, project_id: &str) {
             effort: None,
             perm_mode: PermMode::Default,
             created_at: Some(now_ms()),
+            is_git: false,
         })
         .await
         .unwrap();
@@ -535,6 +630,54 @@ async fn wait_for_prompts(log: &Arc<Mutex<Vec<String>>>, n: usize) {
     );
 }
 
+/// Poll the `running` map until background startup registers the session's
+/// live handle — i.e. startup completed (git prep + harness start done).
+async fn wait_for_running_handle(
+    cp: &Arc<ControlPlane>,
+    session_pk: &str,
+) -> Arc<dyn HarnessSession> {
+    for _ in 0..400 {
+        if let Some(h) = cp.running.lock().unwrap().get(session_pk).cloned() {
+            return h;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for the live handle of {session_pk}");
+}
+
+/// Poll the session's persisted messages until one matches `pred`.
+async fn wait_for_message(
+    store: &Store,
+    session_pk: &str,
+    pred: impl Fn(&Message) -> bool,
+) -> Message {
+    for _ in 0..400 {
+        if let Some(m) = store
+            .list_messages(session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| pred(m))
+        {
+            return m;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for a matching message in {session_pk}");
+}
+
+/// Background startup builds the SessionCtx asynchronously — poll until the
+/// fake harness has captured it.
+async fn wait_for_session_ctx(counters: &Counters) -> Vec<crate::domain::McpServerSpec> {
+    for _ in 0..400 {
+        if let Some(servers) = counters.mcp_servers.lock().unwrap().clone() {
+            return servers;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for the harness SessionCtx");
+}
+
 #[tokio::test]
 #[serial]
 async fn unknown_harness_errors_cleanly() {
@@ -567,6 +710,58 @@ async fn connect_project_defaults_to_the_native_harness() {
 }
 
 #[tokio::test]
+async fn connect_project_on_plain_folder_succeeds_with_is_git_false() {
+    let (cp, store, _db_guard) = provisioning_control_plane().await;
+
+    // Deliberately NOT a git repo.
+    let dir = tempfile::tempdir().unwrap();
+    let project = cp.connect_project(dir.path(), "plain").await.unwrap();
+    assert!(!project.is_git);
+    let got = store
+        .get_project(&project.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!got.is_git, "read-time recompute must also say non-git");
+
+    // A real repo still connects with is_git=true.
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    let gitty = cp.connect_project(repo_dir.path(), "gitty").await.unwrap();
+    assert!(gitty.is_git);
+}
+
+#[tokio::test]
+async fn start_session_on_non_git_project_skips_workspace_prep() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+
+    // A plain folder — no repo, so no branch and no worktree.
+    let dir = tempfile::tempdir().unwrap();
+    let project = cp.connect_project(dir.path(), "plain").await.unwrap();
+    assert!(!project.is_git);
+
+    let session = cp
+        .start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+    assert_eq!(session.branch, None, "non-git sessions carry no branch");
+    assert_eq!(session.worktree_path, None);
+    assert!(!session.branch_owned);
+
+    // Wait for background startup to register the live handle (git prep is
+    // skipped, so the harness starts directly in project.workdir), then confirm
+    // the persisted row kept the same no-branch/no-worktree shape.
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let got = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.branch, None);
+    assert_eq!(got.worktree_path, None);
+}
+
+#[tokio::test]
 #[serial]
 async fn stop_immediately_after_start_is_registered() {
     let _guard = StateDirGuard::new();
@@ -582,9 +777,10 @@ async fn stop_immediately_after_start_is_registered() {
         .start_session(&project.project_id, "go", "test", &[])
         .await
         .unwrap();
-    // The harness handle must be registered synchronously by start_session,
-    // BEFORE the background prompt task is spawned — so an immediate stop
-    // reaches the live session's cancel().
+    // Startup now runs in the background — wait for the live handle, then
+    // stop; the stop must reach the live session's cancel(). (A stop that
+    // lands DURING startup is covered by stop_during_startup_cancels_cleanly.)
+    wait_for_running_handle(&cp, &session.session_pk).await;
     cp.stop_session(&session.session_pk).await.unwrap();
 
     // Give the background task a moment to observe cancellation and exit.
@@ -631,13 +827,7 @@ async fn continue_reuses_the_live_session() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Snapshot the live handle so we can prove the SAME one is reused.
-    let handle_before = cp
-        .running
-        .lock()
-        .unwrap()
-        .get(&session.session_pk)
-        .cloned()
-        .expect("start_session must register a live handle");
+    let handle_before = wait_for_running_handle(&cp, &session.session_pk).await;
 
     // Second turn: MUST reuse the live handle — no new ACP session.
     cp.continue_session(&session.session_pk, "second", &[])
@@ -691,7 +881,9 @@ async fn continue_cold_resumes_when_handle_absent() {
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Simulate an app restart that wiped the in-memory running map.
+    // Simulate an app restart that wiped the in-memory running map (after
+    // background startup registered the handle).
+    wait_for_running_handle(&cp, &session.session_pk).await;
     cp.running.lock().unwrap().remove(&session.session_pk);
 
     // Continue must fall back to the cold-resume path: start a FRESH session
@@ -752,6 +944,7 @@ async fn failed_cold_resume_rolls_back_the_running_status() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Simulate a restart, then a resume whose harness can't start.
+    wait_for_running_handle(&cp, &session.session_pk).await;
     cp.running.lock().unwrap().remove(&session.session_pk);
     let err = cp
         .continue_session(&session.session_pk, "second", &[])
@@ -778,8 +971,11 @@ async fn end_session_clears_the_stale_worktree_path() {
         .start_session(&project.project_id, "go", "test", &[])
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(session.worktree_path.is_some());
+    // The worktree path is backfilled by background startup — wait for
+    // startup to complete, then read the stored row.
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+    assert!(stored[0].worktree_path.is_some());
 
     cp.end_session(&session.session_pk).await.unwrap();
     let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
@@ -805,8 +1001,7 @@ async fn end_session_removes_and_ends_the_handle() {
         .start_session(&project.project_id, "go", "test", &[])
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(cp.running.lock().unwrap().contains_key(&session.session_pk));
+    wait_for_running_handle(&cp, &session.session_pk).await;
 
     cp.end_session(&session.session_pk).await.unwrap();
 
@@ -865,19 +1060,440 @@ async fn start_session_streams_events_and_records_agent_id() {
     // On completion the background task demotes Running → Idle.
     assert_eq!(stored[0].status, crate::domain::SessionStatus::Idle);
 
-    // History is durable: the user prompt + streamed assistant text persist in order.
+    // History is durable: the user prompt + streamed assistant text persist
+    // in order. Startup progress rows (system/status) now precede the turn —
+    // the user prompt must still be the first non-status row.
     let msgs = cp.list_messages(&session.session_pk).await.unwrap();
-    let kinds: Vec<(&str, &str)> = msgs
+    let first_turn = msgs
         .iter()
-        .map(|m| (m.role.as_str(), m.block_type.as_str()))
-        .collect();
-    assert_eq!(kinds.first(), Some(&("user", "text")));
-    assert_eq!(msgs[0].payload["text"], "do it");
+        .find(|m| m.block_type != "status")
+        .expect("expected a non-status row");
+    assert_eq!(
+        (first_turn.role.as_str(), first_turn.block_type.as_str()),
+        ("user", "text")
+    );
+    assert_eq!(first_turn.payload["text"], "do it");
     assert!(msgs.iter().any(|m| m.role == "assistant"
         && m.block_type == "text"
         && m.payload["text"] == "working"));
     // seq is monotonic and matches insertion order.
     assert!(msgs.windows(2).all(|w| w[0].seq < w[1].seq));
+}
+
+#[tokio::test]
+#[serial]
+async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+    // The row is returned BEFORE git prep: workspace columns are provisional.
+    assert_eq!(
+        session.worktree_path, None,
+        "provisional row: no worktree yet"
+    );
+    assert_eq!(
+        session.branch, None,
+        "provisional row: engine name unknown yet"
+    );
+    assert_eq!(session.status, SessionStatus::Running);
+
+    // Background prep backfills the workspace columns…
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.worktree_path.is_some(), "worktree path backfilled");
+    let branch = stored.branch.clone().unwrap();
+    assert!(branch.starts_with("harness/"), "got: {branch}");
+    assert!(stored.branch_owned);
+
+    // …and the progress rows landed in order.
+    let msgs = store.list_messages(&session.session_pk).await.unwrap();
+    let statuses: Vec<String> = msgs
+        .iter()
+        .filter(|m| m.block_type == "status")
+        .map(|m| m.payload["summary"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(statuses[0], "Creating worktree…");
+    assert!(
+        statuses[1].starts_with("Created and checked out branch harness/"),
+        "got: {statuses:?}"
+    );
+    assert_eq!(statuses[2], "Connecting tools…");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _db) = fake_control_plane_any_harness().await;
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    commit_file(repo_dir.path(), "a.txt", "one");
+    let project = cp.connect_project(repo_dir.path(), "demo").await.unwrap();
+    // Unstaged modification to a tracked file = dirty → in-place prep refuses.
+    std::fs::write(repo_dir.path().join("a.txt"), "changed").unwrap();
+    // Subscribe BEFORE starting: the orchestrator's and scheduler's session
+    // watchers finish only on a bus-terminal Result/Error for the session,
+    // so a startup failure MUST broadcast CoreEvent::Error — without it they
+    // hang to their 2h deadline instead of reporting the real git error.
+    let mut rx = cp.subscribe();
+
+    let session = cp
+        .start_session_with_prompt(
+            &project.project_id,
+            TurnPrompt::text("go", "go"),
+            "test",
+            &[],
+            Some(git_opts(false, true, None, None)),
+        )
+        .await
+        .expect("start must succeed; git errors surface in the transcript");
+
+    let err_row = wait_for_message(&store, &session.session_pk, |m| m.block_type == "error").await;
+    let message = err_row.payload["message"].as_str().unwrap_or("");
+    assert!(message.contains("uncommitted changes"), "got: {message}");
+
+    // The bus-terminal Error reached subscribers with the real git error.
+    let bus_message = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(CoreEvent::Error {
+                session_pk: pk,
+                message,
+            })) if pk == session.session_pk => break message,
+            Ok(Ok(_)) => continue,
+            other => panic!("expected CoreEvent::Error on the bus, got: {other:?}"),
+        }
+    };
+    assert!(
+        bus_message.contains("uncommitted changes"),
+        "got: {bus_message}"
+    );
+
+    // The session persists and is released back to Idle for a retry.
+    let mut stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..400 {
+        if stored.status == SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        stored = store
+            .get_session(&session.session_pk)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(stored.status, SessionStatus::Idle);
+}
+
+#[tokio::test]
+#[serial]
+async fn stop_during_startup_cancels_cleanly() {
+    let _guard = StateDirGuard::new();
+    let (_db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut regs = Registries::new();
+    regs.harness.register(
+        "native",
+        Arc::new(GatedHarnessFactory {
+            release: release.clone(),
+            counters: counters.clone(),
+        }),
+    );
+    let cp = ControlPlane::new(store, regs).await;
+    let store = cp.store().clone();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+    // Git prep is done once "Connecting tools…" lands; the harness is parked
+    // on the gate — a genuinely mid-startup stop.
+    wait_for_message(&store, &session.session_pk, |m| {
+        m.block_type == "status" && m.payload["summary"] == "Connecting tools…"
+    })
+    .await;
+
+    cp.stop_session(&session.session_pk).await.unwrap();
+    release.notify_one();
+
+    // The startup task must observe the cancellation, deregister its token,
+    // and finish WITHOUT driving the first prompt.
+    for _ in 0..400 {
+        if cp.starting.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        cp.starting.lock().unwrap().is_empty(),
+        "the startup task must deregister its cancellation token"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        counters.sends.load(Ordering::SeqCst),
+        0,
+        "a stopped startup must never drive the first prompt"
+    );
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Interrupted);
+}
+
+// Task 7.2 review fix: `startup_phases`' only pre-harness cancel checkpoint
+// used to live INSIDE the `if project.is_git` branch (right after git prep),
+// so a non-git session's `else` branch fell straight through to
+// `emit_status("Connecting tools…")` + `start_harness_session` with no
+// cancel check at all — a stop landing during a non-git startup still spawned
+// its harness, unlike a git session with identical timing (caught at the
+// git-prep checkpoint). The fix adds an unconditional checkpoint common to
+// both paths, right before "Connecting tools…" is emitted.
+//
+// This can't be pinned via `stop_session()` racing the background task like
+// `stop_during_startup_cancels_cleanly` above: the non-git path has NO
+// `.await` between registering the cancellation token (in
+// `run_session_startup`) and evaluating the new checkpoint, so on this
+// crate's current-thread `#[tokio::test]` runtime there is no scheduling
+// opportunity for a concurrent `stop_session()` call to ever land inside that
+// window — by the time the background task is observably registered, it has
+// already run the checkpoint (current-thread tasks run to completion of
+// their synchronous prefix, uninterrupted, until their first real
+// `Poll::Pending`). Driving `startup_phases` directly with an
+// already-cancelled token is the only deterministic way to test it.
+#[tokio::test]
+#[serial]
+async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
+    let _guard = StateDirGuard::new();
+    let (_db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let store = cp.store().clone();
+    let dir = tempfile::tempdir().unwrap(); // plain temp dir — no git init.
+    let project = cp.connect_project(dir.path(), "demo").await.unwrap();
+    assert!(!project.is_git);
+
+    // Seed a session row the way `start_session_with_prompt` does, then drive
+    // `startup_phases` directly instead of going through the normal
+    // `start_session` spawn (see the comment above for why).
+    let session_pk = crate::paths::new_id();
+    let session = Session {
+        session_pk: session_pk.clone(),
+        project_id: project.project_id.clone(),
+        agent_session_id: None,
+        worktree_path: None,
+        branch: None,
+        title: Some("go".to_string()),
+        status: SessionStatus::Running,
+        started_by: Some("test".to_string()),
+        created_at: Some(now_ms()),
+        last_active: Some(now_ms()),
+        resume_attempts: 0,
+        branch_owned: false,
+    };
+    store.insert_session(session).await.unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    cp.startup_phases(
+        &project,
+        &session_pk,
+        crate::domain::SessionGitOptions::default(),
+        TurnPrompt::text("go", "go"),
+        Vec::new(),
+        &cancel,
+    )
+    .await;
+
+    assert_eq!(
+        counters.starts.load(Ordering::SeqCst),
+        0,
+        "a non-git startup already cancelled before it begins must never start the harness"
+    );
+    assert_eq!(counters.sends.load(Ordering::SeqCst), 0);
+    let msgs = store.list_messages(&session_pk).await.unwrap();
+    assert!(
+        msgs.is_empty(),
+        "no status row should be emitted once startup was already cancelled; got: {msgs:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn end_during_startup_waits_for_the_startup_task_and_cleans_the_worktree() {
+    let _guard = StateDirGuard::new();
+    let (_db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut regs = Registries::new();
+    regs.harness.register(
+        "native",
+        Arc::new(GatedHarnessFactory {
+            release: release.clone(),
+            counters: counters.clone(),
+        }),
+    );
+    let cp = ControlPlane::new(store, regs).await;
+    let store = cp.store().clone();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+    // Git prep is done (workspace columns backfilled) once "Connecting
+    // tools…" lands; the harness is parked on the gate — startup in flight.
+    wait_for_message(&store, &session.session_pk, |m| {
+        m.block_type == "status" && m.payload["summary"] == "Connecting tools…"
+    })
+    .await;
+    let wt = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .worktree_path
+        .expect("git prep backfilled the worktree path");
+    assert!(std::path::Path::new(&wt).exists());
+
+    // End while startup is parked. end_session must WAIT for the startup
+    // task to unwind before tearing down — otherwise an end that races git
+    // prep reads provisional workspace columns and leaks the worktree.
+    let ender = {
+        let cp = Arc::clone(&cp);
+        let pk = session.session_pk.clone();
+        tokio::spawn(async move { cp.end_session(&pk).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !ender.is_finished(),
+        "end_session must wait for the in-flight startup task"
+    );
+
+    release.notify_one();
+    ender.await.unwrap().unwrap();
+    assert!(
+        !std::path::Path::new(&wt).exists(),
+        "the worktree created during startup must be removed by end_session"
+    );
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Ended);
+    assert_eq!(stored.worktree_path, None, "workspace columns cleared");
+}
+
+// Scope addition (Task 6.3 review): a follow-up that arrives while a session
+// is still in background startup must NOT take the cold-resume path — that
+// would spawn a SECOND harness (in project.workdir while worktree_path is
+// still provisional), run the follow-up ahead of the first prompt, and orphan
+// the handle the startup task later registers. It must WAIT for startup to
+// land its live handle, then drive the follow-up on THAT handle.
+#[tokio::test]
+#[serial]
+async fn continue_during_startup_waits_and_reuses_the_startup_handle() {
+    let _guard = StateDirGuard::new();
+    let (_db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let open = Arc::new(AtomicBool::new(false));
+    let mut regs = Registries::new();
+    regs.harness.register(
+        "native",
+        Arc::new(LatchGatedHarnessFactory {
+            open: open.clone(),
+            counters: counters.clone(),
+        }),
+    );
+    let cp = ControlPlane::new(store, regs).await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "first", "test", &[])
+        .await
+        .unwrap();
+    // Wait until the startup task has reached the parked harness phase — its
+    // one and only `start_session` attempt is now counted and blocked on the
+    // latch, and the session is still registered as in-flight.
+    for _ in 0..400 {
+        if counters.starts.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(counters.starts.load(Ordering::SeqCst), 1);
+    assert!(
+        cp.starting
+            .lock()
+            .unwrap()
+            .contains_key(&session.session_pk),
+        "startup must still be in flight"
+    );
+
+    // Issue the follow-up while startup is parked.
+    let cont = {
+        let cp = Arc::clone(&cp);
+        let pk = session.session_pk.clone();
+        tokio::spawn(async move { cp.continue_session(&pk, "second", &[]).await })
+    };
+    // Give a buggy cold-resume time to spawn its second harness in the main
+    // checkout. The follow-up must instead be parked waiting for startup.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !cont.is_finished(),
+        "continue must wait for the in-flight startup, not race ahead"
+    );
+    assert_eq!(
+        counters.starts.load(Ordering::SeqCst),
+        1,
+        "continue must NOT cold-resume a second harness while startup is in flight"
+    );
+
+    // Release: startup registers its live handle, drives the first prompt, and
+    // deregisters; the parked continue then lands on that same handle.
+    open.store(true, Ordering::SeqCst);
+    cont.await.unwrap().unwrap();
+
+    assert_eq!(
+        counters.starts.load(Ordering::SeqCst),
+        1,
+        "the follow-up must reuse the startup's live handle, not start a new one"
+    );
+    wait_for_prompts(&counters.prompts, 2).await;
+    let prompts = counters.prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 2, "both prompts drove on the one handle");
+    assert!(
+        prompts.contains(&"first".to_string()) && prompts.contains(&"second".to_string()),
+        "both the startup prompt and the follow-up ran; got: {prompts:?}"
+    );
 }
 
 #[tokio::test]
@@ -1558,6 +2174,70 @@ async fn provision_project_git_clone_treats_option_like_url_as_a_literal_repo_pa
 }
 
 #[tokio::test]
+async fn clone_project_derives_name_records_source_and_needs_no_settings() {
+    // Gateway-free: no workdir_root, no gateway binding — a bare store.
+    let (cp, store, _db_guard) = provisioning_control_plane().await;
+    let dest = tempfile::tempdir().unwrap();
+
+    let upstream_root = tempfile::tempdir().unwrap();
+    let upstream_dir = upstream_root.path().join("upstream-repo");
+    std::fs::create_dir_all(&upstream_dir).unwrap();
+    init_repo(&upstream_dir);
+
+    // Forward slashes on purpose: `basename_of` splits on `/` only, and git
+    // accepts forward-slash local paths on Windows too. (The `\`-separated
+    // form is exactly what makes provision_project_git_url_flow_* fail on
+    // Windows dev boxes.)
+    let git_url = format!("{}/.git", upstream_dir.display()).replace('\\', "/");
+    let project = cp.clone_project(&git_url, dest.path()).await.unwrap();
+
+    assert_eq!(project.name, "upstream-repo");
+    assert_eq!(project.source.as_deref(), Some(git_url.as_str()));
+    assert_eq!(project.harness, "native");
+    assert!(project.is_git);
+    assert_eq!(
+        project.workdir,
+        dest.path().join("upstream-repo").to_string_lossy()
+    );
+    let repo = git2::Repository::open(&project.workdir).unwrap();
+    assert!(repo.head().is_ok(), "clone must produce a repo with a HEAD");
+    assert!(store
+        .get_project(&project.project_id)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn clone_project_rolls_back_on_failure_and_refuses_existing_dest() {
+    let (cp, store, _db_guard) = provisioning_control_plane().await;
+    let dest = tempfile::tempdir().unwrap();
+
+    let err = cp
+        .clone_project("/no/such/upstream/repo.git", dest.path())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("git"), "got: {err}");
+    assert!(
+        !dest.path().join("repo").exists(),
+        "a failed clone must not leave a partial dir behind"
+    );
+    assert!(
+        store.list_projects().await.unwrap().is_empty(),
+        "no project row on failure"
+    );
+
+    // A pre-existing destination is refused BEFORE any git call — the
+    // rollback below must never be able to delete user data.
+    std::fs::create_dir_all(dest.path().join("taken")).unwrap();
+    let err = cp
+        .clone_project("https://example.invalid/taken.git", dest.path())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "got: {err}");
+}
+
+#[tokio::test]
 #[serial]
 async fn provision_project_gates_bypass_permissions_for_non_admin() {
     let _guard = StateDirGuard::new();
@@ -1823,12 +2503,7 @@ async fn enabled_declarative_plugins_mcp_server_attaches_to_the_session() {
         .await
         .unwrap();
 
-    let servers = counters
-        .mcp_servers
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("start_session must build a SessionCtx");
+    let servers = wait_for_session_ctx(&counters).await;
     assert!(
         servers.iter().any(|s| s.name == "acme"),
         "expected the enabled plugin's mcp server to attach, got: {servers:?}"
@@ -1854,12 +2529,7 @@ async fn disabled_declarative_plugins_mcp_server_does_not_attach() {
         .await
         .unwrap();
 
-    let servers = counters
-        .mcp_servers
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("start_session must build a SessionCtx");
+    let servers = wait_for_session_ctx(&counters).await;
     assert!(
         !servers.iter().any(|s| s.name == "acme"),
         "a disabled plugin's mcp server must not attach, got: {servers:?}"
@@ -1887,12 +2557,7 @@ async fn broken_plugin_connector_is_skipped_and_never_fails_session_start() {
         .await
         .expect("a broken plugin connector must not fail session start");
 
-    let servers = counters
-        .mcp_servers
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("start_session must build a SessionCtx");
+    let servers = wait_for_session_ctx(&counters).await;
     assert!(
         !servers.iter().any(|s| s.name == "acme"),
         "a connector that failed to resolve must not contribute a server, got: {servers:?}"
@@ -1948,12 +2613,7 @@ async fn db_configured_server_wins_over_a_same_named_plugin_server() {
         .await
         .unwrap();
 
-    let servers = counters
-        .mcp_servers
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("start_session must build a SessionCtx");
+    let servers = wait_for_session_ctx(&counters).await;
     let acme: Vec<_> = servers.iter().filter(|s| s.name == "acme").collect();
     assert_eq!(
         acme.len(),
@@ -1997,10 +2657,7 @@ async fn user_named_branch_survives_end_session() {
     let session = cp
         .start_session_with_prompt(
             &project.project_id,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             "test",
             &[],
             Some(git_opts(true, true, Some("keep/me"), None)),
@@ -2013,6 +2670,8 @@ async fn user_named_branch_survives_end_session() {
         "user-named branch is not engine-owned"
     );
 
+    // Let background startup finish so teardown has a real worktree to clean.
+    wait_for_running_handle(&cp, &session.session_pk).await;
     cp.end_session(&session.session_pk).await.unwrap();
 
     let repo = git2::Repository::open(repo_dir.path()).unwrap();
@@ -2032,7 +2691,7 @@ async fn user_named_branch_survives_end_session() {
 #[serial]
 async fn engine_named_branch_is_deleted_on_end_session() {
     let _guard = StateDirGuard::new();
-    let (cp, _store, _db) = fake_control_plane_any_harness().await;
+    let (cp, store, _db) = fake_control_plane_any_harness().await;
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
     let project = cp.connect_project(repo_dir.path(), "demo").await.unwrap();
@@ -2041,19 +2700,23 @@ async fn engine_named_branch_is_deleted_on_end_session() {
     let session = cp
         .start_session_with_prompt(
             &project.project_id,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             "test",
             &[],
             None,
         )
         .await
         .unwrap();
-    let branch = session.branch.clone().unwrap();
-    assert!(branch.starts_with("harness/"));
     assert!(session.branch_owned);
+    // The engine-generated name is backfilled by background startup.
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    let branch = stored.branch.clone().unwrap();
+    assert!(branch.starts_with("harness/"));
 
     cp.end_session(&session.session_pk).await.unwrap();
 
@@ -2078,10 +2741,7 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
     let session = cp
         .start_session_with_prompt(
             &project.project_id,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             "test",
             &[],
             Some(git_opts(false, false, None, None)),
@@ -2089,7 +2749,25 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
         .await
         .unwrap();
     assert!(session.worktree_path.is_none(), "no worktree for this cell");
-    assert_eq!(session.branch.as_deref(), Some(head_before.as_str()));
+    // The branch (current checkout) is resolved during background prep.
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.worktree_path.is_none(), "no worktree for this cell");
+    assert_eq!(stored.branch.as_deref(), Some(head_before.as_str()));
+    // In-place cell: the startup copy must not claim anything was created
+    // (no worktree, no branch; this same-branch cell checks nothing out).
+    let msgs = store.list_messages(&session.session_pk).await.unwrap();
+    let statuses: Vec<String> = msgs
+        .iter()
+        .filter(|m| m.block_type == "status")
+        .map(|m| m.payload["summary"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(statuses[0], "Preparing workspace…");
+    assert_eq!(statuses[1], format!("Using branch {head_before}"));
 
     cp.end_session(&session.session_pk).await.unwrap();
 
@@ -2104,36 +2782,4 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
         .unwrap()
         .unwrap();
     assert_eq!(stored.status, SessionStatus::Ended);
-}
-
-#[tokio::test]
-#[serial]
-async fn dirty_tree_refusal_aborts_before_a_session_row_exists() {
-    let _guard = StateDirGuard::new();
-    let (cp, store, _db) = fake_control_plane_any_harness().await;
-    let repo_dir = tempfile::tempdir().unwrap();
-    init_repo(repo_dir.path());
-    commit_file(repo_dir.path(), "a.txt", "one");
-    let project = cp.connect_project(repo_dir.path(), "demo").await.unwrap();
-    // Unstaged modification to a tracked file = dirty.
-    std::fs::write(repo_dir.path().join("a.txt"), "changed").unwrap();
-
-    let result = cp
-        .start_session_with_prompt(
-            &project.project_id,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
-            "test",
-            &[],
-            Some(git_opts(false, true, None, None)),
-        )
-        .await;
-
-    assert!(result.is_err(), "dirty in-place start must fail");
-    assert!(
-        store.list_sessions(None).await.unwrap().is_empty(),
-        "no half-created session row may exist after a matrix refusal"
-    );
 }

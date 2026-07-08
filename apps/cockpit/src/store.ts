@@ -13,7 +13,7 @@ import {
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
-import type { Row } from "./lib/transcript";
+import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
 export type ChatOptions = {
@@ -42,12 +42,17 @@ type State = {
   setFocused: (pk: string | null) => void;
   selectProject: (id: string | null) => void;
   refresh: () => Promise<void>;
-  addProject: () => Promise<void>;
+  /** Native folder picker → connect_project. True when a project was added. */
+  addProject: () => Promise<boolean>;
+  /** Clone `url` into `<destParent>/<repo-name>` via the backend. */
+  cloneProject: (url: string, destParent: string) => Promise<boolean>;
   /** Pin (or clear, with null) the model future turns of this project use. */
   setProjectModel: (projectId: string, model: string | null) => Promise<void>;
   /** Change the permission mode future turns of this project run under. */
   setProjectPermMode: (projectId: string, permMode: PermMode) => Promise<void>;
-  start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
+  /** Resolves true as soon as the backend accepts — navigate immediately;
+   *  the session list refresh completes in the background. */
+  start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
   send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
   stop: (sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
@@ -59,12 +64,6 @@ type State = {
 
 function append(map: Record<string, Row[]>, pk: string, row: Row): Record<string, Row[]> {
   return { ...map, [pk]: [...(map[pk] ?? []), row] };
-}
-
-function outputPreview(v: unknown): string | null {
-  if (v === undefined || v === null) return null;
-  if (typeof v === "string") return v;
-  return JSON.stringify(v, null, 2);
 }
 
 function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions | null {
@@ -81,44 +80,6 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
       : null,
     attachments: options.attachments ?? [],
     git: options.git ?? null,
-  };
-}
-
-// Projects a persisted/streamed message block onto the render Row shape.
-// Unknown block types fall through as text (forward compatibility).
-export function messageToRow(
-  seq: number,
-  role: string,
-  blockType: string,
-  payload: unknown,
-  toolCallId: string | null,
-  status: string | null,
-  toolKind: string | null,
-): Row {
-  const p = (payload ?? {}) as Record<string, unknown>;
-  const text = blockType === "status" ? String(p.summary ?? "") : blockType === "error" ? String(p.message ?? "") : String(p.text ?? "");
-  return {
-    seq,
-    role,
-    blockType,
-    text,
-    toolCallId,
-    toolStatus: status,
-    toolKind,
-    toolName: blockType === "tool_call" && typeof p.name === "string" && p.name ? p.name : null,
-    toolOutput: blockType === "tool_call" ? outputPreview(p.output) : null,
-  };
-}
-
-// A tool-update re-emit re-uses the original row's seq: merge by identity.
-function mergeToolRow(prev: Row, payload: unknown, status: string | null, toolKind: string | null): Row {
-  const p = (payload ?? {}) as Record<string, unknown>;
-  return {
-    ...prev,
-    toolStatus: status ?? prev.toolStatus,
-    toolKind: toolKind ?? prev.toolKind,
-    toolName: typeof p.name === "string" && p.name ? p.name : prev.toolName,
-    toolOutput: outputPreview(p.output) ?? prev.toolOutput,
   };
 }
 
@@ -155,7 +116,7 @@ export const useStore = create<State>((set, get) => ({
           }
           const prev = st.lastSeq[pk] ?? 0;
           if (e.seq <= prev) return {}; // stale/duplicate (covers reload/replay races)
-          const row = messageToRow(e.seq, e.role, e.block_type, e.payload, e.tool_call_id, e.status, e.tool_kind);
+          const row = messageToRow(e.seq, e.role, e.block_type, e.payload, e.tool_call_id, e.status, e.tool_kind, Date.now());
           return {
             transcripts: append(st.transcripts, pk, row),
             lastSeq: { ...st.lastSeq, [pk]: e.seq },
@@ -174,6 +135,9 @@ export const useStore = create<State>((set, get) => ({
               toolKind: null,
               toolName: null,
               toolOutput: null,
+              createdAt: Date.now(),
+              attachments: [],
+              toolPath: null,
             }),
           };
         case "approvalRequested":
@@ -186,6 +150,10 @@ export const useStore = create<State>((set, get) => ({
         case "result":
           // Turn finished — the session is alive but awaiting input. Flip it out of "running"
           // so the composer leaves Stop mode and the user can reply.
+          // Also: turn-end guarantees the background git/harness prep (branch, worktreePath)
+          // has already backfilled the DB row — refresh now so the UI picks it up instead
+          // of waiting for some unrelated action to call refresh().
+          void get().refresh();
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
         case "sessionEnded":
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "ended" as const } : s)) };
@@ -209,7 +177,7 @@ export const useStore = create<State>((set, get) => ({
           const res = await commands.listMessages(pk);
           return res.status === "ok" ? res.data : [];
         })();
-    const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind));
+    const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind, m.createdAt));
     const maxSeq = rows.reduce((mx, m) => Math.max(mx, m.seq), 0);
     set((st) => {
       // Rows appended by applyCoreEvent while listMessages was in flight (fresher
@@ -235,14 +203,25 @@ export const useStore = create<State>((set, get) => ({
 
   addProject: async () => {
     const dir = await commands.pickDirectory();
-    if (!dir) return;
+    if (!dir) return false;
     const name = basename(dir) || "project";
     const res = await commands.connectProject(dir, name);
     if (res.status === "ok") {
       await get().refresh();
-    } else if (res.status === "error") {
-      toast.error("Couldn't add project: " + res.error.message);
+      return true;
     }
+    toast.error("Couldn't add project: " + res.error.message);
+    return false;
+  },
+
+  cloneProject: async (url, destParent) => {
+    const res = await commands.cloneProject(url, destParent);
+    if (res.status === "ok") {
+      await get().refresh();
+      return true;
+    }
+    toast.error("Couldn't clone project: " + res.error.message);
+    return false;
   },
 
   setProjectModel: async (projectId, model) => {
@@ -271,13 +250,16 @@ export const useStore = create<State>((set, get) => ({
 
   start: async (projectId, prompt, options) => {
     const res = await commands.startSession(projectId, prompt, toChatRequestOptions(options));
-    if (res.status === "ok") {
-      const pk = res.data.sessionPk;
-      set({ focusedSessionPk: pk });
-      await get().refresh();
-    } else if (res.status === "error") {
+    if (res.status === "error") {
       toast.error("Couldn't start session: " + res.error.message);
+      return false;
     }
+    // Optimistic navigation: the backend returns the session row before its
+    // git/harness startup finishes. Seed and focus it now; the full refresh
+    // catches up in the background.
+    set({ focusedSessionPk: res.data.sessionPk, sessions: [...get().sessions, res.data] });
+    void get().refresh();
+    return true;
   },
   send: async (sessionPk, prompt, options) => {
     const res = await commands.continueSession(sessionPk, prompt, toChatRequestOptions(options));

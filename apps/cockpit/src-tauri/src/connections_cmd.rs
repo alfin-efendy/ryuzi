@@ -10,6 +10,7 @@ use ryuzi_core::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderCate
 use ryuzi_core::llm_router::routes::{
     self, ModelRouteInfo, ModelRouteStrategy, ProviderAccountRouteInfo,
 };
+use ryuzi_core::store::ModelStatusRow;
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -37,6 +38,9 @@ pub struct CatalogEntry {
     pub format: String,
     pub requires_base_url: bool,
     pub models: Vec<String>,
+    pub free_tier: bool,
+    pub risk_notice: bool,
+    pub uses_device_grant: bool,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -65,8 +69,40 @@ pub struct ConnectionInfo {
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TestResult {
+    /// Legacy pass/fail, kept for existing call sites (connection-level
+    /// test, toasts). Always derived: `status == "valid"`.
+    pub ok: bool,
+    /// Tri-state probe verdict: "valid" | "invalid" | "unknown".
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshModelsResult {
+    pub connection_id: String,
+    pub label: String,
     pub ok: bool,
     pub message: String,
+}
+
+/// One persisted probe verdict row for the provider Models card.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatusInfo {
+    pub model: String,
+    pub status: String,
+    pub message: String,
+    pub tested_at: i64,
+}
+
+/// One outcome line per refreshed connection — pure so it's testable
+/// without a Store or network.
+fn refresh_message(label: &str, outcome: &Result<usize, String>) -> (bool, String) {
+    match outcome {
+        Ok(n) => (true, format!("{n} models discovered")),
+        Err(e) => (false, format!("{label}: {e}")),
+    }
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -107,6 +143,24 @@ static FLOWS: OnceLock<Mutex<HashMap<String, KiroFlowState>>> = OnceLock::new();
 
 fn flows() -> &'static Mutex<HashMap<String, KiroFlowState>> {
     FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// In-flight RFC 8628 device-grant state (Qwen, GitHub Copilot), stashed
+/// between `start_device_flow` and `await_device_flow`. Separate from Kiro's
+/// `FLOWS` (AWS SSO-OIDC) so Kiro's shipped path is untouched.
+struct GrantFlowState {
+    provider: String,
+    device_code: String,
+    /// PKCE verifier — `Some` only for providers with `use_pkce` (Qwen).
+    verifier: Option<String>,
+    interval: i64,
+    deadline_ms: i64,
+}
+
+static GRANT_FLOWS: OnceLock<Mutex<HashMap<String, GrantFlowState>>> = OnceLock::new();
+
+fn grant_flows() -> &'static Mutex<HashMap<String, GrantFlowState>> {
+    GRANT_FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Mask a secret for display: first 3 + last 4 chars, elided in between.
@@ -192,6 +246,17 @@ fn provider_http_client() -> R<reqwest::Client> {
         })
 }
 
+/// Ids of OTHER connections for `provider` that are dead
+/// (`needs_relogin == Some(true)`) and should be cleared once a fresh one
+/// (`keep_id`) is persisted. Never selects `keep_id`, a healthy row, or a row
+/// for a different provider.
+fn dead_connection_ids(rows: &[ConnectionRow], provider: &str, keep_id: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.provider == provider && r.id != keep_id && r.data.needs_relogin == Some(true))
+        .map(|r| r.id.clone())
+        .collect()
+}
+
 /// Pick out the ids of OTHER kiro connections that are dead
 /// (`needs_relogin == Some(true)`) and should be cleared once a fresh kiro
 /// connection (`keep_id`) has been persisted. Split out from
@@ -200,10 +265,7 @@ fn provider_http_client() -> R<reqwest::Client> {
 /// `Store`. Never selects `keep_id` itself, never selects a healthy kiro row
 /// (`needs_relogin` `None`/`false`), and never selects a non-kiro row.
 fn dead_kiro_connection_ids(rows: &[ConnectionRow], keep_id: &str) -> Vec<String> {
-    rows.iter()
-        .filter(|r| r.provider == "kiro" && r.id != keep_id && r.data.needs_relogin == Some(true))
-        .map(|r| r.id.clone())
-        .collect()
+    dead_connection_ids(rows, "kiro", keep_id)
 }
 
 /// After persisting a fresh kiro connection (`keep_id`) via
@@ -224,6 +286,40 @@ async fn remove_dead_kiro_connections(cp: &ControlPlane, keep_id: &str) -> anyho
         connections::remove_connection(cp.store(), &id).await?;
     }
     Ok(())
+}
+
+/// After persisting a fresh `provider` connection (`keep_id`), remove any OTHER
+/// `provider` row still flagged `needs_relogin` (see
+/// [`remove_dead_kiro_connections`] for why this shadow cleanup is required).
+async fn remove_dead_connections(
+    cp: &ControlPlane,
+    provider: &str,
+    keep_id: &str,
+) -> anyhow::Result<()> {
+    let rows = connections::list_connections(cp.store()).await?;
+    for id in dead_connection_ids(&rows, provider, keep_id) {
+        connections::remove_connection(cp.store(), &id).await?;
+    }
+    Ok(())
+}
+
+/// True if this connection should be refreshed for `family`: it belongs to the
+/// family (via family_of, falling back to a direct provider==family match for
+/// single-member families) AND is enabled.
+fn is_refresh_target(row: &ConnectionRow, family: &str) -> bool {
+    let in_family =
+        registry::family_of(&row.provider).map_or(row.provider == family, |f| f == family);
+    in_family && row.enabled
+}
+
+/// Display label for a refresh outcome: the connection's label, or its provider
+/// id when the label is empty.
+fn refresh_label(row: &ConnectionRow) -> String {
+    if row.label.is_empty() {
+        row.provider.clone()
+    } else {
+        row.label.clone()
+    }
 }
 
 #[tauri::command]
@@ -252,6 +348,9 @@ pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
             },
             requires_base_url: d.requires_base_url,
             models: d.models.iter().map(|s| s.to_string()).collect(),
+            free_tier: d.free_tier,
+            risk_notice: d.risk_notice,
+            uses_device_grant: d.device_grant.is_some(),
         })
         .collect())
 }
@@ -378,24 +477,21 @@ pub async fn move_connection(
 /// Map the probe response to the user-facing verdict: 2xx passes, 401/403
 /// blames the API key, any other status is surfaced as-is, and a transport
 /// failure (`Err` carries its display text) reads as network trouble.
+/// The tri-state `status` comes from `models::probe_status` (tested in core).
 fn probe_outcome(resp: Result<reqwest::StatusCode, String>) -> TestResult {
-    match resp {
-        Ok(s) if s.is_success() => TestResult {
-            ok: true,
-            message: "Connection OK".into(),
-        },
-        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => TestResult {
-            ok: false,
-            message: "Rejected: the API key looks invalid for this provider.".into(),
-        },
-        Ok(s) => TestResult {
-            ok: false,
-            message: format!("Upstream returned HTTP {s}"),
-        },
-        Err(e) => TestResult {
-            ok: false,
-            message: format!("Network error: {e}"),
-        },
+    let status = models::probe_status(resp.as_ref().ok().map(|s| s.as_u16()));
+    let message = match &resp {
+        Ok(s) if s.is_success() => "Connection OK".to_string(),
+        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => {
+            "Rejected: the API key looks invalid for this provider.".to_string()
+        }
+        Ok(s) => format!("Upstream returned HTTP {s}"),
+        Err(e) => format!("Network error: {e}"),
+    };
+    TestResult {
+        ok: status == models::ProbeStatus::Valid,
+        status: status.as_str().to_string(),
+        message,
     }
 }
 
@@ -417,23 +513,19 @@ fn model_probe_body(format: ApiFormat, model: &str) -> Value {
 }
 
 fn model_probe_outcome(model: &str, resp: Result<reqwest::StatusCode, String>) -> TestResult {
-    match resp {
-        Ok(s) if s.is_success() => TestResult {
-            ok: true,
-            message: format!("Model {model} OK"),
-        },
-        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => TestResult {
-            ok: false,
-            message: format!("Model {model} was rejected by provider credentials."),
-        },
-        Ok(s) => TestResult {
-            ok: false,
-            message: format!("Model {model} returned HTTP {s}"),
-        },
-        Err(e) => TestResult {
-            ok: false,
-            message: format!("Model {model} network error: {e}"),
-        },
+    let status = models::probe_status(resp.as_ref().ok().map(|s| s.as_u16()));
+    let message = match &resp {
+        Ok(s) if s.is_success() => format!("Model {model} OK"),
+        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => {
+            format!("Model {model} was rejected by provider credentials.")
+        }
+        Ok(s) => format!("Model {model} returned HTTP {s}"),
+        Err(e) => format!("Model {model} network error: {e}"),
+    };
+    TestResult {
+        ok: status == models::ProbeStatus::Valid,
+        status: status.as_str().to_string(),
+        message,
     }
 }
 
@@ -619,6 +711,7 @@ pub async fn test_connection_model(
     if model.is_empty() {
         return Ok(TestResult {
             ok: false,
+            status: "invalid".into(),
             message: "Model id is empty".into(),
         });
     }
@@ -637,7 +730,83 @@ pub async fn test_connection_model(
             |e| model_probe_outcome(&model, Err(e.to_string())),
             |status| model_probe_outcome(&model, Ok(status)),
         );
+    // Best-effort persistence of definitive verdicts; upsert_model_status
+    // ignores "unknown" so rate limits / outages never clobber a stored
+    // valid/invalid record, and a store hiccup must not fail the probe.
+    let _ = cp
+        .store()
+        .upsert_model_status(ModelStatusRow {
+            family: desc.family.to_string(),
+            model: model.clone(),
+            status: result.status.clone(),
+            message: result.message.clone(),
+            tested_at: ryuzi_core::paths::now_ms(),
+        })
+        .await;
     Ok(result)
+}
+
+/// Persisted per-model probe verdicts for a vendor family — hydrates the
+/// provider Models card so earlier Test All results show immediately.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_model_statuses(
+    cp: State<'_, Arc<ControlPlane>>,
+    family: String,
+) -> R<Vec<ModelStatusInfo>> {
+    let rows = cp.store().list_model_statuses(&family).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ModelStatusInfo {
+            model: row.model,
+            status: row.status,
+            message: row.message,
+            tested_at: row.tested_at,
+        })
+        .collect())
+}
+
+/// Re-fetch the live model list for every enabled connection in a vendor
+/// family, persisting discoveries. Unlike the add/update-time best-effort
+/// refresh, failures are returned to the UI instead of being swallowed.
+#[tauri::command]
+#[specta::specta]
+pub async fn refresh_provider_models(
+    cp: State<'_, Arc<ControlPlane>>,
+    family: String,
+) -> R<Vec<RefreshModelsResult>> {
+    let http = quota_http_client()?;
+    let rows = connections::list_connections(cp.store()).await?;
+    let mut out = Vec::new();
+    for mut row in rows {
+        if !is_refresh_target(&row, &family) {
+            continue;
+        }
+        let label = refresh_label(&row);
+        let has_endpoint =
+            registry::descriptor(&row.provider).is_none_or(|d| d.has_models_endpoint);
+        if !has_endpoint {
+            out.push(RefreshModelsResult {
+                connection_id: row.id.clone(),
+                label,
+                ok: true,
+                message: "Uses a seeded model list — no live catalog endpoint".to_string(),
+            });
+            continue;
+        }
+        let outcome = models::refresh_connection_models(cp.store(), &http, &mut row)
+            .await
+            .map(|models| models.len())
+            .map_err(|e| e.to_string());
+        let (ok, message) = refresh_message(&label, &outcome);
+        out.push(RefreshModelsResult {
+            connection_id: row.id.clone(),
+            label,
+            ok,
+            message,
+        });
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -921,6 +1090,133 @@ mod tests {
             kiro_row("healthy-2", Some(false)),
         ];
         assert!(dead_kiro_connection_ids(&rows, "healthy-1").is_empty());
+    }
+
+    #[test]
+    fn refresh_message_reports_count_or_error() {
+        assert_eq!(
+            refresh_message("Work OpenAI", &Ok(12)),
+            (true, "12 models discovered".to_string())
+        );
+        assert_eq!(
+            refresh_message(
+                "Work OpenAI",
+                &Err("model list request for openai failed with status 401".to_string())
+            ),
+            (
+                false,
+                "Work OpenAI: model list request for openai failed with status 401".to_string()
+            )
+        );
+    }
+
+    fn connection_row(id: &str, provider: &str, label: &str, enabled: bool) -> ConnectionRow {
+        ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: "api_key".into(),
+            label: label.into(),
+            priority: 0,
+            enabled,
+            data: ConnectionData::default(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// `refresh_provider_models` must refresh only enabled, in-family
+    /// connections: a disabled in-family row, an enabled row from a different
+    /// family, and an enabled row with an unrecognized provider id must all be
+    /// skipped.
+    #[test]
+    fn refresh_targets_filter_by_family_and_enabled() {
+        let in_family_enabled = connection_row("c1", "anthropic-oauth", "Claude", true);
+        let in_family_disabled = connection_row("c2", "anthropic-oauth", "Claude (off)", false);
+        let other_family_enabled = connection_row("c3", "openai", "Work OpenAI", true);
+        let unrecognized_provider_enabled =
+            connection_row("c4", "not-a-real-provider", "Mystery", true);
+
+        assert!(is_refresh_target(&in_family_enabled, "anthropic"));
+        assert!(!is_refresh_target(&in_family_disabled, "anthropic"));
+        assert!(!is_refresh_target(&other_family_enabled, "anthropic"));
+        assert!(!is_refresh_target(
+            &unrecognized_provider_enabled,
+            "anthropic"
+        ));
+    }
+
+    #[test]
+    fn refresh_label_falls_back_to_provider_when_label_is_empty() {
+        let row = connection_row("c1", "openai", "", true);
+        assert_eq!(refresh_label(&row), "openai");
+    }
+
+    #[test]
+    fn refresh_label_uses_the_connection_label_when_present() {
+        let row = connection_row("c1", "openai", "Work OpenAI", true);
+        assert_eq!(refresh_label(&row), "Work OpenAI");
+    }
+
+    #[test]
+    fn dead_connection_ids_selects_by_provider() {
+        let mk = |id: &str, provider: &str, relogin: Option<bool>| ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: "oauth".into(),
+            label: String::new(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                needs_relogin: relogin,
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        };
+        let rows = vec![
+            mk("keep", "qwen", Some(true)),            // keep_id — excluded
+            mk("dead", "qwen", Some(true)),            // selected
+            mk("healthy", "qwen", None),               // healthy — excluded
+            mk("other", "github-copilot", Some(true)), // other provider — excluded
+        ];
+        assert_eq!(
+            dead_connection_ids(&rows, "qwen", "keep"),
+            vec!["dead".to_string()]
+        );
+        assert_eq!(
+            dead_connection_ids(&rows, "github-copilot", "x"),
+            vec!["other".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_marks_device_grant_providers() {
+        let cat = list_provider_catalog().await.unwrap();
+        let qwen = cat.iter().find(|e| e.id == "qwen").unwrap();
+        assert_eq!(qwen.category, "oauth");
+        assert!(qwen.uses_device_grant);
+        let anth = cat.iter().find(|e| e.id == "anthropic-oauth").unwrap();
+        assert!(!anth.uses_device_grant);
+    }
+
+    #[tokio::test]
+    async fn build_device_grant_data_qwen_captures_resource_url() {
+        let cfg = registry::device_grant_config("qwen").unwrap();
+        let http = reqwest::Client::new();
+        let tokens = oauth::device_grant::GrantTokens {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: 123,
+            raw: serde_json::json!({ "resource_url": "dashscope.aliyuncs.com" }),
+        };
+        let data = build_device_grant_data(cfg, tokens, &http).await.unwrap();
+        assert_eq!(data.access_token.as_deref(), Some("at"));
+        assert_eq!(data.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(data.expires_at, Some(123));
+        assert_eq!(
+            data.provider_specific.unwrap()["resource_url"],
+            "dashscope.aliyuncs.com"
+        );
     }
 }
 
@@ -1341,4 +1637,219 @@ pub async fn import_kiro_token(
     // `remove_dead_kiro_connections`.
     remove_dead_kiro_connections(&cp, &new_id).await?;
     Ok(assemble(&cp).await?)
+}
+
+/// Start an RFC 8628 device-authorization grant for a device-grant provider
+/// (Qwen, GitHub Copilot): request a device code, open the verification URL,
+/// and stash in-flight state under a fresh `flow_id` for `await_device_flow`.
+/// Errors for providers that are not device-grant (e.g. `kiro`, which uses
+/// `start_kiro_device_flow`).
+#[tauri::command]
+#[specta::specta]
+pub async fn start_device_flow(
+    _cp: State<'_, Arc<ControlPlane>>,
+    app: tauri::AppHandle,
+    provider: String,
+) -> R<DeviceFlowInfo> {
+    let cfg = registry::device_grant_config(&provider).ok_or_else(|| CmdError {
+        message: format!("{provider} is not a device-grant provider"),
+    })?;
+    let http = reqwest::Client::new();
+    let pkce = if cfg.use_pkce {
+        Some(oauth::pkce::generate())
+    } else {
+        None
+    };
+    let auth = oauth::device_grant::request_device_code(&http, cfg, pkce.as_ref())
+        .await
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
+
+    let flow_id = ryuzi_core::paths::new_id();
+    let deadline_ms = ryuzi_core::paths::now_ms() + auth.expires_in * 1000;
+    grant_flows()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            flow_id.clone(),
+            GrantFlowState {
+                provider: provider.clone(),
+                device_code: auth.device_code.clone(),
+                verifier: pkce.map(|p| p.verifier),
+                interval: auth.interval,
+                deadline_ms,
+            },
+        );
+
+    let _ = app
+        .opener()
+        .open_url(auth.verification_uri_complete.clone(), None::<&str>);
+
+    Ok(DeviceFlowInfo {
+        flow_id,
+        user_code: auth.user_code,
+        verification_uri: auth.verification_uri,
+        verification_uri_complete: auth.verification_uri_complete,
+        expires_in: auth.expires_in,
+        interval: auth.interval,
+    })
+}
+
+/// Poll a device-grant flow started by `start_device_flow` until completion,
+/// then persist the connection with `auth_type = "oauth"`. GitHub Copilot runs
+/// the Copilot-token exchange (leg 2) before persisting; Qwen captures its
+/// shard `resource_url`.
+#[tauri::command]
+#[specta::specta]
+pub async fn await_device_flow(
+    cp: State<'_, Arc<ControlPlane>>,
+    provider: String,
+    label: String,
+    flow_id: String,
+) -> R<Vec<ConnectionInfo>> {
+    let GrantFlowState {
+        provider: flow_provider,
+        device_code,
+        verifier,
+        mut interval,
+        deadline_ms,
+    } = grant_flows()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&flow_id)
+        .ok_or_else(|| CmdError {
+            message: "device sign-in flow not found — start again".into(),
+        })?;
+    if flow_provider != provider {
+        return Err(CmdError {
+            message: "device flow provider mismatch".into(),
+        });
+    }
+    let cfg = registry::device_grant_config(&provider).ok_or_else(|| CmdError {
+        message: format!("{provider} is not a device-grant provider"),
+    })?;
+    let pkce = verifier.map(|v| oauth::pkce::Pkce {
+        verifier: v,
+        challenge: String::new(),
+        state: String::new(),
+    });
+    let http = reqwest::Client::new();
+
+    let tokens = loop {
+        if ryuzi_core::paths::now_ms() > deadline_ms {
+            return Err(CmdError {
+                message: "device code expired — start again".into(),
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(interval.max(1) as u64)).await;
+        match oauth::device_grant::poll_token_once(&http, cfg, &device_code, pkce.as_ref())
+            .await
+            .map_err(|e| CmdError {
+                message: e.to_string(),
+            })? {
+            oauth::device_grant::GrantPoll::Pending => continue,
+            oauth::device_grant::GrantPoll::SlowDown => {
+                interval = (interval + 5).min(30);
+                continue;
+            }
+            oauth::device_grant::GrantPoll::Denied => {
+                return Err(CmdError {
+                    message: "sign-in was denied".into(),
+                });
+            }
+            oauth::device_grant::GrantPoll::Expired => {
+                return Err(CmdError {
+                    message: "device code expired — start again".into(),
+                });
+            }
+            oauth::device_grant::GrantPoll::Ready(t) => break t,
+        }
+    };
+
+    let data = build_device_grant_data(cfg, tokens, &http)
+        .await
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
+
+    let now = ryuzi_core::paths::now_ms();
+    let new_id = ryuzi_core::paths::new_id();
+    connections::add_connection(
+        cp.store(),
+        ConnectionRow {
+            id: new_id.clone(),
+            provider: provider.clone(),
+            auth_type: "oauth".into(),
+            label,
+            priority: 0,
+            enabled: true,
+            data,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await?;
+    remove_dead_connections(&cp, &provider, &new_id).await?;
+    Ok(assemble(&cp).await?)
+}
+
+/// Build `ConnectionData` from a completed device grant. GitHub Copilot swaps
+/// the GitHub token for a Copilot token (stored as `access_token`, GitHub token
+/// kept as the durable `refresh_token`). Qwen keeps the grant tokens and its
+/// `resource_url`.
+async fn build_device_grant_data(
+    cfg: &registry::DeviceGrantConfig,
+    tokens: oauth::device_grant::GrantTokens,
+    http: &reqwest::Client,
+) -> anyhow::Result<ConnectionData> {
+    if let Some(exchange) = cfg.token_exchange.as_ref() {
+        let gh_token = tokens.access_token;
+        let copilot = oauth::github::exchange_copilot_token(http, &gh_token, exchange.url).await?;
+        let mut provider_specific = None;
+        if let Some(gh_refresh) = tokens.refresh_token {
+            provider_specific = Some(serde_json::json!({ "gh_refresh": gh_refresh }));
+        }
+        Ok(ConnectionData {
+            access_token: Some(copilot.token),
+            refresh_token: Some(gh_token),
+            expires_at: Some(copilot.expires_at_ms),
+            provider_specific,
+            ..Default::default()
+        })
+    } else {
+        let resource_url = tokens
+            .raw
+            .get("resource_url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| serde_json::json!({ "resource_url": s }));
+        Ok(ConnectionData {
+            access_token: Some(tokens.access_token),
+            refresh_token: tokens.refresh_token,
+            expires_at: Some(tokens.expires_at),
+            provider_specific: resource_url,
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn catalog_exposes_free_tier_and_risk_notice() {
+        let catalog = list_provider_catalog().await.unwrap();
+        let by_id = |id: &str| catalog.iter().find(|e| e.id == id).unwrap();
+        assert!(by_id("openrouter").free_tier);
+        assert!(by_id("nvidia").free_tier);
+        assert!(!by_id("anthropic").free_tier);
+        assert!(by_id("kiro").risk_notice);
+        assert!(!by_id("openai").risk_notice);
+        // serde camelCase contract the frontend relies on
+        let v = serde_json::to_value(by_id("kiro")).unwrap();
+        assert_eq!(v["riskNotice"], serde_json::Value::Bool(true));
+        assert_eq!(v["freeTier"], serde_json::Value::Bool(false));
+    }
 }

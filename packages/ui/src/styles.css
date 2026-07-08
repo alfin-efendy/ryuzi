@@ -51,6 +51,12 @@
   --diff-add-fg: oklch(0.55 0.17 149);
   --diff-del-bg: oklch(0.637 0.237 25 / 0.12);
   --diff-del-fg: oklch(0.55 0.21 25);
+  --syntax-comment: var(--muted-foreground);
+  --syntax-keyword: oklch(0.5 0.18 285);
+  --syntax-string: oklch(0.52 0.12 150);
+  --syntax-number: oklch(0.55 0.15 60);
+  --syntax-title: oklch(0.5 0.15 235);
+  --syntax-attr: oklch(0.5 0.12 30);
 }
 body {
   margin: 0;
@@ -98,26 +104,29 @@ body {
   --code-number: oklch(0.72 0 0);
   --diff-add-fg: oklch(0.723 0.219 149);
   --diff-del-fg: oklch(0.68 0.2 25);
+  --syntax-keyword: oklch(0.75 0.14 285);
+  --syntax-string: oklch(0.75 0.12 150);
+  --syntax-number: oklch(0.76 0.13 60);
+  --syntax-title: oklch(0.75 0.12 235);
+  --syntax-attr: oklch(0.75 0.11 30);
 }
 
 /* Translucent surfaces over an OS backdrop (mica on Windows 11, vibrancy on
    macOS). Activated by data-backdrop on <html>; absent attribute = every token
    keeps its :root/.dark value and rendering is pixel-identical to opaque mode.
    --background itself is NEVER made transparent (it doubles as a raised/inverse
-   surface in Composer, button outline variant, hover states). */
+   surface in Composer, button outline variant, hover states).
+   Overlay tokens (--popover, --surface-acrylic) are intentionally NOT
+   overridden here: overlays stay fully opaque even over a backdrop. */
 html[data-backdrop] {
   --surface-window: transparent;
   --sidebar: transparent;
   --surface-layer: oklch(1 0 0 / 0.78);
   --card: oklch(1 0 0 / 0.82);
-  --popover: oklch(1 0 0 / 0.88);
-  --surface-acrylic: oklch(1 0 0 / 0.7);
 }
 html.dark[data-backdrop] {
   --surface-layer: oklch(0.205 0 0 / 0.6);
   --card: oklch(0.205 0 0 / 0.68);
-  --popover: oklch(0.205 0 0 / 0.78);
-  --surface-acrylic: oklch(0.205 0 0 / 0.55);
 }
 /* Theme-mismatch guard: mica follows the OS theme, not the app theme. When the
    app theme differs from the OS theme, fully transparent chrome would put dark
@@ -137,8 +146,6 @@ html.dark[data-backdrop] {
 }
 @utility surface-acrylic {
   background: var(--surface-acrylic);
-  -webkit-backdrop-filter: blur(16px) saturate(140%);
-  backdrop-filter: blur(16px) saturate(140%);
 }
 
 /* Acrylic surface recipes: one full-window glass layer behind a transparent

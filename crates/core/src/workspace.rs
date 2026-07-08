@@ -122,7 +122,7 @@ pub fn prepare_session_workspace(
 /// itself refuses (ambiguous with an option flag). `Branch::name_is_valid`
 /// wraps libgit2's `git_branch_name_is_valid`, which applies that extra
 /// branch-specific rule on top of the general ref-format checks.
-fn validate_branch_name(name: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_branch_name(name: &str) -> anyhow::Result<()> {
     let valid = !name.is_empty() && git2::Branch::name_is_valid(name).unwrap_or(false);
     if !valid {
         anyhow::bail!("'{name}' is not a valid git branch name");

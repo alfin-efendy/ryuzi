@@ -3,9 +3,10 @@ import { Copy, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
 import { events, type CatalogEntry, type DeviceFlowInfo } from "@/bindings";
-import { Chip } from "@/components/common/bits";
+import { CategoryBadge, Chip } from "@/components/common/bits";
 import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
 import {
+  DEVICE_SIGNIN_ACTION,
   KIRO_DEVICE_CODE_HINT,
   KIRO_IMPORT_ACTION,
   KIRO_IMPORT_HINT,
@@ -13,13 +14,20 @@ import {
   KIRO_SIGNIN_ACTION,
   KIRO_SIGNIN_SUBTITLE,
   KIRO_WAITING_HINT,
+  PROVIDER_DEVICE_SUBTITLE,
+  PROVIDER_RISK_NOTICE,
 } from "@/constants";
+import { usesDeviceSignin } from "./deviceSignin";
 
 type DeviceStep = "form" | "waiting";
 
 const SUBSCRIPTION_LABELS: Record<string, string> = {
   "anthropic-oauth": "Claude subscription",
   "openai-oauth": "ChatGPT subscription",
+};
+
+const BASE_URL_PLACEHOLDERS: Record<string, string> = {
+  "cloudflare-ai": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
 };
 
 function authMethodLabel(entry: CatalogEntry): string {
@@ -30,7 +38,8 @@ function authMethodLabel(entry: CatalogEntry): string {
 }
 
 export function AddConnectionModal({ open, onClose, family }: { open: boolean; onClose: () => void; family: string }) {
-  const { catalog, add, connectOauth, addFree, startKiroDevice, awaitKiroDevice, importKiro } = useConnections();
+  const { catalog, add, connectOauth, addFree, startKiroDevice, awaitKiroDevice, importKiro, startDeviceFlow, awaitDeviceFlow } =
+    useConnections();
   const members = useMemo(() => catalog.filter((entry) => entry.family === family), [catalog, family]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [label, setLabel] = useState("");
@@ -134,15 +143,17 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     if (oauthAuthorizeUrl) void navigator.clipboard.writeText(oauthAuthorizeUrl);
   };
 
-  // Kiro (the "device" category) signs in via AWS SSO-OIDC device-code flow —
-  // start a fresh sign-in, or import an existing sign-in from a Kiro IDE on
-  // this machine. The `selectedRef` guard drops results that resolve after the
-  // user has navigated to a different provider.
+  // Kiro (the "device" category) signs in via AWS SSO-OIDC device-code flow;
+  // RFC 8628 device-grant providers (qwen, github-copilot) use the generic
+  // device flow commands instead. Kiro also supports starting a fresh sign-in
+  // or importing an existing sign-in from a Kiro IDE on this machine. The
+  // `selectedRef` guard drops results that resolve after the user has
+  // navigated to a different provider.
   const startDevice = async () => {
     if (!selected || saving) return;
     const target = selected;
     setSaving(true);
-    const info = await startKiroDevice();
+    const info = target.usesDeviceGrant ? await startDeviceFlow(target.id) : await startKiroDevice();
     if (selectedRef.current?.id !== target.id) return;
     if (!info) {
       setSaving(false);
@@ -150,7 +161,10 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     }
     setDeviceInfo(info);
     setDeviceStep("waiting");
-    const ok = await awaitKiroDevice(label.trim() || target.name, info.flowId);
+    const signinLabel = label.trim() || target.name;
+    const ok = target.usesDeviceGrant
+      ? await awaitDeviceFlow(target.id, signinLabel, info.flowId)
+      : await awaitKiroDevice(signinLabel, info.flowId);
     if (selectedRef.current?.id !== target.id) return;
     setSaving(false);
     if (ok) close();
@@ -214,7 +228,10 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
               >
                 <Chip initial={entry.initial} color={entry.color} size={32} />
                 <span className="min-w-0">
-                  <span className="block font-semibold">{authMethodLabel(entry)}</span>
+                  <span className="flex items-center gap-1.5 font-semibold">
+                    {authMethodLabel(entry)}
+                    <CategoryBadge category={entry.freeTier ? "free_tier" : entry.category} />
+                  </span>
                   <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11px] font-normal text-muted-foreground">
                     {entry.name}
                   </span>
@@ -223,6 +240,12 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
             );
           })}
         </div>
+      )}
+
+      {selected?.riskNotice && (
+        <p className="mt-3 rounded-md border border-border px-3 py-2 text-[11.5px]" style={{ color: "#F59E0B" }}>
+          {PROVIDER_RISK_NOTICE}
+        </p>
       )}
 
       {selected?.category === "oauth" ? (
@@ -261,7 +284,7 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
             </div>
           )}
         </>
-      ) : selected?.category === "device" ? (
+      ) : selected && usesDeviceSignin(selected) ? (
         <>
           {deviceStep === "form" && (
             <>
@@ -270,14 +293,22 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
                   <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected.name} />
                 </FormField>
               </div>
-              <p className="mt-2 text-[11.5px] text-muted-foreground">{KIRO_SIGNIN_SUBTITLE}</p>
+              <p className="mt-2 text-[11.5px] text-muted-foreground">
+                {selected.id === "kiro"
+                  ? KIRO_SIGNIN_SUBTITLE
+                  : (PROVIDER_DEVICE_SUBTITLE[selected.id] ?? "Sign in with your provider account.")}
+              </p>
               <Button size="lg" onClick={() => void startDevice()} disabled={saving} className="mt-2 w-full">
-                {saving ? "Opening..." : KIRO_SIGNIN_ACTION}
+                {saving ? "Opening..." : selected.id === "kiro" ? KIRO_SIGNIN_ACTION : DEVICE_SIGNIN_ACTION}
               </Button>
-              <Button size="lg" variant="outline" onClick={() => void importFromIde()} disabled={saving} className="mt-2 w-full">
-                {saving ? "Importing..." : KIRO_IMPORT_ACTION}
-              </Button>
-              <p className="mt-2 text-[11.5px] text-muted-foreground">{KIRO_IMPORT_HINT}</p>
+              {selected.id === "kiro" && (
+                <>
+                  <Button size="lg" variant="outline" onClick={() => void importFromIde()} disabled={saving} className="mt-2 w-full">
+                    {saving ? "Importing..." : KIRO_IMPORT_ACTION}
+                  </Button>
+                  <p className="mt-2 text-[11.5px] text-muted-foreground">{KIRO_IMPORT_HINT}</p>
+                </>
+              )}
             </>
           )}
 
@@ -294,6 +325,11 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
                 <Loader2 aria-hidden size={13} strokeWidth={2} className="shrink-0 animate-spin" />
                 {KIRO_WAITING_HINT}
               </div>
+              {deviceInfo.verificationUri && (
+                <p className="text-[11px] text-muted-foreground break-all">
+                  or visit <span className="font-mono">{deviceInfo.verificationUri}</span>
+                </p>
+              )}
             </div>
           )}
         </>
@@ -319,7 +355,11 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
                     )
                   }
                 >
-                  <Input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://host/v1" />
+                  <Input
+                    value={baseUrl}
+                    onChange={(event) => setBaseUrl(event.target.value)}
+                    placeholder={BASE_URL_PLACEHOLDERS[selected?.id ?? ""] ?? "https://host/v1"}
+                  />
                 </FormField>
               </>
             )}

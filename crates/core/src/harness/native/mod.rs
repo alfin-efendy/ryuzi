@@ -64,29 +64,36 @@ impl Default for NativeHarness {
 }
 
 /// Connect the session's enabled MCP servers (stdio only) and build native
-/// tool wrappers for their tools. Failures are logged and skipped.
+/// tool wrappers for their tools. Servers connect CONCURRENTLY (`join_all` —
+/// each stdio handshake is independent), so total startup latency is the
+/// slowest server, not the sum. Failures are logged and skipped; `join_all`
+/// preserves input order, so tool order stays deterministic.
 async fn connect_mcp_tools(
     mcp_servers: &[crate::domain::McpServerSpec],
 ) -> Vec<Arc<dyn tools::Tool>> {
-    let mut extra: Vec<Arc<dyn tools::Tool>> = Vec::new();
-    for spec in mcp_servers {
+    let connections = futures::future::join_all(mcp_servers.iter().map(|spec| async move {
         if !matches!(spec.transport, crate::domain::McpTransport::Stdio { .. }) {
-            continue; // HTTP MCP transport is not yet executed natively
+            return None; // HTTP MCP transport is not yet executed natively
         }
         match mcp_client::McpConnection::connect_stdio(spec).await {
-            Ok(conn) => {
-                let conn = Arc::new(conn);
-                for t in &conn.tools {
-                    extra.push(Arc::new(tools::mcp::McpTool::new(
-                        &conn.server_name,
-                        &t.name,
-                        &t.description,
-                        t.input_schema.clone(),
-                        conn.clone(),
-                    )));
-                }
+            Ok(conn) => Some(Arc::new(conn)),
+            Err(e) => {
+                tracing::warn!("native: MCP server `{}` unavailable: {e}", spec.name);
+                None
             }
-            Err(e) => tracing::warn!("native: MCP server `{}` unavailable: {e}", spec.name),
+        }
+    }))
+    .await;
+    let mut extra: Vec<Arc<dyn tools::Tool>> = Vec::new();
+    for conn in connections.into_iter().flatten() {
+        for t in &conn.tools {
+            extra.push(Arc::new(tools::mcp::McpTool::new(
+                &conn.server_name,
+                &t.name,
+                &t.description,
+                t.input_schema.clone(),
+                conn.clone(),
+            )));
         }
     }
     extra
@@ -359,10 +366,7 @@ mod tests {
         assert_eq!(session.agent_session_id().as_deref(), Some("sess"));
 
         session
-            .send_prompt(TurnPrompt {
-                agent: "hi".into(),
-                display: "hi".into(),
-            })
+            .send_prompt(TurnPrompt::text("hi", "hi"))
             .await
             .unwrap();
 
@@ -503,5 +507,41 @@ mod tests {
                 .as_deref(),
             Some("fable")
         );
+    }
+
+    #[tokio::test]
+    async fn connect_mcp_tools_skips_http_and_unreachable_servers() {
+        use crate::domain::{McpServerSpec, McpTransport};
+        // One HTTP spec (not executed natively) + two stdio specs whose
+        // commands don't exist (spawn fails fast, no real process). The
+        // joined connect must complete and yield no tools — failures are
+        // logged and skipped, never propagated.
+        let specs = vec![
+            McpServerSpec {
+                name: "http-server".into(),
+                transport: McpTransport::Http {
+                    url: "http://localhost:1/mcp".into(),
+                    headers: vec![],
+                },
+            },
+            McpServerSpec {
+                name: "ghost-a".into(),
+                transport: McpTransport::Stdio {
+                    command: "ryuzi-definitely-not-a-real-binary-a".into(),
+                    args: vec![],
+                    env: vec![],
+                },
+            },
+            McpServerSpec {
+                name: "ghost-b".into(),
+                transport: McpTransport::Stdio {
+                    command: "ryuzi-definitely-not-a-real-binary-b".into(),
+                    args: vec![],
+                    env: vec![],
+                },
+            },
+        ];
+        let tools = connect_mcp_tools(&specs).await;
+        assert!(tools.is_empty());
     }
 }

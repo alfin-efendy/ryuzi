@@ -633,10 +633,7 @@ pub async fn run_via_harness_trait_collecting_events(
         .expect("start_session via Harness trait failed");
 
     session
-        .send_prompt(TurnPrompt {
-            agent: prompt.to_string(),
-            display: prompt.to_string(),
-        })
+        .send_prompt(TurnPrompt::text(prompt, prompt))
         .await
         .expect("send_prompt failed");
 
@@ -1222,10 +1219,7 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
         .expect("run_prompt_with_fs_calls: start_session failed");
 
     session
-        .send_prompt(TurnPrompt {
-            agent: "write and read".to_string(),
-            display: "write and read".to_string(),
-        })
+        .send_prompt(TurnPrompt::text("write and read", "write and read"))
         .await
         .expect("run_prompt_with_fs_calls: send_prompt failed");
 
@@ -1494,10 +1488,7 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
         .expect("run_prompt_with_terminal_calls: start_session failed");
 
     session
-        .send_prompt(TurnPrompt {
-            agent: "run terminal".to_string(),
-            display: "run terminal".to_string(),
-        })
+        .send_prompt(TurnPrompt::text("run terminal", "run terminal"))
         .await
         .expect("run_prompt_with_terminal_calls: send_prompt failed");
 
@@ -1579,6 +1570,7 @@ pub async fn run_perm_mock_via_harness(
         effort: None,
         perm_mode: PermMode::Default,
         created_at: None,
+        is_git: false,
     };
     store.insert_project(project).await.unwrap();
 
@@ -1725,10 +1717,7 @@ pub async fn run_perm_mock_via_harness(
         .expect("run_perm_mock_via_harness: start_session failed");
 
     session
-        .send_prompt(TurnPrompt {
-            agent: "trigger permission".to_string(),
-            display: "trigger permission".to_string(),
-        })
+        .send_prompt(TurnPrompt::text("trigger permission", "trigger permission"))
         .await
         .expect("run_perm_mock_via_harness: send_prompt failed");
 

@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { openFileTab, closeTab, normalizeActive, type DockTab } from "./store-ui";
+import { openFileTab, closeTab, normalizeActive, setTabMode, useUi, type DockTab } from "./store-ui";
 
 const fileTab = (path: string): DockTab => ({ id: path, kind: "file", path, title: path.split("/").pop() ?? path });
 
@@ -46,4 +46,35 @@ test("normalizeActive maps empty/null to null, keeps real ids", () => {
   expect(normalizeActive("")).toBeNull();
   expect(normalizeActive(null)).toBeNull();
   expect(normalizeActive("/a.ts")).toBe("/a.ts");
+});
+
+test("setTabMode sets mode on the target tab only", () => {
+  const start = [fileTab("/a/readme.md"), fileTab("/c/d.ts")];
+  const r = setTabMode(start, "/a/readme.md", "code");
+  expect(r.find((t) => t.id === "/a/readme.md")?.mode).toBe("code");
+  expect(r.find((t) => t.id === "/c/d.ts")?.mode).toBeUndefined();
+});
+
+test("setTabMode with an unknown id leaves tabs unchanged", () => {
+  const start = [fileTab("/a.ts")];
+  expect(setTabMode(start, "/nope.ts", "view")).toEqual(start);
+});
+
+test("tabs persisted before the mode field stay valid and can adopt a mode", () => {
+  // Exact shape old clients wrote to localStorage (no mode key).
+  const legacy = JSON.parse('[{"id":"/a.md","kind":"file","path":"/a.md","title":"a.md"}]') as DockTab[];
+  expect(legacy[0].mode).toBeUndefined();
+  expect(setTabMode(legacy, "/a.md", "view")[0].mode).toBe("view");
+});
+
+test("hideInvalidModels toggle flips state and persists to localStorage", () => {
+  // happy-dom preload (bunfig.toml) gives a fresh localStorage, so the
+  // store initialized with the false default at module load.
+  expect(useUi.getState().hideInvalidModels).toBe(false);
+  useUi.getState().toggleHideInvalidModels();
+  expect(useUi.getState().hideInvalidModels).toBe(true);
+  expect(localStorage.getItem("cockpit.ui.hideInvalidModels")).toBe("1");
+  useUi.getState().toggleHideInvalidModels();
+  expect(useUi.getState().hideInvalidModels).toBe(false);
+  expect(localStorage.getItem("cockpit.ui.hideInvalidModels")).toBe("0");
 });

@@ -108,7 +108,7 @@ pub async fn run_turn(
         deps,
         "user",
         "text",
-        json!({ "text": prompt.display }),
+        user_row_payload(&prompt),
         None,
         None,
         None,
@@ -118,7 +118,7 @@ pub async fn run_turn(
     // 2. Load history and append the user turn to the ledger.
     let mut ledger = Ledger::load(deps.store.clone(), &deps.session_pk).await?;
     ledger
-        .append_user(json!([{ "type": "text", "text": agent_text }]))
+        .append_user(user_content_blocks(&prompt.blocks, &agent_text))
         .await?;
 
     // 3. Drive the loop with a spawner available for the `task` tool.
@@ -132,6 +132,23 @@ pub async fn run_turn(
     // 4. Best-effort: give a fresh session a generated title.
     maybe_generate_title(deps, &prompt.display).await;
     Ok(())
+}
+
+/// The persisted user-row payload: `{text}` plus `attachments` display
+/// metadata when the turn carried any.
+pub(crate) fn user_row_payload(prompt: &TurnPrompt) -> Value {
+    let mut payload = json!({ "text": prompt.display });
+    if !prompt.attachments.is_empty() {
+        payload["attachments"] = Value::Array(prompt.attachments.clone());
+    }
+    payload
+}
+
+/// The Anthropic user-content array: image blocks first, then the text block.
+pub(crate) fn user_content_blocks(blocks: &[Value], agent_text: &str) -> Value {
+    let mut content = blocks.to_vec();
+    content.push(json!({ "type": "text", "text": agent_text }));
+    Value::Array(content)
 }
 
 fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
@@ -1027,10 +1044,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "please write out.txt".into(),
-                display: "please write out.txt".into(),
-            },
+            TurnPrompt::text("please write out.txt", "please write out.txt"),
             CancellationToken::new(),
         )
         .await
@@ -1096,16 +1110,9 @@ mod tests {
         )];
         let llm = Arc::new(ScriptedLlm::new(vec![turn]));
         let deps = deps_at(dir.path(), llm).await;
-        let err = run_turn(
-            &deps,
-            TurnPrompt {
-                agent: "x".into(),
-                display: "x".into(),
-            },
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
+        let err = run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("boom"));
     }
 
@@ -1142,10 +1149,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "where is the readme?".into(),
-                display: "where is the readme?".into(),
-            },
+            TurnPrompt::text("where is the readme?", "where is the readme?"),
             CancellationToken::new(),
         )
         .await
@@ -1393,10 +1397,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "go wide".into(),
-                display: "go wide".into(),
-            },
+            TurnPrompt::text("go wide", "go wide"),
             CancellationToken::new(),
         )
         .await
@@ -1475,10 +1476,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             CancellationToken::new(),
         )
         .await
@@ -1536,10 +1534,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "go".into(),
-                display: "go".into(),
-            },
+            TurnPrompt::text("go", "go"),
             CancellationToken::new(),
         )
         .await
@@ -1591,6 +1586,7 @@ mod tests {
                 effort: None,
                 perm_mode: PermMode::Default,
                 created_at: Some(0),
+                is_git: false,
             })
             .await
             .unwrap();
@@ -1614,10 +1610,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "fix login".into(),
-                display: "fix login".into(),
-            },
+            TurnPrompt::text("fix login", "fix login"),
             CancellationToken::new(),
         )
         .await
@@ -1641,10 +1634,7 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                agent: "/review".into(),
-                display: "/review".into(),
-            },
+            TurnPrompt::text("/review", "/review"),
             CancellationToken::new(),
         )
         .await
@@ -1674,11 +1664,10 @@ mod tests {
 
         run_turn(
             &deps,
-            TurnPrompt {
-                display: "/review auth".into(),
-                agent: "/review auth\n\n[Chat context]\n- Branch: feature/auth\n\n[User attached 1 file - saved to disk:]"
-                    .into(),
-            },
+            TurnPrompt::text(
+                "/review auth\n\n[Chat context]\n- Branch: feature/auth\n\n[User attached 1 file - saved to disk:]",
+                "/review auth",
+            ),
             CancellationToken::new(),
         )
         .await
@@ -1693,6 +1682,32 @@ mod tests {
         assert!(user_text.contains("[User attached 1 file"));
     }
 
+    #[test]
+    fn user_row_payload_omits_attachments_when_empty_and_includes_them_when_present() {
+        let plain = TurnPrompt::text("hi", "hi");
+        assert_eq!(user_row_payload(&plain), json!({ "text": "hi" }));
+
+        let with = TurnPrompt {
+            attachments: vec![
+                json!({ "name": "a.png", "path": "/x/a.png", "contentType": "image/png", "size": 4 }),
+            ],
+            ..TurnPrompt::text("hi", "hi")
+        };
+        let payload = user_row_payload(&with);
+        assert_eq!(payload["text"], "hi");
+        assert_eq!(payload["attachments"][0]["name"], "a.png");
+    }
+
+    #[test]
+    fn user_content_blocks_prepends_image_blocks_before_the_text_block() {
+        let img = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } });
+        let content = user_content_blocks(std::slice::from_ref(&img), "look at this");
+        let arr = content.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], img);
+        assert_eq!(arr[1], json!({ "type": "text", "text": "look at this" }));
+    }
+
     #[tokio::test]
     async fn precancelled_turn_returns_without_calling_model() {
         let dir = tempfile::tempdir().unwrap();
@@ -1701,16 +1716,9 @@ mod tests {
         let deps = deps_at(dir.path(), llm).await;
         let cancel = CancellationToken::new();
         cancel.cancel();
-        run_turn(
-            &deps,
-            TurnPrompt {
-                agent: "x".into(),
-                display: "x".into(),
-            },
-            cancel,
-        )
-        .await
-        .unwrap();
+        run_turn(&deps, TurnPrompt::text("x", "x"), cancel)
+            .await
+            .unwrap();
         // The user row was still persisted before the cancel check.
         let msgs = deps.store.list_messages("s1").await.unwrap();
         assert_eq!(msgs.len(), 1);

@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronRight, Plus, TestTube2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronRight, Plus, RefreshCw, TestTube2 } from "lucide-react";
 import { toast } from "sonner";
 import { commands, type ConnectionInfo, type ModelRouteStrategy, type UsageSeries } from "@/bindings";
 import { useConnections } from "@/store-connections";
 import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
+import { useUi } from "@/store-ui";
+import { runPool, visibleModels, type ModelTestEntry, type ModelTestStatus } from "@/lib/model-testing";
 import {
   Button,
   Combobox,
@@ -136,8 +138,42 @@ function AccountRow({ conn, index, count }: { conn: ConnectionInfo; index: numbe
   );
 }
 
-function ProviderModelsCard({ connections, catalogModels }: { connections: ConnectionInfo[]; catalogModels: string[] }) {
-  const [testingModel, setTestingModel] = useState<string | null>(null);
+function StatusBadge({ entry }: { entry: ModelTestEntry }) {
+  const look =
+    entry.status === "valid"
+      ? { symbol: "✓", className: "text-green-500" }
+      : entry.status === "invalid"
+        ? { symbol: "✗", className: "text-red-500" }
+        : { symbol: "?", className: "text-muted-foreground" };
+  return (
+    <span
+      role="img"
+      title={entry.message}
+      aria-label={`${entry.status}: ${entry.message}`}
+      className={`w-4 shrink-0 text-center text-xs font-semibold ${look.className}`}
+    >
+      {look.symbol}
+    </span>
+  );
+}
+
+function ProviderModelsCard({
+  family,
+  connections,
+  catalogModels,
+}: {
+  family: string;
+  connections: ConnectionInfo[];
+  catalogModels: string[];
+}) {
+  const [results, setResults] = useState<Map<string, ModelTestEntry>>(new Map());
+  const [inFlight, setInFlight] = useState<Set<string>>(new Set());
+  const [batch, setBatch] = useState<{ done: number; total: number } | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshErrors, setRefreshErrors] = useState<Array<{ connectionId: string; message: string }>>([]);
+  const hideInvalid = useUi((s) => s.hideInvalidModels);
+  const toggleHideInvalid = useUi((s) => s.toggleHideInvalidModels);
+  const hydrate = useConnections((s) => s.hydrate);
   const models = useMemo(() => {
     const set = new Set<string>();
     for (const conn of connections) {
@@ -148,44 +184,136 @@ function ProviderModelsCard({ connections, catalogModels }: { connections: Conne
     }
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [catalogModels, connections]);
+  const visible = useMemo(() => visibleModels(models, results, hideInvalid), [models, results, hideInvalid]);
+
+  useEffect(() => {
+    let active = true;
+    void commands.listModelStatuses(family).then((result) => {
+      if (!active || result.status !== "ok") return;
+      setResults(new Map(result.data.map((row) => [row.model, { status: row.status as ModelTestStatus, message: row.message }])));
+    });
+    return () => {
+      active = false;
+    };
+  }, [family]);
+
+  const connFor = (model: string) =>
+    connections.find((item) => item.enabled && item.models.includes(model)) ?? connections.find((item) => item.models.includes(model));
+
+  const testOne = async (model: string): Promise<ModelTestEntry | null> => {
+    const conn = connFor(model);
+    if (!conn) return null;
+    setInFlight((prev) => new Set(prev).add(model));
+    try {
+      let entry: ModelTestEntry;
+      try {
+        const result = await commands.testConnectionModel(conn.id, model);
+        entry =
+          result.status === "ok"
+            ? { status: result.data.status as ModelTestStatus, message: result.data.message }
+            : { status: "unknown", message: `Model test failed: ${result.error.message}` };
+      } catch (e) {
+        entry = { status: "unknown", message: e instanceof Error ? e.message : String(e) };
+      }
+      setResults((prev) => new Map(prev).set(model, entry));
+      return entry;
+    } finally {
+      setInFlight((prev) => {
+        const next = new Set(prev);
+        next.delete(model);
+        return next;
+      });
+    }
+  };
 
   const runModelTest = async (model: string) => {
-    const conn =
-      connections.find((item) => item.enabled && item.models.includes(model)) ?? connections.find((item) => item.models.includes(model));
-    if (!conn) return;
-    setTestingModel(model);
-    const result = await commands.testConnectionModel(conn.id, model);
-    setTestingModel(null);
-    if (result.status === "ok") {
-      if (result.data.ok) toast.success(result.data.message);
-      else toast.error(result.data.message);
+    const entry = await testOne(model);
+    if (!entry) return;
+    if (entry.status === "valid") toast.success(entry.message);
+    else toast.error(entry.message);
+  };
+
+  const runTestAll = async () => {
+    const targets = models.filter((model) => connFor(model));
+    if (targets.length === 0) return;
+    setBatch({ done: 0, total: targets.length });
+    try {
+      // Cap of 3: every probe is a real billed inference call.
+      await runPool(targets, 3, async (model) => {
+        await testOne(model);
+        setBatch((prev) => (prev ? { done: prev.done + 1, total: prev.total } : prev));
+      });
+    } finally {
+      setBatch(null);
+    }
+  };
+
+  const runRefresh = async () => {
+    setRefreshing(true);
+    setRefreshErrors([]);
+    const result = await commands.refreshProviderModels(family);
+    setRefreshing(false);
+    if (result.status !== "ok") {
+      toast.error(`Refresh failed: ${result.error.message}`);
       return;
     }
-    toast.error(`Model test failed: ${result.error.message}`);
+    const failures = result.data.filter((item) => !item.ok);
+    setRefreshErrors(failures.map((item) => ({ connectionId: item.connectionId, message: item.message })));
+    if (failures.length === 0) toast.success("Models refreshed");
+    await hydrate();
   };
 
   return (
     <Card className="mt-3">
-      <CardHeader>
+      <CardHeader className="flex-wrap">
         <CardTitle>Models</CardTitle>
         <CardHint>{modelLabel(models.length)}</CardHint>
-      </CardHeader>
-      {models.map((model) => (
-        <div key={model} className="flex min-h-11 items-center gap-2 border-b border-border px-[18px] py-2.5 last:border-b-0">
-          <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{model}</span>
-          <ModelCapabilityIcons model={model} compact />
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void runModelTest(model)}
-            disabled={testingModel === model || connections.length === 0}
-            aria-label={`Test ${model}`}
-          >
+        <div className="ml-auto flex items-center gap-2">
+          <span className="text-xs font-medium text-muted-foreground">Hide invalid</span>
+          <Switch on={hideInvalid} onToggle={toggleHideInvalid} label="Hide invalid models" />
+          <Button variant="outline" size="sm" onClick={() => void runTestAll()} disabled={batch !== null || connections.length === 0}>
             <TestTube2 aria-hidden size={12} strokeWidth={2} className="size-3" />
-            {testingModel === model ? "Testing..." : "Test"}
+            {batch ? `Testing ${batch.done}/${batch.total}` : "Test all"}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => void runRefresh()} disabled={refreshing || connections.length === 0}>
+            <RefreshCw aria-hidden size={12} strokeWidth={2} className="size-3" />
+            {refreshing ? "Refreshing..." : "Refresh models"}
           </Button>
         </div>
+      </CardHeader>
+      {refreshErrors.map((err) => (
+        <div key={err.connectionId} className="border-b border-border px-[18px] py-2 text-xs last:border-b-0" style={{ color: "#EF4444" }}>
+          {err.message}
+        </div>
       ))}
+      {visible.map((model) => {
+        const entry = results.get(model);
+        const testing = inFlight.has(model);
+        return (
+          <div key={model} className="flex min-h-11 items-center gap-2 border-b border-border px-[18px] py-2.5 last:border-b-0">
+            <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{model}</span>
+            {entry && <StatusBadge entry={entry} />}
+            <ModelCapabilityIcons model={model} compact />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void runModelTest(model)}
+              disabled={testing || connections.length === 0}
+              aria-label={`Test ${model}`}
+            >
+              {testing ? (
+                <RefreshCw aria-hidden size={12} strokeWidth={2} className="size-3 animate-spin" />
+              ) : (
+                <TestTube2 aria-hidden size={12} strokeWidth={2} className="size-3" />
+              )}
+              {testing ? "Testing..." : "Test"}
+            </Button>
+          </div>
+        );
+      })}
+      {visible.length === 0 && models.length > 0 && (
+        <div className="px-[18px] py-8 text-center text-[13px] text-muted-foreground">All models hidden by the Hide-invalid filter.</div>
+      )}
       {models.length === 0 && <div className="px-[18px] py-8 text-center text-[13px] text-muted-foreground">No models discovered yet.</div>}
     </Card>
   );
@@ -334,7 +462,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
           </div>
         </Card>
 
-        <ProviderModelsCard connections={providerConnections} catalogModels={catalogModels} />
+        <ProviderModelsCard family={provider} connections={providerConnections} catalogModels={catalogModels} />
       </div>
       <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} family={provider} />
     </div>

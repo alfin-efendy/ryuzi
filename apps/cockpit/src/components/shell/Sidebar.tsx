@@ -38,6 +38,7 @@ import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForPr
 import { statusMeta } from "@/lib/status";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { StatusDot } from "@/components/common/bits";
+import { AddProjectModal } from "@/components/modals/AddProjectModal";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
@@ -79,7 +80,7 @@ function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
 }
 
 export function Sidebar() {
-  const { projects, sessions, setFocused, focusedSessionPk, selectProject, addProject, end } = useStore();
+  const { projects, sessions, setFocused, focusedSessionPk, selectProject, end } = useStore();
   const { pinned, archived, togglePin, setArchived } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
   const [archivingPk, setArchivingPk] = useState<string | null>(null);
@@ -155,6 +156,7 @@ export function Sidebar() {
   const [projectsMenuOpen, setProjectsMenuOpen] = useState(false);
   const [orderingSubOpen, setOrderingSubOpen] = useState(false);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
+  const [addProjectOpen, setAddProjectOpen] = useState(false);
 
   const q = nav.searchQuery;
   const ws = gateways.find((w) => w.id === activeGateway) ?? gateways[0];
@@ -238,8 +240,8 @@ export function Sidebar() {
           variant="ghost"
           size="icon-xs"
           className={iconBtn}
-          title="New project — open folder"
-          onClick={() => void addProject()}
+          title="New project"
+          onClick={() => setAddProjectOpen(true)}
         >
           <FolderPlus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
         </Button>
@@ -484,6 +486,8 @@ export function Sidebar() {
           </MenuPanel>
         )}
       </div>
+
+      <AddProjectModal open={addProjectOpen} onClose={() => setAddProjectOpen(false)} />
 
       {confirmArchive && (
         <Modal onClose={() => setConfirmArchive(null)} width={440}>

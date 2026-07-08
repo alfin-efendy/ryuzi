@@ -119,6 +119,81 @@ pub async fn git_diff(workdir: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Revert one file to its HEAD state — the exact base [`git_diff`] renders,
+/// so this precisely undoes what a Review card shows. Tracked files are
+/// restored (staged + worktree); untracked files (a created file's "revert"
+/// is deletion) are removed. `rel_path` is repo-relative.
+pub async fn revert_file(workdir: &str, rel_path: &str) -> anyhow::Result<()> {
+    // Reject parent traversal AND absolute/rooted paths up front: `toolPath`
+    // is agent-controlled, and on Windows `Path::join` REPLACES the base for
+    // drive-absolute (`C:\x`) or rooted (`\x`) components — without this an
+    // absolute path would skip the tracked branch (outside the repo) and fall
+    // into the delete branch pointed at an arbitrary file.
+    let rel = std::path::Path::new(rel_path);
+    anyhow::ensure!(
+        !rel.components().any(|c| matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )),
+        "invalid path: {rel_path}"
+    );
+    // Reject empty/"."-only paths too: both pass the component guard above
+    // (a bare "." yields a single CurDir component, not ParentDir/RootDir/
+    // Prefix) but would otherwise widen the git calls below to the whole
+    // worktree instead of one file.
+    anyhow::ensure!(
+        !rel_path.trim().is_empty() && rel_path.trim() != ".",
+        "invalid path: {rel_path}"
+    );
+    // `:(literal)` disables pathspec globbing so an agent-controlled
+    // `rel_path` containing `*`/`?`/`[...]` can only ever match its own
+    // literal name, never widen the revert to other files.
+    let literal_pathspec = format!(":(literal){rel_path}");
+    let tracked = tokio::process::Command::new("git")
+        .args([
+            "-C",
+            workdir,
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            &literal_pathspec,
+        ])
+        .output()
+        .await?;
+    if tracked.status.success() {
+        let out = tokio::process::Command::new("git")
+            .args([
+                "-C",
+                workdir,
+                "restore",
+                "--staged",
+                "--worktree",
+                "--",
+                &literal_pathspec,
+            ])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git restore failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return Ok(());
+    }
+    // Untracked → delete, but only after proving the resolved target really
+    // lives under the workdir (canonicalize both sides: symlinks resolve, and
+    // Windows `\\?\` prefixes compare consistently). A missing file errors at
+    // canonicalize — acceptable, it surfaces as a toast.
+    let abs = std::path::Path::new(workdir).join(rel);
+    let canon = tokio::fs::canonicalize(&abs).await?;
+    let root = tokio::fs::canonicalize(workdir).await?;
+    anyhow::ensure!(canon.starts_with(&root), "path escapes workdir: {rel_path}");
+    tokio::fs::remove_file(&canon).await?;
+    Ok(())
+}
+
 /// Case-insensitive substring search over relative file paths (capped).
 pub fn search_files(root: &Path, query: &str, cap: usize) -> Vec<String> {
     let needle = query.to_lowercase();
@@ -159,6 +234,138 @@ pub fn search_files(root: &Path, query: &str, cap: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    /// Empty, unique scratch directory (recreated on reruns of the same pid).
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ryuzi-fsview-core-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Run git isolated from the developer's global/system config so commits
+    /// need no signing keys or hooks.
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=test", "-c", "user.email=test@test"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[tokio::test]
+    async fn revert_file_restores_a_tracked_file_to_head() {
+        let dir = fresh_dir("revert-tracked");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "base").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.join("a.txt"), "agent edit").unwrap();
+        revert_file(dir.to_str().unwrap(), "a.txt").await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "base");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_deletes_an_untracked_file() {
+        let dir = fresh_dir("revert-untracked");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("new.txt"), "created by agent").unwrap();
+        revert_file(dir.to_str().unwrap(), "new.txt").await.unwrap();
+        assert!(!dir.join("new.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_parent_traversal() {
+        let dir = fresh_dir("revert-traversal");
+        git(&dir, &["init", "-q"]);
+        assert!(revert_file(dir.to_str().unwrap(), "../outside.txt")
+            .await
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_an_absolute_path_outside_the_repo() {
+        // Repo nested one level down; the target lives in the PARENT dir. On
+        // Windows Path::join replaces the base for absolute components, so an
+        // unguarded delete branch would remove the outside file.
+        let parent = fresh_dir("revert-absolute");
+        std::fs::write(parent.join("outside.txt"), "precious").unwrap();
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        let outside_abs = parent.join("outside.txt");
+        assert!(
+            revert_file(repo.to_str().unwrap(), outside_abs.to_str().unwrap())
+                .await
+                .is_err()
+        );
+        assert!(outside_abs.exists(), "outside file must survive");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_a_rooted_path() {
+        // "/abs.txt" carries a RootDir component on every platform (and on
+        // Windows "\abs.txt"-style rooted paths would re-root Path::join).
+        let dir = fresh_dir("revert-rooted");
+        git(&dir, &["init", "-q"]);
+        assert!(revert_file(dir.to_str().unwrap(), "/abs.txt")
+            .await
+            .is_err());
+        assert!(revert_file(dir.to_str().unwrap(), "\\abs.txt")
+            .await
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_dot_and_empty_paths() {
+        // "." and "" pass the component guard (a bare "." is a single CurDir
+        // component, not ParentDir/RootDir/Prefix) but would otherwise widen
+        // the git calls to the whole worktree instead of one file.
+        let dir = fresh_dir("revert-dot-empty");
+        git(&dir, &["init", "-q"]);
+        assert!(revert_file(dir.to_str().unwrap(), ".").await.is_err());
+        assert!(revert_file(dir.to_str().unwrap(), "").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revert_file_treats_glob_characters_as_literal() {
+        // Both files committed then modified; "a*.txt" must NOT expand to a
+        // glob (which would match both) — the literal pathspec means it
+        // matches nothing, so the call errors and both files keep their edits.
+        let dir = fresh_dir("revert-glob-literal");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "base-a").unwrap();
+        std::fs::write(dir.join("ab.txt"), "base-ab").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.join("a.txt"), "agent edit a").unwrap();
+        std::fs::write(dir.join("ab.txt"), "agent edit ab").unwrap();
+
+        assert!(revert_file(dir.to_str().unwrap(), "a*.txt").await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "agent edit a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ab.txt")).unwrap(),
+            "agent edit ab"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn tree() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();

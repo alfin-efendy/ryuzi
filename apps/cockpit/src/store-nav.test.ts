@@ -81,24 +81,20 @@ test("composer model starts unset and round-trips through setComposerModel", () 
   expect(useNav.getState().composerModel).toBeNull();
 });
 
-test("composer git controls default to worktree ON, new branch ON, no branch until the list loads", () => {
+test("composer git controls default to worktree ON, no branch until the list loads", () => {
   const s = useNav.getState();
   expect(s.composerBranch).toBeNull();
   expect(s.composerUseWorktree).toBe(true);
-  expect(s.composerCreateBranch).toBe(true);
 });
 
 test("composer git setters update and reset state", () => {
   useNav.getState().setComposerBranch("feature/x");
   useNav.getState().setComposerUseWorktree(false);
-  useNav.getState().setComposerCreateBranch(false);
   expect(useNav.getState().composerBranch).toBe("feature/x");
   expect(useNav.getState().composerUseWorktree).toBe(false);
-  expect(useNav.getState().composerCreateBranch).toBe(false);
   // setComposerBranch(null) clears the selection (project switch).
   useNav.getState().setComposerBranch(null);
   expect(useNav.getState().composerBranch).toBeNull();
   // restore defaults for other tests in this file
   useNav.getState().setComposerUseWorktree(true);
-  useNav.getState().setComposerCreateBranch(true);
 });

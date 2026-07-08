@@ -5,11 +5,13 @@ import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSectio
 import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
+import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
+import { useConnections } from "@/store-connections";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
-import { basename } from "@/lib/paths";
+import { groupModelOptions } from "@/lib/model-groups";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
@@ -19,14 +21,17 @@ import { Transcript } from "@/components/transcript/Transcript";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
+import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { startVoiceDictation } from "@/lib/voice";
+import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
+import { AttachmentChips } from "@/components/composer/AttachmentChips";
 
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
     useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<string[]>([]);
+  const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
@@ -44,10 +49,30 @@ export function SessionView() {
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
+  const catalog = useConnections((s) => s.catalog);
+  const connections = useConnections((s) => s.connections);
+  const connectionsLoaded = useConnections((s) => s.loaded);
+  const hydrateConnections = useConnections((s) => s.hydrate);
 
   useEffect(() => {
     if (projectId) void loadCommands(projectId);
   }, [projectId, loadCommands]);
+
+  useEffect(() => {
+    if (!connectionsLoaded) void hydrateConnections();
+  }, [connectionsLoaded, hydrateConnections]);
+
+  // Refresh edit-card diff stats after every turn, independent of the right
+  // panel (which only fetches while open/on its own "review" tab).
+  const fetchDiff = useDiff((s) => s.fetch);
+  const sessionRunning = session?.status === "running";
+  const prevSessionRunning = useRef(sessionRunning);
+  useEffect(() => {
+    if (prevSessionRunning.current && !sessionRunning && session?.sessionPk) {
+      void fetchDiff(session.sessionPk);
+    }
+    prevSessionRunning.current = sessionRunning;
+  }, [sessionRunning, session?.sessionPk, fetchDiff]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
@@ -94,20 +119,14 @@ export function SessionView() {
 
   const submit = () => {
     const t = draft.trim();
-    if (!t && attachments.length === 0) return;
+    if (!t && composerFiles.attachments.length === 0) return;
     setDraft("");
-    setAttachments([]);
+    composerFiles.clear();
     setContextRefs([]);
     void send(session.sessionPk, t, {
       context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-      attachments,
+      attachments: composerFiles.attachments,
     });
-  };
-
-  const attachFiles = async () => {
-    const picked = await commands.pickFiles();
-    if (!picked.length) return;
-    setAttachments((cur) => Array.from(new Set([...cur, ...picked])));
   };
 
   const pickContext = (path: string) => {
@@ -158,6 +177,7 @@ export function SessionView() {
             </div>
           </div>
           <div className="flex-1" />
+          <OpenInMenu sessionPk={session.sessionPk} />
           <div className="mx-0.5 h-[18px] w-px bg-border" />
           <Button
             variant="ghost"
@@ -183,13 +203,21 @@ export function SessionView() {
         <TodoPanel sessionPk={session.sessionPk} running={running} />
 
         {/* Transcript */}
-        <Transcript rows={rows} agentName={agent?.name ?? "Agent"} agentColor={agent?.color ?? "var(--muted-foreground)"} running={running}>
+        <Transcript
+          sessionPk={session.sessionPk}
+          rows={rows}
+          agentName={agent?.name ?? "Agent"}
+          agentColor={agent?.color ?? "var(--muted-foreground)"}
+          running={running}
+        >
           {hasApproval && <ApprovalPrompt sessionPk={session.sessionPk} />}
         </Transcript>
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
-          <div className="acrylic-card relative rounded-2xl border border-border shadow-xs">
+          <div
+            className={`acrylic-card relative mx-auto w-full max-w-3xl rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
+          >
             <Textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
@@ -199,6 +227,7 @@ export function SessionView() {
                   submit();
                 }
               }}
+              onPaste={composerFiles.onPaste}
               placeholder="Ask for follow-up changes"
               rows={1}
               className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
@@ -230,7 +259,7 @@ export function SessionView() {
                 variant="ghost"
                 size="icon-sm"
                 title="Attach"
-                onClick={() => void attachFiles()}
+                onClick={() => void composerFiles.attachFiles()}
                 className="rounded-full text-muted-foreground"
               >
                 <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
@@ -259,7 +288,7 @@ export function SessionView() {
               <div className="flex-1" />
               <Combobox
                 aria-label="Model"
-                options={modelOptions.map((m) => ({ value: m, label: m, mono: true }))}
+                options={groupModelOptions(modelOptions, catalog, connections)}
                 value={selectedModel || null}
                 onValueChange={(m) => {
                   if (projectId) void setProjectModel(projectId, m);
@@ -297,7 +326,7 @@ export function SessionView() {
                 </Button>
               )}
             </div>
-            {(attachments.length > 0 || contextRefs.length > 0) && (
+            {(composerFiles.attachments.length > 0 || contextRefs.length > 0) && (
               <div className="flex flex-wrap gap-1.5 px-2.5 pb-2">
                 {contextRefs.map((path) => (
                   <Button
@@ -313,20 +342,7 @@ export function SessionView() {
                     <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
                   </Button>
                 ))}
-                {attachments.map((path) => (
-                  <Button
-                    key={path}
-                    variant="outline"
-                    size="sm"
-                    title={path}
-                    onClick={() => setAttachments((cur) => cur.filter((p) => p !== path))}
-                    className="max-w-[220px] rounded-full px-2 text-[12px] text-muted-foreground"
-                  >
-                    <Paperclip aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
-                    <span className="truncate">{basename(path)}</span>
-                    <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
-                  </Button>
-                ))}
+                <AttachmentChips attachments={composerFiles.attachments} onRemove={composerFiles.remove} />
               </div>
             )}
           </div>
@@ -337,10 +353,16 @@ export function SessionView() {
       </div>
 
       {/* Right panel — keyed by session so switching sessions remounts it: per-session
-          review/file state resets and in-flight gitDiff responses from the previous
-          session land on an unmounted component instead of clobbering the new diff. */}
+          review/file state resets, while diff data lives in the useDiff store keyed
+          by sessionPk so sessions never see each other's results. */}
       {nav.rightOpen && (
-        <RightPanel key={session.sessionPk} sessionPk={session.sessionPk} branch={session.branch ?? null} running={running} />
+        <RightPanel
+          key={session.sessionPk}
+          sessionPk={session.sessionPk}
+          branch={session.branch ?? null}
+          running={running}
+          isGit={project?.isGit ?? true}
+        />
       )}
     </div>
   );

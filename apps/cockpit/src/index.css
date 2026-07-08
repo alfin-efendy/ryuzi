@@ -81,8 +81,8 @@ input:focus {
 .chat-md h2 { font-size: 14.5px; }
 .chat-md h3 { font-size: 14px; }
 .chat-md h4, .chat-md h5, .chat-md h6 { font-size: 13.5px; }
-.chat-md ul, .chat-md ol { margin: 0.35em 0; padding-left: 1.4em; }
-.chat-md li { margin: 0.15em 0; }
+.chat-md ul, .chat-md ol { margin: 0.35em 0; padding-left: 1.35em; }
+.chat-md li { margin: 0.18em 0; }
 .chat-md blockquote {
   margin: 0.5em 0; padding: 0.1em 0 0.1em 0.9em;
   border-left: 2px solid var(--border); color: var(--muted-foreground);

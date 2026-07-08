@@ -14,6 +14,8 @@ import { AlertTriangle, Copy, Layers, Loader2, MonitorUp, X } from "lucide-react
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { commands, type RuntimeConfigStatusInfo } from "@/bindings";
+import type { ComboboxGroup, ComboboxOption } from "@ryuzi/ui";
+import { groupModelOptions, withLeadingOption } from "@/lib/model-groups";
 import { Chip, Pill } from "@/components/common/bits";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { PERM_MODES } from "@/constants";
@@ -27,7 +29,8 @@ import { useNav } from "@/store-nav";
 const WARN = "#F59E0B";
 
 // A single label + Combobox row for the endpoint-config card's model
-// pickers — options come from the enabled connections' models.
+// pickers — options come from the enabled connections' models, grouped by
+// provider family (values stay the raw `provider/model` ids).
 function ModelSelectRow({
   label,
   value,
@@ -36,7 +39,7 @@ function ModelSelectRow({
 }: {
   label: string;
   value: string;
-  options: string[];
+  options: ComboboxOption[] | ComboboxGroup[];
   onChange: (v: string) => void;
 }) {
   return (
@@ -44,7 +47,7 @@ function ModelSelectRow({
       <span className="w-[100px] shrink-0 text-[12.5px] font-medium text-muted-foreground">{label}</span>
       <Combobox
         aria-label={label}
-        options={options.map((m) => ({ value: m, label: m, mono: true }))}
+        options={options}
         value={value || null}
         onValueChange={onChange}
         placeholder="— pick a model —"
@@ -65,13 +68,14 @@ export function RuntimeDetailView({ id }: { id: string }) {
   // Ryuzi's local router, guarded on the server being up + a key existing.
   const [cfg, setCfg] = useState<RuntimeConfigStatusInfo | null>(null);
   const { status: epStatus, keys: epKeys } = useEndpoint();
-  const { connections } = useConnections();
+  const { catalog, connections } = useConnections();
   const { routes } = useModelRoutes();
   const modelOptions = useMemo(() => {
     const routeModels = routes.filter((r) => r.enabled && r.targets.length > 0).map((r) => r.name);
     const providerModels = connections.filter((c) => c.enabled).flatMap((c) => c.models.map((m) => `${c.provider}/${m}`));
     return Array.from(new Set([...routeModels, ...providerModels]));
   }, [connections, routes]);
+  const groupedModelOptions = useMemo(() => groupModelOptions(modelOptions, catalog, connections), [modelOptions, catalog, connections]);
   const [model, setModel] = useState("");
   const [opus, setOpus] = useState("");
   const [sonnet, setSonnet] = useState("");
@@ -238,10 +242,10 @@ export function RuntimeDetailView({ id }: { id: string }) {
                 </div>
                 <Combobox
                   aria-label={`${tier.label} model`}
-                  options={[
-                    ...agent.models.map((m) => ({ value: m, label: m, mono: true })),
+                  options={withLeadingOption(
                     { value: "__combo__", label: "Route by task (combo)" },
-                  ]}
+                    groupModelOptions(agent.models, catalog, connections),
+                  )}
                   value={tier.combo ? "__combo__" : tier.value}
                   onValueChange={(v) => {
                     if (v === "__combo__") void setTier(agent.id, tier.id, "route by task", true);
@@ -280,10 +284,10 @@ export function RuntimeDetailView({ id }: { id: string }) {
               agent.models.length > 0 ? (
                 <Combobox
                   aria-label="Default model"
-                  options={[
+                  options={withLeadingOption(
                     { value: "", label: "Router default (first usable provider)" },
-                    ...agent.models.map((m) => ({ value: m, label: m, mono: true })),
-                  ]}
+                    groupModelOptions(agent.models, catalog, connections),
+                  )}
                   value={agent.model || ""}
                   onValueChange={(v) => void update(agent.id, { model: v })}
                   className="min-w-0 flex-1"
@@ -352,12 +356,12 @@ export function RuntimeDetailView({ id }: { id: string }) {
                 <div className="flex flex-col gap-1 py-2">
                   {agent.id === "claude" && (
                     <>
-                      <ModelSelectRow label="Opus" value={opus} options={modelOptions} onChange={setOpus} />
-                      <ModelSelectRow label="Sonnet" value={sonnet} options={modelOptions} onChange={setSonnet} />
-                      <ModelSelectRow label="Haiku" value={haiku} options={modelOptions} onChange={setHaiku} />
+                      <ModelSelectRow label="Opus" value={opus} options={groupedModelOptions} onChange={setOpus} />
+                      <ModelSelectRow label="Sonnet" value={sonnet} options={groupedModelOptions} onChange={setSonnet} />
+                      <ModelSelectRow label="Haiku" value={haiku} options={groupedModelOptions} onChange={setHaiku} />
                     </>
                   )}
-                  <ModelSelectRow label="Default model" value={model} options={modelOptions} onChange={setModel} />
+                  <ModelSelectRow label="Default model" value={model} options={groupedModelOptions} onChange={setModel} />
                 </div>
                 <div className="flex items-center justify-end gap-2 border-t border-border px-[18px] py-3">
                   {cfg?.configured && (

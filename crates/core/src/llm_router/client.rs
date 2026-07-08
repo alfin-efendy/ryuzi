@@ -517,6 +517,19 @@ fn claude_cloak_map_for(target: &RouteTarget, body: &Value) -> claude_cloak::Too
 // `&AppState` retargeted to `&UpstreamCtx`)
 // ---------------------------------------------------------------------------
 
+/// Chat-generation path appended to the effective base URL. Most providers
+/// follow their wire format's standard path; `chat_path` overrides it for
+/// endpoints with nonstandard shapes.
+fn upstream_chat_path(desc: &ProviderDescriptor) -> &'static str {
+    if let Some(path) = desc.chat_path {
+        return path;
+    }
+    match desc.format {
+        ApiFormat::OpenAi => "/chat/completions",
+        ApiFormat::Anthropic => "/messages",
+    }
+}
+
 pub(crate) fn upstream_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
@@ -530,10 +543,7 @@ pub(crate) fn upstream_request(
     }
     let base = connections::effective_base_url(target.desc, &target.conn)
         .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
-    let path = match target.desc.format {
-        ApiFormat::OpenAi => "/chat/completions",
-        ApiFormat::Anthropic => "/messages",
-    };
+    let path = upstream_chat_path(target.desc);
     let mut req = ctx.http.post(format!("{base}{path}")).json(body);
     let key = target.conn.data.api_key.clone().unwrap_or_default();
     req = match target.desc.auth {
@@ -544,6 +554,79 @@ pub(crate) fn upstream_request(
         AuthScheme::None => req,
     };
     Ok(req)
+}
+
+/// Extra per-provider request headers keyed by provider id. Copilot's chat
+/// endpoint requires a VS Code / Copilot-Chat fingerprint; opencode-free wants
+/// its placeholder bearer + client id. Applied on the OAuth (Copilot) and
+/// free (opencode) paths.
+fn apply_provider_request_headers(
+    req: reqwest::RequestBuilder,
+    provider: &str,
+) -> reqwest::RequestBuilder {
+    match provider {
+        "opencode-free" => req
+            .header("authorization", "Bearer public")
+            .header("x-opencode-client", "desktop"),
+        "github-copilot" => req
+            .header("copilot-integration-id", "vscode-chat")
+            .header("editor-version", "vscode/1.110.0")
+            .header("editor-plugin-version", "copilot-chat/0.38.0")
+            .header("user-agent", "GitHubCopilotChat/0.38.0")
+            .header("openai-intent", "conversation-panel")
+            .header("x-github-api-version", "2025-04-01")
+            .header("x-vscode-user-agent-library-version", "electron-fetch")
+            .header("x-initiator", "user")
+            .header("x-request-id", uuid::Uuid::new_v4().to_string()),
+        _ => req,
+    }
+}
+
+/// Qwen chat base: tokens are bound to the shard `resource_url` returned at
+/// grant time; using portal.qwen.ai for a token issued on another shard 401s.
+/// Falls back to the descriptor base when no `resource_url` is present.
+fn qwen_base_url(target: &RouteTarget) -> anyhow::Result<String> {
+    if let Some(host) = target
+        .conn
+        .data
+        .provider_specific
+        .as_ref()
+        .and_then(|v| v.get("resource_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            s.trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+        })
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(format!("https://{host}/v1"));
+    }
+    connections::effective_base_url(target.desc, &target.conn)
+        .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))
+}
+
+/// GitHub Copilot's `/chat/completions` only accepts `text` and `image_url`
+/// content parts; any other part type (`tool_use`/`tool_result`/`thinking`/…)
+/// 400s. Serialize those to a `text` part so tool-using harness sessions work.
+/// String content and top-level `tool_calls` are left untouched.
+fn sanitize_copilot_body(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for msg in messages.iter_mut() {
+        let Some(parts) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue; // string content or no content — leave as-is.
+        };
+        for part in parts.iter_mut() {
+            let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if kind == "text" || kind == "image_url" {
+                continue;
+            }
+            let serialized = serde_json::to_string(part).unwrap_or_default();
+            *part = serde_json::json!({ "type": "text", "text": serialized });
+        }
+    }
 }
 
 /// OAuth-authenticated upstream request (anthropic-oauth or openai-oauth).
@@ -615,14 +698,36 @@ fn oauth_upstream_request(
             }
             Ok(req)
         }
+        "qwen" => {
+            let base = qwen_base_url(target)?;
+            let req = ctx
+                .http
+                .post(format!("{base}/chat/completions"))
+                .json(body)
+                .header("authorization", format!("Bearer {access_token}"));
+            Ok(req)
+        }
+        "github-copilot" => {
+            let base = connections::effective_base_url(target.desc, &target.conn)
+                .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
+            let mut copilot_body = body.clone();
+            sanitize_copilot_body(&mut copilot_body);
+            let req = ctx
+                .http
+                .post(format!("{base}/chat/completions"))
+                .json(&copilot_body)
+                .header("authorization", format!("Bearer {access_token}"));
+            Ok(apply_provider_request_headers(req, &target.conn.provider))
+        }
         other => Err(anyhow::anyhow!(
             "no OAuth upstream wiring for provider `{other}`"
         )),
     }
 }
 
-/// Free-tier passthrough (opencode-free): no real credential, just the
-/// wire's own placeholder bearer + client-id header.
+/// Free-tier passthrough: no real credential. opencode-free additionally
+/// wants its wire's placeholder bearer + client-id header; other no_auth
+/// providers (mimo-free) get a bare JSON POST.
 fn free_upstream_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
@@ -630,16 +735,9 @@ fn free_upstream_request(
 ) -> anyhow::Result<reqwest::RequestBuilder> {
     let base = connections::effective_base_url(target.desc, &target.conn)
         .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
-    let path = match target.desc.format {
-        ApiFormat::OpenAi => "/chat/completions",
-        ApiFormat::Anthropic => "/messages",
-    };
-    Ok(ctx
-        .http
-        .post(format!("{base}{path}"))
-        .json(body)
-        .header("authorization", "Bearer public")
-        .header("x-opencode-client", "desktop"))
+    let path = upstream_chat_path(target.desc);
+    let req = ctx.http.post(format!("{base}{path}")).json(body);
+    Ok(apply_provider_request_headers(req, &target.conn.provider))
 }
 
 /// Build + send the upstream request; on a 401/403 from an OAuth-backed
@@ -2735,6 +2833,156 @@ mod tests {
         );
         assert_eq!(req.headers().get("authorization").unwrap(), "Bearer public");
         assert_eq!(req.headers().get("x-opencode-client").unwrap(), "desktop");
+    }
+
+    #[tokio::test]
+    async fn mimo_free_hits_nonstandard_chat_path_without_opencode_headers() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("mimo-free").unwrap();
+        let conn = mk_conn("c6", "mimo-free", "free", ConnectionData::default());
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "mimo-auto".into(),
+        };
+        let body = json!({"model": "mimo-auto", "messages": []});
+        let req = upstream_request(&ctx, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.xiaomimimo.com/api/free-ai/openai/chat"
+        );
+        assert!(req.headers().get("authorization").is_none());
+        assert!(req.headers().get("x-opencode-client").is_none());
+    }
+
+    #[tokio::test]
+    async fn qwen_uses_resource_url_host_when_present() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("qwen").unwrap();
+        let data = ConnectionData {
+            access_token: Some("qtok".into()),
+            provider_specific: Some(json!({ "resource_url": "dashscope.aliyuncs.com" })),
+            ..Default::default()
+        };
+        let conn = mk_conn("q1", "qwen", "oauth", data);
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "qwen3-coder-plus".into(),
+        };
+        let body = json!({ "model": "qwen3-coder-plus", "messages": [] });
+        let req = upstream_request(&ctx, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://dashscope.aliyuncs.com/v1/chat/completions"
+        );
+        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer qtok");
+    }
+
+    #[tokio::test]
+    async fn qwen_falls_back_to_descriptor_base() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("qwen").unwrap();
+        let conn = mk_conn(
+            "q2",
+            "qwen",
+            "oauth",
+            ConnectionData {
+                access_token: Some("qtok".into()),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "qwen3-coder-plus".into(),
+        };
+        let body = json!({ "model": "qwen3-coder-plus", "messages": [] });
+        let req = upstream_request(&ctx, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://portal.qwen.ai/v1/chat/completions"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_copilot_sends_bearer_and_mandatory_headers() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("github-copilot").unwrap();
+        let conn = mk_conn(
+            "g1",
+            "github-copilot",
+            "oauth",
+            ConnectionData {
+                access_token: Some("cop-tok".into()),
+                ..Default::default()
+            },
+        );
+        let target = RouteTarget {
+            conn,
+            desc,
+            upstream_model: "gpt-5.2".into(),
+        };
+        let body = json!({ "model": "gpt-5.2", "messages": [] });
+        let req = upstream_request(&ctx, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.githubcopilot.com/chat/completions"
+        );
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer cop-tok"
+        );
+        assert_eq!(
+            req.headers().get("copilot-integration-id").unwrap(),
+            "vscode-chat"
+        );
+        assert_eq!(
+            req.headers().get("editor-version").unwrap(),
+            "vscode/1.110.0"
+        );
+        assert_eq!(
+            req.headers().get("x-github-api-version").unwrap(),
+            "2025-04-01"
+        );
+        assert!(req.headers().get("x-request-id").is_some());
+    }
+
+    #[test]
+    fn copilot_sanitizer_serializes_unsupported_content_parts() {
+        let mut body = json!({
+            "model": "gpt-5.2",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "keep me" },
+                    { "type": "image_url", "image_url": { "url": "data:..." } },
+                    { "type": "thinking", "thinking": "drop-to-text" }
+                ]}
+            ]
+        });
+        sanitize_copilot_body(&mut body);
+        let parts = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        // The unsupported part is now a text part (serialized).
+        assert_eq!(parts[2]["type"], "text");
+        assert!(parts[2]["text"].as_str().unwrap().contains("thinking"));
+        // String content is untouched.
+        assert_eq!(body["messages"][0]["content"], "hi");
     }
 
     #[tokio::test]
