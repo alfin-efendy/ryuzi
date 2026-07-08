@@ -416,8 +416,10 @@ export function PluginsView() {
   };
 
   const installCuratedSkill = async (source: string) => {
-    await installSkillSource(source);
-    setSkillInstallSource("");
+    const installed = await installSkillSource(source);
+    if (installed) {
+      setSkillInstallSource("");
+    }
   };
 
   return (
@@ -455,7 +457,7 @@ export function PluginsView() {
 
         {tab !== "browse" && tab !== "skills" && loaded && apps.length === 0 && (
           <Card className="p-6 text-center text-[13px] text-muted-foreground">
-            No plugins installed yet. Add an MCP server by hand or browse the catalog.
+            No plugins installed yet. Add an MCP server by hand or browse plugins.
           </Card>
         )}
 
@@ -676,7 +678,12 @@ export function PluginsView() {
                   <div className="text-sm font-semibold">Superpowers</div>
                   <div className="text-[11.5px] text-muted-foreground">Curated workflow and development skills</div>
                 </div>
-                <Button size="sm" onClick={() => void installCuratedSkill("superpowers")} disabled={skillsLoading} aria-label="Install Superpowers">
+                <Button
+                  size="sm"
+                  onClick={() => void installCuratedSkill("superpowers")}
+                  disabled={skillsLoading}
+                  aria-label="Install Superpowers"
+                >
                   Install
                 </Button>
               </div>
@@ -698,7 +705,10 @@ export function PluginsView() {
                   aria-label="Skill source"
                   className="flex-1"
                 />
-                <Button onClick={() => void installCuratedSkill(skillInstallSource)} disabled={skillsLoading || skillInstallSource.trim() === ""}>
+                <Button
+                  onClick={() => void installCuratedSkill(skillInstallSource)}
+                  disabled={skillsLoading || skillInstallSource.trim() === ""}
+                >
                   Install source
                 </Button>
               </div>
@@ -722,7 +732,10 @@ export function PluginsView() {
               ) : (
                 <div className="flex flex-col">
                   {skills.map((skill) => (
-                    <div key={skill.id} className="flex items-center gap-3 border-t border-border py-3 first:border-t-0 first:pt-0 last:pb-0">
+                    <div
+                      key={skill.id}
+                      className="flex items-center gap-3 border-t border-border py-3 first:border-t-0 first:pt-0 last:pb-0"
+                    >
                       <Chip initial={skill.name.charAt(0).toUpperCase()} color={colorFor(skill.id)} size={34} mono />
                       <div className="min-w-0 flex-1">
                         <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[13px] font-medium">{skill.name}</div>

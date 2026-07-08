@@ -112,6 +112,7 @@ const oauthDetail: PluginDetail = {
     helpUrl: "https://acme.example.com/help",
     configured: false,
     oauthConnectAvailable: true,
+    oauthConnectError: null,
     oauthTokenStored: false,
     oauthReconnectRequired: false,
   },
@@ -142,15 +143,13 @@ const beginPluginOauth = mock((_pluginId: string) =>
     redirectUri: "http://127.0.0.1:8976/plugin-oauth/acme-oauth/callback",
   }),
 );
-const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken: string) =>
-  ok(oauthDetail.auth),
-);
-const disconnectPluginOauth = mock((_pluginId: string) =>
-  ok({ ...oauthDetail.auth, configured: false, oauthTokenStored: false }),
-);
+const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken: string) => ok(oauthDetail.auth));
+const disconnectPluginOauth = mock((_pluginId: string) => ok({ ...oauthDetail.auth, configured: false, oauthTokenStored: false }));
 const listPlugins = mock(() => ok([]));
 const openUrl = mock(async (_url: string) => {});
-const pluginOauthAuthorizeUrlMsgListen = mock(async (_cb: (event: { payload: { pluginId: string; authorizeUrl: string } }) => void) => () => {});
+const pluginOauthAuthorizeUrlMsgListen = mock(
+  async (_cb: (event: { payload: { pluginId: string; authorizeUrl: string } }) => void) => () => {},
+);
 
 mock.module("@/bindings", () => ({
   events: {

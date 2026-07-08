@@ -195,7 +195,9 @@ export function Sidebar() {
           when no plugin qualifies so it never reserves empty space. */}
       {menuPlugins.length > 0 && (
         <div className="box-border flex w-[260px] flex-col gap-[2px] px-2.5 pb-1">
-          <div className="px-2.5 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Enabled plugins</div>
+          <div className="px-2.5 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">
+            Enabled plugins
+          </div>
           {menuPlugins.map((plugin) => {
             const active = view.kind === "pluginDetail" && view.id === plugin.id;
             const Icon = pluginIcon(plugin.icon);

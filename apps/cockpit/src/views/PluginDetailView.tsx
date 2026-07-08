@@ -293,8 +293,8 @@ export function PluginDetailView({ id }: { id: string }) {
                       : detail.auth.oauthTokenStored
                         ? "Cockpit has a saved OAuth token for this plugin."
                         : "Cockpit can start OAuth for this plugin. After the browser redirects, paste the returned code below to finish connecting."
-                    : detail.auth.oauthConnectError ??
-                      "Cockpit needs an authorize URL, token URL, and a saved client ID before it can start OAuth for this plugin."}
+                    : (detail.auth.oauthConnectError ??
+                      "Cockpit needs an authorize URL, token URL, and a saved client ID before it can start OAuth for this plugin.")}
                 </div>
                 {detail.auth.oauthConnectAvailable && (
                   <div className="border-t border-border px-[18px] py-3">

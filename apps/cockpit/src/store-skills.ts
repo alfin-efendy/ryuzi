@@ -6,7 +6,7 @@ type SkillsState = {
   skills: InstalledSkillInfo[];
   loading: boolean;
   error: string | null;
-  installSource: (source: string) => Promise<void>;
+  installSource: (source: string) => Promise<boolean>;
   refresh: () => Promise<void>;
   refreshSkillPack: (id: string) => Promise<void>;
   remove: (id: string) => Promise<void>;
@@ -40,7 +40,7 @@ export const useSkills = create<SkillsState>((set, get) => ({
       const message = "Enter a skill source.";
       set({ error: message });
       toast.error(message);
-      return;
+      return false;
     }
 
     set({ loading: true, error: null });
@@ -49,11 +49,12 @@ export const useSkills = create<SkillsState>((set, get) => ({
       const message = trimMessage(res.error);
       set({ loading: false, error: message });
       toast.error(`Skill install failed: ${message}`);
-      return;
+      return false;
     }
 
     toast.success(`${res.data.name} installed`);
     await get().refresh();
+    return true;
   },
 
   refreshSkillPack: async (id) => {

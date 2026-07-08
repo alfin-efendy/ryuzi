@@ -16,8 +16,7 @@ mock.module("@/store-apps", () => ({
 }));
 
 mock.module("@/store-runtimes", () => ({
-  useRuntimes: (selector: (state: { runtimes: { id: string; name: string; color: string }[] }) => unknown) =>
-    selector({ runtimes: [] }),
+  useRuntimes: (selector: (state: { runtimes: { id: string; name: string; color: string }[] }) => unknown) => selector({ runtimes: [] }),
 }));
 
 mock.module("@/store-gateways", () => ({
@@ -87,17 +86,36 @@ const listSkills = mock(async () => ({
   ],
 }));
 
-const installSkill = mock(async (_source: string) => ({
-  status: "ok" as const,
-  data: {
-    id: "superpowers",
-    name: "Superpowers",
-    source: "superpowers",
-    pluginId: null,
-    installedAt: "2026-07-08T10:00:00Z",
-    skills: [{ id: "superpowers:brainstorming", name: "brainstorming" }],
-  },
-}));
+type InstallSkillResponse =
+  | {
+      status: "ok";
+      data: {
+        id: string;
+        name: string;
+        source: string;
+        pluginId: null;
+        installedAt: string;
+        skills: { id: string; name: string }[];
+      };
+    }
+  | {
+      status: "error";
+      error: string;
+    };
+
+const installSkill = mock(
+  async (_source: string): Promise<InstallSkillResponse> => ({
+    status: "ok" as const,
+    data: {
+      id: "superpowers",
+      name: "Superpowers",
+      source: "superpowers",
+      pluginId: null,
+      installedAt: "2026-07-08T10:00:00Z",
+      skills: [{ id: "superpowers:brainstorming", name: "brainstorming" }],
+    },
+  }),
+);
 
 const removeSkill = mock(async (_id: string) => ({
   status: "ok" as const,
@@ -198,6 +216,7 @@ test("renders the plugins heading and browse action", () => {
 
   expect(screen.getByRole("heading", { name: "Plugins" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Browse plugins" })).toBeTruthy();
+  expect(screen.getByText("No plugins installed yet. Add an MCP server by hand or browse plugins.")).toBeTruthy();
 });
 
 test("browse combines catalog cards with live registry results from the same view", async () => {
@@ -256,6 +275,25 @@ test("skills tab installs Superpowers from the curated action", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Install Superpowers" }));
 
   await waitFor(() => expect(installSkill).toHaveBeenCalledWith("superpowers"));
+});
+
+test("manual skill install preserves the typed source after a failed attempt", async () => {
+  installSkill.mockImplementationOnce(async () => ({
+    status: "error" as const,
+    error: "network down",
+  }));
+
+  render(<PluginsView />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+  await screen.findByText("Superpowers");
+
+  const input = screen.getByRole("textbox", { name: "Skill source" }) as HTMLInputElement;
+  fireEvent.change(input, { target: { value: "obra/superpowers" } });
+  fireEvent.click(screen.getByRole("button", { name: "Install source" }));
+
+  await waitFor(() => expect(installSkill).toHaveBeenCalledWith("obra/superpowers"));
+  expect(input.value).toBe("obra/superpowers");
 });
 
 test("filterByCategory passes every plugin through for the default all category", () => {
