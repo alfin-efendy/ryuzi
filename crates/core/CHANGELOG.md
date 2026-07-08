@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.1.0...core-v0.2.0) (2026-07-08)
+
+
+### Features
+
+* **cockpit:** chat enhancement batch — media in chat, turn summaries + edit cards, branch popover, model groups, open-in ([#75](https://github.com/alfin-efendy/ryuzi/issues/75)) ([3cce67c](https://github.com/alfin-efendy/ryuzi/commit/3cce67cf8cbf3596057423ba9e4bea434fb82c6c))
+* **cockpit:** UI polish batch — solid overlays, Route groups, file viewer View/Code, Windows attachments, model Test All, instant sessions, git-URL/non-git projects ([#78](https://github.com/alfin-efendy/ryuzi/issues/78)) ([0cc9077](https://github.com/alfin-efendy/ryuzi/commit/0cc90770f35dcd6bf818d37f1003157ca3925d1a))
+* **cockpit:** Windows bash fix, Ryuzi-only sessions, real branch controls, Combobox migration ([#72](https://github.com/alfin-efendy/ryuzi/issues/72)) ([9eb076d](https://github.com/alfin-efendy/ryuzi/commit/9eb076d315c1cdf237febd87a69d9b0a917ed0eb))
+* **models:** provider category badges, free/free-tier providers, OpenAI-OAuth model fix (Phase A) ([#74](https://github.com/alfin-efendy/ryuzi/issues/74)) ([e6d269c](https://github.com/alfin-efendy/ryuzi/commit/e6d269cef013ba6d93ad965df3b5575bad2b01ec))
+* **models:** Qwen Code + GitHub Copilot device-grant providers (Phase B) ([#76](https://github.com/alfin-efendy/ryuzi/issues/76)) ([8067a63](https://github.com/alfin-efendy/ryuzi/commit/8067a63f1fd2e79376ce47f0b5dbe406b384bc01))
+* provider families + per-model router targets + HTTP endpoint failover ([#70](https://github.com/alfin-efendy/ryuzi/issues/70)) ([5e37347](https://github.com/alfin-efendy/ryuzi/commit/5e373477a74cf469f5bf33325b2873c50a859231))
+
 ## 0.1.0 (2026-07-06)
 
 
