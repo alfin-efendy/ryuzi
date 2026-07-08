@@ -1,18 +1,15 @@
-import { afterEach, expect, mock, test } from "bun:test";
-import { cleanup, render, screen } from "@testing-library/react";
-import type { AppInfo, PluginInfo } from "@/bindings";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { AppInfo, PluginInfo, RegistryEntry } from "@/bindings";
 
-// PluginsView itself pulls from four zustand stores (apps/runtimes/gateways/
-// plugins) whose hydrate() calls would need a fairly heavy IPC mock to
-// render meaningfully; the Catalog tab's one bit of real logic — filtering
-// by category — is pure and exported for exactly this reason, so it's
-// covered directly here instead.
+const add = mock(async (_input: unknown) => true);
 
 mock.module("@/store-apps", () => ({
   useApps: () => ({
     apps: [] as AppInfo[],
     loaded: true,
     hydrate: async () => {},
+    add,
     toggleAgent: async () => {},
   }),
   agentAllowed: () => false,
@@ -27,9 +24,16 @@ mock.module("@/store-gateways", () => ({
   useGateways: (selector: (state: { gateways: { id: string; name: string }[] }) => unknown) => selector({ gateways: [] }),
 }));
 
+const github = plugin("github", ["vcs", "issues"]);
+const notion = plugin("notion", ["docs", "wiki", "productivity"]);
+const builtin = {
+  ...plugin("ollama", ["model-provider"]),
+  source: "builtin" as const,
+};
+
 mock.module("@/store-plugins", () => ({
   usePlugins: () => ({
-    plugins: [] as PluginInfo[],
+    plugins: [github, notion, builtin] as PluginInfo[],
     loaded: true,
     load: async () => {},
     setEnabled: async () => {},
@@ -47,7 +51,35 @@ mock.module("@/components/modals/AddAppModal", () => ({
   AddAppModal: () => null,
 }));
 
-const { filterByCategory, PluginsView } = await import("./PluginsView");
+const registrySearch = mock(async (_query: string | null, _cursor: string | null) => ({
+  status: "ok" as const,
+  data: {
+    entries: [
+      {
+        ...entry("io.github/org/alpha", "1.1.0", {
+          name: "Alpha Server",
+          desc: "Registry alpha",
+          installTarget: "@alpha/server@1.1.0",
+          website: "https://alpha.example",
+          isLatest: true,
+        }),
+        versions: [
+          { version: "1.1.0", installTarget: "@alpha/server@1.1.0", website: "https://alpha.example", isLatest: true },
+          { version: "1.0.0", installTarget: "@alpha/server@1.0.0", website: "https://alpha-old.example", isLatest: false },
+        ],
+      },
+    ],
+    nextCursor: null,
+  },
+}));
+
+mock.module("@/bindings", () => ({
+  commands: {
+    registrySearch,
+  },
+}));
+
+const { filterByCategory, mergeRegistryEntries, PluginsView } = await import("./PluginsView");
 
 function plugin(id: string, categories: string[]): PluginInfo {
   return {
@@ -64,10 +96,45 @@ function plugin(id: string, categories: string[]): PluginInfo {
   };
 }
 
-const github = plugin("github", ["vcs", "issues"]);
-const notion = plugin("notion", ["docs", "wiki", "productivity"]);
-const sentry = plugin("sentry", ["observability"]);
-const all = [github, notion, sentry];
+function entry(
+  id: string,
+  version: string,
+  options: {
+    name?: string;
+    desc?: string;
+    installTarget?: string | null;
+    website?: string | null;
+    publisher?: string | null;
+    kind?: string;
+    isLatest?: boolean;
+  } = {},
+): RegistryEntry {
+  return {
+    id,
+    name: options.name ?? "Server",
+    desc: options.desc ?? "A server.",
+    version,
+    publisher: options.publisher ?? "Acme",
+    kind: options.kind ?? "stdio",
+    installTarget: options.installTarget ?? `npx ${id}@${version}`,
+    website: options.website ?? null,
+    versions: [
+      {
+        version,
+        installTarget: options.installTarget ?? `npx ${id}@${version}`,
+        website: options.website ?? null,
+        isLatest: options.isLatest ?? false,
+      },
+    ],
+  };
+}
+
+const all = [github, notion, builtin];
+
+beforeEach(() => {
+  add.mockClear();
+  registrySearch.mockClear();
+});
 
 afterEach(() => {
   cleanup();
@@ -80,8 +147,42 @@ test("renders the plugins heading and browse action", () => {
   expect(screen.getByRole("button", { name: "Browse plugins" })).toBeTruthy();
 });
 
+test("browse combines catalog cards with live registry results from the same view", async () => {
+  render(<PluginsView />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+
+  await waitFor(() => expect(registrySearch).toHaveBeenCalledWith(null, null));
+  expect(await screen.findByText("notion")).toBeTruthy();
+  expect(await screen.findByText("Alpha Server")).toBeTruthy();
+  expect(screen.getAllByText("Catalog").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("Registry").length).toBeGreaterThan(0);
+});
+
+test("registry install uses the selected version install target from browse", async () => {
+  render(<PluginsView />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("Alpha Server");
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Version for Alpha Server" }));
+  fireEvent.click(await screen.findByRole("option", { name: "1.0.0" }));
+  fireEvent.click(screen.getByRole("button", { name: "Install Alpha Server" }));
+
+  await waitFor(() =>
+    expect(add).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "Alpha Server",
+        version: "1.0.0",
+        command: "npx",
+        args: ["-y", "@alpha/server@1.0.0"],
+      }),
+    ),
+  );
+});
+
 test("filterByCategory passes every plugin through for the default all category", () => {
-  expect(filterByCategory(all, "all")).toEqual(all);
+  expect(filterByCategory(all, "all").map((item) => item.id)).toEqual(["github", "notion", "ollama"]);
 });
 
 test("filterByCategory keeps only plugins whose categories include the picked one", () => {
@@ -95,4 +196,78 @@ test("filterByCategory matches a plugin tagged with several categories from any 
 
 test("filterByCategory returns an empty list when nothing matches", () => {
   expect(filterByCategory(all, "sandbox")).toEqual([]);
+});
+
+test("mergeRegistryEntries de-dupes by id, keeps first-seen order, and uses isLatest-aware winner", () => {
+  const pageOne: RegistryEntry[] = [
+    { ...entry("io.github/org/alpha", "1.0.0", { desc: "alpha old", installTarget: "@alpha/server@1.0.0", isLatest: false }) },
+    { ...entry("io.github/org/beta", "0.9.0", { installTarget: "@beta/server@0.9.0" }) },
+  ];
+  const pageTwo: RegistryEntry[] = [
+    {
+      ...entry("io.github/org/alpha", "1.1.0", {
+        desc: "alpha latest",
+        installTarget: "@alpha/server@1.1.0",
+        website: "https://alpha.example",
+        isLatest: true,
+      }),
+      versions: [{ version: "1.1.0", installTarget: "@alpha/server@1.1.0", website: "https://alpha.example", isLatest: true }],
+    },
+    { ...entry("io.github/org/gamma", "2.0.0", { installTarget: "@gamma/server@2.0.0" }) },
+  ];
+
+  const merged = mergeRegistryEntries(pageOne, pageTwo);
+
+  expect(merged).toHaveLength(3);
+  expect(merged.map((row) => row.id)).toEqual(["io.github/org/alpha", "io.github/org/beta", "io.github/org/gamma"]);
+
+  const alpha = merged[0];
+  expect(alpha.version).toBe("1.1.0");
+  expect(alpha.desc).toBe("alpha latest");
+  expect(alpha.installTarget).toBe("@alpha/server@1.1.0");
+  expect(alpha.website).toBe("https://alpha.example");
+  expect(alpha.versions.map((v) => v.version)).toEqual(["1.1.0", "1.0.0"]);
+  expect(new Set(alpha.versions.map((v) => v.version)).size).toBe(2);
+});
+
+test("mergeRegistryEntries selects top-level winner by isLatest when newer version is not top-level", () => {
+  const pageOne: RegistryEntry[] = [
+    {
+      ...entry("io.github/org/alpha", "2.0.0", {
+        name: "Alpha Core",
+        desc: "Original top-level name",
+        installTarget: "@alpha/server@2.0.0",
+        website: "https://old.example",
+        isLatest: false,
+      }),
+      versions: [{ version: "2.0.0", installTarget: "@alpha/server@2.0.0", website: "https://old.example", isLatest: false }],
+    },
+  ];
+
+  const pageTwo: RegistryEntry[] = [
+    {
+      ...entry("io.github/org/alpha", "2.0.0", {
+        name: "Incoming name",
+        desc: "Incoming top-level name",
+        installTarget: "@alpha/server@2.0.0-new",
+        website: "https://incoming.example",
+        isLatest: false,
+      }),
+      versions: [
+        { version: "2.0.0", installTarget: "@alpha/server@2.0.0-new", website: "https://incoming.example", isLatest: false },
+        { version: "1.9.0", installTarget: "@alpha/server@1.9.0", website: "https://latest-only.example", isLatest: true },
+      ],
+    },
+  ];
+
+  const merged = mergeRegistryEntries(pageOne, pageTwo);
+
+  expect(merged).toHaveLength(1);
+  expect(merged[0].version).toBe("1.9.0");
+  expect(merged[0].installTarget).toBe("@alpha/server@1.9.0");
+  expect(merged[0].website).toBe("https://latest-only.example");
+  expect(merged[0].name).toBe("Alpha Core");
+  expect(merged[0].desc).toBe("Original top-level name");
+  expect(merged[0].publisher).toBe("Acme");
+  expect(merged[0].versions.map((v) => v.version)).toEqual(["1.9.0", "2.0.0"]);
 });
