@@ -6,7 +6,6 @@ use ryuzi_core::{
 };
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
@@ -221,26 +220,6 @@ fn chat_agent_prompt(prompt: &str, context: Option<&ChatContextArg>) -> String {
     }
 }
 
-fn percent_encode_file_path(path: &str) -> String {
-    let mut out = String::new();
-    for b in path.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(*b, b'/' | b':' | b'.' | b'-' | b'_' | b'~') {
-            out.push(*b as char);
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-    }
-    out
-}
-
-fn file_url_from_abs_path(path: &Path) -> String {
-    let mut normalized = path.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) && !normalized.starts_with('/') {
-        normalized = format!("/{normalized}");
-    }
-    format!("file://{}", percent_encode_file_path(&normalized))
-}
-
 fn content_type_for_path(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
     match ext.as_str() {
@@ -285,7 +264,7 @@ async fn attachment_refs_from_paths(paths: &[String]) -> R<Vec<AttachmentRef>> {
             .unwrap_or_else(|| "file".to_string());
         out.push(AttachmentRef {
             name,
-            url: file_url_from_abs_path(&path),
+            url: ryuzi_core::attachments::file_url_for_path(&path)?.to_string(),
             content_type: content_type_for_path(&path),
             size: meta.len(),
         });
