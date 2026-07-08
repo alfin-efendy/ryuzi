@@ -17,6 +17,7 @@ import { StatusDot } from "@/components/common/bits";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
+import { BranchNameModal } from "@/components/modals/BranchNameModal";
 
 export function HomeView() {
   const { projects, selectedProjectId, selectProject, start, addProject, setProjectModel } = useStore();
@@ -58,6 +59,7 @@ export function HomeView() {
   }, [projectId, setComposerModel]);
 
   const [branchList, setBranchList] = useState<BranchList | null>(null);
+  const [branchModalOpen, setBranchModalOpen] = useState(false);
   const setComposerBranch = nav.setComposerBranch;
 
   useEffect(() => {
@@ -312,7 +314,8 @@ export function HomeView() {
               onValueChange={(v) => nav.setComposerBranch(v)}
               allowCreate
               onCreate={(input) => nav.setComposerBranch(input)}
-              createHintLabel="Create and checkout new branch…"
+              createHintLabel="New Branch"
+              onCreateHint={() => setBranchModalOpen(true)}
               placeholder="Branch"
               trigger={
                 <Button variant="ghost" size="sm" className="gap-[7px] font-medium text-muted-foreground">
@@ -344,6 +347,12 @@ export function HomeView() {
             </Button>
           ))}
         </div>
+        <BranchNameModal
+          open={branchModalOpen}
+          onClose={() => setBranchModalOpen(false)}
+          existingBranches={branchList?.branches ?? []}
+          onCreate={(name) => nav.setComposerBranch(name)}
+        />
       </div>
     </div>
   );
