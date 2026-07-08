@@ -283,8 +283,35 @@ const runningSession = (pk: string) => ({
 test("result event flips the session status back to idle (so the composer leaves Stop mode)", () => {
   reset();
   useStore.setState({ sessions: [runningSession("s1")] });
+  // result also fires a fire-and-forget refresh(); stub its IPC calls (never resolving,
+  // like the "start" tests do) so nothing hits the real Tauri binding after this test ends.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
   useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
   expect(useStore.getState().sessions[0].status).toBe("idle");
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("result event triggers a refresh so the git/harness backfill (branch, worktreePath) lands in the UI", async () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const backfilled = { ...runningSession("s1"), status: "idle" as const, branch: "harness/s1", worktreePath: "C:\\wt\\s1" };
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [backfilled] });
+
+  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
+  // refresh() is fire-and-forget; let its microtasks flush.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(listProjects).toHaveBeenCalled();
+  expect(listSessions).toHaveBeenCalled();
+  expect(useStore.getState().sessions[0].branch).toBe("harness/s1");
+  expect(useStore.getState().sessions[0].worktreePath).toBe("C:\\wt\\s1");
+
+  listProjects.mockRestore();
+  listSessions.mockRestore();
 });
 
 test("sessionEnded event marks the session ended", () => {
@@ -297,9 +324,15 @@ test("sessionEnded event marks the session ended", () => {
 test("result event leaves other sessions' status untouched", () => {
   reset();
   useStore.setState({ sessions: [runningSession("s1"), runningSession("s2")] });
+  // result also fires a fire-and-forget refresh(); stub its IPC calls (never resolving,
+  // like the "start" tests do) so nothing hits the real Tauri binding after this test ends.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
   useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
   const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
   expect(byPk).toEqual({ s1: "idle", s2: "running" });
+  listProjects.mockRestore();
+  listSessions.mockRestore();
 });
 
 test("start forwards chat options so composer runtime, context, and attachments reach IPC", async () => {

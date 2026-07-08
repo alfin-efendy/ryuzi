@@ -150,6 +150,10 @@ export const useStore = create<State>((set, get) => ({
         case "result":
           // Turn finished — the session is alive but awaiting input. Flip it out of "running"
           // so the composer leaves Stop mode and the user can reply.
+          // Also: turn-end guarantees the background git/harness prep (branch, worktreePath)
+          // has already backfilled the DB row — refresh now so the UI picks it up instead
+          // of waiting for some unrelated action to call refresh().
+          void get().refresh();
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
         case "sessionEnded":
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "ended" as const } : s)) };
