@@ -223,20 +223,32 @@ fn remove_stale_refresh_artifacts(
     installed: &InstalledSkillPack,
     refreshed: &InstalledSkillPack,
 ) -> Result<()> {
-    let refreshed_plugin_or_id = refreshed
-        .plugin_id
-        .as_deref()
-        .unwrap_or(refreshed.id.as_str());
-
-    if let Some(previous_plugin_id) = &installed.plugin_id {
-        if previous_plugin_id != refreshed_plugin_or_id {
+    match (
+        installed.plugin_id.as_deref(),
+        refreshed.plugin_id.as_deref(),
+    ) {
+        (Some(previous_plugin_id), Some(refreshed_plugin_id)) => {
+            if previous_plugin_id != refreshed_plugin_id {
+                remove_checked_dir(&roots.plugins_root, previous_plugin_id)?;
+                for skill in &installed.skills {
+                    remove_checked_dir(&roots.skills_root, &skill.id)?;
+                }
+            }
+        }
+        (Some(previous_plugin_id), None) => {
             remove_checked_dir(&roots.plugins_root, previous_plugin_id)?;
             for skill in &installed.skills {
                 remove_checked_dir(&roots.skills_root, &skill.id)?;
             }
         }
-    } else if refreshed.id != installed.id {
-        remove_checked_dir(&roots.skills_root, &installed.id)?;
+        (None, Some(_)) => {
+            remove_checked_dir(&roots.skills_root, &installed.id)?;
+        }
+        (None, None) => {
+            if refreshed.id != installed.id {
+                remove_checked_dir(&roots.skills_root, &installed.id)?;
+            }
+        }
     }
 
     Ok(())
@@ -699,20 +711,32 @@ fn collect_installed_packs(roots: &InstallRoots) -> Result<Vec<InstalledSkillPac
             }
             None => skill_name.clone(),
         };
+        let skill = InstalledSkillEntry {
+            id: skill_id,
+            name: skill_name,
+        };
         let pack = grouped
             .entry(group_id.clone())
             .or_insert_with(|| InstalledSkillPack {
                 id: group_id.clone(),
-                name: pack_name,
+                name: pack_name.clone(),
                 source: provenance.source.clone(),
                 plugin_id: provenance.plugin_id.clone(),
                 installed_at: provenance.installed_at.clone(),
                 skills: Vec::new(),
             });
-        pack.skills.push(InstalledSkillEntry {
-            id: skill_id,
-            name: skill_name,
-        });
+        let is_newer_generation = provenance.installed_at > pack.installed_at;
+        let is_same_generation = provenance.installed_at == pack.installed_at;
+        if is_newer_generation {
+            pack.name = pack_name;
+            pack.source = provenance.source;
+            pack.plugin_id = provenance.plugin_id;
+            pack.installed_at = provenance.installed_at;
+            pack.skills.clear();
+        }
+        if is_same_generation || is_newer_generation {
+            pack.skills.push(skill);
+        }
     }
 
     let mut packs = grouped.into_values().collect::<Vec<_>>();
@@ -865,7 +889,7 @@ fn write_provenance(path: &Path, provenance: &SkillInstallProvenance) -> Result<
 }
 
 fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn normalize_name(input: &str) -> String {
@@ -1466,6 +1490,137 @@ path = 123
         let listed = list_installed_skills_in(&roots).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "fresh-ideas");
+    }
+
+    #[tokio::test]
+    async fn refresh_plugin_pack_to_same_id_single_skill_removes_old_pack_artifacts() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".codex-plugin")).unwrap();
+        std::fs::write(
+            repo.path().join(".codex-plugin/plugin.json"),
+            serde_json::json!({
+                "name": "superpowers",
+                "skills": "./skills/",
+                "interface": { "displayName": "Superpowers" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_skill(
+            &repo.path().join("skills/brainstorming"),
+            "brainstorming",
+            "Explore ideas",
+            "v1",
+        );
+
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/obra/superpowers".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner { repos };
+
+        let installed = install_skill_source_with("superpowers", &roots, &cloner)
+            .await
+            .unwrap();
+        assert_eq!(installed.id, "superpowers");
+        assert_eq!(installed.plugin_id.as_deref(), Some("superpowers"));
+        assert!(roots.plugins_root.join("superpowers").exists());
+        assert!(roots
+            .skills_root
+            .join("superpowers--brainstorming")
+            .exists());
+
+        std::fs::remove_file(repo.path().join(".codex-plugin/plugin.json")).unwrap();
+        std::fs::remove_dir_all(repo.path().join(".codex-plugin")).unwrap();
+        std::fs::remove_dir_all(repo.path().join("skills")).unwrap();
+        write_skill(repo.path(), "superpowers", "Explore ideas", "v2");
+
+        let refreshed = refresh_installed_skill_with("superpowers", &roots, &cloner)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed.id, "superpowers");
+        assert_eq!(refreshed.plugin_id, None);
+        assert!(!roots.plugins_root.join("superpowers").exists());
+        assert!(!roots
+            .skills_root
+            .join("superpowers--brainstorming")
+            .exists());
+        assert!(roots
+            .skills_root
+            .join("superpowers")
+            .join("SKILL.md")
+            .is_file());
+
+        let listed = list_installed_skills_in(&roots).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "superpowers");
+        assert_eq!(listed[0].plugin_id, None);
+        assert_eq!(listed[0].skill_count, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_single_skill_to_same_id_plugin_pack_removes_old_single_artifact() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "superpowers", "Explore ideas", "v1");
+
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/obra/superpowers".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner { repos };
+
+        let installed = install_skill_source_with("superpowers", &roots, &cloner)
+            .await
+            .unwrap();
+        assert_eq!(installed.id, "superpowers");
+        assert_eq!(installed.plugin_id, None);
+        assert!(roots.skills_root.join("superpowers").exists());
+
+        std::fs::create_dir_all(repo.path().join(".codex-plugin")).unwrap();
+        std::fs::write(
+            repo.path().join(".codex-plugin/plugin.json"),
+            serde_json::json!({
+                "name": "superpowers",
+                "skills": "./skills/",
+                "interface": { "displayName": "Superpowers" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::remove_file(repo.path().join("SKILL.md")).unwrap();
+        write_skill(
+            &repo.path().join("skills/brainstorming"),
+            "brainstorming",
+            "Explore ideas",
+            "v2",
+        );
+
+        let refreshed = refresh_installed_skill_with("superpowers", &roots, &cloner)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed.id, "superpowers");
+        assert_eq!(refreshed.plugin_id.as_deref(), Some("superpowers"));
+        assert!(!roots.skills_root.join("superpowers").exists());
+        assert!(roots.plugins_root.join("superpowers").exists());
+        assert!(roots
+            .skills_root
+            .join("superpowers--brainstorming")
+            .join("SKILL.md")
+            .is_file());
+
+        let listed = list_installed_skills_in(&roots).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "superpowers");
+        assert_eq!(listed[0].plugin_id.as_deref(), Some("superpowers"));
+        assert_eq!(listed[0].skill_count, 1);
     }
 
     #[tokio::test]
