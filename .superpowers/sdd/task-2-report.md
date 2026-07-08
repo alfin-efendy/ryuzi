@@ -20,3 +20,7 @@ Follow-up (Task 2 review finding):
   `RuntimeDetailView.test.tsx` and an unrelated confirmation copy in
   `ModelsView.tsx` (`Apps using it`), which were not part of the Apps-navigation
   rename.
+
+- Updated `apps/cockpit/src/views/RuntimeDetailView.test.tsx` to match new copy
+  (`No plugins installed yet — add MCP servers from the Plugins screen.`) and ran:
+  `bun test apps/cockpit/src/views/RuntimeDetailView.test.tsx` (pass: 7/7 tests).

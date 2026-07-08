@@ -207,7 +207,7 @@ test("shows the apps empty state when no apps are installed", async () => {
   useApps.setState({ apps: [], loaded: true });
   await renderView();
 
-  expect(screen.getByText("No apps installed yet — add MCP servers from the Apps screen.")).toBeTruthy();
+  expect(screen.getByText("No plugins installed yet — add MCP servers from the Plugins screen.")).toBeTruthy();
 });
 
 test("switching the permission mode calls updateRuntimeConfig and updates the description", async () => {
