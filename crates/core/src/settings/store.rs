@@ -73,6 +73,10 @@ impl SettingsStore {
         Self { store }
     }
 
+    pub(crate) fn store(&self) -> Arc<Store> {
+        self.store.clone()
+    }
+
     /// The persisted row, if any (even an empty string); else the field's
     /// schema default.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {

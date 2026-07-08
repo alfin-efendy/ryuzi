@@ -12,6 +12,8 @@ verified = true
 [auth]
 kind = "oauth"
 help_url = "https://www.atlassian.com/platform/remote-mcp-server"
+resource = "https://mcp.atlassian.com/v1/mcp/authv2"
+dynamic-registration = true
 
 [[mcp]]
 name = "atlassian"

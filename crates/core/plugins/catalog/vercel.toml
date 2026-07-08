@@ -12,6 +12,8 @@ verified = true
 [auth]
 kind = "oauth"
 help_url = "https://vercel.com/docs"
+resource = "https://mcp.vercel.com"
+dynamic-registration = true
 
 [[mcp]]
 name = "vercel"

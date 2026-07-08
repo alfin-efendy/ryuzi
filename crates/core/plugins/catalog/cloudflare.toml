@@ -12,6 +12,8 @@ verified = true
 [auth]
 kind = "oauth"
 help_url = "https://developers.cloudflare.com/agents/model-context-protocol/"
+resource = "https://mcp.cloudflare.com/mcp"
+dynamic-registration = true
 
 [[mcp]]
 name = "cloudflare"
