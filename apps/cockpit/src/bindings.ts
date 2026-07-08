@@ -966,7 +966,7 @@ export type CatalogEntry = { id: string; name: string;
  * Vendor family id (a catalog id). Entries sharing a family render as one
  * provider card; the entry whose id == family is the display head.
  */
-family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean }
+family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
 export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**

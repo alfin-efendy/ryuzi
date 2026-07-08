@@ -39,6 +39,7 @@ pub struct CatalogEntry {
     pub models: Vec<String>,
     pub free_tier: bool,
     pub risk_notice: bool,
+    pub uses_device_grant: bool,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -212,6 +213,17 @@ fn provider_http_client() -> R<reqwest::Client> {
         })
 }
 
+/// Ids of OTHER connections for `provider` that are dead
+/// (`needs_relogin == Some(true)`) and should be cleared once a fresh one
+/// (`keep_id`) is persisted. Never selects `keep_id`, a healthy row, or a row
+/// for a different provider.
+fn dead_connection_ids(rows: &[ConnectionRow], provider: &str, keep_id: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.provider == provider && r.id != keep_id && r.data.needs_relogin == Some(true))
+        .map(|r| r.id.clone())
+        .collect()
+}
+
 /// Pick out the ids of OTHER kiro connections that are dead
 /// (`needs_relogin == Some(true)`) and should be cleared once a fresh kiro
 /// connection (`keep_id`) has been persisted. Split out from
@@ -220,10 +232,7 @@ fn provider_http_client() -> R<reqwest::Client> {
 /// `Store`. Never selects `keep_id` itself, never selects a healthy kiro row
 /// (`needs_relogin` `None`/`false`), and never selects a non-kiro row.
 fn dead_kiro_connection_ids(rows: &[ConnectionRow], keep_id: &str) -> Vec<String> {
-    rows.iter()
-        .filter(|r| r.provider == "kiro" && r.id != keep_id && r.data.needs_relogin == Some(true))
-        .map(|r| r.id.clone())
-        .collect()
+    dead_connection_ids(rows, "kiro", keep_id)
 }
 
 /// After persisting a fresh kiro connection (`keep_id`) via
@@ -241,6 +250,22 @@ fn dead_kiro_connection_ids(rows: &[ConnectionRow], keep_id: &str) -> Vec<String
 async fn remove_dead_kiro_connections(cp: &ControlPlane, keep_id: &str) -> anyhow::Result<()> {
     let rows = connections::list_connections(cp.store()).await?;
     for id in dead_kiro_connection_ids(&rows, keep_id) {
+        connections::remove_connection(cp.store(), &id).await?;
+    }
+    Ok(())
+}
+
+/// After persisting a fresh `provider` connection (`keep_id`), remove any OTHER
+/// `provider` row still flagged `needs_relogin` (see
+/// [`remove_dead_kiro_connections`] for why this shadow cleanup is required).
+#[allow(dead_code)]
+async fn remove_dead_connections(
+    cp: &ControlPlane,
+    provider: &str,
+    keep_id: &str,
+) -> anyhow::Result<()> {
+    let rows = connections::list_connections(cp.store()).await?;
+    for id in dead_connection_ids(&rows, provider, keep_id) {
         connections::remove_connection(cp.store(), &id).await?;
     }
     Ok(())
@@ -293,6 +318,7 @@ pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
             models: d.models.iter().map(|s| s.to_string()).collect(),
             free_tier: d.free_tier,
             risk_notice: d.risk_notice,
+            uses_device_grant: d.device_grant.is_some(),
         })
         .collect())
 }
@@ -1070,6 +1096,48 @@ mod tests {
     fn refresh_label_uses_the_connection_label_when_present() {
         let row = connection_row("c1", "openai", "Work OpenAI", true);
         assert_eq!(refresh_label(&row), "Work OpenAI");
+    }
+
+    #[test]
+    fn dead_connection_ids_selects_by_provider() {
+        let mk = |id: &str, provider: &str, relogin: Option<bool>| ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: "oauth".into(),
+            label: String::new(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                needs_relogin: relogin,
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        };
+        let rows = vec![
+            mk("keep", "qwen", Some(true)),            // keep_id — excluded
+            mk("dead", "qwen", Some(true)),            // selected
+            mk("healthy", "qwen", None),               // healthy — excluded
+            mk("other", "github-copilot", Some(true)), // other provider — excluded
+        ];
+        assert_eq!(
+            dead_connection_ids(&rows, "qwen", "keep"),
+            vec!["dead".to_string()]
+        );
+        assert_eq!(
+            dead_connection_ids(&rows, "github-copilot", "x"),
+            vec!["other".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_marks_device_grant_providers() {
+        let cat = list_provider_catalog().await.unwrap();
+        let qwen = cat.iter().find(|e| e.id == "qwen").unwrap();
+        assert_eq!(qwen.category, "oauth");
+        assert!(qwen.uses_device_grant);
+        let anth = cat.iter().find(|e| e.id == "anthropic-oauth").unwrap();
+        assert!(!anth.uses_device_grant);
     }
 }
 
