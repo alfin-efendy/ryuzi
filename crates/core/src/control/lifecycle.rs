@@ -332,7 +332,15 @@ impl ControlPlane {
     /// claim a worktree/branch was created. Failures emit an error row,
     /// demote the session to Idle, and broadcast the bus-terminal error —
     /// the row persists so the user can retry from the same chat.
-    async fn startup_phases(
+    // `pub(super)` (not private) so `control::tests` can drive this phase
+    // function directly with a pre-cancelled token — the non-git path's
+    // pre-harness checkpoint sits before any `.await`, so a `stop_session()`
+    // call from a test can never deterministically land inside that window
+    // on this crate's current-thread `#[tokio::test]` runtime (there is no
+    // scheduling opportunity between registering the cancellation token and
+    // evaluating the checkpoint). Calling the phase directly with the token
+    // already cancelled is the only reliable way to pin it.
+    pub(super) async fn startup_phases(
         self: &Arc<Self>,
         project: &Project,
         session_pk: &str,
@@ -417,6 +425,18 @@ impl ControlPlane {
         } else {
             std::path::PathBuf::from(&project.workdir)
         };
+
+        // Unconditional pre-harness cancel checkpoint, common to BOTH paths.
+        // For a git session this is redundant with the checkpoint above (git
+        // prep already re-checked `cancel` before returning `work_dir`), but
+        // for a non-git session this is the ONLY checkpoint before the
+        // harness is started — the `else` branch above does no prep at all,
+        // so without this a stop landing right after startup begins would
+        // still spawn the harness (unlike a git session with identical
+        // timing, caught above).
+        if cancel.is_cancelled() {
+            return;
+        }
 
         self.emit_status(session_pk, "Connecting tools…").await;
         let handle = match self

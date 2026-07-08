@@ -1256,6 +1256,84 @@ async fn stop_during_startup_cancels_cleanly() {
     assert_eq!(stored.status, SessionStatus::Interrupted);
 }
 
+// Task 7.2 review fix: `startup_phases`' only pre-harness cancel checkpoint
+// used to live INSIDE the `if project.is_git` branch (right after git prep),
+// so a non-git session's `else` branch fell straight through to
+// `emit_status("Connecting tools…")` + `start_harness_session` with no
+// cancel check at all — a stop landing during a non-git startup still spawned
+// its harness, unlike a git session with identical timing (caught at the
+// git-prep checkpoint). The fix adds an unconditional checkpoint common to
+// both paths, right before "Connecting tools…" is emitted.
+//
+// This can't be pinned via `stop_session()` racing the background task like
+// `stop_during_startup_cancels_cleanly` above: the non-git path has NO
+// `.await` between registering the cancellation token (in
+// `run_session_startup`) and evaluating the new checkpoint, so on this
+// crate's current-thread `#[tokio::test]` runtime there is no scheduling
+// opportunity for a concurrent `stop_session()` call to ever land inside that
+// window — by the time the background task is observably registered, it has
+// already run the checkpoint (current-thread tasks run to completion of
+// their synchronous prefix, uninterrupted, until their first real
+// `Poll::Pending`). Driving `startup_phases` directly with an
+// already-cancelled token is the only deterministic way to test it.
+#[tokio::test]
+#[serial]
+async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
+    let _guard = StateDirGuard::new();
+    let (_db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let store = cp.store().clone();
+    let dir = tempfile::tempdir().unwrap(); // plain temp dir — no git init.
+    let project = cp.connect_project(dir.path(), "demo").await.unwrap();
+    assert!(!project.is_git);
+
+    // Seed a session row the way `start_session_with_prompt` does, then drive
+    // `startup_phases` directly instead of going through the normal
+    // `start_session` spawn (see the comment above for why).
+    let session_pk = crate::paths::new_id();
+    let session = Session {
+        session_pk: session_pk.clone(),
+        project_id: project.project_id.clone(),
+        agent_session_id: None,
+        worktree_path: None,
+        branch: None,
+        title: Some("go".to_string()),
+        status: SessionStatus::Running,
+        started_by: Some("test".to_string()),
+        created_at: Some(now_ms()),
+        last_active: Some(now_ms()),
+        resume_attempts: 0,
+        branch_owned: false,
+    };
+    store.insert_session(session).await.unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    cp.startup_phases(
+        &project,
+        &session_pk,
+        crate::domain::SessionGitOptions::default(),
+        TurnPrompt::text("go", "go"),
+        Vec::new(),
+        &cancel,
+    )
+    .await;
+
+    assert_eq!(
+        counters.starts.load(Ordering::SeqCst),
+        0,
+        "a non-git startup already cancelled before it begins must never start the harness"
+    );
+    assert_eq!(counters.sends.load(Ordering::SeqCst), 0);
+    let msgs = store.list_messages(&session_pk).await.unwrap();
+    assert!(
+        msgs.is_empty(),
+        "no status row should be emitted once startup was already cancelled; got: {msgs:?}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn end_during_startup_waits_for_the_startup_task_and_cleans_the_worktree() {
