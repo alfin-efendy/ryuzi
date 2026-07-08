@@ -296,6 +296,20 @@ test("manual skill install preserves the typed source after a failed attempt", a
   expect(input.value).toBe("obra/superpowers");
 });
 
+test("manual skill install clears the typed source after a successful attempt", async () => {
+  render(<PluginsView />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+  await screen.findByText("Superpowers");
+
+  const input = screen.getByRole("textbox", { name: "Skill source" }) as HTMLInputElement;
+  fireEvent.change(input, { target: { value: "obra/superpowers" } });
+  fireEvent.click(screen.getByRole("button", { name: "Install source" }));
+
+  await waitFor(() => expect(installSkill).toHaveBeenCalledWith("obra/superpowers"));
+  await waitFor(() => expect(input.value).toBe(""));
+});
+
 test("filterByCategory passes every plugin through for the default all category", () => {
   expect(filterByCategory(all, "all").map((item) => item.id)).toEqual(["github", "notion", "ollama"]);
 });

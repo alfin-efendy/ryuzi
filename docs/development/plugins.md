@@ -370,10 +370,12 @@ backend for a richer `PluginAuthInfo`:
 - `disconnect_plugin_oauth` deletes the saved token and returns the plugin to
   an unconfigured state.
 
-Today this native sign-in path is scoped to HTTP MCP plugins whose manifests
-carry full OAuth metadata. Stdio plugins with `kind = "oauth"` still stay on
-their current settings/help-link path unless a provider-specific native flow
-is added later.
+Today this native sign-in path is available to plugin manifests whose
+`auth.kind = "oauth"` block carries the full OAuth metadata and points at a
+saved client id, regardless of MCP transport. Declarative HTTP MCP entries use
+the stored token automatically as an `Authorization: Bearer ...` header; other
+transports still need their manifests or provider-specific host support to map
+the stored credential into the runtime process.
 
 ---
 
