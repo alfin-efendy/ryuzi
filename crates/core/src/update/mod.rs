@@ -15,7 +15,7 @@ pub mod version;
 
 pub use applier::{apply_update, handle_apply_outcome, ApplierCfg, ApplierHost, ApplyOutcome};
 pub use asset::{
-    asset_name, asset_url, checksums_url, detect_platform, sha256_hex, target_triple,
+    asset_name, asset_url, checksums_url, detect_platform, platform_tag, sha256_hex,
     verify_checksum, Platform,
 };
 pub use canary::{

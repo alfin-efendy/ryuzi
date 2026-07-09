@@ -1,8 +1,11 @@
 //! Release-asset naming, URLs, and checksum verification. The asset-naming
-//! scheme is `ryuzi-{version}-{target-triple}.tar.gz` — a deliberate break
-//! from the legacy `ryuzi_{v}_{goos}_{goarch}` scheme, so still-deployed
-//! legacy self-updaters match assets by name, find nothing, and stay silent
-//! instead of installing an incompatible binary.
+//! scheme is `ryuzi-{version}-{platform-tag}.tar.gz`, where the platform tag
+//! is the Rust target triple minus its `-unknown` vendor segment
+//! (`x86_64-linux-gnu`, `aarch64-apple-darwin`). Two deliberate breaks live
+//! in this history: legacy `ryuzi_{v}_{goos}_{goarch}` TS self-updaters, and
+//! `-unknown-` triple names in ryuzi <= 0.6.0 — both match assets by the old
+//! name, find nothing, and stay silent instead of installing a mismatched
+//! binary (reinstall via curl|sh or npm picks up the new scheme).
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -14,12 +17,12 @@ pub struct Platform {
     pub musl: bool,
 }
 
-pub fn target_triple(p: Platform) -> Option<&'static str> {
+pub fn platform_tag(p: Platform) -> Option<&'static str> {
     match (p.os, p.arch, p.musl) {
-        ("linux", "x86_64", false) => Some("x86_64-unknown-linux-gnu"),
-        ("linux", "x86_64", true) => Some("x86_64-unknown-linux-musl"),
-        ("linux", "aarch64", false) => Some("aarch64-unknown-linux-gnu"),
-        ("linux", "aarch64", true) => Some("aarch64-unknown-linux-musl"),
+        ("linux", "x86_64", false) => Some("x86_64-linux-gnu"),
+        ("linux", "x86_64", true) => Some("x86_64-linux-musl"),
+        ("linux", "aarch64", false) => Some("aarch64-linux-gnu"),
+        ("linux", "aarch64", true) => Some("aarch64-linux-musl"),
         ("macos", "x86_64", _) => Some("x86_64-apple-darwin"),
         ("macos", "aarch64", _) => Some("aarch64-apple-darwin"),
         _ => None,
@@ -27,7 +30,7 @@ pub fn target_triple(p: Platform) -> Option<&'static str> {
 }
 
 pub fn asset_name(version: &str, p: Platform) -> Option<String> {
-    Some(format!("ryuzi-{version}-{}.tar.gz", target_triple(p)?))
+    Some(format!("ryuzi-{version}-{}.tar.gz", platform_tag(p)?))
 }
 
 pub fn asset_url(repo: &str, tag: &str, name: &str) -> String {
@@ -78,7 +81,7 @@ pub fn detect_platform() -> Option<Platform> {
         },
         musl: cfg!(target_env = "musl"),
     };
-    target_triple(p).map(|_| p)
+    platform_tag(p).map(|_| p)
 }
 
 #[cfg(test)]
@@ -92,14 +95,14 @@ mod tests {
     };
 
     #[test]
-    fn asset_name_uses_the_new_triple_scheme() {
+    fn asset_name_uses_the_platform_tag_scheme() {
         assert_eq!(
-            asset_name("0.3.0", LINUX_GNU).as_deref(),
-            Some("ryuzi-0.3.0-x86_64-unknown-linux-gnu.tar.gz")
+            asset_name("0.7.0", LINUX_GNU).as_deref(),
+            Some("ryuzi-0.7.0-x86_64-linux-gnu.tar.gz")
         );
         assert_eq!(
             asset_name(
-                "0.3.0",
+                "0.7.0",
                 Platform {
                     os: "linux",
                     arch: "aarch64",
@@ -107,11 +110,11 @@ mod tests {
                 }
             )
             .as_deref(),
-            Some("ryuzi-0.3.0-aarch64-unknown-linux-musl.tar.gz")
+            Some("ryuzi-0.7.0-aarch64-linux-musl.tar.gz")
         );
         assert_eq!(
             asset_name(
-                "0.3.0",
+                "0.7.0",
                 Platform {
                     os: "macos",
                     arch: "aarch64",
@@ -119,14 +122,16 @@ mod tests {
                 }
             )
             .as_deref(),
-            Some("ryuzi-0.3.0-aarch64-apple-darwin.tar.gz")
+            Some("ryuzi-0.7.0-aarch64-apple-darwin.tar.gz")
         );
-        // the legacy goos/goarch scheme must be impossible to produce
-        assert!(asset_name("0.3.0", LINUX_GNU)
-            .unwrap()
-            .contains("x86_64-unknown-linux-gnu"));
+        // both retired schemes must be impossible to produce: the legacy
+        // goos/goarch names and the pre-0.7 `-unknown-` triple names
+        let linux_name = asset_name("0.7.0", LINUX_GNU).unwrap();
+        assert!(linux_name.contains("x86_64-linux-gnu"));
+        assert!(!linux_name.contains("-unknown-"));
+        assert!(!linux_name.starts_with("ryuzi_"));
         assert!(asset_name(
-            "0.3.0",
+            "0.7.0",
             Platform {
                 os: "windows",
                 arch: "x86_64",
@@ -152,7 +157,7 @@ mod tests {
     fn verify_checksum_matches_the_named_entry_case_insensitively() {
         let bytes = b"tarball";
         let sum = sha256_hex(bytes);
-        let name = "ryuzi-0.3.0-x86_64-unknown-linux-gnu.tar.gz";
+        let name = "ryuzi-0.7.0-x86_64-linux-gnu.tar.gz";
         let ok = format!("{sum}  {name}\n");
         assert!(verify_checksum(bytes, name, &ok));
         assert!(verify_checksum(
@@ -179,6 +184,6 @@ mod tests {
     fn detect_platform_is_some_on_supported_hosts() {
         // On CI (linux/mac x86_64/aarch64) this must resolve to a triple.
         let p = detect_platform().expect("supported host");
-        assert!(target_triple(p).is_some());
+        assert!(platform_tag(p).is_some());
     }
 }
