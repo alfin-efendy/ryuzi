@@ -63,15 +63,52 @@ fn probe_body(desc: &ProviderDescriptor, model: &str) -> Value {
     body
 }
 
-/// Build the probe request for `target`: the real chat request builder with a
-/// ping body. (Kiro and Codex get dedicated branches — added with their
-/// pipelines.)
+/// Build the probe request for `target` — the real chat request builders
+/// with a ping body.
 fn probe_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
     model: &str,
 ) -> anyhow::Result<reqwest::RequestBuilder> {
-    client::upstream_request(ctx, target, &probe_body(target.desc, model))
+    match target.conn.provider.as_str() {
+        // Kiro has no base URL by design — the probe goes through the same
+        // CodeWhisperer translator + endpoint list as real chat; the
+        // Anthropic body's `max_tokens: 1` becomes `inferenceConfig.
+        // maxTokens: 1`, and the profile ARN is attached by the translator.
+        "kiro" => {
+            let anthropic_body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+                "stream": false
+            });
+            let conversation_id = uuid::Uuid::new_v4().to_string();
+            let kiro_body = crate::llm_router::kiro::anthropic_request_to_kiro(
+                &anthropic_body,
+                model,
+                &target.conn.data,
+                &conversation_id,
+            );
+            Ok(client::kiro_upstream_request(ctx, target, &kiro_body))
+        }
+        // Codex speaks the Responses wire; picker ids may carry effort or
+        // `-review` suffixes the upstream doesn't know — probe the base
+        // model (suffixed variants inherit its verdict).
+        "openai-oauth" => {
+            let body = json!({
+                "model": crate::llm_router::codex::codex_base_model(model),
+                "input": "ping",
+                "stream": false,
+                "store": false
+            });
+            client::upstream_request(ctx, target, &body)
+        }
+        // Everything else — api-key, free/no-auth (incl. mimo's `/chat`
+        // path), anthropic-oauth (system-prompt injection + cloak live in
+        // `upstream_request`), qwen, github-copilot — is the generic
+        // real-chat builder with a ping body.
+        _ => client::upstream_request(ctx, target, &probe_body(target.desc, model)),
+    }
 }
 
 async fn probe_once(
@@ -353,5 +390,181 @@ mod tests {
         assert!(!bad.ok);
         assert_eq!(bad.status, ProbeStatus::Invalid);
         assert_eq!(bad.message, "Model gpt-bad returned HTTP 404 Not Found");
+    }
+
+    #[tokio::test]
+    async fn kiro_probe_needs_no_base_url_and_caps_max_tokens_at_one() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("kiro").unwrap();
+        assert!(desc.base_url.is_none(), "kiro has no base URL by design");
+        let target = RouteTarget {
+            conn: mk_conn(
+                "k1",
+                "kiro",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at-kiro".into()),
+                    ..Default::default()
+                },
+            ),
+            desc,
+            upstream_model: "claude-sonnet-5".into(),
+        };
+        let req = probe_request(&ctx, &target, "claude-sonnet-5")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://runtime.us-east-1.kiro.dev/generateAssistantResponse"
+        );
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer at-kiro"
+        );
+        assert_eq!(
+            req.headers().get("x-amz-target").unwrap(),
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+        );
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(sent["inferenceConfig"]["maxTokens"], 1);
+        let cur = &sent["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(cur["modelId"], "claude-sonnet-5");
+        assert!(cur["content"].as_str().unwrap().contains("ping"));
+        assert_eq!(
+            sent["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_probe_hits_responses_and_normalizes_suffixed_ids() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("openai-oauth").unwrap();
+        let target = RouteTarget {
+            conn: mk_conn(
+                "cx",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at-codex".into()),
+                    provider_specific: Some(json!({"chatgpt_account_id": "acct-1"})),
+                    ..Default::default()
+                },
+            ),
+            desc,
+            upstream_model: "gpt-5.2-codex-high".into(),
+        };
+        let req = probe_request(&ctx, &target, "gpt-5.2-codex-high")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer at-codex"
+        );
+        assert_eq!(req.headers().get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(req.headers().get("chatgpt-account-id").unwrap(), "acct-1");
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(sent["model"], "gpt-5.2-codex");
+        assert_eq!(sent["input"], "ping");
+        assert_eq!(sent["store"], false);
+        assert_eq!(sent["stream"], false);
+    }
+
+    #[tokio::test]
+    async fn codex_probe_strips_review_suffix_too() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("openai-oauth").unwrap();
+        let target = RouteTarget {
+            conn: mk_conn(
+                "cx2",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at-codex".into()),
+                    ..Default::default()
+                },
+            ),
+            desc,
+            upstream_model: "gpt-5.4-review".into(),
+        };
+        let req = probe_request(&ctx, &target, "gpt-5.4-review")
+            .unwrap()
+            .build()
+            .unwrap();
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(sent["model"], "gpt-5.4");
+    }
+
+    #[tokio::test]
+    async fn anthropic_oauth_probe_injects_system_prompt_and_beta_headers() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("anthropic-oauth").unwrap();
+        let target = RouteTarget {
+            conn: mk_conn(
+                "a1",
+                "anthropic-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at-claude".into()),
+                    ..Default::default()
+                },
+            ),
+            desc,
+            upstream_model: "claude-opus-4-8".into(),
+        };
+        let req = probe_request(&ctx, &target, "claude-opus-4-8")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer at-claude"
+        );
+        assert_eq!(
+            req.headers().get("anthropic-beta").unwrap(),
+            crate::llm_router::models::ANTHROPIC_OAUTH_BETA
+        );
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(
+            sent["system"][0]["text"],
+            crate::llm_router::models::CLAUDE_CODE_SYSTEM_PROMPT
+        );
+        assert_eq!(sent["max_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_oauth_probe_applies_cloak_when_enabled() {
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("anthropic-oauth").unwrap();
+        let target = RouteTarget {
+            conn: mk_conn(
+                "a2",
+                "anthropic-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("sk-ant-oat-test".into()),
+                    provider_specific: Some(json!({"claudeCloaking": true})),
+                    ..Default::default()
+                },
+            ),
+            desc,
+            upstream_model: "claude-opus-4-8".into(),
+        };
+        let req = probe_request(&ctx, &target, "claude-opus-4-8")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(req.headers().contains_key("x-claude-code-session-id"));
+        assert!(req.headers().contains_key("x-stainless-runtime-version"));
     }
 }

@@ -1389,7 +1389,7 @@ fn kiro_endpoints(auth_method: &str, region: &str) -> Vec<String> {
 }
 
 /// Build the verbatim kiro upstream request (wire contract only — no cloaking).
-fn kiro_upstream_request(
+pub(crate) fn kiro_upstream_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
     kiro_body: &Value,
