@@ -552,3 +552,12 @@ test("shows empty states for API keys, providers, and routes", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Endpoint" }));
   expect(await screen.findByText("No API keys yet — create one for external tools.")).toBeTruthy();
 });
+
+test("route target picker always shows the search input", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
+  expect(await screen.findByPlaceholderText("Search…")).toBeTruthy();
+});
