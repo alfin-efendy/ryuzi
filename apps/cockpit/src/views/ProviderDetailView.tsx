@@ -6,6 +6,7 @@ import { useConnections } from "@/store-connections";
 import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
 import { useUi } from "@/store-ui";
+import { useModelStatuses } from "@/store-model-statuses";
 import { runPool, visibleModels, type ModelTestEntry, type ModelTestStatus } from "@/lib/model-testing";
 import {
   Button,
@@ -216,6 +217,10 @@ function ProviderModelsCard({
         entry = { status: "unknown", message: e instanceof Error ? e.message : String(e) };
       }
       setResults((prev) => new Map(prev).set(model, entry));
+      // Feed the app-wide status store so every model picker (not just this
+      // card) updates live. runTestAll funnels each model through testOne,
+      // so batch runs are covered by this single call site.
+      useModelStatuses.getState().upsert(family, model, entry.status);
       return entry;
     } finally {
       setInFlight((prev) => {
