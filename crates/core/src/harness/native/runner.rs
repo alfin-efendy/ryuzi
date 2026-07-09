@@ -256,7 +256,10 @@ async fn drive(
         let body = json!({
             "model": model,
             "system": system,
-            "messages": ledger.messages(),
+            // Sanitized projection: dangling tool_use ids from an interrupted
+            // prior turn get synthesized error tool_results, or Anthropic
+            // 400s the whole request (and the session stays poisoned).
+            "messages": ledger.messages_for_request(),
             "tools": tool_defs,
             "max_tokens": MAX_TOKENS,
             "stream": true,
@@ -1723,5 +1726,48 @@ mod tests {
         let msgs = deps.store.list_messages("s1").await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
+    }
+
+    #[tokio::test]
+    async fn request_body_repairs_a_dangling_tool_use_from_a_prior_interrupted_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        // Simulate a prior turn interrupted mid-tools: the assistant tool_use
+        // turn was persisted but its tool_result user turn never was.
+        {
+            let mut ledger = Ledger::load(deps.store.clone(), "s1").await.unwrap();
+            ledger
+                .append_user(json!([{"type": "text", "text": "earlier"}]))
+                .await
+                .unwrap();
+            ledger
+                .append_assistant(json!([
+                    {"type": "tool_use", "id": "tu-dangling", "name": "bash", "input": {}}
+                ]))
+                .await
+                .unwrap();
+        }
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("next", "next"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        let messages = bodies[0]["messages"].as_array().unwrap();
+        // user(earlier), assistant(tool_use), user(tool_result + "next") —
+        // the repair is folded into the immediately-following user message.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "tu-dangling");
+        assert_eq!(messages[2]["content"][0]["is_error"], true);
+        assert_eq!(messages[2]["content"][1]["type"], "text");
+        assert_eq!(messages[2]["content"][1]["text"], "next");
     }
 }
