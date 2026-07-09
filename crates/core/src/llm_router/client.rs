@@ -1480,6 +1480,13 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
 }
 
 /// Pump an Anthropic-format upstream SSE response into `(name, Value)` events.
+///
+/// Mirrors the OpenAI-translated pump's `saw_terminal` guard
+/// (`translate::OpenAiToAnthropicStream::saw_terminal`): a 2xx stream that
+/// ends without `message_stop` (or an explicit `error` event) is a truncated
+/// stream, not a completed one — emit a terminal error event instead of
+/// ending silently as a "(no output)" turn. Emitted before any content, the
+/// error also lets `probe_stream_head` rotate to the next target.
 #[allow(clippy::too_many_arguments)]
 async fn pump_anthropic(
     resp: reqwest::Response,
@@ -1498,6 +1505,7 @@ async fn pump_anthropic(
     let mut input_tokens = 0i64;
     let mut output_tokens = 0i64;
     let mut errored = false;
+    let mut saw_terminal = false;
     'pump: while let Some(item) = stream.next().await {
         let chunk = match item {
             Ok(c) => c,
@@ -1524,10 +1532,23 @@ async fn pump_anthropic(
             if let Some(u) = v.get("usage") {
                 output_tokens += u.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
             }
+            if name == "message_stop" || name == "error" {
+                saw_terminal = true;
+            }
             if tx.send(Ok((name, v))).await.is_err() {
                 break 'pump; // consumer dropped
             }
         }
+    }
+    if !errored && !saw_terminal {
+        let _ = tx
+            .send(Ok((
+                "error".to_string(),
+                json!({"type": "error", "error": {"type": "api_error",
+                       "message": "upstream stream ended without a terminal event"}}),
+            )))
+            .await;
+        errored = true;
     }
     crate::llm_router::usage::record(
         &store,
@@ -2342,6 +2363,123 @@ mod tests {
         assert!(
             err.to_string().contains("Overloaded"),
             "expected the aggregated fallback error to mention both attempts' failures: {err}"
+        );
+    }
+
+    /// 2xx stream with content but NO terminal event (no message_stop).
+    const SSE_TRUNCATED_NO_TERMINAL: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half\"}}\n\n",
+    );
+
+    /// 2xx stream that ends after message_start — no content, no terminal.
+    const SSE_MESSAGE_START_ONLY: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+    );
+
+    #[tokio::test]
+    async fn stream_surfaces_error_when_2xx_stream_ends_without_terminal_event() {
+        use axum::{routing::post, Router};
+
+        let app = Router::new().route(
+            "/messages",
+            post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    SSE_TRUNCATED_NO_TERMINAL,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "only",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-only".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["claude-t".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        // The content that DID arrive is preserved…
+        assert_eq!(stream_text(&events), "half");
+        // …and the silent truncation becomes an explicit terminal error.
+        let (last_name, last_data) = events.last().expect("stream must not be empty");
+        assert_eq!(last_name, "error");
+        assert_eq!(
+            last_data["error"]["message"],
+            "upstream stream ended without a terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_rotates_past_stream_missing_terminal_before_content() {
+        use axum::{routing::post, Router};
+
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_MESSAGE_START_ONLY,
+                    )
+                }),
+            )
+            .route(
+                "/second/messages",
+                post(|| async { ([("content-type", "text/event-stream")], SSE_OK_STREAM) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        // The empty first stream (no terminal event, no content) triggers the
+        // guard's error event, which the pre-content probe converts into a
+        // rotation to the second account.
+        assert_eq!(stream_text(&events), "rotated");
+        assert!(
+            !events.iter().any(|(name, _)| name.as_str() == "error"),
+            "empty truncated stream must rotate, not surface: {events:?}"
         );
     }
 
