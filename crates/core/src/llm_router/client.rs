@@ -236,6 +236,60 @@ async fn expanded_route_targets(
         .collect())
 }
 
+/// Continuation targets once a `family/model`-pinned request has exhausted
+/// every same-family account with retryable failures: the targets of the
+/// first enabled Model Route (in `list_model_routes` order — the Models →
+/// Route tab ordering) whose target list contains that exact (family, model)
+/// pair, expanded to concrete connections in the route's CONFIGURED target
+/// order, minus (connection id, model) pairs already attempted.
+///
+/// `route.targets` is used directly rather than `routes::ordered_targets`,
+/// which would advance a RoundRobin route's cursor as a side effect of a
+/// mere continuation lookup — the locked product decision is "continue in
+/// the target order configured in the Route tab".
+///
+/// Empty when the request isn't `family/model`-pinned (named routes and bare
+/// models don't continue) or no enabled route lists the pinned model.
+async fn route_continuation_targets(
+    store: &Store,
+    requested: &str,
+    attempted: &std::collections::HashSet<(String, String)>,
+) -> anyhow::Result<Vec<RouteTarget>> {
+    let Some((family, model)) = requested.split_once('/') else {
+        return Ok(Vec::new());
+    };
+    let route_list = routes::list_model_routes(store).await?;
+    let Some(route) = route_list.iter().find(|route| {
+        route.enabled
+            && route
+                .targets
+                .iter()
+                .any(|t| t.provider == family && t.model == model)
+    }) else {
+        return Ok(Vec::new());
+    };
+    let conns = connections::list_connections(store).await?;
+    let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
+    let mut seen = attempted.clone();
+    let mut out = Vec::new();
+    for target in &route.targets {
+        for route_target in
+            expanded_route_targets(store, &enabled, target, anthropic_messages_target_allowed)
+                .await?
+        {
+            let key = (
+                route_target.conn.id.clone(),
+                route_target.upstream_model.clone(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            out.push(route_target);
+        }
+    }
+    Ok(out)
+}
+
 fn route_target_has_candidate(
     enabled: &[connections::ConnectionRow],
     target: &routes::ModelRouteTarget,
@@ -1132,7 +1186,25 @@ pub async fn anthropic_messages_stream(
     }
 
     let mut failures = Vec::new();
-    for mut target in targets {
+    let mut attempted = std::collections::HashSet::<(String, String)>::new();
+    let mut queue = std::collections::VecDeque::from(targets);
+    let mut continued = false;
+    loop {
+        let Some(mut target) = queue.pop_front() else {
+            // Initial targets exhausted with only retryable failures
+            // (non-retryable ones returned early above): continue down the
+            // first Model Route containing the pinned (family, model) — once.
+            if continued {
+                break;
+            }
+            continued = true;
+            queue.extend(route_continuation_targets(&ctx.store, &requested, &attempted).await?);
+            if queue.is_empty() {
+                break;
+            }
+            continue;
+        };
+        attempted.insert((target.conn.id.clone(), target.upstream_model.clone()));
         if let Err(failure) = ensure_fresh_for_attempt(ctx, &mut target).await {
             let try_next = should_try_next_target(&failure);
             failures.push(failure);
@@ -1314,7 +1386,25 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
     }
 
     let mut failures = Vec::new();
-    for mut target in targets {
+    let mut attempted = std::collections::HashSet::<(String, String)>::new();
+    let mut queue = std::collections::VecDeque::from(targets);
+    let mut continued = false;
+    loop {
+        let Some(mut target) = queue.pop_front() else {
+            // Initial targets exhausted with only retryable failures
+            // (non-retryable ones returned early above): continue down the
+            // first Model Route containing the pinned (family, model) — once.
+            if continued {
+                break;
+            }
+            continued = true;
+            queue.extend(route_continuation_targets(&ctx.store, &requested, &attempted).await?);
+            if queue.is_empty() {
+                break;
+            }
+            continue;
+        };
+        attempted.insert((target.conn.id.clone(), target.upstream_model.clone()));
         if let Err(failure) = ensure_fresh_for_attempt(ctx, &mut target).await {
             let try_next = should_try_next_target(&failure);
             failures.push(failure);
@@ -3634,5 +3724,266 @@ mod tests {
             MessageStreamEvent::from_event(&stop),
             Some(MessageStreamEvent::MessageStop)
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_family_exhaustion_continues_down_matching_route() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let quota_hits = Arc::new(AtomicUsize::new(0));
+        let quota_hits_handler = quota_hits.clone();
+
+        async fn ok(Json(body): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": body["model"].clone(),
+                "content": [{"type": "text", "text": "route continuation worked"}],
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }))
+        }
+
+        let app = Router::new()
+            .route(
+                "/quota/messages",
+                post(move || {
+                    let hits = quota_hits_handler.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({"error": {"message": "You're out of extra usage."}})),
+                        )
+                    }
+                }),
+            )
+            .route("/backup/messages", post(ok));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        // The only account serving the pinned model — quota'd out.
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "pinned-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-a".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/quota")),
+                    models_override: Some(vec!["claude-a".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        // Serves only the route's second target model.
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "backup-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-b".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/backup")),
+                    models_override: Some(vec!["claude-b".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "task".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-a".into(),
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-b".into(),
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "anthropic/claude-a",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["content"][0]["text"], "route continuation worked");
+        assert_eq!(response["model"], "claude-b");
+        // The (pinned-acct, claude-a) pair was already attempted in the
+        // family pass — the route continuation must not retry it.
+        assert_eq!(quota_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_continues_down_route_after_family_exhaustion() {
+        use axum::{routing::post, Json, Router};
+
+        let app = Router::new()
+            .route(
+                "/quota/messages",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({"error": {"message": "You're out of extra usage."}})),
+                    )
+                }),
+            )
+            .route(
+                "/backup/messages",
+                post(|| async { ([("content-type", "text/event-stream")], SSE_OK_STREAM) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "pinned-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-a".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/quota")),
+                    models_override: Some(vec!["claude-a".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "backup-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-b".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/backup")),
+                    models_override: Some(vec!["claude-b".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "task".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-a".into(),
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-b".into(),
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({
+                "model": "anthropic/claude-a",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        assert_eq!(stream_text(&events), "rotated");
+    }
+
+    #[tokio::test]
+    async fn pinned_family_exhaustion_without_matching_route_surfaces_failures() {
+        use axum::{routing::post, Json, Router};
+
+        let app = Router::new().route(
+            "/messages",
+            post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error": {"message": "You're out of extra usage."}})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "only-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-a".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["claude-a".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let err = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "anthropic/claude-a",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("out of extra usage"), "got: {err}");
     }
 }
