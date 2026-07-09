@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { groupModelOptions, withLeadingOption } from "./model-groups";
+import { groupModelOptions, modelStatusKey, withLeadingOption } from "./model-groups";
 import type { CatalogEntry, ConnectionInfo } from "../bindings";
 
 const entry = (id: string, family: string, name: string, models: string[] = []): CatalogEntry =>
@@ -119,4 +119,41 @@ test("withLeadingOption wraps the sentinel in a headingless group ahead of a gro
     { label: "", options: [sentinel] },
     { label: "Anthropic", options: [{ value: "anthropic/claude-fable-5", label: "claude-fable-5", mono: true }] },
   ]);
+});
+
+test("modelStatusKey splits family::model route-target keys", () => {
+  expect(modelStatusKey("openai::gpt-5.5", catalog)).toEqual({ family: "openai", model: "gpt-5.5" });
+});
+
+test("modelStatusKey resolves family/model runtime ids", () => {
+  expect(modelStatusKey("anthropic/claude-fable-5", catalog)).toEqual({ family: "anthropic", model: "claude-fable-5" });
+});
+
+test("modelStatusKey resolves entry-id/model to the entry's family via the catalog", () => {
+  expect(modelStatusKey("anthropic-oauth/claude-opus-4-8", catalog)).toEqual({
+    family: "anthropic",
+    model: "claude-opus-4-8",
+  });
+});
+
+test("modelStatusKey returns null for bare route aliases and unknown prefixes", () => {
+  expect(modelStatusKey("smart", catalog)).toBeNull();
+  expect(modelStatusKey("low_task", catalog)).toBeNull();
+  expect(modelStatusKey("mystery/whatever", catalog)).toBeNull();
+});
+
+test("modelStatusKey strips codex effort/review variants to the base model (mirrors codex_probe_model)", () => {
+  expect(modelStatusKey("openai/gpt-5.5-codex-low", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
+  expect(modelStatusKey("openai/gpt-5.5-codex-medium", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
+  expect(modelStatusKey("openai/gpt-5.5-codex-high", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
+  // "-xhigh" must strip whole, not leave "…-x" behind by matching "-high".
+  expect(modelStatusKey("openai/gpt-5.5-codex-xhigh", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
+  expect(modelStatusKey("openai/gpt-5.6-luna-none", catalog)).toEqual({ family: "openai", model: "gpt-5.6-luna" });
+  expect(modelStatusKey("openai/gpt-5.6-luna-review", catalog)).toEqual({ family: "openai", model: "gpt-5.6-luna" });
+  // Review strips first, then ONE effort suffix — same one-pass order as Rust.
+  expect(modelStatusKey("openai/gpt-5.5-codex-high-review", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
+  // Suffix stripping applies to route-target keys too.
+  expect(modelStatusKey("openai::gpt-5.5-codex-review", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
+  // Non-variant models pass through untouched.
+  expect(modelStatusKey("anthropic/claude-fable-5", catalog)).toEqual({ family: "anthropic", model: "claude-fable-5" });
 });

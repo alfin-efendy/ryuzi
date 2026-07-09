@@ -1,6 +1,40 @@
 import type { CatalogEntry, ConnectionInfo } from "../bindings";
 import type { ComboboxGroup, ComboboxOption } from "@ryuzi/ui";
 
+/** Codex effort/review picker variants ("…-high", "…-review") share the base
+ *  model's probe verdict. Mirror of `codex_base_model`
+ *  (crates/core/src/llm_router/codex.rs): strip one trailing "-review", then
+ *  one effort suffix — "xhigh" checked before "high" so "-xhigh" strips
+ *  whole. */
+function stripCodexVariant(model: string): string {
+  let base = model.endsWith("-review") ? model.slice(0, -"-review".length) : model;
+  for (const effort of ["xhigh", "high", "medium", "low", "none"]) {
+    const suffix = `-${effort}`;
+    if (base.endsWith(suffix)) {
+      base = base.slice(0, -suffix.length);
+      break;
+    }
+  }
+  return base;
+}
+
+/** Normalize a picker value to the `(family, bare model)` pair that
+ *  `model_status` verdicts are keyed by. Handles `family::model`
+ *  route-target keys, `family/model` runtime ids, and `entry-id/model`
+ *  endpoint-card ids (resolved to the entry's family via the catalog).
+ *  Bare values are route aliases and unknown prefixes are unmappable —
+ *  both return null so callers never filter them. */
+export function modelStatusKey(value: string, catalog: CatalogEntry[]): { family: string; model: string } | null {
+  const sep = value.indexOf("::");
+  if (sep > 0) return { family: value.slice(0, sep), model: stripCodexVariant(value.slice(sep + 2)) };
+  const slash = value.indexOf("/");
+  if (slash <= 0) return null;
+  const prefix = value.slice(0, slash);
+  const entry = catalog.find((e) => e.family === prefix) ?? catalog.find((e) => e.id === prefix);
+  if (!entry) return null;
+  return { family: entry.family, model: stripCodexVariant(value.slice(slash + 1)) };
+}
+
 /** Group the composer's runtime model ids by provider family (PR #70 data).
  *  Runtime ids may be prefixed ("anthropic/claude-fable-5", or a catalog
  *  entry id like "anthropic-oauth/…" which resolves to its family): a known
