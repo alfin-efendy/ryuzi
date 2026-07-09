@@ -11,12 +11,12 @@ import { useConnections } from "@/store-connections";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
-import { groupModelOptions } from "@/lib/model-groups";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalPrompt } from "@/components/ApprovalPrompt";
 import { StatusDot } from "@/components/common/bits";
+import { ModelPicker } from "@/components/ModelPicker";
 import { Transcript } from "@/components/transcript/Transcript";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
@@ -49,8 +49,6 @@ export function SessionView() {
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
-  const catalog = useConnections((s) => s.catalog);
-  const connections = useConnections((s) => s.connections);
   const connectionsLoaded = useConnections((s) => s.loaded);
   const hydrateConnections = useConnections((s) => s.hydrate);
 
@@ -286,26 +284,16 @@ export function SessionView() {
                 }
               />
               <div className="flex-1" />
-              <Combobox
-                aria-label="Model"
-                options={groupModelOptions(modelOptions, catalog, connections)}
-                value={selectedModel || null}
+              <ModelPicker
+                ariaLabel="Model"
+                variant="chip"
+                models={modelOptions}
+                value={selectedModel}
                 onValueChange={(m) => {
                   if (projectId) void setProjectModel(projectId, m);
                 }}
                 disabled={modelOptions.length === 0}
-                trigger={
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    title={modelOptions.length === 0 ? "No models available. Add a provider connection in Models." : "Model"}
-                    className="font-semibold"
-                  >
-                    <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
-                    {selectedModel || agent?.name || "No agent"}
-                    <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                  </Button>
-                }
+                placeholder="Default model"
               />
               <Button
                 variant="ghost"

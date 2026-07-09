@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import type { BranchList, CmdError, CommandInfo, Project, Result } from "@/bindings";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { BranchList, CatalogEntry, CmdError, CommandInfo, ConnectionInfo, Project, Result, RuntimeInfo } from "@/bindings";
 
 const branchListData: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
 const listBranches = mock((): Promise<Result<BranchList, CmdError>> => Promise.resolve({ status: "ok", data: branchListData }));
@@ -20,6 +20,9 @@ const { HomeView } = await import("./HomeView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
+const { useRuntimes } = await import("@/store-runtimes");
+const { useModelStatuses, statusKey } = await import("@/store-model-statuses");
+const { useUi } = await import("@/store-ui");
 
 function project(overrides: Partial<Project> = {}): Project {
   return {
@@ -37,10 +40,67 @@ function project(overrides: Partial<Project> = {}): Project {
   };
 }
 
+const nativeRuntime: RuntimeInfo = {
+  id: "native",
+  name: "Ryuzi",
+  color: "#8B5CF6",
+  initial: "R",
+  connection: "In-process",
+  binaryPath: "in-process",
+  installedVersion: "0.5.0",
+  latestVersion: null,
+  npmPackage: null,
+  models: ["anthropic/claude-opus-4", "anthropic/claude-sonnet-4"],
+  enabled: true,
+  model: "",
+  permMode: "ask",
+  flags: "",
+  tiers: [],
+  isDefault: true,
+  runnable: true,
+};
+
+const catalogEntries: CatalogEntry[] = [
+  {
+    id: "anthropic",
+    name: "Anthropic",
+    family: "anthropic",
+    color: "#D97757",
+    initial: "A",
+    category: "api_key",
+    format: "anthropic",
+    requiresBaseUrl: false,
+    models: ["claude-opus-4", "claude-sonnet-4"],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
+  },
+];
+
+const anthropicConnection: ConnectionInfo = {
+  id: "conn-1",
+  provider: "anthropic",
+  providerName: "Anthropic",
+  color: "#D97757",
+  initial: "A",
+  authType: "apiKey",
+  label: "Anthropic",
+  priority: 0,
+  enabled: true,
+  baseUrl: null,
+  models: ["claude-opus-4", "claude-sonnet-4"],
+  keyMasked: "sk-…3fk9",
+  needsRelogin: false,
+  claudeCloaking: false,
+};
+
 beforeEach(() => {
   useStore.setState({ projects: [project()], selectedProjectId: "p1" });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
-  useConnections.setState({ catalog: [], connections: [], loaded: true });
+  useConnections.setState({ catalog: catalogEntries, connections: [anthropicConnection], loaded: true });
+  useRuntimes.setState({ runtimes: [nativeRuntime], loaded: true });
+  useModelStatuses.setState({ byKey: {} });
+  useUi.setState({ hideInvalidModels: false });
   useNav.setState({ composerBranch: null, composerModel: null });
   listBranches.mockClear();
   nativeCommands.mockClear();
@@ -65,4 +125,23 @@ test("non-git project: no branch pill, no worktree toggle, no list_branches call
   // Let the other mount effect flush so a stray branch fetch would have fired by now.
   await waitFor(() => expect(nativeCommands).toHaveBeenCalledWith("p1"));
   expect(listBranches).not.toHaveBeenCalled();
+});
+
+test("composer model chip: shared ModelPicker look — no Ryuzi suffix, search always available", async () => {
+  render(<HomeView />);
+  const chip = screen.getByRole("combobox", { name: "Model" });
+  expect(chip.textContent).toContain("Default model");
+  expect(chip.textContent).not.toContain("Ryuzi");
+  fireEvent.click(chip);
+  expect(await screen.findByPlaceholderText("Search…")).toBeTruthy();
+  expect(screen.getByRole("option", { name: "claude-opus-4" })).toBeTruthy();
+});
+
+test("hide-invalid filters the composer model list, keeping untested models", async () => {
+  useModelStatuses.setState({ byKey: { [statusKey("anthropic", "claude-sonnet-4")]: "invalid" } });
+  useUi.setState({ hideInvalidModels: true });
+  render(<HomeView />);
+  fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
+  expect(await screen.findByRole("option", { name: "claude-opus-4" })).toBeTruthy();
+  expect(screen.queryByRole("option", { name: "claude-sonnet-4" })).toBeNull();
 });
