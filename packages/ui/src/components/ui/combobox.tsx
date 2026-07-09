@@ -10,6 +10,9 @@ type ComboboxOption = {
   label: string;
   description?: string;
   mono?: boolean;
+  /** Render the label in the warning tone with a TriangleAlert icon — used for
+   *  entries with a persisted invalid verdict that must stay selectable. */
+  invalid?: boolean;
 };
 
 type ComboboxGroup = {

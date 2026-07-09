@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { groupModelOptions, modelStatusKey, withLeadingOption } from "./model-groups";
 import type { CatalogEntry, ConnectionInfo } from "../bindings";
+import { statusKey } from "../store-model-statuses";
 
 const entry = (id: string, family: string, name: string, models: string[] = []): CatalogEntry =>
   ({
@@ -156,4 +157,63 @@ test("modelStatusKey strips codex effort/review variants to the base model (mirr
   expect(modelStatusKey("openai::gpt-5.5-codex-review", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
   // Non-variant models pass through untouched.
   expect(modelStatusKey("anthropic/claude-fable-5", catalog)).toEqual({ family: "anthropic", model: "claude-fable-5" });
+});
+
+test("hideInvalid drops options with a persisted invalid verdict; untested stay", () => {
+  const statuses = { [statusKey("openai", "gpt-5.5")]: "invalid" as const };
+  const groups = groupModelOptions(["anthropic/claude-fable-5", "openai/gpt-5.5"], catalog, [], {
+    statuses,
+    hideInvalid: true,
+  });
+  expect(groups).toEqual([{ label: "Anthropic", options: [{ value: "anthropic/claude-fable-5", label: "claude-fable-5", mono: true }] }]);
+});
+
+test("the selected invalid model stays visible, flagged invalid", () => {
+  const statuses = { [statusKey("openai", "gpt-5.5")]: "invalid" as const };
+  const groups = groupModelOptions(["anthropic/claude-fable-5", "openai/gpt-5.5"], catalog, [], {
+    statuses,
+    hideInvalid: true,
+    selectedValue: "openai/gpt-5.5",
+  });
+  expect(groups).toEqual([
+    { label: "Anthropic", options: [{ value: "anthropic/claude-fable-5", label: "claude-fable-5", mono: true }] },
+    { label: "OpenAI", options: [{ value: "openai/gpt-5.5", label: "gpt-5.5", mono: true, invalid: true }] },
+  ]);
+});
+
+test("invalid options are flagged (not hidden) when hideInvalid is off", () => {
+  const statuses = { [statusKey("openai", "gpt-5.5")]: "invalid" as const };
+  const groups = groupModelOptions(["openai/gpt-5.5"], catalog, [], { statuses, hideInvalid: false });
+  expect(groups).toEqual([{ label: "OpenAI", options: [{ value: "openai/gpt-5.5", label: "gpt-5.5", mono: true, invalid: true }] }]);
+});
+
+test("route aliases are never filtered; grouping survives filtering", () => {
+  const statuses = { [statusKey("openai", "gpt-5.5")]: "invalid" as const };
+  const groups = groupModelOptions(["smart", "openai/gpt-5.5", "anthropic/claude-fable-5"], catalog, [], {
+    statuses,
+    hideInvalid: true,
+  });
+  expect(groups).toEqual([
+    { label: "Route", options: [{ value: "smart", label: "smart", mono: true }] },
+    { label: "Anthropic", options: [{ value: "anthropic/claude-fable-5", label: "claude-fable-5", mono: true }] },
+  ]);
+});
+
+test("the ungrouped fallback honors hide-invalid too (no resurrection)", () => {
+  // All grouped options filtered away → byFamily is empty → the fallback
+  // must return the FILTERED flat list, not the raw input.
+  const statuses = { [statusKey("openai", "gpt-5.5")]: "invalid" as const };
+  const flat = groupModelOptions(["smart", "openai/gpt-5.5"], catalog, [], { statuses, hideInvalid: true });
+  expect(flat).toEqual([{ value: "smart", label: "smart", mono: true }]);
+});
+
+test("hideInvalid resolves bare ids via connections; codex variants inherit the base verdict", () => {
+  const statuses = { [statusKey("openai", "gpt-5.5-codex")]: "invalid" as const };
+  const groups = groupModelOptions(
+    ["gpt-5.5-codex", "openai/gpt-5.5-codex-high", "claude-fable-5"],
+    catalog,
+    [conn("openai", ["gpt-5.5-codex"]), conn("anthropic-oauth", ["claude-fable-5"])],
+    { statuses, hideInvalid: true },
+  );
+  expect(groups).toEqual([{ label: "Anthropic", options: [{ value: "claude-fable-5", label: "claude-fable-5", mono: true }] }]);
 });
