@@ -123,23 +123,15 @@ export const useStore = create<State>((set, get) => ({
           };
         }
         case "error":
-          // Transient infrastructure error (not a persisted transcript row; seq 0).
-          return {
-            transcripts: append(st.transcripts, e.session_pk, {
-              seq: 0,
-              role: "system",
-              blockType: "error",
-              text: e.message,
-              toolCallId: null,
-              toolStatus: null,
-              toolKind: null,
-              toolName: null,
-              toolOutput: null,
-              createdAt: Date.now(),
-              attachments: [],
-              toolPath: null,
-            }),
-          };
+          // Turn failed. The error text is persisted by the backend
+          // (emit_error) and arrives as a normal "message" event
+          // (role=system, block_type=error) BEFORE this terminal event, so
+          // appending a transient copy here would double-render it. Mirror
+          // the "result" arm: flip the session out of "running" (composer
+          // leaves Stop mode, the "Working…" pulse stops) and refresh so the
+          // DB-side Running→Idle demotion lands in the UI.
+          void get().refresh();
+          return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
         case "approvalRequested":
           return {
             pendingApprovals: [
@@ -180,8 +172,9 @@ export const useStore = create<State>((set, get) => ({
     const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind, m.createdAt));
     const maxSeq = rows.reduce((mx, m) => Math.max(mx, m.seq), 0);
     set((st) => {
-      // Rows appended by applyCoreEvent while listMessages was in flight (fresher
-      // than the snapshot, or transient seq-0 error rows) must survive the replace.
+      // Rows appended by applyCoreEvent while listMessages was in flight
+      // (fresher than the snapshot) must survive the replace. seq-0 rows are
+      // kept defensively — no reducer currently produces them.
       const liveTail = (st.transcripts[pk] ?? []).filter((r) => r.seq > maxSeq || r.seq === 0);
       return {
         transcripts: { ...st.transcripts, [pk]: [...hydrated, ...liveTail] },

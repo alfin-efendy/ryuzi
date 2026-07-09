@@ -216,7 +216,7 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
     },
   ];
   await useStore.getState().hydrateTranscript("s1", async () => {
-    // Simulates events landing while listMessages is in flight.
+    // Simulates an event landing while listMessages is in flight.
     useStore.getState().applyCoreEvent({
       kind: "message",
       session_pk: "s1",
@@ -228,24 +228,12 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
       status: null,
       tool_kind: null,
     });
-    useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "transient" });
     return dbRows;
   });
   const st = useStore.getState();
-  expect(st.transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3, 0]);
+  expect(st.transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3]);
   expect(st.transcripts.s1[2].text).toBe("live");
-  expect(st.transcripts.s1[3].blockType).toBe("error");
   expect(st.lastSeq.s1).toBe(3);
-});
-
-test("transient error events append a seq-0 error row", () => {
-  reset();
-  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "spawn failed" });
-  const rows = useStore.getState().transcripts.s1;
-  expect(rows).toHaveLength(1);
-  expect(rows[0].seq).toBe(0);
-  expect(rows[0].blockType).toBe("error");
-  expect(rows[0].text).toBe("spawn failed");
 });
 
 test("approval.requested adds a pending approval; resolving removes it", () => {
@@ -331,6 +319,73 @@ test("result event leaves other sessions' status untouched", () => {
   useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
   const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
   expect(byPk).toEqual({ s1: "idle", s2: "running" });
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("error event flips the failed session back to idle and leaves others untouched", () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1"), runningSession("s2")] });
+  // error also fires a fire-and-forget refresh(); stub its IPC calls (never
+  // resolving, like the "result" tests do) so nothing hits the real Tauri
+  // binding after this test ends.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "upstream quota exhausted" });
+  const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
+  expect(byPk).toEqual({ s1: "idle", s2: "running" });
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("error event triggers a refresh so the DB-side demotion lands in the UI", async () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const demoted = { ...runningSession("s1"), status: "idle" as const };
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [demoted] });
+
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "boom" });
+  // refresh() is fire-and-forget; let its microtasks flush.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(listProjects).toHaveBeenCalled();
+  expect(listSessions).toHaveBeenCalled();
+  expect(useStore.getState().sessions[0].status).toBe("idle");
+
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("error event appends no transient row — the durable error row arrives via the message event", () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
+
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "upstream quota exhausted" });
+  expect(useStore.getState().transcripts.s1 ?? []).toHaveLength(0);
+
+  // The backend persists the same text via emit_error and broadcasts it as a
+  // normal message row (role=system, block_type=error) — THAT renders it.
+  useStore.getState().applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 7,
+    role: "system",
+    block_type: "error",
+    payload: { message: "upstream quota exhausted" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+  const rows = useStore.getState().transcripts.s1;
+  expect(rows).toHaveLength(1);
+  expect(rows[0].blockType).toBe("error");
+  expect(rows[0].text).toBe("upstream quota exhausted");
+  expect(rows[0].seq).toBe(7);
+
   listProjects.mockRestore();
   listSessions.mockRestore();
 });
