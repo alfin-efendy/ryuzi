@@ -530,6 +530,22 @@ fn upstream_chat_path(desc: &ProviderDescriptor) -> &'static str {
     }
 }
 
+/// OpenAI's current generation (gpt-5.x / o-series) rejects `max_tokens` with
+/// HTTP 400 and requires `max_completion_tokens`. Applied post-translation at
+/// call sites that know the descriptor, so `translate` stays
+/// provider-agnostic. A no-op for every other provider (mimo, qwen, copilot,
+/// custom-openai, … all still speak `max_tokens`).
+pub(crate) fn apply_max_completion_tokens(desc: &ProviderDescriptor, body: &mut Value) {
+    if !desc.uses_max_completion_tokens {
+        return;
+    }
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(v) = obj.remove("max_tokens") {
+            obj.insert("max_completion_tokens".to_string(), v);
+        }
+    }
+}
+
 pub(crate) fn upstream_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
