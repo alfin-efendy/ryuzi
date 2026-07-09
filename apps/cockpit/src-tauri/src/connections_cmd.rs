@@ -96,6 +96,18 @@ pub struct ModelStatusInfo {
     pub tested_at: i64,
 }
 
+/// One persisted probe verdict row across ALL families — hydrates the
+/// app-wide model-status store consumed by every model picker.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatusEntry {
+    pub family: String,
+    pub model: String,
+    pub status: String,
+    pub message: String,
+    pub tested_at: i64,
+}
+
 /// One outcome line per refreshed connection — pure so it's testable
 /// without a Store or network.
 fn refresh_message(label: &str, outcome: &Result<usize, String>) -> (bool, String) {
@@ -595,6 +607,25 @@ pub async fn list_model_statuses(
     Ok(rows
         .into_iter()
         .map(|row| ModelStatusInfo {
+            model: row.model,
+            status: row.status,
+            message: row.message,
+            tested_at: row.tested_at,
+        })
+        .collect())
+}
+
+/// Every persisted probe verdict, unfiltered — the family-scoped
+/// `list_model_statuses` above stays for the provider Models card; this
+/// variant feeds the app-wide picker filter.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_all_model_statuses(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<ModelStatusEntry>> {
+    let rows = cp.store().list_all_model_statuses().await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ModelStatusEntry {
+            family: row.family,
             model: row.model,
             status: row.status,
             message: row.message,
