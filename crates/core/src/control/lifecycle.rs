@@ -806,6 +806,12 @@ impl ControlPlane {
         if let Some(handle) = handle {
             let _ = handle.cancel().await;
         }
+        // Deny any approval prompts still parked for this session so a
+        // stopped turn settles (pairing its tool_use with an error
+        // tool_result) instead of waiting forever on an answer that will
+        // never come. The native gate also observes the turn token; this
+        // covers the hub side and clears stale prompts.
+        self.approvals.resolve_session(session_pk, false);
         self.store
             .update_status(session_pk, SessionStatus::Interrupted, Some(now_ms()))
             .await?;

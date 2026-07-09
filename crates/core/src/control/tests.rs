@@ -806,6 +806,50 @@ async fn stop_immediately_after_start_is_registered() {
 
 #[tokio::test]
 #[serial]
+async fn stop_session_denies_this_sessions_parked_approvals_only() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    // A harness whose session blocks until cancelled, so the session stays
+    // Running with a live handle.
+    let cp = ControlPlane::new(store, registries(true)).await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+    let session = cp
+        .start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+    wait_for_running_handle(&cp, &session.session_pk).await;
+
+    // Two approvals parked for this session, one for an unrelated session.
+    let rx_a = cp
+        .approvals
+        .register_for_session(&session.session_pk, "tool-a".into());
+    let rx_b = cp
+        .approvals
+        .register_for_session(&session.session_pk, "tool-b".into());
+    let rx_other = cp
+        .approvals
+        .register_for_session("some-other-session", "tool-c".into());
+
+    cp.stop_session(&session.session_pk).await.unwrap();
+
+    assert!(
+        !rx_a.await.unwrap(),
+        "stop must deny this session's parked approval"
+    );
+    assert!(
+        !rx_b.await.unwrap(),
+        "stop must deny this session's parked approval"
+    );
+    // The unrelated session's approval is untouched and still resolvable.
+    assert!(cp.resolve_approval("tool-c", true));
+    assert!(rx_other.await.unwrap());
+}
+
+#[tokio::test]
+#[serial]
 async fn continue_reuses_the_live_session() {
     let _guard = StateDirGuard::new();
     let db = tempfile::NamedTempFile::new().unwrap();
