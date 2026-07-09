@@ -311,3 +311,35 @@ test("onCreateHint: clicking the hint row closes the popup, calls the callback, 
   await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
   expect(focusSpy).not.toHaveBeenCalled();
 });
+
+test("popupClassName lands on the popup element", async () => {
+  render(<Combobox options={few} popupClassName="min-w-[320px]" value={null} onValueChange={() => {}} aria-label="Fruit" />);
+  await openCombobox("Fruit");
+  const popup = document.querySelector('[data-slot="combobox-popup"]');
+  expect(popup).not.toBeNull();
+  expect(popup?.className).toContain("min-w-[320px]");
+  // The anchor-width default stays — popupClassName merges, it does not replace.
+  expect(popup?.className).toContain("w-[max(var(--anchor-width),11rem)]");
+});
+
+test("invalid option renders the warning tone and triangle icon; valid option does not", async () => {
+  const options: ComboboxOption[] = [
+    { value: "good-model", label: "good-model" },
+    { value: "bad-model", label: "bad-model", invalid: true },
+  ];
+  render(<Combobox options={options} value={null} onValueChange={() => {}} aria-label="Model" />);
+  await openCombobox("Model");
+  const bad = screen.getByRole("option", { name: "bad-model" });
+  expect(bad.querySelector(".text-amber-500")).not.toBeNull();
+  // Nothing is selected, so the only possible svg inside an option is the warning icon.
+  expect(bad.querySelector("svg")).not.toBeNull();
+  const good = screen.getByRole("option", { name: "good-model" });
+  expect(good.querySelector(".text-amber-500")).toBeNull();
+  expect(good.querySelector("svg")).toBeNull();
+});
+
+test("every option carries title={label} for hover-reveal of truncated ids", async () => {
+  render(<Combobox options={few} value={null} onValueChange={() => {}} aria-label="Fruit" />);
+  await openCombobox("Fruit");
+  expect(screen.getByRole("option", { name: /Apple/ }).getAttribute("title")).toBe("Apple");
+});
