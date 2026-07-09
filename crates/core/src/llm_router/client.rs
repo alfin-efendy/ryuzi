@@ -1029,6 +1029,85 @@ impl MessageStreamEvent {
     }
 }
 
+/// Outcome of probing the head of an attempt's event stream before anything
+/// has been handed to the consumer.
+enum StreamProbe {
+    /// Content (or a clean end) was observed — deliver `buffered` then `rest`.
+    Deliver {
+        buffered: Vec<anyhow::Result<AnthropicEvent>>,
+        rest: mpsc::Receiver<anyhow::Result<AnthropicEvent>>,
+    },
+    /// The stream failed before producing any content — safe to fail over.
+    Failover(UpstreamAttemptFailure),
+}
+
+/// Watch the first events of a freshly-started attempt stream. Nothing has
+/// been forwarded to the consumer yet, so an error arriving before the first
+/// content event (`content_block_start`/`content_block_delta`) can still be
+/// converted into an attempt failure and the next target tried. From the
+/// first content event on, the stream belongs to the consumer — later errors
+/// flow through verbatim (failing over then would duplicate output).
+async fn probe_stream_head(
+    provider: &str,
+    mut rx: mpsc::Receiver<anyhow::Result<AnthropicEvent>>,
+) -> StreamProbe {
+    let mut buffered: Vec<anyhow::Result<AnthropicEvent>> = Vec::new();
+    loop {
+        let Some(item) = rx.recv().await else {
+            // Ended without content and without an error event — a valid
+            // (empty) completion; deliver whatever arrived.
+            return StreamProbe::Deliver { buffered, rest: rx };
+        };
+        let error_message = match &item {
+            Err(e) => Some(e.to_string()),
+            Ok((name, data)) if name == "error" => Some(
+                data.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("upstream error")
+                    .to_string(),
+            ),
+            Ok(_) => None,
+        };
+        if let Some(message) = error_message {
+            return StreamProbe::Failover(UpstreamAttemptFailure::transport(provider, message));
+        }
+        let is_content = matches!(
+            &item,
+            Ok((name, _)) if name == "content_block_start" || name == "content_block_delta"
+        );
+        buffered.push(item);
+        if is_content {
+            return StreamProbe::Deliver { buffered, rest: rx };
+        }
+    }
+}
+
+/// Re-join a probed stream: emit the buffered head events, then forward the
+/// rest of the upstream receiver.
+fn deliver_probed(
+    buffered: Vec<anyhow::Result<AnthropicEvent>>,
+    mut rest: mpsc::Receiver<anyhow::Result<AnthropicEvent>>,
+) -> mpsc::Receiver<anyhow::Result<AnthropicEvent>> {
+    if buffered.is_empty() {
+        return rest;
+    }
+    let (tx, out) = mpsc::channel(64);
+    tokio::spawn(async move {
+        for item in buffered {
+            if tx.send(item).await.is_err() {
+                return;
+            }
+        }
+        while let Some(item) = rest.recv().await {
+            if tx.send(item).await.is_err() {
+                return;
+            }
+        }
+    });
+    out
+}
+
 /// Route + send an Anthropic-Messages-format request exactly like
 /// `/v1/messages` (stream forced on) and yield Anthropic SSE events. The
 /// returned channel closes when the upstream stream ends. Both Anthropic-
@@ -1036,9 +1115,12 @@ impl MessageStreamEvent {
 /// (request translated, chunks re-encoded via
 /// [`translate::OpenAiToAnthropicStream`]) produce the same event shape.
 ///
-/// Errors surfaced BEFORE streaming (routing miss, dead OAuth token, a non-2xx
-/// upstream status) fail the call directly; a mid-stream transport error is
-/// delivered as a trailing `Err` in the channel.
+/// Failover: errors surfaced BEFORE streaming (routing miss, dead OAuth
+/// token, transport send failure, non-2xx status) rotate to the next target,
+/// and each attempt's stream head is probed ([`probe_stream_head`]) so an
+/// error arriving before the first content event rotates too. Once content
+/// has been delivered, a later error is delivered in-stream — failing over
+/// then would duplicate output.
 pub async fn anthropic_messages_stream(
     ctx: &UpstreamCtx,
     body: Value,
@@ -1072,7 +1154,15 @@ pub async fn anthropic_messages_stream(
         // fallback target, matching the other providers' behavior.
         if target.conn.provider == "kiro" {
             match kiro_stream(ctx, &mut target, &attempt_body, started).await {
-                Ok(rx) => return Ok(rx),
+                Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
+                    StreamProbe::Deliver { buffered, rest } => {
+                        return Ok(deliver_probed(buffered, rest));
+                    }
+                    StreamProbe::Failover(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                },
                 Err(failure) => {
                     let try_next = should_try_next_target(&failure);
                     failures.push(failure);
@@ -1089,7 +1179,15 @@ pub async fn anthropic_messages_stream(
         // match via its own translation + upstream pipeline.
         if target.conn.provider == "openai-oauth" {
             match codex_stream(ctx, &mut target, &attempt_body, started).await {
-                Ok(rx) => return Ok(rx),
+                Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
+                    StreamProbe::Deliver { buffered, rest } => {
+                        return Ok(deliver_probed(buffered, rest));
+                    }
+                    StreamProbe::Failover(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                },
                 Err(failure) => {
                     let try_next = should_try_next_target(&failure);
                     failures.push(failure);
@@ -1144,7 +1242,15 @@ pub async fn anthropic_messages_stream(
                     )
                     .await;
                 });
-                return Ok(rx);
+                match probe_stream_head(&target.conn.provider, rx).await {
+                    StreamProbe::Deliver { buffered, rest } => {
+                        return Ok(deliver_probed(buffered, rest));
+                    }
+                    StreamProbe::Failover(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                }
             }
             ApiFormat::OpenAi => {
                 let upstream_body = translate::anthropic_to_openai_request(&attempt_body)?;
@@ -1184,7 +1290,15 @@ pub async fn anthropic_messages_stream(
                     )
                     .await;
                 });
-                return Ok(rx);
+                match probe_stream_head(&target.conn.provider, rx).await {
+                    StreamProbe::Deliver { buffered, rest } => {
+                        return Ok(deliver_probed(buffered, rest));
+                    }
+                    StreamProbe::Failover(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -1947,6 +2061,198 @@ mod tests {
         let events = collect_stream(rx).await;
 
         assert_eq!(stream_text(&events), "rotated");
+    }
+
+    /// 2xx stream that errors before any content event.
+    const SSE_ERROR_BEFORE_CONTENT: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+
+    /// 2xx stream that errors AFTER content already flowed.
+    const SSE_CONTENT_THEN_ERROR: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+
+    /// Two anthropic api_key accounts serving `claude-t`, first→/first,
+    /// second→/second on the given mock port.
+    async fn add_two_anthropic_accounts(ctx: &UpstreamCtx, port: u16) {
+        for (id, path) in [("first", "first"), ("second", "second")] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    "anthropic",
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some(format!("sk-{id}")),
+                        base_url_override: Some(format!("http://127.0.0.1:{port}/{path}")),
+                        models_override: Some(vec!["claude-t".into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_rotates_on_error_event_before_first_content() {
+        use axum::{routing::post, Router};
+
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_ERROR_BEFORE_CONTENT,
+                    )
+                }),
+            )
+            .route(
+                "/second/messages",
+                post(|| async { ([("content-type", "text/event-stream")], SSE_OK_STREAM) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        assert_eq!(stream_text(&events), "rotated");
+        assert!(
+            !events.iter().any(|(name, _)| name.as_str() == "error"),
+            "the first target's pre-content error must not leak to the consumer: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_rotate_after_first_content_token() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits_handler = second_hits.clone();
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_CONTENT_THEN_ERROR,
+                    )
+                }),
+            )
+            .route(
+                "/second/messages",
+                post(move || {
+                    let hits = second_hits_handler.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        ([("content-type", "text/event-stream")], SSE_OK_STREAM)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        assert_eq!(stream_text(&events), "partial");
+        assert!(
+            events
+                .iter()
+                .any(|(name, data)| name.as_str() == "error"
+                    && data["error"]["message"] == "Overloaded"),
+            "post-content errors surface to the consumer instead of rotating: {events:?}"
+        );
+        assert_eq!(
+            second_hits.load(Ordering::SeqCst),
+            0,
+            "must not fail over once content has been delivered"
+        );
+    }
+
+    /// When every target's stream errors before any content, the call
+    /// returns `Err` (the aggregated fallback error) instead of handing back
+    /// a stream that would carry the last target's error event verbatim.
+    #[tokio::test]
+    async fn stream_returns_err_when_every_target_fails_pre_content() {
+        use axum::{routing::post, Router};
+
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_ERROR_BEFORE_CONTENT,
+                    )
+                }),
+            )
+            .route(
+                "/second/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_ERROR_BEFORE_CONTENT,
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+
+        let err = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Overloaded"),
+            "expected the aggregated fallback error to mention both attempts' failures: {err}"
+        );
     }
 
     #[test]
