@@ -43,19 +43,21 @@ builds:
       - -p=ryuzi-cli
 
 archives:
-  # Deliberate cut-over break (design §10): triple-based names that the
-  # in-field TS self-updater can never match, and that MUST agree
-  # byte-for-byte with crates/core/src/update/asset.rs::asset_name.
+  # Names are the target triple minus `-unknown` ("platform tag") and MUST
+  # agree byte-for-byte with crates/core/src/update/asset.rs::asset_name.
+  # This deliberately broke ryuzi <= 0.6.0 self-updaters (they look up
+  # `-unknown-` names, find nothing, and stay silent) — same cut-over
+  # pattern as the earlier goos/goarch break (design §10).
   - id: default
     ids: [ryuzi, ryuzi-darwin]
     formats: [tar.gz]
-    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Target }}"
+    name_template: '{{ .ProjectName }}-{{ .Version }}-{{ replace .Target "-unknown" "" }}'
     files: [README*]
 
   - id: musl
     ids: [ryuzi-musl]
     formats: [tar.gz]
-    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Target }}"
+    name_template: '{{ .ProjectName }}-{{ .Version }}-{{ replace .Target "-unknown" "" }}'
     files: [README*]
 
 checksum:
