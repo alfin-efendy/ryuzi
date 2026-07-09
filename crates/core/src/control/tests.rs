@@ -1594,6 +1594,109 @@ async fn continue_session_cold_resume_failure_rolls_back_to_idle() {
     );
 }
 
+/// A `HarnessSession` whose `send_prompt` always fails — models an upstream
+/// LLM error (e.g. quota exhaustion) surfacing from the harness turn. Pure
+/// in-process fake: spawns no subprocesses.
+struct ErrSendSession;
+
+#[async_trait]
+impl HarnessSession for ErrSendSession {
+    async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
+        anyhow::bail!("upstream quota exhausted")
+    }
+    async fn cancel(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn end(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn agent_session_id(&self) -> Option<String> {
+        None
+    }
+}
+
+struct ErrSendHarness;
+
+#[async_trait]
+impl Harness for ErrSendHarness {
+    async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+        Ok(Box::new(ErrSendSession))
+    }
+}
+
+struct ErrSendHarnessFactory;
+impl HarnessFactory for ErrSendHarnessFactory {
+    fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+        Ok(Arc::new(ErrSendHarness))
+    }
+}
+
+#[tokio::test]
+async fn failed_turn_persists_a_durable_error_row_and_demotes_before_the_bus_error() {
+    let (_db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let mut regs = Registries::new();
+    regs.harness
+        .register("native", Arc::new(ErrSendHarnessFactory));
+    let cp = ControlPlane::new(store, regs).await;
+    seed_project(&cp.store, "p1").await;
+    seed_session(
+        &cp.store,
+        "s1",
+        "p1",
+        SessionStatus::Idle,
+        Some("acp-123"),
+        0,
+    )
+    .await;
+
+    // Subscribe BEFORE driving the turn so the bus-terminal Error is caught.
+    let mut rx = cp.subscribe();
+    // Cold-resume succeeds (the factory works) — the failure happens inside
+    // the fire-and-forget `spawn_prompt` turn, so this call itself is Ok.
+    cp.continue_session("s1", "hi", &[]).await.unwrap();
+
+    // The turn error must be persisted as a DURABLE transcript row
+    // (role=system, block_type=error) — today it is broadcast-only and
+    // vanishes on app reload.
+    let row = wait_for_message(&cp.store, "s1", |m| m.block_type == "error").await;
+    assert_eq!(row.role, "system");
+    assert_eq!(
+        row.payload["message"].as_str().unwrap_or(""),
+        "upstream quota exhausted"
+    );
+
+    // Bus order: the durable row's Message event precedes the terminal Error
+    // (the UI appends the row on Message, then flips status on Error), and by
+    // the time Error is observed the DB row is already demoted Running→Idle
+    // (a subscriber that refreshes on Error must never read a stale Running).
+    let mut saw_error_row = false;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(CoreEvent::Message {
+                session_pk,
+                block_type,
+                ..
+            })) if session_pk == "s1" && block_type == "error" => saw_error_row = true,
+            Ok(Ok(CoreEvent::Error {
+                session_pk,
+                message,
+            })) if session_pk == "s1" => {
+                assert!(
+                    saw_error_row,
+                    "durable error row must be broadcast before the terminal Error"
+                );
+                assert_eq!(message, "upstream quota exhausted");
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            other => panic!("expected CoreEvent::Error on the bus, got: {other:?}"),
+        }
+    }
+    let s = cp.store.get_session("s1").await.unwrap().unwrap();
+    assert_eq!(s.status, SessionStatus::Idle, "must not be stuck Running");
+}
+
 // ---------- Task 3: attachments wired into start/continue_session ----------
 
 fn text_attachment(url: &str) -> AttachmentRef {

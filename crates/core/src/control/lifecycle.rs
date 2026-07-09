@@ -702,7 +702,10 @@ impl ControlPlane {
     /// Drive a prompt on `handle` in the background. `send_prompt` blocks until
     /// the turn completes (ACP `EndTurn`); on completion we atomically demote
     /// `Running → Idle` (unless the session was already Interrupted/Ended) and
-    /// broadcast a `Result`. Errors surface as `CoreEvent::Error`.
+    /// broadcast a `Result`. Errors are persisted as a durable error row
+    /// (via `emit_error`), the row is demoted Running→Idle, and only then
+    /// does the bus-terminal `CoreEvent::Error` fire — mirroring
+    /// `fail_startup`'s ordering.
     ///
     /// The `handle` is the PERSISTENT live session — the same handle inserted
     /// into `running` by `start_harness_session` and reused across
@@ -754,11 +757,23 @@ impl ControlPlane {
                     });
                 }
                 Err(e) => {
+                    let message = e.to_string();
+                    // Persist the turn error as a DURABLE transcript row
+                    // (role=system, block_type=error) so it survives an app
+                    // reload — the bus-terminal broadcast below is transient.
+                    // emit_error also re-broadcasts the row as a normal
+                    // Message event, which is what live UIs render (the UI's
+                    // "error" handler no longer appends its own transient
+                    // copy). Mirrors `fail_startup`.
+                    me.emit_error(&session_pk, &message).await;
+                    // Demote BEFORE the broadcast so a subscriber that
+                    // refreshes on Error (the UI does) never reads a stale
+                    // Running row.
+                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                     let _ = me.events.send(CoreEvent::Error {
                         session_pk: session_pk.clone(),
-                        message: e.to_string(),
+                        message,
                     });
-                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                 }
             }
         });
