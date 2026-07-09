@@ -1734,3 +1734,130 @@ async fn messages_streaming_fails_over_pre_stream_to_next_connection() {
 
     srv.stop().await;
 }
+
+#[tokio::test]
+async fn openai_target_gets_max_completion_tokens_while_custom_openai_keeps_max_tokens() {
+    use axum::{routing::post, Json, Router};
+    use std::sync::Mutex;
+
+    fn ok_completion(model: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": "chatcmpl-mock", "object": "chat.completion", "model": model,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "pong"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })
+    }
+
+    let captured: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap_openai = captured.clone();
+    let cap_custom = captured.clone();
+    let app = Router::new()
+        .route(
+            "/openai/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap_openai.clone();
+                async move {
+                    cap.lock()
+                        .unwrap()
+                        .push(("openai".to_string(), body.clone()));
+                    Json(ok_completion(body["model"].clone()))
+                }
+            }),
+        )
+        .route(
+            "/custom/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap_custom.clone();
+                async move {
+                    cap.lock()
+                        .unwrap()
+                        .push(("custom".to_string(), body.clone()));
+                    Json(ok_completion(body["model"].clone()))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let (_, path) = tmp.keep().unwrap();
+    let store = Arc::new(Store::open(&path).await.unwrap());
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "real-openai".into(),
+            provider: "openai".into(),
+            auth_type: "api_key".into(),
+            label: "openai".into(),
+            priority: 0,
+            enabled: true,
+            data: connections::ConnectionData {
+                api_key: Some("sk-oai".into()),
+                base_url_override: Some(format!("http://127.0.0.1:{up_port}/openai")),
+                models_override: Some(vec!["gpt-5.2".into()]),
+                ..Default::default()
+            },
+            created_at: 1,
+            updated_at: 1,
+        },
+    )
+    .await
+    .unwrap();
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "custom".into(),
+            provider: "custom-openai".into(),
+            auth_type: "api_key".into(),
+            label: "custom".into(),
+            priority: 1,
+            enabled: true,
+            data: connections::ConnectionData {
+                api_key: Some("sk-custom".into()),
+                base_url_override: Some(format!("http://127.0.0.1:{up_port}/custom")),
+                models_override: Some(vec!["mock-model".into()]),
+                ..Default::default()
+            },
+            created_at: 1,
+            updated_at: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let key = keys::create_key(&store, "test").await.unwrap();
+    let srv = RouterServer::new(store.clone());
+    let port = srv.start(0).await.unwrap();
+    std::mem::forget(srv);
+
+    let client = reqwest::Client::new();
+    let r1 = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", &key.key)
+        .json(&json!({"model": "openai/gpt-5.2", "max_tokens": 64,
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    let r2 = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", &key.key)
+        .json(
+            &json!({"model": "custom-openai/mock-model", "max_tokens": 64,
+                      "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+
+    let seen = captured.lock().unwrap().clone();
+    let openai_body = &seen.iter().find(|(who, _)| who == "openai").unwrap().1;
+    assert_eq!(openai_body["max_completion_tokens"], 64);
+    assert!(openai_body.get("max_tokens").is_none());
+    let custom_body = &seen.iter().find(|(who, _)| who == "custom").unwrap().1;
+    assert_eq!(custom_body["max_tokens"], 64);
+    assert!(custom_body.get("max_completion_tokens").is_none());
+}

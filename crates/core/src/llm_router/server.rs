@@ -337,10 +337,15 @@ async fn handle_messages(
                 }
             }
             ApiFormat::OpenAi => {
-                let upstream_body = match translate::anthropic_to_openai_request(&attempt_body) {
+                let mut upstream_body = match translate::anthropic_to_openai_request(&attempt_body)
+                {
                     Ok(b) => b,
                     Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e.to_string()),
                 };
+                crate::llm_router::client::apply_max_completion_tokens(
+                    target.desc,
+                    &mut upstream_body,
+                );
                 if stream {
                     let ctx = RecordCtx {
                         conn_id: target.conn.id.clone(),
