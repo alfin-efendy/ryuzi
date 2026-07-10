@@ -836,16 +836,16 @@ async fn stop_session_denies_this_sessions_parked_approvals_only() {
     cp.stop_session(&session.session_pk).await.unwrap();
 
     assert!(
-        !rx_a.await.unwrap(),
+        !rx_a.await.unwrap().allowed(),
         "stop must deny this session's parked approval"
     );
     assert!(
-        !rx_b.await.unwrap(),
+        !rx_b.await.unwrap().allowed(),
         "stop must deny this session's parked approval"
     );
     // The unrelated session's approval is untouched and still resolvable.
     assert!(cp.resolve_approval("tool-c", true));
-    assert!(rx_other.await.unwrap());
+    assert!(rx_other.await.unwrap().allowed());
 }
 
 #[tokio::test]

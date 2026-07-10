@@ -922,9 +922,9 @@ pub async fn run_prompt_with_permission(
                     // Register with the hub, then resolve immediately (binary 3A
                     // path: hub is already wired before the request arrives).
                     let rx = hub.register(request_id.clone());
-                    hub.resolve(&request_id, allow);
+                    hub.resolve_bool(&request_id, allow);
 
-                    let got_allow = rx.await.unwrap_or(false);
+                    let got_allow = rx.await.map(|r| r.allowed()).unwrap_or(false);
                     let decision = if got_allow {
                         crate::domain::ApprovalDecision::AllowOnce
                     } else {
@@ -1627,7 +1627,7 @@ pub async fn run_perm_mock_via_harness(
                         // The bridge calls hub.register(..) right after emitting the
                         // event; retry briefly so we don't race ahead of it.
                         for _ in 0..200 {
-                            if hub_for_resolver.resolve(&request_id, true) {
+                            if hub_for_resolver.resolve_bool(&request_id, true) {
                                 break;
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(1)).await;

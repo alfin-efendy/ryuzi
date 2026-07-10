@@ -241,12 +241,10 @@ async fn run_client_loop(
                     });
 
                     let rx = hub.register(request_id.clone());
-                    let got_allow = rx.await.unwrap_or(false);
-                    let decision = if got_allow {
-                        crate::domain::ApprovalDecision::AllowOnce
-                    } else {
-                        crate::domain::ApprovalDecision::RejectOnce
-                    };
+                    let decision = rx
+                        .await
+                        .map(|r| r.decision)
+                        .unwrap_or(crate::domain::ApprovalDecision::RejectOnce);
                     let response =
                         crate::harness::acp::permission::map_response(&request, decision);
                     responder.respond(response)

@@ -72,13 +72,12 @@ pub async fn evaluate(
         // Turn stopped while parked: deny, and deregister the abandoned
         // prompt so a later resolve() can't hit a stale entry.
         _ = cancel.cancelled() => {
-            approvals.resolve(tool_call_id, false);
+            approvals.resolve_bool(tool_call_id, false);
             PermDecision::Deny
         }
         res = rx => match res {
-            Ok(true) => PermDecision::Allow,
-            // Explicit deny, or the sender was dropped (session ended) — deny.
-            Ok(false) | Err(_) => PermDecision::Deny,
+            Ok(resp) if resp.allowed() => PermDecision::Allow,
+            Ok(_) | Err(_) => PermDecision::Deny,
         },
     }
 }
@@ -196,7 +195,7 @@ mod tests {
                     request_id, tool, ..
                 } => {
                     assert_eq!(tool, "bash");
-                    hub2.resolve(&request_id, true);
+                    hub2.resolve_bool(&request_id, true);
                 }
                 other => panic!("unexpected event {other:?}"),
             }
@@ -223,7 +222,7 @@ mod tests {
         let hub2 = hub.clone();
         tokio::spawn(async move {
             if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
-                hub2.resolve(&request_id, false);
+                hub2.resolve_bool(&request_id, false);
             }
         });
         let d = evaluate(

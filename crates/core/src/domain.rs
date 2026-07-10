@@ -199,7 +199,7 @@ pub struct ApprovalRequest {
 }
 
 /// The user's decision on a tool-approval request. Mirrors ACP permission kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub enum ApprovalDecision {
     AllowOnce,
@@ -207,6 +207,63 @@ pub enum ApprovalDecision {
     RejectOnce,
     RejectAlways,
     Cancel,
+}
+
+/// What a pending approval is asking the user for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovalKind {
+    /// Permission to run one tool call.
+    Tool,
+    /// Review of an `exitplanmode` plan.
+    Plan,
+    /// An `askuserquestion` form.
+    Question,
+}
+
+/// Where an `AllowAlways`/`RejectAlways` decision is remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovalScope {
+    /// In-memory for the current session only.
+    Session,
+    /// Persisted to the project's `tool_policies` row.
+    Project,
+}
+
+/// The user's full reply to an approval request. `payload` carries
+/// kind-specific data: `{"mode": "acceptEdits"|"default"}` or
+/// `{"feedback": "…"}` for Plan, `{"answers": {question: [labels]}}`
+/// for Question.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalResponse {
+    pub decision: ApprovalDecision,
+    pub scope: Option<ApprovalScope>,
+    pub payload: Option<serde_json::Value>,
+}
+
+impl ApprovalResponse {
+    /// The plain binary reply (`resolve_bool`, bulk session deny, gateways).
+    pub fn once(allow: bool) -> Self {
+        ApprovalResponse {
+            decision: if allow {
+                ApprovalDecision::AllowOnce
+            } else {
+                ApprovalDecision::RejectOnce
+            },
+            scope: None,
+            payload: None,
+        }
+    }
+
+    /// Whether the decision grants the request.
+    pub fn allowed(&self) -> bool {
+        matches!(
+            self.decision,
+            ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
+        )
+    }
 }
 
 /// A persisted transcript entry. Forward-compatible with ACP session/update blocks.

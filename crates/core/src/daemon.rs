@@ -993,7 +993,7 @@ mod tests {
                 summary: "ls -la".into(),
             });
             let rx = self.approvals.register(request_id);
-            let allow = rx.await.unwrap_or(false);
+            let allow = rx.await.map(|r| r.allowed()).unwrap_or(false);
             if allow {
                 let _ = self
                     .store

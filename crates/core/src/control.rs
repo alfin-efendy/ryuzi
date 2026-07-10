@@ -169,7 +169,7 @@ impl ControlPlane {
     }
 
     pub fn resolve_approval(&self, request_id: &str, allow: bool) -> bool {
-        let resolved = self.approvals.resolve(request_id, allow);
+        let resolved = self.approvals.resolve_bool(request_id, allow);
         let name = if allow {
             "approval.allow"
         } else {
