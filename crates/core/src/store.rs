@@ -1476,6 +1476,14 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a settings row. A missing key is a no-op.
+    pub async fn delete_setting_raw(&self, key: &str) -> anyhow::Result<()> {
+        let key = key.to_string();
+        self.with_conn(move |c| c.execute("DELETE FROM settings WHERE key = ?1", params![key]))
+            .await?;
+        Ok(())
+    }
+
     /// List all persisted settings rows.
     pub async fn list_settings(&self) -> anyhow::Result<Vec<(String, String)>> {
         self.with_conn(|c| -> rusqlite::Result<Vec<(String, String)>> {
@@ -1942,6 +1950,20 @@ mod tests {
             created_at: Some(123),
             is_git: false,
         }
+    }
+
+    #[tokio::test]
+    async fn delete_setting_raw_removes_the_row_and_tolerates_missing_keys() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .set_setting_raw("discord.token", "secret")
+            .await
+            .unwrap();
+        store.delete_setting_raw("discord.token").await.unwrap();
+        assert_eq!(store.get_setting_raw("discord.token").await.unwrap(), None);
+        // Deleting a key that doesn't exist is a no-op, not an error.
+        store.delete_setting_raw("discord.token").await.unwrap();
     }
 
     #[tokio::test]
