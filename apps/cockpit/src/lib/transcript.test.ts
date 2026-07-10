@@ -8,9 +8,12 @@ import {
   groupRows,
   mergeToolRow,
   messageToRow,
+  partitionActivity,
+  STREAMING_TAIL,
   toolCardHeader,
   toolInputSummary,
   turnDurationMs,
+  type ActivityFragment,
   type Row,
   type TurnBlock,
 } from "./transcript";
@@ -483,4 +486,86 @@ test("formatToolDuration", () => {
   expect(formatToolDuration(36000)).toBe("36s");
   expect(formatToolDuration(239000)).toBe("3m 59s");
   expect(formatToolDuration(null)).toBe("");
+});
+
+function toolItem(key: string, status: string, over: Partial<Extract<ActivityItem, { type: "tool" }>> = {}) {
+  return {
+    type: "tool" as const,
+    key,
+    name: "read",
+    kind: "read",
+    status,
+    output: null,
+    path: null,
+    input: null,
+    durationMs: null,
+    exitCode: null,
+    summary: null,
+    ...over,
+  };
+}
+const statusItem = (key: string, text: string) => ({ type: "status" as const, key, text });
+
+test("liveTail keeps the last 3 visible and folds the rest with the full run length", () => {
+  const items = [1, 2, 3, 4, 5].map((n) => toolItem(`t${n}`, "completed"));
+  const frags = partitionActivity(items, true);
+  expect(frags[0]).toEqual({ kind: "fold", items: items.slice(0, 2), runLength: 5 });
+  expect(frags.slice(1)).toEqual(items.slice(2).map((item) => ({ kind: "item", item })));
+});
+
+test("liveTail with 3 or fewer items folds nothing", () => {
+  const items = [1, 2, 3].map((n) => toolItem(`t${n}`, "completed"));
+  expect(partitionActivity(items, true)).toEqual(items.map((item) => ({ kind: "item", item })));
+});
+
+test("an in-progress tool never folds and splits the fold", () => {
+  const items = [
+    toolItem("t1", "completed"),
+    toolItem("t2", "in_progress"),
+    toolItem("t3", "completed"),
+    toolItem("t4", "completed"),
+    toolItem("t5", "completed"),
+    toolItem("t6", "completed"),
+  ];
+  const frags = partitionActivity(items, true);
+  // t1 folds; t2 standalone (in-progress); t3 folds; t4-t6 are the tail.
+  expect(frags).toEqual([
+    { kind: "fold", items: [items[0]], runLength: 6 },
+    { kind: "item", item: items[1] },
+    { kind: "fold", items: [items[2]], runLength: 6 },
+    { kind: "item", item: items[3] },
+    { kind: "item", item: items[4] },
+    { kind: "item", item: items[5] },
+  ]);
+});
+
+test("pending counts as in-progress; failed folds", () => {
+  const items = [
+    toolItem("t1", "failed"),
+    toolItem("t2", "pending"),
+    toolItem("t3", "completed"),
+    toolItem("t4", "completed"),
+    toolItem("t5", "completed"),
+    toolItem("t6", "completed"),
+  ];
+  const frags = partitionActivity(items, false);
+  expect(frags).toEqual([
+    { kind: "fold", items: [items[0]], runLength: 6 },
+    { kind: "item", item: items[1] },
+    { kind: "fold", items: [items[2], items[3], items[4], items[5]], runLength: 6 },
+  ]);
+});
+
+test("idle branch folds everything, including the most recent items", () => {
+  const items = [1, 2, 3, 4].map((n) => toolItem(`t${n}`, "completed"));
+  expect(partitionActivity(items, false)).toEqual([{ kind: "fold", items, runLength: 4 }]);
+});
+
+test("status items fold like completed tools", () => {
+  const items = [statusItem("s1", "compacting"), toolItem("t1", "completed")];
+  expect(partitionActivity(items, false)).toEqual([{ kind: "fold", items, runLength: 2 }]);
+});
+
+test("empty input yields no fragments", () => {
+  expect(partitionActivity([], true)).toEqual([]);
 });
