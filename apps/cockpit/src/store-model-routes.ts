@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { toast } from "sonner";
 import { commands, type CmdError, type ModelRouteInfo, type Result } from "./bindings";
+import { useRuntimes } from "./store-runtimes";
 
 type ModelRoutesState = {
   routes: ModelRouteInfo[];
@@ -13,6 +14,10 @@ type ModelRoutesState = {
 function apply(set: (patch: Partial<ModelRoutesState>) => void, res: Result<ModelRouteInfo[], CmdError>, action: string): boolean {
   if (res.status === "ok") {
     set({ routes: res.data, loaded: true });
+    // Route aliases feed the native runtime's selectable models
+    // (selectable_native_models on the Rust side), so refresh the runtime
+    // list — fire-and-forget so saving never blocks on it.
+    void useRuntimes.getState().reloadList();
     return true;
   }
   toast.error(`${action} failed: ${res.error.message}`);
