@@ -208,9 +208,13 @@ function AgentLoopCard() {
       if (raw.trim() !== "") toast.error(`Enter a whole number of at least ${min}.`);
       return;
     }
+    const prev = values[key] ?? "";
     setValues((cur) => ({ ...cur, [key]: normalized }));
     const res = await commands.setSetting(key, normalized);
-    if (res.status === "error") toast.error("Couldn't save setting: " + res.error.message);
+    if (res.status === "error") {
+      setValues((cur) => ({ ...cur, [key]: prev }));
+      toast.error("Couldn't save setting: " + res.error.message);
+    }
   };
 
   return (
