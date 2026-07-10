@@ -165,14 +165,16 @@ struct CodexPluginInterface {
 
 #[async_trait::async_trait]
 trait RepoCloner {
-    async fn clone_repo(&self, source: &ParsedSkillSource, dest: &Path) -> Result<()>;
+    /// Clone `source` into `dest`. Returns the resolved commit SHA when it can
+    /// be determined (`None` for test doubles that don't produce a git repo).
+    async fn clone_repo(&self, source: &ParsedSkillSource, dest: &Path) -> Result<Option<String>>;
 }
 
 struct GitRepoCloner;
 
 #[async_trait::async_trait]
 impl RepoCloner for GitRepoCloner {
-    async fn clone_repo(&self, source: &ParsedSkillSource, dest: &Path) -> Result<()> {
+    async fn clone_repo(&self, source: &ParsedSkillSource, dest: &Path) -> Result<Option<String>> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg("clone")
             .arg("--depth")
@@ -184,14 +186,28 @@ impl RepoCloner for GitRepoCloner {
             .output()
             .await
             .with_context(|| format!("failed to spawn git clone for {}", source.repo))?;
-        if output.status.success() {
-            return Ok(());
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                bail!("git clone failed for {}", source.repo);
+            }
+            bail!("git clone failed for {}: {}", source.repo, stderr);
         }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            bail!("git clone failed for {}", source.repo);
-        }
-        bail!("git clone failed for {}: {}", source.repo, stderr);
+        // The clone still has `.git` at this point; `copy_dir_recursive`
+        // strips it later when the tree is installed. Resolve HEAD now while
+        // it's still available.
+        let head = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(dest)
+            .arg("rev-parse")
+            .arg("HEAD")
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        Ok(head)
     }
 }
 
@@ -226,7 +242,8 @@ async fn install_skill_source_with(
     let source = parse_skill_source(source)?;
     let temp = tempfile::tempdir()?;
     let repo_dir = temp.path().join("repo");
-    cloner.clone_repo(&source, &repo_dir).await?;
+    // Bound but unused until a later task threads it into the install ledger.
+    let _commit = cloner.clone_repo(&source, &repo_dir).await?;
     let discovered = discover_install_target(&repo_dir, &source)?;
     match discovered {
         Discovery::Single(skill) => install_single_skill(roots, &source, skill),
@@ -1020,6 +1037,59 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Stable content hash of an installed tree. Walks files in sorted order,
+/// hashing each file's relative path and bytes, so the same content always
+/// yields the same digest regardless of install location. Excludes `.git`
+/// (stripped by `copy_dir_recursive` anyway) and `PROVENANCE_FILE` (written
+/// AFTER fingerprinting — including it would make every live-dir comparison a
+/// false mismatch). Symlinks/special files are ignored, matching
+/// `copy_dir_recursive`.
+///
+/// Not yet called from production code — a later task wires it into the
+/// install ledger for local-edit detection. Allow dead-code on this pair
+/// until then so clippy stays clean; both are exercised directly by
+/// `fingerprint_is_stable_and_excludes_git_and_stamp` below.
+#[allow(dead_code)]
+pub(crate) fn fingerprint_dir(dir: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    collect_files_rel(dir, dir, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (rel, path) in files {
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("failed to read {} for fingerprint", path.display()))?;
+        hasher.update(rel.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update([0u8]);
+        hasher.update(&bytes);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+#[allow(dead_code)]
+fn collect_files_rel(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)?.filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == ".git" || name == std::ffi::OsStr::new(PROVENANCE_FILE) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_files_rel(base, &path, out)?;
+        } else if path.is_file() {
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, path));
+        }
+    }
+    Ok(())
+}
+
 fn checked_child(root: &Path, id: &str) -> Result<PathBuf> {
     if !is_safe_id(id) {
         bail!("unsafe install id: {id}");
@@ -1083,16 +1153,22 @@ mod tests {
 
     struct FakeRepoCloner {
         repos: BTreeMap<String, PathBuf>,
+        commit: Option<String>,
     }
 
     #[async_trait::async_trait]
     impl RepoCloner for FakeRepoCloner {
-        async fn clone_repo(&self, source: &ParsedSkillSource, dest: &Path) -> Result<()> {
+        async fn clone_repo(
+            &self,
+            source: &ParsedSkillSource,
+            dest: &Path,
+        ) -> Result<Option<String>> {
             let repo = self
                 .repos
                 .get(&source.repo)
                 .ok_or_else(|| anyhow!("missing fake repo for {}", source.repo))?;
-            copy_dir_recursive(repo, dest)
+            copy_dir_recursive(repo, dest)?;
+            Ok(self.commit.clone())
         }
     }
 
@@ -1165,7 +1241,10 @@ mod tests {
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let pack = install_skill_source_with("https://github.com/acme/my-skill", &roots, &cloner)
             .await
@@ -1313,7 +1392,10 @@ mod tests {
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let pack = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -1407,7 +1489,10 @@ path = "skills/brainstorming"
             "https://github.com/obra/superpowers".to_string(),
             repo.path().to_path_buf(),
         );
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let pack = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -1485,7 +1570,10 @@ path = "skills/brainstorming"
             "https://github.com/obra/superpowers".to_string(),
             repo.path().to_path_buf(),
         );
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let pack = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -1556,7 +1644,10 @@ path = "bundled/brainstorming"
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let pack = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -1634,7 +1725,10 @@ path = 123
         let mut repos = BTreeMap::new();
         repos.insert(source.repo.clone(), repo.path().to_path_buf());
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let install_err = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -1675,7 +1769,10 @@ path = 123
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let pack = install_skill_source_with("acme/toolbox", &roots, &cloner)
             .await
@@ -1727,7 +1824,10 @@ path = 123
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -1786,7 +1886,10 @@ path = 123
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let installed = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -1848,7 +1951,10 @@ path = 123
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let installed = install_skill_source_with("acme/skill-pack", &roots, &cloner)
             .await
@@ -1898,7 +2004,10 @@ path = 123
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let installed = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -1956,7 +2065,10 @@ path = 123
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let installed = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -2010,7 +2122,10 @@ path = 123
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let installed = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -2087,7 +2202,10 @@ path = 123
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -2190,7 +2308,10 @@ path = "skills/focus"
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -2265,7 +2386,10 @@ path = "skills/focus"
             repo.path().to_path_buf(),
         );
         let roots = InstallRoots::new(config.path().to_path_buf());
-        let cloner = FakeRepoCloner { repos };
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
 
         let installed = install_skill_source_with("superpowers", &roots, &cloner)
             .await
@@ -2345,5 +2469,28 @@ path = "skills/focus"
         assert_eq!(listed[0].id, "mindpowers");
         assert_eq!(listed[0].plugin_id.as_deref(), Some("mindpowers"));
         assert_eq!(listed[0].skill_count, 1);
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_excludes_git_and_stamp() {
+        let a = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(a.path().join("skills/x")).unwrap();
+        std::fs::write(a.path().join("skills/x/SKILL.md"), "hello").unwrap();
+        let fp1 = fingerprint_dir(a.path()).unwrap();
+
+        // Same content in a different dir → same fingerprint.
+        let b = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(b.path().join("skills/x")).unwrap();
+        std::fs::write(b.path().join("skills/x/SKILL.md"), "hello").unwrap();
+        // Noise that must NOT affect the fingerprint:
+        std::fs::create_dir_all(b.path().join(".git")).unwrap();
+        std::fs::write(b.path().join(".git/config"), "junk").unwrap();
+        std::fs::write(b.path().join(PROVENANCE_FILE), "{\"source\":\"x\"}").unwrap();
+        let fp2 = fingerprint_dir(b.path()).unwrap();
+        assert_eq!(fp1, fp2);
+
+        // Changed content → different fingerprint.
+        std::fs::write(b.path().join("skills/x/SKILL.md"), "changed").unwrap();
+        assert_ne!(fp1, fingerprint_dir(b.path()).unwrap());
     }
 }
