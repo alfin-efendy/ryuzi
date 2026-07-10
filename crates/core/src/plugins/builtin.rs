@@ -61,7 +61,6 @@ pub fn discord_plugin() -> CorePlugin {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         },
         harness: None,
         gateway,

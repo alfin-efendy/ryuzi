@@ -2578,7 +2578,6 @@ fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CoreP
         }],
         skills: vec![],
         provider: None,
-        runtime: None,
     };
     crate::plugins::declarative::declarative_plugin(manifest, crate::plugins::PluginSource::Builtin)
         .expect("test manifest must validate")

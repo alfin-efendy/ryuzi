@@ -36,7 +36,6 @@ fn minimal_manifest(id: &str, name: &str) -> PluginManifest {
         mcp: vec![],
         skills: vec![],
         provider: None,
-        runtime: None,
     }
 }
 
@@ -255,6 +254,18 @@ fn real_binary_registers_and_disables_the_discord_plugin() {
         .assert()
         .success()
         .stdout(predicate::str::contains("disabled discord"));
+}
+
+#[test]
+fn enable_native_errors_because_it_is_always_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("t.sqlite");
+    let (code, _out, errs) = run(&db, &["plugins", "enable", "native"]);
+    assert_ne!(code, 0);
+    assert!(
+        errs.iter().any(|l| l.contains("always enabled")),
+        "stderr: {errs:?}"
+    );
 }
 
 #[test]

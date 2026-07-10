@@ -267,7 +267,7 @@ fn derive_kind(plugin: &CorePlugin) -> Option<&'static str> {
     if plugin.manifest.provider.is_some() {
         return Some("provider");
     }
-    if plugin.harness.is_some() || plugin.manifest.runtime.is_some() {
+    if plugin.harness.is_some() {
         return None;
     }
     if matches!(plugin.source, PluginSource::SkillPack(_)) {
@@ -1523,7 +1523,7 @@ mod tests {
     use ryuzi_core::gateway::{Gateway, GatewayFactory};
     use ryuzi_core::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
     use ryuzi_core::Registries;
-    use ryuzi_plugin_sdk::{AuthSpec, ModelDef, PluginManifest, ProviderMeta, RuntimeMeta};
+    use ryuzi_plugin_sdk::{AuthSpec, ModelDef, PluginManifest, ProviderMeta};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1637,7 +1637,6 @@ mod tests {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         }
     }
 
@@ -1668,23 +1667,6 @@ mod tests {
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
             source: PluginSource::SkillPack(std::path::PathBuf::from("/tmp/whatever")),
-        }
-    }
-
-    fn manifest_only_with_runtime_meta(id: &str) -> CorePlugin {
-        CorePlugin {
-            manifest: PluginManifest {
-                runtime: Some(RuntimeMeta {
-                    binary: Some("acme".to_string()),
-                    npm_package: None,
-                    default_model: None,
-                }),
-                ..manifest(id)
-            },
-            harness: None,
-            gateway: None,
-            connector: None,
-            source: PluginSource::Builtin,
         }
     }
 
@@ -1719,14 +1701,6 @@ mod tests {
     #[test]
     fn capabilities_runtime_from_live_harness() {
         assert_eq!(harness_only("h").capabilities(), vec!["runtime"]);
-    }
-
-    #[test]
-    fn capabilities_runtime_from_manifest_only_runtime_meta() {
-        assert_eq!(
-            manifest_only_with_runtime_meta("r").capabilities(),
-            vec!["runtime"]
-        );
     }
 
     #[test]
@@ -1772,7 +1746,6 @@ mod tests {
         assert_eq!(derive_kind(&gateway_only("discord")), Some("gateway"));
         assert_eq!(derive_kind(&connector_only("slack")), Some("integration"));
         assert_eq!(derive_kind(&harness_only("native")), None);
-        assert_eq!(derive_kind(&manifest_only_with_runtime_meta("codex")), None);
     }
 
     #[test]

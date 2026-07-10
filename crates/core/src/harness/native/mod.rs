@@ -286,7 +286,6 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         },
         harness: Some(Arc::new(NativeHarnessFactory::with_llm_factory(
             llm_factory,

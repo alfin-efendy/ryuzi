@@ -35,17 +35,14 @@ fn daemon_process_reaches_running_then_exits_cleanly_on_sigterm() {
         .to_path_buf();
 
     // Seed settings BEFORE spawning: empty enabled_gateways (zero-gateway
-    // daemon) and empty enabled_runtimes (no external harness — the daemon
-    // must never build an adapter or touch the network on this path). The
-    // Store is opened and dropped here so the child owns the only live
-    // handle.
+    // daemon). The Store is opened and dropped here so the child owns the
+    // only live handle.
     {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
             settings.set("enabled_gateways", "").await.unwrap();
-            settings.set("enabled_runtimes", "").await.unwrap();
             settings.set("auto_update", "off").await.unwrap();
         });
     }

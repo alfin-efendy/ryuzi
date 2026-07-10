@@ -1242,7 +1242,6 @@ name = "Meta Only"
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         };
         assert!(declarative_plugin(manifest, PluginSource::Catalog).is_err());
     }

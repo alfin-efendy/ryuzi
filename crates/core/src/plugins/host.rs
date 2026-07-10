@@ -133,10 +133,7 @@ pub struct CorePlugin {
 
 impl CorePlugin {
     /// Which of the four extension axes this plugin advertises. `runtime`
-    /// counts both a live `HarnessFactory` (native/claude-code) AND a
-    /// manifest-only `RuntimeMeta` (a CLI-agent catalog entry with no
-    /// in-process factory) — the same distinction `runtimes_meta` draws
-    /// between the two.
+    /// means a live `HarnessFactory` (the native runtime).
     ///
     /// Single source of truth for `ryuzi_core::serve`'s `GET /plugins`
     /// endpoint, the Cockpit `list_plugins`/`plugin_detail` commands, and
@@ -147,7 +144,7 @@ impl CorePlugin {
         if self.manifest.provider.is_some() {
             caps.push("provider");
         }
-        if self.harness.is_some() || self.manifest.runtime.is_some() {
+        if self.harness.is_some() {
             caps.push("runtime");
         }
         if self.gateway.is_some() {
@@ -202,7 +199,8 @@ impl PluginHost {
 
     /// Whether `id` is enabled, in priority order:
     /// - unknown id → `false`
-    /// - harness-capable → the `enabled_runtimes` CSV setting contains `id`
+    /// - harness-capable → always `true` (the native runtime cannot be
+    ///   disabled)
     /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
     /// - experimental → always `false` (see below)
     /// - manifest-only (no harness/gateway/connector capability) → always
@@ -214,8 +212,8 @@ impl PluginHost {
             return Ok(false);
         };
         if plugin.harness.is_some() {
-            let enabled = csv(settings.get("enabled_runtimes").await?.as_deref());
-            return Ok(enabled.iter().any(|r| r == id));
+            // The native runtime is the only harness and is always enabled.
+            return Ok(true);
         }
         if plugin.gateway.is_some() {
             let enabled = csv(settings.get("enabled_gateways").await?.as_deref());
@@ -426,7 +424,6 @@ mod tests {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         }
     }
 
@@ -563,19 +560,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn is_enabled_harness_capability_follows_enabled_runtimes() {
+    async fn is_enabled_harness_capability_is_always_true() {
         let (_store, settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
         host.add(harness_only("native"));
-
-        // A fresh `Store` now seeds `enabled_runtimes = "native"` by default
-        // (migration #13, ryuzi-only defaults) — clear it first so the "off
-        // by default" half of this toggle test still holds, mirroring how
-        // `is_enabled_gateway_capability_follows_enabled_gateways` deliberately
-        // avoids the gateway seed default.
-        settings.set("enabled_runtimes", "").await.unwrap();
-        assert!(!host.is_enabled(&settings, "native").await.unwrap());
-        settings.set("enabled_runtimes", "native").await.unwrap();
         assert!(host.is_enabled(&settings, "native").await.unwrap());
     }
 

@@ -14,10 +14,10 @@
 //! harness code in `harness::native`; `discord` lives here since
 //! `gateway::discord` is data/protocol-only.
 //!
-//! [`providers`] and [`runtimes_meta`] generate manifest-only plugins from
-//! two existing static catalogs (`llm_router::registry::CATALOG` and
-//! `runtimes::CATALOG`) rather than hand-authoring one manifest per entry.
-//! [`install_builtins`] adds all of them in one call.
+//! [`providers`] generates manifest-only plugins from the static provider
+//! catalog (`llm_router::registry::CATALOG`) rather than hand-authoring one
+//! manifest per entry. [`install_builtins`] adds them plus the embedded
+//! catalog in one call.
 
 pub mod builtin;
 pub mod catalog;
@@ -25,34 +25,27 @@ pub mod declarative;
 pub mod host;
 pub mod oauth;
 pub mod providers;
-pub mod runtimes_meta;
 
 use crate::settings::{csv, SettingsStore};
 
 pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Add every generated manifest-only builtin — every model provider
-/// ([`providers::provider_plugins`]) and every CLI agent
-/// ([`runtimes_meta::cli_agent_plugins`]) — plus the embedded integration
-/// catalog ([`catalog::catalog_plugins`]) to `regs`.
+/// ([`providers::provider_plugins`]) — plus the embedded integration catalog
+/// ([`catalog::catalog_plugins`]) to `regs`.
 ///
 /// This deliberately does NOT add `native` or `discord`: those carry
 /// host-injected config (a gateway factory) that only the composition root
 /// can supply, so hosts add them first and call `install_builtins`
-/// afterward (see `runtimes_meta`'s module doc for why `native` is skipped
-/// from the CLI-agent catalog for exactly this reason — it would otherwise
-/// collide with the harness plugin).
+/// afterward.
 ///
 /// The catalog is added last: `Registries::add_plugin` keeps the first
-/// registration for a colliding id, so providers and CLI agents (added
-/// above) always win over a same-id catalog entry, and both of those always
-/// lose to `native`/`discord` (added by the composition root before calling
-/// this function).
+/// registration for a colliding id, so providers (added above) always win
+/// over a same-id catalog entry, and both of those always lose to
+/// `native`/`discord` (added by the composition root before calling this
+/// function).
 pub fn install_builtins(regs: &mut Registries) {
     for plugin in providers::provider_plugins() {
-        regs.add_plugin(plugin);
-    }
-    for plugin in runtimes_meta::cli_agent_plugins() {
         regs.add_plugin(plugin);
     }
     for plugin in catalog::catalog_plugins() {
@@ -178,7 +171,7 @@ pub(crate) fn load_skill_pack_plugins_from(
 /// `set_plugin_enabled` command, so the write side can never drift from
 /// [`PluginHost::is_enabled`]'s read side:
 /// - unknown id → an error (`"unknown plugin: {id}"`)
-/// - harness-capable → add/remove `id` in the `enabled_runtimes` CSV setting
+/// - harness-capable → an error (the native runtime is always enabled)
 /// - gateway-capable → add/remove `id` in the `enabled_gateways` CSV setting
 /// - experimental (docs-only, no capability) → an error, since
 ///   `is_enabled` always reports it disabled regardless of any
@@ -199,7 +192,7 @@ pub async fn toggle_enabled(
         anyhow::bail!("unknown plugin: {id}");
     };
     if plugin.harness.is_some() {
-        return toggle_csv(settings, "enabled_runtimes", id, enable).await;
+        anyhow::bail!("{id} is always enabled");
     }
     if plugin.gateway.is_some() {
         return toggle_csv(settings, "enabled_gateways", id, enable).await;
@@ -343,7 +336,6 @@ mod toggle_enabled_tests {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         }
     }
 
@@ -404,36 +396,14 @@ mod toggle_enabled_tests {
     }
 
     #[tokio::test]
-    async fn harness_capable_toggles_enabled_runtimes_csv_without_duplicating() {
+    async fn harness_capable_toggle_errors_because_native_is_always_enabled() {
         let (settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
-        // Deliberately not "native" — a fresh store seeds
-        // `enabled_runtimes = "native"`, which would defeat the "off by
-        // default" half of this test.
-        host.add(harness_only("claude-code"));
-
-        toggle_enabled(&host, &settings, "claude-code", true)
+        host.add(harness_only("native"));
+        let err = toggle_enabled(&host, &settings, "native", false)
             .await
-            .unwrap();
-        assert_eq!(
-            settings.get("enabled_runtimes").await.unwrap().as_deref(),
-            Some("native,claude-code")
-        );
-        // enabling again must not duplicate the entry
-        toggle_enabled(&host, &settings, "claude-code", true)
-            .await
-            .unwrap();
-        assert_eq!(
-            settings.get("enabled_runtimes").await.unwrap().as_deref(),
-            Some("native,claude-code")
-        );
-        toggle_enabled(&host, &settings, "claude-code", false)
-            .await
-            .unwrap();
-        assert_eq!(
-            settings.get("enabled_runtimes").await.unwrap().as_deref(),
-            Some("native")
-        );
+            .unwrap_err();
+        assert_eq!(err.to_string(), "native is always enabled");
     }
 
     #[tokio::test]
@@ -737,7 +707,7 @@ mod install_builtins_tests {
     use super::*;
 
     #[test]
-    fn install_builtins_adds_every_provider_and_cli_agent_id() {
+    fn install_builtins_adds_every_provider_id() {
         let mut regs = Registries::new();
         install_builtins(&mut regs);
         let ids: Vec<String> = regs
@@ -751,18 +721,6 @@ mod install_builtins_tests {
             assert!(
                 ids.contains(&d.id.to_string()),
                 "missing provider plugin for {}",
-                d.id
-            );
-        }
-        for d in crate::runtimes::CATALOG {
-            if d.id == crate::harness::native::NATIVE_ID
-                || crate::llm_router::registry::descriptor(d.id).is_some()
-            {
-                continue; // claimed elsewhere — see `runtimes_meta`'s module doc
-            }
-            assert!(
-                ids.contains(&d.id.to_string()),
-                "missing cli-agent plugin for {}",
                 d.id
             );
         }
@@ -795,16 +753,11 @@ mod install_builtins_tests {
         );
 
         // 2 pre-registered (native, discord) + every provider + every
-        // runtimes-catalog entry EXCEPT `native` (already registered above,
-        // under the same id, by the harness plugin) and `ollama` (already
-        // covered by the `ollama` model-provider plugin — see
-        // `runtimes_meta`'s module doc) + every embedded integration-catalog
-        // entry (`catalog::CATALOG_MANIFESTS`, disjoint from all of the
-        // above by construction — see `catalog`'s own collision test).
-        let expected = 2
-            + crate::llm_router::registry::CATALOG.len()
-            + (crate::runtimes::CATALOG.len() - 2)
-            + catalog::CATALOG_MANIFESTS.len();
+        // embedded integration-catalog entry (`catalog::CATALOG_MANIFESTS`,
+        // disjoint from all of the above by construction — see `catalog`'s
+        // own collision test).
+        let expected =
+            2 + crate::llm_router::registry::CATALOG.len() + catalog::CATALOG_MANIFESTS.len();
         assert_eq!(
             ids.len(),
             expected,
