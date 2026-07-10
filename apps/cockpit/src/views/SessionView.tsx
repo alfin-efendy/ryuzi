@@ -5,6 +5,9 @@ import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSectio
 import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
+import { useUi } from "@/store-ui";
+import { joinPath, toRepoRelative } from "@/lib/paths";
+import { FileOpenContext } from "@/components/transcript/Markdown";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
@@ -63,6 +66,25 @@ export function SessionView() {
   const stopVoice = useRef<(() => void) | null>(null);
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
+  const ui = useUi();
+  const sessionPk = session?.sessionPk;
+  // Chat file-link click: resolve against the session workdir, verify the
+  // file exists (jailed — silently ignore misses), open as a right-panel dock
+  // tab (same mechanism as the review panel's "open in Files").
+  const openChatFile = useCallback(
+    async (path: string) => {
+      if (!sessionPk) return;
+      const wd = await commands.sessionWorkdir(sessionPk);
+      if (wd.status !== "ok") return;
+      const rel = toRepoRelative(path, wd.data);
+      const exists = await commands.fileExists(sessionPk, rel);
+      if (exists.status !== "ok" || !exists.data) return;
+      ui.openFile(joinPath(wd.data, rel));
+      ui.setRight(true);
+      nav.setRightTab("file");
+    },
+    [sessionPk, ui, nav],
+  );
   const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
   const runtimes = useRuntimes((s) => s.runtimes);
   const project = projects.find((p) => p.projectId === session?.projectId);
@@ -256,19 +278,21 @@ export function SessionView() {
         <TodoPanel sessionPk={session.sessionPk} running={running} />
 
         {/* Transcript */}
-        <Transcript
-          sessionPk={session.sessionPk}
-          rows={rows}
-          agentName={agent?.name ?? "Agent"}
-          agentColor={agent?.color ?? "var(--muted-foreground)"}
-          running={running}
-        >
-          {pendingForSession.map((a, i) => (
-            <div key={a.requestId} className="px-4 pb-2">
-              <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
-            </div>
-          ))}
-        </Transcript>
+        <FileOpenContext.Provider value={openChatFile}>
+          <Transcript
+            sessionPk={session.sessionPk}
+            rows={rows}
+            agentName={agent?.name ?? "Agent"}
+            agentColor={agent?.color ?? "var(--muted-foreground)"}
+            running={running}
+          >
+            {pendingForSession.map((a, i) => (
+              <div key={a.requestId} className="px-4 pb-2">
+                <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
+              </div>
+            ))}
+          </Transcript>
+        </FileOpenContext.Provider>
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">

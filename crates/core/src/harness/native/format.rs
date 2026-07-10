@@ -19,13 +19,14 @@ pub async fn maybe_format(path: &Path) -> Option<String> {
         | "yaml" | "yml" => ("prettier", vec!["--write".into(), p]),
         _ => return None,
     };
-    let status = tokio::process::Command::new(cmd)
+    let mut command = tokio::process::Command::new(cmd);
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+        .stderr(Stdio::null());
+    crate::process_util::no_window(&mut command);
+    let status = command.status().await;
     match status {
         Ok(s) if s.success() => Some(cmd.to_string()),
         _ => None, // tool missing or failed — skip silently

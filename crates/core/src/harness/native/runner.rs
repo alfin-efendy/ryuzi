@@ -181,7 +181,15 @@ pub async fn run_turn(
         cancel: cancel.clone(),
         depth: 0,
     });
-    drive(deps, &agent, &mut cm, &cancel, Some(spawn), true).await?;
+    drive(
+        deps,
+        &agent,
+        &mut cm,
+        &cancel,
+        Some(spawn),
+        DisplayMode::Full,
+    )
+    .await?;
 
     // 4. Best-effort: give a fresh session a generated title.
     maybe_generate_title(deps, &prompt.display).await;
@@ -365,17 +373,42 @@ async fn maybe_generate_title(deps: &RunnerDeps, first_prompt: &str) {
     }
 }
 
+/// What a [`drive`] loop persists/streams to the transcript.
+#[derive(Clone, Debug, PartialEq)]
+enum DisplayMode {
+    /// Parent turn: text, thoughts, tools, notices, context usage.
+    Full,
+    /// Sub-agent: only tool rows, tagged with the sub-agent's label. Text,
+    /// thinking, notices, and context usage stay internal (the report arrives
+    /// via the parent's `task` tool output).
+    ToolsOnly { label: String },
+}
+
+impl DisplayMode {
+    /// Text/thought/notice/context/compaction rows are shown (parent only).
+    fn text(&self) -> bool {
+        matches!(self, DisplayMode::Full)
+    }
+    /// Sub-agent attribution label for tool rows, if any.
+    fn subagent(&self) -> Option<&str> {
+        match self {
+            DisplayMode::ToolsOnly { label } => Some(label),
+            DisplayMode::Full => None,
+        }
+    }
+}
+
 /// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
-/// `emit_display` gates persistence of display rows (off for sub-agents so
-/// their internal steps don't clutter the parent transcript). Returns the
-/// final assistant text.
+/// `display` gates persistence of display rows: sub-agents stream only their
+/// tool rows (tagged with their label) so their text/thinking stay internal.
+/// Returns the final assistant text.
 async fn drive(
     deps: &RunnerDeps,
     agent: &Agent,
     cm: &mut ContextManager,
     cancel: &CancellationToken,
     spawn: Option<Arc<dyn SubagentSpawner>>,
-    emit_display: bool,
+    display: DisplayMode,
 ) -> anyhow::Result<String> {
     let system = match &agent.prompt {
         Some(p) => p.clone(),
@@ -422,10 +455,10 @@ async fn drive(
                 "mid_turn"
             };
             match cm.compact(&deps.llm, &model, trigger).await {
-                Ok(outcome) => emit_compaction(deps, trigger, &outcome, emit_display).await,
+                Ok(outcome) => emit_compaction(deps, trigger, &outcome, display.text()).await,
                 Err(e) => {
                     tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
-                    if emit_display {
+                    if display.text() {
                         emit_row(
                             deps,
                             "system",
@@ -467,7 +500,7 @@ async fn drive(
             Ok(rx) => rx,
             Err(e) if is_context_overflow(&e.to_string()) => {
                 cm.mark_full();
-                emit_context_usage(deps, cm, emit_display).await;
+                emit_context_usage(deps, cm, display.text()).await;
                 anyhow::bail!(
                     "context window exceeded — send another message and the session \
                      will compact before retrying: {e}"
@@ -487,10 +520,10 @@ async fn drive(
             let ev = match item {
                 Ok(ev) => ev,
                 Err(e) => {
-                    flush_text(deps, &mut text_buf, emit_display).await;
+                    flush_text(deps, &mut text_buf, display.text()).await;
                     if is_context_overflow(&e.to_string()) {
                         cm.mark_full();
-                        emit_context_usage(deps, cm, emit_display).await;
+                        emit_context_usage(deps, cm, display.text()).await;
                         anyhow::bail!(
                             "context window exceeded — send another message and the session \
                              will compact before retrying: {e}"
@@ -507,11 +540,11 @@ async fn drive(
                     turn.text.push_str(&text);
                     text_buf.push_str(&text);
                     if text_buf.len() >= TEXT_FLUSH_BYTES || text_buf.contains('\n') {
-                        flush_text(deps, &mut text_buf, emit_display).await;
+                        flush_text(deps, &mut text_buf, display.text()).await;
                     }
                 }
                 MessageStreamEvent::ThinkingDelta { text, .. } => {
-                    if emit_display {
+                    if display.text() {
                         emit_row(
                             deps,
                             "assistant",
@@ -569,10 +602,10 @@ async fn drive(
                     );
                 }
                 MessageStreamEvent::Error(msg) => {
-                    flush_text(deps, &mut text_buf, emit_display).await;
+                    flush_text(deps, &mut text_buf, display.text()).await;
                     if is_context_overflow(&msg) {
                         cm.mark_full();
-                        emit_context_usage(deps, cm, emit_display).await;
+                        emit_context_usage(deps, cm, display.text()).await;
                         anyhow::bail!(
                             "context window exceeded — send another message and the session \
                              will compact before retrying: {msg}"
@@ -587,9 +620,9 @@ async fn drive(
                 MessageStreamEvent::ContentBlockStop { .. } => {}
             }
         }
-        flush_text(deps, &mut text_buf, emit_display).await;
+        flush_text(deps, &mut text_buf, display.text()).await;
         cm.commit_response();
-        emit_context_usage(deps, cm, emit_display).await;
+        emit_context_usage(deps, cm, display.text()).await;
         if !turn.text.is_empty() {
             final_text = turn.text.clone();
         }
@@ -630,7 +663,7 @@ async fn drive(
                 }
                 break;
             }
-            results.push(run_tool_call(deps, agent, t, emit_display, &spawn, cancel).await);
+            results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
         }
         cm.append_tool_results(results).await?;
 
@@ -638,7 +671,7 @@ async fn drive(
             return Ok(final_text);
         }
     }
-    if emit_display {
+    if display.text() {
         emit_row(
             deps,
             "system",
@@ -808,7 +841,8 @@ impl RunnerSpawner {
                 ),
             });
         }
-        // No display rows, no memory access; history is ephemeral.
+        // Tool rows only (tagged with the sub-agent label), no memory access;
+        // history is ephemeral.
         let mut child_deps = self.deps.clone();
         child_deps.memory = None;
         child_deps.agent = child.clone();
@@ -831,7 +865,10 @@ impl RunnerSpawner {
         {
             return result(SubtaskStatus::Error, e.to_string());
         }
-        match drive(&child_deps, &child, &mut cm, &cancel, child_spawn, false).await {
+        let display = DisplayMode::ToolsOnly {
+            label: spec.agent_type.clone(),
+        };
+        match drive(&child_deps, &child, &mut cm, &cancel, child_spawn, display).await {
             Ok(text) if cancel.is_cancelled() => {
                 result(SubtaskStatus::Interrupted, cap_report(&text))
             }
@@ -882,17 +919,15 @@ async fn run_tool_call(
     deps: &RunnerDeps,
     agent: &Agent,
     t: &ToolAccum,
-    emit_display: bool,
+    display: &DisplayMode,
     spawn: &Option<Arc<dyn SubagentSpawner>>,
     cancel: &CancellationToken,
 ) -> Value {
     let input = t.parsed_input();
     let Some(tool) = deps.tools.get(&t.name) else {
         let msg = format!("unknown tool `{}`", t.name);
-        if emit_display {
-            insert_tool_row(deps, t, &input, "unknown").await;
-            finish_tool_row(deps, &t.id, &msg, true).await;
-        }
+        insert_tool_row(deps, t, &input, "unknown", display.subagent()).await;
+        finish_tool_row(deps, &t.id, &msg, true).await;
         return tool_result(&t.id, &msg, true);
     };
     // Enforce the agent's tool allow-list.
@@ -901,15 +936,11 @@ async fn run_tool_call(
             "tool `{}` is not permitted for the `{}` agent",
             t.name, agent.name
         );
-        if emit_display {
-            insert_tool_row(deps, t, &input, tool.kind()).await;
-            finish_tool_row(deps, &t.id, &msg, true).await;
-        }
+        insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await;
+        finish_tool_row(deps, &t.id, &msg, true).await;
         return tool_result(&t.id, &msg, true);
     }
-    if emit_display {
-        insert_tool_row(deps, t, &input, tool.kind()).await;
-    }
+    insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await;
 
     // Plugin hooks: a `tool.before` hook may deny the call.
     let hook = super::hooks::run(
@@ -922,9 +953,7 @@ async fn run_tool_call(
         let msg = hook
             .message
             .unwrap_or_else(|| "blocked by plugin hook".to_string());
-        if emit_display {
-            finish_tool_row(deps, &t.id, &msg, true).await;
-        }
+        finish_tool_row(deps, &t.id, &msg, true).await;
         return tool_result(&t.id, &msg, true);
     }
 
@@ -956,9 +985,7 @@ async fn run_tool_call(
         } else {
             "Denied by user"
         };
-        if emit_display {
-            finish_tool_row(deps, &t.id, msg, true).await;
-        }
+        finish_tool_row(deps, &t.id, msg, true).await;
         return tool_result(&t.id, msg, true);
     }
 
@@ -994,37 +1021,37 @@ async fn run_tool_call(
     };
     match tool.execute(&ctx, input).await {
         Ok(out) => {
-            if emit_display {
-                let display = merge_display_duration(out.display, elapsed_ms(started));
-                finish_tool_row_with_display(
-                    deps,
-                    &t.id,
-                    &out.for_model,
-                    out.is_error,
-                    Some(display),
-                )
+            let extras = merge_display_duration(out.display, elapsed_ms(started));
+            finish_tool_row_with_display(deps, &t.id, &out.for_model, out.is_error, Some(extras))
                 .await;
-            }
             tool_result(&t.id, &out.for_model, out.is_error)
         }
         Err(e) => {
             let msg = format!("{}: {e}", t.name);
-            if emit_display {
-                let display = merge_display_duration(None, elapsed_ms(started));
-                finish_tool_row_with_display(deps, &t.id, &msg, true, Some(display)).await;
-            }
+            let extras = merge_display_duration(None, elapsed_ms(started));
+            finish_tool_row_with_display(deps, &t.id, &msg, true, Some(extras)).await;
             tool_result(&t.id, &msg, true)
         }
     }
 }
 
 /// Insert the initial `tool_call` row (`{name, input}`, in_progress).
-async fn insert_tool_row(deps: &RunnerDeps, t: &ToolAccum, input: &Value, kind: &str) {
+async fn insert_tool_row(
+    deps: &RunnerDeps,
+    t: &ToolAccum,
+    input: &Value,
+    kind: &str,
+    subagent: Option<&str>,
+) {
+    let mut payload = json!({ "name": t.name, "input": input });
+    if let Some(label) = subagent {
+        payload["subagent"] = json!(label);
+    }
     emit_row(
         deps,
         "assistant",
         "tool_call",
-        json!({ "name": t.name, "input": input }),
+        payload,
         Some(t.id.clone()),
         Some("in_progress".to_string()),
         Some(kind.to_string()),
@@ -1396,6 +1423,17 @@ mod tests {
     use super::*;
     use crate::domain::CoreEvent;
     use crate::store::Store;
+
+    #[test]
+    fn display_mode_gating() {
+        let full = DisplayMode::Full;
+        let sub = DisplayMode::ToolsOnly {
+            label: "explore".into(),
+        };
+        assert!(full.text() && full.subagent().is_none());
+        assert!(!sub.text());
+        assert_eq!(sub.subagent(), Some("explore"));
+    }
 
     async fn deps_at(dir: &std::path::Path, llm: Arc<dyn LlmStream>) -> RunnerDeps {
         let tmp = tempfile::NamedTempFile::new().unwrap();

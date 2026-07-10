@@ -120,6 +120,7 @@ function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "tool" }
       ) : (
         <span className="min-w-0 flex-1" />
       )}
+      {item.subagent !== null && <Badge>{item.subagent}</Badge>}
       {duration !== "" && <Badge>{duration}</Badge>}
       {item.exitCode !== null && <Badge tone={item.exitCode === 0 ? "muted" : "error"}>exit {item.exitCode}</Badge>}
       <StatusMark status={item.status} />

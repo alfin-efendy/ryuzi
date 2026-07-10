@@ -31,6 +31,8 @@ export type Row = {
   toolExitCode: number | null;
   /** One-line display summary (payload.summary — todo/task/memory tools). */
   toolSummary: string | null;
+  /** Sub-agent label when this tool ran inside a dispatched sub-agent (payload.subagent). */
+  toolSubagent: string | null;
 };
 
 export type RowAttachment = { name: string; path: string; contentType: string | null; size: number };
@@ -48,6 +50,7 @@ export type ActivityItem =
       durationMs: number | null;
       exitCode: number | null;
       summary: string | null;
+      subagent: string | null;
     }
   | { type: "status"; key: string; text: string };
 
@@ -139,6 +142,7 @@ export function messageToRow(
     toolDurationMs: blockType === "tool_call" && typeof p.duration_ms === "number" ? p.duration_ms : null,
     toolExitCode: blockType === "tool_call" && typeof p.exit_code === "number" ? p.exit_code : null,
     toolSummary: blockType === "tool_call" && typeof p.summary === "string" && p.summary ? p.summary : null,
+    toolSubagent: blockType === "tool_call" && typeof p.subagent === "string" && p.subagent ? p.subagent : null,
   };
 }
 
@@ -155,6 +159,7 @@ export function mergeToolRow(prev: Row, payload: unknown, status: string | null,
     toolDurationMs: typeof p.duration_ms === "number" ? p.duration_ms : prev.toolDurationMs,
     toolExitCode: typeof p.exit_code === "number" ? p.exit_code : prev.toolExitCode,
     toolSummary: typeof p.summary === "string" && p.summary ? p.summary : prev.toolSummary,
+    toolSubagent: typeof p.subagent === "string" && p.subagent ? p.subagent : prev.toolSubagent,
   };
 }
 
@@ -201,6 +206,7 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
               durationMs: row.toolDurationMs,
               exitCode: row.toolExitCode,
               summary: row.toolSummary,
+              subagent: row.toolSubagent,
             }
           : { type: "status", key, text: row.text };
       if (item.type === "status" && !item.text.trim()) return;

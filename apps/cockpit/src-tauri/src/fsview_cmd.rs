@@ -69,6 +69,27 @@ pub async fn session_workdir(cp: State<'_, Arc<ControlPlane>>, session_pk: Strin
         .into_owned())
 }
 
+/// Whether `rel` names an existing regular file inside the session's
+/// working tree. Jailed like every fsview path: absolute paths and `..`
+/// escapes are simply "not found" (false), never an error — chat file-links
+/// must fail silent.
+#[tauri::command]
+#[specta::specta]
+pub async fn file_exists(
+    cp: State<'_, Arc<ControlPlane>>,
+    session_pk: String,
+    rel: String,
+) -> R<bool> {
+    let root = session_root(&cp, &session_pk).await?;
+    let Ok(path) = fsview::jail(&root, &rel) else {
+        return Ok(false);
+    };
+    Ok(tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false))
+}
+
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeState {

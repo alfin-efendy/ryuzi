@@ -310,6 +310,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             apps_cmd::toggle_app_agent,
             fsview_cmd::list_dir,
             fsview_cmd::session_workdir,
+            fsview_cmd::file_exists,
             fsview_cmd::worktree_dirty,
             fsview_cmd::git_diff,
             fsview_cmd::search_files,

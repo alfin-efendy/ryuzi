@@ -17,6 +17,7 @@ pub mod orch;
 pub mod paths;
 pub mod plugins;
 pub mod policy;
+pub mod process_util;
 pub mod registry;
 pub mod router;
 pub mod runtime_config;

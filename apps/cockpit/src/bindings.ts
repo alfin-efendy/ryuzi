@@ -436,6 +436,20 @@ async sessionWorkdir(sessionPk: string) : Promise<Result<string, CmdError>> {
 }
 },
 /**
+ * Whether `rel` names an existing regular file inside the session's
+ * working tree. Jailed like every fsview path: absolute paths and `..`
+ * escapes are simply "not found" (false), never an error — chat file-links
+ * must fail silent.
+ */
+async fileExists(sessionPk: string, rel: string) : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("file_exists", { sessionPk, rel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * What the session's OWN worktree would lose on teardown — the archive flow
  * asks before discarding either kind of work. Sessions whose worktree is
  * gone (or isn't a repo, e.g. an emptied leftover dir) report clean —

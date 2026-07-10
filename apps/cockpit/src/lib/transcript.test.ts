@@ -32,6 +32,7 @@ const row = (partial: Partial<Row>): Row => ({
   toolDurationMs: null,
   toolExitCode: null,
   toolSummary: null,
+  toolSubagent: null,
   ...partial,
 });
 
@@ -101,6 +102,7 @@ test("consecutive tool_call/status rows cluster into one activity group", () => 
       durationMs: null,
       exitCode: null,
       summary: null,
+      subagent: null,
     },
     { type: "status", key: "s2", text: "wrote a.txt" },
     {
@@ -115,6 +117,7 @@ test("consecutive tool_call/status rows cluster into one activity group", () => 
       durationMs: null,
       exitCode: null,
       summary: null,
+      subagent: null,
     },
   ]);
 });
@@ -483,4 +486,26 @@ test("formatToolDuration", () => {
   expect(formatToolDuration(36000)).toBe("36s");
   expect(formatToolDuration(239000)).toBe("3m 59s");
   expect(formatToolDuration(null)).toBe("");
+});
+
+test("sub-agent tool rows carry their subagent label through to activity items", () => {
+  const r = messageToRow(
+    5,
+    "assistant",
+    "tool_call",
+    { name: "grep", input: { pattern: "x" }, subagent: "explore" },
+    "tc-1",
+    "in_progress",
+    "search",
+    null,
+  );
+  expect(r.toolSubagent).toBe("explore");
+  const groups = groupRows([r]);
+  if (groups[0].type !== "activity" || groups[0].items[0].type !== "tool") throw new Error("expected a tool item");
+  expect(groups[0].items[0].subagent).toBe("explore");
+});
+
+test("parent tool rows have no subagent label", () => {
+  const r = messageToRow(6, "assistant", "tool_call", { name: "bash", input: {} }, "tc-2", "completed", "execute", null);
+  expect(r.toolSubagent).toBeNull();
 });

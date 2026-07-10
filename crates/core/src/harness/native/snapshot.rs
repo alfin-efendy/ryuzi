@@ -11,13 +11,13 @@ use std::path::Path;
 use std::process::Stdio;
 
 async fn git(work_dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new("git")
-        .args(args)
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
         .current_dir(work_dir)
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await?;
+        .stderr(Stdio::null());
+    crate::process_util::no_window(&mut cmd);
+    let out = cmd.output().await?;
     if !out.status.success() {
         anyhow::bail!("git {:?} failed", args);
     }
