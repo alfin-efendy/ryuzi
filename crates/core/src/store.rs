@@ -1017,11 +1017,7 @@ impl Store {
 
     /// Set one session's permission mode (per-session override; the project
     /// row is only the default seed for NEW sessions).
-    pub async fn update_session_perm_mode(
-        &self,
-        pk: &str,
-        mode: PermMode,
-    ) -> anyhow::Result<()> {
+    pub async fn update_session_perm_mode(&self, pk: &str, mode: PermMode) -> anyhow::Result<()> {
         let pk = pk.to_string();
         let pk_for_err = pk.clone();
         let rows = self
@@ -2388,10 +2384,7 @@ mod tests {
             .update_session_perm_mode("does-not-exist", PermMode::AcceptEdits)
             .await
             .expect_err("updating a missing session must surface an error");
-        assert!(
-            err.to_string().contains("does-not-exist"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("does-not-exist"), "{err}");
     }
 
     #[tokio::test]

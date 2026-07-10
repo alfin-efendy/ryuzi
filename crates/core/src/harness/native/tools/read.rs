@@ -90,7 +90,11 @@ impl Tool for Read {
         let resolved = match jail(&ctx.work_dir, path) {
             Ok(p) => p,
             Err(primary_err) => {
-                match ctx.attachments_dir.as_deref().and_then(|root| jail(root, path).ok()) {
+                match ctx
+                    .attachments_dir
+                    .as_deref()
+                    .and_then(|root| jail(root, path).ok())
+                {
                     Some(p) => p,
                     None => return Ok(ToolOutput::error(primary_err.to_string())),
                 }
@@ -129,7 +133,10 @@ impl Tool for Read {
             }
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             return Ok(ToolOutput {
-                for_model: format!("[image {path} ({media_type}, {} bytes) attached]", meta.len()),
+                for_model: format!(
+                    "[image {path} ({media_type}, {} bytes) attached]",
+                    meta.len()
+                ),
                 model_blocks: Some(vec![json!({
                     "type": "image",
                     "source": { "type": "base64", "media_type": media_type, "data": data }
@@ -291,7 +298,7 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(
-            out.for_model.contains("git-lfs") || out.for_model.contains("not") ,
+            out.for_model.contains("git-lfs") || out.for_model.contains("not"),
             "{}",
             out.for_model
         );

@@ -86,7 +86,9 @@ pub fn sandbox(work_dir: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     // as-is would reject a perfectly in-tree path on a false prefix mismatch.
     // Compare against both the marker-bearing and marker-stripped forms; the
     // stripped form is a no-op on non-Windows / non-verbatim roots.
-    if !normalized.starts_with(&canonical_root) && !normalized.starts_with(strip_verbatim_prefix(&canonical_root)) {
+    if !normalized.starts_with(&canonical_root)
+        && !normalized.starts_with(strip_verbatim_prefix(&canonical_root))
+    {
         anyhow::bail!(
             "sandbox: path {} escapes the worktree {}",
             path.display(),

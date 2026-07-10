@@ -453,10 +453,7 @@ pub async fn materialize_attachments(
 /// (redundant, and previously misleading) Read-tool instruction; every other
 /// saved file gets its on-disk path, which the `read` tool's attachments-dir
 /// fallback root makes genuinely readable.
-pub fn build_manifest(
-    result: &MaterializeResult,
-    inlined: &HashSet<PathBuf>,
-) -> String {
+pub fn build_manifest(result: &MaterializeResult, inlined: &HashSet<PathBuf>) -> String {
     let mut lines: Vec<String> = Vec::new();
     if !result.saved.is_empty() {
         let n = result.saved.len();
@@ -891,7 +888,10 @@ mod tests {
             saved_at("/tmp/a/shot.png", "shot.png", Some("image/png"), 1000),
             saved_at("/tmp/a/notes.txt", "notes.txt", Some("text/plain"), 500),
         ];
-        let result = MaterializeResult { saved, skipped: vec![] };
+        let result = MaterializeResult {
+            saved,
+            skipped: vec![],
+        };
         let inlined: HashSet<PathBuf> = [PathBuf::from("/tmp/a/shot.png")].into();
         let m = build_manifest(&result, &inlined);
         assert!(m.contains("shot.png") && m.contains("attached inline above"));
