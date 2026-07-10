@@ -4,6 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
 import { commands } from "@/bindings";
+import { PermissionsCard } from "@/components/PermissionsCard";
 import { PROJECTS_ROOT_KEY } from "@/constants";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
 // Canonical brand assets (assets/brand/README.md). Explicit light/dark variants:
@@ -273,6 +274,8 @@ export function SettingsView() {
             </Button>
           </div>
         </Card>
+
+        <PermissionsCard />
 
         <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">About</div>
 

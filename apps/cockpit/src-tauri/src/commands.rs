@@ -1,6 +1,6 @@
 use crate::error::CmdError;
 use ryuzi_core::branches::BranchList;
-use ryuzi_core::domain::AttachmentRef;
+use ryuzi_core::domain::{AttachmentRef, ToolPolicyRow};
 use ryuzi_core::{
     ControlPlane, Message, PermMode, Project, Session, SessionGitOptions, TurnPrompt,
 };
@@ -348,6 +348,22 @@ pub async fn stop_session(cp: State<'_, Arc<ControlPlane>>, session_pk: String) 
 #[specta::specta]
 pub async fn end_session(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -> R<()> {
     Ok(cp.end_session(&session_pk).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_tool_policies(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<ToolPolicyRow>> {
+    Ok(cp.list_tool_policies().await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_tool_policy(
+    cp: State<'_, Arc<ControlPlane>>,
+    project_id: String,
+    tool: String,
+) -> R<()> {
+    Ok(cp.delete_tool_policy(&project_id, &tool).await?)
 }
 
 #[tauri::command]

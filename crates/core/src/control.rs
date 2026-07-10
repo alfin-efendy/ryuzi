@@ -1,6 +1,8 @@
 use crate::approval::ApprovalHub;
 use crate::attachments::{AttachmentFetcher, UreqFetcher};
-use crate::domain::{ApprovalResponse, CoreEvent, Message, PermMode, Project, Session};
+use crate::domain::{
+    ApprovalResponse, CoreEvent, Message, PermMode, Project, Session, ToolPolicyRow,
+};
 use crate::harness::HarnessSession;
 use crate::plugins::Registries;
 use crate::store::Store;
@@ -230,6 +232,16 @@ impl ControlPlane {
         decision: &str,
     ) -> anyhow::Result<()> {
         self.store.set_tool_policy(project_id, tool, decision).await
+    }
+
+    /// All persisted tool policies (Settings → Permissions).
+    pub async fn list_tool_policies(&self) -> anyhow::Result<Vec<ToolPolicyRow>> {
+        self.store.list_tool_policies().await
+    }
+
+    /// Remove a persisted tool policy.
+    pub async fn delete_tool_policy(&self, project_id: &str, tool: &str) -> anyhow::Result<()> {
+        self.store.delete_tool_policy(project_id, tool).await
     }
 }
 

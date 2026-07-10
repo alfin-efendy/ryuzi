@@ -77,6 +77,22 @@ async endSession(sessionPk: string) : Promise<Result<null, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+async listToolPolicies() : Promise<Result<ToolPolicyRow[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_tool_policies") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteToolPolicy(projectId: string, tool: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_tool_policy", { projectId, tool }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async resolveApproval(requestId: string, response: ApprovalResponse) : Promise<boolean> {
     return await TAURI_INVOKE("resolve_approval", { requestId, response });
 },
@@ -1415,6 +1431,10 @@ status: string; message: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type TodoItem = { content: string; status: string }
 export type ToolInfo = { name: string; desc: string; perm: string }
+/**
+ * One persisted "don't ask again" rule (Settings → Permissions).
+ */
+export type ToolPolicyRow = { projectId: string; tool: string; decision: string }
 export type UsagePoint = { day: string; requests: number; inputTokens: number; outputTokens: number }
 export type UsageSeries = { days: UsagePoint[]; todayRequests: number; todayInputTokens: number; todayOutputTokens: number }
 export type WorktreeState = { 

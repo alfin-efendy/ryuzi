@@ -269,6 +269,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::continue_session,
             commands::stop_session,
             commands::end_session,
+            commands::list_tool_policies,
+            commands::delete_tool_policy,
             commands::resolve_approval,
             commands::read_file,
             commands::stage_attachment,

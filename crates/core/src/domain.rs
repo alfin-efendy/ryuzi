@@ -266,6 +266,15 @@ impl ApprovalResponse {
     }
 }
 
+/// One persisted "don't ask again" rule (Settings → Permissions).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolPolicyRow {
+    pub project_id: String,
+    pub tool: String,
+    pub decision: String,
+}
+
 /// A persisted transcript entry. Forward-compatible with ACP session/update blocks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]

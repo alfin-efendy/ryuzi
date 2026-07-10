@@ -1,6 +1,6 @@
 use crate::domain::{
     Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionStatus,
-    Surface,
+    Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -1382,6 +1382,41 @@ impl Store {
         Ok(())
     }
 
+    /// Every persisted tool policy, ordered for stable display.
+    pub async fn list_tool_policies(&self) -> anyhow::Result<Vec<ToolPolicyRow>> {
+        self.with_conn(|c| -> rusqlite::Result<Vec<ToolPolicyRow>> {
+            let mut stmt = c.prepare(
+                "SELECT project_id, tool, decision FROM tool_policies \
+                 ORDER BY project_id, tool",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(ToolPolicyRow {
+                        project_id: r.get(0)?,
+                        tool: r.get(1)?,
+                        decision: r.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Remove one persisted tool policy (the Settings "revoke" action).
+    pub async fn delete_tool_policy(&self, project_id: &str, tool: &str) -> anyhow::Result<()> {
+        let project_id = project_id.to_string();
+        let tool = tool.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM tool_policies WHERE project_id=?1 AND tool=?2",
+                params![project_id, tool],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Merge `patch` into the tool_call row's payload (SQLite `json_patch`,
     /// so the original `{name, input}` survives an `{output: …}` update),
     /// optionally flip status, and return the row's seq, the merged payload,
@@ -2331,6 +2366,27 @@ mod tests {
                 .as_deref(),
             Some("rejectAlways")
         );
+    }
+
+    #[tokio::test]
+    async fn list_and_delete_tool_policies() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .set_tool_policy("p1", "Bash", "allowAlways")
+            .await
+            .unwrap();
+        store
+            .set_tool_policy("p2", "Edit", "rejectAlways")
+            .await
+            .unwrap();
+        let rows = store.list_tool_policies().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        store.delete_tool_policy("p1", "Bash").await.unwrap();
+        let rows = store.list_tool_policies().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project_id, "p2");
+        assert_eq!(rows[0].decision, "rejectAlways");
     }
 
     #[tokio::test]
