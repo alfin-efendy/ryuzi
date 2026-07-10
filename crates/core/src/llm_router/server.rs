@@ -644,7 +644,11 @@ async fn handle_responses(
 
         // Normalize the upstream response to OpenAI chat shape, then encode Responses.
         let upstream_body = match target.desc.format {
-            ApiFormat::OpenAi => attempt_chat.clone(),
+            ApiFormat::OpenAi => {
+                let mut b = attempt_chat.clone();
+                crate::llm_router::client::apply_max_completion_tokens(target.desc, &mut b);
+                b
+            }
             ApiFormat::Anthropic => match translate::openai_to_anthropic_request(&attempt_chat) {
                 Ok(b) => b,
                 Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),

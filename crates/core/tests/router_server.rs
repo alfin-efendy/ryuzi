@@ -1861,3 +1861,84 @@ async fn openai_target_gets_max_completion_tokens_while_custom_openai_keeps_max_
     assert_eq!(custom_body["max_tokens"], 64);
     assert!(custom_body.get("max_completion_tokens").is_none());
 }
+
+/// `/v1/responses` synthesizes `max_tokens` from the client's
+/// `max_output_tokens` (`responses_request_to_chat`), then forwards it
+/// verbatim to an OpenAI-format target. An api-key `openai` target still
+/// needs the max_tokens -> max_completion_tokens rename applied on that
+/// chat-shaped body before it goes upstream, same as the `/v1/messages` path.
+#[tokio::test]
+async fn responses_endpoint_applies_max_completion_tokens_for_openai_target() {
+    use axum::{routing::post, Json, Router};
+    use std::sync::Mutex;
+
+    fn ok_completion(model: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": "chatcmpl-mock", "object": "chat.completion", "model": model,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "pong"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })
+    }
+
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let cap = captured.clone();
+    let app = Router::new().route(
+        "/openai/chat/completions",
+        post(move |Json(body): Json<serde_json::Value>| {
+            let cap = cap.clone();
+            async move {
+                *cap.lock().unwrap() = Some(body.clone());
+                Json(ok_completion(body["model"].clone()))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let (_, path) = tmp.keep().unwrap();
+    let store = Arc::new(Store::open(&path).await.unwrap());
+    connections::add_connection(
+        &store,
+        connections::ConnectionRow {
+            id: "real-openai".into(),
+            provider: "openai".into(),
+            auth_type: "api_key".into(),
+            label: "openai".into(),
+            priority: 0,
+            enabled: true,
+            data: connections::ConnectionData {
+                api_key: Some("sk-oai".into()),
+                base_url_override: Some(format!("http://127.0.0.1:{up_port}/openai")),
+                models_override: Some(vec!["gpt-5.2".into()]),
+                ..Default::default()
+            },
+            created_at: 1,
+            updated_at: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let key = keys::create_key(&store, "test").await.unwrap();
+    let srv = RouterServer::new(store.clone());
+    let port = srv.start(0).await.unwrap();
+    std::mem::forget(srv);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .header("x-api-key", &key.key)
+        .json(&json!({"model": "openai/gpt-5.2", "max_output_tokens": 64,
+                      "input": [{"type": "message", "role": "user",
+                                 "content": [{"type": "input_text", "text": "hi"}]}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let seen = captured.lock().unwrap().clone().expect("upstream was hit");
+    assert_eq!(seen["max_completion_tokens"], 64);
+    assert!(seen.get("max_tokens").is_none());
+}

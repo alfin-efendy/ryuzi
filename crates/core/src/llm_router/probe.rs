@@ -76,12 +76,10 @@ fn probe_request(
         // Anthropic body's `max_tokens: 1` becomes `inferenceConfig.
         // maxTokens: 1`, and the profile ARN is attached by the translator.
         "kiro" => {
-            let anthropic_body = json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-                "stream": false
-            });
+            // kiro's `uses_max_completion_tokens` is false, so `probe_body`
+            // produces the same Anthropic-shaped ping body the translator
+            // below expects — reuse it instead of duplicating the literal.
+            let anthropic_body = probe_body(target.desc, model);
             let conversation_id = uuid::Uuid::new_v4().to_string();
             let kiro_body = crate::llm_router::kiro::anthropic_request_to_kiro(
                 &anthropic_body,
@@ -474,6 +472,35 @@ mod tests {
         assert_eq!(sent["input"], "ping");
         assert_eq!(sent["store"], false);
         assert_eq!(sent["stream"], false);
+    }
+
+    #[tokio::test]
+    async fn codex_probe_accepts_chatgpt_account_id_alias() {
+        // `provider_specific` accepts chatgpt_account_id | chatgptAccountId |
+        // accountId | workspaceId (see `models::chatgpt_account_id`) — the
+        // probe/upstream request builder must honor the aliases too, not
+        // just the canonical snake_case key.
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("openai-oauth").unwrap();
+        let target = RouteTarget {
+            conn: mk_conn(
+                "cx3",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at-codex".into()),
+                    provider_specific: Some(json!({"accountId": "acct-2"})),
+                    ..Default::default()
+                },
+            ),
+            desc,
+            upstream_model: "gpt-5.2-codex".into(),
+        };
+        let req = probe_request(&ctx, &target, "gpt-5.2-codex")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(req.headers().get("chatgpt-account-id").unwrap(), "acct-2");
     }
 
     #[tokio::test]

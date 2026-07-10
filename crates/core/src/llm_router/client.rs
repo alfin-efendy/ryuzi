@@ -702,14 +702,7 @@ fn oauth_upstream_request(
                 .header("authorization", format!("Bearer {access_token}"))
                 .header("originator", "codex_cli_rs")
                 .header("session_id", uuid::Uuid::new_v4().to_string());
-            if let Some(account_id) = target
-                .conn
-                .data
-                .provider_specific
-                .as_ref()
-                .and_then(|v| v.get("chatgpt_account_id"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(account_id) = crate::llm_router::models::chatgpt_account_id(&target.conn) {
                 req = req.header("chatgpt-account-id", account_id);
             }
             Ok(req)
