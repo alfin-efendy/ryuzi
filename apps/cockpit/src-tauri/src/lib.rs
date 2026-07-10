@@ -4,6 +4,7 @@ mod backdrop;
 mod commands;
 mod connections_cmd;
 mod endpoint_cmd;
+pub mod engine_daemon;
 mod error;
 mod events;
 mod fsview_cmd;
@@ -51,7 +52,7 @@ const ADAPTER_BIN: &str = "claude-agent-acp";
 ///   3. an actionable error — surfaced verbatim at session start, which
 ///      beats the old bare-name fallback whose only symptom was
 ///      "failed to spawn ACP adapter: program not found".
-fn resolve_acp_adapter() -> anyhow::Result<(String, Vec<String>)> {
+pub(crate) fn resolve_acp_adapter() -> anyhow::Result<(String, Vec<String>)> {
     let resolve_err = match ryuzi_core::sidecar::host_manager().resolve() {
         Ok(r) => return Ok((r.command, r.args)),
         Err(e) => e,
