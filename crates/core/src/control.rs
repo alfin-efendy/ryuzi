@@ -69,6 +69,14 @@ pub struct ControlPlane {
     /// before the task is spawned, decremented by `TurnGuard`'s `Drop` inside
     /// the task) — polled by `drain` to know when it's safe to stop waiting.
     active_turns: std::sync::atomic::AtomicUsize,
+    /// One-way in-memory latch: set once a plugin/skill install, update, or
+    /// uninstall has mutated on-disk state that the already-constructed
+    /// `registries` above cannot pick up without a process restart. Reset
+    /// only by restarting the daemon (deliberately not persisted — the
+    /// underlying `Registries` snapshot is also rebuilt from scratch on
+    /// every startup, so a stale `true` surviving a restart would be
+    /// meaningless).
+    plugins_restart_required: std::sync::atomic::AtomicBool,
 }
 
 impl ControlPlane {
@@ -129,6 +137,7 @@ impl ControlPlane {
             attachment_fetcher,
             draining: std::sync::atomic::AtomicBool::new(false),
             active_turns: std::sync::atomic::AtomicUsize::new(0),
+            plugins_restart_required: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -181,6 +190,24 @@ impl ControlPlane {
         while self.running_count() > 0 && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Set the in-memory restart-required latch. Called by plugin/skill
+    /// install, update, and uninstall paths (Task 9) once they mutate
+    /// on-disk state that `self.registries` — built once at startup — cannot
+    /// reflect until the process restarts. Idempotent and safe to call from
+    /// any number of concurrent mutation paths.
+    pub fn mark_plugins_restart_required(&self) {
+        self.plugins_restart_required
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a plugin/skill mutation since this process started requires a
+    /// restart before it takes effect. Read by the daemon's plugins routes
+    /// and Cockpit surfaces to show a "restart required" indicator.
+    pub fn plugins_restart_required(&self) -> bool {
+        self.plugins_restart_required
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Public event injection — used by `UpdateManager`'s notify path to

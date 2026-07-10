@@ -2506,6 +2506,16 @@ async fn provision_project_explicit_settings_override_defaults() {
 }
 
 #[tokio::test]
+async fn restart_required_flag_defaults_false_and_latches_true() {
+    let (_db, path) = temp_db_path();
+    let store = Store::open(&path).await.unwrap();
+    let cp = ControlPlane::new(store, Registries::new()).await;
+    assert!(!cp.plugins_restart_required());
+    cp.mark_plugins_restart_required();
+    assert!(cp.plugins_restart_required());
+}
+
+#[tokio::test]
 async fn drain_resolves_immediately_when_nothing_is_running() {
     let (_db, path) = temp_db_path();
     let store = Store::open(&path).await.unwrap();
