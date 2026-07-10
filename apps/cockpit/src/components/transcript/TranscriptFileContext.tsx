@@ -39,10 +39,14 @@ export function WorkspacePathCode({ text, className }: { text: string; className
   const [exists, setExists] = useState(false);
 
   const rel = ctx ? toWorkspaceRelativePath(text, ctx.workdir) : null;
-  const trusted = rel !== null && rel !== text; // an absolute form resolved under the workdir
+  // Trusted = the span was an absolute path that resolved under the workdir;
+  // only those may skip the shape heuristic (they still get probed).
+  const inputWasAbsolute = text.startsWith("/") || /^[A-Za-z]:[\\/]/.test(text);
+  const trusted = rel !== null && inputWasAbsolute;
   const candidate = ctx && rel !== null && (trusted || looksLikeWorkspaceFilePath(text)) ? rel : null;
 
   useEffect(() => {
+    setExists(false);
     if (!ctx || candidate === null) return;
     let alive = true;
     void workspaceFileExists(ctx.sessionPk, candidate).then((ok) => {

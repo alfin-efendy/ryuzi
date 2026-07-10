@@ -54,3 +54,19 @@ test("a non-existing path stays plain", async () => {
   await waitFor(() => expect(screen.queryByRole("button")).toBeNull());
   expect(screen.getByText("src/ghost.ts")).toBeTruthy();
 });
+
+test("a backslash-relative path fails the shape gate and stays plain even when it exists", async () => {
+  renderInCtx("a\\b");
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(screen.queryByRole("button")).toBeNull();
+  expect(screen.getByText("a\\b").tagName).toBe("CODE");
+});
+
+test("an absolute path under the workdir is trusted and links", async () => {
+  renderInCtx("/home/u/proj/src/app.ts");
+  const link = await screen.findByRole("button", { name: "/home/u/proj/src/app.ts" });
+  fireEvent.click(link);
+  const tabs = useUi.getState().tabs;
+  expect(tabs.some((t) => t.path === "/home/u/proj/src/app.ts")).toBe(true);
+});
