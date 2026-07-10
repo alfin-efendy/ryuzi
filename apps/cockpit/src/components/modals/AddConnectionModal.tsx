@@ -72,18 +72,25 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     selectedRef.current = selected;
   }, [selected]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: changing family resets the modal and invalidates its pending operation.
   useEffect(() => {
-    if (!open) return;
-    setSelectedId(null);
-    setLabel("");
-    setApiKey("");
-    setBaseUrl("");
-    setSaving(false);
-    setOauthWaiting(false);
-    setOauthAuthorizeUrl("");
-    setDeviceStep("form");
-    setDeviceInfo(null);
-  }, [open]);
+    operationRef.current += 1;
+    if (open) {
+      setSelectedId(null);
+      setLabel("");
+      setApiKey("");
+      setBaseUrl("");
+      setSaving(false);
+      setOauthWaiting(false);
+      setOauthAuthorizeUrl("");
+      setDeviceStep("form");
+      setDeviceInfo(null);
+    }
+
+    return () => {
+      operationRef.current += 1;
+    };
+  }, [open, family]);
 
   useEffect(() => {
     if (!open) return;

@@ -207,6 +207,78 @@ test("closing a pending OAuth flow ignores its late completion", async () => {
   await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
 });
 
+test("external close and reopen invalidates a pending OAuth completion", async () => {
+  let resolveConnect: ((value: Result<ConnectionInfo[], CmdError>) => void) | undefined;
+  connectOauth.mockImplementationOnce(
+    () =>
+      new Promise<Result<ConnectionInfo[], CmdError>>((resolve) => {
+        resolveConnect = resolve;
+      }),
+  );
+  const onClose = mock(() => {});
+  const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
+  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
+
+  view.rerender(<AddConnectionModal open={false} onClose={onClose} family="anthropic" />);
+  view.rerender(<AddConnectionModal open onClose={onClose} family="anthropic" />);
+  const currentApiKey = screen.getByLabelText("API key", { selector: "input" });
+  fireEvent.change(currentApiKey, { target: { value: "current-session-key" } });
+
+  await act(async () => {
+    resolveConnect?.({ status: "ok", data: [] });
+  });
+
+  await waitFor(() => expect(onClose).toHaveBeenCalledTimes(0));
+  expect((currentApiKey as HTMLInputElement).value).toBe("current-session-key");
+});
+
+test("family transition invalidates a pending OAuth completion", async () => {
+  let resolveConnect: ((value: Result<ConnectionInfo[], CmdError>) => void) | undefined;
+  connectOauth.mockImplementationOnce(
+    () =>
+      new Promise<Result<ConnectionInfo[], CmdError>>((resolve) => {
+        resolveConnect = resolve;
+      }),
+  );
+  const onClose = mock(() => {});
+  const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
+  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
+
+  view.rerender(<AddConnectionModal open onClose={onClose} family="custom-openai" />);
+  const currentLabel = screen.getByLabelText("Label");
+  fireEvent.change(currentLabel, { target: { value: "Current family" } });
+
+  await act(async () => {
+    resolveConnect?.({ status: "ok", data: [] });
+  });
+
+  await waitFor(() => expect(onClose).toHaveBeenCalledTimes(0));
+  expect((currentLabel as HTMLInputElement).value).toBe("Current family");
+});
+
+test("unmount invalidates a pending OAuth completion", async () => {
+  let resolveConnect: ((value: Result<ConnectionInfo[], CmdError>) => void) | undefined;
+  connectOauth.mockImplementationOnce(
+    () =>
+      new Promise<Result<ConnectionInfo[], CmdError>>((resolve) => {
+        resolveConnect = resolve;
+      }),
+  );
+  const onClose = mock(() => {});
+  const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
+  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
+  view.unmount();
+
+  await act(async () => {
+    resolveConnect?.({ status: "ok", data: [] });
+  });
+
+  expect(onClose).toHaveBeenCalledTimes(0);
+});
+
 test("short credential commit locks every dismissal and method switch", async () => {
   let resolveAdd: ((value: Result<ConnectionInfo[], CmdError>) => void) | undefined;
   addConnection.mockImplementationOnce(
