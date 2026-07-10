@@ -515,6 +515,10 @@ pub(crate) fn apply_native_reasoning_effort(body: &mut Value, effort: &str) {
     }
 }
 
+fn usable_effort(value: Option<&str>) -> Option<&str> {
+    value.filter(|effort| !effort.trim().is_empty())
+}
+
 pub fn normalize_codex_responses_body(
     body: &mut Value,
     upstream_model: &str,
@@ -545,16 +549,23 @@ pub fn normalize_codex_responses_body(
         }
     }
 
-    if body.get("reasoning").is_none() {
-        if let Some(effort) = body
-            .get("reasoning_effort")
-            .and_then(Value::as_str)
-            .or(explicit_effort)
-        {
-            body["reasoning"] = json!({
-                "effort": reasoning_effort_for_request(effort),
-                "summary": "auto"
-            });
+    let nested_effort = usable_effort(body.pointer("/reasoning/effort").and_then(Value::as_str));
+    let flat_effort = usable_effort(body.get("reasoning_effort").and_then(Value::as_str));
+    let fallback = if nested_effort.is_some() {
+        None
+    } else if let Some(effort) = flat_effort {
+        Some(effort.to_string())
+    } else {
+        usable_effort(explicit_effort)
+            .map(reasoning_effort_for_request)
+            .map(str::to_string)
+    };
+    if let Some(effort) = fallback {
+        match body.get_mut("reasoning") {
+            Some(Value::Object(reasoning)) => {
+                reasoning.insert("effort".into(), json!(effort));
+            }
+            _ => body["reasoning"] = json!({"effort": effort}),
         }
     }
     if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
@@ -900,7 +911,64 @@ mod tests {
             normalize_codex_responses_body(&mut body, "gpt-5.5", Some("low"), None);
         }));
         assert!(result.is_ok());
-        assert_eq!(body["reasoning"], "malformed");
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn external_effort_precedence_uses_usable_values_and_preserves_summary() {
+        let mut nested_explicit = json!({
+            "input": [],
+            "reasoning": {"effort": "ultra", "summary": "detailed"},
+            "reasoning_effort": "high"
+        });
+        normalize_codex_responses_body(&mut nested_explicit, "gpt-5.5", Some("low"), None);
+        assert_eq!(nested_explicit["reasoning"]["effort"], "ultra");
+        assert_eq!(nested_explicit["reasoning"]["summary"], "detailed");
+
+        let mut flat_fills_object = json!({
+            "input": [],
+            "reasoning": {"summary": "detailed"},
+            "reasoning_effort": "high"
+        });
+        normalize_codex_responses_body(&mut flat_fills_object, "gpt-5.5", Some("ultra"), None);
+        assert_eq!(flat_fills_object["reasoning"]["effort"], "high");
+        assert_eq!(flat_fills_object["reasoning"]["summary"], "detailed");
+        assert!(flat_fills_object.get("reasoning_effort").is_none());
+
+        let mut compatibility_fills_object =
+            json!({"input": [], "reasoning": {"summary": "detailed"}});
+        normalize_codex_responses_body(
+            &mut compatibility_fills_object,
+            "gpt-5.5",
+            Some("ultra"),
+            None,
+        );
+        assert_eq!(compatibility_fills_object["reasoning"]["effort"], "max");
+        assert_eq!(
+            compatibility_fills_object["reasoning"]["summary"],
+            "detailed"
+        );
+
+        let mut malformed_with_flat =
+            json!({"input": [], "reasoning": "bad", "reasoning_effort": "ultra"});
+        normalize_codex_responses_body(&mut malformed_with_flat, "gpt-5.5", Some("low"), None);
+        assert_eq!(malformed_with_flat["reasoning"]["effort"], "ultra");
+        assert_eq!(malformed_with_flat["reasoning"]["summary"], "auto");
+
+        let mut malformed_with_compat = json!({"input": [], "reasoning": ["bad"]});
+        normalize_codex_responses_body(&mut malformed_with_compat, "gpt-5.5", Some("ultra"), None);
+        assert_eq!(malformed_with_compat["reasoning"]["effort"], "max");
+        assert_eq!(malformed_with_compat["reasoning"]["summary"], "auto");
+
+        let mut no_usable_fallback = json!({
+            "input": [],
+            "reasoning": {"summary": "detailed"},
+            "reasoning_effort": 7
+        });
+        normalize_codex_responses_body(&mut no_usable_fallback, "gpt-5.5", None, None);
+        assert!(no_usable_fallback["reasoning"].get("effort").is_none());
+        assert_eq!(no_usable_fallback["reasoning"]["summary"], "detailed");
     }
 
     #[test]
