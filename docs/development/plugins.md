@@ -95,8 +95,12 @@ falling back to a manual client-id form when registration is impossible.
 The browser callback lands on a loopback server Cockpit runs at
 `http://127.0.0.1:8976/plugin-oauth/<id>/callback`, so the happy path
 needs no manual code paste (paste remains the fallback when the port is
-taken or the callback times out). Required `[[settings]]` are collected
-before the plugin is enabled.
+taken or the callback times out). External-OAuth plugins (`auth.kind =
+"oauth"` with neither an `auth.resource` nor a manifest `authorize-url` —
+e.g. `google-workspace`) skip discovery, DCR, and the callback entirely:
+the wizard only collects the client id, and the child server brokers
+sign-in itself at first use. Required `[[settings]]` are collected before
+the plugin is enabled.
 
 ---
 
@@ -348,9 +352,20 @@ rather than relying on a session-time warning.
 When a plugin detail screen sees `auth.kind = "oauth"`, Cockpit asks the Tauri
 backend for a richer `PluginAuthInfo`:
 
-- `oauthConnectAvailable = true` only when the manifest has enough metadata
-  for Cockpit to start the flow, currently `authorize-url`, `token-url`, and a
-  non-empty saved value under `client-id-setting`.
+- `oauthConnectAvailable = true` only when `resolve_plugin_oauth`
+  (`plugins_cmd.rs`) can resolve an authorize URL, a token URL, and a client
+  id. Resolution is **table-first**, not manifest-first: it reads this
+  plugin's row in the same `plugin_oauth_clients` table the Install wizard
+  populates via RFC 8414 discovery, RFC 7591 DCR, or the wizard's manual
+  client-id form (see above) — falling back to the manifest's
+  `authorize-url`/`token-url` for the endpoints, then to the saved value
+  under `client-id-setting` for the client id, and, for external-OAuth
+  plugins only, to the saved value under `auth.setting` as a last resort
+  (`google-workspace`'s client-id setting key *is* its `auth.setting`). The
+  manual client-id form (`set_plugin_oauth_client_id`) upserts straight into
+  the `plugin_oauth_clients` row for non-external plugins — it deliberately
+  never writes a `plugin.*` setting, since none of these manifests declare
+  one.
 - `begin_plugin_oauth` builds a PKCE authorize URL, opens it in the browser,
   emits `plugin-oauth-authorize-url-msg`, and shows the callback URL Cockpit
   expects (`http://127.0.0.1:8976/plugin-oauth/<id>/callback`).
@@ -360,11 +375,11 @@ backend for a richer `PluginAuthInfo`:
   an unconfigured state.
 
 Today this native sign-in path is available to plugin manifests whose
-`auth.kind = "oauth"` block carries the full OAuth metadata and points at a
-saved client id, regardless of MCP transport. Declarative HTTP MCP entries use
-the stored token automatically as an `Authorization: Bearer ...` header; other
-transports still need their manifests or provider-specific host support to map
-the stored credential into the runtime process.
+`auth.kind = "oauth"` resolves (table or manifest, per above) to full OAuth
+metadata and a client id, regardless of MCP transport. Declarative HTTP MCP
+entries use the stored token automatically as an `Authorization: Bearer ...`
+header; other transports still need their manifests or provider-specific host
+support to map the stored credential into the runtime process.
 
 For declarative HTTP MCP entries, the connector checks token expiry before
 injecting the bearer. If the token is due and a refresh token is available, it
@@ -610,6 +625,25 @@ loaded (no installer provenance → skipped). To author a plugin:
    `SKILL.md` directories) and install it from Cockpit's Skills tab; the
    installer materializes `ryuzi-plugin.toml` and the provenance stamp
    for you.
+
+   Minimal example — no `.codex-plugin/plugin.json`, just a `skills/`
+   directory of leaf `SKILL.md` dirs:
+
+   ```
+   my-skills-repo/
+   └── skills/
+       └── code-review/
+           └── SKILL.md
+   ```
+
+   Paste `owner/my-skills-repo` (or the full GitHub URL) into the Skills
+   tab's **Install source** field. `discover_install_target` finds no
+   `plugin.json` or top-level `SKILL.md`, scans `skills/*/SKILL.md`, and
+   generates `~/.config/ryuzi/plugins/my-skills-repo/ryuzi-plugin.toml`
+   with `id = "my-skills-repo"` and one `[[skills]]` entry
+   (`path = "skills/code-review"`), plus the `.ryuzi-skill.json` provenance
+   stamp — then materializes the skill to
+   `~/.config/ryuzi/skills/my-skills-repo--code-review/`.
 
 Then validate with `ryuzi plugins info <id>`, enable with
 `ryuzi plugins enable <id>`, configure any `[auth]` credential, and start
