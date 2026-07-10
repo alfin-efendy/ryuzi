@@ -493,26 +493,13 @@ pub fn codex_base_model(model: &str) -> &str {
     model.strip_suffix("-review").unwrap_or(model)
 }
 
-pub fn codex_virtual_model_to_upstream(model: &str) -> (String, Option<&'static str>) {
-    let mut upstream = model.strip_suffix("-review").unwrap_or(model).to_string();
-    for effort in ["xhigh", "high", "medium", "low", "none"] {
-        let suffix = format!("-{effort}");
-        if upstream.ends_with(&suffix) {
-            let new_len = upstream.len() - suffix.len();
-            upstream.truncate(new_len);
-            return (upstream, Some(effort));
-        }
-    }
-    (upstream, None)
-}
-
 pub fn normalize_codex_responses_body(
     body: &mut Value,
     upstream_model: &str,
+    explicit_effort: Option<&str>,
     cache_key: Option<&str>,
 ) {
-    let (model, model_effort) = codex_virtual_model_to_upstream(upstream_model);
-    body["model"] = json!(model);
+    body["model"] = json!(codex_base_model(upstream_model));
     let input = body.get("input").cloned().unwrap_or(Value::Null);
     body["input"] = normalize_responses_input(input);
     convert_codex_system_items_to_developer(body);
@@ -537,12 +524,13 @@ pub fn normalize_codex_responses_body(
     }
 
     if body.get("reasoning").is_none() {
-        let effort = body
+        if let Some(effort) = body
             .get("reasoning_effort")
             .and_then(Value::as_str)
-            .or(model_effort)
-            .unwrap_or("low");
-        body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+            .or(explicit_effort)
+        {
+            body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+        }
     } else if body
         .get("reasoning")
         .and_then(|r| r.get("summary"))
@@ -814,7 +802,7 @@ mod tests {
             "stream": false
         });
 
-        normalize_codex_responses_body(&mut body, "gpt-5.3-codex-high", Some("session-1"));
+        normalize_codex_responses_body(&mut body, "gpt-5.3-codex", Some("high"), Some("session-1"));
 
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["stream"], true);
@@ -843,6 +831,16 @@ mod tests {
         );
         assert_eq!(codex_base_model("gpt-5.5-review"), "gpt-5.5");
         assert_eq!(codex_base_model("gpt-5.5"), "gpt-5.5");
+    }
+
+    #[test]
+    fn bare_effort_suffix_remains_exact_without_injected_effort() {
+        let mut body = json!({"input": []});
+
+        normalize_codex_responses_body(&mut body, "gpt-known-high", None, None);
+
+        assert_eq!(body["model"], "gpt-known-high");
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]

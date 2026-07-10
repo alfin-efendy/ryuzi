@@ -597,7 +597,12 @@ async fn handle_responses(
         // same-format.
         if target.conn.provider == "openai-oauth" {
             let mut passthrough_body = body.clone();
-            normalize_codex_responses_body(&mut passthrough_body, &target.upstream_model, None);
+            normalize_codex_responses_body(
+                &mut passthrough_body,
+                &target.upstream_model,
+                target.request_compatibility_effort.as_deref(),
+                None,
+            );
             let started = crate::paths::now_ms();
             match proxy_passthrough(&state, &mut target, &passthrough_body).await {
                 Ok(resp) => {

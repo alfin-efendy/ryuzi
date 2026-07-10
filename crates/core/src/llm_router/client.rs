@@ -412,12 +412,6 @@ fn resolve_target_effort(
     )
 }
 
-fn apply_resolved_effort(responses: &mut Value, effort: &model_effort::EffectiveEffort) {
-    if let Some(value) = &effort.value {
-        responses["reasoning_effort"] = json!(value);
-    }
-}
-
 async fn ordered_provider_connections(
     store: &Store,
     provider: &str,
@@ -1602,8 +1596,10 @@ pub async fn anthropic_messages_stream(
     if targets.is_empty() {
         anyhow::bail!("no enabled connection serves model '{requested}'");
     }
-    let policy_model = model_effort::parse_legacy_codex_selection(&requested)
-        .map(|(canonical, _)| canonical)
+    let policy_model = targets
+        .iter()
+        .find(|target| target.request_compatibility_effort.is_some())
+        .map(|target| format!("{}/{}", target.desc.family, target.upstream_model))
         .unwrap_or_else(|| requested.clone());
     let effort_policy =
         model_effort::build_utility_effort_policy(&ctx.store, &policy_model).await?;
@@ -2295,10 +2291,10 @@ async fn codex_stream(
         &preference_key,
         &surface,
     );
-    apply_resolved_effort(&mut responses, &effort);
     crate::llm_router::codex::normalize_codex_responses_body(
         &mut responses,
         &target.upstream_model,
+        effort.value.as_deref(),
         None,
     );
     let resp = send_upstream(ctx, target, &responses)
@@ -3677,10 +3673,6 @@ mod tests {
             resolved.source,
             model_effort::EffectiveEffortSource::RouteCompatibility
         );
-        let mut wire = json!({});
-        apply_resolved_effort(&mut wire, &resolved);
-        assert_eq!(wire["reasoning_effort"], "high");
-
         policy.project_override = Some("low".into());
         let project = resolve_target_effort(&policy, None, Some("high"), &preference, &surface);
         assert_eq!(project.value.as_deref(), Some("low"));
