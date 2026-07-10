@@ -1,7 +1,7 @@
 //! Sessions/projects/settings/attachments RPC family — the largest
 //! surface Cockpit's Tauri layer proxies today. Moved verbatim (per the
-//! Move Recipe) from `apps/cockpit/src-tauri/src/commands.rs`; that file
-//! keeps its own copy until the proxy rewrite in Tasks 15-16.
+//! Move Recipe) from `apps/cockpit/src-tauri/src/commands.rs`; that file now
+//! proxies every handle here through `EngineClient::rpc` (Task 15).
 
 use super::{ok, params, ApiError};
 use crate::api::types::*;
@@ -29,6 +29,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "end_session",
     "list_messages",
     "stage_attachment",
+    "attachments_root",
 ];
 
 /// Largest pasted attachment accepted from the webview (decoded size).
@@ -154,6 +155,12 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: StageP = params(p)?;
             ok(stage_attachment(state, &a.name, &a.data_base64).await?)
         }
+        "attachments_root" => ok(state
+            .cp
+            .attachments_root()
+            .await
+            .to_string_lossy()
+            .into_owned()),
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }

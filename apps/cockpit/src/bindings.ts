@@ -1194,7 +1194,16 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).
  */
-{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number }
+{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number } | 
+/**
+ * A provider OAuth flow produced its authorize URL. Surfaces open it
+ * (Cockpit maps this onto the legacy OauthAuthorizeUrlMsg Tauri event).
+ */
+{ kind: "oauthAuthorizeUrl"; provider: string; authorize_url: string } | 
+/**
+ * Same for a plugin OAuth flow.
+ */
+{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string }
 export type CoreEventMsg = { event: CoreEvent }
 /**
  * Device-code flow info shown to the user while they complete the browser

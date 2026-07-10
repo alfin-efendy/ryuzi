@@ -20,9 +20,6 @@ mod session_io;
 mod skills_cmd;
 mod term;
 
-use ryuzi_core::harness::acp::claude_code_plugin_with_resolver;
-use ryuzi_core::harness::native::native_plugin;
-use ryuzi_core::{AcpAdapterDescriptor, ControlPlane, Registries, Store};
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
@@ -213,52 +210,6 @@ pub(crate) fn resolve_claude_code_executable() -> Option<String> {
     None
 }
 
-/// Build the extension registries: the in-process `native` harness (needs no
-/// external binary) plus the `claude-agent-acp` harness with a LAZY adapter
-/// resolver.
-///
-/// Registration performs no sidecar I/O: the resolver (which may download the
-/// adapter on first run) only executes when a `claude-code` session actually
-/// starts. App launch therefore never blocks on the resolve, and a setup that
-/// only runs the `native` harness never touches the resolver at all.
-///
-/// `env_remove: ["CLAUDECODE"]` is required: the adapter checks for this
-/// variable to detect a nested Claude Code session and refuses to start.
-fn build_registries() -> Registries {
-    let mut registries = Registries::new();
-    // The native runtime needs no external binary — register it unconditionally
-    // so projects with `harness = "native"` work in the desktop app.
-    registries.add_plugin(native_plugin());
-
-    registries.add_plugin(claude_code_plugin_with_resolver(|| {
-        let mut env = Vec::new();
-        if let Some(cli) = resolve_claude_code_executable() {
-            env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
-        }
-        let (command, args) = resolve_acp_adapter()?;
-        Ok(AcpAdapterDescriptor {
-            command,
-            args,
-            env,
-            // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's
-            // running inside a Claude Code session and refuses to start.
-            env_remove: vec!["CLAUDECODE".to_string()],
-        })
-    }));
-
-    // Discord is a built-in gateway (its factory is a no-op unless the
-    // `discord` feature is on); register it like `native`/`claude-code` so
-    // Cockpit's `list_plugins`/`set_plugin_enabled` recognize it — the store
-    // seeds `enabled_gateways = "discord"` by default, so leaving this
-    // unregistered made Cockpit diverge from the CLI/`serve`, which both
-    // already register it (see `crates/cli/src/main.rs`'s `build_registries`).
-    registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
-
-    ryuzi_core::plugins::install_builtins(&mut registries);
-    ryuzi_core::plugins::load_user_plugins(&mut registries);
-    registries
-}
-
 fn make_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
@@ -428,24 +379,22 @@ pub fn run() {
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             builder.mount_events(app);
-            // Build the engine inside the async runtime so Store::open (and any
-            // harness setup) run within a Tokio context.
-            let (cp, attachments_root) = tauri::async_runtime::block_on(async move {
-                let store = Store::open(&ryuzi_core::paths::db_path())
+            // Cockpit no longer embeds the engine: attach to a live engine
+            // daemon or spawn one, then talk to it exclusively over
+            // `EngineClient` (the daemon's HTTP control API). The attachments
+            // root is derived engine-side (`workdir_root` setting) — fetch it
+            // over the same RPC so the asset-protocol scope below still works.
+            let (engine_handle, attachments_root) = tauri::async_runtime::block_on(async move {
+                let client = crate::engine::connect_or_spawn()
                     .await
-                    .expect("open ryuzi db");
-                // One-time (idempotent) upgrade of any legacy plaintext
-                // secrets to encrypted-at-rest; see
-                // `llm_router::secrets::init_and_sweep`'s doc for the
-                // atomicity/idempotency/degraded-state contract.
-                ryuzi_core::llm_router::secrets::init_and_sweep(&store).await;
-                let registries = build_registries();
-                let cp = ControlPlane::new(store, registries).await;
-                // Computed here (rather than a second `block_on`) because the
-                // async runtime does not support nested `block_on` calls.
-                let attachments_root = cp.attachments_root().await;
-                (cp, attachments_root)
+                    .expect("engine daemon unreachable");
+                let root: String = client
+                    .rpc("attachments_root", serde_json::json!({}))
+                    .await
+                    .expect("attachments root");
+                (std::sync::Arc::new(client), std::path::PathBuf::from(root))
             });
+            let bridge_client = engine_handle.clone();
             // Media previews: serve attachment files to the webview via the
             // asset protocol, scoped to the attachments root ONLY. The root
             // derives from the runtime-configurable `workdir_root` setting,
@@ -460,37 +409,6 @@ pub fn run() {
             {
                 eprintln!("[ryuzi] asset protocol scope: {e}");
             }
-            // Subscribe BEFORE manage() moves the Arc.
-            let mut rx = cp.subscribe();
-            // The scheduler loop fires enabled jobs for real (30s tick). Runs
-            // on the tauri async runtime — setup() has no ambient tokio context.
-            tauri::async_runtime::spawn(ryuzi_core::scheduler::run_loop(cp.clone()));
-            // The orch dispatcher drives auto-decomposed task graphs (5s tick).
-            tauri::async_runtime::spawn(ryuzi_core::orch::run_loop(cp.clone()));
-            // Capture clones BEFORE app.manage(cp) moves the Arc away.
-            let cp2 = cp.clone();
-            // Make Arc<ControlPlane> available to all Tauri commands.
-            app.manage(cp);
-            // Local router endpoint server (Models → Endpoint).
-            let router_srv = std::sync::Arc::new(
-                ryuzi_core::llm_router::server::RouterServer::new(cp2.store().clone()),
-            );
-            app.manage(router_srv.clone());
-            let cp3 = cp2.clone();
-            tauri::async_runtime::spawn(async move {
-                let auto = cp3
-                    .store()
-                    .get_setting("endpoint_autostart")
-                    .await
-                    .ok()
-                    .flatten();
-                if auto.as_deref() == Some("1") {
-                    let port = endpoint_cmd::configured_port(&cp3).await;
-                    if let Err(e) = router_srv.start(port).await {
-                        eprintln!("[ryuzi] endpoint autostart failed: {e}");
-                    }
-                }
-            });
             // UI terminal registry (session shells over portable-pty).
             app.manage(std::sync::Arc::new(term::UiTerms::default()));
             // Apply the OS backdrop (mica/vibrancy) at runtime and record what
@@ -501,24 +419,77 @@ pub fn run() {
             let cap = backdrop::apply_backdrop(&main_window);
             app.manage(backdrop::BackdropState(cap));
             accent::spawn_accent_watcher(app.handle());
-            // Bridge: forward every CoreEvent from the broadcast channel to the webview.
+            // Bridge: forward every CoreEvent from the engine daemon's SSE
+            // stream to the webview. Reconnects with exponential backoff
+            // (500ms -> 30s cap) whenever the stream ends or errors — the
+            // daemon may restart independently of Cockpit. OAuth-authorize-URL
+            // events are mapped onto their legacy Tauri events AND trigger a
+            // local browser open (the daemon has no webview to open one from).
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                use futures::StreamExt;
                 use tauri_specta::Event as _;
-                use tokio::sync::broadcast::error::RecvError;
+                let mut backoff_ms: u64 = 500;
                 loop {
-                    match rx.recv().await {
-                        Ok(ev) => {
-                            let _ = events::CoreEventMsg { event: ev }.emit(&app_handle);
+                    match bridge_client.events().await {
+                        Ok(stream) => {
+                            backoff_ms = 500;
+                            let mut stream = Box::pin(stream);
+                            while let Some(v) = stream.next().await {
+                                match v.get("kind").and_then(|k| k.as_str()) {
+                                    Some("oauthAuthorizeUrl") => {
+                                        let provider =
+                                            v["provider"].as_str().unwrap_or("").to_string();
+                                        let url =
+                                            v["authorize_url"].as_str().unwrap_or("").to_string();
+                                        let _ = tauri_plugin_opener::open_url(
+                                            url.clone(),
+                                            None::<String>,
+                                        );
+                                        let _ = events::OauthAuthorizeUrlMsg {
+                                            provider,
+                                            authorize_url: url,
+                                        }
+                                        .emit(&app_handle);
+                                    }
+                                    Some("pluginOauthAuthorizeUrl") => {
+                                        let plugin_id =
+                                            v["plugin_id"].as_str().unwrap_or("").to_string();
+                                        let url =
+                                            v["authorize_url"].as_str().unwrap_or("").to_string();
+                                        let _ = tauri_plugin_opener::open_url(
+                                            url.clone(),
+                                            None::<String>,
+                                        );
+                                        let _ = events::PluginOauthAuthorizeUrlMsg {
+                                            plugin_id,
+                                            authorize_url: url,
+                                        }
+                                        .emit(&app_handle);
+                                    }
+                                    _ => {
+                                        if let Ok(ev) =
+                                            serde_json::from_value::<ryuzi_core::CoreEvent>(v)
+                                        {
+                                            let _ = events::CoreEventMsg { event: ev }
+                                                .emit(&app_handle);
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!("[ryuzi] engine event stream ended — reconnecting");
                         }
-                        Err(RecvError::Lagged(n)) => {
-                            eprintln!("[ryuzi] CoreEvent bridge lagged, skipped {n} event(s)");
-                            continue;
-                        }
-                        Err(RecvError::Closed) => break,
+                        Err(e) => eprintln!(
+                            "[ryuzi] engine event stream error: {} — retrying",
+                            e.message
+                        ),
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(30_000);
                 }
             });
+            // Make Arc<EngineClient> available to all Tauri commands.
+            app.manage(engine_handle);
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -537,31 +508,6 @@ mod tests {
     fn export_bindings_test() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
         export_bindings(&out);
-    }
-
-    /// Registration must be hermetic: both harnesses appear in the registry
-    /// without any sidecar resolve (this test would touch the network under
-    /// the old eager resolution — laziness is what makes it runnable at all).
-    #[test]
-    fn build_registries_registers_both_harnesses_without_sidecar_io() {
-        let registries = build_registries();
-        let names = registries.harness.names();
-        assert!(names.iter().any(|n| n == "native"), "got: {names:?}");
-        assert!(names.iter().any(|n| n == "claude-code"), "got: {names:?}");
-    }
-
-    /// Regression test: Cockpit's composition root historically omitted
-    /// `discord_plugin()`, so `list_plugins` omitted discord and
-    /// `set_plugin_enabled("discord")` errored "unknown plugin: discord",
-    /// diverging from the CLI and `ryuzi serve` (both of which register it —
-    /// see `crates/cli/src/main.rs`'s `build_registries`).
-    #[test]
-    fn build_registries_registers_discord_plugin() {
-        let registries = build_registries();
-        assert!(
-            registries.plugins.get("discord").is_some(),
-            "discord plugin missing from Cockpit's composition root"
-        );
     }
 
     #[test]
