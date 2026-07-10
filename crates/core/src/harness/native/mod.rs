@@ -368,8 +368,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn session_runs_a_turn_and_exposes_stable_resume_id() {
         use runner::testutil::{message_delta, message_stop, text_delta};
+        let _guard = StateDirGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -482,9 +484,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn concurrent_prompts_on_one_session_are_serialized() {
         use runner::testutil::{message_delta, message_stop, text_delta};
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let _guard = StateDirGuard::new();
 
         /// Holds each provider stream open ~100ms and records how many
         /// streams were ever active at once: >1 means two turns interleaved
