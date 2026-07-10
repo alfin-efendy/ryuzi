@@ -82,6 +82,7 @@ test("importSession reports success", async () => {
       branch: null,
       title: "Imported",
       status: "ended",
+      permMode: "default",
       startedBy: "import",
       createdAt: 0,
       lastActive: 0,

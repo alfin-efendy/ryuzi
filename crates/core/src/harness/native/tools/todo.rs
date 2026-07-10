@@ -128,6 +128,7 @@ impl Tool for TodoWrite {
         let listing = render(&load_todos(ctx).await.unwrap_or_default());
         Ok(ToolOutput {
             for_model: format!("Updated todo list ({done}/{total} done):\n{listing}"),
+            model_blocks: None,
             // A status block so the Cockpit UI shows progress.
             display: Some(json!({ "summary": format!("todos: {done}/{total} done") })),
             is_error: false,

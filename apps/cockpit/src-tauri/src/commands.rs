@@ -61,6 +61,21 @@ pub async fn update_project(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn update_session_perm_mode(
+    engine: Engine<'_>,
+    session_pk: String,
+    perm_mode: PermMode,
+) -> R<()> {
+    engine
+        .rpc(
+            "update_session_perm_mode",
+            serde_json::json!({ "session_pk": session_pk, "perm_mode": perm_mode }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn list_projects(engine: Engine<'_>) -> R<Vec<Project>> {
     engine.rpc("list_projects", serde_json::json!({})).await
 }

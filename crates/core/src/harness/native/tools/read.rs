@@ -7,6 +7,48 @@ use serde_json::{json, Value};
 /// 2 MiB read cap, matching the ACP fs handler and Cockpit's `read_file`.
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Images at or under this size come back as a vision block; larger ones get
+/// an honest size error (provider hard limits sit at ~5 MB anyway).
+pub(crate) const IMAGE_READ_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+fn image_media_type_for_ext(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Sniff the image container format from magic bytes, independent of the
+/// filename extension. `None` for unrecognized (or too-short) content — e.g.
+/// a git-lfs pointer file (plain ASCII text) or an SVG renamed `.png`.
+///
+/// This exists because trusting the extension alone lets bad bytes become a
+/// durable "image" content block in the provider ledger: the provider 400s
+/// on it, and since the block is already appended, EVERY subsequent request
+/// (including compaction) replays it and 400s again — the session is bricked.
+fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 4 && &bytes[0..4] == b"\x89PNG" {
+        return Some("image/png");
+    }
+    if bytes.len() >= 2 && &bytes[0..2] == b"\xFF\xD8" {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 4 && &bytes[0..4] == b"GIF8" {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
 pub struct Read;
 
 #[async_trait]
@@ -15,9 +57,9 @@ impl Tool for Read {
         "read"
     }
     fn description(&self) -> &str {
-        "Read a UTF-8 text file relative to the working directory. Supports an \
-         optional line offset and limit. Output lines are prefixed with their \
-         1-based line number."
+        "Read a UTF-8 text file or image (png/jpg/gif/webp) from the working \
+         directory or an attachment path from the conversation. Text supports \
+         optional line offset/limit; lines are prefixed with 1-based numbers."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -42,14 +84,67 @@ impl Tool for Read {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("read: `path` is required"))?;
+        // Primary root: the worktree. Fallback root: the session's attachment
+        // folder — the manifest hands the model ABSOLUTE paths there, which
+        // the worktree jail (correctly) rejects.
         let resolved = match jail(&ctx.work_dir, path) {
             Ok(p) => p,
-            Err(e) => return Ok(ToolOutput::error(e.to_string())),
+            Err(primary_err) => {
+                match ctx
+                    .attachments_dir
+                    .as_deref()
+                    .and_then(|root| jail(root, path).ok())
+                {
+                    Some(p) => p,
+                    None => return Ok(ToolOutput::error(primary_err.to_string())),
+                }
+            }
         };
         let meta = match tokio::fs::metadata(&resolved).await {
             Ok(m) => m,
             Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
         };
+        if let Some(media_type) = image_media_type_for_ext(path) {
+            if meta.len() > IMAGE_READ_MAX_BYTES {
+                return Ok(ToolOutput::error(format!(
+                    "read: {path} is {:.1} MB — too large to attach (5 MB limit). \
+                     Ask the user for a smaller version.",
+                    meta.len() as f64 / (1024.0 * 1024.0)
+                )));
+            }
+            if meta.len() == 0 {
+                return Ok(ToolOutput::error(format!(
+                    "read: {path} is empty — not a valid image"
+                )));
+            }
+            use base64::Engine as _;
+            let bytes = match tokio::fs::read(&resolved).await {
+                Ok(b) => b,
+                Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
+            };
+            match sniff_image_media_type(&bytes) {
+                Some(sniffed) if sniffed == media_type => {}
+                _ => {
+                    return Ok(ToolOutput::error(format!(
+                        "read: {path} does not contain valid {media_type} data — \
+                         possibly a git-lfs pointer; try 'git lfs pull'"
+                    )));
+                }
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            return Ok(ToolOutput {
+                for_model: format!(
+                    "[image {path} ({media_type}, {} bytes) attached]",
+                    meta.len()
+                ),
+                model_blocks: Some(vec![json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": media_type, "data": data }
+                })]),
+                display: None,
+                is_error: false,
+            });
+        }
         if meta.len() > MAX_READ_BYTES {
             return Ok(ToolOutput::error(format!(
                 "read: {path} is {} bytes, over the {MAX_READ_BYTES} byte cap",
@@ -118,5 +213,108 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
+    }
+
+    /// A real PNG magic header (the 8-byte signature) plus a few filler
+    /// bytes — enough to pass the magic-byte sniff without a full valid
+    /// PNG stream.
+    const PNG_BYTES: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+
+    #[tokio::test]
+    async fn attachments_dir_paths_are_readable() {
+        let work = tempfile::tempdir().unwrap();
+        let attach = tempfile::tempdir().unwrap();
+        std::fs::write(attach.path().join("notes.txt"), "hello\n").unwrap();
+        let mut ctx = ctx_at(work.path()).await;
+        ctx.attachments_dir = Some(attach.path().to_path_buf());
+        let abs = attach.path().join("notes.txt");
+        let out = Read
+            .execute(&ctx, json!({"path": abs.to_string_lossy()}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.for_model);
+        assert!(out.for_model.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn non_attachment_escapes_stay_rejected() {
+        let work = tempfile::tempdir().unwrap();
+        let attach = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("secret"), "x").unwrap();
+        let mut ctx = ctx_at(work.path()).await;
+        ctx.attachments_dir = Some(attach.path().to_path_buf());
+        let abs = elsewhere.path().join("secret");
+        let out = Read
+            .execute(&ctx, json!({"path": abs.to_string_lossy()}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn image_read_returns_an_image_block() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("shot.png"), PNG_BYTES).unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "shot.png"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        let blocks = out.model_blocks.expect("image read must carry blocks");
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert!(!blocks[0]["source"]["data"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_image_file_is_an_honest_error() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("empty.png"), []).unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "empty.png"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.for_model.contains("empty"), "{}", out.for_model);
+    }
+
+    #[tokio::test]
+    async fn lfs_pointer_masquerading_as_png_is_rejected() {
+        // A git-lfs pointer file is plain ASCII text — nothing like a PNG's
+        // magic bytes — but an extension-only check would wave it through
+        // and hand the provider a 400 that poisons the whole session ledger.
+        let work = tempfile::tempdir().unwrap();
+        let pointer = b"version https://git-lfs.github.com/spec/v1\n\
+                         oid sha256:0000000000000000000000000000000000000000000000000000000000000000\n\
+                         size 130\n";
+        std::fs::write(work.path().join("logo.png"), pointer).unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "logo.png"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.for_model.contains("git-lfs") || out.for_model.contains("not"),
+            "{}",
+            out.for_model
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_image_is_an_honest_error() {
+        let work = tempfile::tempdir().unwrap();
+        let big = vec![0u8; (super::IMAGE_READ_MAX_BYTES + 1) as usize];
+        std::fs::write(work.path().join("big.png"), big).unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "big.png"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.for_model.contains("too large"), "{}", out.for_model);
     }
 }

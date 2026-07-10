@@ -162,6 +162,14 @@ async updateProject(projectId: string, model: string | null, permMode: PermMode,
     else return { status: "error", error: e  as any };
 }
 },
+async updateSessionPermMode(sessionPk: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_session_perm_mode", { sessionPk, permMode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listBranches(projectId: string) : Promise<Result<BranchList, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_branches", { projectId }) };
@@ -1259,7 +1267,12 @@ export type ChatRequestOptions = { runtimeId: string | null; model: string | nul
 /**
  * None => engine default (worktree ON, new engine-named branch from HEAD).
  */
-git: GitOptions | null }
+git: GitOptions | null; 
+/**
+ * Initial permission mode for the session being started (new-chat
+ * picker). `None` ⇒ inherit the project default.
+ */
+permMode: PermMode | null }
 export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
@@ -1549,7 +1562,12 @@ export type RuntimeInfo = { id: string; name: string; color: string; initial: st
  */
 runnable: boolean }
 export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
-export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
+export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; 
+/**
+ * Per-session permission mode. Copied from the project (or the new-chat
+ * picker) at creation; changing it affects THIS session only.
+ */
+permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
 /**
  * True when the engine auto-generated the branch name (`harness/{short}`).
  * `end_session` deletes the branch ONLY when this is set; user-named and

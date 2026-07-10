@@ -11,6 +11,7 @@ function sess(pk: string, projectId: string, title: string | null, lastActive = 
     branch: null,
     title,
     status: "idle",
+    permMode: "default",
     startedBy: null,
     createdAt: null,
     lastActive,
@@ -78,6 +79,7 @@ function unreadSess(pk: string, lastActive: number | null): Session {
     lastActive,
     resumeAttempts: 0,
     branchOwned: false,
+    permMode: "default",
   };
 }
 

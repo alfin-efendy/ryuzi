@@ -619,6 +619,7 @@ async fn seed_session(
             branch: None,
             title: Some("seed".into()),
             status,
+            perm_mode: PermMode::Default,
             started_by: Some("test".into()),
             created_at: Some(now),
             last_active: Some(now),
@@ -1222,6 +1223,7 @@ async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
             "test",
             &[],
             Some(git_opts(false, true, None, None)),
+            None,
         )
         .await
         .expect("start must succeed; git errors surface in the transcript");
@@ -1373,6 +1375,7 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         branch: None,
         title: Some("go".to_string()),
         status: SessionStatus::Running,
+        perm_mode: PermMode::Default,
         started_by: Some("test".to_string()),
         created_at: Some(now_ms()),
         last_active: Some(now_ms()),
@@ -1812,7 +1815,7 @@ async fn attachments_manifest_is_appended_to_the_prompt_the_harness_receives() {
         .join(&session.session_pk)
         .join("notes.txt");
     let expected_manifest = format!(
-        "[User attached 1 file — saved to disk, use the Read tool to open them:]\n- {} (text/plain, 5 B)",
+        "[User attached 1 file:]\n- notes.txt (text/plain, 5 B) — saved to disk; open it with the Read tool: {}",
         dest.display()
     );
     assert_eq!(
@@ -2830,6 +2833,7 @@ async fn user_named_branch_survives_end_session() {
             "test",
             &[],
             Some(git_opts(true, true, Some("keep/me"), None)),
+            None,
         )
         .await
         .unwrap();
@@ -2873,6 +2877,7 @@ async fn engine_named_branch_is_deleted_on_end_session() {
             "test",
             &[],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2914,6 +2919,7 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
             "test",
             &[],
             Some(git_opts(false, false, None, None)),
+            None,
         )
         .await
         .unwrap();

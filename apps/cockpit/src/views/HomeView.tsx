@@ -7,7 +7,7 @@ import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
-import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
+import { HOME_SUGGESTIONS, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
@@ -28,6 +28,8 @@ export function HomeView() {
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
+  // Permission mode for the session about to be created. null = project default.
+  const [composerPerm, setComposerPerm] = useState<UiPermMode | null>(null);
 
   const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
   const projectId = project?.projectId;
@@ -65,6 +67,12 @@ export function HomeView() {
   useEffect(() => {
     setComposerModel(null);
   }, [projectId, setComposerModel]);
+
+  // A permission mode picked for one project's new-chat composer must not leak into the next one.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
+  useEffect(() => {
+    setComposerPerm(null);
+  }, [projectId]);
 
   const [branchList, setBranchList] = useState<BranchList | null>(null);
   const [branchModalOpen, setBranchModalOpen] = useState(false);
@@ -161,6 +169,7 @@ export function HomeView() {
       context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
       git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
+      permMode: composerPerm ? uiPermToCore(composerPerm) : null,
     };
     const typed = draft;
     useNav.getState().clearDraft(draftKey);
@@ -225,15 +234,27 @@ export function HomeView() {
             >
               <Paperclip aria-hidden size={16} strokeWidth={2} />
             </Button>
-            <Button
-              variant="ghost"
-              className="font-medium"
-              title="Permission mode is set on the runtime"
-              style={{ color: native?.permMode === "full" ? "#E8703A" : undefined }}
-            >
-              <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-              {PERM_MODES.find((m) => m.id === native?.permMode)?.label ?? "Ask"}
-            </Button>
+            <Combobox
+              aria-label="Permission mode"
+              options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
+              value={composerPerm ?? corePermToUi(project?.permMode ?? "default")}
+              onValueChange={(mode) => setComposerPerm(mode as UiPermMode)}
+              trigger={
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  title="Permission mode for the new session"
+                  className="font-medium"
+                  style={{
+                    color: (composerPerm ?? corePermToUi(project?.permMode ?? "default")) === "full" ? "#E8703A" : undefined,
+                  }}
+                >
+                  <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                  {PERM_MODES.find((m) => m.id === (composerPerm ?? corePermToUi(project?.permMode ?? "default")))?.label ?? "Ask"}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+            />
             <div className="flex-1" />
             <ModelPicker
               ariaLabel="Model"

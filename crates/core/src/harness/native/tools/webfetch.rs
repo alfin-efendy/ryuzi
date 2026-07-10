@@ -117,6 +117,7 @@ impl Tool for WebFetch {
         let text = format!("[{status}] {url}\n\n{}", truncate(&rendered, &ctx.caps));
         Ok(ToolOutput {
             for_model: text,
+            model_blocks: None,
             display: None,
             is_error: !status.is_success(),
         })

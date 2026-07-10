@@ -38,6 +38,7 @@ export type ChatOptions = {
   } | null;
   attachments?: string[];
   git?: GitOptions | null;
+  permMode?: PermMode | null;
 };
 
 type State = {
@@ -74,8 +75,8 @@ type State = {
   cloneProject: (url: string, destParent: string) => Promise<boolean>;
   /** Pin (or clear, with null) the model future turns of this project use. */
   setProjectModel: (projectId: string, model: string | null) => Promise<void>;
-  /** Change the permission mode future turns of this project run under. */
-  setProjectPermMode: (projectId: string, permMode: PermMode) => Promise<void>;
+  /** Change the permission mode this session (only this session) runs under. */
+  setSessionPermMode: (sessionPk: string, permMode: PermMode) => Promise<void>;
   /** Resolves true as soon as the backend accepts — navigate immediately;
    *  the session list refresh completes in the background. */
   start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
@@ -108,6 +109,7 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
       : null,
     attachments: options.attachments ?? [],
     git: options.git ?? null,
+    permMode: options.permMode ?? null,
   };
 }
 
@@ -309,11 +311,11 @@ export const useStore = create<State>((set, get) => ({
       await get().refresh();
     }
   },
-  setProjectPermMode: async (projectId, permMode) => {
-    const project = get().projects.find((p) => p.projectId === projectId);
-    if (!project || project.permMode === permMode) return;
-    set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode } : p)) });
-    const res = await commands.updateProject(projectId, project.model, permMode, project.harness);
+  setSessionPermMode: async (sessionPk, permMode) => {
+    const session = get().sessions.find((s) => s.sessionPk === sessionPk);
+    if (!session || session.permMode === permMode) return;
+    set({ sessions: get().sessions.map((s) => (s.sessionPk === sessionPk ? { ...s, permMode } : s)) });
+    const res = await commands.updateSessionPermMode(sessionPk, permMode);
     if (res.status === "error") {
       toast.error("Couldn't set permission mode: " + res.error.message);
       await get().refresh();
