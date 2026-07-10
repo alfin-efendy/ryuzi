@@ -86,3 +86,9 @@ test("normalizeBranchName: whitespace runs become single dashes", () => {
   expect(normalizeBranchName("already-fine")).toBe("already-fine");
   expect(normalizeBranchName("")).toBe("");
 });
+
+test("normalizeBranchName: whitespace-and-dash runs collapse to one dash; pure dashes stay", () => {
+  expect(normalizeBranchName("my- new")).toBe("my-new"); // live typing: "my-" + " new" collapses
+  expect(normalizeBranchName("my-- x")).toBe("my-x");
+  expect(normalizeBranchName("feat-x")).toBe("feat-x"); // intentional dashes untouched
+});

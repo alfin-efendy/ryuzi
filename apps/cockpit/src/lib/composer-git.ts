@@ -41,9 +41,12 @@ export function newBranchNameError(name: string, existing: string[]): string | n
   return null;
 }
 
-/** Live input normalization for new branch names: each whitespace run
- *  becomes a single dash, so "my new feature" types as "my-new-feature".
+/** Live input normalization for new branch names: any run of whitespace and
+ *  dashes that contains at least one whitespace character collapses into a
+ *  single dash, so "my new feature" types as "my-new-feature" and typing a
+ *  space after "my-" stays "my-" + next word instead of producing "my--".
+ *  Pure dash runs typed intentionally (e.g. "feat-x") are left untouched.
  *  The whitespace check in newBranchNameError stays as a safety net. */
 export function normalizeBranchName(input: string): string {
-  return input.replace(/\s+/g, "-");
+  return input.replace(/[\s-]*\s[\s-]*/g, "-");
 }

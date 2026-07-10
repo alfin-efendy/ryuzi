@@ -23,7 +23,9 @@ export function BranchNameModal({
 
   if (!open) return null;
 
-  const trimmed = name.trim();
+  // Live normalization can leave leading/trailing dashes (e.g. pasted
+  // "  feat/login " becomes "-feat/login-"); strip them for validation/submit.
+  const trimmed = name.trim().replace(/^-+|-+$/g, "");
   const error = newBranchNameError(trimmed, existingBranches);
   const submit = () => {
     if (error !== null) return;

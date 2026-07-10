@@ -44,6 +44,16 @@ test("Create submits the normalized name and closes; no git command is involved"
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
+test("pasted surrounding whitespace normalizes to dashes in the input but submits the dash-stripped name", () => {
+  const { onClose, onCreate } = setup();
+  fireEvent.change(input(), { target: { value: "  feat/login " } });
+  expect((input() as HTMLInputElement).value).toBe("-feat/login-");
+  expect(createButton().disabled).toBe(false);
+  fireEvent.click(createButton());
+  expect(onCreate).toHaveBeenCalledWith("feat/login");
+  expect(onClose).toHaveBeenCalledTimes(1);
+});
+
 test("Enter submits a valid name; Enter on an invalid name does nothing", () => {
   const { onClose, onCreate } = setup();
   fireEvent.change(input(), { target: { value: "main" } });
