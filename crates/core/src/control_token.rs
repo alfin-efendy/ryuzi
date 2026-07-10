@@ -17,12 +17,24 @@ pub fn write_token(dir: &Path) -> anyhow::Result<String> {
         uuid::Uuid::new_v4().simple()
     );
     let path = token_path(dir);
-    std::fs::write(&path, &token)?;
     #[cfg(unix)]
     {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600) // applies at creation — file is born 0600
+            .open(&path)?;
+        // A pre-existing file (older daemon run) keeps its old mode across
+        // truncate; tighten it before any bytes land.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(token.as_bytes())?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(&path, &token)?;
     Ok(token)
 }
 
@@ -67,6 +79,22 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_token_tightens_pre_existing_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = token_path(dir.path());
+        std::fs::write(&path, "stale-token-from-older-run").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let token = write_token(dir.path()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(read_token(dir.path()), Some(token));
     }
 
     #[test]
