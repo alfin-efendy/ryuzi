@@ -124,6 +124,38 @@ export function PluginDetailView({ id }: { id: string }) {
     };
   }, [id]);
 
+  // Loopback completions land as an event (the install wizard's callback
+  // server also serves flows begun here) — pick them up so Connect finishes
+  // without the manual code paste. The paste UI stays as the fallback.
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    void events.pluginOauthCompletedMsg
+      .listen((event) => {
+        if (!active || event.payload.pluginId !== id) return;
+        if (!event.payload.ok) {
+          toast.error(event.payload.error ?? "OAuth sign-in didn't finish.");
+          return;
+        }
+        toast.success("Connected");
+        setOauthStateToken(null);
+        setOauthAuthorizeUrl("");
+        setOauthRedirectUri("");
+        setOauthCode("");
+        void load().then(() => reloadPlugins());
+      })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [id, load, reloadPlugins]);
+
   if (!loaded || !detail) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
