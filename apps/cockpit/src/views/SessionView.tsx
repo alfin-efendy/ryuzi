@@ -262,7 +262,7 @@ export function SessionView() {
                   submit();
                   return;
                 }
-                if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+                if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
                   const dir = e.key === "ArrowUp" ? ("up" as const) : ("down" as const);
                   const popupOpen = slashMatches.length > 0 || contextHits.length > 0;
                   const el = e.currentTarget;
