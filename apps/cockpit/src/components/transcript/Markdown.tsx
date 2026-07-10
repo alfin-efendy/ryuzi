@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { WorkspacePathCode } from "./TranscriptFileContext";
 
 /** A renderer crash must never lose content: fall back to plain pre-wrap text. */
 class Boundary extends Component<{ raw: string; children: ReactNode }, { failed: boolean }> {
@@ -41,6 +42,25 @@ export const Markdown = memo(function Markdown({ text }: { text: string }) {
                 {children}
               </a>
             ),
+            code: ({ node: _node, className, children, ...rest }) => {
+              // react-markdown v10 has no `inline` prop: fenced/indented
+              // blocks carry a className or embedded newlines; bare inline
+              // spans have neither. False negatives just render plain.
+              const text =
+                typeof children === "string"
+                  ? children
+                  : Array.isArray(children) && children.every((c) => typeof c === "string")
+                    ? children.join("")
+                    : null;
+              if (text !== null && className === undefined && !text.includes("\n")) {
+                return <WorkspacePathCode text={text} />;
+              }
+              return (
+                <code {...rest} className={className}>
+                  {children}
+                </code>
+              );
+            },
           }}
         >
           {text}
