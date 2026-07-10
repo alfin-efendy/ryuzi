@@ -137,6 +137,7 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
             started_at,
             last_error: None,
             version: version.clone(),
+            port: None,
         },
     );
 
@@ -153,6 +154,7 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
                     started_at,
                     last_error: Some(e.to_string()),
                     version,
+                    port: None,
                 },
             );
             (deps.err)(&format!("daemon: failed to start: {e}"));
@@ -168,6 +170,7 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
             started_at,
             last_error: None,
             version,
+            port: None,
         },
     );
     (deps.out)("daemon: running");
@@ -439,6 +442,7 @@ fn write_update_failure_status(dir: &Path, message: &str) {
             started_at: ryuzi_core::paths::now_ms(),
             last_error: Some(message.to_string()),
             version: Some(crate::meta::version().to_string()),
+            port: None,
         },
     );
 }
@@ -548,6 +552,7 @@ impl CanaryHost for ProdCanaryHost {
                 started_at: ryuzi_core::paths::now_ms(),
                 last_error: None,
                 version: Some(self.version.clone()),
+                port: None,
             },
         );
         Ok(())
@@ -705,6 +710,7 @@ mod tests {
                 started_at: 1,
                 last_error: None,
                 version: None,
+                port: None,
             },
         )
         .unwrap();

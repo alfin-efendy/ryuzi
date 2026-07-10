@@ -237,6 +237,7 @@ impl AppController {
                     started_at: ryuzi_core::paths::now_ms(),
                     last_error: Some(why),
                     version: None,
+                    port: None,
                 },
             );
             return Ok(());
@@ -369,6 +370,7 @@ mod tests {
                 started_at: 1,
                 last_error: None,
                 version: None,
+                port: None,
             },
         )
         .unwrap();
@@ -381,6 +383,7 @@ mod tests {
                 started_at: 1,
                 last_error: None,
                 version: None,
+                port: None,
             },
         )
         .unwrap();
@@ -393,6 +396,7 @@ mod tests {
                 started_at: 1,
                 last_error: Some("boom".into()),
                 version: None,
+                port: None,
             },
         )
         .unwrap();
@@ -415,6 +419,7 @@ mod tests {
                 started_at: 1,
                 last_error: None,
                 version: None,
+                port: None,
             },
         )
         .unwrap();
