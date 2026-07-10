@@ -354,13 +354,20 @@ fn install_plugin_pack(
     pack: PackDescriptor,
 ) -> Result<InstalledSkillPack> {
     let plugin_target = checked_child(&roots.plugins_root, &pack.plugin_id)?;
-    replace_dir_from(&pack.repo_dir, &plugin_target)?;
+
+    // Write the (possibly regenerated) manifest into the temp clone BEFORE
+    // staging, so the DirSwap copy of the plugin dir captures it. The live
+    // plugin dir is untouched until `swap.commit()` below.
     if let Some(text) = &pack.manifest_to_write {
-        std::fs::write(plugin_target.join("ryuzi-plugin.toml"), text)?;
+        std::fs::write(pack.repo_dir.join("ryuzi-plugin.toml"), text)?;
     }
 
     let existing = materialized_skill_ids_for_plugin(roots, &pack.plugin_id)?;
-    let materialized = materialized_skills_from_manifest(&plugin_target, &pack.manifest)?;
+    // Resolve materialized skills against the temp clone (`pack.repo_dir`),
+    // not the live plugin dir: nothing has been written to the live target
+    // yet, and `repo_dir` is the same base the manifest's skill paths were
+    // already resolved against at discovery time.
+    let materialized = materialized_skills_from_manifest(&pack.repo_dir, &pack.manifest)?;
     let desired = materialized
         .iter()
         .map(|skill| format!("{}--{}", pack.plugin_id, skill.normalized_name))
@@ -370,9 +377,10 @@ fn install_plugin_pack(
     // Skill-pack provenance in the plugin directory itself: the loader
     // (`crate::plugins::load_skill_pack_plugins_from`) only registers
     // directories carrying this stamp (or heals legacy installs from the
-    // materialized skills' provenance below the skills root).
+    // materialized skills' provenance below the skills root). Stamped into
+    // the temp clone (before staging) so the DirSwap copy captures it.
     write_provenance(
-        &plugin_target.join(PROVENANCE_FILE),
+        &pack.repo_dir.join(PROVENANCE_FILE),
         &SkillInstallProvenance {
             source: source.repo.clone(),
             plugin_id: Some(pack.plugin_id.clone()),
@@ -380,20 +388,40 @@ fn install_plugin_pack(
         },
     )?;
 
+    // Stage the plugin dir FIRST, from the still-clean tree — only the
+    // top-level `ryuzi-plugin.toml` + plugin-dir stamp have been written into
+    // `pack.repo_dir` so far. Per-skill stamps are written AFTER this so they
+    // don't get copied into the plugin dir's own skill subtrees (the plugin
+    // dir carries only its single top-level stamp, matching the pre-DirSwap
+    // on-disk shape).
+    let mut swap = DirSwap::new();
+    swap.stage(&pack.repo_dir, &plugin_target)?;
+
+    // Now stamp each materialized skill's own copy (still inside the temp
+    // clone) and stage it into the skills root. The plugin-dir stage above
+    // already captured a clean tree, so these nested stamps never leak into
+    // the plugin dir.
     for skill in &materialized {
-        let target_id = format!("{}--{}", pack.plugin_id, skill.normalized_name);
-        let target = checked_child(&roots.skills_root, &target_id)?;
-        replace_dir_from(&skill.source_dir, &target)?;
         write_provenance(
-            &target.join(PROVENANCE_FILE),
+            &skill.source_dir.join(PROVENANCE_FILE),
             &SkillInstallProvenance {
                 source: source.repo.clone(),
                 plugin_id: Some(pack.plugin_id.clone()),
                 installed_at: installed_at.clone(),
             },
         )?;
+        let target_id = format!("{}--{}", pack.plugin_id, skill.normalized_name);
+        let target = checked_child(&roots.skills_root, &target_id)?;
+        swap.stage(&skill.source_dir, &target)?;
     }
 
+    // Commit all staged dirs as one atomic swap: either all land, or a
+    // failure restores every pre-existing target this call already moved
+    // aside.
+    swap.commit()?;
+
+    // Stale-artifact removal only runs after a successful commit, so a
+    // failed install never deletes still-valid pre-existing artifacts.
     for stale in existing {
         if !desired.contains(&stale) {
             remove_checked_dir(&roots.skills_root, &stale)?;
@@ -1014,6 +1042,73 @@ fn replace_dir_from(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Multi-directory atomic swap. `stage` copies each source into a sibling
+/// staging dir under the target's parent (never touching the live target);
+/// `commit` moves every existing target aside to a backup, renames each
+/// staging dir into place, and — on ANY failure — restores every backup it
+/// already moved and removes staging dirs. Generalizes `replace_dir_from` so a
+/// plugin-pack install that writes several directories is all-or-nothing.
+struct DirSwap {
+    staged: Vec<(PathBuf, PathBuf)>, // (staging_dir, final_target)
+}
+
+impl DirSwap {
+    fn new() -> Self {
+        Self { staged: Vec::new() }
+    }
+
+    fn stage(&mut self, source: &Path, target: &Path) -> Result<()> {
+        let parent = target
+            .parent()
+            .ok_or_else(|| anyhow!("install target has no parent: {}", target.display()))?;
+        std::fs::create_dir_all(parent)?;
+        let staging = parent.join(format!(".stage-{}", crate::paths::new_id()));
+        copy_dir_recursive(source, &staging)?;
+        self.staged.push((staging, target.to_path_buf()));
+        Ok(())
+    }
+
+    fn commit(self) -> Result<()> {
+        let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new(); // (backup, original_target)
+        let mut moved_in: Vec<PathBuf> = Vec::new(); // targets we renamed staging INTO
+
+        let result = (|| -> Result<()> {
+            for (staging, target) in &self.staged {
+                if target.exists() {
+                    let backup =
+                        target.with_file_name(format!(".backup-{}", crate::paths::new_id()));
+                    std::fs::rename(target, &backup)?;
+                    backups.push((backup, target.clone()));
+                }
+                std::fs::rename(staging, target)?;
+                moved_in.push(target.clone());
+            }
+            Ok(())
+        })();
+
+        if result.is_err() {
+            // Undo swapped-in targets, then restore backups.
+            for target in moved_in.iter().rev() {
+                let _ = std::fs::remove_dir_all(target);
+            }
+            for (backup, target) in backups.iter().rev() {
+                let _ = std::fs::rename(backup, target);
+            }
+            // Best-effort clean of any remaining staging dirs.
+            for (staging, _) in &self.staged {
+                let _ = std::fs::remove_dir_all(staging);
+            }
+            return result;
+        }
+
+        // Success: delete backups.
+        for (backup, _) in backups {
+            let _ = std::fs::remove_dir_all(backup);
+        }
+        Ok(())
+    }
+}
+
 fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)?;
     for entry in std::fs::read_dir(source)? {
@@ -1179,6 +1274,21 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
         )
         .unwrap();
+    }
+
+    /// Recursively count files named `file_name` anywhere under `dir`.
+    fn count_files_named(dir: &std::path::Path, file_name: &str) -> usize {
+        let mut count = 0;
+        for entry in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            let ty = entry.file_type().unwrap();
+            if ty.is_dir() {
+                count += count_files_named(&path, file_name);
+            } else if entry.file_name().to_string_lossy() == file_name {
+                count += 1;
+            }
+        }
+        count
     }
 
     fn write_installed_skill(
@@ -1418,6 +1528,26 @@ mod tests {
             "https://github.com/obra/superpowers"
         );
         assert_eq!(pack_provenance.plugin_id.as_deref(), Some("superpowers"));
+
+        // Regression: the installed plugin dir must carry ONLY its single
+        // top-level provenance stamp — none nested inside its skill subtrees.
+        // (The atomic DirSwap stages the plugin dir from the clean clone
+        // BEFORE the per-skill stamps are written, so those stamps land only
+        // in the materialized skill dirs under the skills root, never in the
+        // plugin dir's own copy of the skill tree.)
+        assert!(!plugin_dir
+            .join("skills/brainstorming")
+            .join(PROVENANCE_FILE)
+            .exists());
+        assert!(!plugin_dir
+            .join("skills/test-driven-development")
+            .join(PROVENANCE_FILE)
+            .exists());
+        assert_eq!(
+            count_files_named(&plugin_dir, PROVENANCE_FILE),
+            1,
+            "plugin dir should contain exactly one (top-level) provenance stamp"
+        );
 
         let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(
             &std::fs::read_to_string(plugin_dir.join("ryuzi-plugin.toml")).unwrap(),
@@ -2492,5 +2622,54 @@ path = "skills/focus"
         // Changed content → different fingerprint.
         std::fs::write(b.path().join("skills/x/SKILL.md"), "changed").unwrap();
         assert_ne!(fp1, fingerprint_dir(b.path()).unwrap());
+    }
+
+    #[test]
+    fn dir_swap_commits_all_or_restores_on_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        // Pre-existing target with sentinel content.
+        std::fs::create_dir_all(base.join("t1")).unwrap();
+        std::fs::write(base.join("t1/old.txt"), "old").unwrap();
+
+        // Two source dirs to stage into t1 and t2.
+        let src1 = tempfile::tempdir().unwrap();
+        std::fs::write(src1.path().join("new.txt"), "new1").unwrap();
+        let src2 = tempfile::tempdir().unwrap();
+        std::fs::write(src2.path().join("new.txt"), "new2").unwrap();
+
+        // Happy path: both commit.
+        let mut swap = DirSwap::new();
+        swap.stage(src1.path(), &base.join("t1")).unwrap();
+        swap.stage(src2.path(), &base.join("t2")).unwrap();
+        swap.commit().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("t1/new.txt")).unwrap(),
+            "new1"
+        );
+        assert!(!base.join("t1/old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(base.join("t2/new.txt")).unwrap(),
+            "new2"
+        );
+
+        // Rollback path: a staged swap whose commit fails must restore t1.
+        std::fs::write(base.join("t1/new.txt"), "new1").unwrap(); // t1 currently committed content
+        let src3 = tempfile::tempdir().unwrap();
+        std::fs::write(src3.path().join("v.txt"), "v3").unwrap();
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        let mut swap = DirSwap::new();
+        swap.stage(src3.path(), &base.join("t1")).unwrap();
+        swap.stage(src3.path(), &base.join("sub/child")).unwrap();
+        // Sabotage the second target's parent so its commit-time rename fails.
+        std::fs::remove_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub"), "now a file").unwrap();
+        assert!(swap.commit().is_err());
+        // t1 must be restored to its committed content, not left as v3.
+        assert_eq!(
+            std::fs::read_to_string(base.join("t1/new.txt")).unwrap(),
+            "new1"
+        );
+        assert!(!base.join("t1/v.txt").exists());
     }
 }
