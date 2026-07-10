@@ -143,8 +143,14 @@ export function ApprovalCard({
   const primaryRef = useRef<() => void>(() => {});
   primaryRef.current = () => {
     if (approval.kind === "question") submitQuestions();
-    else if (approval.kind === "plan") resolve({ decision: "allowOnce", scope: null, payload: { mode: "acceptEdits" } });
-    else resolve(once(true));
+    else if (approval.kind === "plan") {
+      // While the reject-with-feedback panel is open, the hotkey must submit
+      // that rejection — not approve the plan. Otherwise a user typing
+      // feedback and pressing Ctrl/Cmd+Enter would invert their intent and
+      // auto-approve edits.
+      if (rejecting) resolve({ decision: "rejectOnce", scope: null, payload: { feedback } });
+      else resolve({ decision: "allowOnce", scope: null, payload: { mode: "acceptEdits" } });
+    } else resolve(once(true));
   };
 
   useEffect(() => {

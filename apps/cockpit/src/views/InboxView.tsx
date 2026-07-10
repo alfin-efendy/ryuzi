@@ -5,7 +5,8 @@ import { useNav } from "@/store-nav";
 import { ApprovalCard } from "@/components/approval/ApprovalCard";
 
 /** Cross-session queue of everything waiting on the user: newest first,
- *  newest expanded (older cards are still fully interactive, just stacked). */
+ *  every card fully rendered and interactive (no expand/collapse — they're
+ *  just stacked in a list). */
 export function InboxView() {
   const pending = useStore((s) => s.pendingApprovals);
   const setFocused = useStore((s) => s.setFocused);

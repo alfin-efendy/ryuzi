@@ -180,3 +180,12 @@ test("without hotkey, Cmd/Ctrl+Enter does nothing", async () => {
   fireEvent.keyDown(window, { key: "Enter", metaKey: true });
   expect(calls.length).toBe(0);
 });
+
+test("plan card hotkey submits the rejection instead of approving while feedback is open", async () => {
+  const calls = seedResolve();
+  render(<ApprovalCard approval={approval({ kind: "plan", tool: "exitplanmode", input: { plan: "# My plan\ndo X" } })} hotkey />);
+  fireEvent.click(screen.getByRole("button", { name: "Reject with feedback" }));
+  fireEvent.change(screen.getByLabelText("Feedback"), { target: { value: "needs more tests" } });
+  fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+  expect(calls[0]).toEqual(["r1", { decision: "rejectOnce", scope: null, payload: { feedback: "needs more tests" } }]);
+});
