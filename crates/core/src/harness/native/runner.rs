@@ -1208,6 +1208,17 @@ mod tests {
             bodies[1]["model"], "anthropic/model-b",
             "the next turn must re-read the project's pinned model"
         );
+
+        // Negative invariant: both pins (model-a, then model-b) are routable
+        // via the connection seeded above, so neither turn should have
+        // announced a substitution.
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        assert!(
+            !msgs.iter().any(|m| m.payload["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("is not routable"))),
+            "a routable pin must never emit a not-routable status row"
+        );
     }
 
     #[tokio::test]
