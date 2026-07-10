@@ -113,17 +113,11 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
 });
 
 test("browsePlugins keeps only not-installed entries", () => {
-  expect(browsePlugins([builtin, github, skillPack, disabledCatalog]).map((p) => p.id)).toEqual([
-    "native",
-    "linear",
-  ]);
+  expect(browsePlugins([builtin, github, skillPack, disabledCatalog]).map((p) => p.id)).toEqual(["native", "linear"]);
 });
 
 test("installedPlugins keeps only installed entries", () => {
-  expect(installedPlugins([builtin, github, skillPack]).map((p) => p.id)).toEqual([
-    "github",
-    "acme",
-  ]);
+  expect(installedPlugins([builtin, github, skillPack]).map((p) => p.id)).toEqual(["github", "acme"]);
 });
 
 test("uninstall swaps in the returned list", async () => {

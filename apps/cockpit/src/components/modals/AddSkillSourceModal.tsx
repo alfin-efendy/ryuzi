@@ -21,12 +21,7 @@ export function AddSkillSourceModal({ onClose }: { onClose: () => void }) {
     <Modal onClose={onClose} width={440}>
       <div className="mb-3 text-[15px] font-semibold tracking-[-0.01em]">Add skill source</div>
       <FormField label="Skill source" hint="A GitHub repo (owner/repo) containing agent skills.">
-        <Input
-          value={source}
-          onChange={(e) => setSource(e.target.value)}
-          placeholder="owner/repo"
-          aria-label="Skill source"
-        />
+        <Input value={source} onChange={(e) => setSource(e.target.value)} placeholder="owner/repo" aria-label="Skill source" />
       </FormField>
       <ModalFooter>
         <Button variant="outline" onClick={onClose}>
