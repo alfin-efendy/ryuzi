@@ -1092,7 +1092,24 @@ pub async fn begin_plugin_install(
     };
     let auth = auth.expect("a prepared oauth flow implies an auth block");
 
-    // 7. Callback server on the fixed wizard port. A same-plugin re-begin
+    // 7. Register a cancel handle for this flow BEFORE the bind-retry loop
+    // below: cancel_plugin_install can arrive while that loop is still
+    // running (worst case ~300ms across the 3 attempts), and if the sender
+    // isn't in the map yet, cancel_pending_plugin_flows finds nothing to
+    // signal — the flow entry is removed but the eventually-spawned
+    // background task never learns it was canceled and holds the port for
+    // the full 5-minute timeout. Registering first means a cancel that
+    // fires during the bind window pre-fires cancel_rx, and the spawned
+    // task's `tokio::select!` on an already-fired oneshot resolves on its
+    // first poll — no window is lost.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let flow_key = plugin_oauth_flow_key(&plugin_id, &begin.state_token);
+    plugin_install_cancels()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(flow_key.clone(), cancel_tx);
+
+    // Callback server on the fixed wizard port. A same-plugin re-begin
     // (Retry) has just SIGNALED the previous flow's callback server via
     // cancel_pending_plugin_flows (step 6), but that axum server shuts down
     // asynchronously — the port can still be held for a moment. Retry the
@@ -1114,12 +1131,6 @@ pub async fn begin_plugin_install(
                     listener,
                     &plugin_oauth_callback_path(&plugin_id),
                 );
-            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-            let flow_key = plugin_oauth_flow_key(&plugin_id, &begin.state_token);
-            plugin_install_cancels()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .insert(flow_key.clone(), cancel_tx);
             let store = cp.store().clone();
             let app_handle = app.clone();
             let task_plugin_id = plugin_id.clone();
@@ -1177,8 +1188,15 @@ pub async fn begin_plugin_install(
         }
         Err(_) => {
             // Port still taken after the retries — e.g. another plugin's
-            // flow is pending. The wizard explains why; completion goes
-            // through complete_plugin_oauth.
+            // flow is pending. No background task will ever be spawned to
+            // consume cancel_rx in this branch, so remove the sender
+            // registered above to avoid leaking it in the cancels map. The
+            // wizard explains why; completion goes through
+            // complete_plugin_oauth.
+            plugin_install_cancels()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&flow_key);
             result.callback_mode = "manual".to_string();
         }
     }
@@ -2311,5 +2329,132 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         assert!(!flows.contains_key(&plugin_oauth_flow_key("wiz-cancel", "s2")));
+    }
+
+    // ---------- finish_plugin_oauth_callback ----------
+
+    fn insert_test_flow(plugin_id: &str, state_token: &str, verifier: &str) -> String {
+        let flow_key = plugin_oauth_flow_key(plugin_id, state_token);
+        plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                flow_key.clone(),
+                PluginOauthFlowState {
+                    verifier: verifier.to_string(),
+                    redirect_uri: plugin_oauth_redirect_uri(plugin_id),
+                    requested_scopes: vec![],
+                },
+            );
+        flow_key
+    }
+
+    #[tokio::test]
+    async fn finish_callback_missing_code_errors_and_preserves_the_flow() {
+        let (store, _tmp) = test_store().await;
+        let flow_key = insert_test_flow("wiz-cb-code", "state-a", "verifier-a");
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let callback = ryuzi_core::oauth_loopback::CallbackResult {
+            code: None,
+            state: Some("state-a".into()),
+        };
+        let err = finish_plugin_oauth_callback(&store, "wiz-cb-code", &auth, "state-a", callback)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("code"), "{err}");
+        assert!(
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains_key(&flow_key),
+            "a missing-code callback must leave the flow entry in place for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_callback_missing_state_errors_and_preserves_the_flow() {
+        let (store, _tmp) = test_store().await;
+        let flow_key = insert_test_flow("wiz-cb-state", "state-b", "verifier-b");
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let callback = ryuzi_core::oauth_loopback::CallbackResult {
+            code: Some("auth-code".into()),
+            state: None,
+        };
+        let err = finish_plugin_oauth_callback(&store, "wiz-cb-state", &auth, "state-b", callback)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("state"), "{err}");
+        assert!(
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains_key(&flow_key),
+            "a missing-state callback must leave the flow entry in place for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_callback_state_mismatch_errors_and_preserves_the_flow() {
+        let (store, _tmp) = test_store().await;
+        let flow_key = insert_test_flow("wiz-cb-mismatch", "state-c", "verifier-c");
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let callback = ryuzi_core::oauth_loopback::CallbackResult {
+            code: Some("auth-code".into()),
+            state: Some("not-state-c".into()),
+        };
+        let err =
+            finish_plugin_oauth_callback(&store, "wiz-cb-mismatch", &auth, "state-c", callback)
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("state mismatch"), "{err}");
+        assert!(
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains_key(&flow_key),
+            "a state-mismatch callback must leave the flow entry in place — it wasn't this \
+             install's response, so the pending install can still complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_callback_exchange_failure_reinserts_the_flow_for_retry() {
+        let (store, _tmp) = test_store().await;
+        let flow_key = insert_test_flow("wiz-cb-exchange", "state-d", "verifier-d");
+        // No table row and no manifest endpoints/client id source at all —
+        // exchange fails deterministically inside `exchange_plugin_oauth_code`
+        // (via `plugin_oauth_prereq_error`) before any network call.
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let callback = ryuzi_core::oauth_loopback::CallbackResult {
+            code: Some("auth-code".into()),
+            state: Some("state-d".into()),
+        };
+        let err =
+            finish_plugin_oauth_callback(&store, "wiz-cb-exchange", &auth, "state-d", callback)
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("isn't ready"), "{err}");
+        let flows = plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let flow = flows
+            .get(&flow_key)
+            .expect("exchange failure must re-insert the flow so the wizard can retry");
+        assert_eq!(
+            flow.verifier, "verifier-d",
+            "the re-inserted flow must be the same one that was removed, not a blank default"
+        );
     }
 }
