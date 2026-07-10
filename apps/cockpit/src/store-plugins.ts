@@ -4,7 +4,7 @@ import { commands, type PluginInfo } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
 // embedded catalog, or user-authored — and this store mirrors the flattened
-// `PluginInfo` list Cockpit needs for the catalog and sidebar screens.
+// `PluginInfo` list Cockpit needs for the Plugins hub screens.
 
 type PluginsState = {
   plugins: PluginInfo[];
@@ -39,19 +39,8 @@ export function pluginById(plugins: PluginInfo[], id: string): PluginInfo | unde
 }
 
 /**
- * Plugins the sidebar shows as their own menu row: enabled catalog
- * integrations. Skill packs surface in the Plugins hub's Skills tab, not
- * here, and core builtins (native, claude-code, discord, providers) are
- * wired into the fixed NAV items above.
- */
-export function sidebarPlugins(plugins: PluginInfo[]): PluginInfo[] {
-  return plugins.filter((p) => p.enabled && p.source === "catalog");
-}
-
-/**
  * Plugins the Plugins hub's Browse tab lists: every embedded-catalog
- * entry, enabled or not (unlike `sidebarPlugins`, which only surfaces the
- * ones already enabled). Skill packs (`source === "skill-pack"`) surface
+ * entry, enabled or not. Skill packs (`source === "skill-pack"`) surface
  * in the Skills tab instead; core builtins keep their own dedicated
  * screens.
  */

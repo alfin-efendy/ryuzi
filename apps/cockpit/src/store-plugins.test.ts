@@ -1,5 +1,5 @@
 import { test, expect, spyOn } from "bun:test";
-import { usePlugins, sidebarPlugins, catalogPlugins } from "./store-plugins";
+import { usePlugins, catalogPlugins } from "./store-plugins";
 import { commands, type PluginInfo } from "./bindings";
 
 function reset() {
@@ -97,11 +97,6 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
   expect(usePlugins.getState().plugins[0].enabled).toBe(true);
   setSpy.mockRestore();
   listSpy.mockRestore();
-});
-
-test("sidebarPlugins keeps only enabled catalog plugins, hiding builtins, skill packs, and disabled ones", () => {
-  const result = sidebarPlugins([builtin, github, skillPack, disabledCatalog]);
-  expect(result.map((p) => p.id)).toEqual(["github"]);
 });
 
 test("catalogPlugins keeps every catalog plugin regardless of enabled state, hiding builtins and skill packs", () => {
