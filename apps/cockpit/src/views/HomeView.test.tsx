@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { BranchList, CatalogEntry, CmdError, CommandInfo, ConnectionInfo, Project, Result, RuntimeInfo } from "@/bindings";
+import type { BranchList, CatalogEntry, CmdError, CommandInfo, ConnectionInfo, Project, Result } from "@/bindings";
 
 const branchListData: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
 const listBranches = mock((): Promise<Result<BranchList, CmdError>> => Promise.resolve({ status: "ok", data: branchListData }));
@@ -20,7 +20,7 @@ const { HomeView } = await import("./HomeView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
-const { useRuntimes } = await import("@/store-runtimes");
+const { useAgent } = await import("@/store-agent");
 const { useModelStatuses, statusKey } = await import("@/store-model-statuses");
 const { useUi } = await import("@/store-ui");
 
@@ -39,26 +39,6 @@ function project(overrides: Partial<Project> = {}): Project {
     ...overrides,
   };
 }
-
-const nativeRuntime: RuntimeInfo = {
-  id: "native",
-  name: "Ryuzi",
-  color: "#8B5CF6",
-  initial: "R",
-  connection: "In-process",
-  binaryPath: "in-process",
-  installedVersion: "0.5.0",
-  latestVersion: null,
-  npmPackage: null,
-  models: ["anthropic/claude-opus-4", "anthropic/claude-sonnet-4"],
-  enabled: true,
-  model: "",
-  permMode: "ask",
-  flags: "",
-  tiers: [],
-  isDefault: true,
-  runnable: true,
-};
 
 const catalogEntries: CatalogEntry[] = [
   {
@@ -98,7 +78,7 @@ beforeEach(() => {
   useStore.setState({ projects: [project()], selectedProjectId: "p1" });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ catalog: catalogEntries, connections: [anthropicConnection], loaded: true });
-  useRuntimes.setState({ runtimes: [nativeRuntime], loaded: true });
+  useAgent.setState({ models: ["anthropic/claude-opus-4", "anthropic/claude-sonnet-4"], model: null, permMode: "ask" });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
   useNav.setState({ composerBranch: null, composerModel: null });
@@ -111,7 +91,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   useConnections.setState({ catalog: [], connections: [], loaded: false });
-  useRuntimes.setState({ runtimes: [], loaded: false });
+  useAgent.setState({ models: [], model: null, permMode: null });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
 });

@@ -11,12 +11,12 @@ import { FileOpenContext } from "@/components/transcript/Markdown";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { useAgent } from "@/store-agent";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { headerAgentLine } from "@/lib/session-header";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
-import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
+import { NATIVE_AGENT, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
@@ -86,13 +86,13 @@ export function SessionView() {
     [sessionPk, ui, nav],
   );
   const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
-  const runtimes = useRuntimes((s) => s.runtimes);
-  const project = projects.find((p) => p.projectId === session?.projectId);
-  const projectId = project?.projectId;
-  // Ryuzi-only: every session runs the native runtime. Tolerant by
+  // Ryuzi-only: every session runs the native agent. Tolerant by
   // construction — legacy rows still saying "claude-code" (restored DBs)
   // are simply treated as native.
-  const agent = runtimeById(runtimes, "native");
+  const agentModel = useAgent((s) => s.model);
+  const agentModels = useAgent((s) => s.models);
+  const project = projects.find((p) => p.projectId === session?.projectId);
+  const projectId = project?.projectId;
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
@@ -182,8 +182,8 @@ export function SessionView() {
   const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(project?.permMode ?? "default");
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
-  const selectedModel = project?.model || agent?.model || "";
-  const modelOptions = agent?.models ?? [];
+  const selectedModel = project?.model || agentModel || "";
+  const modelOptions = agentModels;
 
   const submit = () => {
     const t = draft.trim();
@@ -242,7 +242,7 @@ export function SessionView() {
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
             <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-              <span>{headerAgentLine(agent, project)}</span>
+              <span>{headerAgentLine(project, agentModel)}</span>
               {session.branch && (
                 <span className="inline-flex items-center gap-1">
                   <GitBranch aria-hidden size={11} strokeWidth={2} />
@@ -282,8 +282,8 @@ export function SessionView() {
           <Transcript
             sessionPk={session.sessionPk}
             rows={rows}
-            agentName={agent?.name ?? "Agent"}
-            agentColor={agent?.color ?? "var(--muted-foreground)"}
+            agentName={NATIVE_AGENT.name}
+            agentColor={NATIVE_AGENT.color}
             running={running}
           >
             {pendingForSession.map((a, i) => (

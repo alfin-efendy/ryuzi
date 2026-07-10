@@ -8,7 +8,7 @@ import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { useAgent } from "@/store-agent";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
@@ -41,11 +41,11 @@ export function HomeView() {
     [draftKey],
   );
   const isGit = project?.isGit ?? false;
-  const runtimes = useRuntimes((s) => s.runtimes);
-  // Ryuzi-only: every session runs the native runtime; the user picks a model.
-  const native = runtimeById(runtimes, "native");
-  const modelOptions = native?.models ?? [];
-  const selectedModel = nav.composerModel ?? project?.model ?? native?.model ?? "";
+  // Ryuzi-only: every session runs the native agent; the user picks a model.
+  const modelOptions = useAgent((s) => s.models);
+  const agentModel = useAgent((s) => s.model);
+  const agentPermMode = useAgent((s) => s.permMode);
+  const selectedModel = nav.composerModel ?? project?.model ?? agentModel ?? "";
   const setComposerModel = useNav((s) => s.setComposerModel);
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
@@ -156,7 +156,6 @@ export function HomeView() {
     const t = draft.trim();
     if ((!t && composerFiles.attachments.length === 0) || !project) return;
     const opts = {
-      runtimeId: "native",
       model: nav.composerModel ?? null,
       context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
@@ -228,11 +227,11 @@ export function HomeView() {
             <Button
               variant="ghost"
               className="font-medium"
-              title="Permission mode is set on the runtime"
-              style={{ color: native?.permMode === "full" ? "#E8703A" : undefined }}
+              title="Permission mode — change it in Settings → Agent"
+              style={{ color: agentPermMode === "full" ? "#E8703A" : undefined }}
             >
               <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-              {PERM_MODES.find((m) => m.id === native?.permMode)?.label ?? "Ask"}
+              {PERM_MODES.find((m) => m.id === agentPermMode)?.label ?? "Ask"}
             </Button>
             <div className="flex-1" />
             <ModelPicker

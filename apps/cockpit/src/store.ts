@@ -14,7 +14,6 @@ import {
   type ApprovalResponse,
 } from "./bindings";
 import { basename } from "./lib/paths";
-import { useRuntimes } from "./store-runtimes";
 import { useNative } from "./store-native";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 
@@ -27,7 +26,6 @@ export type PendingApproval = {
   input: unknown;
 };
 export type ChatOptions = {
-  runtimeId?: string | null;
   model?: string | null;
   context?: {
     branch?: string | null;
@@ -83,7 +81,8 @@ function append(map: Record<string, Row[]>, pk: string, row: Row): Record<string
 function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions | null {
   if (!options) return null;
   return {
-    runtimeId: options.runtimeId ?? null,
+    // Legacy field — the backend ignores it; removed with the Task-7 regen.
+    runtimeId: null,
     model: options.model ?? null,
     context: options.context
       ? {
@@ -341,8 +340,6 @@ export const useStore = create<State>((set, get) => ({
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
-      else if (event.kind === "runtimeUpdateLog") useRuntimes.getState().onUpdateLog(event.runtime_id, event.line);
-      else if (event.kind === "runtimeUpdateDone") useRuntimes.getState().onUpdateDone(event.runtime_id, event.ok, event.message);
     });
   },
 }));

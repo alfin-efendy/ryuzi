@@ -191,6 +191,8 @@ mock.module("@/bindings", () => ({
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
     listRuntimes: () => Promise.resolve({ status: "ok", data: [] }),
+    getAgentSettings: () => Promise.resolve({ status: "ok", data: { model: null, permMode: null } }),
+    listSelectableModels: () => Promise.resolve({ status: "ok", data: [] }),
     saveModelRoute,
     refreshProviderModels,
     deleteModelRoute: (_id: string) => Promise.resolve({ status: "ok", data: [] }),

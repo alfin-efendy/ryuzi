@@ -416,7 +416,7 @@ test("error event appends no transient row — the durable error row arrives via
   listSessions.mockRestore();
 });
 
-test("start forwards chat options so composer runtime, context, and attachments reach IPC", async () => {
+test("start forwards chat options so composer model, context, and attachments reach IPC", async () => {
   reset();
   const start = spyOn(commands, "startSession").mockResolvedValue({
     status: "ok",
@@ -439,14 +439,13 @@ test("start forwards chat options so composer runtime, context, and attachments 
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
 
   await useStore.getState().start("p1", "/review", {
-    runtimeId: "native",
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
   });
 
   expect(start).toHaveBeenCalledWith("p1", "/review", {
-    runtimeId: "native",
+    runtimeId: null,
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
