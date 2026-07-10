@@ -115,6 +115,15 @@ pub async fn run_turn(
     )
     .await;
 
+    // Per-turn model snapshot: re-read the project's pinned model fresh from
+    // the store and resolve it for THIS turn, so a picker change mid-chat
+    // applies on the next turn without restarting the session. Everything
+    // below — request bodies, compaction, title generation, and the sub-agent
+    // spawner — reads the snapshot; the original `deps` is never mutated, so
+    // in-flight turns and running subagents keep the model they started with.
+    let turn_deps = refresh_turn_model(deps).await;
+    let deps = &turn_deps;
+
     // 2. Load history and append the user turn to the ledger.
     let mut ledger = Ledger::load(deps.store.clone(), &deps.session_pk).await?;
     ledger
@@ -164,6 +173,43 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
     } else {
         format!("{expanded}\n\n{suffix}")
     }
+}
+
+/// Build this turn's `RunnerDeps`: a clone of `deps` carrying the freshest
+/// resolution of the project's pinned model. Falls back to the session-start
+/// model when no project row is reachable (bare tests, ephemeral contexts) or
+/// when nothing resolves at all (empty store / no routable connection), so
+/// those contexts behave exactly as before.
+async fn refresh_turn_model(deps: &RunnerDeps) -> RunnerDeps {
+    let pinned = match project_pinned_model(deps).await {
+        Some(pinned) => pinned,
+        None => deps.model.clone(),
+    };
+    let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
+    let mut turn = deps.clone();
+    if resolved.is_some() {
+        turn.model = resolved;
+    }
+    turn
+}
+
+/// `Some(project.model)` when the session's project row is reachable — the
+/// inner Option is the pin itself, which may legitimately be unset. `None`
+/// when there is no session/project row to read.
+async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
+    let session = deps
+        .store
+        .get_session(&deps.session_pk)
+        .await
+        .ok()
+        .flatten()?;
+    let project = deps
+        .store
+        .get_project(&session.project_id)
+        .await
+        .ok()
+        .flatten()?;
+    Some(project.model)
 }
 
 /// If this session has no title yet, generate a terse one from the first
@@ -1028,6 +1074,121 @@ mod tests {
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Seed a project (pinned to `model`) plus a TITLED session "s1" so the
+    /// per-turn snapshot has rows to read while title generation stays off
+    /// (an untitled session row would consume an extra scripted LLM turn).
+    async fn seed_pinned_project(store: &Store, model: Option<&str>) {
+        use crate::domain::{Project, Session, SessionStatus};
+        store
+            .insert_project(Project {
+                project_id: "p".into(),
+                name: "p".into(),
+                workdir: "/w".into(),
+                source: None,
+                harness: "native".into(),
+                model: model.map(str::to_string),
+                effort: None,
+                perm_mode: PermMode::BypassPermissions,
+                created_at: Some(0),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: "p".into(),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("titled".into()),
+                status: SessionStatus::Running,
+                started_by: None,
+                created_at: Some(0),
+                last_active: Some(0),
+                resume_attempts: 0,
+                branch_owned: true,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// An enabled anthropic API-key connection serving exactly `models`, so
+    /// `family/model` pins like "anthropic/model-a" resolve through routing.
+    async fn add_anthropic_conn(store: &Store, models: &[&str]) {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+        connections::add_connection(
+            store,
+            ConnectionRow {
+                id: "claude".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "claude".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    models_override: Some(models.iter().map(|m| m.to_string()).collect()),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_turn_picks_up_a_mid_chat_model_change() {
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![text_delta("one"), message_delta("end_turn"), message_stop()];
+        let turn2 = vec![text_delta("two"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        // Simulate what start_session froze into RunnerDeps at session start.
+        deps.model = Some("anthropic/model-a".into());
+        add_anthropic_conn(&deps.store, &["model-a", "model-b"]).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("one", "one"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // The user repins the model mid-chat (exactly what the composer's
+        // model picker writes via update_project).
+        deps.store
+            .update_project(
+                "p",
+                Some("anthropic/model-b".into()),
+                PermMode::BypassPermissions,
+                "native",
+            )
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("two", "two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["model"], "anthropic/model-a");
+        assert_eq!(
+            bodies[1]["model"], "anthropic/model-b",
+            "the next turn must re-read the project's pinned model"
+        );
     }
 
     #[tokio::test]
