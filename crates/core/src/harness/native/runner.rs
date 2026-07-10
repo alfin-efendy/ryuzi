@@ -179,13 +179,32 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
 /// resolution of the project's pinned model. Falls back to the session-start
 /// model when no project row is reachable (bare tests, ephemeral contexts) or
 /// when nothing resolves at all (empty store / no routable connection), so
-/// those contexts behave exactly as before.
+/// those contexts behave exactly as before. When the pinned model fails
+/// routing and a substitute is resolved, a status row announces the
+/// substitution — no silent swap.
 async fn refresh_turn_model(deps: &RunnerDeps) -> RunnerDeps {
     let pinned = match project_pinned_model(deps).await {
         Some(pinned) => pinned,
         None => deps.model.clone(),
     };
     let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
+    if let (Some(pinned), Some(resolved)) = (pinned.as_deref(), resolved.as_deref()) {
+        if !pinned.trim().is_empty() && pinned != resolved {
+            emit_row(
+                deps,
+                "system",
+                "status",
+                json!({
+                    "summary":
+                        format!("model `{pinned}` is not routable, using `{resolved}`")
+                }),
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+    }
     let mut turn = deps.clone();
     if resolved.is_some() {
         turn.model = resolved;
@@ -1189,6 +1208,64 @@ mod tests {
             bodies[1]["model"], "anthropic/model-b",
             "the next turn must re-read the project's pinned model"
         );
+    }
+
+    #[tokio::test]
+    async fn unroutable_pinned_model_surfaces_a_status_row() {
+        use crate::llm_router::routes::{
+            self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
+        };
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        add_anthropic_conn(&deps.store, &["model-a"]).await;
+        // A route the default-model fallback resolves to (mirrors
+        // native/mod.rs::native_model_resolution_falls_back_from_an_unresolvable_model).
+        routes::save_model_route(
+            &deps.store,
+            ModelRouteInfo {
+                id: "r1".into(),
+                name: "fable".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::Fallback,
+                targets: vec![ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "model-a".into(),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        // The project pins a model no connection serves.
+        seed_pinned_project(&deps.store, Some("anthropic/ghost")).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // The request really used the substitute...
+        assert_eq!(llm.bodies.lock().unwrap()[0]["model"], "fable");
+        // ...and the substitution is announced instead of silent.
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        let status = msgs
+            .iter()
+            .find(|m| m.role == "system" && m.block_type == "status")
+            .expect("a status transcript row");
+        assert_eq!(
+            status.payload["summary"],
+            "model `anthropic/ghost` is not routable, using `fable`"
+        );
+        // It lands after the user's message, where the turn it affects starts.
+        let user_seq = msgs.iter().find(|m| m.role == "user").unwrap().seq;
+        assert!(status.seq > user_seq);
     }
 
     #[tokio::test]
