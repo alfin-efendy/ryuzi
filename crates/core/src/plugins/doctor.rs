@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct DoctorFinding {
     pub plugin_id: String,
     pub severity: String, // "warn" | "error"
-    pub kind: String, // "unconfigured" | "reconnect-required" | "missing-binary" | "attach-failed"
+    pub kind: String,     // "reconnect-required" | "missing-binary" | "attach-failed"
     pub message: String,
     pub suggested_action: String,
 }

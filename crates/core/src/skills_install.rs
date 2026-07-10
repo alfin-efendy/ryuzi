@@ -269,6 +269,96 @@ pub async fn refresh_installed_skill(id: &str) -> Result<InstalledSkillPack> {
     refresh_installed_skill_with(id, &roots, &cloner).await
 }
 
+/// Like `refresh_installed_skill`, but also keeps the pack's `plugin_installs`
+/// ledger row in sync with the refreshed on-disk content. A bare refresh
+/// re-clones and reinstalls the CURRENTLY RECORDED source (not a new one),
+/// but still writes a fresh tree, so without this the ledger's `fingerprint`
+/// goes stale — the next `update_installed_pack`/`update_all_packs`
+/// local-edit guard would then false-positive a `LocalEdits` result for a
+/// refresh that changed nothing the user asked for. `resolved_commit` is left
+/// at its prior value (never nulled): the refresh path doesn't expose the
+/// freshly cloned commit the way `update_installed_pack_with` does. When no
+/// ledger record exists yet (a legacy pack refreshed before this ledger
+/// existed), this backfills one — same trust-tier rule as
+/// `install_skill_source_with_recorded`.
+pub async fn refresh_installed_skill_recorded(
+    id: &str,
+    store: &crate::store::Store,
+) -> Result<InstalledSkillPack> {
+    let roots = InstallRoots::for_user()?;
+    let cloner = GitRepoCloner;
+    refresh_installed_skill_recorded_with(id, &roots, &cloner, store).await
+}
+
+async fn refresh_installed_skill_recorded_with(
+    id: &str,
+    roots: &InstallRoots,
+    cloner: &impl RepoCloner,
+    store: &crate::store::Store,
+) -> Result<InstalledSkillPack> {
+    let prior = store.get_plugin_install(id).await?;
+    let refreshed = refresh_installed_skill_with(id, roots, cloner).await?;
+    let dir = installed_pack_dir(roots, &refreshed);
+    let fingerprint = fingerprint_dir(&dir)?;
+    let now = crate::paths::now_ms();
+    let kind = if refreshed.plugin_id.is_some() {
+        "plugin_pack"
+    } else {
+        "single_skill"
+    };
+    let record = match &prior {
+        Some(rec) => crate::store::PluginInstallRecord {
+            plugin_id: refreshed.id.clone(),
+            kind: kind.into(),
+            source_spec: rec.source_spec.clone(),
+            resolved_commit: rec.resolved_commit.clone(),
+            fingerprint,
+            installed_at: rec.installed_at,
+            updated_at: now,
+            pinned: rec.pinned,
+            pin_reason: rec.pin_reason.clone(),
+            trust_tier: rec.trust_tier.clone(),
+            trust_ack_at: rec.trust_ack_at,
+            trust_ack_summary: rec.trust_ack_summary.clone(),
+        },
+        None => {
+            let trust_tier = if is_curated_source(&refreshed.source) {
+                "curated"
+            } else {
+                "acknowledged"
+            };
+            crate::store::PluginInstallRecord {
+                plugin_id: refreshed.id.clone(),
+                kind: kind.into(),
+                source_spec: refreshed.source.clone(),
+                resolved_commit: None,
+                fingerprint,
+                installed_at: now,
+                updated_at: now,
+                pinned: false,
+                pin_reason: None,
+                trust_tier: trust_tier.into(),
+                trust_ack_at: if trust_tier == "acknowledged" {
+                    Some(now)
+                } else {
+                    None
+                },
+                trust_ack_summary: None,
+            }
+        }
+    };
+    // The pack's identity (id) can change across a refresh (e.g. an upstream
+    // rename) — same handling as `update_installed_pack_with`: drop the old
+    // row instead of leaving a stale duplicate behind.
+    if let Some(rec) = &prior {
+        if record.plugin_id != rec.plugin_id {
+            store.delete_plugin_install(&rec.plugin_id).await?;
+        }
+    }
+    store.upsert_plugin_install(&record).await?;
+    Ok(refreshed)
+}
+
 async fn install_skill_source_with(
     source: &str,
     roots: &InstallRoots,
@@ -390,6 +480,15 @@ struct StagedInstall {
     commit: Option<String>,
     ack_summary: String, // JSON snapshot shown to the user; persisted verbatim as trust_ack_summary
     created_ms: i64,
+    /// The `plugin_installs` record id being updated, when this staged state
+    /// came from `update_installed_pack_with`'s re-ack-on-hook branch —
+    /// `None` for a fresh `begin_install` (nothing prior to reconcile).
+    /// `confirm_install` uses this to detect an identity change (the
+    /// confirmed pack's id differs from `prior_id`) and clean up the old
+    /// pack's artifacts/ledger row, mirroring what a normal (non-reack)
+    /// update already does via `remove_stale_refresh_artifacts` +
+    /// `delete_plugin_install`.
+    prior_id: Option<String>,
 }
 
 /// How long a staged (unconfirmed) install stays valid before `confirm_install`
@@ -465,7 +564,7 @@ async fn begin_install_with(
     let temp = tempfile::tempdir()?;
     let repo_dir = temp.path().join("repo");
     let commit = cloner.clone_repo(&parsed, &repo_dir).await?;
-    let prompt = stage_for_trust_prompt(source, parsed, roots, temp, repo_dir, commit)?;
+    let prompt = stage_for_trust_prompt(source, parsed, roots, temp, repo_dir, commit, None)?;
     Ok(BeginInstall::NeedsConfirmation(prompt))
 }
 
@@ -489,11 +588,29 @@ pub async fn confirm_install(
         bail!("install session expired — start the install again");
     }
     let roots = &staged.roots;
+    // A reack-triggered update's staged state carries the id of the record
+    // being updated (`prior_id`); capture its on-disk pack now, before the
+    // install below can touch anything, so an identity change (the confirmed
+    // pack's id differs from `prior_id`) can still clean up the old pack's
+    // artifacts/ledger row afterward — see `StagedInstall::prior_id`'s doc
+    // comment. `None`/not-found both mean "nothing prior to reconcile".
+    let prior_installed = staged
+        .prior_id
+        .as_deref()
+        .and_then(|old| read_installed_pack(roots, old).ok());
     let discovered = discover_install_target(&staged.repo_dir, &staged.parsed)?;
     let pack = match discovered {
         Discovery::Single(skill) => install_single_skill(roots, &staged.parsed, skill)?,
         Discovery::Pack(p) => install_plugin_pack(roots, &staged.parsed, *p)?,
     };
+    if let Some(old) = staged.prior_id.as_deref() {
+        if old != pack.id {
+            if let Some(old_installed) = &prior_installed {
+                remove_stale_refresh_artifacts(roots, old_installed, &pack)?;
+            }
+            store.delete_plugin_install(old).await?;
+        }
+    }
     let dir = installed_pack_dir(roots, &pack);
     let now = crate::paths::now_ms();
     store
@@ -525,6 +642,8 @@ pub async fn confirm_install(
 /// token. Shared by `begin_install_with`'s arbitrary-source branch and
 /// `update_installed_pack_with`'s re-ack-on-hook branch — both need the same
 /// "hold a clone, prompt the user, wait for `confirm_install`" behavior.
+/// `prior_id` is `None` from the fresh-install branch, `Some(rec.plugin_id)`
+/// from the re-ack-on-hook branch — see `StagedInstall::prior_id`.
 fn stage_for_trust_prompt(
     source_spec: &str,
     parsed: ParsedSkillSource,
@@ -532,6 +651,7 @@ fn stage_for_trust_prompt(
     temp: tempfile::TempDir,
     repo_dir: PathBuf,
     commit: Option<String>,
+    prior_id: Option<String>,
 ) -> Result<TrustPrompt> {
     let discovered = discover_install_target(&repo_dir, &parsed)?;
     let skills = discovered_skill_names(&discovered);
@@ -561,6 +681,7 @@ fn stage_for_trust_prompt(
             commit: commit.clone(),
             ack_summary,
             created_ms: crate::paths::now_ms(),
+            prior_id,
         },
     );
     Ok(TrustPrompt {
@@ -692,6 +813,54 @@ async fn backfill_install_records_in(
     Ok(backfilled)
 }
 
+/// Prefixes used for staging/backup leftovers by `replace_dir_from`'s
+/// `.tmp-` staging dir and `DirSwap`'s `.stage-`/`.backup-` dirs. A crash
+/// between staging and the final rename (or between a commit's backup-rename
+/// and its cleanup) can leave one of these behind under `skills_root` or
+/// `plugins_root`.
+const STALE_INSTALL_LEFTOVER_PREFIXES: &[&str] = &[".stage-", ".backup-", ".tmp-"];
+
+/// Best-effort sweep of crash leftovers from an interrupted install/update:
+/// staging (`.stage-`, `.tmp-`) and backup (`.backup-`) directories that a
+/// prior process never got to clean up (see `replace_dir_from`/`DirSwap`).
+/// Left behind, these sit alongside real installed packs under
+/// `skills_root`/`plugins_root` and — if they happen to carry a stray
+/// `.ryuzi-skill.json` copied from the pack being staged — can be misread by
+/// `collect_installed_packs` as a phantom installed skill. Idempotent: a
+/// clean install tree has nothing matching these prefixes, so repeated calls
+/// (e.g. every daemon startup) after the first are no-ops.
+pub fn sweep_stale_install_leftovers() -> Result<usize> {
+    let roots = InstallRoots::for_user()?;
+    sweep_stale_install_leftovers_in(&roots)
+}
+
+fn sweep_stale_install_leftovers_in(roots: &InstallRoots) -> Result<usize> {
+    let mut removed = 0usize;
+    for root in [&roots.skills_root, &roots.plugins_root] {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if STALE_INSTALL_LEFTOVER_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                std::fs::remove_dir_all(entry.path())?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Result of attempting to bring an installed pack up to date with its
 /// recorded source. `Failed` carries a human-readable reason (rather than
 /// propagating an `Err`) so `update_all_packs` can report a per-pack outcome
@@ -791,6 +960,7 @@ async fn update_installed_pack_with(
                 temp,
                 repo_dir,
                 new_commit,
+                Some(rec.plugin_id.clone()),
             )?;
             return Ok(UpdateOutcome::NeedsReack(prompt));
         }
@@ -3397,6 +3567,53 @@ path = "skills/focus"
         );
     }
 
+    #[tokio::test]
+    async fn sweep_removes_stale_leftovers_but_keeps_real_installs() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "S", "d", "b");
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/acme/s".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
+        install_skill_source_with("https://github.com/acme/s", &roots, &cloner)
+            .await
+            .unwrap();
+
+        // Fabricate crash leftovers under both roots: a `.stage-`/`.backup-`
+        // pair (DirSwap) and a `.tmp-` dir (replace_dir_from), one of which
+        // even carries a stray provenance stamp — the exact case that would
+        // otherwise be misread as a phantom installed skill.
+        roots.ensure_exists().unwrap();
+        let leftover_stage = roots.skills_root.join(".stage-abc123");
+        std::fs::create_dir_all(&leftover_stage).unwrap();
+        std::fs::write(leftover_stage.join(".ryuzi-skill.json"), "{}").unwrap();
+        let leftover_backup = roots.plugins_root.join(".backup-def456");
+        std::fs::create_dir_all(&leftover_backup).unwrap();
+        let leftover_tmp = roots.skills_root.join(".tmp-ghi789");
+        std::fs::create_dir_all(&leftover_tmp).unwrap();
+
+        let removed = sweep_stale_install_leftovers_in(&roots).unwrap();
+        assert_eq!(removed, 3);
+        assert!(!leftover_stage.exists());
+        assert!(!leftover_backup.exists());
+        assert!(!leftover_tmp.exists());
+        // The real install must be untouched.
+        assert!(roots.skills_root.join("s").join("SKILL.md").is_file());
+        let listed = list_installed_skills_in(&roots).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "s");
+
+        // Idempotent: a clean tree sweeps to zero.
+        assert_eq!(sweep_stale_install_leftovers_in(&roots).unwrap(), 0);
+    }
+
     /// The fixture repo directory `recorded_setup` writes the source skill
     /// into. Kept as a fixed sibling of the skills/plugins roots under the
     /// same temp config root so a second `FakeRepoCloner` can be built
@@ -3501,6 +3718,76 @@ path = "skills/focus"
             outcomes,
             vec![("p".to_string(), UpdateOutcome::SkippedPinned)]
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_recorded_updates_ledger_fingerprint_and_preserves_installed_at() {
+        let (roots, cloner, store) = recorded_setup("https://github.com/acme/p", "c1").await;
+        install_skill_source_with_recorded("https://github.com/acme/p", &roots, &cloner, &store)
+            .await
+            .unwrap();
+        let original = store.get_plugin_install("p").await.unwrap().unwrap();
+
+        // Simulate a stale ledger fingerprint (as if left over from a bug in
+        // an earlier code path) WITHOUT touching the on-disk pack, so a bare
+        // refresh — which reinstalls the same content — must recompute it
+        // back to the real on-disk hash.
+        let mut stale = original.clone();
+        stale.fingerprint = "sha256:stale".to_string();
+        store.upsert_plugin_install(&stale).await.unwrap();
+
+        let refreshed = refresh_installed_skill_recorded_with("p", &roots, &cloner, &store)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.id, "p");
+
+        let rec = store.get_plugin_install("p").await.unwrap().unwrap();
+        assert_ne!(rec.fingerprint, "sha256:stale");
+        assert_eq!(
+            rec.fingerprint, original.fingerprint,
+            "refresh must recompute the fingerprint from the refreshed on-disk content"
+        );
+        assert_eq!(
+            rec.installed_at, original.installed_at,
+            "installed_at must survive a refresh unchanged"
+        );
+        assert!(rec.updated_at >= original.updated_at);
+        // resolved_commit is left at its prior value — the refresh path
+        // doesn't expose the freshly cloned commit — never nulled.
+        assert_eq!(rec.resolved_commit, original.resolved_commit);
+    }
+
+    #[tokio::test]
+    async fn refresh_recorded_backfills_a_ledger_row_when_none_existed() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "P", "d", "body");
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/acme/p".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
+        // Install WITHOUT recording (legacy install, no ledger row).
+        install_skill_source_with("acme/p", &roots, &cloner)
+            .await
+            .unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        assert!(store.get_plugin_install("p").await.unwrap().is_none());
+
+        refresh_installed_skill_recorded_with("p", &roots, &cloner, &store)
+            .await
+            .unwrap();
+
+        let rec = store.get_plugin_install("p").await.unwrap().unwrap();
+        assert_eq!(rec.source_spec, "https://github.com/acme/p");
+        assert!(rec.resolved_commit.is_none());
     }
 
     #[tokio::test]
@@ -3629,6 +3916,48 @@ path = "skills/focus"
             .as_deref()
             .unwrap()
             .contains("guard.sh"));
+    }
+
+    #[tokio::test]
+    async fn confirm_install_reack_identity_change_cleans_up_old_artifacts_and_ledger_row() {
+        let (roots, cloner_c1, store) = recorded_setup("https://github.com/acme/p", "c1").await;
+        install_skill_source_with_recorded("https://github.com/acme/p", &roots, &cloner_c1, &store)
+            .await
+            .unwrap();
+        assert!(roots.skills_root.join("p").exists());
+
+        // Upstream renames the skill (changing its resolved id from "p" to
+        // "q") AND introduces a hook script before the next update, so the
+        // update routes through the re-ack trust gate instead of reinstalling
+        // directly.
+        let repo_dir = roots_repo(&roots);
+        write_skill(&repo_dir, "Q", "d", "body-v2");
+        std::fs::create_dir_all(repo_dir.join(".ryuzi/hooks/tool.before")).unwrap();
+        std::fs::write(
+            repo_dir.join(".ryuzi/hooks/tool.before/guard.sh"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        let cloner_c2 = fake_cloner("https://github.com/acme/p", &repo_dir, "c2");
+
+        let outcome = update_installed_pack_with("p", false, &roots, &cloner_c2, &store)
+            .await
+            .unwrap();
+        let prompt = match outcome {
+            UpdateOutcome::NeedsReack(p) => p,
+            other => panic!("expected NeedsReack, got {other:?}"),
+        };
+
+        let pack = confirm_install(&prompt.token, &store).await.unwrap();
+        assert_eq!(pack.id, "q");
+
+        // The old identity's on-disk artifacts must be gone...
+        assert!(!roots.skills_root.join("p").exists());
+        assert!(roots.skills_root.join("q").exists());
+        // ...and so must its ledger row — no stale duplicate left behind.
+        assert!(store.get_plugin_install("p").await.unwrap().is_none());
+        let rec = store.get_plugin_install("q").await.unwrap().unwrap();
+        assert_eq!(rec.trust_tier, "acknowledged");
     }
 
     #[tokio::test]

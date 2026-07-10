@@ -235,8 +235,8 @@ fn merge_attach_status(
 }
 
 /// `GET /plugins/doctor` — read-only aggregation of plugin health findings
-/// (unconfigured/reconnect-required/missing-binary/attach-failed). Never
-/// mutates state; see `crate::plugins::doctor::plugin_doctor`.
+/// (reconnect-required/missing-binary/attach-failed). Never mutates state;
+/// see `crate::plugins::doctor::plugin_doctor`.
 async fn plugins_doctor(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse {
     match crate::plugins::doctor::plugin_doctor(&cp).await {
         Ok(findings) => Json(findings).into_response(),

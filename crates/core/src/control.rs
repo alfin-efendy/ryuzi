@@ -126,6 +126,14 @@ impl ControlPlane {
         // `backfill_install_records_in` directly, so coverage is preserved.
         Self::backfill_install_ledger(&store).await;
 
+        // Best-effort: remove any staging/backup leftovers a prior process
+        // crashed mid-install/update without cleaning up (see
+        // `skills_install::sweep_stale_install_leftovers`). Same
+        // warn-and-continue discipline and the same reason for being
+        // compiled out under the crate's own `#[cfg(test)]` build as the
+        // backfill above — it also touches `InstallRoots::for_user()`.
+        Self::sweep_stale_install_leftovers();
+
         Arc::new(ControlPlane {
             store,
             registries,
@@ -155,6 +163,21 @@ impl ControlPlane {
 
     #[cfg(test)]
     async fn backfill_install_ledger(_store: &Arc<Store>) {}
+
+    /// Best-effort one-time crash-leftover sweep (see the call site in
+    /// `new_full`). In a real (non-`test`) build this removes stale staging/
+    /// backup directories under the operator's `InstallRoots::for_user()` and
+    /// warns-and-continues on any error. Compiled out entirely under the
+    /// crate's own unit tests so they never touch the real `$HOME`.
+    #[cfg(not(test))]
+    fn sweep_stale_install_leftovers() {
+        if let Err(e) = crate::skills_install::sweep_stale_install_leftovers() {
+            tracing::warn!("plugin install-leftover sweep failed: {e}");
+        }
+    }
+
+    #[cfg(test)]
+    fn sweep_stale_install_leftovers() {}
 
     /// Shared handle to the persistence layer — used by daemon wiring,
     /// the domain modules (scheduler/mcp/providers/gateways), and the Tauri
