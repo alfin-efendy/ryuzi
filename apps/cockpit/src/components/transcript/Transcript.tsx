@@ -190,7 +190,7 @@ export function Transcript({
               case "thought":
                 return <ThoughtBlock key={g.key} markdown={g.markdown} streaming={streamingTail} />;
               case "activity":
-                return <ActivityCluster key={g.key} items={g.items} live={running} />;
+                return <ActivityCluster key={g.key} items={g.items} live={running} fold={running} liveTail={streamingTail} />;
               case "error":
                 return <ErrorRow key={g.key} text={g.text} />;
               case "notice":

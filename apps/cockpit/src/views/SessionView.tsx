@@ -5,9 +5,6 @@ import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSectio
 import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
-import { useUi } from "@/store-ui";
-import { joinPath, toRepoRelative } from "@/lib/paths";
-import { FileOpenContext } from "@/components/transcript/Markdown";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
@@ -22,6 +19,7 @@ import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
 import { ModelPicker } from "@/components/ModelPicker";
 import { Transcript } from "@/components/transcript/Transcript";
+import { TranscriptFileContext } from "@/components/transcript/TranscriptFileContext";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
@@ -66,25 +64,6 @@ export function SessionView() {
   const stopVoice = useRef<(() => void) | null>(null);
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
-  const ui = useUi();
-  const sessionPk = session?.sessionPk;
-  // Chat file-link click: resolve against the session workdir, verify the
-  // file exists (jailed — silently ignore misses), open as a right-panel dock
-  // tab (same mechanism as the review panel's "open in Files").
-  const openChatFile = useCallback(
-    async (path: string) => {
-      if (!sessionPk) return;
-      const wd = await commands.sessionWorkdir(sessionPk);
-      if (wd.status !== "ok") return;
-      const rel = toRepoRelative(path, wd.data);
-      const exists = await commands.fileExists(sessionPk, rel);
-      if (exists.status !== "ok" || !exists.data) return;
-      ui.openFile(joinPath(wd.data, rel));
-      ui.setRight(true);
-      nav.setRightTab("file");
-    },
-    [sessionPk, ui, nav],
-  );
   const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
   const runtimes = useRuntimes((s) => s.runtimes);
   const project = projects.find((p) => p.projectId === session?.projectId);
@@ -118,6 +97,27 @@ export function SessionView() {
     }
     prevSessionRunning.current = sessionRunning;
   }, [sessionRunning, session?.sessionPk, fetchDiff]);
+
+  // Session working directory, used to linkify workspace file paths in the
+  // transcript's markdown (see TranscriptFileContext).
+  const [workdir, setWorkdir] = useState<string | null>(null);
+  useEffect(() => {
+    setWorkdir(null);
+    if (!session?.sessionPk) return;
+    let alive = true;
+    void commands.sessionWorkdir(session.sessionPk).then((res) => {
+      if (alive && res.status === "ok") setWorkdir(res.data);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [session?.sessionPk]);
+  // Provider value for TranscriptFileContext — memoized so the Transcript's
+  // WorkspacePathCode instances don't all re-render on every SessionView render.
+  const transcriptFileCtx = useMemo(
+    () => (workdir && session?.sessionPk ? { sessionPk: session.sessionPk, workdir } : null),
+    [session?.sessionPk, workdir],
+  );
 
   // ArrowUp/Down history over this session's sent messages. A ref (not state)
   // holds the navigation cursor — it never drives rendering.
@@ -278,7 +278,7 @@ export function SessionView() {
         <TodoPanel sessionPk={session.sessionPk} running={running} />
 
         {/* Transcript */}
-        <FileOpenContext.Provider value={openChatFile}>
+        <TranscriptFileContext.Provider value={transcriptFileCtx}>
           <Transcript
             sessionPk={session.sessionPk}
             rows={rows}
@@ -292,7 +292,7 @@ export function SessionView() {
               </div>
             ))}
           </Transcript>
-        </FileOpenContext.Provider>
+        </TranscriptFileContext.Provider>
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
