@@ -230,8 +230,25 @@ mod tests {
     use super::*;
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
+    use serial_test::serial;
     use std::path::Path;
     use std::process::Command;
+
+    /// Redirect dirs::data_dir() into a tempdir for the duration of a test so
+    /// scratch-dir creation never touches the real ~/.local/share.
+    /// Process-global env — every test using it must be #[serial].
+    struct StateDirGuard {
+        _dir: tempfile::TempDir,
+    }
+
+    impl StateDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            StateDirGuard { _dir: dir }
+        }
+    }
 
     /// Empty, unique scratch directory (recreated on reruns of the same pid).
     fn fresh_dir(name: &str) -> PathBuf {
@@ -257,7 +274,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn session_root_resolves_chat_scratch_dir() {
+        let _guard = StateDirGuard::new();
         let s = crate::api::tests_support::state().await;
         let now = crate::paths::now_ms();
         s.cp.store()
