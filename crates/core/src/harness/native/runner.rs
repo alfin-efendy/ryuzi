@@ -467,8 +467,10 @@ async fn drive(
 
 /// Tools delegated children may never use regardless of filters. `task` is
 /// re-armed for delegator agents (the orchestrator role); `memory` never is —
-/// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`.
-const SUBAGENT_BLOCKLIST: &[&str] = &["task", "memory"];
+/// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`. The todo
+/// tools are blocked because the list is keyed by the parent's session_pk: a
+/// child's `todowrite` would silently clobber the user-visible plan.
+const SUBAGENT_BLOCKLIST: &[&str] = &["task", "memory", "todowrite", "todoread"];
 /// Cap on one delegated child's model-visible report (protects the parent's
 /// context from runaway child output).
 const MAX_SUBTASK_REPORT_CHARS: usize = 16_000;
@@ -1461,6 +1463,27 @@ mod tests {
         let eff = effective_child_filter(&ToolFilter::All, &ToolFilter::All, &names, &["memory"]);
         assert!(eff.allows("task") && eff.allows("read"));
         assert!(!eff.allows("memory"));
+    }
+
+    #[test]
+    fn subagent_blocklist_blocks_todo_tools() {
+        use super::super::agents::ToolFilter;
+        let names: Vec<String> = ["read", "bash", "todowrite", "todoread"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let eff = effective_child_filter(
+            &ToolFilter::All,
+            &ToolFilter::All,
+            &names,
+            SUBAGENT_BLOCKLIST,
+        );
+        assert!(eff.allows("read") && eff.allows("bash"));
+        assert!(
+            !eff.allows("todowrite"),
+            "a sub-agent todowrite would clobber the parent session's plan"
+        );
+        assert!(!eff.allows("todoread"));
     }
 
     #[tokio::test]
