@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { PluginDetail, PluginFieldInfo, PluginInstallBeginResult } from "@/bindings";
+import type { CmdError, PluginDetail, PluginFieldInfo, PluginInstallBeginResult, Result } from "@/bindings";
 
 // The wizard talks only to the Tauri IPC boundary (`@/bindings`) and the
 // real usePlugins zustand store — mock the boundary, seed the store.
@@ -90,14 +90,17 @@ let beginData: PluginInstallBeginResult = beginResult();
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 
 const pluginDetail = mock((_id: string) => ok(detailData));
-const beginPluginInstall = mock((_pluginId: string) => ok(beginData));
-const setPluginOauthClientId = mock((_pluginId: string, _clientId: string) => ok(null));
+const beginPluginInstall = mock(
+  (_pluginId: string): Promise<Result<PluginInstallBeginResult, CmdError>> => ok(beginData),
+);
+const setPluginOauthClientId = mock((_pluginId: string, _clientId: string): Promise<Result<null, CmdError>> => ok(null));
 const cancelPluginInstall = mock((_pluginId: string, _stateToken: string | null) => ok(null));
 const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken: string) => ok(oauthAuthInfo));
 const setPluginSetting = mock((_key: string, _value: string) => ok(null));
 const setPluginEnabled = mock((_id: string, _enabled: boolean) => ok(null));
 const listPlugins = mock(() => ok([]));
 const openUrl = mock(async (_url: string) => {});
+const toastError = mock((_message: string) => {});
 
 type CompletedEvent = { payload: { pluginId: string; ok: boolean; error: string | null } };
 let completedListener: ((event: CompletedEvent) => void) | null = null;
@@ -124,6 +127,9 @@ mock.module("@/bindings", () => ({
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
+// @ryuzi/ui's barrel also re-exports sonner's `Toaster` (unused here, but
+// its module-eval import must resolve), so the mock stubs it too.
+mock.module("sonner", () => ({ toast: { error: toastError }, Toaster: () => null }));
 
 const { InstallWizardModal } = await import("./InstallWizardModal");
 const { usePlugins } = await import("@/store-plugins");
@@ -148,6 +154,7 @@ beforeEach(() => {
   setPluginEnabled.mockClear();
   listPlugins.mockClear();
   openUrl.mockClear();
+  toastError.mockClear();
   pluginOauthCompletedMsgListen.mockClear();
   onClose.mockClear();
   usePlugins.setState({ plugins: [], loaded: false });
@@ -308,6 +315,72 @@ test("manualClientId shows dcrError, saves the id, and re-begin starts the brows
   await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith("notion", "client-abc"));
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledTimes(2));
   expect(await screen.findByText("Browser opened — finish signing in there.")).toBeTruthy();
+});
+
+test("manualClientId disables Continue until a client id is typed", async () => {
+  beginData = beginResult({ authKind: "oauth", needsClientId: true });
+  await renderWizard();
+
+  const cont = screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement;
+  expect(cont.disabled).toBe(true);
+});
+
+test("manualClientId toasts and stays put with the typed value when saving the client id fails", async () => {
+  beginData = beginResult({ authKind: "oauth", needsClientId: true });
+  await renderWizard();
+
+  const input = screen.getByPlaceholderText("Paste the client ID from the vendor's console") as HTMLInputElement;
+  fireEvent.change(input, { target: { value: "client-abc" } });
+
+  setPluginOauthClientId.mockImplementationOnce(() =>
+    Promise.resolve({ status: "error" as const, error: { message: "client id rejected" } }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("client id rejected"));
+  expect(beginPluginInstall).toHaveBeenCalledTimes(1);
+  expect(screen.getByText(/doesn't support automatic app registration/)).toBeTruthy();
+  expect(input.value).toBe("client-abc");
+});
+
+test("manualClientId toasts and stays put with no dead end when the re-begin call errors", async () => {
+  beginData = beginResult({ authKind: "oauth", needsClientId: true });
+  await renderWizard();
+
+  const input = screen.getByPlaceholderText("Paste the client ID from the vendor's console") as HTMLInputElement;
+  fireEvent.change(input, { target: { value: "client-xyz" } });
+
+  beginPluginInstall.mockImplementationOnce(() =>
+    Promise.resolve({ status: "error" as const, error: { message: "network unreachable" } }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith("notion", "client-xyz"));
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("network unreachable"));
+  expect(screen.getByText(/doesn't support automatic app registration/)).toBeTruthy();
+  expect(input.value).toBe("client-xyz");
+});
+
+test("manualClientId toasts and stays put when the re-begin succeeds but oauth is still unavailable (second DCR failure)", async () => {
+  beginData = beginResult({ authKind: "oauth", needsClientId: true });
+  await renderWizard();
+
+  const input = screen.getByPlaceholderText("Paste the client ID from the vendor's console") as HTMLInputElement;
+  fireEvent.change(input, { target: { value: "client-def" } });
+
+  beginData = beginResult({
+    authKind: "oauth",
+    needsClientId: true,
+    oauthAvailable: false,
+    dcrError: "still can't verify this client id",
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("still can't verify this client id"));
+  expect(screen.getByText(/doesn't support automatic app registration/)).toBeTruthy();
+  expect(await screen.findByText("still can't verify this client id")).toBeTruthy();
+  expect(input.value).toBe("client-def");
 });
 
 test("external oauth collects the client id and continues without a browser flow", async () => {

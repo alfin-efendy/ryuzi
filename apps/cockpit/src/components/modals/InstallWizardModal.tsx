@@ -89,8 +89,10 @@ export function InstallWizardModal({
   };
 
   // Single resolution call: the backend runs env-var detection, RFC 8414
-  // discovery, DCR, and (when possible) opens the browser. Reused by the
-  // checking-step Retry and by manualClientId's re-begin.
+  // discovery, DCR, and (when possible) opens the browser. Used at mount and
+  // by the checking-step Retry. manualClientId's submitClientId deliberately
+  // does NOT call this — it hand-rolls a reduced re-begin so failures toast
+  // instead of setting checkError, reusing the mount-time detail.
   const runBegin = useCallback(
     async (d: PluginDetail | null) => {
       setCheckError(null);
