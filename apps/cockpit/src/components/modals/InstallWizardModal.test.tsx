@@ -536,3 +536,23 @@ test("untouched fields are not saved on Continue", async () => {
   expect(await screen.findByText("Notion is installed.")).toBeTruthy();
   expect(setPluginSetting).not.toHaveBeenCalled();
 });
+
+test("done enables the plugin and reloads the plugins store", async () => {
+  beginData = beginResult({ authKind: "none" });
+  await renderWizard();
+
+  expect(await screen.findByText("Notion is installed.")).toBeTruthy();
+  await waitFor(() => expect(setPluginEnabled).toHaveBeenCalledWith("notion", true));
+  await waitFor(() => expect(listPlugins).toHaveBeenCalled());
+  expect(screen.getByText("It's enabled and ready for your agents.")).toBeTruthy();
+});
+
+test("experimental plugins are not auto-enabled at done", async () => {
+  detailData = detailFixture({ experimental: true });
+  beginData = beginResult({ authKind: "none" });
+  await renderWizard();
+
+  expect(await screen.findByText(/enable it from the card when ready/)).toBeTruthy();
+  expect(setPluginEnabled).not.toHaveBeenCalled();
+  await waitFor(() => expect(listPlugins).toHaveBeenCalled());
+});

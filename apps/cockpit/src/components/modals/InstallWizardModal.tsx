@@ -6,6 +6,7 @@ import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
 import { commands, events, type PluginDetail, type PluginInstallBeginResult } from "@/bindings";
 import { IconChip, StatusDot } from "@/components/common/bits";
 import { pluginIcon as iconFor } from "@/lib/plugin-icons";
+import { usePlugins } from "@/store-plugins";
 
 type WizardStep = "checking" | "tokenInput" | "manualClientId" | "waitingOauth" | "settings" | "done";
 
@@ -29,6 +30,7 @@ export function InstallWizardModal({
   pluginIcon?: string | null;
   onClose: () => void;
 }) {
+  const loadPlugins = usePlugins((s) => s.load);
   const [step, setStep] = useState<WizardStep>("checking");
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [begin, setBegin] = useState<PluginInstallBeginResult | null>(null);
@@ -228,6 +230,20 @@ export function InstallWizardModal({
       unlisten?.();
     };
   }, [step, pluginId, detail]);
+
+  // Entering "done" is the commit point: enable the plugin (experimental
+  // plugins keep the existing gate and are never auto-enabled), then refresh
+  // the plugins store so the Browse card flips to Open + Switch.
+  useEffect(() => {
+    if (step !== "done") return;
+    void (async () => {
+      if (detail && !detail.info.experimental) {
+        const res = await commands.setPluginEnabled(pluginId, true);
+        if (res.status === "error") toast.error(res.error.message);
+      }
+      await loadPlugins();
+    })();
+  }, [step, pluginId, detail, loadPlugins]);
 
   return (
     <Modal onClose={close} width={480}>
@@ -458,6 +474,11 @@ export function InstallWizardModal({
             <Check aria-hidden size={16} strokeWidth={2.5} style={{ color: "#22C55E" }} />
             {pluginName} is installed.
           </div>
+          <p className="m-0 text-[12.5px] text-muted-foreground">
+            {detail?.info.experimental
+              ? "It's experimental, so it stays off — enable it from the card when ready."
+              : "It's enabled and ready for your agents."}
+          </p>
           <ModalFooter>
             <Button onClick={close}>Close</Button>
           </ModalFooter>
