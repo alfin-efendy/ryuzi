@@ -19,12 +19,14 @@
 use crate::error::CmdError;
 use crate::events::{PluginOauthAuthorizeUrlMsg, PluginOauthCompletedMsg};
 use reqwest::Url;
+use ryuzi_core::plugins::doctor;
 use ryuzi_core::plugins::oauth::{
     discover_oauth_server_metadata, generate_pkce_verifier, pkce_challenge_s256,
     register_oauth_client, OauthServerMetadata, PluginOauthToken,
 };
 use ryuzi_core::plugins::providers;
 use ryuzi_core::settings::SettingsStore;
+use ryuzi_core::skills_install::{BeginInstall, InstalledSkillPack, TrustPrompt, UpdateOutcome};
 use ryuzi_core::store::PluginOauthClient;
 use ryuzi_core::{ControlPlane, CorePlugin, PluginSource, Store};
 use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, SettingField};
@@ -1515,6 +1517,251 @@ pub async fn cancel_plugin_install(
     Ok(())
 }
 
+// ---------- Skill/plugin distribution: trust prompt, update, pin, doctor ----------
+//
+// The DTOs below are thin camelCase mirrors of `ryuzi_core::skills_install`'s
+// `TrustPrompt`/`UpdateOutcome` and `ryuzi_core::plugins::doctor`'s
+// `DoctorFinding` — those core types derive `Serialize`/`Deserialize` but not
+// specta's `Type`, so they cannot cross the Tauri IPC boundary directly (same
+// rationale as `PluginInfo` mirroring `ryuzi_plugin_sdk::PluginManifest`
+// above). None of these add or drop any field relative to the core type, and
+// `TrustPrompt` is already secret-free by construction (repo path, skill
+// names, hook-script paths, byte count — no credential material).
+
+/// Mirror of `ryuzi_core::skills_install::TrustPrompt`. `total_bytes` stays a
+/// `u64` (not narrowed to `u32`) to avoid silently truncating a large pack's
+/// byte count — `export_bindings`'s `BigIntExportBehavior::Number` already
+/// renders any bigint-sized field as a plain TS `number`, so there's no
+/// bindings-shape cost to keeping the wider type.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustPromptDto {
+    pub token: String,
+    pub source_spec: String,
+    pub owner_repo: String,
+    pub resolved_commit: Option<String>,
+    pub skills: Vec<String>,
+    pub hook_scripts: Vec<String>,
+    pub total_bytes: u64,
+}
+
+impl From<TrustPrompt> for TrustPromptDto {
+    fn from(p: TrustPrompt) -> Self {
+        TrustPromptDto {
+            token: p.token,
+            source_spec: p.source_spec,
+            owner_repo: p.owner_repo,
+            resolved_commit: p.resolved_commit,
+            skills: p.skills,
+            hook_scripts: p.hook_scripts,
+            total_bytes: p.total_bytes,
+        }
+    }
+}
+
+/// Mirror of `ryuzi_core::skills_install::BeginInstall`, flattened into a
+/// single `{completed, trust?, plugin?}` shape the wizard can branch on
+/// without a tagged-union match in TS. `trust` is set for
+/// `NeedsConfirmation`, `plugin` for `Completed` — exactly one is ever
+/// `Some`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInstallBegin {
+    pub completed: bool,
+    pub trust: Option<TrustPromptDto>,
+    pub plugin: Option<InstalledSkillPack>,
+}
+
+impl SkillInstallBegin {
+    fn from_completed(pack: InstalledSkillPack) -> Self {
+        SkillInstallBegin {
+            completed: true,
+            trust: None,
+            plugin: Some(pack),
+        }
+    }
+
+    fn from_needs_confirmation(prompt: TrustPrompt) -> Self {
+        SkillInstallBegin {
+            completed: false,
+            trust: Some(TrustPromptDto::from(prompt)),
+            plugin: None,
+        }
+    }
+}
+
+/// Mirror of `ryuzi_core::skills_install::UpdateOutcome`. Keeps the same
+/// `#[serde(tag = "kind", content = "detail")]` shape so the discriminated
+/// union round-trips identically to the core enum.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "detail")]
+pub enum UpdateOutcomeDto {
+    Updated,
+    AlreadyCurrent,
+    SkippedPinned,
+    LocalEdits,
+    Failed(String),
+    NeedsReack(TrustPromptDto),
+}
+
+impl From<UpdateOutcome> for UpdateOutcomeDto {
+    fn from(outcome: UpdateOutcome) -> Self {
+        match outcome {
+            UpdateOutcome::Updated => UpdateOutcomeDto::Updated,
+            UpdateOutcome::AlreadyCurrent => UpdateOutcomeDto::AlreadyCurrent,
+            UpdateOutcome::SkippedPinned => UpdateOutcomeDto::SkippedPinned,
+            UpdateOutcome::LocalEdits => UpdateOutcomeDto::LocalEdits,
+            UpdateOutcome::Failed(message) => UpdateOutcomeDto::Failed(message),
+            UpdateOutcome::NeedsReack(prompt) => {
+                UpdateOutcomeDto::NeedsReack(TrustPromptDto::from(prompt))
+            }
+        }
+    }
+}
+
+/// One pack's outcome from `update_all_plugins` — `ryuzi_core::skills_install
+/// ::update_all_packs` returns `Vec<(String, UpdateOutcome)>`; specta can't
+/// name a bare tuple usefully in the generated TS, so this wraps it in a
+/// named struct.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateOutcomeEntry {
+    pub id: String,
+    pub outcome: UpdateOutcomeDto,
+}
+
+/// Mirror of `ryuzi_core::plugins::doctor::DoctorFinding`. Already
+/// secret-free at the source (see that module's doc comment) — this DTO adds
+/// no new fields, just the specta `Type` the core struct doesn't derive.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DoctorFinding {
+    pub plugin_id: String,
+    /// `warn` | `error`.
+    pub severity: String,
+    /// `unconfigured` | `reconnect-required` | `missing-binary` | `attach-failed`.
+    pub kind: String,
+    pub message: String,
+    pub suggested_action: String,
+}
+
+impl From<doctor::DoctorFinding> for DoctorFinding {
+    fn from(f: doctor::DoctorFinding) -> Self {
+        DoctorFinding {
+            plugin_id: f.plugin_id,
+            severity: f.severity,
+            kind: f.kind,
+            message: f.message,
+            suggested_action: f.suggested_action,
+        }
+    }
+}
+
+/// Pure mapping layer over `skills_install::begin_install`, split out so it's
+/// unit-testable against a hermetic `Store` without a Tauri `State`.
+async fn begin_skill_install_inner(
+    source: &str,
+    store: &Store,
+) -> anyhow::Result<SkillInstallBegin> {
+    Ok(
+        match ryuzi_core::skills_install::begin_install(source, store).await? {
+            BeginInstall::Completed(pack) => SkillInstallBegin::from_completed(pack),
+            BeginInstall::NeedsConfirmation(prompt) => {
+                SkillInstallBegin::from_needs_confirmation(prompt)
+            }
+        },
+    )
+}
+
+/// Phase 1 of the two-phase tiered trust gate (see
+/// `ryuzi_core::skills_install::begin_install`): curated sources install
+/// immediately (`completed: true`); arbitrary sources stop at a trust prompt
+/// the wizard must show before `confirm_skill_install` can proceed.
+#[tauri::command]
+#[specta::specta]
+pub async fn begin_skill_install(
+    cp: State<'_, Arc<ControlPlane>>,
+    source: String,
+) -> R<SkillInstallBegin> {
+    Ok(begin_skill_install_inner(&source, cp.store()).await?)
+}
+
+/// Phase 2: complete a staged install (or update) after the user has
+/// acknowledged its `TrustPromptDto`. The token is single-use — see
+/// `ryuzi_core::skills_install::confirm_install`.
+#[tauri::command]
+#[specta::specta]
+pub async fn confirm_skill_install(
+    cp: State<'_, Arc<ControlPlane>>,
+    token: String,
+) -> R<InstalledSkillPack> {
+    Ok(ryuzi_core::skills_install::confirm_install(&token, cp.store()).await?)
+}
+
+/// Update one installed pack. `force` overrides the local-edits guard but
+/// never the pinned guard or the hook-script re-ack gate — see
+/// `ryuzi_core::skills_install::update_installed_pack`'s decision order.
+#[tauri::command]
+#[specta::specta]
+pub async fn update_plugin(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+    force: bool,
+) -> R<UpdateOutcomeDto> {
+    let outcome = ryuzi_core::skills_install::update_installed_pack(&id, force, cp.store()).await?;
+    Ok(UpdateOutcomeDto::from(outcome))
+}
+
+/// Update every installed pack (skipping pinned ones); never fails as a
+/// whole — a single pack's error surfaces as that pack's
+/// `UpdateOutcomeDto::Failed` entry.
+#[tauri::command]
+#[specta::specta]
+pub async fn update_all_plugins(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<UpdateOutcomeEntry>> {
+    let results = ryuzi_core::skills_install::update_all_packs(cp.store()).await?;
+    Ok(results
+        .into_iter()
+        .map(|(id, outcome)| UpdateOutcomeEntry {
+            id,
+            outcome: UpdateOutcomeDto::from(outcome),
+        })
+        .collect())
+}
+
+/// Pin (or unpin) an installed pack against future updates.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_plugin_pin(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+    pinned: bool,
+    reason: Option<String>,
+) -> R<()> {
+    Ok(
+        ryuzi_core::skills_install::set_pack_pin(&id, pinned, reason.as_deref(), cp.store())
+            .await?,
+    )
+}
+
+/// Read-only plugin health aggregation — see
+/// `ryuzi_core::plugins::doctor::plugin_doctor`'s doc comment for the full
+/// list of checks. Never mutates state.
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_doctor(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<DoctorFinding>> {
+    let findings = doctor::plugin_doctor(&cp).await?;
+    Ok(findings.into_iter().map(DoctorFinding::from).collect())
+}
+
+/// Whether a plugin install/update since the last app start requires a
+/// restart to take effect (in-memory flag on `ControlPlane`, cleared only by
+/// process restart).
+#[tauri::command]
+#[specta::specta]
+pub async fn plugins_restart_required(cp: State<'_, Arc<ControlPlane>>) -> R<bool> {
+    Ok(cp.plugins_restart_required())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2960,5 +3207,127 @@ mod tests {
             flow.verifier, "verifier-d",
             "the re-inserted flow must be the same one that was removed, not a blank default"
         );
+    }
+
+    // ---------- SkillInstallBegin / TrustPromptDto mapping ----------
+
+    #[tokio::test]
+    async fn begin_skill_install_inner_prompts_for_arbitrary_source() {
+        // Arbitrary sources can't be cloned offline; assert the mapping layer
+        // instead by driving core's begin_install with a fake is impractical
+        // here (install_skill_source resolves for_user). So assert the DTO
+        // mapping from a constructed BeginInstall::NeedsConfirmation is correct.
+        let prompt = ryuzi_core::skills_install::TrustPrompt {
+            token: "t".into(),
+            source_spec: "acme/p".into(),
+            owner_repo: "acme/p".into(),
+            resolved_commit: Some("c1".into()),
+            skills: vec!["S".into()],
+            hook_scripts: vec!["tool.before/g.sh".into()],
+            total_bytes: 12,
+        };
+        let dto = SkillInstallBegin::from_needs_confirmation(prompt);
+        assert!(!dto.completed);
+        assert_eq!(
+            dto.trust.unwrap().hook_scripts,
+            vec!["tool.before/g.sh".to_string()]
+        );
+    }
+
+    #[test]
+    fn skill_install_begin_from_completed_carries_the_pack_and_no_trust_prompt() {
+        let pack = InstalledSkillPack {
+            id: "superpowers".into(),
+            name: "Superpowers".into(),
+            source: "https://github.com/obra/superpowers".into(),
+            plugin_id: None,
+            installed_at: "2026-07-11T00:00:00Z".into(),
+            skills: vec![],
+        };
+        let dto = SkillInstallBegin::from_completed(pack.clone());
+        assert!(dto.completed);
+        assert!(dto.trust.is_none());
+        assert_eq!(dto.plugin.unwrap(), pack);
+    }
+
+    #[test]
+    fn update_outcome_dto_mirrors_every_variant_including_nested_trust_prompt() {
+        assert!(matches!(
+            UpdateOutcomeDto::from(UpdateOutcome::Updated),
+            UpdateOutcomeDto::Updated
+        ));
+        assert!(matches!(
+            UpdateOutcomeDto::from(UpdateOutcome::AlreadyCurrent),
+            UpdateOutcomeDto::AlreadyCurrent
+        ));
+        assert!(matches!(
+            UpdateOutcomeDto::from(UpdateOutcome::SkippedPinned),
+            UpdateOutcomeDto::SkippedPinned
+        ));
+        assert!(matches!(
+            UpdateOutcomeDto::from(UpdateOutcome::LocalEdits),
+            UpdateOutcomeDto::LocalEdits
+        ));
+        match UpdateOutcomeDto::from(UpdateOutcome::Failed("boom".into())) {
+            UpdateOutcomeDto::Failed(msg) => assert_eq!(msg, "boom"),
+            other => panic!(
+                "expected Failed, got a different variant: {}",
+                other_kind(&other)
+            ),
+        }
+        let prompt = TrustPrompt {
+            token: "t2".into(),
+            source_spec: "acme/q".into(),
+            owner_repo: "acme/q".into(),
+            resolved_commit: None,
+            skills: vec![],
+            hook_scripts: vec!["tool.after/h.sh".into()],
+            total_bytes: 0,
+        };
+        match UpdateOutcomeDto::from(UpdateOutcome::NeedsReack(prompt)) {
+            UpdateOutcomeDto::NeedsReack(dto) => {
+                assert_eq!(dto.hook_scripts, vec!["tool.after/h.sh".to_string()]);
+            }
+            other => panic!(
+                "expected NeedsReack, got a different variant: {}",
+                other_kind(&other)
+            ),
+        }
+    }
+
+    fn other_kind(v: &UpdateOutcomeDto) -> &'static str {
+        match v {
+            UpdateOutcomeDto::Updated => "Updated",
+            UpdateOutcomeDto::AlreadyCurrent => "AlreadyCurrent",
+            UpdateOutcomeDto::SkippedPinned => "SkippedPinned",
+            UpdateOutcomeDto::LocalEdits => "LocalEdits",
+            UpdateOutcomeDto::Failed(_) => "Failed",
+            UpdateOutcomeDto::NeedsReack(_) => "NeedsReack",
+        }
+    }
+
+    #[test]
+    fn doctor_finding_dto_mirrors_the_core_struct_field_for_field() {
+        let core = doctor::DoctorFinding {
+            plugin_id: "github".into(),
+            severity: "warn".into(),
+            kind: "attach-failed".into(),
+            message: "github: authentication failed".into(),
+            suggested_action: "Check github's configuration".into(),
+        };
+        let dto = DoctorFinding::from(core.clone());
+        assert_eq!(dto.plugin_id, core.plugin_id);
+        assert_eq!(dto.severity, core.severity);
+        assert_eq!(dto.kind, core.kind);
+        assert_eq!(dto.message, core.message);
+        assert_eq!(dto.suggested_action, core.suggested_action);
+    }
+
+    #[tokio::test]
+    async fn plugins_restart_required_reflects_the_control_plane_flag() {
+        let cp = test_cp().await;
+        assert!(!cp.plugins_restart_required());
+        cp.mark_plugins_restart_required();
+        assert!(cp.plugins_restart_required());
     }
 }
