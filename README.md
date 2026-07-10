@@ -8,7 +8,7 @@
 [![CI](https://github.com/alfin-efendy/ryuzi/actions/workflows/ci.yml/badge.svg)](https://github.com/alfin-efendy/ryuzi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Gateway-agnostic **control plane** for running agent harnesses (starting with Claude Code) and driving them from many clients (starting with Discord). The CLI is `ryuzi` — *drive Claude Code from chat and terminal*.
+Gateway-agnostic **control plane** for Ryuzi's built-in coding agent — an in-process native harness that runs against your own model providers — driven from many clients (starting with Discord). The CLI is `ryuzi` — *drive your coding agent from chat and terminal*.
 
 > Long-term: a **mission control** web app, an **IDE** desktop app, and a **mobile** app — all in this monorepo, all sharing one API/contract with the router.
 
@@ -17,7 +17,7 @@ Gateway-agnostic **control plane** for running agent harnesses (starting with Cl
 | Need | Why |
 | --- | --- |
 | [`git`](https://git-scm.com/) | Sessions run inside git repositories. |
-| [`claude` CLI](https://docs.claude.com/en/docs/claude-code) | The Claude Code runtime. **Log in once on the host** — the runtime uses your host login. |
+| A model provider | The native agent runs against your configured model providers (API key or OAuth) — set up in Cockpit's Models screen or the CLI wizard. |
 | [Bun](https://bun.sh) | Only for running **from source** (development). The installed `ryuzi` binary needs nothing else. |
 | A Discord server | Only if you want to drive sessions from Discord (you must be able to add a bot to it). |
 
@@ -65,15 +65,13 @@ Verify your environment:
 ```bash
 ryuzi doctor
 # git:    OK 2.43.0
-# claude: OK 2.1.191
-# auth:   unknown (relies on host login)
 # settings: OK
 # doctor: PASS
 ```
 
-`doctor` prints `PASS` only when git, claude, and all required settings are present — otherwise `FAIL` with the missing pieces.
+`doctor` prints `PASS` only when git and all required settings are present — otherwise `FAIL` with the missing pieces.
 
-Then launch the dashboard. **The first run starts an interactive setup wizard** — pick a gateway (Discord) and a runtime (Claude Code), then fill the required fields (at minimum `workdir_root`, the parent folder where your repos live):
+Then launch the dashboard. **The first run starts an interactive setup wizard** — pick a gateway (Discord), then fill the required fields (at minimum `workdir_root`, the parent folder where your repos live):
 
 ```bash
 ryuzi
@@ -142,7 +140,7 @@ Settings live in a local SQLite database at `~/.local/share/ryuzi/ryuzi.sqlite`.
 | Command | What it does |
 | --- | --- |
 | `ryuzi` | Open the dashboard; the first run launches the setup wizard. |
-| `ryuzi doctor` | Check your environment (git, claude, settings). |
+| `ryuzi doctor` | Check your environment (git, settings). |
 | `ryuzi run --dir <repo> --prompt <text> [--model x] [--effort y] [--mode m]` | One-shot session in a repo. |
 | `ryuzi --help` (or `-h`) | Show help. |
 | `ryuzi --version` (or `-v`) | Print the version. |
@@ -184,7 +182,7 @@ assets/
 
 ## Roadmap
 
-Phase 1 ships the router: the `ryuzi` CLI, the Discord gateway, and the Claude Code harness. Next come the **mission control** web app, the **IDE** desktop app, and the **mobile** app — all in this monorepo, all sharing one API/contract with the router.
+Phase 1 ships the router: the `ryuzi` CLI, the Discord gateway, and the native agent harness. Next come the **mission control** web app, the **IDE** desktop app, and the **mobile** app — all in this monorepo, all sharing one API/contract with the router.
 
 ## License
 
