@@ -352,8 +352,12 @@ pub async fn end_session(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -
 
 #[tauri::command]
 #[specta::specta]
-pub fn resolve_approval(cp: State<'_, Arc<ControlPlane>>, request_id: String, allow: bool) -> bool {
-    cp.resolve_approval(&request_id, allow)
+pub fn resolve_approval(
+    cp: State<'_, Arc<ControlPlane>>,
+    request_id: String,
+    response: ryuzi_core::domain::ApprovalResponse,
+) -> bool {
+    cp.resolve_approval(&request_id, response)
 }
 
 /// Largest file the viewer will load into memory.

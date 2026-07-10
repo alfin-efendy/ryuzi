@@ -11,6 +11,7 @@ import {
   type GitOptions,
   type PermMode,
   type ApprovalKind,
+  type ApprovalResponse,
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
@@ -70,7 +71,7 @@ type State = {
   stop: (sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
   end: (sessionPk: string) => Promise<boolean>;
-  resolveApproval: (requestId: string, allow: boolean) => Promise<void>;
+  resolveApproval: (requestId: string, response: ApprovalResponse) => Promise<void>;
   hydrateTranscript: (pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
   init: () => Promise<void>;
 };
@@ -322,9 +323,9 @@ export const useStore = create<State>((set, get) => ({
     await get().refresh();
     return res.status === "ok";
   },
-  resolveApproval: async (requestId, allow) => {
+  resolveApproval: async (requestId, response) => {
     try {
-      await commands.resolveApproval(requestId, allow);
+      await commands.resolveApproval(requestId, response);
       get().clearApproval(requestId);
     } catch (e) {
       console.error("resolveApproval failed", e);

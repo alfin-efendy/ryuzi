@@ -1,6 +1,6 @@
 use crate::approval::ApprovalHub;
 use crate::attachments::{AttachmentFetcher, UreqFetcher};
-use crate::domain::{CoreEvent, Message, PermMode, Project, Session};
+use crate::domain::{ApprovalResponse, CoreEvent, Message, PermMode, Project, Session};
 use crate::harness::HarnessSession;
 use crate::plugins::Registries;
 use crate::store::Store;
@@ -168,15 +168,23 @@ impl ControlPlane {
         self.events.clone()
     }
 
-    pub fn resolve_approval(&self, request_id: &str, allow: bool) -> bool {
-        let resolved = self.approvals.resolve_bool(request_id, allow);
-        let name = if allow {
+    /// Resolve a pending approval with the user's full decision. Telemetry
+    /// counts by decision so allow/deny rates stay observable.
+    pub fn resolve_approval(&self, request_id: &str, response: ApprovalResponse) -> bool {
+        let name = if response.allowed() {
             "approval.allow"
         } else {
             "approval.deny"
         };
+        let resolved = self.approvals.resolve(request_id, response);
         self.telemetry.count(name, vec![]);
         resolved
+    }
+
+    /// Binary resolve for surfaces that only know allow/deny (gateway
+    /// fan-out timeout/deny paths).
+    pub fn resolve_approval_bool(&self, request_id: &str, allow: bool) -> bool {
+        self.resolve_approval(request_id, ApprovalResponse::once(allow))
     }
 
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {

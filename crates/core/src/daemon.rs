@@ -360,7 +360,7 @@ fn spawn_approval_fanout(
 /// Core approval fan-out decision, callable directly (no broadcast loop
 /// needed) so it's unit-testable: reads `approval_timeout_ms` /
 /// `approver_role_ids` from settings and `started_by` from the session, then
-/// resolves via `cp.resolve_approval`.
+/// resolves via `cp.resolve_approval_bool`.
 ///
 /// - No surfaces bound to the session (after filtering to gateways we know
 ///   about) → immediate deny.
@@ -421,7 +421,7 @@ pub(crate) async fn handle_approval(
         .collect();
 
     if known_surfaces.is_empty() {
-        cp.resolve_approval(request_id, false);
+        cp.resolve_approval_bool(request_id, false);
         return;
     }
 
@@ -464,7 +464,7 @@ pub(crate) async fn handle_approval(
         Ok(None) | Err(_) => ApprovalDecision::RejectOnce,
     };
 
-    cp.resolve_approval(
+    cp.resolve_approval_bool(
         request_id,
         matches!(
             decision,

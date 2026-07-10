@@ -1,5 +1,7 @@
 use super::*;
-use crate::domain::{AttachmentRef, CoreEvent, NewMessage, SessionStatus};
+use crate::domain::{
+    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionStatus,
+};
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::now_ms;
 use crate::plugins::Registries;
@@ -525,8 +527,8 @@ async fn resolve_approval_counts_allow_and_deny() {
     let (lines, telemetry) = capturing_console_telemetry();
     let (cp, _store, _prompts, _db_guard) = fake_control_plane_with_telemetry(telemetry).await;
 
-    cp.resolve_approval("req-allow", true);
-    cp.resolve_approval("req-deny", false);
+    cp.resolve_approval_bool("req-allow", true);
+    cp.resolve_approval_bool("req-deny", false);
 
     let parsed = parse_telemetry_lines(&lines);
     assert!(
@@ -541,6 +543,27 @@ async fn resolve_approval_counts_allow_and_deny() {
             .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
         "expected an approval.deny count line, got: {parsed:?}"
     );
+}
+
+#[tokio::test]
+async fn resolve_approval_delegates_the_structured_response() {
+    let (cp, _store, _prompts, _db_guard) = fake_control_plane().await;
+    let rx = cp.approvals.register("req-structured".into());
+
+    let resolved = cp.resolve_approval(
+        "req-structured",
+        ApprovalResponse {
+            decision: ApprovalDecision::AllowAlways,
+            scope: Some(ApprovalScope::Session),
+            payload: None,
+        },
+    );
+
+    assert!(resolved, "a registered request must resolve");
+    let response = rx.await.unwrap();
+    assert_eq!(response.decision, ApprovalDecision::AllowAlways);
+    assert_eq!(response.scope, Some(ApprovalScope::Session));
+    assert!(response.allowed());
 }
 
 /// Like `fake_control_plane`, but the registered harness always fails to
@@ -844,7 +867,7 @@ async fn stop_session_denies_this_sessions_parked_approvals_only() {
         "stop must deny this session's parked approval"
     );
     // The unrelated session's approval is untouched and still resolvable.
-    assert!(cp.resolve_approval("tool-c", true));
+    assert!(cp.resolve_approval_bool("tool-c", true));
     assert!(rx_other.await.unwrap().allowed());
 }
 

@@ -257,8 +257,30 @@ async fn run_session(
                 summary,
                 ..
             } if session_pk == session.session_pk => {
-                let answer = (deps.prompt)(&format!("approve {tool}? {summary} [y/N] "));
-                cp.resolve_approval(&request_id, answer.trim().eq_ignore_ascii_case("y"));
+                use ryuzi_core::domain::{ApprovalDecision, ApprovalResponse, ApprovalScope};
+                let answer = (deps.prompt)(&format!(
+                    "approve {tool}? {summary} [y=once, s=always this session, a=always this project, n=no, N=never this project] "
+                ));
+                let response = match answer.trim() {
+                    "y" | "Y" | "yes" => ApprovalResponse::once(true),
+                    "s" | "S" => ApprovalResponse {
+                        decision: ApprovalDecision::AllowAlways,
+                        scope: Some(ApprovalScope::Session),
+                        payload: None,
+                    },
+                    "a" | "A" => ApprovalResponse {
+                        decision: ApprovalDecision::AllowAlways,
+                        scope: Some(ApprovalScope::Project),
+                        payload: None,
+                    },
+                    "N" => ApprovalResponse {
+                        decision: ApprovalDecision::RejectAlways,
+                        scope: Some(ApprovalScope::Project),
+                        payload: None,
+                    },
+                    _ => ApprovalResponse::once(false),
+                };
+                cp.resolve_approval(&request_id, response);
             }
             CoreEvent::Result { session_pk } if session_pk == session.session_pk => {
                 (deps.out)("✓ done");

@@ -21,10 +21,14 @@ export function ApprovalPrompt({ sessionPk }: { sessionPk: string }) {
         </div>
         <div className="px-3.5 py-3 font-mono text-xs break-words whitespace-pre-wrap">{a.summary}</div>
         <div className="flex justify-end gap-2 border-t border-border bg-muted/40 px-3.5 py-2.5">
-          <Button size="sm" variant="outline" onClick={() => resolveApproval(a.requestId, false)}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => resolveApproval(a.requestId, { decision: "rejectOnce", scope: null, payload: null })}
+          >
             Deny
           </Button>
-          <Button size="sm" onClick={() => resolveApproval(a.requestId, true)}>
+          <Button size="sm" onClick={() => resolveApproval(a.requestId, { decision: "allowOnce", scope: null, payload: null })}>
             Allow
           </Button>
         </div>

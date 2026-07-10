@@ -77,8 +77,8 @@ async endSession(sessionPk: string) : Promise<Result<null, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async resolveApproval(requestId: string, allow: boolean) : Promise<boolean> {
-    return await TAURI_INVOKE("resolve_approval", { requestId, allow });
+async resolveApproval(requestId: string, response: ApprovalResponse) : Promise<boolean> {
+    return await TAURI_INVOKE("resolve_approval", { requestId, response });
 },
 async readFile(path: string) : Promise<Result<string, CmdError>> {
     try {
@@ -1118,6 +1118,10 @@ export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 /**
+ * The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+ */
+export type ApprovalDecision = "allowOnce" | "allowAlways" | "rejectOnce" | "rejectAlways" | "cancel"
+/**
  * What a pending approval is asking the user for.
  */
 export type ApprovalKind = 
@@ -1133,6 +1137,25 @@ export type ApprovalKind =
  * An `askuserquestion` form.
  */
 "question"
+/**
+ * The user's full reply to an approval request. `payload` carries
+ * kind-specific data: `{"mode": "acceptEdits"|"default"}` or
+ * `{"feedback": "…"}` for Plan, `{"answers": {question: [labels]}}`
+ * for Question.
+ */
+export type ApprovalResponse = { decision: ApprovalDecision; scope: ApprovalScope | null; payload: JsonValue | null }
+/**
+ * Where an `AllowAlways`/`RejectAlways` decision is remembered.
+ */
+export type ApprovalScope = 
+/**
+ * In-memory for the current session only.
+ */
+"session" | 
+/**
+ * Persisted to the project's `tool_policies` row.
+ */
+"project"
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type BranchList = { 
 /**
