@@ -119,9 +119,29 @@ function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "tool" }
   // path resolves inside the worktree.
   const linkRel = openWorkspaceFile && fileCtx && item.path ? toWorkspaceRelativePath(item.path, fileCtx.workdir) : null;
 
-  const detailNode =
-    detail !== null ? (
-      linkRel !== null && openWorkspaceFile !== null ? (
+  const iconTitle = (
+    <>
+      <Icon aria-hidden size={12} strokeWidth={2} className="shrink-0 text-muted-foreground" />
+      <span className="shrink-0">{title}</span>
+    </>
+  );
+  const trailing = (
+    <>
+      {duration !== "" && <Badge>{duration}</Badge>}
+      {item.exitCode !== null && <Badge tone={item.exitCode === 0 ? "muted" : "error"}>exit {item.exitCode}</Badge>}
+      <StatusMark status={item.status} />
+    </>
+  );
+  const headerClass = "flex w-full items-center gap-2 px-3 py-[7px] font-mono text-xs text-foreground";
+
+  let headerNode: ReactNode;
+  if (linkRel !== null && openWorkspaceFile !== null) {
+    // A clickable path is present, so the row renders a real <a>. An anchor
+    // nested inside a <button> is invalid content (and, unlike
+    // button-in-button, browsers won't auto-repair it), so the toggle target
+    // (icon+title only) and the link must be siblings inside a plain div.
+    const detailNode =
+      detail !== null ? (
         <a
           href={linkRel}
           className="min-w-0 flex-1 cursor-pointer truncate text-left font-normal text-muted-foreground underline decoration-dotted underline-offset-2"
@@ -130,31 +150,15 @@ function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "tool" }
             e.stopPropagation();
             openWorkspaceFile(linkRel);
           }}
+          onAuxClick={(e) => e.preventDefault()}
+          draggable={false}
         >
           {detail}
         </a>
       ) : (
-        <span className="min-w-0 flex-1 truncate text-left font-normal text-muted-foreground">{detail}</span>
-      )
-    ) : (
-      <span className="min-w-0 flex-1" />
-    );
-
-  // Icon + title toggle the card when expandable. Kept as its own Button
-  // (rather than wrapping the whole row, as before) because `detailNode` can
-  // render a real <a> for the clickable path — an anchor nested inside a
-  // <button> is invalid content (and, unlike button-in-button, browsers won't
-  // auto-repair it), so the toggle target and the link must be siblings.
-  const iconTitle = (
-    <>
-      <Icon aria-hidden size={12} strokeWidth={2} className="shrink-0 text-muted-foreground" />
-      <span className="shrink-0">{title}</span>
-    </>
-  );
-  const headerClass = "flex w-full items-center gap-2 px-3 py-[7px] font-mono text-xs text-foreground";
-
-  return (
-    <div className="acrylic-panel flex w-full max-w-[640px] flex-col overflow-hidden rounded-md border border-border">
+        <span className="min-w-0 flex-1" />
+      );
+    headerNode = (
       <div className={headerClass}>
         {expandable ? (
           <Button
@@ -170,10 +174,42 @@ function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "tool" }
           iconTitle
         )}
         {detailNode}
-        {duration !== "" && <Badge>{duration}</Badge>}
-        {item.exitCode !== null && <Badge tone={item.exitCode === 0 ? "muted" : "error"}>exit {item.exitCode}</Badge>}
-        <StatusMark status={item.status} />
+        {trailing}
       </div>
+    );
+  } else {
+    // No clickable path on this card: the whole header row is the toggle
+    // again (original pre-4c34f40 behavior) — full-row hover affordance and
+    // click target, with detail rendered as a plain, non-interactive span.
+    const header = (
+      <>
+        {iconTitle}
+        {detail !== null ? (
+          <span className="min-w-0 flex-1 truncate text-left font-normal text-muted-foreground">{detail}</span>
+        ) : (
+          <span className="min-w-0 flex-1" />
+        )}
+        {trailing}
+      </>
+    );
+    headerNode = expandable ? (
+      <Button
+        variant="ghost"
+        size="xs"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className={`${headerClass} h-auto cursor-pointer justify-start rounded-none font-normal hover:bg-accent dark:hover:bg-accent`}
+      >
+        {header}
+      </Button>
+    ) : (
+      <div className={headerClass}>{header}</div>
+    );
+  }
+
+  return (
+    <div className="acrylic-panel flex w-full max-w-[640px] flex-col overflow-hidden rounded-md border border-border">
+      {headerNode}
       {open && item.output && <OutputBlock text={item.output} />}
     </div>
   );

@@ -82,3 +82,11 @@ test("without a provider the detail stays a plain span", () => {
   render(<ActivityCluster items={[item]} />);
   expect(screen.queryByRole("link")).toBeNull();
 });
+
+test("an expandable no-link card toggles open when clicking the detail text (full row is the toggle)", () => {
+  const item = { ...toolItem("t1"), path: null, summary: "3 files touched", output: "diff output here" };
+  render(<ActivityCluster items={[item]} />);
+  expect(screen.queryByText("diff output here")).toBeNull();
+  fireEvent.click(screen.getByText("3 files touched"));
+  expect(screen.getByText("diff output here")).toBeTruthy();
+});
