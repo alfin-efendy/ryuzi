@@ -114,6 +114,11 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
                 let mut text_parts: Vec<Value> = Vec::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
                 let mut tool_results: Vec<Value> = Vec::new();
+                // Images from ALL tool_result blocks in this turn accumulate
+                // here and hoist into a single user message after every
+                // `role: tool` message — never interleaved between them (see
+                // the contiguity note below).
+                let mut hoisted_images: Vec<Value> = Vec::new();
                 for b in blocks {
                     match b["type"].as_str().unwrap_or("") {
                         "text" => text_parts.push(json!({"type": "text", "text": b["text"]})),
@@ -139,9 +144,7 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
                                 "tool_call_id": b["tool_use_id"],
                                 "content": content,
                             }));
-                            if !images.is_empty() {
-                                tool_results.push(json!({"role": "user", "content": images}));
-                            }
+                            hoisted_images.extend(images);
                         }
                         _ => {}
                     }
@@ -171,8 +174,17 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
                     // tool_result blocks must land immediately after the
                     // assistant tool_calls turn, before this turn's own user
                     // text — OpenAI-compat providers 400 on a `role: tool`
-                    // message that doesn't directly follow it.
+                    // message that doesn't directly follow it. All hoisted
+                    // images from every tool_result in this turn are emitted
+                    // as ONE user message right after the (contiguous) tool
+                    // messages, never interleaved between them.
                     messages.append(&mut tool_results);
+                    if !hoisted_images.is_empty() {
+                        messages.push(json!({
+                            "role": "user",
+                            "content": std::mem::take(&mut hoisted_images),
+                        }));
+                    }
                     if !text_parts.is_empty() {
                         // Single text part → plain string; mixed parts stay array.
                         let only_text = text_parts.len() == 1 && text_parts[0]["type"] == "text";
@@ -185,6 +197,12 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
                     }
                 }
                 messages.extend(tool_results);
+                // Defensive fallback: only reachable if tool_result blocks
+                // somehow appeared in an assistant-role message, since the
+                // non-assistant branch above already drains hoisted_images.
+                if !hoisted_images.is_empty() {
+                    messages.push(json!({"role": "user", "content": hoisted_images}));
+                }
             }
             _ => {}
         }
@@ -1010,6 +1028,83 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn multiple_tool_result_images_hoist_into_one_contiguous_user_message() {
+        // Two image-bearing tool_results in the SAME user turn must not
+        // interleave role:"tool" messages with a hoisted role:"user" image
+        // message in between — strict OpenAI-compat providers 400 on a
+        // `role: tool` message that doesn't directly follow the assistant
+        // tool_calls turn. Both images must hoist into a single user message
+        // placed after both tool messages.
+        let body = json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "read", "input": {"path": "shot1.png"}},
+                    {"type": "tool_use", "id": "tu_2", "name": "read", "input": {"path": "shot2.png"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+                        {"type": "text", "text": "[image shot1.png attached]"}
+                    ]},
+                    {"type": "tool_result", "tool_use_id": "tu_2", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "REVG"}},
+                        {"type": "text", "text": "[image shot2.png attached]"}
+                    ]}
+                ]}
+            ]
+        });
+        let out = anthropic_to_openai_request(&body).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+
+        let tool_positions: Vec<usize> = msgs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m["role"] == "tool")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            tool_positions.len(),
+            2,
+            "expected exactly two tool messages, got: {msgs:#?}"
+        );
+        assert_eq!(
+            tool_positions[1],
+            tool_positions[0] + 1,
+            "tool messages must be contiguous (no message in between), got: {msgs:#?}"
+        );
+
+        let user_positions: Vec<usize> = msgs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m["role"] == "user")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            user_positions.len(),
+            1,
+            "expected exactly one hoisted user image message, got: {msgs:#?}"
+        );
+        assert!(
+            user_positions[0] > tool_positions[1],
+            "hoisted user image message must come after both tool messages, got: {msgs:#?}"
+        );
+
+        let images = msgs[user_positions[0]]["content"].as_array().unwrap();
+        assert_eq!(images.len(), 2, "both images must land in one message");
+        assert_eq!(images[0]["type"], "image_url");
+        assert!(images[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,QUJD"));
+        assert_eq!(images[1]["type"], "image_url");
+        assert!(images[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,REVG"));
     }
 
     #[test]
