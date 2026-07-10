@@ -93,7 +93,7 @@ const pluginDetail = mock((_id: string) => ok(detailData));
 const beginPluginInstall = mock((_pluginId: string) => ok(beginData));
 const setPluginOauthClientId = mock((_pluginId: string, _clientId: string) => ok(null));
 const cancelPluginInstall = mock((_pluginId: string, _stateToken: string | null) => ok(null));
-const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken: string) => ok(null));
+const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken: string) => ok(oauthAuthInfo));
 const setPluginSetting = mock((_key: string, _value: string) => ok(null));
 const setPluginEnabled = mock((_id: string, _enabled: boolean) => ok(null));
 const listPlugins = mock(() => ok([]));
@@ -256,4 +256,39 @@ test("Cancel closes the wizard", async () => {
 
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   expect(onClose).toHaveBeenCalled();
+});
+
+test("tokenInput saves through the manifest auth.setting key and continues", async () => {
+  detailData = detailFixture({ auth: tokenAuthInfo });
+  beginData = beginResult({ authKind: "token" });
+  await renderWizard();
+
+  const cont = screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement;
+  expect(cont.disabled).toBe(true);
+
+  fireEvent.change(screen.getByPlaceholderText("Required — not set"), { target: { value: "secret-token" } });
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith("plugin.notion.token", "secret-token"));
+  expect(await screen.findByText("Notion is installed.")).toBeTruthy();
+});
+
+test("tokenInput routes to settings after saving when settings are declared", async () => {
+  detailData = detailFixture({ auth: tokenAuthInfo, settings: [field("plugin.notion.user", "User")] });
+  beginData = beginResult({ authKind: "token" });
+  await renderWizard();
+
+  fireEvent.change(screen.getByPlaceholderText("Required — not set"), { target: { value: "secret-token" } });
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  expect(await screen.findByText(/Required fields are marked/)).toBeTruthy();
+});
+
+test("tokenInput renders the help link and opens it via openUrl", async () => {
+  detailData = detailFixture({ auth: tokenAuthInfo });
+  beginData = beginResult({ authKind: "token" });
+  await renderWizard();
+
+  fireEvent.click(screen.getByRole("button", { name: /Get a token at/ }));
+  expect(openUrl).toHaveBeenCalledWith("https://notion.example/help");
 });

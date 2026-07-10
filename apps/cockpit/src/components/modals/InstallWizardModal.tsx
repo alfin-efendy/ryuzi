@@ -1,6 +1,8 @@
-import { Check, CircleAlert } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { Check, CircleAlert, ExternalLink } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { Button, Modal, ModalFooter } from "@ryuzi/ui";
+import { toast } from "sonner";
+import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
 import { commands, type PluginDetail, type PluginInstallBeginResult } from "@/bindings";
 import { IconChip, StatusDot } from "@/components/common/bits";
 import { pluginIcon as iconFor } from "@/lib/plugin-icons";
@@ -31,11 +33,26 @@ export function InstallWizardModal({
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [begin, setBegin] = useState<PluginInstallBeginResult | null>(null);
   const [checkError, setCheckError] = useState<string | null>(null);
+  const [tokenValue, setTokenValue] = useState("");
+  const [busy, setBusy] = useState(false);
 
   const Icon = iconFor(pluginIcon ?? null);
 
   const close = () => {
     onClose();
+  };
+
+  const submitToken = async () => {
+    const key = detail?.auth?.setting;
+    if (!key || tokenValue.trim().length === 0 || busy) return;
+    setBusy(true);
+    const res = await commands.setPluginSetting(key, tokenValue.trim());
+    setBusy(false);
+    if (res.status === "error") {
+      toast.error(res.error.message);
+      return;
+    }
+    setStep(settingsOrDone(detail));
   };
 
   // Single resolution call: the backend runs env-var detection, RFC 8414
@@ -126,9 +143,39 @@ export function InstallWizardModal({
             {pluginName} authenticates with {begin?.authKind === "api-key" ? "an API key" : "a token"}. Paste it below — Cockpit
             stores it locally and never shows it again.
           </p>
+          {detail?.auth?.setting ? (
+            <FormField label={begin?.authKind === "api-key" ? "API key" : "Token"}>
+              <Input
+                type="password"
+                value={tokenValue}
+                onChange={(e) => setTokenValue(e.target.value)}
+                placeholder={detail?.auth?.configured ? "●●●● saved" : "Required — not set"}
+              />
+            </FormField>
+          ) : (
+            <p className="m-0 text-[12.5px] text-muted-foreground">
+              This plugin reads its credential from the{" "}
+              <span className="font-mono text-xs">{detail?.auth?.env ?? begin?.envVarName ?? "required"}</span> environment
+              variable. Set it, restart Cockpit, and install again.
+            </p>
+          )}
+          {detail?.auth?.helpUrl && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void openUrl(detail.auth?.helpUrl as string)}
+              className="mt-2 px-0 text-[12px] text-muted-foreground"
+            >
+              <ExternalLink aria-hidden size={12} strokeWidth={2} className="size-3" />
+              Get a token at {detail.auth.helpUrl}
+            </Button>
+          )}
           <ModalFooter>
             <Button variant="outline" onClick={close}>
               Cancel
+            </Button>
+            <Button disabled={busy || !detail?.auth?.setting || tokenValue.trim().length === 0} onClick={() => void submitToken()}>
+              {busy ? "Saving…" : "Continue"}
             </Button>
           </ModalFooter>
         </>
