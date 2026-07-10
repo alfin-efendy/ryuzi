@@ -67,10 +67,8 @@ pub fn install_builtins(regs: &mut Registries) {
 /// Callers that only need `validate_setting`/`is_secret` to recognize
 /// `plugin.*` keys (e.g. `ryuzi config get/set/list`) should call this
 /// instead of building a real `Registries` — in particular, this
-/// deliberately never resolves the claude-code ACP sidecar the way
-/// `crates/cli/src/main.rs`'s `build_registries` does, which can print a
-/// noisy `eprintln!` note on failure (a regression in `config get` output)
-/// and, worse, touch the network or the filesystem to download an adapter.
+/// deliberately avoids side-effectful operations like spawning processes
+/// or touching the network, keeping output clean without noisy diagnostic notes.
 ///
 /// The built `Registries` value is dropped at the end of this function:
 /// registration into `PLUGIN_FIELDS` is a side effect of
