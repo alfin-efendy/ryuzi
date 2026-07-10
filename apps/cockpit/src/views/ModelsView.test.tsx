@@ -190,6 +190,7 @@ mock.module("@/bindings", () => ({
     listProviderCatalog: () => Promise.resolve({ status: "ok", data: catalog }),
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
+    listRuntimes: () => Promise.resolve({ status: "ok", data: [] }),
     saveModelRoute,
     refreshProviderModels,
     deleteModelRoute: (_id: string) => Promise.resolve({ status: "ok", data: [] }),
