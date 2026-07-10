@@ -52,3 +52,91 @@ test("unrelated events → null", () => {
   expect(notifyIntentForEvent(ev({ kind: "message", session_pk: "a" }), null, false)).toBeNull();
   expect(notifyIntentForEvent(ev({ kind: "sessionCreated", session_pk: "a" }), null, false)).toBeNull();
 });
+
+import { createNotifier, notificationText, SETTLE_MS, type NotifierDeps } from "./notify";
+
+function fakeDeps(over: Partial<NotifierDeps> = {}) {
+  const sent: Array<{ title: string; body: string }> = [];
+  const badges: Array<number | undefined> = [];
+  const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+  const deps: NotifierDeps = {
+    sendNotification: (o) => sent.push(o),
+    setBadgeCount: (n) => badges.push(n),
+    ensurePermission: async () => true,
+    isEnabled: () => true,
+    schedule: (fn, ms) => {
+      const t = { fn, ms, cancelled: false };
+      timers.push(t);
+      return () => { t.cancelled = true; };
+    },
+    ...over,
+  };
+  const runTimers = () => timers.filter((t) => !t.cancelled).forEach((t) => t.fn());
+  return { deps, sent, badges, timers, runTimers };
+}
+
+test("settle intent schedules, fires after the settle window", async () => {
+  const f = fakeDeps();
+  const n = createNotifier(f.deps);
+  n.handle({ sessionPk: "a", kind: "finished", settle: true }, undefined);
+  expect(f.timers[0].ms).toBe(SETTLE_MS);
+  expect(f.sent.length).toBe(0);
+  f.runTimers();
+  await Promise.resolve();
+  expect(f.sent.length).toBe(1);
+});
+
+test("a second event for the same session cancels the pending settle", () => {
+  const f = fakeDeps();
+  const n = createNotifier(f.deps);
+  n.handle({ sessionPk: "a", kind: "finished", settle: true }, undefined);
+  n.cancelSettle("a"); // new activity arrives
+  f.runTimers();
+  expect(f.sent.length).toBe(0);
+});
+
+test("immediate intent sends now and cancels any pending settle", async () => {
+  const f = fakeDeps();
+  const n = createNotifier(f.deps);
+  n.handle({ sessionPk: "a", kind: "finished", settle: true }, undefined);
+  n.handle({ sessionPk: "a", kind: "approval", settle: false, detail: "bash" }, undefined);
+  await Promise.resolve();
+  expect(f.sent.length).toBe(1);
+  expect(f.sent[0].body).toContain("bash");
+  f.runTimers(); // the settle timer was cancelled
+  await Promise.resolve();
+  expect(f.sent.length).toBe(1);
+});
+
+test("disabled → no send, but updateBadge still works", async () => {
+  const f = fakeDeps({ isEnabled: () => false });
+  const n = createNotifier(f.deps);
+  n.handle({ sessionPk: "a", kind: "approval", settle: false, detail: "x" }, undefined);
+  await Promise.resolve();
+  expect(f.sent.length).toBe(0);
+  n.updateBadge(3);
+  expect(f.badges).toEqual([3]);
+});
+
+test("updateBadge maps 0 to undefined (clears)", () => {
+  const f = fakeDeps();
+  const n = createNotifier(f.deps);
+  n.updateBadge(0);
+  n.updateBadge(5);
+  expect(f.badges).toEqual([undefined, 5]);
+});
+
+test("permission denied → no send", async () => {
+  const f = fakeDeps({ ensurePermission: async () => false });
+  const n = createNotifier(f.deps);
+  n.handle({ sessionPk: "a", kind: "error", settle: false }, undefined);
+  await Promise.resolve(); await Promise.resolve();
+  expect(f.sent.length).toBe(0);
+});
+
+test("notificationText formats per kind", () => {
+  const s = { title: "My session" } as never;
+  expect(notificationText({ sessionPk: "a", kind: "finished", settle: true }, s)).toEqual({ title: "My session", body: "Turn finished" });
+  expect(notificationText({ sessionPk: "a", kind: "approval", settle: false, detail: "bash" }, s)).toEqual({ title: "My session", body: "Needs approval: bash" });
+  expect(notificationText({ sessionPk: "a", kind: "error", settle: false }, s)).toEqual({ title: "My session", body: "Turn errored" });
+});
