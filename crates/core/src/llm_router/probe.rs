@@ -219,6 +219,8 @@ pub(crate) async fn probe_model_with_ctx(
         conn: conn.clone(),
         desc,
         upstream_model: model.to_string(),
+        route_target_key: None,
+        request_compatibility_effort: None,
     };
     if connections::is_oauth(&target.conn) {
         if let Err(err) =
@@ -350,6 +352,8 @@ mod tests {
             ),
             desc,
             upstream_model: "gpt-5.2".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.2")
             .unwrap()
@@ -382,6 +386,8 @@ mod tests {
             conn: mk_conn("c2", "mimo-free", "free", ConnectionData::default()),
             desc,
             upstream_model: "mimo-auto".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "mimo-auto")
             .unwrap()
@@ -620,6 +626,8 @@ mod tests {
             ),
             desc,
             upstream_model: "claude-sonnet-4-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-sonnet-4-5")
             .unwrap()
@@ -706,6 +714,8 @@ mod tests {
             ),
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-sonnet-5")
             .unwrap()
@@ -751,6 +761,8 @@ mod tests {
             ),
             desc,
             upstream_model: "gpt-5.2-codex-high".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.2-codex-high")
             .unwrap()
@@ -811,6 +823,8 @@ mod tests {
             ),
             desc,
             upstream_model: "gpt-5.2-codex".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.2-codex")
             .unwrap()
@@ -835,6 +849,8 @@ mod tests {
             ),
             desc,
             upstream_model: "gpt-5.4-review".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.4-review")
             .unwrap()
@@ -860,6 +876,8 @@ mod tests {
             ),
             desc,
             upstream_model: "claude-opus-4-8".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-opus-4-8")
             .unwrap()
@@ -902,6 +920,8 @@ mod tests {
             ),
             desc,
             upstream_model: "claude-opus-4-8".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-opus-4-8")
             .unwrap()

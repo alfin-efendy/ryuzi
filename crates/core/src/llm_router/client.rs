@@ -58,6 +58,8 @@ pub struct RouteTarget {
     pub conn: connections::ConnectionRow,
     pub desc: &'static ProviderDescriptor,
     pub upstream_model: String,
+    pub route_target_key: Option<crate::llm_router::model_effort::RouteTargetEffortKey>,
+    pub request_compatibility_effort: Option<String>,
 }
 
 pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Option<RouteTarget>> {
@@ -135,6 +137,8 @@ async fn route_models_for_body_matching(
                     conn,
                     desc,
                     upstream_model: model.to_string(),
+                    route_target_key: None,
+                    request_compatibility_effort: None,
                 });
             }
         }
@@ -142,13 +146,15 @@ async fn route_models_for_body_matching(
     }
     let route_list = routes::list_model_routes(store).await?;
     if let Some(route) = routes::route_by_name(&route_list, requested) {
-        let targets =
-            prefer_capable_targets(routes::ordered_targets(store, route).await?, required);
+        let targets = prefer_capable_indexed_targets(
+            routes::ordered_indexed_targets(store, route).await?,
+            required,
+        );
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::<(String, String)>::new();
-        for target in targets {
-            for route_target in
-                expanded_route_targets(store, &enabled, &target, target_allowed).await?
+        for indexed in targets {
+            for mut route_target in
+                expanded_route_targets(store, &enabled, &indexed.target, target_allowed).await?
             {
                 let key = (
                     route_target.conn.id.clone(),
@@ -157,6 +163,11 @@ async fn route_models_for_body_matching(
                 if !seen.insert(key) {
                     continue;
                 }
+                route_target.route_target_key =
+                    Some(crate::llm_router::model_effort::RouteTargetEffortKey {
+                        route_id: route.id.clone(),
+                        target_index: indexed.original_index,
+                    });
                 out.push(route_target);
             }
         }
@@ -189,6 +200,8 @@ async fn route_models_for_body_matching(
                     conn,
                     desc,
                     upstream_model: requested.to_string(),
+                    route_target_key: None,
+                    request_compatibility_effort: None,
                 });
             }
         }
@@ -236,6 +249,8 @@ async fn expanded_route_targets(
                 conn,
                 desc,
                 upstream_model: target.model.clone(),
+                route_target_key: None,
+                request_compatibility_effort: None,
             })
         })
         .collect())
@@ -373,28 +388,24 @@ async fn ordered_provider_connections(
         .collect())
 }
 
-fn prefer_capable_targets(
-    targets: Vec<routes::ModelRouteTarget>,
+fn prefer_capable_indexed_targets(
+    targets: Vec<routes::IndexedModelRouteTarget>,
     required: capabilities::RequiredCapabilities,
-) -> Vec<routes::ModelRouteTarget> {
+) -> Vec<routes::IndexedModelRouteTarget> {
     if !required.any() || targets.len() <= 1 {
         return targets;
     }
     let mut capable = Vec::new();
     let mut rest = Vec::new();
     for target in targets {
-        if required.satisfied_by(capabilities::model_capabilities(&target.model)) {
+        if required.satisfied_by(capabilities::model_capabilities(&target.target.model)) {
             capable.push(target);
         } else {
             rest.push(target);
         }
     }
-    if capable.is_empty() {
-        rest
-    } else {
-        capable.extend(rest);
-        capable
-    }
+    capable.extend(rest);
+    capable
 }
 
 /// The first model of the highest-priority enabled connection, as a
@@ -2784,6 +2795,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-x".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "claude-x", "system": "be helpful", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -2829,6 +2842,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-x".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({
             "model": "claude-x",
@@ -2885,6 +2900,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "gpt-5.2-codex".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "gpt-5.2-codex", "input": "hi"});
         let req = upstream_request(&ctx, &target, &body)
@@ -2921,6 +2938,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "gpt-5.2-codex".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "gpt-5.2-codex", "input": "hi"});
         let req = upstream_request(&ctx, &target, &body)
@@ -2977,10 +2996,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-5.2-codex".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-sonnet-4-5".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -3046,10 +3067,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-5.2-codex".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-sonnet-4-5".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -3190,6 +3213,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "openrouter".into(),
                     model: "deepseek/deepseek-chat:free".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -3207,6 +3231,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "openai".into(),
                     model: "gpt-5.2-codex".into(),
+                    effort: None,
                 }],
                 created_at: 2,
                 updated_at: 2,
@@ -3295,6 +3320,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "claude-fable-5".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -3360,10 +3386,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "openrouter".into(),
                         model: "z-ai/glm-5.2".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-sonnet-4-5".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -3427,6 +3455,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "claude-sonnet-4-5".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -3518,10 +3547,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-first".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-second".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -3684,6 +3715,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "claude-fable-5".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -3819,6 +3851,8 @@ mod tests {
             conn: mk_conn("m1", "mimo-free", "free", ConnectionData::default()),
             desc,
             upstream_model: "mimo-auto".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({
             "model": "mimo-auto",
@@ -3879,6 +3913,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "grok-code".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "grok-code", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -3909,6 +3945,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "mimo-auto".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "mimo-auto", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -3937,6 +3975,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "qwen3-coder-plus".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({ "model": "qwen3-coder-plus", "messages": [] });
         let req = upstream_request(&ctx, &target, &body)
@@ -3967,6 +4007,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "qwen3-coder-plus".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({ "model": "qwen3-coder-plus", "messages": [] });
         let req = upstream_request(&ctx, &target, &body)
@@ -3996,6 +4038,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "gpt-5.2".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({ "model": "gpt-5.2", "messages": [] });
         let req = upstream_request(&ctx, &target, &body)
@@ -4067,6 +4111,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "gpt-5.2".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "gpt-5.2", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -4234,10 +4280,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-a".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-b".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -4332,10 +4380,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-a".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-b".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,

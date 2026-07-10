@@ -1578,6 +1578,7 @@ mod tests {
                 targets: vec![ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "model-a".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,

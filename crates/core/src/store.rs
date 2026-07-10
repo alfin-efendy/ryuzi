@@ -12,6 +12,171 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::path::{Path, PathBuf};
 
+fn migration_20_codex_models(
+    tx: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut models: std::collections::HashSet<String> =
+        crate::llm_router::registry::descriptor("openai-oauth")
+            .map(|descriptor| {
+                descriptor
+                    .models
+                    .iter()
+                    .map(|model| (*model).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+    let snapshot: Value = serde_json::from_str(include_str!("llm_router/model_meta_snapshot.json"))
+        .map_err(to_sql_json_error)?;
+    if let Some(entries) = snapshot.as_object() {
+        for key in entries.keys() {
+            if let Some(model) = key.strip_prefix("provider::openai-oauth::model::") {
+                models.insert(model.to_string());
+            }
+        }
+    }
+    let mut stmt =
+        tx.prepare("SELECT data FROM provider_connections WHERE provider='openai-oauth'")?;
+    for raw in stmt.query_map([], |row| row.get::<_, String>(0))? {
+        let value: Value = serde_json::from_str(&raw?).unwrap_or(Value::Null);
+        if let Some(stored) = value.get("modelsOverride").and_then(Value::as_array) {
+            models.extend(stored.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+        if let Some(stored) = value.get("modelMetaOverrides").and_then(Value::as_object) {
+            models.extend(stored.keys().cloned());
+        }
+    }
+    Ok(models)
+}
+
+fn migration_20_known_codex_model(known: &std::collections::HashSet<String>, model: &str) -> bool {
+    known.contains(model)
+        || model
+            .strip_suffix("-review")
+            .is_some_and(|base| known.contains(base))
+}
+
+fn migration_20_parse_prefixed(
+    value: &str,
+    known: &std::collections::HashSet<String>,
+) -> Option<(String, String, String)> {
+    let (prefix, _) = value.split_once('/')?;
+    if !matches!(prefix, "openai" | "openai-oauth") {
+        return None;
+    }
+    let (parsed, effort) = crate::llm_router::model_effort::parse_legacy_codex_selection(value)?;
+    let model = parsed.split_once('/')?.1.to_string();
+    let canonical = format!("openai/{model}");
+    migration_20_known_codex_model(known, &model).then_some((canonical, model, effort))
+}
+
+fn migration_20_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration::HookResult {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS model_effort_preferences (\
+            family TEXT NOT NULL,\
+            model TEXT NOT NULL,\
+            effort TEXT NOT NULL,\
+            PRIMARY KEY (family, model)\
+        );",
+    )?;
+    let known = migration_20_codex_models(tx)?;
+
+    let projects = {
+        let mut stmt =
+            tx.prepare("SELECT project_id, model, effort FROM projects WHERE model IS NOT NULL")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (id, model, existing_effort) in projects {
+        if let Some((canonical, _, suffix_effort)) = migration_20_parse_prefixed(&model, &known) {
+            let effort = existing_effort.or(Some(suffix_effort));
+            tx.execute(
+                "UPDATE projects SET model=?2, effort=?3 WHERE project_id=?1",
+                params![id, canonical, effort],
+            )?;
+        }
+    }
+
+    let default_model: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key='default_model'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(default_model) = default_model {
+        if let Some((canonical, model, suffix_effort)) =
+            migration_20_parse_prefixed(&default_model, &known)
+        {
+            tx.execute(
+                "UPDATE settings SET value=?1 WHERE key='default_model'",
+                params![canonical],
+            )?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key='default_effort'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing
+                .as_deref()
+                .is_none_or(|effort| effort.trim().is_empty())
+            {
+                tx.execute(
+                    "INSERT OR IGNORE INTO model_effort_preferences(family,model,effort) VALUES ('openai',?1,?2)",
+                    params![model, suffix_effort],
+                )?;
+            }
+        }
+    }
+
+    let routes_raw: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key='llm_model_routes'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(routes_raw) = routes_raw {
+        let mut routes: Vec<crate::llm_router::routes::ModelRouteInfo> =
+            serde_json::from_str(&routes_raw).map_err(to_sql_json_error)?;
+        for route in &mut routes {
+            for target in &mut route.targets {
+                if target.provider != "openai" {
+                    continue;
+                }
+                let prefixed = format!("openai/{}", target.model);
+                if let Some((canonical, _, suffix_effort)) =
+                    migration_20_parse_prefixed(&prefixed, &known)
+                {
+                    target.model = canonical.split_once('/').unwrap().1.to_string();
+                    if target
+                        .effort
+                        .as_deref()
+                        .is_none_or(|effort| effort.trim().is_empty())
+                    {
+                        target.effort = Some(suffix_effort);
+                    }
+                }
+            }
+        }
+        let serialized = serde_json::to_string(&routes).map_err(to_sql_json_error)?;
+        tx.execute(
+            "UPDATE settings SET value=?1 WHERE key='llm_model_routes'",
+            params![serialized],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(
@@ -512,6 +677,11 @@ fn migrations() -> Migrations<'static> {
             DROP TABLE plugin_oauth_clients;\
             ALTER TABLE plugin_oauth_clients_rebuild RENAME TO plugin_oauth_clients;",
         ),
+        // Typed model-effort preferences and normalization of legacy Codex
+        // virtual model suffixes. The hook is one SQLite transaction: a bad
+        // route JSON value aborts without partially rewriting projects or
+        // defaults. Every write converges, so rewind/replay is safe.
+        M::up_with_hook("", migration_20_normalize),
     ])
 }
 
@@ -1073,6 +1243,97 @@ impl Store {
         })
         .await?;
         Ok(())
+    }
+
+    /// Replace the project-wide runtime selection. Unlike
+    /// `update_project_prefs`, `None` is an explicit SQL NULL.
+    pub async fn update_project_runtime(
+        &self,
+        project_id: &str,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        let project_id = project_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE projects SET model=?2, effort=?3 WHERE project_id=?1",
+                params![project_id, model, effort],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_model_effort_preference(
+        &self,
+        key: &crate::llm_router::model_effort::ModelPreferenceKey,
+    ) -> anyhow::Result<Option<String>> {
+        let key = key.clone();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT effort FROM model_effort_preferences WHERE family=?1 AND model=?2",
+                params![key.family, key.model],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_model_effort_preferences(
+        &self,
+    ) -> anyhow::Result<Vec<(crate::llm_router::model_effort::ModelPreferenceKey, String)>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT family, model, effort FROM model_effort_preferences ORDER BY family, model",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        crate::llm_router::model_effort::ModelPreferenceKey {
+                            family: row.get(0)?,
+                            model: row.get(1)?,
+                        },
+                        row.get(2)?,
+                    ))
+                })?
+                .collect();
+            rows
+        })
+        .await
+    }
+
+    pub async fn set_model_effort_preference(
+        &self,
+        key: &crate::llm_router::model_effort::ModelPreferenceKey,
+        effort: &str,
+    ) -> anyhow::Result<()> {
+        let key = key.clone();
+        let effort = effort.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO model_effort_preferences(family,model,effort) VALUES (?1,?2,?3) \
+                 ON CONFLICT(family,model) DO UPDATE SET effort=excluded.effort",
+                params![key.family, key.model, effort],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn clear_model_effort_preference(
+        &self,
+        key: &crate::llm_router::model_effort::ModelPreferenceKey,
+    ) -> anyhow::Result<()> {
+        let key = key.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM model_effort_preferences WHERE family=?1 AND model=?2",
+                params![key.family, key.model],
+            )
+            .map(|_| ())
+        })
+        .await
     }
 
     /// Atomically demote `Running → Idle` only if the current status is still `Running`.
@@ -2629,6 +2890,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_effort_preferences_use_structured_keys_and_clear_explicitly() {
+        use crate::llm_router::model_effort::ModelPreferenceKey;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let key = ModelPreferenceKey {
+            family: "openai".into(),
+            model: "org/team/gpt-custom".into(),
+        };
+
+        assert_eq!(store.get_model_effort_preference(&key).await.unwrap(), None);
+        store
+            .set_model_effort_preference(&key, "ultra")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_model_effort_preference(&key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(
+            store.list_model_effort_preferences().await.unwrap(),
+            vec![(key.clone(), "ultra".into())]
+        );
+        store.clear_model_effort_preference(&key).await.unwrap();
+        assert_eq!(store.get_model_effort_preference(&key).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn model_effort_update_project_runtime_assigns_nulls() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .insert_project(Project {
+                project_id: "runtime-prefs".into(),
+                name: "runtime".into(),
+                workdir: "/tmp/runtime".into(),
+                source: None,
+                harness: "native".into(),
+                model: Some("old-model".into()),
+                effort: Some("high".into()),
+                perm_mode: PermMode::Default,
+                created_at: Some(1),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+
+        store
+            .update_project_runtime("runtime-prefs", Some("new/model".into()), None)
+            .await
+            .unwrap();
+        let project = store.get_project("runtime-prefs").await.unwrap().unwrap();
+        assert_eq!(project.model.as_deref(), Some("new/model"));
+        assert_eq!(project.effort, None);
+
+        store
+            .update_project_runtime("runtime-prefs", None, Some("none".into()))
+            .await
+            .unwrap();
+        let project = store.get_project("runtime-prefs").await.unwrap().unwrap();
+        assert_eq!(project.model, None);
+        assert_eq!(project.effort.as_deref(), Some("none"));
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_normalizes_eligible_legacy_storage_and_replays() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(|c| {
+                    c.execute_batch(
+                        r#"DROP TABLE model_effort_preferences;
+                           INSERT INTO projects(project_id,name,workdir,harness,model,effort)
+                             VALUES ('p1','p1','/p1','native','openai/gpt-5.2-codex-high',NULL),
+                                    ('p2','p2','/p2','native','openai/gpt-5.2-codex-review-high','ultra'),
+                                    ('oauthprefix','oauthprefix','/oauth','native','openai-oauth/gpt-5.2-codex-high',NULL),
+                                    ('alias','alias','/alias','native','fast-high',NULL),
+                                    ('unknown','unknown','/unknown','native','openai/not-cataloged-high',NULL);
+                           INSERT OR REPLACE INTO settings(key,value) VALUES
+                             ('default_model','openai/gpt-5.2-codex-high-review'),
+                             ('default_effort',''),
+                             ('llm_model_routes','[{"id":"r1","name":"route","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"gpt-5.2-codex-review-high"},{"provider":"anthropic","model":"claude-high"}],"createdAt":1,"updatedAt":1}]');
+                           PRAGMA user_version=19;"#,
+                    )
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let p1 = store.get_project("p1").await.unwrap().unwrap();
+        assert_eq!(p1.model.as_deref(), Some("openai/gpt-5.2-codex"));
+        assert_eq!(p1.effort.as_deref(), Some("high"));
+        let p2 = store.get_project("p2").await.unwrap().unwrap();
+        assert_eq!(p2.model.as_deref(), Some("openai/gpt-5.2-codex-review"));
+        assert_eq!(p2.effort.as_deref(), Some("ultra"), "existing effort wins");
+        assert_eq!(
+            store
+                .get_project("alias")
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("fast-high")
+        );
+        assert_eq!(
+            store
+                .get_project("unknown")
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("openai/not-cataloged-high")
+        );
+        assert_eq!(
+            store
+                .get_project("oauthprefix")
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("openai/gpt-5.2-codex")
+        );
+        assert_eq!(
+            store.get_setting("default_model").await.unwrap().as_deref(),
+            Some("openai/gpt-5.2-codex-review")
+        );
+        let key = crate::llm_router::model_effort::ModelPreferenceKey {
+            family: "openai".into(),
+            model: "gpt-5.2-codex-review".into(),
+        };
+        assert_eq!(
+            store
+                .get_model_effort_preference(&key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("high")
+        );
+        let routes = crate::llm_router::routes::list_model_routes(&store)
+            .await
+            .unwrap();
+        assert_eq!(routes[0].targets[0].model, "gpt-5.2-codex-review");
+        assert_eq!(routes[0].targets[0].effort.as_deref(), Some("high"));
+        assert_eq!(routes[0].targets[1].model, "claude-high");
+
+        let before = store.list_model_effort_preferences().await.unwrap();
+        store
+            .with_conn(|c| c.pragma_update(None, "user_version", 19))
+            .await
+            .unwrap();
+        drop(store);
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(store.list_model_effort_preferences().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_malformed_routes_rolls_back_atomically() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store.with_conn(|c| c.execute_batch(
+                "DROP TABLE model_effort_preferences;
+                 INSERT INTO projects(project_id,name,workdir,harness,model) VALUES ('p','p','/p','native','openai/gpt-5.2-codex-high');
+                 INSERT OR REPLACE INTO settings(key,value) VALUES ('llm_model_routes','{malformed');
+                 PRAGMA user_version=19;"
+            )).await.unwrap();
+        }
+
+        assert!(Store::open(tmp.path()).await.is_err());
+        let c = rusqlite::Connection::open(tmp.path()).unwrap();
+        let version: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 19);
+        let model: String = c
+            .query_row("SELECT model FROM projects WHERE project_id='p'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(model, "openai/gpt-5.2-codex-high");
+        assert!(c.prepare("SELECT 1 FROM model_effort_preferences").is_err());
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_non_empty_default_effort_wins_without_seeding() {
+        use crate::llm_router::model_effort::ModelPreferenceKey;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(|c| {
+                    c.execute_batch(
+                        "DROP TABLE model_effort_preferences;
+                 INSERT OR REPLACE INTO settings(key,value) VALUES
+                   ('default_model','openai/gpt-5.5-review-high'),
+                   ('default_effort','ultra');
+                 PRAGMA user_version=19;",
+                    )
+                })
+                .await
+                .unwrap();
+        }
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(
+            store.get_setting("default_model").await.unwrap().as_deref(),
+            Some("openai/gpt-5.5-review")
+        );
+        assert_eq!(
+            store
+                .get_setting("default_effort")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(
+            store
+                .get_model_effort_preference(&ModelPreferenceKey {
+                    family: "openai".into(),
+                    model: "gpt-5.5-review".into(),
+                })
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn quarantine_leaves_rust_schema_and_missing_file_alone() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("ryuzi.sqlite");
@@ -2904,21 +3403,23 @@ mod tests {
     #[tokio::test]
     async fn migration_13_rewrites_claude_code_defaults_to_native() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back seven so the
+        // DB, seed the old values, then wind user_version back eight so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
         // CREATE TABLE IF NOT EXISTS; 17 context_checkpoints + session_context —
         // CREATE TABLE IF NOT EXISTS; 18 plugin_oauth_clients — CREATE TABLE
         // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
-        // copy-drop-rename; all no-ops on replay) re-run on the next open.
+        // copy-drop-rename; 20 model_effort_preferences + legacy normalization —
+        // convergent and CREATE TABLE IF NOT EXISTS; all no-ops on replay)
+        // re-run on the next open.
         // `Migrations` always fast-forwards to the latest defined version,
         // so there is no way to replay 13 alone once something is appended
         // after it.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 7)
+            c.pragma_update(None, "user_version", v - 8)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();

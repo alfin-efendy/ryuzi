@@ -1,4 +1,6 @@
 use crate::llm_router::model_meta::ModelMeta;
+use crate::llm_router::{connections, model_meta, registry, routes};
+use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -212,6 +214,278 @@ pub(crate) fn intersect_capabilities(
         resolved_default,
         default_source,
     }
+}
+
+fn resolved_surface_default(capabilities: &ExecutionModelEffortCapabilities) -> Option<String> {
+    capabilities
+        .provider_default
+        .as_ref()
+        .filter(|value| {
+            capabilities
+                .supported
+                .iter()
+                .any(|option| &option.value == *value)
+        })
+        .cloned()
+        .or_else(|| {
+            (capabilities.supported.len() == 1).then(|| capabilities.supported[0].value.clone())
+        })
+}
+
+pub fn resolve_for_target(
+    policy: &TurnEffortPolicy,
+    route_target_key: Option<&RouteTargetEffortKey>,
+    request_compatibility_effort: Option<&str>,
+    preference_key: &ModelPreferenceKey,
+    surface: &ExecutionSurfaceKey,
+) -> EffectiveEffort {
+    let Some(capabilities) = policy.surfaces.get(surface) else {
+        return EffectiveEffort {
+            value: None,
+            label: None,
+            source: EffectiveEffortSource::None,
+            stored_status: Some(if policy.project_override.is_some() {
+                StoredEffortStatus::UnknownMetadata
+            } else {
+                StoredEffortStatus::Valid
+            }),
+        };
+    };
+    let supported = |value: &str| {
+        capabilities
+            .supported
+            .iter()
+            .any(|option| option.value == value)
+    };
+    let stored_status = Some(match policy.project_override.as_deref() {
+        Some(value) if !supported(value) => StoredEffortStatus::Unsupported,
+        _ => StoredEffortStatus::Valid,
+    });
+    let route_value = route_target_key
+        .and_then(|key| policy.route_compatibility.get(key).map(String::as_str))
+        .or(request_compatibility_effort);
+    let candidates = [
+        (
+            policy.project_override.as_deref(),
+            EffectiveEffortSource::Project,
+        ),
+        (route_value, EffectiveEffortSource::RouteCompatibility),
+        (
+            policy.configured.get(preference_key).map(String::as_str),
+            EffectiveEffortSource::Configured,
+        ),
+    ];
+    let selected = candidates
+        .into_iter()
+        .find_map(|(value, source)| {
+            value
+                .filter(|value| supported(value))
+                .map(|value| (value.to_string(), source))
+        })
+        .or_else(|| {
+            resolved_surface_default(capabilities)
+                .map(|value| (value, EffectiveEffortSource::Provider))
+        });
+    let (value, source) = selected
+        .map_or((None, EffectiveEffortSource::None), |(value, source)| {
+            (Some(value), source)
+        });
+    let label = value.as_ref().and_then(|value| {
+        capabilities
+            .supported
+            .iter()
+            .find(|option| &option.value == value)
+            .map(|option| option.label.clone())
+    });
+    EffectiveEffort {
+        value,
+        label,
+        source,
+        stored_status,
+    }
+}
+
+pub(crate) async fn capabilities_for_preference(
+    store: &Store,
+    key: &ModelPreferenceKey,
+) -> anyhow::Result<Vec<ExecutionModelEffortCapabilities>> {
+    let connections = connections::list_connections(store).await?;
+    let mut capabilities = Vec::new();
+    for connection in connections
+        .into_iter()
+        .filter(|connection| connection.enabled)
+    {
+        let Some(descriptor) = registry::descriptor(&connection.provider) else {
+            continue;
+        };
+        if descriptor.family != key.family {
+            continue;
+        }
+        let serves = connections::effective_models(descriptor, &connection)
+            .iter()
+            .any(|model| model == &key.model)
+            || key.model.strip_suffix("-review").is_some_and(|base| {
+                connections::effective_models(descriptor, &connection)
+                    .iter()
+                    .any(|model| model == base)
+            });
+        if !serves {
+            continue;
+        }
+        let surface = ExecutionSurfaceKey {
+            provider_id: connection.provider.clone(),
+            connection_id: Some(connection.id.clone()),
+            model: key.model.clone(),
+        };
+        let metadata = model_meta::resolve_for_surface(store, &surface).await;
+        capabilities.push(ExecutionModelEffortCapabilities {
+            surface,
+            model_display_name: metadata.display_name.unwrap_or_else(|| key.model.clone()),
+            supported: metadata.reasoning_efforts,
+            provider_default: metadata.default_reasoning_effort,
+        });
+    }
+    Ok(capabilities)
+}
+
+pub async fn set_preference(
+    store: &Store,
+    key: &ModelPreferenceKey,
+    effort: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(effort) = effort else {
+        return store.clear_model_effort_preference(key).await;
+    };
+    let intersection = intersect_capabilities(&capabilities_for_preference(store, key).await?);
+    if !intersection
+        .supported
+        .iter()
+        .any(|option| option.value == effort)
+    {
+        anyhow::bail!(
+            "effort {effort:?} is not supported for {}/{}",
+            key.family,
+            key.model
+        );
+    }
+    store.set_model_effort_preference(key, effort).await
+}
+
+async fn selection_capabilities(
+    store: &Store,
+    requested_model: &str,
+) -> anyhow::Result<
+    Option<(
+        Vec<ModelPreferenceKey>,
+        Vec<ExecutionModelEffortCapabilities>,
+        HashMap<RouteTargetEffortKey, String>,
+        bool,
+    )>,
+> {
+    let route_list = routes::list_model_routes(store).await?;
+    if let Some(route) = routes::route_by_name(&route_list, requested_model) {
+        let mut keys = Vec::new();
+        let mut surfaces = Vec::new();
+        let mut compatibility = HashMap::new();
+        for (index, target) in route.targets.iter().enumerate() {
+            let key = ModelPreferenceKey {
+                family: target.provider.clone(),
+                model: target.model.clone(),
+            };
+            surfaces.extend(capabilities_for_preference(store, &key).await?);
+            keys.push(key);
+            if let Some(effort) = &target.effort {
+                compatibility.insert(
+                    RouteTargetEffortKey {
+                        route_id: route.id.clone(),
+                        target_index: index as u32,
+                    },
+                    effort.clone(),
+                );
+            }
+        }
+        return Ok(Some((keys, surfaces, compatibility, true)));
+    }
+    let Some((family, model)) = requested_model.split_once('/') else {
+        return Ok(None);
+    };
+    let Some(family) = registry::family_of(family) else {
+        return Ok(None);
+    };
+    let key = ModelPreferenceKey {
+        family: family.to_string(),
+        model: model.to_string(),
+    };
+    let capabilities = capabilities_for_preference(store, &key).await?;
+    Ok(Some((vec![key], capabilities, HashMap::new(), false)))
+}
+
+pub async fn legacy_effort_supported_for_selection(
+    store: &Store,
+    requested_model: &str,
+    effort: &str,
+) -> anyhow::Result<bool> {
+    let Some((keys, capabilities, _, is_named_route)) =
+        selection_capabilities(store, requested_model).await?
+    else {
+        return Ok(false);
+    };
+    if is_named_route {
+        for key in &keys {
+            if store.get_model_effort_preference(key).await?.is_some() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(intersect_capabilities(&capabilities)
+        .supported
+        .iter()
+        .any(|option| option.value == effort))
+}
+
+async fn build_effort_policy(
+    store: &Store,
+    project_override: Option<String>,
+    requested_model: &str,
+) -> anyhow::Result<TurnEffortPolicy> {
+    let configured = store
+        .list_model_effort_preferences()
+        .await?
+        .into_iter()
+        .collect();
+    let (_, capabilities, route_compatibility, _) = selection_capabilities(store, requested_model)
+        .await?
+        .unwrap_or_default();
+    let surfaces = capabilities
+        .into_iter()
+        .map(|capability| (capability.surface.clone(), capability))
+        .collect();
+    Ok(TurnEffortPolicy {
+        requested_model: requested_model.to_string(),
+        project_override,
+        route_compatibility,
+        configured,
+        surfaces,
+    })
+}
+
+pub async fn build_turn_effort_policy(
+    store: &Store,
+    project_id: &str,
+    requested_model: &str,
+) -> anyhow::Result<TurnEffortPolicy> {
+    let project_override = store
+        .get_project(project_id)
+        .await?
+        .and_then(|project| project.effort);
+    build_effort_policy(store, project_override, requested_model).await
+}
+
+pub async fn build_utility_effort_policy(
+    store: &Store,
+    requested_model: &str,
+) -> anyhow::Result<TurnEffortPolicy> {
+    build_effort_policy(store, None, requested_model).await
 }
 
 #[allow(dead_code)] // Consumed by tolerant routing in a later plan task.
@@ -453,6 +727,48 @@ mod tests {
             Some(("openai/org/model-review".into(), "high".into()))
         );
         assert_eq!(parse_legacy_codex_selection("fast-high"), None);
+    }
+
+    #[test]
+    fn effective_resolution_audits_stale_values_and_falls_through() {
+        let preference = ModelPreferenceKey {
+            family: "openai".into(),
+            model: "gpt-custom".into(),
+        };
+        let surface = ExecutionSurfaceKey {
+            provider_id: "openai-oauth".into(),
+            connection_id: Some("c1".into()),
+            model: "gpt-custom".into(),
+        };
+        let capabilities = capabilities(
+            "openai-oauth",
+            vec![option("low", "Low", None)],
+            Some("low"),
+        );
+        let mut policy = TurnEffortPolicy {
+            requested_model: "openai/gpt-custom".into(),
+            project_override: Some("stale".into()),
+            route_compatibility: HashMap::new(),
+            configured: HashMap::from([(preference.clone(), "also-stale".into())]),
+            surfaces: HashMap::from([(surface.clone(), capabilities)]),
+        };
+
+        let result = resolve_for_target(&policy, None, None, &preference, &surface);
+        assert_eq!(result.value.as_deref(), Some("low"));
+        assert_eq!(result.source, EffectiveEffortSource::Provider);
+        assert_eq!(result.stored_status, Some(StoredEffortStatus::Unsupported));
+
+        policy.surfaces.clear();
+        let result = resolve_for_target(&policy, None, None, &preference, &surface);
+        assert_eq!(result.value, None);
+        assert_eq!(
+            result.stored_status,
+            Some(StoredEffortStatus::UnknownMetadata)
+        );
+
+        policy.project_override = None;
+        let result = resolve_for_target(&policy, None, None, &preference, &surface);
+        assert_eq!(result.stored_status, Some(StoredEffortStatus::Valid));
     }
 
     #[test]

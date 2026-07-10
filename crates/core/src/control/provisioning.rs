@@ -239,6 +239,22 @@ impl ControlPlane {
             .get("default_effort")
             .await?
             .filter(|v| !v.is_empty());
+        let selected_model = s.model.clone().or(default_model);
+        let selected_effort = if let Some(explicit) = s.effort.clone() {
+            Some(explicit)
+        } else if let (Some(model), Some(effort)) =
+            (selected_model.as_deref(), default_effort.as_deref())
+        {
+            crate::llm_router::model_effort::legacy_effort_supported_for_selection(
+                &self.store,
+                model,
+                effort,
+            )
+            .await?
+            .then(|| effort.to_string())
+        } else {
+            None
+        };
 
         let project = Project {
             project_id: new_id(),
@@ -246,8 +262,8 @@ impl ControlPlane {
             workdir: workdir.to_string_lossy().into_owned(),
             source,
             harness: s.harness.clone().unwrap_or(default_runtime),
-            model: s.model.clone().or(default_model),
-            effort: s.effort.clone().or(default_effort),
+            model: selected_model,
+            effort: selected_effort,
             perm_mode,
             created_at: Some(now_ms()),
             is_git: true,

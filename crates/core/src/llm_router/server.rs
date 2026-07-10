@@ -1856,10 +1856,12 @@ mod tests {
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-first".into(),
+                        effort: None,
                     },
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-fallback".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -1907,10 +1909,12 @@ mod tests {
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-one".into(),
+                        effort: None,
                     },
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-two".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -2005,10 +2009,12 @@ mod tests {
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "text-only".into(),
+                        effort: None,
                     },
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-4o".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -2055,6 +2061,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let kiro_body = json!({"conversationState": {}});
         let req = kiro_upstream_request(&state, &target, &kiro_body)
@@ -2136,6 +2144,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2168,6 +2178,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2195,6 +2207,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()

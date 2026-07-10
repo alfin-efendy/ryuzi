@@ -538,6 +538,7 @@ mod tests {
                 targets: vec![ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "claude-sonnet-4-5".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -588,6 +589,7 @@ mod tests {
                 targets: vec![ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "claude-sonnet-4-5".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
