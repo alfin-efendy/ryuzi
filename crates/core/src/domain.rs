@@ -467,6 +467,17 @@ pub enum CoreEvent {
         after_tokens: u64,
         window_number: u32,
     },
+    /// A provider OAuth flow produced its authorize URL. Surfaces open it
+    /// (Cockpit maps this onto the legacy OauthAuthorizeUrlMsg Tauri event).
+    OauthAuthorizeUrl {
+        provider: String,
+        authorize_url: String,
+    },
+    /// Same for a plugin OAuth flow.
+    PluginOauthAuthorizeUrl {
+        plugin_id: String,
+        authorize_url: String,
+    },
     /// Per-session accumulated cost: total USD and a per-model token+dollar
     /// breakdown. Emitted alongside `ContextUsage`.
     ///
@@ -577,6 +588,29 @@ mod tests {
         let j = serde_json::to_value(&e).unwrap();
         assert_eq!(j["kind"], "contextCompacted");
         assert_eq!(j["window_number"], 2);
+    }
+
+    #[test]
+    fn oauth_authorize_url_event_serializes_with_kind_tag() {
+        let e = CoreEvent::OauthAuthorizeUrl {
+            provider: "anthropic-oauth".into(),
+            authorize_url: "https://x".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "oauthAuthorizeUrl");
+        assert_eq!(v["authorize_url"], "https://x");
+    }
+
+    #[test]
+    fn plugin_oauth_authorize_url_event_serializes_with_kind_tag() {
+        let e = CoreEvent::PluginOauthAuthorizeUrl {
+            plugin_id: "acme".into(),
+            authorize_url: "https://y".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "pluginOauthAuthorizeUrl");
+        assert_eq!(v["plugin_id"], "acme");
+        assert_eq!(v["authorize_url"], "https://y");
     }
 
     #[test]

@@ -195,6 +195,36 @@ make cockpit # start Cockpit in dev mode (HMR)
 
 ---
 
+## Engine daemon & control API
+
+The engine (`ryuzi-core`) runs as a single background daemon process that
+every surface talks to — there is no per-surface embedded engine anymore.
+
+- **Single host.** The daemon (`ryuzi __daemon` from the CLI, or Cockpit's
+  hidden `--engine-daemon` mode) is the one process that owns the scheduler,
+  the orchestrator loops, the gateways (Discord, etc.), and the
+  `RouterServer` LLM-proxy endpoint.
+- **Thin clients.** Cockpit attaches to an already-running daemon if it finds
+  one, or auto-spawns `--engine-daemon` itself when none is running, then
+  talks to it exclusively over the control API — it never opens the SQLite
+  store or runs the scheduler/gateways in-process.
+- **Control API.** Served on `127.0.0.1:${control_port:-4483}` (falls back to
+  an ephemeral port if that one is taken). RPC calls and the SSE event stream
+  require a bearer token read from `<state_dir>/control.token`, a file
+  created `0600` at birth so it is never briefly world-readable.
+- **Discovery.** `daemon.json` in the state dir carries the bound port (and
+  other bring-up metadata) so clients can find a running daemon without
+  guessing.
+- **Singleton lock.** A `daemon.lock` file in the state dir enforces exactly
+  one daemon per state dir — a second `__daemon` invocation exits immediately
+  with an "already running" error instead of double-binding the store.
+- **`ryuzi serve` is unchanged.** It remains a legacy embedded, read-mostly
+  HTTP surface (`token: None`, no auth) for one-off/local use — it is not the
+  daemon and is not part of this phase. Consolidating it into the control API
+  is slated for a later phase.
+
+---
+
 ## Troubleshooting
 
 ### `bun: command not found: tauri`
