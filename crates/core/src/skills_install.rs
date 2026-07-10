@@ -13,6 +13,29 @@ const CURATED_SKILL_SOURCES: &[(&str, &str)] = &[
     ("obra/superpowers", "https://github.com/obra/superpowers"),
 ];
 
+/// A curated skill pack the Cockpit catalog offers before it's installed.
+/// Distinct from `CURATED_SKILL_SOURCES`, which is an alias table for
+/// `parse_skill_source` (several aliases may map to one repo) — this list
+/// has exactly one entry per unique repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CuratedSkillPack {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub repo: &'static str,
+}
+
+const CURATED_SKILL_PACKS: &[CuratedSkillPack] = &[CuratedSkillPack {
+    id: "superpowers",
+    name: "Superpowers",
+    description: "Curated workflow and development skills",
+    repo: "https://github.com/obra/superpowers",
+}];
+
+pub fn curated_skill_packs() -> &'static [CuratedSkillPack] {
+    CURATED_SKILL_PACKS
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledSkillEntry {
@@ -1108,6 +1131,18 @@ mod tests {
             parse_skill_source("superpowers").unwrap().repo,
             "https://github.com/obra/superpowers"
         );
+    }
+
+    #[test]
+    fn curated_skill_packs_are_deduped_and_resolvable() {
+        let packs = curated_skill_packs();
+        assert_eq!(packs.len(), 1, "one unique curated repo today");
+        let sp = &packs[0];
+        assert_eq!(sp.id, "superpowers");
+        assert_eq!(sp.name, "Superpowers");
+        assert_eq!(sp.repo, "https://github.com/obra/superpowers");
+        // Every curated pack id must resolve through the normal source parser.
+        assert_eq!(parse_skill_source(sp.id).unwrap().repo, sp.repo);
     }
 
     #[tokio::test]
