@@ -413,3 +413,173 @@ pub struct UsageSeries {
     pub today_input_tokens: i64,
     pub today_output_tokens: i64,
 }
+
+// --- connections_api (moved verbatim from apps/cockpit/src-tauri/src/connections_cmd.rs) ---
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionInfo {
+    pub id: String,
+    pub provider: String,
+    pub provider_name: String,
+    pub color: String,
+    pub initial: String,
+    pub auth_type: String,
+    pub label: String,
+    pub priority: i32,
+    pub enabled: bool,
+    pub base_url: Option<String>,
+    pub models: Vec<String>,
+    /// e.g. "sk-…3fk9" — full key never leaves the backend after creation.
+    pub key_masked: Option<String>,
+    /// OAuth connections only: true once refresh has failed terminally and
+    /// the user needs to reconnect via the browser/paste flow again.
+    pub needs_relogin: bool,
+    /// Anthropic OAuth only: enable full Claude Code-style request cloaking.
+    pub claude_cloaking: bool,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TestResult {
+    /// Legacy pass/fail, kept for existing call sites (connection-level
+    /// test, toasts). Always derived: `status == "valid"`.
+    pub ok: bool,
+    /// Tri-state probe verdict: "valid" | "invalid" | "unknown".
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshModelsResult {
+    pub connection_id: String,
+    pub label: String,
+    pub ok: bool,
+    pub message: String,
+}
+
+/// One persisted probe verdict row for the provider Models card.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatusInfo {
+    pub model: String,
+    pub status: String,
+    pub message: String,
+    pub tested_at: i64,
+}
+
+/// One persisted probe verdict row across ALL families — hydrates the
+/// app-wide model-status store consumed by every model picker.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatusEntry {
+    pub family: String,
+    pub model: String,
+    pub status: String,
+    pub message: String,
+    pub tested_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualStartInfo {
+    pub authorize_url: String,
+    pub verifier: String,
+    pub state: String,
+    pub redirect_uri: String,
+}
+
+/// Device-code flow info shown to the user while they complete the browser
+/// step (Kiro): the short code to enter, the URL to visit, and the poll
+/// cadence the frontend's `await_kiro_device_flow` call will honor.
+#[derive(Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceFlowInfo {
+    pub flow_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    pub expires_in: i64,
+    pub interval: i64,
+}
+
+// --- plugins_api (moved verbatim from apps/cockpit/src-tauri/src/plugins_cmd.rs) ---
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub icon: Option<String>,
+    pub categories: Vec<String>,
+    pub verified: bool,
+    pub experimental: bool,
+    pub enabled: bool,
+    /// `builtin` | `catalog` | `user`.
+    pub source: String,
+    /// Any of `provider` | `runtime` | `gateway` | `connector`.
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginAuthInfo {
+    /// `none` | `api-key` | `token` | `oauth`.
+    pub kind: String,
+    pub setting: Option<String>,
+    pub env: Option<String>,
+    pub help_url: Option<String>,
+    /// A persisted (non-empty) row exists for `setting`, OR `env` is set in
+    /// the process environment. Never reveals the value itself.
+    pub configured: bool,
+    pub oauth_connect_available: bool,
+    pub oauth_connect_error: Option<String>,
+    pub oauth_token_stored: bool,
+    pub oauth_reconnect_required: bool,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginOauthBeginResult {
+    pub state_token: String,
+    pub authorize_url: String,
+    pub redirect_uri: String,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginFieldInfo {
+    pub key: String,
+    pub label: String,
+    pub help: String,
+    pub secret: bool,
+    pub required: bool,
+    /// A persisted (non-empty) row exists for `key`. Never the value itself.
+    pub value_set: bool,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginMcpInfo {
+    pub name: String,
+    /// `stdio` | `http`.
+    pub transport: String,
+    /// The raw manifest string (command for stdio, url for http) — no
+    /// `${auth}` substitution, matching `ryuzi plugins info`'s output.
+    pub command_or_url: String,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginDetail {
+    pub info: PluginInfo,
+    pub auth: Option<PluginAuthInfo>,
+    pub settings: Vec<PluginFieldInfo>,
+    pub mcp: Vec<PluginMcpInfo>,
+    pub models: Vec<String>,
+    pub menu_label: Option<String>,
+    pub homepage: Option<String>,
+    pub publisher: String,
+}
