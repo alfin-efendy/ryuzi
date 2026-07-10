@@ -192,11 +192,16 @@ const LOOP_SETTINGS = [
 
 function AgentLoopCard() {
   const [values, setValues] = useState<Record<string, string>>({});
+  // Last confirmed-persisted value per key, separate from `values` (which
+  // tracks the live input and is mutated on every keystroke). A failed save
+  // must roll back to this — not to whatever the user just typed.
+  const [saved, setSaved] = useState<Record<string, string>>({});
   useEffect(() => {
     for (const s of LOOP_SETTINGS) {
       void commands.getSetting(s.key).then((res) => {
         if (res.status === "ok" && res.data) {
           setValues((cur) => ({ ...cur, [s.key]: res.data ?? "" }));
+          setSaved((cur) => ({ ...cur, [s.key]: res.data ?? "" }));
         }
       });
     }
@@ -208,12 +213,13 @@ function AgentLoopCard() {
       if (raw.trim() !== "") toast.error(`Enter a whole number of at least ${min}.`);
       return;
     }
-    const prev = values[key] ?? "";
     setValues((cur) => ({ ...cur, [key]: normalized }));
     const res = await commands.setSetting(key, normalized);
     if (res.status === "error") {
-      setValues((cur) => ({ ...cur, [key]: prev }));
+      setValues((cur) => ({ ...cur, [key]: saved[key] ?? "" }));
       toast.error("Couldn't save setting: " + res.error.message);
+    } else {
+      setSaved((cur) => ({ ...cur, [key]: normalized }));
     }
   };
 
