@@ -959,6 +959,14 @@ async setPluginSetting(key: string, value: string) : Promise<Result<null, CmdErr
     else return { status: "error", error: e  as any };
 }
 },
+async uninstallPlugin(id: string) : Promise<Result<PluginInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("uninstall_plugin", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async beginPluginOauth(pluginId: string) : Promise<Result<PluginOauthBeginResult, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("begin_plugin_oauth", { pluginId }) };
@@ -1409,7 +1417,23 @@ source: string;
 /**
  * Any of `provider` | `runtime` | `gateway` | `connector`.
  */
-capabilities: string[] }
+capabilities: string[]; 
+/**
+ * `integration` | `provider` | `gateway` | `skill-pack`. Runtime-kind
+ * plugins are excluded from the list — the Runtime page owns them.
+ */
+kind: string; 
+/**
+ * Kind-specific "already set up" flag: integration = configured ||
+ * enabled; provider = ≥1 connection in the provider's family; gateway =
+ * all manifest settings present; skill-pack = installed on disk.
+ */
+installed: boolean; 
+/**
+ * Provider family head id (providers only) — the Models `providerDetail`
+ * navigation target. `None` for other kinds.
+ */
+family: string | null }
 export type PluginInstallBeginResult = { 
 /**
  * `none` | `api-key` | `token` | `oauth`.
