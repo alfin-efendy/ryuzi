@@ -124,10 +124,12 @@ fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
     }
 }
 
-/// Bring up the control API for a started daemon: write a fresh bearer
-/// token, read `control_port` (default [`DEFAULT_CONTROL_PORT`]), and serve.
-/// Returns the BOUND port. Shared by `run_daemon` and the canary's
-/// `promote()` so the two entry points cannot drift.
+/// Bring up the control API for a started daemon: resolve the bearer token
+/// (reused across same-port restarts, or freshly generated — see
+/// [`ryuzi_core::control_token::write_token`]), read `control_port` (default
+/// [`DEFAULT_CONTROL_PORT`]), and serve. Returns the BOUND port. Shared by
+/// `run_daemon` and the canary's `promote()` so the two entry points cannot
+/// drift.
 async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<u16> {
     let token = ryuzi_core::control_token::write_token(dir)?;
     let settings = SettingsStore::new(daemon.store.clone());
