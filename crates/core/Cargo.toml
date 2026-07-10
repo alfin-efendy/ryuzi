@@ -28,6 +28,7 @@ rusqlite_migration = "1.2"
 git2 = { version = "0.21", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 dirs.workspace = true
+fd-lock.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tracing = "0.1"

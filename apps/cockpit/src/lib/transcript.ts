@@ -66,6 +66,47 @@ export type EditCard = { path: string; kind: string };
 
 export type TurnBlock = Group | { type: "summary"; key: string; groups: Group[]; durationMs: number | null; editCards: EditCard[] };
 
+/** How many most-recent items stay visible in a live streaming run. */
+export const STREAMING_TAIL = 3;
+
+/** One piece of a partitioned activity cluster: a folded run of steps, or a
+ *  standalone item that must stay visible. */
+export type ActivityFragment = { kind: "fold"; items: ActivityItem[]; runLength: number } | { kind: "item"; item: ActivityItem };
+
+/** True while the tool is still running — running items never fold. */
+function isInProgress(item: ActivityItem): boolean {
+  return item.type === "tool" && (item.status === "pending" || item.status === "in_progress");
+}
+
+/** Split a cluster into folded groups and standalone items.
+ *
+ *  `liveTail=true` (the cluster is the transcript tail while the agent runs):
+ *  the last STREAMING_TAIL items stay visible; everything older folds.
+ *  `liveTail=false` (the agent moved past this cluster): everything folds.
+ *  In-progress items never fold in either branch and split the fold around
+ *  them. Every fold carries `runLength` = the WHOLE cluster's size, so the
+ *  "See N steps" label counts the run, not just its hidden part. */
+export function partitionActivity(items: ActivityItem[], liveTail: boolean): ActivityFragment[] {
+  const tailStart = liveTail ? Math.max(0, items.length - STREAMING_TAIL) : items.length;
+  const fragments: ActivityFragment[] = [];
+  let fold: ActivityItem[] = [];
+  const flush = () => {
+    if (fold.length === 0) return;
+    fragments.push({ kind: "fold", items: fold, runLength: items.length });
+    fold = [];
+  };
+  items.forEach((item, index) => {
+    if ((liveTail && index >= tailStart) || isInProgress(item)) {
+      flush();
+      fragments.push({ kind: "item", item });
+    } else {
+      fold.push(item);
+    }
+  });
+  flush();
+  return fragments;
+}
+
 /** Distinct completed edit/delete/move/write tool targets, first-seen order,
  *  latest kind wins per path. */
 export function editCardsForGroups(groups: Group[]): EditCard[] {

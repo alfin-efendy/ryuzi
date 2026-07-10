@@ -48,6 +48,60 @@ test("toRepoRelative strips the workdir prefix across separators", () => {
   expect(toRepoRelative("src/a.ts", "C:\\work\\proj")).toBe("src/a.ts");
 });
 
+// Tests for looksLikeWorkspaceFilePath and toWorkspaceRelativePath
+import { looksLikeWorkspaceFilePath, toWorkspaceRelativePath } from "./paths";
+
+const W = "/home/u/project";
+
+test.each([
+  ["src/app.ts", true],
+  ["docs/Design Notes.md", true], // spaces inside a segment are fine
+  ["a/b/c.rs", true],
+  ["/etc/passwd", false], // absolute
+  ["https://x.dev/a/b", false], // URL
+  ["src/app.ts?raw", false], // query
+  ["src/app.ts#L10", false], // fragment
+  ["app.ts", false], // no parent segment
+  ["git diff src/app.ts", false], // whitespace before first slash
+  ["src//app.ts", false], // empty segment
+  ["src/../secret", false], // dot-dot
+  ["./src/app.ts", false], // dot segment
+  ["", false],
+])("looksLikeWorkspaceFilePath(%p) === %p", (input, expected) => {
+  expect(looksLikeWorkspaceFilePath(input)).toBe(expected);
+});
+
+test("relative path with safe segments passes through", () => {
+  expect(toWorkspaceRelativePath("src/app.ts", W)).toBe("src/app.ts");
+});
+
+test("absolute path under the workdir is stripped to relative", () => {
+  expect(toWorkspaceRelativePath(`${W}/src/app.ts`, W)).toBe("src/app.ts");
+});
+
+test("absolute path outside the workdir is rejected", () => {
+  expect(toWorkspaceRelativePath("/etc/passwd", W)).toBeNull();
+});
+
+test("the workdir itself is rejected", () => {
+  expect(toWorkspaceRelativePath(W, W)).toBeNull();
+});
+
+test("url/query/fragment rejected before any resolution", () => {
+  expect(toWorkspaceRelativePath("https://x.dev/a", W)).toBeNull();
+  expect(toWorkspaceRelativePath(`${W}/a.ts#L1`, W)).toBeNull();
+  expect(toWorkspaceRelativePath(`${W}/a.ts?x`, W)).toBeNull();
+});
+
+test("unsafe segments rejected after stripping", () => {
+  expect(toWorkspaceRelativePath(`${W}/src/../x.ts`, W)).toBeNull();
+  expect(toWorkspaceRelativePath("src/../x.ts", W)).toBeNull();
+});
+
+test("windows-style workdir separators are tolerated", () => {
+  expect(toWorkspaceRelativePath("C:\\w\\proj\\src\\app.ts", "C:\\w\\proj")).toBe("src/app.ts");
+});
+
 test("parsePathToken accepts relative and absolute paths with optional :line[:col]", () => {
   expect(parsePathToken("src/store.ts")).toEqual({ path: "src/store.ts", line: null });
   expect(parsePathToken("src/store.ts:42")).toEqual({ path: "src/store.ts", line: 42 });

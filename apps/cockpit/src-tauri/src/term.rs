@@ -2,9 +2,9 @@
 //! (ConPTY on Windows). Output streams to the webview over the
 //! `term-output-msg` event; input/resize/close are commands.
 
+use crate::engine::EngineClient;
 use crate::error::CmdError;
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
-use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::collections::HashMap;
@@ -62,28 +62,18 @@ fn default_shell() -> (String, Vec<String>) {
 #[specta::specta]
 pub async fn term_open(
     app: tauri::AppHandle,
-    cp: State<'_, Arc<ControlPlane>>,
+    engine: State<'_, Arc<EngineClient>>,
     terms: State<'_, Arc<UiTerms>>,
     session_pk: String,
     cols: u16,
     rows: u16,
 ) -> R<String> {
-    let session = cp
-        .store()
-        .get_session(&session_pk)
-        .await?
-        .ok_or_else(|| CmdError {
-            message: format!("unknown session: {session_pk}"),
-        })?;
-    let cwd = match &session.worktree_path {
-        Some(wt) if std::path::Path::new(wt).exists() => wt.clone(),
-        _ => {
-            let project = cp.store().get_project(&session.project_id).await?;
-            project.map(|p| p.workdir).ok_or_else(|| CmdError {
-                message: "session has no working directory".into(),
-            })?
-        }
-    };
+    let cwd: String = engine
+        .rpc(
+            "session_workdir",
+            serde_json::json!({ "session_pk": session_pk.clone() }),
+        )
+        .await?;
 
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system

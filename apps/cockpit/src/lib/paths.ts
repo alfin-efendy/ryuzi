@@ -54,3 +54,40 @@ export function toRepoRelative(path: string, workdir: string): string {
   const root = workdir.replace(/\\/g, "/").replace(/\/+$/, "");
   return root && norm.toLowerCase().startsWith(`${root.toLowerCase()}/`) ? norm.slice(root.length + 1) : norm;
 }
+
+function hasUnsafeSegments(rel: string): boolean {
+  return rel.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
+}
+
+/** Heuristic: does an inline code span look like a repo-relative file path?
+ *  Rejects absolutes, URLs, query/fragment strings, command-like text
+ *  (whitespace before the first slash), and unsafe segments. Spaces INSIDE
+ *  a segment are allowed ("docs/Design Notes.md"). */
+export function looksLikeWorkspaceFilePath(text: string): boolean {
+  if (!text) return false;
+  if (text.startsWith("/")) return false;
+  if (text.includes("://")) return false;
+  if (text.includes("?") || text.includes("#")) return false;
+  const slash = text.indexOf("/");
+  if (slash <= 0) return false;
+  if (/\s/.test(text.slice(0, slash))) return false;
+  return !hasUnsafeSegments(text);
+}
+
+/** Resolve `text` to a clean workdir-relative posix path, or null when it
+ *  cannot be a workspace file: URLs/query/fragment, absolute paths outside
+ *  (or equal to) the workdir, and unsafe segments are rejected. Relative
+ *  inputs pass through when their segments are safe. */
+export function toWorkspaceRelativePath(text: string, workdir: string): string | null {
+  if (!text || text.includes("://") || text.includes("?") || text.includes("#")) return null;
+  const norm = text.replace(/\\/g, "/");
+  const root = workdir.replace(/\\/g, "/").replace(/\/+$/, "");
+  const absolute = norm.startsWith("/") || /^[A-Za-z]:\//.test(norm);
+  if (absolute) {
+    if (!root) return null;
+    if (!norm.toLowerCase().startsWith(`${root.toLowerCase()}/`)) return null;
+    const rel = norm.slice(root.length + 1);
+    return rel && !hasUnsafeSegments(rel) ? rel : null;
+  }
+  return !hasUnsafeSegments(norm) ? norm : null;
+}

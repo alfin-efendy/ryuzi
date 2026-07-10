@@ -12,6 +12,7 @@ pub mod agents;
 pub mod commands;
 pub mod context;
 pub mod context_manager;
+pub mod cost;
 pub mod format;
 pub mod hooks;
 pub mod ledger;

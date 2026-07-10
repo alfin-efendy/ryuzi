@@ -318,7 +318,13 @@ impl Router {
             // Context telemetry has no Discord rendering (yet) — the
             // compaction notice arrives as a persisted Message row instead.
             | CoreEvent::ContextUsage { .. }
-            | CoreEvent::ContextCompacted { .. } => {}
+            | CoreEvent::ContextCompacted { .. }
+            // OAuth authorize-URL events are a Cockpit-only browser-open
+            // signal — Discord has no matching surface.
+            | CoreEvent::OauthAuthorizeUrl { .. }
+            | CoreEvent::PluginOauthAuthorizeUrl { .. }
+            // Per-session cost telemetry is a Cockpit-only surface too.
+            | CoreEvent::SessionCost { .. } => {}
         }
     }
 

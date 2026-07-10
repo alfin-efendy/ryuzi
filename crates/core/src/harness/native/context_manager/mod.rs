@@ -194,6 +194,16 @@ impl ContextManager {
         self.tokens.last_output
     }
 
+    /// The last committed response's non-cached input token count (server truth).
+    pub fn last_input(&self) -> u64 {
+        self.tokens.last_input
+    }
+
+    /// The last committed response's cache-creation token count (server truth).
+    pub fn last_cache_creation(&self) -> u64 {
+        self.tokens.cache_creation
+    }
+
     /// On a context-overflow error: pin the indicator to 0% so the next
     /// turn's pre-check deterministically compacts (spec §12).
     pub fn mark_full(&mut self) {
@@ -264,6 +274,10 @@ mod tests {
             max_output_tokens: 8_192,
             supports_prompt_cache: true,
             supports_reasoning: false,
+            cost_input: 0.0,
+            cost_output: 0.0,
+            cost_cache_read: 0.0,
+            cost_cache_write: 0.0,
         }
     }
 
