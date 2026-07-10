@@ -379,8 +379,8 @@ export function RuntimeDetailView({ id }: { id: string }) {
                 <span className="block text-[11px] text-muted-foreground">{app.kind}</span>
               </span>
               <Switch
-                on={agentAllowed(app, agent.id)}
-                onToggle={() => void toggleAppAgent(app.id, agent.id, !agentAllowed(app, agent.id))}
+                on={agentAllowed(app)}
+                onToggle={() => void toggleAppAgent(app.id, !agentAllowed(app))}
                 label={`${app.name} access`}
               />
             </CardRow>
