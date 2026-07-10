@@ -493,7 +493,12 @@ pub struct ManualStartInfo {
 /// Device-code flow info shown to the user while they complete the browser
 /// step (Kiro): the short code to enter, the URL to visit, and the poll
 /// cadence the frontend's `await_kiro_device_flow` call will honor.
-#[derive(Serialize, Type)]
+// `Deserialize` (not just `Serialize`) is required: the engine serializes
+// this as an RPC result, and Cockpit's `EngineClient` deserializes it back
+// client-side to read `verification_uri_complete` before opening the
+// system browser. A plain `//` comment (not `///`) so it isn't captured
+// into the generated TS binding's doc comment.
+#[derive(Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceFlowInfo {
     pub flow_id: String,
