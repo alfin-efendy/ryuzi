@@ -1,4 +1,5 @@
 mod accent;
+mod agent_cmd;
 mod apps_cmd;
 mod backdrop;
 mod commands;
@@ -279,6 +280,9 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::set_setting,
             commands::update_project,
             commands::list_branches,
+            agent_cmd::get_agent_settings,
+            agent_cmd::set_agent_settings,
+            agent_cmd::list_selectable_models,
             runtimes_cmd::list_runtimes,
             runtimes_cmd::refresh_runtimes,
             runtimes_cmd::update_runtime_config,

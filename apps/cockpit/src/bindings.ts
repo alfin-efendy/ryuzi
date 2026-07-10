@@ -170,6 +170,35 @@ async listBranches(projectId: string) : Promise<Result<BranchList, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+async getAgentSettings() : Promise<Result<AgentSettingsInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_settings") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setAgentSettings(model: string | null, permMode: string | null) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_agent_settings", { model, permMode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The models a native session can actually run, in presentation order —
+ * enabled route aliases first, then provider/model ids (previously
+ * embedded in list_runtimes' native entry).
+ */
+async listSelectableModels() : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_selectable_models") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_runtimes") };
@@ -1186,6 +1215,11 @@ transport: string; command: string | null; args: string[];
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
+export type AgentSettingsInfo = { model: string | null; 
+/**
+ * "plan" | "ask" | "edit" | "full"; None = engine default ("ask").
+ */
+permMode: string | null }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 /**
  * The user's decision on a tool-approval request. Mirrors ACP permission kinds.
