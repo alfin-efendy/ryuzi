@@ -108,12 +108,15 @@ impl ControlPlane {
         // the ledger existed. Best-effort — a backfill failure must not
         // block startup (mirrors the plugin path's warn-and-continue
         // discipline). Runs here (rather than in `new`/`new_with_telemetry`)
-        // so every construction path — daemon, tests, and any future caller
-        // — gets it exactly once, while `store` is still an `Arc<Store>` we
-        // can borrow before it's moved into the struct below.
-        if let Err(e) = crate::skills_install::backfill_install_records(&store).await {
-            tracing::warn!("plugin install-ledger backfill failed: {e}");
-        }
+        // so every real construction path — daemon, Cockpit, and any future
+        // caller — gets it exactly once, while `store` is still an
+        // `Arc<Store>` we can borrow before it's moved into the struct below.
+        // A no-op under the crate's own `#[cfg(test)]` build so the ~56
+        // in-crate `control::tests` stay hermetic instead of reading the
+        // operator's real `$HOME/.config/ryuzi/skills` via
+        // `InstallRoots::for_user()`; the two Task 4 unit tests exercise
+        // `backfill_install_records_in` directly, so coverage is preserved.
+        Self::backfill_install_ledger(&store).await;
 
         Arc::new(ControlPlane {
             store,
@@ -128,6 +131,21 @@ impl ControlPlane {
             active_turns: std::sync::atomic::AtomicUsize::new(0),
         })
     }
+
+    /// Best-effort one-time install-ledger backfill (see the call site in
+    /// `new_full`). In a real (non-`test`) build this reads the operator's
+    /// installed packs via `InstallRoots::for_user()` and warns-and-continues
+    /// on any error. Compiled out entirely under the crate's own unit tests so
+    /// they never touch the real `$HOME`.
+    #[cfg(not(test))]
+    async fn backfill_install_ledger(store: &Arc<Store>) {
+        if let Err(e) = crate::skills_install::backfill_install_records(store).await {
+            tracing::warn!("plugin install-ledger backfill failed: {e}");
+        }
+    }
+
+    #[cfg(test)]
+    async fn backfill_install_ledger(_store: &Arc<Store>) {}
 
     /// Shared handle to the persistence layer — used by daemon wiring,
     /// the domain modules (scheduler/mcp/providers/gateways), and the Tauri

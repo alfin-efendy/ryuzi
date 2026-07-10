@@ -2876,6 +2876,41 @@ path = "skills/focus"
     }
 
     #[tokio::test]
+    async fn recorded_install_of_a_curated_source_gets_curated_tier_without_ack() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "Superpowers", "d", "body");
+        let mut repos = BTreeMap::new();
+        // The `"superpowers"` alias resolves to this canonical repo, which is
+        // in `CURATED_SKILL_SOURCES`.
+        repos.insert(
+            "https://github.com/obra/superpowers".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: Some("cafef00d".into()),
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+
+        let pack = install_skill_source_with_recorded("superpowers", &roots, &cloner, &store)
+            .await
+            .unwrap();
+
+        let rec = store.get_plugin_install(&pack.id).await.unwrap().unwrap();
+        // Curated source → curated tier, and no acknowledgement timestamp
+        // (nothing to acknowledge — curated packs are trusted by default).
+        assert_eq!(rec.trust_tier, "curated");
+        assert!(rec.trust_ack_at.is_none());
+        // `source_spec` preserves the caller's literal alias, not the
+        // canonicalized repo.
+        assert_eq!(rec.source_spec, "superpowers");
+    }
+
+    #[tokio::test]
     async fn backfill_records_missing_installs_idempotently() {
         let config = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
