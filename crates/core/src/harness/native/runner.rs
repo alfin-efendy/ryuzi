@@ -699,7 +699,12 @@ async fn drive(
         // auto-continue if any remain: tell the user, then append a synthetic
         // "continue" user turn to the ledger (ledger-only — NOT a display
         // row, so the transcript shows the notice, not a fake user message).
-        if auto_continue < auto_budget {
+        // Guarded by `!cancel.is_cancelled()`: if the user stopped the run
+        // right as this inner loop exhausted, we must not announce an
+        // auto-continue or append a synthetic turn the run will never act
+        // on — the very next iteration's top-of-loop check (above) returns
+        // early anyway, but only after this block would otherwise have run.
+        if auto_continue < auto_budget && !cancel.is_cancelled() {
             if display.text() {
                 emit_row(
                     deps,
