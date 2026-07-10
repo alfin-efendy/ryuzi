@@ -10,7 +10,7 @@ import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
-import { composerGitOptionsForProject } from "@/lib/composer-git";
+import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
 import { ModelPicker } from "@/components/ModelPicker";
 import { startVoiceDictation } from "@/lib/voice";
@@ -315,7 +315,7 @@ export function HomeView() {
                 value={nav.composerBranch}
                 onValueChange={(v) => nav.setComposerBranch(v)}
                 allowCreate
-                onCreate={(input) => nav.setComposerBranch(input)}
+                onCreate={(input) => nav.setComposerBranch(normalizeBranchName(input))}
                 createHintLabel="New Branch"
                 onCreateHint={() => setBranchModalOpen(true)}
                 placeholder="Branch"

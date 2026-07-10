@@ -40,3 +40,10 @@ export function newBranchNameError(name: string, existing: string[]): string | n
   if (existing.includes(name)) return `Branch "${name}" already exists`;
   return null;
 }
+
+/** Live input normalization for new branch names: each whitespace run
+ *  becomes a single dash, so "my new feature" types as "my-new-feature".
+ *  The whitespace check in newBranchNameError stays as a safety net. */
+export function normalizeBranchName(input: string): string {
+  return input.replace(/\s+/g, "-");
+}

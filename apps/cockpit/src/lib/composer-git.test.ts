@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { composerGitOptions, composerGitOptionsForProject, newBranchNameError } from "./composer-git";
+import { composerGitOptions, composerGitOptionsForProject, newBranchNameError, normalizeBranchName } from "./composer-git";
 import type { BranchList } from "../bindings";
 
 const list: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
@@ -78,4 +78,11 @@ test("git project → delegates to composerGitOptions", () => {
     branchName: null,
     baseBranch: "develop",
   });
+});
+
+test("normalizeBranchName: whitespace runs become single dashes", () => {
+  expect(normalizeBranchName("my new feature")).toBe("my-new-feature");
+  expect(normalizeBranchName("a  b\tc")).toBe("a-b-c");
+  expect(normalizeBranchName("already-fine")).toBe("already-fine");
+  expect(normalizeBranchName("")).toBe("");
 });
