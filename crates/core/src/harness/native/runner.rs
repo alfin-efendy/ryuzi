@@ -389,7 +389,7 @@ async fn drive(
                 }
                 break;
             }
-            results.push(run_tool_call(deps, agent, t, emit_display, &spawn).await);
+            results.push(run_tool_call(deps, agent, t, emit_display, &spawn, cancel).await);
         }
         ledger.append_user(json!(results)).await?;
 
@@ -607,6 +607,7 @@ async fn run_tool_call(
     t: &ToolAccum,
     emit_display: bool,
     spawn: &Option<Arc<dyn SubagentSpawner>>,
+    cancel: &CancellationToken,
 ) -> Value {
     let input = t.parsed_input();
     let Some(tool) = deps.tools.get(&t.name) else {
@@ -661,12 +662,17 @@ async fn run_tool_call(
         &t.id,
         &deps.approvals,
         &deps.events,
+        cancel,
     )
     .await;
     if decision == PermDecision::Deny {
         // Plan mode denies mutations outright (no prompt) — tell the model why
         // so it plans instead of retrying, rather than showing "Denied by user".
-        let msg = if perm_mode == PermMode::Plan && !matches!(tool.kind(), "read") {
+        let msg = if cancel.is_cancelled() {
+            // Stopped while gated/parked: pair the tool_use with an
+            // interrupted tool_result, not a user denial.
+            "Interrupted by user"
+        } else if perm_mode == PermMode::Plan && !matches!(tool.kind(), "read") {
             "Plan mode is read-only: file edits and shell commands are disabled. \
              Propose a plan for the user to review; they can switch to Ask/Edit/Full to execute it."
         } else {
@@ -693,7 +699,7 @@ async fn run_tool_call(
         work_dir: deps.work_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
         store: deps.store.clone(),
-        cancel: CancellationToken::new(),
+        cancel: cancel.clone(),
         caps: OutputCaps::default(),
         spawn: spawn.clone(),
         memory: deps.memory.clone(),
@@ -1769,5 +1775,55 @@ mod tests {
         assert_eq!(messages[2]["content"][0]["is_error"], true);
         assert_eq!(messages[2]["content"][1]["type"], "text");
         assert_eq!(messages[2]["content"][1]["text"], "next");
+    }
+
+    #[tokio::test]
+    async fn cancel_during_parked_approval_still_appends_a_paired_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![
+            tool_use_start(0, "call-park", "bash"),
+            input_json_delta(0, "{\"command\":\"echo hi\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm).await;
+        // Default mode: bash prompts, and nobody will ever answer.
+        deps.set_perm_mode(PermMode::Default);
+        let mut rx = deps.events.subscribe();
+        let cancel = CancellationToken::new();
+        let run = {
+            let deps = deps.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                run_turn(&deps, TurnPrompt::text("run it", "run it"), cancel).await
+            })
+        };
+        // Wait for the approval prompt, then stop the turn instead of answering.
+        loop {
+            if let CoreEvent::ApprovalRequested { request_id, .. } = rx.recv().await.unwrap() {
+                assert_eq!(request_id, "call-park");
+                break;
+            }
+        }
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("turn must settle after cancel (approval gate must observe the turn token)")
+            .unwrap()
+            .unwrap();
+
+        // The ledger is PAIRED: user, assistant(tool_use), user(tool_result).
+        let turns = deps.store.list_provider_turns("s1").await.unwrap();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[2].role, "user");
+        assert_eq!(turns[2].payload[0]["type"], "tool_result");
+        assert_eq!(turns[2].payload[0]["tool_use_id"], "call-park");
+        assert_eq!(turns[2].payload[0]["is_error"], true);
+        assert!(turns[2].payload[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Interrupted"));
     }
 }
