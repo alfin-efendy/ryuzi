@@ -100,6 +100,13 @@ pub trait HarnessSession: Send + Sync {
     /// the ACP harness delegates permission to the external agent, so only the
     /// in-process native session overrides this (see its `RunnerDeps`).
     fn set_perm_mode(&self, _mode: PermMode) {}
+
+    /// Buffer a message sent while a turn is already running, for injection
+    /// into that turn's next tool-result batch (Task B3). Default no-op: only
+    /// the in-process native runtime has an in-flight loop to steer — the ACP
+    /// harness delegates the whole turn to an external agent process with no
+    /// such mid-turn channel, so a steer call on it is silently dropped.
+    fn steer(&self, _text: String) {}
 }
 
 /// Builds a `Harness`. The factory instance carries host-injected config

@@ -340,7 +340,14 @@ export const useStore = create<State>((set, get) => ({
     return true;
   },
   send: async (sessionPk, prompt, options) => {
-    const res = await commands.continueSession(sessionPk, prompt, toChatRequestOptions(options));
+    // A session already RUNNING a turn gets steered — the message is
+    // injected into that turn's next tool-result batch instead of racing a
+    // whole new turn onto the session. Any other status (idle, interrupted,
+    // ended) starts a normal continue.
+    const isRunning = get().sessions.find((s) => s.sessionPk === sessionPk)?.status === "running";
+    const res = isRunning
+      ? await commands.steerSession(sessionPk, prompt)
+      : await commands.continueSession(sessionPk, prompt, toChatRequestOptions(options));
     if (res.status === "error") {
       toast.error("Couldn't send message: " + res.error.message);
     }

@@ -57,6 +57,9 @@ struct FakeSession {
     /// Every prompt text driven on this (or a sibling) fake session, in
     /// order — lets resume tests assert the exact nudge text sent.
     prompts: Arc<Mutex<Vec<String>>>,
+    /// Every `steer()` call observed on this (or a sibling) fake session, in
+    /// order — lets steer tests assert the live handle actually received it.
+    steered: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -128,6 +131,10 @@ impl HarnessSession for FakeSession {
     fn agent_session_id(&self) -> Option<String> {
         Some("agent-1".to_string())
     }
+
+    fn steer(&self, text: String) {
+        self.steered.lock().unwrap().push(text);
+    }
 }
 
 /// Shared counters so tests can observe the harness/session lifecycle across
@@ -142,6 +149,8 @@ struct Counters {
     ended: Arc<AtomicBool>,
     /// Prompts observed by `send_prompt` across every produced session, in order.
     prompts: Arc<Mutex<Vec<String>>>,
+    /// `steer()` calls observed across every produced session, in order.
+    steered: Arc<Mutex<Vec<String>>>,
     /// The `SessionCtx.mcp_servers` the most recent `start_session` call was
     /// built with — lets plugin-connector tests assert on exactly what
     /// `start_harness_session` attached, without a bespoke fake per test.
@@ -167,6 +176,7 @@ impl Harness for FakeHarness {
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
+            steered: self.counters.steered.clone(),
         }))
     }
 }
@@ -207,6 +217,7 @@ impl Harness for GatedHarness {
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
+            steered: self.counters.steered.clone(),
         }))
     }
 }
@@ -252,6 +263,7 @@ impl Harness for LatchGatedHarness {
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
+            steered: self.counters.steered.clone(),
         }))
     }
 }
@@ -972,6 +984,107 @@ async fn continue_cold_resumes_when_handle_absent() {
     // Two ACP sessions created total: the initial start + the cold resume.
     assert_eq!(counters.starts.load(Ordering::SeqCst), 2);
     assert_eq!(counters.sends.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn steer_session_reaches_the_live_handle_without_starting_a_new_turn() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let counters = Counters::default();
+    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "first", "test", &[])
+        .await
+        .unwrap();
+    let handle_before = wait_for_running_handle(&cp, &session.session_pk).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let received = cp
+        .steer_session(&session.session_pk, "stop and check the tests first")
+        .await
+        .unwrap();
+    assert!(received, "a live handle must report it received the steer");
+
+    // The SAME live handle observed the steer — no new turn/session started.
+    assert_eq!(
+        counters.steered.lock().unwrap().as_slice(),
+        ["stop and check the tests first"]
+    );
+    assert_eq!(
+        counters.starts.load(Ordering::SeqCst),
+        1,
+        "steer must not start a new harness session"
+    );
+    assert_eq!(
+        counters.sends.load(Ordering::SeqCst),
+        1,
+        "steer must not itself drive a new turn — only the original send_prompt ran"
+    );
+    let handle_after = cp
+        .running
+        .lock()
+        .unwrap()
+        .get(&session.session_pk)
+        .cloned()
+        .unwrap();
+    assert!(Arc::ptr_eq(&handle_before, &handle_after));
+}
+
+#[tokio::test]
+#[serial]
+async fn steer_session_falls_back_to_a_new_turn_when_no_live_handle() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let counters = Counters::default();
+    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "first", "test", &[])
+        .await
+        .unwrap();
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Simulate the handle being gone (app restart) — no in-flight turn exists
+    // to steer into.
+    cp.running.lock().unwrap().remove(&session.session_pk);
+
+    let received = cp
+        .steer_session(&session.session_pk, "second, but as a fresh turn")
+        .await
+        .unwrap();
+    assert!(
+        !received,
+        "no live handle: the text must fall back to a normal continue, not report as steered"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // No steer() call was ever recorded — it went through continue_session's
+    // ordinary cold-resume + send_prompt path instead.
+    assert!(counters.steered.lock().unwrap().is_empty());
+    assert_eq!(
+        counters.sends.load(Ordering::SeqCst),
+        2,
+        "the fallback must have driven a real turn with the steer text"
+    );
+    assert_eq!(
+        counters.prompts.lock().unwrap().last().map(String::as_str),
+        Some("second, but as a fresh turn")
+    );
+    assert!(
+        cp.running.lock().unwrap().contains_key(&session.session_pk),
+        "the fallback's cold resume must re-register a live handle"
+    );
 }
 
 /// Factory that works for the first session but fails every later create —

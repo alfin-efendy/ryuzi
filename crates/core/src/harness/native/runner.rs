@@ -10,6 +10,7 @@ use super::context_manager::{
 use super::iteration_budget::{IterationBudget, PARENT_MAX_ITERS, SUBAGENT_MAX_ITERS};
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
+use super::steer::SteerBuffer;
 use super::tools::{
     OutputCaps, SubagentSpawner, SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
 };
@@ -72,6 +73,12 @@ pub struct RunnerDeps {
     pub memory: Option<Arc<super::memory::MemoryStore>>,
     /// Worktree snapshot stack for the `revert` tool (most recent last).
     pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Mid-turn steering buffer (Task B3). Cloned from `NativeSession::steer`
+    /// at session start — the SAME buffer, not a fresh one — so a `steer()`
+    /// call reaches whichever turn is currently draining it. Survives across
+    /// turns: `refresh_turn_model` clones the whole `RunnerDeps` per turn, but
+    /// `SteerBuffer`'s clone shares the underlying `Arc<Mutex<Vec<_>>>`.
+    pub steer: SteerBuffer,
 }
 
 impl RunnerDeps {
@@ -699,6 +706,16 @@ async fn drive(
             results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
         }
         cm.append_tool_results(results).await?;
+
+        // Mid-turn steering (Task B3): a message sent while this turn was
+        // running is queued in `deps.steer`, not raced into the ledger
+        // directly. Drain it now — right after the tool-result batch it rides
+        // alongside — so the model sees it on the NEXT iteration's request,
+        // wrapped in the verbatim marker the system prompt teaches it to
+        // trust as a direct user instruction.
+        if let Some(block) = deps.steer.take_block() {
+            cm.append_user_text(&block).await?;
+        }
 
         if cancel.is_cancelled() {
             return Ok(final_text);
@@ -1683,6 +1700,7 @@ mod tests {
             commands: Arc::new(CommandRegistry::builtin()),
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            steer: SteerBuffer::new(),
         }
     }
 
@@ -2468,6 +2486,56 @@ mod tests {
         // A CoreEvent::Message was broadcast for the user row.
         let first = rx.try_recv();
         assert!(matches!(first, Ok(CoreEvent::Message { .. })));
+    }
+
+    #[tokio::test]
+    async fn mid_turn_steer_is_injected_into_the_next_tool_result_batch() {
+        use super::super::steer::{STEER_MARKER_CLOSE, STEER_MARKER_OPEN};
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1: one tool call (bash), no tool-less text.
+        let turn1 = vec![
+            tool_use_start(1, "call-1", "bash"),
+            input_json_delta(1, "{\"command\":\"echo hi\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // Turn 2: acknowledges and ends.
+        let turn2 = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+
+        // A `steer()` call landing while the tool call above is executing
+        // pushes onto the SAME buffer `drive()` drains — exactly what
+        // `NativeSession::steer` does from a concurrent `steer` RPC. Pushed
+        // here (before the turn starts) is equivalent: `take_block()` picks
+        // up whatever is queued the instant `drive()` reaches the drain
+        // point, regardless of exactly when the push landed.
+        deps.steer.push("stop and check the tests first".into());
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("run the tests", "run the tests"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "the tool round, then the follow-up call");
+        // The follow-up request's LAST message is the drained steer block —
+        // appended right after the tool-result user turn, so the model sees
+        // it on this, the NEXT, iteration.
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let last = messages.last().expect("at least one message");
+        assert_eq!(last["role"], "user");
+        let rendered = serde_json::to_string(last).unwrap();
+        assert!(rendered.contains(STEER_MARKER_OPEN));
+        assert!(rendered.contains(STEER_MARKER_CLOSE));
+        assert!(rendered.contains("stop and check the tests first"));
+
+        // Drained: a later turn would not see it again.
+        assert!(deps.steer.take_block().is_none());
     }
 
     #[tokio::test]

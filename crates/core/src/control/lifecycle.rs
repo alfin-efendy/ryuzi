@@ -421,6 +421,36 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Mid-turn steering (Task B3): inject `text` into a LIVE turn's next
+    /// tool-result batch instead of racing a whole new turn onto the session.
+    /// Looks up the live handle in `running` and calls
+    /// `HarnessSession::steer` — this never bypasses the turn lock or starts
+    /// a new turn, it only queues for whatever turn that handle is (or will
+    /// be) running to pick up on its own next iteration.
+    ///
+    /// Returns `true` when a live handle received it. When the session has no
+    /// live handle (ended, never started, or the in-memory handle was lost to
+    /// a restart), there is no in-flight turn to steer into at all, so this
+    /// falls back to ordinary `continue_session` semantics — the text starts
+    /// a fresh turn — and returns `false`.
+    pub async fn steer_session(
+        self: &Arc<Self>,
+        session_pk: &str,
+        text: &str,
+    ) -> anyhow::Result<bool> {
+        let handle = self.running.lock().unwrap().get(session_pk).cloned();
+        match handle {
+            Some(handle) => {
+                handle.steer(text.to_string());
+                Ok(true)
+            }
+            None => {
+                self.continue_session(session_pk, text, &[]).await?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Persist a user-visible status row (role=system, block_type=status) and
     /// broadcast it so live subscribers render it immediately.
     async fn emit_status(&self, session_pk: &str, text: &str) {

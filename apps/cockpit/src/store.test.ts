@@ -713,3 +713,39 @@ test("send resolves true on success and false on backend error (drives composer 
   listProjects.mockRestore();
   listSessions.mockRestore();
 });
+
+test("send steers a RUNNING session instead of starting a new turn via continue", async () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const steer = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "hold on", null)).resolves.toBe(true);
+  expect(steer).toHaveBeenCalledWith("s1", "hold on");
+  expect(cont).not.toHaveBeenCalled();
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("send falls back to continue for a session that is not running", async () => {
+  reset();
+  useStore.setState({ sessions: [{ ...runningSession("s1"), status: "idle" as const }] });
+  const steer = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "go", null)).resolves.toBe(true);
+  expect(cont).toHaveBeenCalled();
+  expect(steer).not.toHaveBeenCalled();
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});

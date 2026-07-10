@@ -27,6 +27,7 @@ pub mod permission;
 pub mod runner;
 pub mod skills;
 pub mod snapshot;
+pub mod steer;
 pub mod tools;
 
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
@@ -152,8 +153,13 @@ impl Harness for NativeHarness {
         let memory_store = Some(Arc::new(memory::MemoryStore::at_default(
             project_id.as_deref(),
         )));
+        // One buffer for the session's whole lifetime: cloned into
+        // `RunnerDeps` below so `drive()` can drain what `NativeSession::steer`
+        // pushes — both sides share the same `Arc<Mutex<_>>` (Task B3).
+        let steer = steer::SteerBuffer::new();
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
+            steer: steer.clone(),
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 work_dir: ctx.work_dir,
@@ -174,6 +180,7 @@ impl Harness for NativeHarness {
                 commands,
                 memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                steer,
             },
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),
@@ -193,6 +200,10 @@ pub struct NativeSession {
     /// ledger's user/assistant alternation — and its tool_use/tool_result
     /// pairing — breaks durably.
     turn_lock: tokio::sync::Mutex<()>,
+    /// Mid-turn steering buffer (Task B3) — the SAME buffer cloned into
+    /// `deps.steer`, so a `steer()` call here is visible to whatever turn is
+    /// currently running in `send_prompt`/`drive()`.
+    steer: steer::SteerBuffer,
 }
 
 #[async_trait]
@@ -234,6 +245,12 @@ impl HarnessSession for NativeSession {
         // The native runtime owns its own history (the provider_turns ledger),
         // so the session_pk is a stable, always-present resume id.
         Some(self.session_pk.clone())
+    }
+
+    fn steer(&self, text: String) {
+        // Never touches turn_lock/live_cancel: this queues for whatever turn
+        // is (or will be) running, it does not interrupt or race it.
+        self.steer.push(text);
     }
 }
 

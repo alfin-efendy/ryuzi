@@ -26,6 +26,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "start_session",
     "start_chat_session",
     "continue_session",
+    "steer",
     "stop_session",
     "end_session",
     "list_messages",
@@ -92,6 +93,11 @@ struct ContinueP {
 #[derive(Deserialize)]
 struct SessionPkP {
     session_pk: String,
+}
+#[derive(Deserialize)]
+struct SteerP {
+    session_pk: String,
+    text: String,
 }
 #[derive(Deserialize)]
 struct StageP {
@@ -173,6 +179,10 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "continue_session" => {
             let a: ContinueP = params(p)?;
             ok(continue_session(state, &a.session_pk, &a.prompt, a.options).await?)
+        }
+        "steer" => {
+            let a: SteerP = params(p)?;
+            ok(cp.steer_session(&a.session_pk, &a.text).await?)
         }
         "stop_session" => {
             let a: SessionPkP = params(p)?;
@@ -399,6 +409,27 @@ mod tests {
         .unwrap();
         assert_eq!(out["projectId"], serde_json::Value::Null);
         assert_eq!(out["kind"], "chat");
+    }
+
+    #[tokio::test]
+    async fn steer_on_an_unknown_session_errors_like_continue_session() {
+        // No live handle AND no session row at all: `steer` dispatches through
+        // to `ControlPlane::steer_session`'s fallback, which — like
+        // `continue_session` — must fail cleanly on an unknown session_pk
+        // rather than panic or silently succeed. (The "live handle received
+        // it" / "fell back to a new turn" branching itself is covered by
+        // `control::tests::steer_session_*`, which can synchronize on the
+        // background-started live handle that this dispatch-only layer
+        // cannot.)
+        let s = state().await;
+        let err = dispatch(
+            &s,
+            "steer",
+            json!({"session_pk": "no-such-session", "text": "hi"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 500);
     }
 
     #[tokio::test]

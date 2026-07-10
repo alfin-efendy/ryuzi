@@ -219,6 +219,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::start_session,
             commands::start_chat_session,
             commands::continue_session,
+            commands::steer_session,
             commands::stop_session,
             commands::end_session,
             commands::list_tool_policies,

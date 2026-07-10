@@ -162,6 +162,17 @@ pub async fn continue_session(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn steer_session(engine: Engine<'_>, session_pk: String, text: String) -> R<bool> {
+    engine
+        .rpc(
+            "steer",
+            serde_json::json!({ "session_pk": session_pk, "text": text }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn stop_session(engine: Engine<'_>, session_pk: String) -> R<()> {
     engine
         .rpc(

@@ -69,6 +69,14 @@ async continueSession(sessionPk: string, prompt: string, options: ChatRequestOpt
     else return { status: "error", error: e  as any };
 }
 },
+async steerSession(sessionPk: string, text: string) : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("steer_session", { sessionPk, text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async stopSession(sessionPk: string) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("stop_session", { sessionPk }) };
