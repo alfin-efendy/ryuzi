@@ -2892,6 +2892,21 @@ mod tests {
                 .as_deref(),
             Some("discord")
         );
+        // Phase 2 migration 20 (sessions rebuild: nullable project_id +
+        // kind/speaker/agent/parent_session_pk) must also fire on this
+        // ancient-DB replay. A row that pre-dates the `kind` column entirely
+        // (inserted here under the raw v4 shape) has to land as kind='project'
+        // — the rebuild's `DEFAULT 'project'` on `sessions_new`, verified end
+        // to end via a genuine forward migration rather than a fresh store.
+        // (A chat session's own insert/read-back round-trip is covered
+        // separately by `chat_session_persists_with_null_project` below.)
+        assert_eq!(s.kind, crate::domain::SessionKind::Project);
+        assert_eq!(s.project_id.as_deref(), Some("p1"));
+        let user_version: i64 = store
+            .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(user_version, 20, "forward migration must land at v20");
     }
 
     #[tokio::test]

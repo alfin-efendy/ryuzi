@@ -225,6 +225,48 @@ every surface talks to — there is no per-surface embedded engine anymore.
 
 ---
 
+## Chat sessions
+
+Sessions no longer require a project. A session's `kind` is `project`,
+`chat`, `worker`, or `review`; `project` is the pre-existing kind (bound to a
+project workdir), and `chat` is the project-less, chat-first kind added in
+this phase (`worker`/`review` are schema-only so far, reserved for a later
+phase's async delegation).
+
+- **No project, no worktree.** A chat session's `project_id` is `None` and it
+  never gets a git worktree. It runs in a scratch directory at
+  `state_dir()/chat/<session_pk>`, created on first use.
+- **Global memory only.** The native runtime's persistent-memory tool always
+  builds global-scope memory; project-scope memory stays unavailable without
+  a bound project. A chat session can read/write global memory, just not
+  project memory.
+- **Start points.** Cockpit Home starts a chat session automatically when no
+  project is attached (the project picker is an optional "attach a project"
+  control, not a hard requirement). Chat sessions also get their own bucket
+  in the sidebar, above the project tree. A Discord DM starts a chat session
+  too — no `/connect` step needed first.
+
+---
+
+## Auxiliary model settings
+
+Three secondary (non-primary-turn) LLM calls each read their own optional
+model override from a raw settings key, so you can route them to a cheaper
+or faster model than the session's main model:
+
+| Setting key | Routes | Falls back to |
+| --- | --- | --- |
+| `auxiliary.title.model` | Session-title generation | The session's model |
+| `auxiliary.compaction.model` | Context-compaction summarization | The session's model |
+| `auxiliary.decompose.model` | Orchestrator goal-decompose | The configured default model |
+
+Each key is unset by default (fallback applies). They are plain key-value
+settings with no dedicated UI yet — set them out-of-band via the `set_setting`
+RPC/Tauri command (`{ key: "auxiliary.title.model", value: "<model-id>" }`) or
+directly in the `settings` table.
+
+---
+
 ## Troubleshooting
 
 ### `bun: command not found: tauri`
