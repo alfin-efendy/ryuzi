@@ -39,7 +39,7 @@ export function SessionView() {
     pendingApprovals,
     projects,
     setProjectModel,
-    setProjectPermMode,
+    setSessionPermMode,
     contextUsage,
   } = useStore();
   const nav = useNav();
@@ -180,7 +180,7 @@ export function SessionView() {
   const running = session.status === "running";
   const usage = contextUsage[session.sessionPk];
   const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
-  const permUi = corePermToUi(project?.permMode ?? "default");
+  const permUi = corePermToUi(session.permMode);
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
   const selectedModel = project?.model || agent?.model || "";
   const modelOptions = agent?.models ?? [];
@@ -365,7 +365,7 @@ export function SessionView() {
                 options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
                 value={permUi}
                 onValueChange={(mode) => {
-                  if (projectId) void setProjectPermMode(projectId, uiPermToCore(mode as UiPermMode));
+                  void setSessionPermMode(session.sessionPk, uiPermToCore(mode as UiPermMode));
                 }}
                 trigger={
                   <Button
