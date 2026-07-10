@@ -236,13 +236,19 @@ export function InstallWizardModal({
   // the plugins store so the Browse card flips to Open + Switch.
   useEffect(() => {
     if (step !== "done") return;
+    let active = true;
     void (async () => {
       if (detail && !detail.info.experimental) {
         const res = await commands.setPluginEnabled(pluginId, true);
+        if (!active) return;
         if (res.status === "error") toast.error(res.error.message);
       }
+      if (!active) return;
       await loadPlugins();
     })();
+    return () => {
+      active = false;
+    };
   }, [step, pluginId, detail, loadPlugins]);
 
   return (
@@ -475,9 +481,11 @@ export function InstallWizardModal({
             {pluginName} is installed.
           </div>
           <p className="m-0 text-[12.5px] text-muted-foreground">
-            {detail?.info.experimental
-              ? "It's experimental, so it stays off — enable it from the card when ready."
-              : "It's enabled and ready for your agents."}
+            {detail == null
+              ? "You can enable it from the card."
+              : detail.info.experimental
+                ? "It's experimental, so it stays off — enable it from the card when ready."
+                : "It's enabled and ready for your agents."}
           </p>
           <ModalFooter>
             <Button onClick={close}>Close</Button>

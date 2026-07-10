@@ -89,7 +89,7 @@ let beginData: PluginInstallBeginResult = beginResult();
 
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 
-const pluginDetail = mock((_id: string) => ok(detailData));
+const pluginDetail = mock((_id: string): Promise<Result<PluginDetail, CmdError>> => ok(detailData));
 const beginPluginInstall = mock(
   (_pluginId: string): Promise<Result<PluginInstallBeginResult, CmdError>> => ok(beginData),
 );
@@ -553,6 +553,19 @@ test("experimental plugins are not auto-enabled at done", async () => {
   await renderWizard();
 
   expect(await screen.findByText(/enable it from the card when ready/)).toBeTruthy();
+  expect(setPluginEnabled).not.toHaveBeenCalled();
+  await waitFor(() => expect(listPlugins).toHaveBeenCalled());
+});
+
+test("a null detail (pluginDetail failed, begin still routed to done) shows neutral copy and skips enable", async () => {
+  pluginDetail.mockImplementationOnce(() =>
+    Promise.resolve({ status: "error" as const, error: { message: "manifest read failed" } }),
+  );
+  beginData = beginResult({ authKind: "none" });
+  await renderWizard();
+
+  expect(await screen.findByText("Notion is installed.")).toBeTruthy();
+  expect(screen.getByText("You can enable it from the card.")).toBeTruthy();
   expect(setPluginEnabled).not.toHaveBeenCalled();
   await waitFor(() => expect(listPlugins).toHaveBeenCalled());
 });
