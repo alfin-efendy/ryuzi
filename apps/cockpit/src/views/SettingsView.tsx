@@ -1,11 +1,23 @@
-import { ACCENTS, Button, Input, type Mode, SettingsCard as Card, SettingsCardRow as CardRow, Switch, useTheme } from "@ryuzi/ui";
+import {
+  ACCENTS,
+  Button,
+  Input,
+  type Mode,
+  Segmented,
+  SettingsCard as Card,
+  SettingsCardRow as CardRow,
+  Switch,
+  useTheme,
+} from "@ryuzi/ui";
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
 import { commands } from "@/bindings";
+import { ModelPicker } from "@/components/ModelPicker";
 import { PermissionsCard } from "@/components/PermissionsCard";
-import { PROJECTS_ROOT_KEY } from "@/constants";
+import { PERM_MODES, PROJECTS_ROOT_KEY, type UiPermMode } from "@/constants";
+import { useAgent } from "@/store-agent";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
 // Canonical brand assets (assets/brand/README.md). Explicit light/dark variants:
 // the app theme is class-driven, so the prefers-color-scheme adaptive SVG can't follow it.
@@ -170,6 +182,61 @@ function AccentRow() {
   );
 }
 
+// ——— Agent (native runtime) settings ———
+// The two knobs that survived the Runtime menu: default model + permission
+// mode, persisted in the engine settings KV via store-agent.
+
+function AgentSection() {
+  const models = useAgent((s) => s.models);
+  const model = useAgent((s) => s.model);
+  const permMode = useAgent((s) => s.permMode);
+  const setModel = useAgent((s) => s.setModel);
+  const setPermMode = useAgent((s) => s.setPermMode);
+
+  useEffect(() => {
+    void useAgent.getState().load();
+  }, []);
+
+  const permUi: UiPermMode = permMode ?? "ask";
+  const permDesc = PERM_MODES.find((m) => m.id === permUi)?.desc ?? "";
+
+  return (
+    <>
+      <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">Agent</div>
+      <Card>
+        <div className="flex flex-col gap-2 border-b border-border px-[18px] py-3">
+          <div className="flex items-center gap-3">
+            <span className="flex-1 text-[13px] font-medium">Permission mode</span>
+            <Segmented
+              options={PERM_MODES.map((m) => ({ id: m.id, label: m.label }))}
+              value={permUi}
+              onChange={(mode) => void setPermMode(mode)}
+            />
+          </div>
+          <div className="text-right text-[11.5px] text-muted-foreground">{permDesc}</div>
+        </div>
+        <CardRow>
+          <span className="w-[110px] shrink-0 text-[13px] font-medium">Default model</span>
+          {models.length > 0 ? (
+            <ModelPicker
+              ariaLabel="Default model"
+              variant="field"
+              models={models}
+              leading={[{ value: "", label: "Router default (first usable provider)" }]}
+              value={model ?? ""}
+              onValueChange={(v) => void setModel(v === "" ? null : v)}
+            />
+          ) : (
+            <span className="flex-1 truncate text-xs text-muted-foreground">
+              Add an enabled provider connection in Models → Providers to pick a model.
+            </span>
+          )}
+        </CardRow>
+      </Card>
+    </>
+  );
+}
+
 // ——— View ———
 
 export function SettingsView() {
@@ -249,6 +316,8 @@ export function SettingsView() {
           </CardRow>
         </Card>
 
+        <AgentSection />
+
         <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">System</div>
 
         <Card>
@@ -285,7 +354,7 @@ export function SettingsView() {
               <img src={wordmarkLight} alt="ryuzi" className="h-5 dark:hidden" />
               <img src={wordmarkDark} alt="ryuzi" className="hidden h-5 dark:block" />
               <div className="mt-1.5 text-[12.5px] text-muted-foreground">
-                Cockpit{version ? ` v${version}` : ""} — drive Claude Code from chat and terminal.
+                Cockpit{version ? ` v${version}` : ""} — drive the Ryuzi agent from chat and terminal.
               </div>
             </div>
           </div>
