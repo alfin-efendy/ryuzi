@@ -489,3 +489,50 @@ test("Reopen browser re-opens the authorize URL", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Reopen browser" }));
   expect(openUrl).toHaveBeenCalledWith("https://vendor.example.com/oauth/authorize?client_id=abc");
 });
+
+test("valueSet satisfies the required gate and optional unset fields never block", async () => {
+  detailData = detailFixture({
+    settings: [
+      field("plugin.notion.app_key", "Application key", { secret: true, valueSet: true }),
+      field("plugin.notion.site", "Site", { required: false }),
+    ],
+  });
+  beginData = beginResult({ authKind: "none" });
+  await renderWizard();
+
+  const saved = screen.getByPlaceholderText("●●●● saved") as HTMLInputElement;
+  expect(saved.value).toBe("");
+  expect(saved.type).toBe("password");
+  expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(false);
+  expect(screen.getByPlaceholderText("Optional — not set")).toBeTruthy();
+});
+
+test("a required unset setting disables Continue until typed, then saves on Continue", async () => {
+  detailData = detailFixture({ settings: [field("plugin.notion.user", "User")] });
+  beginData = beginResult({ authKind: "none" });
+  await renderWizard();
+
+  expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(true);
+
+  fireEvent.change(screen.getByPlaceholderText("Required — not set"), { target: { value: "alice" } });
+  expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(false);
+
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith("plugin.notion.user", "alice"));
+  expect(await screen.findByText("Notion is installed.")).toBeTruthy();
+});
+
+test("untouched fields are not saved on Continue", async () => {
+  detailData = detailFixture({
+    settings: [
+      field("plugin.notion.app_key", "Application key", { secret: true, valueSet: true }),
+      field("plugin.notion.site", "Site", { required: false }),
+    ],
+  });
+  beginData = beginResult({ authKind: "none" });
+  await renderWizard();
+
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+  expect(await screen.findByText("Notion is installed.")).toBeTruthy();
+  expect(setPluginSetting).not.toHaveBeenCalled();
+});

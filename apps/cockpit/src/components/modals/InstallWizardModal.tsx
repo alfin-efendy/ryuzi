@@ -38,6 +38,7 @@ export function InstallWizardModal({
   const [oauthError, setOauthError] = useState<string | null>(null);
   const [pasteOpen, setPasteOpen] = useState(false);
   const [code, setCode] = useState("");
+  const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
 
   const Icon = iconFor(pluginIcon ?? null);
@@ -121,6 +122,30 @@ export function InstallWizardModal({
     // it leaks until the flow's own timeout (Phase 1 whole-branch review).
     await commands.cancelPluginInstall(pluginId, stateToken);
     setStep(settingsOrDone(detail));
+  };
+
+  const settingsFields = detail?.settings ?? [];
+  // valueSet counts (a saved value satisfies the requirement without ever
+  // being echoed); a non-empty typed value counts because Continue saves it.
+  const requiredSatisfied = settingsFields.every(
+    (f) => !f.required || f.valueSet || (fieldValues[f.key] ?? "").trim().length > 0,
+  );
+
+  const submitSettings = async () => {
+    if (busy || !requiredSatisfied) return;
+    setBusy(true);
+    for (const f of settingsFields) {
+      const value = (fieldValues[f.key] ?? "").trim();
+      if (value.length === 0) continue;
+      const res = await commands.setPluginSetting(f.key, value);
+      if (res.status === "error") {
+        setBusy(false);
+        toast.error(res.error.message);
+        return;
+      }
+    }
+    setBusy(false);
+    setStep("done");
   };
 
   // Single resolution call: the backend runs env-var detection, RFC 8414
@@ -404,9 +429,24 @@ export function InstallWizardModal({
           <p className="mb-[18px] mt-0 text-[12.5px] text-muted-foreground">
             Configure {pluginName}. Required fields are marked with * — saved values stay hidden and never display.
           </p>
+          <div className="flex flex-col gap-3">
+            {settingsFields.map((f) => (
+              <FormField key={f.key} label={f.required ? `${f.label} *` : f.label} hint={f.help || undefined}>
+                <Input
+                  type={f.secret ? "password" : "text"}
+                  value={fieldValues[f.key] ?? ""}
+                  onChange={(e) => setFieldValues((m) => ({ ...m, [f.key]: e.target.value }))}
+                  placeholder={f.valueSet ? "●●●● saved" : f.required ? "Required — not set" : "Optional — not set"}
+                />
+              </FormField>
+            ))}
+          </div>
           <ModalFooter>
             <Button variant="outline" onClick={close}>
               Cancel
+            </Button>
+            <Button disabled={busy || !requiredSatisfied} onClick={() => void submitSettings()}>
+              {busy ? "Saving…" : "Continue"}
             </Button>
           </ModalFooter>
         </>
