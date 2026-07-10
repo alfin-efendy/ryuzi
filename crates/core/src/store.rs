@@ -1023,13 +1023,18 @@ impl Store {
         mode: PermMode,
     ) -> anyhow::Result<()> {
         let pk = pk.to_string();
-        self.with_conn(move |c| {
-            c.execute(
-                "UPDATE sessions SET perm_mode=?2 WHERE session_pk=?1",
-                params![pk, mode.as_str()],
-            )
-        })
-        .await?;
+        let pk_for_err = pk.clone();
+        let rows = self
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE sessions SET perm_mode=?2 WHERE session_pk=?1",
+                    params![pk, mode.as_str()],
+                )
+            })
+            .await?;
+        if rows == 0 {
+            anyhow::bail!("update_session_perm_mode: unknown session {pk_for_err}");
+        }
         Ok(())
     }
 
@@ -2371,6 +2376,22 @@ mod tests {
             .unwrap();
         let got = store.get_session("s1").await.unwrap().unwrap();
         assert_eq!(got.perm_mode, PermMode::AcceptEdits);
+    }
+
+    #[tokio::test]
+    async fn update_session_perm_mode_on_unknown_session_is_an_error() {
+        // The UPDATE previously matched zero rows and silently no-opped —
+        // a caller could believe the mode persisted when it never did.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let err = store
+            .update_session_perm_mode("does-not-exist", PermMode::AcceptEdits)
+            .await
+            .expect_err("updating a missing session must surface an error");
+        assert!(
+            err.to_string().contains("does-not-exist"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
