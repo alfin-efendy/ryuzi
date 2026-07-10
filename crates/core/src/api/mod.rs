@@ -3,6 +3,7 @@
 //! names match the Tauri command names 1:1; params objects use the Rust
 //! snake_case parameter names. One submodule per command family.
 
+pub mod sessions;
 pub mod types;
 
 use crate::serve::ApiState;
@@ -41,13 +42,8 @@ impl From<anyhow::Error> for ApiError {
 }
 
 /// Decode an RPC call's params object into a typed request. Malformed params
-/// become a 400 [`ApiError`] rather than a panic or a 500.
-///
-/// No `dispatch` arm needs this yet — `list_projects` takes no params — but
-/// every command family from Task 5 onward decodes its params through this,
-/// so it's part of this task's wire-format contract. `allow(dead_code)`
-/// until the first family lands; covered directly by unit tests below.
-#[allow(dead_code)]
+/// become a 400 [`ApiError`] rather than a panic or a 500. Every command
+/// family decodes its params through this.
 pub(crate) fn params<T: DeserializeOwned>(v: Value) -> Result<T, ApiError> {
     serde_json::from_value(v).map_err(|e| ApiError::bad_request(format!("bad params: {e}")))
 }
@@ -61,15 +57,11 @@ pub(crate) fn ok<T: serde::Serialize>(v: T) -> Result<Value, ApiError> {
 }
 
 /// Route one `POST /rpc/{method}` call to its command family. Method names
-/// match Cockpit's Tauri command names 1:1; later tasks chain family
-/// submodules here, e.g.:
-/// `m if sessions::HANDLES.contains(&m) => sessions::dispatch(state, m, p).await,`
-///
-/// `_p` is unused for now — `list_projects` takes no params — but stays in
-/// the signature since every later arm needs it.
-pub async fn dispatch(state: &ApiState, method: &str, _p: Value) -> Result<Value, ApiError> {
+/// match Cockpit's Tauri command names 1:1; later tasks chain further family
+/// submodules here in the same style.
+pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     match method {
-        "list_projects" => ok(state.cp.list_projects().await?),
+        m if sessions::HANDLES.contains(&m) => sessions::dispatch(state, m, p).await,
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }
