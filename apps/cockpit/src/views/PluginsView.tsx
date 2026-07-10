@@ -660,9 +660,26 @@ export function PluginsView() {
                   <CatalogCard
                     key={plugin.id}
                     plugin={plugin}
-                    onOpen={() => nav.navigate({ kind: "pluginDetail", id: plugin.id })}
-                    onInstall={() => setInstallingPlugin(plugin)}
+                    onOpen={() => {
+                      // Single-flight guard: with the wizard open, the Modal
+                      // scrim blocks mouse clicks on background cards, but a
+                      // keyboard user can still Tab past it and press Enter
+                      // on another card's Open/Install/Switch — navigating
+                      // away mid-wizard is the same class of bypass, so
+                      // no-op while installingPlugin is set.
+                      if (installingPlugin) return;
+                      nav.navigate({ kind: "pluginDetail", id: plugin.id });
+                    }}
+                    onInstall={() => {
+                      // Same single-flight guard: don't let a background
+                      // Install swap installingPlugin mid-wizard.
+                      if (installingPlugin) return;
+                      setInstallingPlugin(plugin);
+                    }}
                     onToggle={() => {
+                      // Same single-flight guard: don't let a background
+                      // Switch toggle fire while the wizard is open.
+                      if (installingPlugin) return;
                       if (!plugin.experimental) void setPluginEnabled(plugin.id, !plugin.enabled);
                     }}
                   />

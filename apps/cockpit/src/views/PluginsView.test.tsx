@@ -340,6 +340,30 @@ test("browse shows Install for unconfigured disabled catalog plugins and opens t
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith("notion"));
 });
 
+test("single-flight guard: opening the wizard blocks background Install clicks on another plugin", async () => {
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("notion");
+
+  // Open the wizard for plugin A (github) via its Install button.
+  fireEvent.click(screen.getByRole("button", { name: "Install github" }));
+  await screen.findByText("Install github", { selector: "span" });
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith("github"));
+  beginPluginInstall.mockClear();
+
+  // The Modal scrim blocks mouse clicks on background content, but jsdom
+  // has no focus trap and dispatches this click regardless — exactly
+  // simulating a keyboard user tabbing to plugin B's card and pressing
+  // Enter on its Install button while the wizard is open.
+  fireEvent.click(screen.getByRole("button", { name: "Install notion" }));
+
+  // installingPlugin must be unchanged: the wizard still shows plugin A's
+  // header, and no begin call was made for plugin B.
+  expect(screen.getByText("Install github", { selector: "span" })).toBeTruthy();
+  expect(beginPluginInstall).not.toHaveBeenCalledWith("notion");
+});
+
 test("browse shows Open plus the enable switch for configured plugins", async () => {
   usePlugins.setState({ plugins: [{ ...github, configured: true }, notion, builtin], loaded: true });
   await renderView();
