@@ -19,6 +19,7 @@ const githubDetail: PluginDetail = {
     enabled: false,
     source: "catalog",
     capabilities: ["connector"],
+    configured: false,
   },
   auth: {
     kind: "token",
@@ -51,6 +52,7 @@ const ollamaDetail: PluginDetail = {
     enabled: true,
     source: "builtin",
     capabilities: ["provider"],
+    configured: false,
   },
   auth: null,
   settings: [
@@ -82,6 +84,7 @@ const sandboxDetail: PluginDetail = {
     enabled: false,
     source: "catalog",
     capabilities: [],
+    configured: false,
   },
   auth: null,
   settings: [],
@@ -104,6 +107,7 @@ const oauthDetail: PluginDetail = {
     enabled: true,
     source: "catalog",
     capabilities: ["connector"],
+    configured: false,
   },
   auth: {
     kind: "oauth",

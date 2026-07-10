@@ -17,6 +17,7 @@ const builtin: PluginInfo = {
   enabled: true,
   source: "builtin",
   capabilities: ["runtime"],
+  configured: false,
 };
 
 const github: PluginInfo = {
@@ -30,6 +31,7 @@ const github: PluginInfo = {
   enabled: true,
   source: "catalog",
   capabilities: ["connector"],
+  configured: false,
 };
 
 const userPlugin: PluginInfo = {

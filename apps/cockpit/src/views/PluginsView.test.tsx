@@ -14,6 +14,7 @@ function plugin(id: string, categories: string[]): PluginInfo {
     enabled: false,
     source: "catalog",
     capabilities: ["connector"],
+    configured: false,
   };
 }
 
