@@ -26,6 +26,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod memory;
 pub mod plan;
+pub mod question;
 pub mod read;
 pub mod revert;
 pub mod skill;
@@ -292,6 +293,7 @@ impl ToolRegistry {
             Arc::new(lsp::Lsp),
             Arc::new(task::Task),
             Arc::new(plan::ExitPlanMode),
+            Arc::new(question::AskUserQuestion),
         ];
         let mut tools = BTreeMap::new();
         for t in list {
@@ -393,6 +395,30 @@ pub(crate) mod testutil {
             interaction: None,
         }
     }
+
+    /// `ctx_at` + a live Interaction pinned to `mode`. Returns the hub/events
+    /// so tests can script the user's reply.
+    pub async fn ctx_with_interaction(
+        dir: &Path,
+        mode: crate::domain::PermMode,
+    ) -> (
+        ToolCtx,
+        Arc<crate::approval::ApprovalHub>,
+        tokio::sync::broadcast::Receiver<crate::domain::CoreEvent>,
+        Arc<std::sync::Mutex<crate::domain::PermMode>>,
+    ) {
+        let mut ctx = ctx_at(dir).await;
+        let hub = Arc::new(crate::approval::ApprovalHub::new());
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let perm = Arc::new(std::sync::Mutex::new(mode));
+        ctx.interaction = Some(Arc::new(Interaction {
+            approvals: hub.clone(),
+            events: tx,
+            perm_mode: perm.clone(),
+            project_id: None,
+        }));
+        (ctx, hub, rx, perm)
+    }
 }
 
 #[cfg(test)]
@@ -458,11 +484,12 @@ mod tests {
             "lsp",
             "task",
             "exitplanmode",
+            "askuserquestion",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 17);
+        assert_eq!(defs.len(), 18);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

@@ -109,36 +109,10 @@ impl Tool for ExitPlanMode {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testutil::ctx_at;
+    use super::super::testutil::{ctx_at, ctx_with_interaction};
     use super::*;
-    use crate::approval::ApprovalHub;
     use crate::domain::{ApprovalDecision, ApprovalKind, ApprovalResponse, CoreEvent, PermMode};
     use serde_json::json;
-    use std::sync::Arc;
-    use tokio::sync::broadcast;
-
-    /// ctx_at + a live Interaction pinned to `mode`.
-    async fn ctx_with_interaction(
-        dir: &std::path::Path,
-        mode: PermMode,
-    ) -> (
-        super::super::ToolCtx,
-        Arc<ApprovalHub>,
-        broadcast::Receiver<CoreEvent>,
-        Arc<std::sync::Mutex<PermMode>>,
-    ) {
-        let mut ctx = ctx_at(dir).await;
-        let hub = Arc::new(ApprovalHub::new());
-        let (tx, rx) = broadcast::channel(8);
-        let perm = Arc::new(std::sync::Mutex::new(mode));
-        ctx.interaction = Some(Arc::new(super::super::Interaction {
-            approvals: hub.clone(),
-            events: tx,
-            perm_mode: perm.clone(),
-            project_id: None,
-        }));
-        (ctx, hub, rx, perm)
-    }
 
     #[tokio::test]
     async fn errors_outside_plan_mode() {
