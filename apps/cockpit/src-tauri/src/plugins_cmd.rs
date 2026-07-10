@@ -1309,10 +1309,19 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
     }
 }
 
+/// `uninstall` plus marking `plugins_restart_required` — split out (taking
+/// `&ControlPlane` rather than the command's `State`) so it's directly
+/// testable with `test_cp()`, the same way `uninstall` itself already is.
+async fn uninstall_and_mark(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
+    uninstall(cp, id).await?;
+    cp.mark_plugins_restart_required();
+    Ok(())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn uninstall_plugin(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<PluginInfo>> {
-    uninstall(&cp, &id).await?;
+    uninstall_and_mark(&cp, &id).await?;
     Ok(assemble_list(&cp).await?)
 }
 
@@ -1738,7 +1747,7 @@ pub struct DoctorFinding {
     pub plugin_id: String,
     /// `warn` | `error`.
     pub severity: String,
-    /// `unconfigured` | `reconnect-required` | `missing-binary` | `attach-failed`.
+    /// `reconnect-required` | `missing-binary` | `attach-failed`.
     pub kind: String,
     pub message: String,
     pub suggested_action: String,
@@ -1757,19 +1766,34 @@ impl From<doctor::DoctorFinding> for DoctorFinding {
 }
 
 /// Pure mapping layer over `skills_install::begin_install`, split out so it's
-/// unit-testable against a hermetic `Store` without a Tauri `State`.
+/// unit-testable against a hermetic `Store` without a Tauri `State`. Marks
+/// the daemon dirty (`plugins_restart_required`) only when the install
+/// actually completed — see `mark_restart_if_begin_completed`.
 async fn begin_skill_install_inner(
     source: &str,
-    store: &Store,
+    cp: &ControlPlane,
 ) -> anyhow::Result<SkillInstallBegin> {
-    Ok(
-        match ryuzi_core::skills_install::begin_install(source, store).await? {
-            BeginInstall::Completed(pack) => SkillInstallBegin::from_completed(pack),
-            BeginInstall::NeedsConfirmation(prompt) => {
-                SkillInstallBegin::from_needs_confirmation(prompt)
-            }
-        },
-    )
+    let result = ryuzi_core::skills_install::begin_install(source, cp.store()).await?;
+    mark_restart_if_begin_completed(cp, &result);
+    Ok(match result {
+        BeginInstall::Completed(pack) => SkillInstallBegin::from_completed(pack),
+        BeginInstall::NeedsConfirmation(prompt) => {
+            SkillInstallBegin::from_needs_confirmation(prompt)
+        }
+    })
+}
+
+/// Whether a `begin_install` result should flip the in-memory
+/// `plugins_restart_required` latch — only true for a `Completed` install (a
+/// `NeedsConfirmation` trust prompt hasn't touched disk yet). Split out from
+/// `begin_skill_install_inner` so it's testable without a hermetic,
+/// network-free way to drive `begin_install`'s `Completed` branch (curated
+/// installs still resolve through `InstallRoots::for_user()` and a real git
+/// clone — see that function's test for why it isn't driven directly here).
+fn mark_restart_if_begin_completed(cp: &ControlPlane, result: &BeginInstall) {
+    if matches!(result, BeginInstall::Completed(_)) {
+        cp.mark_plugins_restart_required();
+    }
 }
 
 /// Phase 1 of the two-phase tiered trust gate (see
@@ -1782,19 +1806,31 @@ pub async fn begin_skill_install(
     cp: State<'_, Arc<ControlPlane>>,
     source: String,
 ) -> R<SkillInstallBegin> {
-    Ok(begin_skill_install_inner(&source, cp.store()).await?)
+    Ok(begin_skill_install_inner(&source, &cp).await?)
 }
 
 /// Phase 2: complete a staged install (or update) after the user has
 /// acknowledged its `TrustPromptDto`. The token is single-use — see
-/// `ryuzi_core::skills_install::confirm_install`.
+/// `ryuzi_core::skills_install::confirm_install`. Always marks
+/// `plugins_restart_required`: reaching this point always means an install
+/// (or reack-triggered update) just completed.
 #[tauri::command]
 #[specta::specta]
 pub async fn confirm_skill_install(
     cp: State<'_, Arc<ControlPlane>>,
     token: String,
 ) -> R<InstalledSkillPack> {
-    Ok(ryuzi_core::skills_install::confirm_install(&token, cp.store()).await?)
+    let pack = ryuzi_core::skills_install::confirm_install(&token, cp.store()).await?;
+    cp.mark_plugins_restart_required();
+    Ok(pack)
+}
+
+/// Whether an `UpdateOutcome` should flip `plugins_restart_required` — only
+/// `Updated` actually reinstalls anything on disk;
+/// `AlreadyCurrent`/`SkippedPinned`/`LocalEdits`/`Failed`/`NeedsReack` are all
+/// no-ops. Mirrors `serve.rs`'s `update_plugin_route`.
+fn is_restart_required_update(outcome: &UpdateOutcome) -> bool {
+    matches!(outcome, UpdateOutcome::Updated)
 }
 
 /// Update one installed pack. `force` overrides the local-edits guard but
@@ -1808,7 +1844,16 @@ pub async fn update_plugin(
     force: bool,
 ) -> R<UpdateOutcomeDto> {
     let outcome = ryuzi_core::skills_install::update_installed_pack(&id, force, cp.store()).await?;
+    if is_restart_required_update(&outcome) {
+        cp.mark_plugins_restart_required();
+    }
     Ok(UpdateOutcomeDto::from(outcome))
+}
+
+/// Whether at least one pack in an `update_all_packs` batch actually
+/// reinstalled — the batch as a whole only needs a restart if one did.
+fn any_update_requires_restart(results: &[(String, UpdateOutcome)]) -> bool {
+    results.iter().any(|(_, o)| is_restart_required_update(o))
 }
 
 /// Update every installed pack (skipping pinned ones); never fails as a
@@ -1818,6 +1863,9 @@ pub async fn update_plugin(
 #[specta::specta]
 pub async fn update_all_plugins(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<UpdateOutcomeEntry>> {
     let results = ryuzi_core::skills_install::update_all_packs(cp.store()).await?;
+    if any_update_requires_restart(&results) {
+        cp.mark_plugins_restart_required();
+    }
     Ok(results
         .into_iter()
         .map(|(id, outcome)| UpdateOutcomeEntry {
@@ -3522,6 +3570,95 @@ mod tests {
         let cp = test_cp().await;
         assert!(!cp.plugins_restart_required());
         cp.mark_plugins_restart_required();
+        assert!(cp.plugins_restart_required());
+    }
+
+    // ---------- plugins_restart_required wiring (Cockpit-side mutations) ----------
+
+    #[tokio::test]
+    async fn mark_restart_if_begin_completed_flips_flag_only_for_completed() {
+        let cp = test_cp().await;
+        let prompt = TrustPrompt {
+            token: "t".into(),
+            source_spec: "acme/p".into(),
+            owner_repo: "acme/p".into(),
+            resolved_commit: None,
+            skills: vec![],
+            hook_scripts: vec![],
+            total_bytes: 0,
+        };
+        mark_restart_if_begin_completed(&cp, &BeginInstall::NeedsConfirmation(prompt));
+        assert!(
+            !cp.plugins_restart_required(),
+            "a trust prompt alone hasn't touched disk yet"
+        );
+
+        let pack = InstalledSkillPack {
+            id: "s".into(),
+            name: "S".into(),
+            source: "https://github.com/acme/s".into(),
+            plugin_id: None,
+            installed_at: "2026-07-11T00:00:00Z".into(),
+            skills: vec![],
+        };
+        mark_restart_if_begin_completed(&cp, &BeginInstall::Completed(pack));
+        assert!(cp.plugins_restart_required());
+    }
+
+    #[test]
+    fn is_restart_required_update_true_only_for_updated() {
+        assert!(is_restart_required_update(&UpdateOutcome::Updated));
+        assert!(!is_restart_required_update(&UpdateOutcome::AlreadyCurrent));
+        assert!(!is_restart_required_update(&UpdateOutcome::SkippedPinned));
+        assert!(!is_restart_required_update(&UpdateOutcome::LocalEdits));
+        assert!(!is_restart_required_update(&UpdateOutcome::Failed(
+            "boom".into()
+        )));
+        let prompt = TrustPrompt {
+            token: "t".into(),
+            source_spec: "acme/p".into(),
+            owner_repo: "acme/p".into(),
+            resolved_commit: None,
+            skills: vec![],
+            hook_scripts: vec!["tool.before/g.sh".into()],
+            total_bytes: 0,
+        };
+        assert!(!is_restart_required_update(&UpdateOutcome::NeedsReack(
+            prompt
+        )));
+    }
+
+    #[test]
+    fn any_update_requires_restart_true_only_when_some_outcome_is_updated() {
+        assert!(!any_update_requires_restart(&[
+            ("a".to_string(), UpdateOutcome::AlreadyCurrent),
+            ("b".to_string(), UpdateOutcome::SkippedPinned),
+        ]));
+        assert!(any_update_requires_restart(&[
+            ("a".to_string(), UpdateOutcome::AlreadyCurrent),
+            ("b".to_string(), UpdateOutcome::Updated),
+        ]));
+    }
+
+    #[tokio::test]
+    async fn plugins_restart_required_flips_on_uninstall_but_not_on_pin() {
+        let cp = test_cp().await;
+        assert!(!cp.plugins_restart_required());
+
+        // A pin-only mutation must not require a restart — it doesn't change
+        // what's on disk or loaded in-process.
+        ryuzi_core::skills_install::set_pack_pin("nonexistent", true, None, cp.store())
+            .await
+            .unwrap();
+        assert!(!cp.plugins_restart_required());
+
+        // An uninstall does (using the hermetic integration-kind path
+        // already exercised by
+        // `uninstall_integration_clears_credential_and_disables` — "github",
+        // not "discord": the `discord` gateway only registers under the
+        // `discord` Cargo feature, which this crate's default test build
+        // doesn't enable).
+        uninstall_and_mark(&cp, "github").await.unwrap();
         assert!(cp.plugins_restart_required());
     }
 }

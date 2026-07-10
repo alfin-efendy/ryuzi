@@ -894,14 +894,13 @@ async listSkills() : Promise<Result<InstalledSkillInfo[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
-async installSkill(source: string) : Promise<Result<InstalledSkillPack, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("install_skill", { source }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
+/**
+ * Remove a single-skill install. Ledger-aware: also deletes the pack's
+ * `plugin_installs`/`plugin_attach_status` rows (via
+ * `remove_installed_skill_recorded`) so a reinstall starts from a clean
+ * ledger state instead of resurrecting stale trust/pin metadata, and marks
+ * `plugins_restart_required` — an uninstall changes what's on disk.
+ */
 async removeSkill(id: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remove_skill", { id }) };
@@ -910,6 +909,14 @@ async removeSkill(id: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Refresh a single-skill install. Ledger-aware: also keeps the pack's
+ * `plugin_installs` fingerprint in sync (via
+ * `refresh_installed_skill_recorded`) so a bare refresh doesn't leave the
+ * ledger's fingerprint stale — which would otherwise false-positive a
+ * `LocalEdits` result on the next update — and marks
+ * `plugins_restart_required`, since a refresh reinstalls fresh content.
+ */
 async refreshSkill(id: string) : Promise<Result<InstalledSkillPack, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("refresh_skill", { id }) };
@@ -1054,7 +1061,9 @@ async beginSkillInstall(source: string) : Promise<Result<SkillInstallBegin, CmdE
 /**
  * Phase 2: complete a staged install (or update) after the user has
  * acknowledged its `TrustPromptDto`. The token is single-use — see
- * `ryuzi_core::skills_install::confirm_install`.
+ * `ryuzi_core::skills_install::confirm_install`. Always marks
+ * `plugins_restart_required`: reaching this point always means an install
+ * (or reack-triggered update) just completed.
  */
 async confirmSkillInstall(token: string) : Promise<Result<InstalledSkillPack, CmdError>> {
     try {
@@ -1413,7 +1422,7 @@ export type DoctorFinding = { pluginId: string;
  */
 severity: string; 
 /**
- * `unconfigured` | `reconnect-required` | `missing-binary` | `attach-failed`.
+ * `reconnect-required` | `missing-binary` | `attach-failed`.
  */
 kind: string; message: string; suggestedAction: string }
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }

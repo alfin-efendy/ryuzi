@@ -359,7 +359,6 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_commands,
             native_cmd::session_todos,
             skills_cmd::list_skills,
-            skills_cmd::install_skill,
             skills_cmd::remove_skill,
             skills_cmd::refresh_skill,
             plugins_cmd::list_plugins,
