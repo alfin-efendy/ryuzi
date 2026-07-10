@@ -5,9 +5,8 @@
 //! delegates to [`ryuzi_core::plugins::toggle_enabled`], the single source of
 //! truth shared with the Cockpit `set_plugin_enabled` command, which mirrors
 //! the enablement rules `PluginHost::is_enabled` reads back (see that
-//! method's doc): harness-capable plugins toggle the `enabled_runtimes` CSV,
-//! gateway-capable toggle `enabled_gateways`, and everything else toggles its
-//! own `plugin.<id>.enabled` flag.
+//! method's doc): gateway-capable plugins toggle the `enabled_gateways` CSV,
+//! and everything else toggles its own `plugin.<id>.enabled` flag.
 
 use std::sync::Arc;
 
@@ -198,15 +197,6 @@ async fn cmd_info(id: &str, deps: &mut Deps) -> u8 {
             provider.format,
             provider.base_url.as_deref().unwrap_or("-"),
             models
-        ));
-    }
-
-    if let Some(runtime) = &m.runtime {
-        (deps.out)(&format!(
-            "runtime: binary={} npm_package={} default_model={}",
-            runtime.binary.as_deref().unwrap_or("-"),
-            runtime.npm_package.as_deref().unwrap_or("-"),
-            runtime.default_model.as_deref().unwrap_or("-"),
         ));
     }
 

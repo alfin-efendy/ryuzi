@@ -26,7 +26,6 @@ use ryuzi_core::update::{
     ApplyInfo, CanaryCfg, CanaryHost, CanaryOutcome, Handoff, NotifyTarget, StageOpts, StageResult,
     TarStageHost, UpdateManager, UpdateManagerDeps, UreqHttp,
 };
-use ryuzi_core::AcpAdapterDescriptor;
 
 use crate::dispatch::Deps;
 
@@ -91,19 +90,14 @@ where
 fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
     BuildDaemonOpts {
         db_path: deps.db_path.clone(),
-        // Lazily resolves the ACP sidecar (may download). `build_daemon`
-        // calls this AT MOST ONCE, and only when the persisted
-        // `enabled_runtimes` setting includes "claude-code" — a
-        // zero-runtime daemon never touches the resolver or the network.
+        // The external claude-code harness is gone from the CLI. Core still
+        // requires `BuildDaemonOpts.adapter` until the engine deletion commit
+        // (group 3) removes the field — this stub only runs if a legacy DB
+        // still lists "claude-code" in `enabled_runtimes`, and fails with a
+        // clear message instead of resolving a sidecar. Delete this stub
+        // together with the core field.
         adapter: Box::new(|| {
-            let resolved = crate::sidecar_host::manager().resolve()?;
-            Ok(AcpAdapterDescriptor {
-                command: resolved.command,
-                args: resolved.args,
-                env: vec![],
-                // REQUIRED: the adapter refuses to start inside a nested Claude Code session.
-                env_remove: vec!["CLAUDECODE".to_string()],
-            })
+            anyhow::bail!("the claude-code harness has been removed; Ryuzi is native-only")
         }),
         telemetry: None,
         // `factory_entries()` is gated INSIDE `ryuzi-core` on ITS OWN

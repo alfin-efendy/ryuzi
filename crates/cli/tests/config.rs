@@ -17,11 +17,6 @@ fn deps_for(
             found: true,
             version: None,
         },
-        detect_claude: || ryuzi_cli::detect::Detected {
-            found: true,
-            version: None,
-        },
-        sidecar_status: Box::new(|| ryuzi_core::sidecar::SidecarStatus::CachedStandalone),
         build_registries: Box::new(|| Ok(ryuzi_core::Registries::new())),
     }
 }

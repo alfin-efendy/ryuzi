@@ -52,9 +52,9 @@ fn connector_only_plugin(id: &str, name: &str) -> CorePlugin {
 
 /// Mirrors what `crates/cli/src/main.rs`'s real `build_registries` wires:
 /// `native`/`discord` added first (they carry host-injected config that
-/// `install_builtins` deliberately skips), then every generated
-/// provider/cli-agent builtin, plus one connector-only test plugin so the
-/// `plugin.<id>.enabled` branch has something to exercise.
+/// `install_builtins` deliberately skips), then every generated builtin,
+/// plus one connector-only test plugin so the `plugin.<id>.enabled` branch
+/// has something to exercise.
 fn test_registries() -> Registries {
     let mut regs = Registries::new();
     regs.add_plugin(ryuzi_core::harness::native::native_plugin());
@@ -83,11 +83,6 @@ fn deps_for(
             found: true,
             version: None,
         },
-        detect_claude: || ryuzi_cli::detect::Detected {
-            found: true,
-            version: None,
-        },
-        sidecar_status: Box::new(|| ryuzi_core::sidecar::SidecarStatus::CachedStandalone),
         build_registries: Box::new(|| Ok(test_registries())),
     }
 }
@@ -142,25 +137,6 @@ fn info_anthropic_prints_categories_and_models_meta() {
 }
 
 #[test]
-fn info_claude_reports_runtime_capability_for_manifest_only_cli_agent() {
-    // Regression test: `claude` is a cli-agent plugin with a manifest-only
-    // `[runtime]` block and no live `HarnessFactory` (see
-    // `plugins::runtimes_meta::cli_agent_plugins`). `capabilities` must
-    // report `runtime` for it via `CorePlugin::capabilities`, the same
-    // helper `ryuzi_core::serve` and Cockpit's `plugins_cmd` use — not
-    // `manifest-only`, which only checked `plugin.harness` and missed the
-    // manifest-only `runtime` meta.
-    let tmp = tempfile::tempdir().unwrap();
-    let db = tmp.path().join("t.sqlite");
-    let (code, out, _) = run(&db, &["plugins", "info", "claude"]);
-    assert_eq!(code, 0);
-
-    let text = out.join("\n");
-    assert!(text.contains("id: claude"));
-    assert!(text.contains("capabilities: runtime"));
-}
-
-#[test]
 fn enable_then_disable_connector_only_plugin_flips_setting() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("t.sqlite");
@@ -198,25 +174,6 @@ fn enable_then_disable_connector_only_plugin_flips_setting() {
         ],
     );
     assert_eq!(out.last().map(String::as_str), Some("false"));
-}
-
-#[test]
-fn enable_native_adds_to_enabled_runtimes_without_duplicating() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = tmp.path().join("t.sqlite");
-    run(&db, &["config", "set", "enabled_runtimes", "claude-code"]);
-
-    let (code, out, _) = run(&db, &["plugins", "enable", "native"]);
-    assert_eq!(code, 0);
-    assert_eq!(out.last().map(String::as_str), Some("enabled native"));
-    let (_, out, _) = run(&db, &["config", "get", "enabled_runtimes"]);
-    assert_eq!(out.last().map(String::as_str), Some("claude-code,native"));
-
-    // Enabling again must not duplicate the entry.
-    let (code, _, _) = run(&db, &["plugins", "enable", "native"]);
-    assert_eq!(code, 0);
-    let (_, out, _) = run(&db, &["config", "get", "enabled_runtimes"]);
-    assert_eq!(out.last().map(String::as_str), Some("claude-code,native"));
 }
 
 #[test]
@@ -286,10 +243,7 @@ fn toggling_a_manifest_only_or_experimental_plugin_errors_instead_of_no_opping()
 /// actual compiled `ryuzi` binary (unlike every other test in this file,
 /// which exercises `dispatch::run_cli` in-process against `test_registries`)
 /// so a regression in `main.rs` itself — not just the fixture mirroring it —
-/// would be caught. `RYUZI_ACP_PATH` points at a path that doesn't exist so
-/// the claude-code sidecar resolution fails fast (no network/bun probe)
-/// instead of trying to download anything; that's harmless here since
-/// `discord` registration doesn't depend on it.
+/// would be caught.
 #[test]
 fn real_binary_registers_and_disables_the_discord_plugin() {
     let tmp = tempfile::tempdir().unwrap();
@@ -298,7 +252,6 @@ fn real_binary_registers_and_disables_the_discord_plugin() {
         .args(["plugins", "disable", "discord"])
         .env("XDG_DATA_HOME", tmp.path())
         .env("HOME", tmp.path())
-        .env("RYUZI_ACP_PATH", tmp.path().join("no-such-acp-binary"))
         .assert()
         .success()
         .stdout(predicate::str::contains("disabled discord"));

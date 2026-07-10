@@ -35,9 +35,10 @@ fn daemon_process_reaches_running_then_exits_cleanly_on_sigterm() {
         .to_path_buf();
 
     // Seed settings BEFORE spawning: empty enabled_gateways (zero-gateway
-    // daemon) and empty enabled_runtimes (no ACP integration — the daemon
-    // must never touch the sidecar resolver/network on this path). The Store
-    // is opened and dropped here so the child owns the only live handle.
+    // daemon) and empty enabled_runtimes (no external harness — the daemon
+    // must never build an adapter or touch the network on this path). The
+    // Store is opened and dropped here so the child owns the only live
+    // handle.
     {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

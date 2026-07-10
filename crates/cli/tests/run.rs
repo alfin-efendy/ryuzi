@@ -113,11 +113,6 @@ fn deps_with_fake(
             found: true,
             version: None,
         },
-        detect_claude: || ryuzi_cli::detect::Detected {
-            found: true,
-            version: None,
-        },
-        sidecar_status: Box::new(|| ryuzi_core::sidecar::SidecarStatus::CachedStandalone),
         build_registries: Box::new(|| {
             let mut r = Registries::new();
             // new projects are always created with the native harness
@@ -482,11 +477,6 @@ fn deps_with_approval_fake(
             found: true,
             version: None,
         },
-        detect_claude: || ryuzi_cli::detect::Detected {
-            found: true,
-            version: None,
-        },
-        sidecar_status: Box::new(|| ryuzi_core::sidecar::SidecarStatus::CachedStandalone),
         build_registries: Box::new(move || {
             let mut r = Registries::new();
             let factory = Arc::new(ApprovalFakeFactory {
