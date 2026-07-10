@@ -157,6 +157,10 @@ export function PluginsView() {
   };
 
   const uninstallPlugin = (plugin: PluginInfo) => {
+    // `uninstall` already swaps in the fresh plugins list from the command,
+    // so the Installed/Browse grids reconcile on their own. The extra
+    // `refreshSkills` is only to update the manual "Skill sources" card,
+    // whose rows come from the skills store, not the plugins list.
     void uninstall(plugin.id).then((ok) => {
       if (ok) void refreshSkills();
     });

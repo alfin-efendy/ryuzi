@@ -985,15 +985,23 @@ async fn compute_installed(
             .any(|c| provider_family(&c.provider) == family)
     };
     let gateway_settings_complete = if kind == "gateway" {
-        let mut complete = !plugin.manifest.settings.is_empty();
-        for field in &plugin.manifest.settings {
-            let value = store.get_setting_raw(&field.key).await?;
-            if value.as_deref().map(str::trim).is_none_or(str::is_empty) {
-                complete = false;
-                break;
+        // A gateway with no manifest settings has nothing to configure, so
+        // its installed-ness is just whether it's enabled — otherwise it
+        // could never leave Browse. Discord (the only gateway today) has 3
+        // required settings and takes the all-present path below.
+        if plugin.manifest.settings.is_empty() {
+            enabled
+        } else {
+            let mut complete = true;
+            for field in &plugin.manifest.settings {
+                let value = store.get_setting_raw(&field.key).await?;
+                if value.as_deref().map(str::trim).is_none_or(str::is_empty) {
+                    complete = false;
+                    break;
+                }
             }
+            complete
         }
-        complete
     } else {
         false
     };
@@ -1050,8 +1058,11 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             categories: vec!["skills".to_string()],
             verified: true,
             experimental: false,
-            enabled: installed,
-            configured: installed,
+            // A synthesized pack isn't a registered plugin, so `enabled` /
+            // `configured` are meaningless here — only `installed` drives the
+            // Browse/Installed split.
+            enabled: false,
+            configured: false,
             source: "skill-pack".to_string(),
             capabilities: vec![],
             kind: "skill-pack".to_string(),
@@ -1825,6 +1836,40 @@ mod tests {
     fn provider_family_falls_back_to_id() {
         assert_eq!(provider_family("anthropic-oauth"), "anthropic");
         assert_eq!(provider_family("not-a-provider"), "not-a-provider");
+    }
+
+    // ---------- compute_installed: settings-less gateway ----------
+
+    #[tokio::test]
+    async fn compute_installed_gateway_without_settings_follows_enabled() {
+        // A gateway with no manifest settings has nothing to configure, so its
+        // installed-ness must track `enabled` — otherwise it could never leave
+        // Browse. `gateway_only` builds a manifest with empty `settings`.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        let plugin = gateway_only("bare-gateway");
+        let ctx = InstalledCtx {
+            connections: vec![],
+            installed_skills: vec![],
+        };
+
+        let installed_when_enabled =
+            compute_installed(&store, &plugin, "gateway", true, false, &ctx)
+                .await
+                .unwrap();
+        assert!(
+            installed_when_enabled,
+            "enabled settings-less gateway is installed"
+        );
+
+        let installed_when_disabled =
+            compute_installed(&store, &plugin, "gateway", false, false, &ctx)
+                .await
+                .unwrap();
+        assert!(
+            !installed_when_disabled,
+            "disabled settings-less gateway is not installed"
+        );
     }
 
     // ---------- plugin_info ----------

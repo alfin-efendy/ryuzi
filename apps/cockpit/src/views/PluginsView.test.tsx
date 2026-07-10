@@ -360,6 +360,40 @@ test("installed aggregates apps and installed plugins with uninstall", async () 
   await waitFor(() => expect(uninstallPlugin).toHaveBeenCalledWith("notion"));
 });
 
+test("an installed curated pack renders as exactly one card, not a duplicate manual row", async () => {
+  // The skills store and the plugins list both know about superpowers once
+  // it's installed (same id). The Installed tab must show it once — as the
+  // plugin card with an Uninstall button — and NOT also as a manual "Skill
+  // sources" row (whose id/pluginId matches a listed plugin, so it's filtered
+  // out).
+  const installedPack = { ...superpowers, installed: true };
+  pluginsFixture = [installedPack];
+  useSkills.setState({
+    skills: [
+      {
+        id: "superpowers",
+        name: "superpowers",
+        source: "superpowers",
+        pluginId: null,
+        installedAt: "2026-07-08T10:00:00Z",
+        skillCount: 12,
+      },
+    ],
+    loading: false,
+    error: null,
+  });
+  await renderView();
+
+  expect(await screen.findByText("superpowers")).toBeTruthy();
+  // Exactly one node bears the pack name (the InstalledPluginCard), and it
+  // carries an Uninstall action — the manual "Skill sources" card would add a
+  // Remove button and a second name node.
+  expect(screen.getAllByText("superpowers")).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "Uninstall superpowers" })).toBeTruthy();
+  expect(screen.queryByText("Skill sources")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Remove superpowers" })).toBeNull();
+});
+
 test("empty installed state points at browse", async () => {
   appsFixture = [];
   pluginsFixture = [];
