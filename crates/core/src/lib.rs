@@ -4,6 +4,7 @@ pub mod branches;
 pub mod connector;
 pub mod control;
 pub mod daemon;
+pub mod daemon_lock;
 pub mod daemon_status;
 pub mod domain;
 pub mod fsview;
