@@ -24,3 +24,9 @@ cross-session Inbox; the CLI prompts inline. Gateways (Discord, headless
 daemon) only fan out Tool-kind prompts as binary approve/deny; Plan/Question
 prompts in headless sessions expire after `approval_timeout_ms` and the tool
 reports that no interactive surface answered.
+
+MCP tools are gated per-tool: the permission key is the tool's own full name
+(`mcp__server__tool`), so "don't ask again" rules never span multiple MCP
+tools or servers. ACP sessions (e.g. Claude Code) forward `*Always` decisions
+to the agent's own permission options and do not write ryuzi `tool_policies`
+rows — this is an accepted deviation from the native runtime's persistence.

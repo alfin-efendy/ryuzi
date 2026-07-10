@@ -232,6 +232,17 @@ async fn run_client_loop(
                         );
                         return responder.respond(response);
                     }
+                    if outcome == crate::policy::PolicyOutcome::Deny {
+                        // Policy hard-denies (a persisted `rejectAlways` rule
+                        // or Plan-mode blocking a mutating tool): respond
+                        // immediately without prompting or registering with
+                        // the hub — there's nothing for the user to decide.
+                        let response = crate::harness::acp::permission::map_response(
+                            &request,
+                            crate::domain::ApprovalDecision::RejectOnce,
+                        );
+                        return responder.respond(response);
+                    }
 
                     let _ = events.send(CoreEvent::ApprovalRequested {
                         session_pk,
@@ -1080,6 +1091,33 @@ mod tests {
         assert!(
             outcome.hub_was_never_registered,
             "hub should NOT have been registered when policy is allowAlways"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_always_policy_denies_without_hub_registration() {
+        // Pre-set a rejectAlways policy for "Bash" on project
+        // "p-perm-bridge-deny". `decide_tool_permission` returns
+        // `PolicyOutcome::Deny` for this, which must short-circuit to an
+        // immediate reject response — no hub registration, no
+        // ApprovalRequested event, no prompt.
+        let outcome = crate::harness::acp::testkit::run_perm_mock_via_harness(
+            "p-perm-bridge-deny",
+            Some(("Bash", "rejectAlways")),
+        )
+        .await;
+
+        assert!(
+            !outcome.allowed,
+            "mock agent should have received a reject selection"
+        );
+        assert!(
+            outcome.hub_was_never_registered,
+            "hub should NOT have been registered when policy is rejectAlways"
+        );
+        assert!(
+            outcome.captured_session_pk.is_none(),
+            "no ApprovalRequested event should be emitted when policy denies outright"
         );
     }
 
