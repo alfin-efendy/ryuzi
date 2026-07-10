@@ -1,4 +1,4 @@
-//! ConfigField schema: the 26 global settings fields. Keys, labels, help
+//! ConfigField schema: the 27 global settings fields. Keys, labels, help
 //! text, and defaults are user-visible contracts — settings stored under
 //! these keys must keep resolving across releases.
 
@@ -38,7 +38,7 @@ pub const BASE: ConfigField = ConfigField {
     default: None,
 };
 
-/// The 26 global settings fields.
+/// The 27 global settings fields.
 pub static GLOBAL_FIELDS: &[ConfigField] = &[
     ConfigField {
         key: "workdir_root",

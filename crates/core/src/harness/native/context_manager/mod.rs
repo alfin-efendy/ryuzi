@@ -197,6 +197,23 @@ impl ContextManager {
         self.tokens.local_appended = 0;
     }
 
+    /// Resume-seed the token state from a persisted `active_tokens` value
+    /// (spec §12 continued): each turn builds a fresh `ContextManager` whose
+    /// estimate comes only from re-summing the reloaded history, which can
+    /// badly undercount the true active total right after `mark_full` pinned
+    /// it to the full window — the in-memory pin never survives past that
+    /// turn. Applied only when `active` exceeds the current estimate, so a
+    /// normal resume (where the reload estimate is already accurate) is a
+    /// no-op; called before the next turn's `needs_compaction` check so an
+    /// overflow reliably drives a pre-turn compaction instead of looping
+    /// forever on an undercounted estimate.
+    pub fn seed_active_tokens(&mut self, active: u64) {
+        if active > self.tokens.active() {
+            self.tokens.last_server_total = Some(active);
+            self.tokens.local_appended = 0;
+        }
+    }
+
     pub fn status(&self) -> ContextStatus {
         let meta = &self.cfg.meta;
         let active = self.tokens.active();
@@ -292,6 +309,25 @@ mod tests {
         assert!(cm.status().needs_compaction, "91k >= 90% of 100k");
         cm.mark_full();
         assert_eq!(cm.status().percent_left, 0);
+    }
+
+    #[tokio::test]
+    async fn seed_active_tokens_only_applies_when_it_exceeds_the_estimate() {
+        let mut cm = ContextManager::ephemeral("s", ContextConfig::with_meta(meta()));
+        cm.set_baseline("short system", &[]);
+        // needs_compaction requires a non-empty history.
+        cm.append_user(json!([{"type":"text","text":"hi"}]))
+            .await
+            .unwrap();
+        let before = cm.status().active_tokens;
+        // A seed below the current estimate must not regress the state.
+        cm.seed_active_tokens(before.saturating_sub(1));
+        assert_eq!(cm.status().active_tokens, before);
+        assert!(!cm.status().needs_compaction);
+        // A seed above the current estimate (the overflow-resume case) wins.
+        cm.seed_active_tokens(90_000);
+        assert_eq!(cm.status().active_tokens, 90_000);
+        assert!(cm.status().needs_compaction, "90k >= 90% of 100k");
     }
 
     #[tokio::test]

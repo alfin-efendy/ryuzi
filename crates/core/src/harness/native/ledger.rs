@@ -126,19 +126,26 @@ impl Ledger {
     /// Install a compacted replacement history. Persistent ledgers write a
     /// durable checkpoint so `load` never replays the replaced turns again;
     /// the provider_turns rows stay untouched (append-only audit record).
+    ///
+    /// `window_number` only advances once the checkpoint insert actually
+    /// succeeds: computing the next number up front (rather than mutating
+    /// `self.window_number` before the fallible write) keeps numbering
+    /// gap-free if the insert fails — a retried compaction reuses the same
+    /// number instead of skipping one.
     pub async fn replace_all(&mut self, replacement: Vec<Value>) -> anyhow::Result<u32> {
-        self.window_number += 1;
+        let next = self.window_number + 1;
         let boundary_seq = self.turns.last().map(|t| t.seq).unwrap_or(0);
         if let Some(store) = &self.store {
             store
                 .insert_context_checkpoint(
                     &self.session_pk,
                     boundary_seq,
-                    self.window_number as i64,
+                    next as i64,
                     &Value::Array(replacement.clone()),
                 )
                 .await?;
         }
+        self.window_number = next;
         self.turns = replacement
             .into_iter()
             .map(|msg| Turn {
@@ -222,6 +229,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(w2, 2);
+    }
+
+    #[tokio::test]
+    async fn replace_all_leaves_window_number_and_turns_unchanged_on_a_failed_insert() {
+        let store = store().await;
+        let mut ledger = Ledger::load(store.clone(), "s1").await.unwrap();
+        ledger
+            .append_user(json!([{"type":"text","text":"u0"}]))
+            .await
+            .unwrap();
+        assert_eq!(ledger.window_number(), 0);
+        let before_len = ledger.len();
+
+        // Force the checkpoint insert to fail so we can assert the counter
+        // and turns are left untouched rather than advancing/replacing ahead
+        // of the (failed) durable write.
+        store
+            .with_conn(|c| c.execute("DROP TABLE context_checkpoints", []).map(|_| ()))
+            .await
+            .unwrap();
+
+        let err = ledger
+            .replace_all(vec![
+                json!({"role":"user","content":[{"type":"text","text":"S"}]}),
+            ])
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .to_lowercase()
+            .contains("context_checkpoints"));
+        assert_eq!(
+            ledger.window_number(),
+            0,
+            "window_number must not advance on a failed insert"
+        );
+        assert_eq!(
+            ledger.len(),
+            before_len,
+            "turns must not be replaced on a failed insert"
+        );
     }
 
     #[tokio::test]

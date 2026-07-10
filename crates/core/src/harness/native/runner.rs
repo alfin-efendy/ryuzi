@@ -134,6 +134,14 @@ pub async fn run_turn(
     // reload estimate (spec §6.1/§10).
     match deps.store.get_session_context(&deps.session_pk).await {
         Ok(Some(saved)) => {
+            // Seed BEFORE reading status: an overflowed prior turn persisted
+            // the full-window total via `mark_full`, but this fresh
+            // `ContextManager` only knows the (possibly much smaller) reload
+            // estimate, which would otherwise let `needs_compaction` miss the
+            // overflow and loop forever (spec §12).
+            if let Some(saved_active) = saved["active_tokens"].as_u64() {
+                cm.seed_active_tokens(saved_active);
+            }
             let st = cm.status();
             let _ = deps.events.send(CoreEvent::ContextUsage {
                 session_pk: deps.session_pk.clone(),
@@ -180,6 +188,14 @@ async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::R
     .await;
     let cfg = ContextConfig::load(&deps.store, deps.meta).await;
     let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
+    // Same resume-seed as `run_turn` (spec §12): honor a persisted
+    // post-overflow total so a manual /compact right after an overflow
+    // reports honest `before_tokens` instead of the reload's undercount.
+    if let Ok(Some(saved)) = deps.store.get_session_context(&deps.session_pk).await {
+        if let Some(saved_active) = saved["active_tokens"].as_u64() {
+            cm.seed_active_tokens(saved_active);
+        }
+    }
     if cm.is_empty() {
         emit_row(
             deps,
@@ -566,6 +582,14 @@ async fn drive(
 
 /// Effort → extended-thinking budget (spec §8): low/None → off, medium → 8192,
 /// high → 16384, clamped to half of max_tokens; only for reasoning models.
+///
+/// This key currently only takes effect on OpenAI-format upstreams: the
+/// router (`llm_router::client::anthropic_messages_stream`) strips
+/// `thinking` before it reaches an Anthropic-native upstream (passthrough
+/// `/messages` and kiro), since the runner doesn't yet replay signed
+/// thinking blocks in tool-use continuations and newest Anthropic models
+/// reject `budget_tokens` outright. The OpenAI translator maps this key to
+/// `reasoning_effort` instead, so it's unaffected.
 fn thinking_budget(
     effort: Option<&str>,
     meta: &crate::llm_router::model_meta::ModelMeta,
@@ -1041,12 +1065,19 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
     }
 }
 
+/// Sub-agent (ephemeral) compactions must never surface to the parent
+/// session: they operate on the child's own throwaway ledger, so neither the
+/// `ContextCompacted` event nor the notice row is the session's business —
+/// gate the whole function on `emit_display`, matching `emit_context_usage`.
 async fn emit_compaction(
     deps: &RunnerDeps,
     trigger: &str,
     outcome: &CompactionOutcome,
     emit_display: bool,
 ) {
+    if !emit_display {
+        return;
+    }
     let _ = deps.events.send(CoreEvent::ContextCompacted {
         session_pk: deps.session_pk.clone(),
         trigger: trigger.to_string(),
@@ -1054,23 +1085,21 @@ async fn emit_compaction(
         after_tokens: outcome.after_tokens,
         window_number: outcome.window_number,
     });
-    if emit_display {
-        let text = format!(
-            "Context compacted: ~{}k → ~{}k tokens",
-            outcome.before_tokens / 1000,
-            outcome.after_tokens / 1000
-        );
-        emit_row(
-            deps,
-            "system",
-            "notice",
-            json!({ "text": text }),
-            None,
-            None,
-            None,
-        )
-        .await;
-    }
+    let text = format!(
+        "Context compacted: ~{}k → ~{}k tokens",
+        outcome.before_tokens / 1000,
+        outcome.after_tokens / 1000
+    );
+    emit_row(
+        deps,
+        "system",
+        "notice",
+        json!({ "text": text }),
+        None,
+        None,
+        None,
+    )
+    .await;
 }
 
 fn tool_result(tool_use_id: &str, content: &str, is_error: bool) -> Value {
@@ -1402,6 +1431,69 @@ mod tests {
         assert!(err.to_string().to_lowercase().contains("context"));
         let ctx = deps.store.get_session_context("s1").await.unwrap().unwrap();
         assert_eq!(ctx["percent_left"], 0);
+    }
+
+    #[tokio::test]
+    async fn overflow_then_next_turn_compacts_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1 overflows: mark_full pins the in-memory indicator to 0%
+        // and persists the full-window total to session_context.
+        let overflow = vec![error_event(
+            "prompt is too long: 500000 tokens > 400000 maximum",
+        )];
+        // Turn 2: the pre-turn compaction check fires BEFORE the real model
+        // call, so the scripted order is summarize-then-main.
+        let summarize = vec![text_delta("compacted summary"), message_stop()];
+        let main = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![overflow, summarize, main]));
+        // deps_at defaults to FALLBACK meta (128k window) — deliberately NOT
+        // a tiny meta, so the turn-2 reload estimate (just the one tiny "x"
+        // user turn left over from turn 1) sits at well under 1% of the
+        // window and would NOT, by itself, cross the 90% auto-compact
+        // threshold. Only the seeded full-window total proves the fix.
+        let deps = deps_at(dir.path(), llm).await;
+
+        let err = run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("context"));
+        assert!(
+            deps.store
+                .latest_context_checkpoint("s1")
+                .await
+                .unwrap()
+                .is_none(),
+            "turn 1 errored before any compaction ran"
+        );
+
+        // Turn 2: the ContextManager rebuilt from the reloaded (tiny) ledger
+        // must be seeded with turn 1's persisted full-window total so the
+        // pre-turn check deterministically compacts instead of looping on
+        // the undercounted reload estimate.
+        run_turn(
+            &deps,
+            TurnPrompt::text("next", "next"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            deps.store
+                .latest_context_checkpoint("s1")
+                .await
+                .unwrap()
+                .is_some(),
+            "pre-turn compaction must fire off the seeded overflow state"
+        );
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        assert!(msgs
+            .iter()
+            .any(|m| m.block_type == "text" && m.payload["text"] == "done"));
     }
 
     #[tokio::test]

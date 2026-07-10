@@ -512,6 +512,22 @@ fn claude_cloak_map_for(target: &RouteTarget, body: &Value) -> claude_cloak::Too
     claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body)
 }
 
+/// Remove the `thinking` key before a request reaches an Anthropic-native
+/// upstream (the `/messages` passthrough and kiro's translated-but-still-
+/// Claude-shaped payload). Extended thinking is not yet supported on these
+/// upstreams: the native runner does not replay signed thinking blocks in
+/// tool-use continuations, and the newest Anthropic models reject
+/// `budget_tokens` outright. The OpenAI-translation path
+/// (`translate::anthropic_to_openai_request`, used directly by the OpenAI
+/// format and by Codex's Responses-API bridge) maps this key to
+/// `reasoning_effort` instead and is unaffected — remove this gate once
+/// thinking-block replay lands in the runner.
+fn strip_thinking(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("thinking");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Upstream request construction (moved from server.rs — behavior unchanged,
 // `&AppState` retargeted to `&UpstreamCtx`)
@@ -1066,6 +1082,7 @@ pub async fn anthropic_messages_stream(
         // format match. On a non-2xx it records a failure and tries the next
         // fallback target, matching the other providers' behavior.
         if target.conn.provider == "kiro" {
+            strip_thinking(&mut attempt_body);
             match kiro_stream(ctx, &mut target, &attempt_body, started).await {
                 Ok(rx) => return Ok(rx),
                 Err(failure) => {
@@ -1103,6 +1120,7 @@ pub async fn anthropic_messages_stream(
 
         match target.desc.format {
             ApiFormat::Anthropic => {
+                strip_thinking(&mut attempt_body);
                 let tool_map = claude_cloak_map_for(&target, &attempt_body);
                 let resp = send_upstream(ctx, &mut target, &attempt_body).await?;
                 if !resp.status().is_success() {
@@ -1131,6 +1149,8 @@ pub async fn anthropic_messages_stream(
                 return Ok(rx);
             }
             ApiFormat::OpenAi => {
+                // Not stripped here: `anthropic_to_openai_request` translates
+                // `thinking` into `reasoning_effort` for this wire format.
                 let upstream_body = translate::anthropic_to_openai_request(&attempt_body)?;
                 let resp = send_upstream(ctx, &mut target, &upstream_body).await?;
                 if !resp.status().is_success() {
@@ -1711,6 +1731,34 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         UpstreamCtx::new(store)
+    }
+
+    #[test]
+    fn strip_thinking_removes_the_key_for_anthropic_native_upstreams() {
+        // Shape the runner sends when `thinking_budget` fires (spec §8):
+        // `thinking: {type: "enabled", budget_tokens: N}` alongside the rest
+        // of the Anthropic Messages body.
+        let mut body = json!({
+            "model": "claude-sonnet-5",
+            "messages": [],
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+        });
+        strip_thinking(&mut body);
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking key must be removed before an Anthropic-native send"
+        );
+        // Other keys are untouched.
+        assert_eq!(body["model"], "claude-sonnet-5");
+        assert_eq!(body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn strip_thinking_is_a_no_op_when_absent() {
+        let mut body = json!({"model": "m", "messages": []});
+        strip_thinking(&mut body);
+        assert_eq!(body["model"], "m");
     }
 
     #[test]
