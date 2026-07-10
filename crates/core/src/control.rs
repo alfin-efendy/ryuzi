@@ -179,6 +179,15 @@ impl ControlPlane {
         resolved
     }
 
+    /// Test-only: park a fake approval and return its receiver.
+    #[doc(hidden)]
+    pub fn approvals_for_test_register(
+        &self,
+        request_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        self.approvals.register(request_id.to_string())
+    }
+
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {
         self.store.list_projects().await
     }

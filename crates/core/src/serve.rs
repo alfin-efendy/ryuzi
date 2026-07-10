@@ -37,6 +37,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/events", get(events))
         .route("/plugins", get(list_plugins))
         .route("/plugins/{id}", get(get_plugin))
+        .route("/rpc/{method}", post(rpc))
+        .route("/approvals/{request_id}", post(resolve_approval_route))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/health", get(health))
@@ -190,6 +192,40 @@ async fn get_plugin(State(state): State<ApiState>, Path(id): Path<String>) -> im
         map.insert("source".to_string(), json!(source_label(&plugin.source)));
     }
     Json(value).into_response()
+}
+
+/// `POST /rpc/{method}` — the generic RPC entry point. `method` is a Rust
+/// snake_case command name (see `crate::api::dispatch`); the request body is
+/// that command's params object. Errors from `dispatch` are surfaced with
+/// the `ApiError`'s own status code, not always 500.
+async fn rpc(
+    State(state): State<ApiState>,
+    Path(method): Path<String>,
+    Json(params): Json<Value>,
+) -> impl IntoResponse {
+    match crate::api::dispatch(&state, &method, params).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::from_u16(e.status)
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            Json(json!({ "error": e.message })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /approvals/{request_id}` — resolve a pending tool-permission
+/// approval (see `ApprovalHub`) with body `{"allow": bool}`. `resolved` is
+/// `false` if no approval with this id was pending (already resolved,
+/// unknown id, or the request timed out).
+async fn resolve_approval_route(
+    State(state): State<ApiState>,
+    Path(request_id): Path<String>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let allow = body.get("allow").and_then(|v| v.as_bool()).unwrap_or(false);
+    let resolved = state.cp.resolve_approval(&request_id, allow);
+    Json(json!({ "resolved": resolved })).into_response()
 }
 
 /// The `{id, name, description, categories, verified, experimental, enabled,

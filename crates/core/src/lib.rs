@@ -1,3 +1,4 @@
+pub mod api;
 pub mod approval;
 pub mod attachments;
 pub mod branches;
