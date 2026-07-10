@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import type { BranchList, CmdError, CommandInfo, Project, Result } from "@/bindings";
 
 const branchListData: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
@@ -74,5 +74,11 @@ test("composer text is read from the persisted draft map (key home:{projectId})"
     const box = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
     expect(box.value).toBe("half-typed prompt");
   });
-  useNav.getState().clearDraft("home:p1");
+  // clearDraft mutates the shared useNav store synchronously while HomeView
+  // (and the branch Combobox, which also reads useNav) are still mounted;
+  // without act() that update is applied outside any act scope and React
+  // warns for every subscriber it re-renders.
+  act(() => {
+    useNav.getState().clearDraft("home:p1");
+  });
 });
