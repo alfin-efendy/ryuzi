@@ -417,6 +417,13 @@ impl DisplayMode {
     }
 }
 
+/// Hermes' verbatim nudge for the post-exhaustion summary call: asks for a
+/// final answer without inviting another round of tool calls.
+const BUDGET_EXHAUSTED_PROMPT: &str = "You've reached the maximum number of \
+    tool-calling iterations allowed. Please provide a final response \
+    summarizing what you've found and accomplished so far, without calling \
+    any more tools.";
+
 /// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
 /// `display` gates persistence of display rows: sub-agents stream only their
 /// tool rows (tagged with their label) so their text/thinking stay internal.
@@ -698,7 +705,50 @@ async fn drive(
         }
         provider_turn += 1;
     }
-    // Budget exhausted (Task B2 replaces this notice with a terminal summary call).
+    // Budget exhausted with tool calls still pending: make one tool-less
+    // call asking the model for a final summary instead of leaving the user
+    // with a bare notice (Hermes' pattern). The nudge + summary are only
+    // committed to `cm` once the call actually succeeds — a failed or empty
+    // call leaves history exactly as the loop left it and falls through to
+    // the notice below, so a botched aux call can't poison the session with
+    // an unanswered nudge.
+    if !model.is_empty() {
+        let mut messages = cm.messages_for_request();
+        messages.push(json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": BUDGET_EXHAUSTED_PROMPT }],
+        }));
+        let body = json!({
+            "model": model,
+            "system": system,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+        if let Ok(text) = super::llm::collect_text(&deps.llm, body).await {
+            let text = text.trim();
+            if !text.is_empty() {
+                let text = text.to_string();
+                cm.append_user_text(BUDGET_EXHAUSTED_PROMPT).await?;
+                cm.append_assistant_text(&text).await?;
+                if display.text() {
+                    emit_row(
+                        deps,
+                        "assistant",
+                        "text",
+                        json!({ "text": text }),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+                return Ok(text);
+            }
+        }
+    }
+    // Fallback: no model configured, the summary call errored, or it
+    // returned nothing — keep the original bare notice.
     if display.text() {
         emit_row(
             deps,
@@ -3221,5 +3271,81 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Interrupted"));
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_emits_a_summary_not_a_bare_notice() {
+        // A tiny budget of 2: two scripted turns ALWAYS return a tool_use (so
+        // neither hits the `tool_calls.is_empty()` end_turn return), which
+        // drives `try_consume()` to genuine exhaustion on the loop's third
+        // attempt — this also closes the B1 gap of never having exercised
+        // that path end-to-end. A THIRD scripted, tool-less turn is the
+        // post-exhaustion summary call.
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        let tool_turn = |call_id: &str| {
+            vec![
+                tool_use_start(0, call_id, "bash"),
+                input_json_delta(0, "{\"command\":\"echo hi\"}"),
+                message_delta("tool_use"),
+                message_stop(),
+            ]
+        };
+        let summary_turn = vec![
+            text_delta("Summary: explored the repo and made no changes."),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![
+            tool_turn("call-1"),
+            tool_turn("call-2"),
+            summary_turn,
+        ]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        let agent = deps.agent.clone();
+        let mut cm =
+            ContextManager::ephemeral(&deps.session_pk, ContextConfig::with_meta(deps.meta));
+        cm.append_user(json!([{ "type": "text", "text": "keep going forever" }]))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let budget = IterationBudget::new(2);
+
+        let text = drive(
+            &deps,
+            &agent,
+            &mut cm,
+            &cancel,
+            None,
+            DisplayMode::Full,
+            &budget,
+        )
+        .await
+        .unwrap();
+
+        // The bare "Turn limit reached" sentinel is gone; drive() returns the
+        // model's actual summary text instead.
+        assert_eq!(text, "Summary: explored the repo and made no changes.");
+        assert!(!text.contains("Turn limit reached"));
+
+        // Exactly 3 requests went out: 2 tool-calling turns + 1 summary call.
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "2 budgeted turns + 1 summary call");
+        // The summary call must be tool-less (no tools offered).
+        let summary_body = &bodies[2];
+        let tools_empty = summary_body
+            .get("tools")
+            .map(|t| t.as_array().is_none_or(|a| a.is_empty()))
+            .unwrap_or(true);
+        assert!(
+            tools_empty,
+            "summary call must not offer tools: {summary_body}"
+        );
+        // ... and it carries the budget-exhausted nudge as its final user turn.
+        let messages = summary_body["messages"].as_array().unwrap();
+        let last_text = messages.last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(last_text.contains("maximum number of tool-calling iterations"));
     }
 }
