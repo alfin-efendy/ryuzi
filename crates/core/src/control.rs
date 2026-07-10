@@ -181,6 +181,7 @@ impl ControlPlane {
 
     /// Test-only: park a fake approval and return its receiver.
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn approvals_for_test_register(
         &self,
         request_id: &str,
