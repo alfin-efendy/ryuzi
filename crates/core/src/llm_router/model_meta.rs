@@ -296,19 +296,20 @@ mod cost_tests {
 
     #[test]
     fn a_known_vendored_model_has_nonzero_rates() {
-        // After the snapshot regen, a mainstream priced model resolves with
-        // real rates. anthropic's sonnet is a stable entry in models.dev.
-        let m = super::vendored()
-            .iter()
-            .find(|(k, _)| k.contains("claude") && k.contains("sonnet"))
-            .map(|(_, m)| *m)
-            .expect("a claude sonnet entry in the vendored snapshot");
+        // At least one claude-sonnet entry must be priced. Fold the rate check
+        // into the predicate: HashMap iteration order is randomized per process,
+        // so a bare `.find(name-only)` could surface a free/alias zero-priced
+        // variant and flake.
+        let priced = super::vendored().iter().any(|(k, m)| {
+            k.contains("claude")
+                && k.contains("sonnet")
+                && m.cost_input > 0.0
+                && m.cost_output > 0.0
+        });
         assert!(
-            m.cost_input > 0.0,
-            "expected non-zero input rate, got {}",
-            m.cost_input
+            priced,
+            "expected at least one priced claude-sonnet entry in the vendored snapshot"
         );
-        assert!(m.cost_output > 0.0);
     }
 }
 
