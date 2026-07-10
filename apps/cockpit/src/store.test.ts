@@ -2,6 +2,7 @@ import { test, expect, mock, spyOn } from "bun:test";
 import { useStore } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
+import { useUi } from "./store-ui";
 
 function reset() {
   useStore.setState({
@@ -639,4 +640,18 @@ test("send resolves true on success and false on backend error (drives composer 
   cont.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+});
+
+test("setFocused marks the previously-focused session read up to its lastActive", () => {
+  useUi.setState({ readAt: {} });
+  useStore.setState({
+    focusedSessionPk: "s1",
+    sessions: [
+      { sessionPk: "s1", projectId: "p", agentSessionId: null, worktreePath: null, branch: null, title: "s1", status: "idle", startedBy: null, createdAt: 0, lastActive: 4200, resumeAttempts: 0, branchOwned: false },
+    ],
+    loaded: { s1: true, s2: true },
+  });
+  useStore.getState().setFocused("s2");
+  expect(useUi.getState().readAt.s1).toBe(4200);
+  expect(useStore.getState().focusedSessionPk).toBe("s2");
 });
