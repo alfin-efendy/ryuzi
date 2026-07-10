@@ -356,8 +356,8 @@ fn migrations() -> Migrations<'static> {
         // one pass. The claude-code harness itself STAYS registered so an
         // unrewritten row (restored DB) still resolves at session start.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
-            // Guarded: migration 20 drops projects.harness, and the
-            // rewind-and-replay migration test re-runs THIS hook on a post-20
+            // Guarded: migration 21 drops projects.harness, and the
+            // rewind-and-replay migration test re-runs THIS hook on a post-21
             // schema (where the column no longer exists).
             let has_harness = tx
                 .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name='harness'")?
@@ -412,7 +412,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migration_13_rewrites_claude_code_defaults_to_native`,
+        // rewind-and-replay in `migrations_13_to_21_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -520,15 +520,47 @@ fn migrations() -> Migrations<'static> {
             DROP TABLE plugin_oauth_clients;\
             ALTER TABLE plugin_oauth_clients_rebuild RENAME TO plugin_oauth_clients;",
         ),
-        // Native-only runtime (design: docs/design/2026-07-10-native-only-runtime-design.md §5):
-        // the runtime concept dies. Drop the legacy per-project harness and
-        // per-job agent columns (SQLite >= 3.35 DROP COLUMN; bundled 3.45),
-        // copy the native agents-row model/perm_mode into the agent_model /
-        // agent_perm_mode settings KV (only when the KV key is absent), drop
-        // the agents/agent_tiers tables, delete the dead settings keys, and
-        // prune non-native mcp_agent_access rows. Every statement is
-        // existence-guarded so the rewind-and-replay migration test's re-run
-        // on an already-migrated DB is a no-op.
+        // Migration 20 — Per-session permission mode (batch-3 design): sessions
+        // previously shared the project's mode; now each session carries its
+        // own, seeded from the owning project. Hook-guarded (SQLite has no ADD
+        // COLUMN IF NOT EXISTS) like branch_owned above: the rewind-and-replay
+        // test re-runs every migration appended after 13 on a DB that already
+        // has this column, so a plain ALTER would fail with "duplicate column".
+        // This batch-3 migration shipped to main first, so it keeps slot 20 and
+        // runs BEFORE the native-only migration on upgrade.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let exists = tx
+                .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='perm_mode'")?
+                .exists([])?;
+            if !exists {
+                tx.execute(
+                    "ALTER TABLE sessions ADD COLUMN perm_mode TEXT NOT NULL DEFAULT 'default'",
+                    [],
+                )?;
+                tx.execute(
+                    "UPDATE sessions SET perm_mode = COALESCE(\
+                         (SELECT p.perm_mode FROM projects p WHERE p.project_id = sessions.project_id),\
+                         'default')",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
+        // Migration 21 — Native-only runtime (design:
+        // docs/design/2026-07-10-native-only-runtime-design.md §5): the runtime
+        // concept dies. Renumbered from 20 to 21 in integration merge #2 because
+        // batch-3's per-session perm_mode migration (above) shipped to main
+        // first and takes slot 20; this native-only migration is now the tail.
+        // Drop the legacy per-project harness and per-job agent columns
+        // (SQLite >= 3.35 DROP COLUMN; bundled 3.45), copy the native agents-row
+        // model/perm_mode into the agent_model / agent_perm_mode settings KV
+        // (only when the KV key is absent), drop the agents/agent_tiers tables,
+        // delete the dead settings keys, and prune non-native mcp_agent_access
+        // rows. Every statement is existence-guarded so the rewind-and-replay
+        // migration test's re-run on an already-migrated DB is a no-op. Ordering
+        // is safe: batch-3's migration 20 only touches sessions.perm_mode (a
+        // column this migration never removes), so running it first is inert
+        // with respect to the harness/agents/settings artifacts dropped here.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
             let col_exists = |table: &str, col: &str| -> rusqlite::Result<bool> {
                 tx.prepare(&format!(
@@ -1010,12 +1042,12 @@ impl Store {
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
                     s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
-                    s.started_by, s.resume_attempts, s.branch_owned
+                    s.started_by, s.resume_attempts, s.branch_owned, s.perm_mode.as_str()
                 ],
             )
         })
@@ -1047,6 +1079,25 @@ impl Store {
             )
         })
         .await?;
+        Ok(())
+    }
+
+    /// Set one session's permission mode (per-session override; the project
+    /// row is only the default seed for NEW sessions).
+    pub async fn update_session_perm_mode(&self, pk: &str, mode: PermMode) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let pk_for_err = pk.clone();
+        let rows = self
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE sessions SET perm_mode=?2 WHERE session_pk=?1",
+                    params![pk, mode.as_str()],
+                )
+            })
+            .await?;
+        if rows == 0 {
+            anyhow::bail!("update_session_perm_mode: unknown session {pk_for_err}");
+        }
         Ok(())
     }
 
@@ -1991,7 +2042,7 @@ impl Store {
 }
 
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     let status: String = r.get(6)?;
@@ -2008,6 +2059,10 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
         started_by: r.get(9)?,
         resume_attempts: r.get(10)?,
         branch_owned: r.get(11)?,
+        perm_mode: {
+            let pm: String = r.get(12)?;
+            PermMode::from_db(&pm)
+        },
     })
 }
 
@@ -2139,6 +2194,7 @@ mod tests {
             last_active: Some(1),
             resume_attempts: 0,
             branch_owned: true,
+            perm_mode: PermMode::Default,
         }
     }
 
@@ -2362,6 +2418,39 @@ mod tests {
             !got.branch_owned,
             "user-named branches persist as not-owned"
         );
+    }
+
+    #[tokio::test]
+    async fn session_perm_mode_roundtrips_and_updates() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_project(sample_project()).await.unwrap();
+        let mut s = sample_session();
+        s.perm_mode = PermMode::Plan;
+        store.insert_session(s).await.unwrap();
+
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.perm_mode, PermMode::Plan);
+
+        store
+            .update_session_perm_mode("s1", PermMode::AcceptEdits)
+            .await
+            .unwrap();
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.perm_mode, PermMode::AcceptEdits);
+    }
+
+    #[tokio::test]
+    async fn update_session_perm_mode_on_unknown_session_is_an_error() {
+        // The UPDATE previously matched zero rows and silently no-opped —
+        // a caller could believe the mode persisted when it never did.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let err = store
+            .update_session_perm_mode("does-not-exist", PermMode::AcceptEdits)
+            .await
+            .expect_err("updating a missing session must surface an error");
+        assert!(err.to_string().contains("does-not-exist"), "{err}");
     }
 
     #[tokio::test]
@@ -2798,12 +2887,16 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let conn = rusqlite::Connection::open(tmp.path()).unwrap();
-            // Minimal v4 shape: the 4 old tables + user_version 4.
+            // Minimal v4 shape: the 4 old tables + user_version 4. The project
+            // row carries a non-default perm_mode so the later
+            // sessions.perm_mode migration's backfill (Task 3) has something
+            // real to copy from 'old1'.
             conn.execute_batch(
                 "CREATE TABLE projects (project_id TEXT PRIMARY KEY, name TEXT, workdir TEXT NOT NULL, source TEXT, harness TEXT NOT NULL DEFAULT 'claude-code', model TEXT, effort TEXT, perm_mode TEXT NOT NULL DEFAULT 'default', created_at INTEGER);
                  CREATE TABLE sessions (session_pk TEXT PRIMARY KEY, project_id TEXT NOT NULL, agent_session_id TEXT, worktree_path TEXT, branch TEXT, title TEXT, status TEXT NOT NULL DEFAULT 'idle', created_at INTEGER, last_active INTEGER);
                  CREATE TABLE messages (session_pk TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL, block_type TEXT NOT NULL, payload TEXT NOT NULL, tool_call_id TEXT, status TEXT, tool_kind TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (session_pk, seq));
                  CREATE TABLE tool_policies (project_id TEXT NOT NULL, tool TEXT NOT NULL, decision TEXT NOT NULL, PRIMARY KEY (project_id, tool));
+                 INSERT INTO projects(project_id, name, workdir, perm_mode) VALUES ('p1', 'old', '/w', 'acceptEdits');
                  INSERT INTO sessions(session_pk, project_id) VALUES ('old1', 'p1');
                  PRAGMA user_version = 4;",
             )
@@ -2813,6 +2906,11 @@ mod tests {
         let s = store.get_session("old1").await.unwrap().unwrap();
         assert_eq!(s.resume_attempts, 0); // ALTER default applied
         assert_eq!(s.started_by, None);
+        assert_eq!(
+            s.perm_mode,
+            PermMode::AcceptEdits,
+            "sessions.perm_mode backfills from the owning project"
+        );
         assert_eq!(
             store
                 .get_setting_raw("enabled_gateways")
@@ -2961,31 +3059,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_20_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_21_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back eight so the
+        // DB, seed the old values, then wind user_version back nine so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
         // CREATE TABLE IF NOT EXISTS; 17 context_checkpoints + session_context —
         // CREATE TABLE IF NOT EXISTS; 18 plugin_oauth_clients — CREATE TABLE
         // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
-        // copy-drop-rename; 20 native-only cleanup — fully existence-guarded;
+        // copy-drop-rename; 20 sessions.perm_mode — hook-guarded, like
+        // branch_owned; 21 native-only cleanup — fully existence-guarded;
         // all no-ops on replay) re-run on the next open. `Migrations` always
         // fast-forwards to the latest defined version, so there is no way to
-        // replay 13 alone once something is appended after it.
+        // replay 13 alone once something is appended after it. NOTE: this
+        // constant must stay in lockstep with the total migration count — it
+        // winds back to right before migration 13, so a new migration appended
+        // at the end means bumping this by one too.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 8)
+            c.pragma_update(None, "user_version", v - 9)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v20 here, so `harness` was
+                    // The DB is fully migrated to v21 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
-                    // guarded UPDATE and migration 20's guarded DROP both run
+                    // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
                     c.execute_batch(
                         "ALTER TABLE projects ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude-code';
@@ -3002,7 +3104,7 @@ mod tests {
         }
 
         let store = Store::open(tmp.path()).await.unwrap();
-        // Migration 13 rewrote the legacy values; migration 20 then deleted the
+        // Migration 13 rewrote the legacy values; migration 21 then deleted the
         // runtime-era keys and the harness column outright.
         assert!(store
             .get_setting("default_runtime")
@@ -3031,10 +3133,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_20_drops_the_runtime_concept() {
-        // Simulate a v19 (pre-native-only) DB: open a fully migrated store,
-        // manually re-create every legacy artifact migration 20 handles,
-        // wind user_version back one, and reopen so 20 replays against it.
+    async fn migration_21_drops_the_runtime_concept() {
+        // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
+        // manually re-create every legacy artifact migration 21 handles,
+        // wind user_version back one, and reopen so 21 replays against it.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;

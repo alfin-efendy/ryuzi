@@ -19,6 +19,7 @@ import { PermissionsCard } from "@/components/PermissionsCard";
 import { PERM_MODES, PROJECTS_ROOT_KEY, type UiPermMode } from "@/constants";
 import { useAgent } from "@/store-agent";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
+import { normalizeLoopSetting } from "@/lib/loop-settings";
 // Canonical brand assets (assets/brand/README.md). Explicit light/dark variants:
 // the app theme is class-driven, so the prefers-color-scheme adaptive SVG can't follow it.
 import wordmarkDark from "../../../../assets/brand/wordmark-dark.svg";
@@ -182,7 +183,7 @@ function AccentRow() {
   );
 }
 
-// ——— Agent (native runtime) settings ———
+// ——— Agent (native) settings ———
 // The two knobs that survived the Runtime menu: default model + permission
 // mode, persisted in the engine settings KV via store-agent.
 
@@ -234,6 +235,87 @@ function AgentSection() {
         </CardRow>
       </Card>
     </>
+  );
+}
+
+// ——— Agent loop settings ———
+// Batch-3 knobs; rendered as a second card under the same "Agent" heading as
+// AgentSection above (a single heading — the Settings test asserts exactly
+// one "Agent" section title).
+
+const LOOP_SETTINGS = [
+  {
+    key: "agent.max_provider_turns",
+    label: "Max provider turns",
+    desc: "Model/tool round-trips per message before pausing.",
+    placeholder: "50",
+    min: 1,
+  },
+  {
+    key: "agent.auto_continue_budget",
+    label: "Auto-continues",
+    desc: "Automatic continues after the turn limit. 0 disables.",
+    placeholder: "4",
+    min: 0,
+  },
+] as const;
+
+function AgentLoopCard() {
+  const [values, setValues] = useState<Record<string, string>>({});
+  // Last confirmed-persisted value per key, separate from `values` (which
+  // tracks the live input and is mutated on every keystroke). A failed save
+  // must roll back to this — not to whatever the user just typed.
+  const [saved, setSaved] = useState<Record<string, string>>({});
+  useEffect(() => {
+    for (const s of LOOP_SETTINGS) {
+      void commands.getSetting(s.key).then((res) => {
+        if (res.status === "ok" && res.data) {
+          setValues((cur) => ({ ...cur, [s.key]: res.data ?? "" }));
+          setSaved((cur) => ({ ...cur, [s.key]: res.data ?? "" }));
+        }
+      });
+    }
+  }, []);
+
+  const commit = async (key: string, min: number, raw: string) => {
+    const normalized = normalizeLoopSetting(raw, min);
+    if (normalized === null) {
+      if (raw.trim() !== "") toast.error(`Enter a whole number of at least ${min}.`);
+      return;
+    }
+    setValues((cur) => ({ ...cur, [key]: normalized }));
+    const res = await commands.setSetting(key, normalized);
+    if (res.status === "error") {
+      setValues((cur) => ({ ...cur, [key]: saved[key] ?? "" }));
+      toast.error("Couldn't save setting: " + res.error.message);
+    } else {
+      setSaved((cur) => ({ ...cur, [key]: normalized }));
+    }
+  };
+
+  return (
+    <Card className="mt-3">
+      {LOOP_SETTINGS.map((s) => (
+        <div key={s.key} className="flex items-center gap-3.5 border-b border-border px-[18px] py-4 last:border-b-0">
+          <div className="min-w-0 flex-1">
+            <div className="text-[13.5px] font-semibold">{s.label}</div>
+            <div className="mt-0.5 text-[12.5px] text-muted-foreground">{s.desc}</div>
+          </div>
+          <Input
+            aria-label={s.label}
+            inputMode="numeric"
+            placeholder={s.placeholder}
+            value={values[s.key] ?? ""}
+            onChange={(e) => setValues((cur) => ({ ...cur, [s.key]: e.target.value }))}
+            onBlur={(e) => void commit(s.key, s.min, e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void commit(s.key, s.min, e.currentTarget.value);
+            }}
+            className="w-24 text-right tabular-nums"
+          />
+        </div>
+      ))}
+    </Card>
   );
 }
 
@@ -317,6 +399,8 @@ export function SettingsView() {
         </Card>
 
         <AgentSection />
+
+        <AgentLoopCard />
 
         <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">System</div>
 

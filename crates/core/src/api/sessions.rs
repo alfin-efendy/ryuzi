@@ -18,6 +18,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "get_setting",
     "set_setting",
     "update_project",
+    "update_session_perm_mode",
     "list_projects",
     "list_sessions",
     "connect_project",
@@ -50,6 +51,11 @@ struct KeyValue {
 struct UpdateProjectP {
     project_id: String,
     model: Option<String>,
+    perm_mode: crate::domain::PermMode,
+}
+#[derive(Deserialize)]
+struct UpdateSessionPermModeP {
+    session_pk: String,
     perm_mode: crate::domain::PermMode,
 }
 #[derive(Deserialize)]
@@ -115,6 +121,13 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                 .update_project(&a.project_id, a.model, a.perm_mode)
                 .await?
                 .ok_or_else(|| ApiError::not_found(format!("unknown project: {}", a.project_id)))?)
+        }
+        "update_session_perm_mode" => {
+            let a: UpdateSessionPermModeP = params(p)?;
+            ok(cp
+                .store()
+                .update_session_perm_mode(&a.session_pk, a.perm_mode)
+                .await?)
         }
         "list_projects" => ok(cp.list_projects().await?),
         "list_sessions" => {
@@ -272,6 +285,7 @@ async fn start_session(
             "cockpit",
             &attachments,
             git,
+            options.perm_mode,
         )
         .await?)
 }

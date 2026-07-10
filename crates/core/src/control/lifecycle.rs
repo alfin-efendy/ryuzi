@@ -3,7 +3,9 @@
 
 use super::{ControlPlane, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
-use crate::domain::{AttachmentRef, CoreEvent, Project, Session, SessionGitOptions, SessionStatus};
+use crate::domain::{
+    AttachmentRef, CoreEvent, PermMode, Project, Session, SessionGitOptions, SessionStatus,
+};
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::settings::SettingsStore;
@@ -25,6 +27,7 @@ impl ControlPlane {
             started_by,
             attachments,
             None,
+            None,
         )
         .await
     }
@@ -36,6 +39,7 @@ impl ControlPlane {
         started_by: &str,
         attachments: &[AttachmentRef],
         git: Option<SessionGitOptions>,
+        perm_mode: Option<PermMode>,
     ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
@@ -49,10 +53,14 @@ impl ControlPlane {
         // A project without a pinned MODEL inherits the agent's default model
         // (Settings → Agent, stored under the `agent_model` settings key).
         //
-        // Permission mode is NOT inherited: the project's own `perm_mode` (set
-        // from the composer / project settings) is the single source of truth.
-        // `Default` means "Ask" — inheriting a global default here is exactly
-        // what made a project set to Ask silently run without asking.
+        // Permission mode is per-session: this new session's mode comes from
+        // `perm_mode` above (the picker) or falls back to the project's own
+        // `perm_mode` — it is NOT inherited from a global/agent default.
+        // `Default` means "Ask" (prompt before edits/commands) — inheriting a
+        // global default here is exactly what made a project set to Ask
+        // silently run without asking. Once created, the SESSION's own row is
+        // the source of truth (per-session mode) — the project's `perm_mode`
+        // only seeds new sessions.
         if project.model.is_none() {
             if let Ok(agent) = crate::agent_settings::get(&self.store).await {
                 project.model = agent.model.filter(|m| !m.trim().is_empty());
@@ -90,6 +98,7 @@ impl ControlPlane {
             },
             title: Some(title),
             status: SessionStatus::Running,
+            perm_mode: perm_mode.unwrap_or(project.perm_mode),
             started_by: Some(started_by.to_string()),
             created_at: Some(now),
             last_active: Some(now),
@@ -217,14 +226,10 @@ impl ControlPlane {
                 }
             }
         };
-        // Refresh the live session's permission mode from the project row so a
-        // change made in the composer/project settings between turns takes
-        // effect NOW — without this the warm handle keeps whatever mode it
-        // started with (ACP delegates permission externally, so its default
-        // no-op set_perm_mode simply does nothing).
-        if let Ok(Some(project)) = self.store.get_project(&session.project_id).await {
-            handle.set_perm_mode(project.perm_mode);
-        }
+        // Refresh the live session's permission mode from ITS OWN row so a
+        // change made in the composer between turns takes effect NOW — and so
+        // one session's change never leaks into siblings (per-session mode).
+        handle.set_perm_mode(session.perm_mode);
         let prepared = self
             .prepare_attachments(session_pk, &prompt.agent, attachments)
             .await;
@@ -572,10 +577,22 @@ impl ControlPlane {
         self.attach_plugin_mcp_servers(&project.project_id, work_dir, &settings, &mut mcp_servers)
             .await;
         let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
+        // Prefer the SESSION's own permission mode (per-session by design);
+        // fall back to the project's only if the session row can't be read
+        // (e.g. a not-yet-persisted resume path).
+        let perm_mode = self
+            .store
+            .get_session(session_pk)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.perm_mode)
+            .unwrap_or(project.perm_mode);
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
             work_dir: work_dir.to_path_buf(),
-            perm_mode: project.perm_mode,
+            attachments_dir: Some(self.attachment_dest_dir(session_pk).await),
+            perm_mode,
             model: project.model.clone(),
             effort: project.effort.clone(),
             resume,

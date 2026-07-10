@@ -31,7 +31,7 @@ import { AttachmentChips } from "@/components/composer/AttachmentChips";
 import { HISTORY_IDLE, historyEntries, shouldNavigateHistory, stepHistory, type HistoryState } from "@/components/composer/inputHistory";
 
 export function SessionView() {
-  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
+  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setSessionPermMode } =
     useStore();
   const nav = useNav();
   // Draft text lives in the persisted useNav drafts map keyed by session, so
@@ -170,7 +170,7 @@ export function SessionView() {
   const meta = statusMeta(session.status);
   const running = session.status === "running";
   const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
-  const permUi = corePermToUi(project?.permMode ?? "default");
+  const permUi = corePermToUi(session.permMode);
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
   const selectedModel = project?.model || agentModel || "";
   const modelOptions = agentModels;
@@ -264,25 +264,26 @@ export function SessionView() {
           </Button>
         </div>
 
-        {/* Agent plan (todowrite) */}
-        <TodoPanel sessionPk={session.sessionPk} running={running} />
-
-        {/* Transcript */}
-        <TranscriptFileContext.Provider value={transcriptFileCtx}>
-          <Transcript
-            sessionPk={session.sessionPk}
-            rows={rows}
-            agentName={NATIVE_AGENT.name}
-            agentColor={NATIVE_AGENT.color}
-            running={running}
-          >
-            {pendingForSession.map((a, i) => (
-              <div key={a.requestId} className="px-4 pb-2">
-                <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
-              </div>
-            ))}
-          </Transcript>
-        </TranscriptFileContext.Provider>
+        {/* Transcript, with the floating plan panel overlaying it */}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <TranscriptFileContext.Provider value={transcriptFileCtx}>
+            <Transcript
+              sessionPk={session.sessionPk}
+              rows={rows}
+              agentName={NATIVE_AGENT.name}
+              agentColor={NATIVE_AGENT.color}
+              running={running}
+            >
+              {pendingForSession.map((a, i) => (
+                <div key={a.requestId} className="px-4 pb-2">
+                  <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
+                </div>
+              ))}
+            </Transcript>
+          </TranscriptFileContext.Provider>
+          {/* Agent plan (todowrite) — floating rounded panel */}
+          <TodoPanel sessionPk={session.sessionPk} running={running} />
+        </div>
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
@@ -355,7 +356,7 @@ export function SessionView() {
                 options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
                 value={permUi}
                 onValueChange={(mode) => {
-                  if (projectId) void setProjectPermMode(projectId, uiPermToCore(mode as UiPermMode));
+                  void setSessionPermMode(session.sessionPk, uiPermToCore(mode as UiPermMode));
                 }}
                 trigger={
                   <Button

@@ -448,22 +448,33 @@ pub async fn materialize_attachments(
 /// Renders the manifest text appended to the agent prompt: a header + one
 /// line per saved file when anything was saved, then one `⚠️ Skipped ...`
 /// line per rejected ref. Empty input (nothing saved, nothing skipped)
-/// renders as `""`.
-pub fn build_manifest(result: &MaterializeResult) -> String {
+/// renders as `""`. Files whose bytes are already inlined as vision blocks
+/// (per `inlined`) are labeled as attached inline rather than given a
+/// (redundant, and previously misleading) Read-tool instruction; every other
+/// saved file gets its on-disk path, which the `read` tool's attachments-dir
+/// fallback root makes genuinely readable.
+pub fn build_manifest(result: &MaterializeResult, inlined: &HashSet<PathBuf>) -> String {
     let mut lines: Vec<String> = Vec::new();
     if !result.saved.is_empty() {
         let n = result.saved.len();
         let plural = if n > 1 { "s" } else { "" };
-        lines.push(format!(
-            "[User attached {n} file{plural} — saved to disk, use the Read tool to open them:]"
-        ));
+        lines.push(format!("[User attached {n} file{plural}:]"));
         for f in &result.saved {
             let content_type = f.content_type.as_deref().unwrap_or("unknown");
-            lines.push(format!(
-                "- {} ({content_type}, {})",
-                f.path.display(),
-                format_bytes(f.size)
-            ));
+            if inlined.contains(&f.path) {
+                lines.push(format!(
+                    "- {} ({content_type}, {}) — attached inline above",
+                    f.name,
+                    format_bytes(f.size)
+                ));
+            } else {
+                lines.push(format!(
+                    "- {} ({content_type}, {}) — saved to disk; open it with the Read tool: {}",
+                    f.name,
+                    format_bytes(f.size),
+                    f.path.display()
+                ));
+            }
         }
     }
     for s in &result.skipped {
@@ -496,10 +507,15 @@ pub fn image_block_media_type(content_type: Option<&str>) -> Option<&'static str
 /// Build Anthropic `{type:"image", source:{type:"base64",…}}` blocks for the
 /// eligible saved images (supported media type, within the size cap), up to
 /// the count cap. Files that fail to read are skipped — the manifest still
-/// lists every saved file either way.
-pub async fn image_blocks_for(saved: &[SavedAttachment]) -> Vec<serde_json::Value> {
+/// lists every saved file either way. Also returns the set of paths that got
+/// inlined, so [`build_manifest`] can skip telling the model to Read them —
+/// the bytes are already in the prompt.
+pub async fn image_blocks_for(
+    saved: &[SavedAttachment],
+) -> (Vec<serde_json::Value>, HashSet<PathBuf>) {
     use base64::Engine as _;
     let mut blocks = Vec::new();
+    let mut inlined = HashSet::new();
     for f in saved {
         if blocks.len() >= IMAGE_BLOCK_MAX_COUNT {
             break;
@@ -518,8 +534,9 @@ pub async fn image_blocks_for(saved: &[SavedAttachment]) -> Vec<serde_json::Valu
             "type": "image",
             "source": { "type": "base64", "media_type": media_type, "data": data }
         }));
+        inlined.insert(f.path.clone());
     }
-    blocks
+    (blocks, inlined)
 }
 
 /// Display metadata persisted on the user transcript row so the cockpit can
@@ -823,29 +840,65 @@ mod tests {
 
     #[test]
     fn build_manifest_lists_saved_paths_and_skips_empty_when_nothing() {
+        let empty: HashSet<PathBuf> = HashSet::new();
         assert_eq!(
-            build_manifest(&MaterializeResult {
-                saved: vec![],
-                skipped: vec![]
-            }),
+            build_manifest(
+                &MaterializeResult {
+                    saved: vec![],
+                    skipped: vec![]
+                },
+                &empty
+            ),
             ""
         );
-        let text = build_manifest(&MaterializeResult {
-            saved: vec![SavedAttachment {
-                path: "/x/a.png".into(),
-                name: "a.png".into(),
-                content_type: Some("image/png".into()),
-                size: 240_000,
-            }],
-            skipped: vec![SkippedAttachment {
-                name: "huge.zip".into(),
-                reason: "exceeds 26214400 bytes".into(),
-            }],
-        });
+        let text = build_manifest(
+            &MaterializeResult {
+                saved: vec![SavedAttachment {
+                    path: "/x/a.png".into(),
+                    name: "a.png".into(),
+                    content_type: Some("image/png".into()),
+                    size: 240_000,
+                }],
+                skipped: vec![SkippedAttachment {
+                    name: "huge.zip".into(),
+                    reason: "exceeds 26214400 bytes".into(),
+                }],
+            },
+            &empty,
+        );
         assert!(text.contains("/x/a.png"));
         assert!(text.contains("image/png"));
         assert!(text.contains("Skipped huge.zip"));
         assert!(text.contains("exceeds"));
+    }
+
+    /// Build a [`SavedAttachment`] fixture without a real download.
+    fn saved_at(path: &str, name: &str, content_type: Option<&str>, size: u64) -> SavedAttachment {
+        SavedAttachment {
+            path: PathBuf::from(path),
+            name: name.to_string(),
+            content_type: content_type.map(str::to_string),
+            size,
+        }
+    }
+
+    #[test]
+    fn manifest_marks_inlined_images_and_readable_paths() {
+        let saved = vec![
+            saved_at("/tmp/a/shot.png", "shot.png", Some("image/png"), 1000),
+            saved_at("/tmp/a/notes.txt", "notes.txt", Some("text/plain"), 500),
+        ];
+        let result = MaterializeResult {
+            saved,
+            skipped: vec![],
+        };
+        let inlined: HashSet<PathBuf> = [PathBuf::from("/tmp/a/shot.png")].into();
+        let m = build_manifest(&result, &inlined);
+        assert!(m.contains("shot.png") && m.contains("attached inline above"));
+        assert!(m.contains("notes.txt") && m.contains("open it with the Read tool"));
+        // Inlined images must NOT carry a "Read" instruction next to them.
+        let png_line = m.lines().find(|l| l.contains("shot.png")).unwrap();
+        assert!(!png_line.to_lowercase().contains("read tool"));
     }
 
     #[test]
@@ -1044,12 +1097,13 @@ mod tests {
                 size: IMAGE_BLOCK_MAX_BYTES + 1,
             },
         ];
-        let blocks = image_blocks_for(&saved).await;
+        let (blocks, inlined) = image_blocks_for(&saved).await;
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "image");
         assert_eq!(blocks[0]["source"]["type"], "base64");
         assert_eq!(blocks[0]["source"]["media_type"], "image/png");
         assert_eq!(blocks[0]["source"]["data"], "iVBORw==");
+        assert_eq!(inlined, [png].into_iter().collect());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

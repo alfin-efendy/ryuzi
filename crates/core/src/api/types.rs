@@ -50,6 +50,9 @@ pub struct ChatRequestOptions {
     pub attachments: Vec<String>,
     /// None => engine default (worktree ON, new engine-named branch from HEAD).
     pub git: Option<GitOptions>,
+    /// Initial permission mode for the session being started (new-chat
+    /// picker). `None` ⇒ inherit the project default.
+    pub perm_mode: Option<crate::domain::PermMode>,
 }
 
 pub(crate) fn chat_agent_prompt(prompt: &str, context: Option<&ChatContextArg>) -> String {

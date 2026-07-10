@@ -13,6 +13,11 @@ use tokio::sync::broadcast;
 pub struct SessionCtx {
     pub session_pk: String,
     pub work_dir: PathBuf,
+    /// The session's attachment folder (`…/.harness-attachments/{session_pk}`)
+    /// — a second read root the native runtime's `read` tool tries when the
+    /// worktree jail rejects a path. `None` when the harness doesn't
+    /// materialize attachments to disk (or in bare test contexts).
+    pub attachments_dir: Option<PathBuf>,
     pub perm_mode: PermMode,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -137,6 +142,7 @@ mod tests {
         SessionCtx {
             session_pk: "s1".into(),
             work_dir: PathBuf::from("/tmp"),
+            attachments_dir: None,
             perm_mode: PermMode::Default,
             model: None,
             effort: None,

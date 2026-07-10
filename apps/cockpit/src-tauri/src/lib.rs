@@ -46,6 +46,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::get_setting,
             commands::set_setting,
             commands::update_project,
+            commands::update_session_perm_mode,
             commands::list_branches,
             agent_cmd::get_agent_settings,
             agent_cmd::set_agent_settings,

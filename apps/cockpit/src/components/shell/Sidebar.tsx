@@ -34,7 +34,15 @@ import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
 import { useTerms } from "@/store-terms";
 import { commands, type Session } from "@/bindings";
-import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
+import {
+  archivedCount,
+  isUnreadVisible,
+  orderProjects,
+  projectLabel,
+  sessionTitle,
+  sessionsForProject,
+  type Ordering,
+} from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
 import { StatusDot } from "@/components/common/bits";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
@@ -81,7 +89,7 @@ function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
 export function Sidebar() {
   const { projects, sessions, setFocused, focusedSessionPk, selectProject, end } = useStore();
   const pendingCount = useStore((s) => s.pendingApprovals.length);
-  const { pinned, archived, togglePin, setArchived } = useUi();
+  const { pinned, archived, togglePin, setArchived, readAt, sessionFilter, toggleStatusFilter, toggleUnreadOnly, markAllRead } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
   const [archivingPk, setArchivingPk] = useState<string | null>(null);
 
@@ -155,6 +163,8 @@ export function Sidebar() {
   const q = nav.searchQuery;
   const ws = gateways.find((w) => w.id === activeGateway) ?? gateways[0];
   const projList = orderProjects(projects, ordering);
+  const filter = { statuses: sessionFilter.statuses, unreadOnly: sessionFilter.unreadOnly, readAt, focusedSessionPk };
+  const filterActive = Object.keys(sessionFilter.statuses).length > 0 || sessionFilter.unreadOnly;
 
   const openSession = (pk: string) => {
     setFocused(pk);
@@ -194,19 +204,22 @@ export function Sidebar() {
       {/* Projects header */}
       <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-5 pr-3">
         <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Projects</span>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          className={iconBtn}
-          title="Sort and filter"
-          onClick={() => {
-            setProjectsMenuOpen((v) => !v);
-            setOrderingSubOpen(false);
-          }}
-        >
-          <ListFilter aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
-        </Button>
+        <span className="relative">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className={iconBtn}
+            title="Sort and filter"
+            onClick={() => {
+              setProjectsMenuOpen((v) => !v);
+              setOrderingSubOpen(false);
+            }}
+          >
+            <ListFilter aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+          </Button>
+          {filterActive && <span aria-hidden className="pointer-events-none absolute right-0 top-0 size-1.5 rounded-full bg-primary" />}
+        </span>
         <Button
           type="button"
           variant="ghost"
@@ -247,13 +260,15 @@ export function Sidebar() {
                 </MenuItem>
               ))}
             <MenuSeparator />
-            <MenuSectionLabel>Filters</MenuSectionLabel>
-            {["Status", "PR", "Source"].map((f) => (
-              <MenuItem key={f}>
-                <span className="flex-1">{f}</span>
-                <ChevronRight aria-hidden size={11} strokeWidth={2} className="text-muted-foreground" />
+            <MenuSectionLabel>Status</MenuSectionLabel>
+            {(["idle", "running", "interrupted", "ended"] as const).map((st) => (
+              <MenuItem key={st} selected={!!sessionFilter.statuses[st]} onClick={() => toggleStatusFilter(st)}>
+                <span className="flex-1 capitalize">{st}</span>
               </MenuItem>
             ))}
+            <MenuItem selected={sessionFilter.unreadOnly} onClick={() => toggleUnreadOnly()}>
+              <span className="flex-1">Unread only</span>
+            </MenuItem>
             <MenuItem selected={archivedGlobal} onClick={() => setArchivedGlobal((v) => !v)}>
               <span className="flex-1">Archived</span>
             </MenuItem>
@@ -266,7 +281,14 @@ export function Sidebar() {
             >
               Collapse all
             </MenuItem>
-            <MenuItem onClick={() => setProjectsMenuOpen(false)}>Mark all as read</MenuItem>
+            <MenuItem
+              onClick={() => {
+                markAllRead(sessions);
+                setProjectsMenuOpen(false);
+              }}
+            >
+              Mark all as read
+            </MenuItem>
           </MenuPanel>
         )}
       </div>
@@ -275,7 +297,7 @@ export function Sidebar() {
       <div className="box-border flex w-[260px] min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2.5">
         {projList.map((p) => {
           const showArch = archivedGlobal || !!showArchived[p.projectId];
-          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived);
+          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, filter);
           const archCount = archivedCount(sessions, p.projectId, archived);
           const open = q.trim() ? sess.length > 0 : (expanded[p.projectId] ?? true);
           return (
@@ -325,6 +347,7 @@ export function Sidebar() {
                     const m = statusMeta(s.status);
                     const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
                     const isPinned = !!pinned[s.sessionPk];
+                    const unread = isUnreadVisible(s, readAt, focusedSessionPk);
                     const showArchivedLabel = archCount > 0 && !archivedGlobal;
                     const hasTail = i < sess.length - 1 || showArchivedLabel;
                     return (
@@ -343,7 +366,13 @@ export function Sidebar() {
                             className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
                           >
                             <StatusDot color={m.color} pulse={m.pulse} />
-                            <span className="min-w-0 flex-1 truncate">{sessionTitle(s)}</span>
+                            <span className={`min-w-0 flex-1 truncate ${unread ? "font-semibold text-foreground" : ""}`}>
+                              {sessionTitle(s)}
+                            </span>
+                            <span aria-hidden className="flex w-2 shrink-0 items-center justify-center">
+                              {unread && <span data-testid={`unread-dot-${s.sessionPk}`} className="size-1.5 rounded-full bg-primary" />}
+                            </span>
+                            {unread && <span className="sr-only">unread</span>}
                           </Button>
                           <Button
                             type="button"
