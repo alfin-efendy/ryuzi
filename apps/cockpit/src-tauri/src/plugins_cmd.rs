@@ -17,7 +17,7 @@
 //! persisted (or an auth env var is set), never the value itself.
 
 use crate::error::CmdError;
-use crate::events::PluginOauthAuthorizeUrlMsg;
+use crate::events::{PluginOauthAuthorizeUrlMsg, PluginOauthCompletedMsg};
 use reqwest::Url;
 use ryuzi_core::plugins::oauth::{
     discover_oauth_server_metadata, generate_pkce_verifier, pkce_challenge_s256,
@@ -845,6 +845,48 @@ async fn exchange_plugin_oauth_code(
     })
 }
 
+/// Consume a captured loopback callback: validate `state` BEFORE touching
+/// the flow map (a mismatched code is discarded but the flow entry stays
+/// usable for retry/manual paste), exchange the code, store the token.
+/// Exchange failure restores the flow entry — the same retry-safe mechanism
+/// as `complete_plugin_oauth`.
+async fn finish_plugin_oauth_callback(
+    store: &Store,
+    plugin_id: &str,
+    auth: &AuthSpec,
+    state_token: &str,
+    callback: ryuzi_core::oauth_loopback::CallbackResult,
+) -> anyhow::Result<()> {
+    let code = callback
+        .code
+        .ok_or_else(|| anyhow::anyhow!("OAuth callback did not include a `code` parameter"))?;
+    let state = callback
+        .state
+        .ok_or_else(|| anyhow::anyhow!("OAuth callback did not include a `state` parameter"))?;
+    if state != state_token {
+        anyhow::bail!("OAuth state mismatch — the sign-in response did not match this install");
+    }
+    let flow_key = plugin_oauth_flow_key(plugin_id, state_token);
+    let flow = plugin_oauth_flows()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&flow_key)
+        .ok_or_else(|| anyhow::anyhow!("plugin sign-in flow not found — start again"))?;
+    match exchange_plugin_oauth_code(store, plugin_id, auth, &flow, code.trim()).await {
+        Ok(token) => {
+            store.upsert_plugin_oauth_token(&token).await?;
+            Ok(())
+        }
+        Err(err) => {
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(flow_key, flow);
+            Err(err)
+        }
+    }
+}
+
 async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let settings = SettingsStore::new(cp.store().clone());
     let mut out = Vec::new();
@@ -1016,6 +1058,199 @@ pub async fn disconnect_plugin_oauth(
 #[specta::specta]
 pub async fn plugin_models(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<String>> {
     Ok(providers::list_models(cp.store(), &id).await?)
+}
+
+/// The install wizard's entry point (spec 8-step resolution order). Steps
+/// 1-6 live in `resolve_plugin_install`; this command adds step 7 (bind
+/// 8976 — retried briefly — + background callback/exchange task, degrading
+/// to `callback_mode: "manual"` only when the port is still taken after
+/// the retries) and step 8 (emit `PluginOauthAuthorizeUrlMsg` + open the
+/// browser), exactly like `begin_plugin_oauth` does for the detail view.
+#[tauri::command]
+#[specta::specta]
+pub async fn begin_plugin_install(
+    app: AppHandle,
+    cp: State<'_, Arc<ControlPlane>>,
+    plugin_id: String,
+) -> R<PluginInstallBeginResult> {
+    let plugin = cp.plugins().get(&plugin_id).ok_or_else(|| CmdError {
+        message: format!("unknown plugin: {plugin_id}"),
+    })?;
+    let auth = plugin.manifest.auth.clone();
+    let http = reqwest::Client::new();
+    let mut result = resolve_plugin_install(cp.store(), &http, &plugin_id, auth.as_ref()).await?;
+    let Some(begin) = result.oauth_begin.clone() else {
+        return Ok(result);
+    };
+    let auth = auth.expect("a prepared oauth flow implies an auth block");
+
+    // 7. Callback server on the fixed wizard port. A same-plugin re-begin
+    // (Retry) has just SIGNALED the previous flow's callback server via
+    // cancel_pending_plugin_flows (step 6), but that axum server shuts down
+    // asynchronously — the port can still be held for a moment. Retry the
+    // bind briefly (3 attempts, 100ms apart) before concluding the port is
+    // genuinely taken by another flow.
+    let mut bound = ryuzi_core::oauth_loopback::bind_fixed(PLUGIN_OAUTH_CALLBACK_PORT).await;
+    for _ in 0..2 {
+        if bound.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        bound = ryuzi_core::oauth_loopback::bind_fixed(PLUGIN_OAUTH_CALLBACK_PORT).await;
+    }
+    match bound {
+        Ok(listener) => {
+            result.callback_mode = "auto".to_string();
+            let (server, result_rx, shutdown_tx) =
+                ryuzi_core::oauth_loopback::spawn_callback_server(
+                    listener,
+                    &plugin_oauth_callback_path(&plugin_id),
+                );
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            let flow_key = plugin_oauth_flow_key(&plugin_id, &begin.state_token);
+            plugin_install_cancels()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(flow_key.clone(), cancel_tx);
+            let store = cp.store().clone();
+            let app_handle = app.clone();
+            let task_plugin_id = plugin_id.clone();
+            let state_token = begin.state_token.clone();
+            tauri::async_runtime::spawn(async move {
+                let outcome = tokio::select! {
+                    res = ryuzi_core::oauth_loopback::await_callback(
+                        server,
+                        result_rx,
+                        shutdown_tx,
+                        std::time::Duration::from_secs(5 * 60),
+                    ) => Some(res),
+                    // Cancellation (wizard closed / re-begin): dropping the
+                    // await_callback future drops shutdown_tx, which shuts
+                    // the axum server down gracefully.
+                    _ = cancel_rx => None,
+                };
+                plugin_install_cancels()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&flow_key);
+                // Canceled: exit silently — the wizard initiated it.
+                let Some(res) = outcome else { return };
+                let msg = match res {
+                    Ok(callback) => {
+                        match finish_plugin_oauth_callback(
+                            &store,
+                            &task_plugin_id,
+                            &auth,
+                            &state_token,
+                            callback,
+                        )
+                        .await
+                        {
+                            Ok(()) => PluginOauthCompletedMsg {
+                                plugin_id: task_plugin_id.clone(),
+                                ok: true,
+                                error: None,
+                            },
+                            Err(err) => PluginOauthCompletedMsg {
+                                plugin_id: task_plugin_id.clone(),
+                                ok: false,
+                                error: Some(err.to_string()),
+                            },
+                        }
+                    }
+                    Err(err) => PluginOauthCompletedMsg {
+                        plugin_id: task_plugin_id.clone(),
+                        ok: false,
+                        error: Some(err.to_string()),
+                    },
+                };
+                let _ = msg.emit(&app_handle);
+            });
+        }
+        Err(_) => {
+            // Port still taken after the retries — e.g. another plugin's
+            // flow is pending. The wizard explains why; completion goes
+            // through complete_plugin_oauth.
+            result.callback_mode = "manual".to_string();
+        }
+    }
+
+    // 8. Emit the authorize URL and open the browser (as begin_plugin_oauth
+    // does today).
+    let _ = PluginOauthAuthorizeUrlMsg {
+        plugin_id: plugin_id.clone(),
+        authorize_url: begin.authorize_url.clone(),
+    }
+    .emit(&app);
+    let _ = app
+        .opener()
+        .open_url(begin.authorize_url.clone(), None::<&str>);
+    Ok(result)
+}
+
+/// Persist a manually-entered client id. External-OAuth plugins store it
+/// under the declared `auth.setting` via the validated SettingsStore path
+/// (`validate_setting`/`register_plugin_fields` only accept
+/// manifest-declared keys); everyone else upserts
+/// `plugin_oauth_clients.client_id` — deliberately NOT a `plugin.*` setting,
+/// since none of these manifests declare one.
+async fn set_plugin_oauth_client_id_inner(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    client_id: &str,
+) -> anyhow::Result<()> {
+    let auth = plugin_oauth_auth(cp, plugin_id)?;
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        anyhow::bail!("client id must not be empty");
+    }
+    if is_external_oauth(&auth) {
+        let Some(key) = auth.setting.as_deref() else {
+            anyhow::bail!("{plugin_id} declares no auth.setting to hold a client id");
+        };
+        let settings = SettingsStore::new(cp.store().clone());
+        settings.set(key, client_id).await?;
+        return Ok(());
+    }
+    cp.store()
+        .upsert_plugin_oauth_client(&PluginOauthClient {
+            plugin_id: plugin_id.to_string(),
+            authorize_url: None,
+            token_url: None,
+            client_id: Some(client_id.to_string()),
+        })
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_plugin_oauth_client_id(
+    cp: State<'_, Arc<ControlPlane>>,
+    plugin_id: String,
+    client_id: String,
+) -> R<()> {
+    Ok(set_plugin_oauth_client_id_inner(&cp, &plugin_id, &client_id).await?)
+}
+
+/// Cancel the pending OAuth flow for this plugin, if any: shuts down the
+/// callback listener and removes the flow-map entry. `state_token` narrows
+/// to a specific flow when known; `None` cancels whatever is pending for
+/// the id.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_plugin_install(
+    cp: State<'_, Arc<ControlPlane>>,
+    plugin_id: String,
+    state_token: Option<String>,
+) -> R<()> {
+    if cp.plugins().get(&plugin_id).is_none() {
+        return Err(CmdError {
+            message: format!("unknown plugin: {plugin_id}"),
+        });
+    }
+    cancel_pending_plugin_flows(&plugin_id, state_token.as_deref());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1948,5 +2183,82 @@ mod tests {
         assert!(!result.needs_client_id, "nothing to enter without endpoints");
         assert!(result.dcr_error.is_some());
         assert!(result.oauth_begin.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_plugin_oauth_client_id_routes_external_to_auth_setting_and_others_to_the_row() {
+        let cp = test_cp().await;
+        // google-workspace is the external-OAuth catalog plugin — its client
+        // id key IS its auth.setting (validated write path).
+        set_plugin_oauth_client_id_inner(&cp, "google-workspace", " google-client-1 ")
+            .await
+            .unwrap();
+        assert_eq!(
+            cp.store()
+                .get_setting_raw("plugin.google-workspace.client_id")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("google-client-1"),
+            "trimmed value stored under the declared auth.setting"
+        );
+        assert!(
+            cp.store()
+                .get_plugin_oauth_client("google-workspace")
+                .await
+                .unwrap()
+                .is_none(),
+            "external plugins never write the row"
+        );
+
+        // notion (resource-declared oauth) goes to plugin_oauth_clients.
+        set_plugin_oauth_client_id_inner(&cp, "notion", "notion-client-1")
+            .await
+            .unwrap();
+        let row = cp
+            .store()
+            .get_plugin_oauth_client("notion")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.client_id.as_deref(), Some("notion-client-1"));
+        assert!(row.authorize_url.is_none());
+
+        // Empty input is rejected.
+        assert!(set_plugin_oauth_client_id_inner(&cp, "notion", "  ")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_plugin_flows_narrows_by_state_token_or_sweeps_the_plugin() {
+        let insert = |token: &str| {
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(
+                    plugin_oauth_flow_key("wiz-cancel", token),
+                    PluginOauthFlowState {
+                        verifier: "v".into(),
+                        redirect_uri: plugin_oauth_redirect_uri("wiz-cancel"),
+                        requested_scopes: vec![],
+                    },
+                );
+        };
+        insert("s1");
+        insert("s2");
+        cancel_pending_plugin_flows("wiz-cancel", Some("s1"));
+        {
+            let flows = plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            assert!(!flows.contains_key(&plugin_oauth_flow_key("wiz-cancel", "s1")));
+            assert!(flows.contains_key(&plugin_oauth_flow_key("wiz-cancel", "s2")));
+        }
+        cancel_pending_plugin_flows("wiz-cancel", None);
+        let flows = plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(!flows.contains_key(&plugin_oauth_flow_key("wiz-cancel", "s2")));
     }
 }
