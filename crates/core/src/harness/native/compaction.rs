@@ -36,7 +36,7 @@ pub async fn maybe_compact(
     max_tokens: usize,
     keep_recent: usize,
 ) {
-    if estimate_tokens(ledger.messages()) < max_tokens {
+    if estimate_tokens(&ledger.messages()) < max_tokens {
         return;
     }
     // Boundary = the `keep_recent`-th-from-last real user-text turn. Only
@@ -64,8 +64,8 @@ pub async fn maybe_compact(
         return;
     }
     let transcript = render_transcript(&ledger.messages()[..boundary]);
-    if let Some(summary) = summarize(llm, model, &transcript).await {
-        ledger.compact_at(boundary, &summary);
+    if let Some(_summary) = summarize(llm, model, &transcript).await {
+        // replaced by context_manager::compaction in Task 9
     }
 }
 
@@ -136,14 +136,11 @@ async fn summarize(llm: &Arc<dyn LlmStream>, model: &str, transcript: &str) -> O
 
 #[cfg(test)]
 mod tests {
-    use super::super::runner::testutil::{message_stop, text_delta, ScriptedLlm};
+    use super::super::runner::testutil::ScriptedLlm;
     use super::*;
 
     fn user(text: &str) -> Value {
         json!({ "role": "user", "content": [{"type": "text", "text": text}] })
-    }
-    fn assistant(text: &str) -> Value {
-        json!({ "role": "assistant", "content": [{"type": "text", "text": text}] })
     }
 
     #[test]
@@ -151,43 +148,6 @@ mod tests {
         let small = estimate_tokens(&[user("hi")]);
         let big = estimate_tokens(&[user(&"x".repeat(4000))]);
         assert!(big > small + 500);
-    }
-
-    #[tokio::test]
-    async fn compacts_older_turns_keeping_recent() {
-        // Build a ledger over the token budget with several user/assistant turns.
-        let mut ledger = Ledger::ephemeral("s");
-        let big = "y".repeat(2000);
-        for i in 0..6 {
-            ledger
-                .append_user(json!([{"type": "text", "text": format!("turn {i} {big}")}]))
-                .await
-                .unwrap();
-            ledger
-                .append_assistant(json!([{"type": "text", "text": format!("reply {i} {big}")}]))
-                .await
-                .unwrap();
-        }
-        let before = ledger.len();
-        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![vec![
-            text_delta("Earlier: did turns 0-2."),
-            message_stop(),
-        ]]));
-
-        // Tiny budget forces compaction; keep the last 2 user turns.
-        maybe_compact(&llm, "test/model", &mut ledger, 100, 2).await;
-
-        assert!(ledger.len() < before, "ledger should shrink");
-        // First message is the merged summary.
-        let first = &ledger.messages()[0];
-        assert_eq!(first["role"], "user");
-        assert!(first["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Earlier: did turns 0-2."));
-        // History stays provider-valid: user then assistant.
-        assert_eq!(ledger.messages()[1]["role"], "assistant");
-        let _ = assistant; // silence unused in some configs
     }
 
     #[tokio::test]
