@@ -21,7 +21,3 @@ transport = "stdio"
 command = "uvx"
 args = ["workspace-mcp", "--tool-tier", "core"]
 env = { GOOGLE_OAUTH_CLIENT_ID = "${auth}" }
-
-[menu]
-section = "plugins"
-label = "Google Workspace"

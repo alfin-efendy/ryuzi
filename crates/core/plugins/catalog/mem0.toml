@@ -20,7 +20,3 @@ name = "mem0"
 transport = "http"
 url = "https://mcp.mem0.ai/mcp"
 headers = { Authorization = "Bearer ${auth}" }
-
-[menu]
-section = "plugins"
-label = "Mem0"

@@ -23,7 +23,3 @@ dynamic-registration = true
 name = "vercel"
 transport = "http"
 url = "https://mcp.vercel.com"
-
-[menu]
-section = "plugins"
-label = "Vercel"

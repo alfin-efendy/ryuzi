@@ -14,7 +14,3 @@ name = "daytona"
 transport = "stdio"
 command = "daytona"
 args = ["mcp", "start"]
-
-[menu]
-section = "plugins"
-label = "Daytona"

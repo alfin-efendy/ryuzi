@@ -19,7 +19,3 @@ dynamic-registration = true
 name = "atlassian"
 transport = "http"
 url = "https://mcp.atlassian.com/v1/mcp/authv2"
-
-[menu]
-section = "plugins"
-label = "Atlassian"

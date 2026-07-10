@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn every_non_experimental_entry_has_mcp_and_menu() {
+    fn every_non_experimental_entry_has_mcp() {
         for plugin in catalog_plugins() {
             if plugin.manifest.experimental {
                 continue;
@@ -188,10 +188,6 @@ mod tests {
             assert!(
                 !plugin.manifest.mcp.is_empty(),
                 "{id} is not experimental so it must declare at least one [[mcp]] server"
-            );
-            assert!(
-                plugin.manifest.menu.is_some(),
-                "{id} is not experimental so it must declare a [menu] contribution"
             );
         }
     }

@@ -19,7 +19,3 @@ dynamic-registration = true
 name = "sentry"
 transport = "http"
 url = "https://mcp.sentry.dev/mcp"
-
-[menu]
-section = "plugins"
-label = "Sentry"
