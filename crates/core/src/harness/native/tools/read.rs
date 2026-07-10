@@ -25,6 +25,30 @@ fn image_media_type_for_ext(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Sniff the image container format from magic bytes, independent of the
+/// filename extension. `None` for unrecognized (or too-short) content — e.g.
+/// a git-lfs pointer file (plain ASCII text) or an SVG renamed `.png`.
+///
+/// This exists because trusting the extension alone lets bad bytes become a
+/// durable "image" content block in the provider ledger: the provider 400s
+/// on it, and since the block is already appended, EVERY subsequent request
+/// (including compaction) replays it and 400s again — the session is bricked.
+fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 4 && &bytes[0..4] == b"\x89PNG" {
+        return Some("image/png");
+    }
+    if bytes.len() >= 2 && &bytes[0..2] == b"\xFF\xD8" {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 4 && &bytes[0..4] == b"GIF8" {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
 pub struct Read;
 
 #[async_trait]
@@ -84,11 +108,25 @@ impl Tool for Read {
                     meta.len() as f64 / (1024.0 * 1024.0)
                 )));
             }
+            if meta.len() == 0 {
+                return Ok(ToolOutput::error(format!(
+                    "read: {path} is empty — not a valid image"
+                )));
+            }
             use base64::Engine as _;
             let bytes = match tokio::fs::read(&resolved).await {
                 Ok(b) => b,
                 Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
             };
+            match sniff_image_media_type(&bytes) {
+                Some(sniffed) if sniffed == media_type => {}
+                _ => {
+                    return Ok(ToolOutput::error(format!(
+                        "read: {path} does not contain valid {media_type} data — \
+                         possibly a git-lfs pointer; try 'git lfs pull'"
+                    )));
+                }
+            }
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             return Ok(ToolOutput {
                 for_model: format!("[image {path} ({media_type}, {} bytes) attached]", meta.len()),
@@ -170,9 +208,10 @@ mod tests {
         assert!(out.is_error);
     }
 
-    /// A 1x1 PNG (89 50 4E 47 … minimal valid file is unnecessary — the tool
-    /// keys off the extension and returns bytes; use a tiny fake payload).
-    const PNG_BYTES: &[u8] = &[0x89, b'P', b'N', b'G', 0, 1, 2, 3];
+    /// A real PNG magic header (the 8-byte signature) plus a few filler
+    /// bytes — enough to pass the magic-byte sniff without a full valid
+    /// PNG stream.
+    const PNG_BYTES: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
 
     #[tokio::test]
     async fn attachments_dir_paths_are_readable() {
@@ -220,6 +259,42 @@ mod tests {
         assert_eq!(blocks[0]["type"], "image");
         assert_eq!(blocks[0]["source"]["media_type"], "image/png");
         assert!(!blocks[0]["source"]["data"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_image_file_is_an_honest_error() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("empty.png"), []).unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "empty.png"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.for_model.contains("empty"), "{}", out.for_model);
+    }
+
+    #[tokio::test]
+    async fn lfs_pointer_masquerading_as_png_is_rejected() {
+        // A git-lfs pointer file is plain ASCII text — nothing like a PNG's
+        // magic bytes — but an extension-only check would wave it through
+        // and hand the provider a 400 that poisons the whole session ledger.
+        let work = tempfile::tempdir().unwrap();
+        let pointer = b"version https://git-lfs.github.com/spec/v1\n\
+                         oid sha256:0000000000000000000000000000000000000000000000000000000000000000\n\
+                         size 130\n";
+        std::fs::write(work.path().join("logo.png"), pointer).unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "logo.png"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.for_model.contains("git-lfs") || out.for_model.contains("not") ,
+            "{}",
+            out.for_model
+        );
     }
 
     #[tokio::test]
