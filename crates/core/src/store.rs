@@ -59,8 +59,11 @@ fn migration_20_parse_prefixed(
     value: &str,
     known: &std::collections::HashSet<String>,
 ) -> Option<(String, String, String)> {
-    let (prefix, _) = value.split_once('/')?;
+    let (prefix, original_model) = value.split_once('/')?;
     if !matches!(prefix, "openai" | "openai-oauth") {
+        return None;
+    }
+    if original_model.contains('/') || migration_20_known_codex_model(known, original_model) {
         return None;
     }
     let (parsed, effort) = crate::llm_router::model_effort::parse_legacy_codex_selection(value)?;
@@ -148,6 +151,7 @@ fn migration_20_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration:
     if let Some(routes_raw) = routes_raw {
         let mut routes: Vec<crate::llm_router::routes::ModelRouteInfo> =
             serde_json::from_str(&routes_raw).map_err(to_sql_json_error)?;
+        let mut changed = false;
         for route in &mut routes {
             for target in &mut route.targets {
                 if target.provider != "openai" {
@@ -165,14 +169,17 @@ fn migration_20_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration:
                     {
                         target.effort = Some(suffix_effort);
                     }
+                    changed = true;
                 }
             }
         }
-        let serialized = serde_json::to_string(&routes).map_err(to_sql_json_error)?;
-        tx.execute(
-            "UPDATE settings SET value=?1 WHERE key='llm_model_routes'",
-            params![serialized],
-        )?;
+        if changed {
+            let serialized = serde_json::to_string(&routes).map_err(to_sql_json_error)?;
+            tx.execute(
+                "UPDATE settings SET value=?1 WHERE key='llm_model_routes'",
+                params![serialized],
+            )?;
+        }
     }
     Ok(())
 }
@@ -3052,6 +3059,112 @@ mod tests {
         drop(store);
         let store = Store::open(tmp.path()).await.unwrap();
         assert_eq!(store.list_model_effort_preferences().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_preserves_exact_known_suffix_bearing_models() {
+        let routes = r#"[{"id":"exact-route","name":"exact","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"foo-high"}],"createdAt":1,"updatedAt":1}]"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            let routes = routes.to_string();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        r#"DROP TABLE model_effort_preferences;
+                           INSERT INTO provider_connections(id,provider,auth_type,label,priority,enabled,data,created_at,updated_at)
+                             VALUES ('exact-codex','openai-oauth','oauth','exact',0,1,'{"modelsOverride":["foo","foo-high"]}',1,1);
+                           INSERT INTO projects(project_id,name,workdir,harness,model,effort)
+                             VALUES ('exact-project','exact','/exact','native','openai/foo-high',NULL);
+                           INSERT OR REPLACE INTO settings(key,value) VALUES
+                             ('default_model','openai/foo-high'),
+                             ('default_effort','');
+                           PRAGMA user_version=19;"#,
+                    )?;
+                    c.execute(
+                        "INSERT OR REPLACE INTO settings(key,value) VALUES ('llm_model_routes',?1)",
+                        params![routes],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let project = store.get_project("exact-project").await.unwrap().unwrap();
+        assert_eq!(project.model.as_deref(), Some("openai/foo-high"));
+        assert_eq!(project.effort, None);
+        assert_eq!(
+            store.get_setting("default_model").await.unwrap().as_deref(),
+            Some("openai/foo-high")
+        );
+        assert_eq!(
+            store
+                .get_setting("llm_model_routes")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(routes)
+        );
+        assert!(store
+            .list_model_effort_preferences()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_preserves_known_nested_model_ids() {
+        let routes = r#"[{"id":"nested-route","name":"nested","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"org/model-high"}],"createdAt":1,"updatedAt":1}]"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            let routes = routes.to_string();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        r#"DROP TABLE model_effort_preferences;
+                           INSERT INTO provider_connections(id,provider,auth_type,label,priority,enabled,data,created_at,updated_at)
+                             VALUES ('nested-codex','openai-oauth','oauth','nested',0,1,'{"modelsOverride":["org/model","org/model-high"]}',1,1);
+                           INSERT INTO projects(project_id,name,workdir,harness,model,effort)
+                             VALUES ('nested-project','nested','/nested','native','openai/org/model-high',NULL);
+                           INSERT OR REPLACE INTO settings(key,value) VALUES
+                             ('default_model','openai/org/model-high'),
+                             ('default_effort','');
+                           PRAGMA user_version=19;"#,
+                    )?;
+                    c.execute(
+                        "INSERT OR REPLACE INTO settings(key,value) VALUES ('llm_model_routes',?1)",
+                        params![routes],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let project = store.get_project("nested-project").await.unwrap().unwrap();
+        assert_eq!(project.model.as_deref(), Some("openai/org/model-high"));
+        assert_eq!(project.effort, None);
+        assert_eq!(
+            store.get_setting("default_model").await.unwrap().as_deref(),
+            Some("openai/org/model-high")
+        );
+        assert_eq!(
+            store
+                .get_setting("llm_model_routes")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(routes)
+        );
+        assert!(store
+            .list_model_effort_preferences()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
