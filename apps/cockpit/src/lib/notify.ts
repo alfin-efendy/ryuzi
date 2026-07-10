@@ -13,17 +13,11 @@ export function attentionCount(
   return unread + pendingApprovalCount;
 }
 
-export type NotifyIntent =
-  | { sessionPk: string; kind: "finished" | "approval" | "error"; settle: boolean; detail?: string }
-  | null;
+export type NotifyIntent = { sessionPk: string; kind: "finished" | "approval" | "error"; settle: boolean; detail?: string } | null;
 
 /** What (if anything) to notify for a CoreEvent. Suppressed entirely while the
  *  window is focused (the in-app unread dot already signals it). */
-export function notifyIntentForEvent(
-  event: CoreEvent,
-  _focusedSessionPk: string | null,
-  windowFocused: boolean,
-): NotifyIntent {
+export function notifyIntentForEvent(event: CoreEvent, _focusedSessionPk: string | null, windowFocused: boolean): NotifyIntent {
   if (windowFocused) return null;
   switch (event.kind) {
     case "result":
@@ -57,10 +51,7 @@ export type Notifier = {
 
 /** Title/body for a notification. Title is the session title; body states the
  *  kind. */
-export function notificationText(
-  intent: NonNullable<NotifyIntent>,
-  session: Session | undefined,
-): { title: string; body: string } {
+export function notificationText(intent: NonNullable<NotifyIntent>, session: Session | undefined): { title: string; body: string } {
   const title = session ? sessionTitle(session) : "Session";
   const body =
     intent.kind === "approval"

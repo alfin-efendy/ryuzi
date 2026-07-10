@@ -4,9 +4,18 @@ import type { Session, CoreEvent } from "../bindings";
 
 function sess(pk: string, lastActive: number | null): Session {
   return {
-    sessionPk: pk, projectId: "p", agentSessionId: null, worktreePath: null,
-    branch: null, title: pk, status: "idle", startedBy: null, createdAt: 0,
-    lastActive, resumeAttempts: 0, branchOwned: false,
+    sessionPk: pk,
+    projectId: "p",
+    agentSessionId: null,
+    worktreePath: null,
+    branch: null,
+    title: pk,
+    status: "idle",
+    startedBy: null,
+    createdAt: 0,
+    lastActive,
+    resumeAttempts: 0,
+    branchOwned: false,
   };
 }
 
@@ -32,19 +41,26 @@ test("windowFocused suppresses every intent", () => {
 
 test("result → finished + settle", () => {
   expect(notifyIntentForEvent(ev({ kind: "result", session_pk: "a" }), null, false)).toEqual({
-    sessionPk: "a", kind: "finished", settle: true,
+    sessionPk: "a",
+    kind: "finished",
+    settle: true,
   });
 });
 
 test("approvalRequested → approval immediate with tool detail", () => {
   expect(notifyIntentForEvent(ev({ kind: "approvalRequested", session_pk: "a", tool: "bash" }), null, false)).toEqual({
-    sessionPk: "a", kind: "approval", settle: false, detail: "bash",
+    sessionPk: "a",
+    kind: "approval",
+    settle: false,
+    detail: "bash",
   });
 });
 
 test("error → error immediate", () => {
   expect(notifyIntentForEvent(ev({ kind: "error", session_pk: "a", message: "boom" }), null, false)).toEqual({
-    sessionPk: "a", kind: "error", settle: false,
+    sessionPk: "a",
+    kind: "error",
+    settle: false,
   });
 });
 
@@ -67,11 +83,17 @@ function fakeDeps(over: Partial<NotifierDeps> = {}) {
     schedule: (fn, ms) => {
       const t = { fn, ms, cancelled: false };
       timers.push(t);
-      return () => { t.cancelled = true; };
+      return () => {
+        t.cancelled = true;
+      };
     },
     ...over,
   };
-  const runTimers = () => timers.filter((t) => !t.cancelled).forEach((t) => t.fn());
+  const runTimers = () => {
+    for (const t of timers) {
+      if (!t.cancelled) t.fn();
+    }
+  };
   return { deps, sent, badges, timers, runTimers };
 }
 
@@ -130,13 +152,17 @@ test("permission denied → no send", async () => {
   const f = fakeDeps({ ensurePermission: async () => false });
   const n = createNotifier(f.deps);
   n.handle({ sessionPk: "a", kind: "error", settle: false }, undefined);
-  await Promise.resolve(); await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
   expect(f.sent.length).toBe(0);
 });
 
 test("notificationText formats per kind", () => {
   const s = { title: "My session" } as never;
   expect(notificationText({ sessionPk: "a", kind: "finished", settle: true }, s)).toEqual({ title: "My session", body: "Turn finished" });
-  expect(notificationText({ sessionPk: "a", kind: "approval", settle: false, detail: "bash" }, s)).toEqual({ title: "My session", body: "Needs approval: bash" });
+  expect(notificationText({ sessionPk: "a", kind: "approval", settle: false, detail: "bash" }, s)).toEqual({
+    title: "My session",
+    body: "Needs approval: bash",
+  });
   expect(notificationText({ sessionPk: "a", kind: "error", settle: false }, s)).toEqual({ title: "My session", body: "Turn errored" });
 });
