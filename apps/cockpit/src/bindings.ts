@@ -959,6 +959,10 @@ async setPluginSetting(key: string, value: string) : Promise<Result<null, CmdErr
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Kind-symmetric uninstall on the daemon; returns the refreshed list so the
+ * entry's `installed` flips false and it reappears in Browse.
+ */
 async uninstallPlugin(id: string) : Promise<Result<PluginInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("uninstall_plugin", { id }) };
@@ -1000,12 +1004,16 @@ async pluginModels(id: string) : Promise<Result<string[], CmdError>> {
 }
 },
 /**
- * The install wizard's entry point (spec 8-step resolution order). Steps
- * 1-6 live in `resolve_plugin_install`; this command adds step 7 (bind
- * 8976 — retried briefly — + background callback/exchange task, degrading
- * to `callback_mode: "manual"` only when the port is still taken after
- * the retries) and step 8 (emit `PluginOauthAuthorizeUrlMsg` + open the
- * browser), exactly like `begin_plugin_oauth` does for the detail view.
+ * The install wizard's entry point. The daemon (steps 1-6) resolves the auth
+ * kind, discovers / registers OAuth endpoints, builds the authorize URL,
+ * stores the PKCE flow state, and emits `CoreEvent::PluginOauthAuthorizeUrl`
+ * (the lib.rs SSE bridge opens the browser). When an OAuth flow was prepared,
+ * Cockpit adds step 7 here: it binds the fixed local callback port `8976`
+ * (retried briefly — a same-plugin Retry's previous axum server shuts down
+ * asynchronously), spawns a background task that awaits the loopback callback
+ * (or a cancel), validates `state` locally, and hands the code back to the
+ * daemon via `complete_plugin_oauth` for exchange + token storage. Degrades
+ * to `callback_mode: "manual"` (paste) only when the port stays taken.
  */
 async beginPluginInstall(pluginId: string) : Promise<Result<PluginInstallBeginResult, CmdError>> {
     try {
@@ -1015,6 +1023,11 @@ async beginPluginInstall(pluginId: string) : Promise<Result<PluginInstallBeginRe
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Persist a manually-entered OAuth client id (external-OAuth plugins store
+ * it under the declared `auth.setting`; everyone else in
+ * `plugin_oauth_clients`). Pure daemon write.
+ */
 async setPluginOauthClientId(pluginId: string, clientId: string) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_plugin_oauth_client_id", { pluginId, clientId }) };
@@ -1024,10 +1037,8 @@ async setPluginOauthClientId(pluginId: string, clientId: string) : Promise<Resul
 }
 },
 /**
- * Cancel the pending OAuth flow for this plugin, if any: shuts down the
- * callback listener and removes the flow-map entry. `state_token` narrows
- * to a specific flow when known; `None` cancels whatever is pending for
- * the id.
+ * Cancel a pending install: fire the LOCAL loopback shutdown first (frees
+ * port 8976 immediately), then drop the daemon's flow state.
  */
 async cancelPluginInstall(pluginId: string, stateToken: string | null) : Promise<Result<null, CmdError>> {
     try {
@@ -1304,6 +1315,15 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * (trigger: pre_turn|mid_turn|manual).
  */
 { kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number } | 
+/**
+ * A provider OAuth flow produced its authorize URL. Surfaces open it
+ * (Cockpit maps this onto the legacy OauthAuthorizeUrlMsg Tauri event).
+ */
+{ kind: "oauthAuthorizeUrl"; provider: string; authorize_url: string } | 
+/**
+ * Same for a plugin OAuth flow.
+ */
+{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } | 
 /**
  * Per-session accumulated cost: total USD and a per-model token+dollar
  * breakdown. Emitted alongside `ContextUsage`.

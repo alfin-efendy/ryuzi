@@ -11,6 +11,9 @@ pub struct DaemonStatusFile {
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Bound control-API port (None while connecting / for pre-API daemons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -116,6 +119,7 @@ mod tests {
             started_at: 1,
             last_error: None,
             version: Some("0.0.0".into()),
+            port: None,
         };
         write_status(dir.path(), &s).unwrap();
         let raw = std::fs::read_to_string(status_path(dir.path())).unwrap();
@@ -125,6 +129,19 @@ mod tests {
         assert_eq!(read_status(dir.path()), Some(s));
         clear_status(dir.path());
         assert_eq!(read_status(dir.path()), None);
+    }
+
+    #[test]
+    fn old_status_files_without_port_still_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            status_path(dir.path()),
+            r#"{"pid":42,"state":"running","startedAt":1}"#,
+        )
+        .unwrap();
+        let s = read_status(dir.path()).unwrap();
+        assert_eq!(s.port, None);
+        assert_eq!(s.pid, 42);
     }
 
     #[test]
@@ -151,6 +168,7 @@ mod tests {
             started_at: 7,
             last_error: last_error.map(String::from),
             version: None,
+            port: None,
         };
         assert_eq!(derive_state(None, &alive), DaemonState::default());
         let e = derive_state(Some(&f(DaemonFileState::Error, -1, Some("boom"))), &alive);
