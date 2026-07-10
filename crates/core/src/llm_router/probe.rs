@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::llm_router::client::{self, RouteTarget, UpstreamCtx};
 use crate::llm_router::connections::{self, ConnectionRow};
+use crate::llm_router::mimo;
 use crate::llm_router::models::{probe_status, ProbeStatus};
 use crate::llm_router::oauth;
 use crate::llm_router::registry::ProviderDescriptor;
@@ -91,12 +92,18 @@ fn probe_request(
         }
         // Codex speaks the Responses wire; picker ids may carry effort or
         // `-review` suffixes the upstream doesn't know — probe the base
-        // model (suffixed variants inherit its verdict).
+        // model (suffixed variants inherit its verdict). The ChatGPT backend
+        // rejects shorthand probes (string `input` → "Input must be a list",
+        // `stream: false` → "Stream must be set to true", `max_output_tokens`
+        // → unsupported parameter), so the ping uses the same wire shape as
+        // real Codex chat; only the response STATUS is read, the SSE body is
+        // dropped unread.
         "openai-oauth" => {
             let body = json!({
                 "model": crate::llm_router::codex::codex_base_model(model),
-                "input": "ping",
-                "stream": false,
+                "input": [{"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "ping"}]}],
+                "stream": true,
                 "store": false
             });
             client::upstream_request(ctx, target, &body)
@@ -134,31 +141,71 @@ pub async fn probe_model(
         store: store.clone(),
         http: http.clone(),
         oauth_token_url_override: None,
+        mimo_bootstrap_url_override: None,
     };
+    probe_model_with_ctx(&ctx, desc, conn, model).await
+}
+
+/// [`probe_model`] against an explicit [`UpstreamCtx`] — the seam that lets
+/// tests point the OAuth-refresh and MiMo-bootstrap endpoints at local
+/// servers.
+pub(crate) async fn probe_model_with_ctx(
+    ctx: &UpstreamCtx,
+    desc: &'static ProviderDescriptor,
+    conn: &ConnectionRow,
+    model: &str,
+) -> ProbeOutcome {
     let mut target = RouteTarget {
         conn: conn.clone(),
         desc,
         upstream_model: model.to_string(),
     };
     if connections::is_oauth(&target.conn) {
-        if let Err(err) = oauth::refresh::ensure_fresh(store, http, &mut target.conn).await {
+        if let Err(err) =
+            oauth::refresh::ensure_fresh(&ctx.store, &ctx.http, &mut target.conn).await
+        {
             if target.conn.data.needs_relogin == Some(true) {
                 return probe_outcome_for(model, Err(err.to_string()));
             }
         }
     }
-    let status = match probe_once(&ctx, &target, model).await {
+    if target.conn.provider == "mimo-free" {
+        // Without the bootstrap JWT every request 403s, which would persist
+        // a false `invalid` verdict — surface a bootstrap outage as a
+        // network error instead (verdict `unknown`, never persisted).
+        if let Err(e) =
+            mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref()).await
+        {
+            return probe_outcome_for(model, Err(e.to_string()));
+        }
+    }
+    let status = match probe_once(ctx, &target, model).await {
         Ok(s) => s,
         Err(e) => return probe_outcome_for(model, Err(e.to_string())),
     };
+    if target.conn.provider == "mimo-free" && matches!(status.as_u16(), 401 | 403) {
+        // The upstream rejected the cached JWT — re-bootstrap once and
+        // resend, mirroring the reactive OAuth refresh below.
+        mimo::invalidate_jwt();
+        if let Err(e) =
+            mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref()).await
+        {
+            return probe_outcome_for(model, Err(e.to_string()));
+        }
+        return match probe_once(ctx, &target, model).await {
+            Ok(s) => probe_outcome_for(model, Ok(s)),
+            Err(e) => probe_outcome_for(model, Err(e.to_string())),
+        };
+    }
     if connections::is_oauth(&target.conn)
         && matches!(status.as_u16(), 401 | 403)
         && target.conn.data.refresh_token.is_some()
     {
-        if let Err(e) = oauth::refresh::force_refresh(store, http, &mut target.conn).await {
+        if let Err(e) = oauth::refresh::force_refresh(&ctx.store, &ctx.http, &mut target.conn).await
+        {
             return probe_outcome_for(model, Err(e.to_string()));
         }
-        return match probe_once(&ctx, &target, model).await {
+        return match probe_once(ctx, &target, model).await {
             Ok(s) => probe_outcome_for(model, Ok(s)),
             Err(e) => probe_outcome_for(model, Err(e.to_string())),
         };
@@ -283,8 +330,13 @@ mod tests {
         assert!(sent.get("max_tokens").is_none());
     }
 
+    // Test-only serialization of the process-wide JWT cache; the guard
+    // legitimately spans awaits on the current_thread test runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn mimo_probe_request_honors_nonstandard_chat_path() {
+        let _lock = crate::llm_router::mimo::test_cache_lock();
+        crate::llm_router::mimo::store_jwt("probe-test-jwt");
         let ctx = test_ctx().await;
         let desc = registry::descriptor("mimo-free").unwrap();
         let target = RouteTarget {
@@ -300,9 +352,168 @@ mod tests {
             req.url().as_str(),
             "https://api.xiaomimimo.com/api/free-ai/openai/chat"
         );
-        assert!(req.headers().get("authorization").is_none());
+        // The free tier's anti-abuse gate (verified live 2026-07-10): a
+        // bootstrap JWT bearer, Chrome-like UA, x-mimo-source and
+        // x-session-affinity headers, plus the MiMoCode marker as the first
+        // system message — a bare POST 403s with "Illegal access".
+        let auth = req
+            .headers()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(auth.starts_with("Bearer "), "{auth}");
+        assert!(req
+            .headers()
+            .get("user-agent")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Chrome"));
+        assert_eq!(
+            req.headers().get("x-mimo-source").unwrap(),
+            "mimocode-cli-free"
+        );
+        assert!(req
+            .headers()
+            .get("x-session-affinity")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("ses_"));
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(sent["max_tokens"], 1);
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(
+            sent["messages"][0]["content"],
+            crate::llm_router::mimo::SYSTEM_MARKER
+        );
+        assert_eq!(sent["messages"][1]["content"], "ping");
+        crate::llm_router::mimo::invalidate_jwt();
+    }
+
+    // Test-only serialization of the process-wide JWT cache; the guard
+    // legitimately spans awaits on the current_thread test runtime.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn mimo_probe_bootstraps_then_probes_over_the_wire() {
+        use axum::{http::HeaderMap, http::StatusCode, routing::post, Json, Router};
+
+        let _lock = crate::llm_router::mimo::test_cache_lock();
+        crate::llm_router::mimo::invalidate_jwt();
+
+        async fn chat(headers: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+            assert_eq!(
+                body["messages"][0]["content"],
+                crate::llm_router::mimo::SYSTEM_MARKER
+            );
+            let authed = headers
+                .get("authorization")
+                .is_some_and(|v| v == "Bearer fresh-e2e-jwt");
+            if authed {
+                (StatusCode::OK, Json(json!({"choices": []})))
+            } else {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": {"message": "Illegal access"}})),
+                )
+            }
+        }
+        let app = Router::new()
+            .route(
+                "/bootstrap",
+                post(|| async { Json(json!({"jwt": "fresh-e2e-jwt"})) }),
+            )
+            .route("/openai/chat", post(chat));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let ctx = UpstreamCtx {
+            store: Arc::new(crate::store::Store::open(tmp.path()).await.unwrap()),
+            http: reqwest::Client::new(),
+            oauth_token_url_override: None,
+            mimo_bootstrap_url_override: Some(format!("http://127.0.0.1:{port}/bootstrap")),
+        };
+        let conn = mk_conn(
+            "m9",
+            "mimo-free",
+            "free",
+            ConnectionData {
+                base_url_override: Some(format!("http://127.0.0.1:{port}/openai")),
+                ..Default::default()
+            },
+        );
+        let desc = registry::descriptor("mimo-free").unwrap();
+        let out = probe_model_with_ctx(&ctx, desc, &conn, "mimo-auto").await;
+        assert!(out.ok, "{}", out.message);
+        assert_eq!(out.status, ProbeStatus::Valid);
+        crate::llm_router::mimo::invalidate_jwt();
+    }
+
+    // Test-only serialization of the process-wide JWT cache; the guard
+    // legitimately spans awaits on the current_thread test runtime.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn mimo_probe_rebootstraps_once_when_the_cached_jwt_is_rejected() {
+        use axum::{http::HeaderMap, http::StatusCode, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _lock = crate::llm_router::mimo::test_cache_lock();
+        // A cached-but-revoked JWT: upstream 403s it, the probe must
+        // re-bootstrap once and succeed on the resend.
+        crate::llm_router::mimo::store_jwt("stale-e2e-jwt");
+
+        static BOOTSTRAPS: AtomicUsize = AtomicUsize::new(0);
+        async fn chat(headers: HeaderMap, Json(_): Json<Value>) -> (StatusCode, Json<Value>) {
+            let authed = headers
+                .get("authorization")
+                .is_some_and(|v| v == "Bearer fresh-e2e-jwt");
+            if authed {
+                (StatusCode::OK, Json(json!({"choices": []})))
+            } else {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": {"message": "Illegal access"}})),
+                )
+            }
+        }
+        let app = Router::new()
+            .route(
+                "/bootstrap",
+                post(|| async {
+                    BOOTSTRAPS.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"jwt": "fresh-e2e-jwt"}))
+                }),
+            )
+            .route("/openai/chat", post(chat));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let ctx = UpstreamCtx {
+            store: Arc::new(crate::store::Store::open(tmp.path()).await.unwrap()),
+            http: reqwest::Client::new(),
+            oauth_token_url_override: None,
+            mimo_bootstrap_url_override: Some(format!("http://127.0.0.1:{port}/bootstrap")),
+        };
+        let conn = mk_conn(
+            "m10",
+            "mimo-free",
+            "free",
+            ConnectionData {
+                base_url_override: Some(format!("http://127.0.0.1:{port}/openai")),
+                ..Default::default()
+            },
+        );
+        let desc = registry::descriptor("mimo-free").unwrap();
+        let out = probe_model_with_ctx(&ctx, desc, &conn, "mimo-auto").await;
+        assert!(out.ok, "{}", out.message);
+        assert_eq!(out.status, ProbeStatus::Valid);
+        assert_eq!(BOOTSTRAPS.load(Ordering::SeqCst), 1);
+        crate::llm_router::mimo::invalidate_jwt();
     }
 
     #[tokio::test]
@@ -466,12 +677,29 @@ mod tests {
             "Bearer at-codex"
         );
         assert_eq!(req.headers().get("originator").unwrap(), "codex_cli_rs");
+        // The Codex CLI fingerprint headers the backend expects on every
+        // request (9router providers/registry/codex.js).
+        assert_eq!(
+            req.headers().get("user-agent").unwrap(),
+            "codex_cli_rs/0.136.0"
+        );
+        assert_eq!(req.headers().get("accept").unwrap(), "text/event-stream");
         assert_eq!(req.headers().get("chatgpt-account-id").unwrap(), "acct-1");
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(sent["model"], "gpt-5.2-codex");
-        assert_eq!(sent["input"], "ping");
+        // The ChatGPT Codex backend rejects shorthand probes (verified live
+        // 2026-07-10): a string `input` 400s with "Input must be a list",
+        // `stream: false` 400s with "Stream must be set to true", and
+        // `max_output_tokens` 400s as an unsupported parameter. The probe
+        // must send the same wire shape real Codex chat uses.
+        assert_eq!(
+            sent["input"],
+            json!([{"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "ping"}]}])
+        );
         assert_eq!(sent["store"], false);
-        assert_eq!(sent["stream"], false);
+        assert_eq!(sent["stream"], true);
+        assert!(sent.get("max_output_tokens").is_none());
     }
 
     #[tokio::test]

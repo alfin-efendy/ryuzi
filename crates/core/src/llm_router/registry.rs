@@ -523,7 +523,9 @@ pub const CATALOG: &[ProviderDescriptor] = &[
             "deepseek-3.2",
             "qwen3-coder-next",
             "glm-5",
-            "MiniMax-M2.5",
+            // CodeWhisperer model ids are lowercase; "MiniMax-M2.5" is
+            // rejected upstream with 400 INVALID_MODEL_ID.
+            "minimax-m2.5",
         ],
         requires_base_url: false,
         oauth: None,
@@ -969,6 +971,18 @@ mod tests {
         // Kiro has no OpenAI-compatible /models route — "Refresh models"
         // must report the seeded-list message instead of erroring.
         assert!(!descriptor("kiro").unwrap().has_models_endpoint);
+    }
+
+    #[test]
+    fn kiro_seeded_model_ids_use_codewhisperer_casing() {
+        // CodeWhisperer validates modelId case-sensitively: probing
+        // "MiniMax-M2.5" returns 400 INVALID_MODEL_ID while "minimax-m2.5"
+        // passes validation (verified live 2026-07-10 against
+        // runtime.us-east-1.kiro.dev). Every other seeded id already
+        // validates; lock the lowercase form so it can't regress.
+        let models = descriptor("kiro").unwrap().models;
+        assert!(models.contains(&"minimax-m2.5"));
+        assert!(!models.contains(&"MiniMax-M2.5"));
     }
 
     #[test]
