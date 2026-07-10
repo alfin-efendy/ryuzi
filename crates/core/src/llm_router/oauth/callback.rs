@@ -3,54 +3,17 @@
 //! persisting a new OAuth connection. Also a manual (paste) fallback for
 //! environments where a browser can't reach the loopback listener.
 //! Ported from 9router (MIT, (c) 2024-2026 decolua and contributors).
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use axum::extract::{Query, State};
-use axum::response::Html;
-use axum::routing::get;
-use axum::Router;
-use serde::Deserialize;
+use anyhow::{bail, Context, Result};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 
 use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
 use crate::llm_router::oauth::{flow, pkce, OAuthTokens};
 use crate::llm_router::registry::{oauth_config, RedirectMode};
+use crate::oauth_loopback::{await_callback, bind_fixed, bind_random, spawn_callback_server};
 use crate::store::Store;
-
-const CALLBACK_HTML: &str = "<!doctype html><html><body>You can close this tab.</body></html>";
-
-/// What the loopback callback captured off the query string. Either field
-/// can be missing if the provider (or something poking the URL) sends a
-/// malformed redirect — callers must degrade to an error, not assume both
-/// are present.
-struct CallbackResult {
-    code: Option<String>,
-    state: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CallbackQuery {
-    code: Option<String>,
-    state: Option<String>,
-}
-
-type CallbackSlot = Arc<Mutex<Option<oneshot::Sender<CallbackResult>>>>;
-
-async fn handle_callback(
-    State(slot): State<CallbackSlot>,
-    Query(q): Query<CallbackQuery>,
-) -> Html<&'static str> {
-    if let Some(tx) = slot.lock().unwrap().take() {
-        let _ = tx.send(CallbackResult {
-            code: q.code,
-            state: q.state,
-        });
-    }
-    Html(CALLBACK_HTML)
-}
 
 fn callback_path(mode: RedirectMode) -> &'static str {
     match mode {
@@ -67,64 +30,14 @@ fn redirect_uri_for(mode: RedirectMode, bound_port: u16) -> String {
 }
 
 /// Bind the loopback listener for `mode`. `LoopbackFixed` bind failures are
-/// mapped to an actionable message — the fixed port is Codex's redirect
-/// requirement, so the only way it's taken is another login already running.
+/// mapped (inside `oauth_loopback::bind_fixed`) to an actionable message —
+/// the fixed port is Codex's redirect requirement, so the only way it's
+/// taken is another login already running.
 async fn bind_loopback(mode: RedirectMode) -> Result<TcpListener> {
     match mode {
-        RedirectMode::LoopbackRandom => TcpListener::bind("127.0.0.1:0")
-            .await
-            .context("failed to bind the OAuth loopback listener"),
-        RedirectMode::LoopbackFixed(p) => TcpListener::bind(("127.0.0.1", p)).await.map_err(|_| {
-            anyhow!("port {p} already in use — close the other Codex login and retry")
-        }),
+        RedirectMode::LoopbackRandom => bind_random().await,
+        RedirectMode::LoopbackFixed(p) => bind_fixed(p).await,
     }
-}
-
-/// Spawn the loopback callback server on an already-bound `listener`. This
-/// is a plain (non-`async`) fn precisely so `tokio::spawn` runs eagerly —
-/// the accept loop is live by the time this returns, before the caller goes
-/// on to hand the authorize URL to the browser.
-fn spawn_callback_server(
-    listener: TcpListener,
-    path: &str,
-) -> (
-    tokio::task::JoinHandle<()>,
-    oneshot::Receiver<CallbackResult>,
-    oneshot::Sender<()>,
-) {
-    let (result_tx, result_rx) = oneshot::channel::<CallbackResult>();
-    let slot: CallbackSlot = Arc::new(Mutex::new(Some(result_tx)));
-    let app = Router::new()
-        .route(path, get(handle_callback))
-        .with_state(slot);
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-    });
-    (handle, result_rx, shutdown_tx)
-}
-
-/// Wait (up to `timeout`) for the spawned callback server to capture a
-/// request, then gracefully shut it down (waits for the in-flight response
-/// to finish) regardless of outcome so the task never leaks.
-async fn await_callback(
-    server: tokio::task::JoinHandle<()>,
-    result_rx: oneshot::Receiver<CallbackResult>,
-    shutdown_tx: oneshot::Sender<()>,
-    timeout: Duration,
-) -> Result<CallbackResult> {
-    let received = tokio::time::timeout(timeout, result_rx).await;
-    let _ = shutdown_tx.send(());
-    let _ = server.await;
-
-    received
-        .context("timed out waiting for the OAuth callback")?
-        .context("callback listener closed before receiving a request")
 }
 
 fn build_connection_row(provider: &str, label: &str, tokens: OAuthTokens) -> ConnectionRow {
