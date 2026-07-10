@@ -30,6 +30,13 @@ impl ContextManager {
     /// Summarize and install a compacted history. On a summarize-call
     /// overflow, drops the oldest item and retries; other errors leave the
     /// history unchanged and propagate.
+    ///
+    /// All pre-trim and retry-drop work happens on a local `working` copy of
+    /// the messages, never on `self.ledger` directly — the ledger is mutated
+    /// exactly once, via `replace_all`, and only after the summarize call has
+    /// actually succeeded. This guarantees a failed compaction (overflow
+    /// persisting down to one message, or any other error) leaves history
+    /// byte-for-byte unchanged.
     pub async fn compact(
         &mut self,
         llm: &Arc<dyn LlmStream>,
@@ -45,12 +52,14 @@ impl ContextManager {
             .clone()
             .unwrap_or_else(|| DEFAULT_COMPACT_PROMPT.to_string());
 
+        let mut working: Vec<Value> = self.ledger.messages();
+
         // Pre-trim: the summarize request itself must fit the usable window
         // (spec §7.2 step 1) — rewrite oversized old tool_results first.
-        self.pre_trim_tool_results();
+        pre_trim_tool_results(&mut working, self.cfg().meta.usable_window());
 
         let summary = loop {
-            let mut messages = self.ledger.messages();
+            let mut messages = working.clone();
             messages.push(json!({
                 "role": "user",
                 "content": [{"type": "text", "text": prompt}]
@@ -64,14 +73,14 @@ impl ContextManager {
             match collect_text(llm, body).await {
                 Ok(s) if !s.trim().is_empty() => break s.trim().to_string(),
                 Ok(_) => anyhow::bail!("compaction: model returned an empty summary"),
-                Err(e) if is_context_overflow(&e.to_string()) && self.ledger.len() > 1 => {
-                    self.ledger.drop_oldest();
+                Err(e) if is_context_overflow(&e.to_string()) && working.len() > 1 => {
+                    drop_oldest_message(&mut working);
                 }
                 Err(e) => return Err(e),
             }
         };
 
-        let replacement = build_replacement(&self.ledger.messages(), &summary);
+        let replacement = build_replacement(&working, &summary);
         let window_number = self.ledger.replace_all(replacement).await?;
         // The indicator drops immediately: estimate the new history. Sum
         // over each message's `content` (not the `{role, content}` wrapper)
@@ -91,45 +100,56 @@ impl ContextManager {
             window_number,
         })
     }
+}
 
-    /// Rewrite tool_result bodies to a one-line placeholder, oldest first,
-    /// until the estimated history fits the usable window.
-    fn pre_trim_tool_results(&mut self) {
-        let usable = self.cfg().meta.usable_window();
-        let mut msgs = self.ledger.messages();
-        let mut total: u64 = msgs.iter().map(estimate_tokens).sum();
-        if total <= usable {
-            return;
-        }
-        let mut changed = false;
-        'outer: for m in msgs.iter_mut() {
-            let Some(blocks) = m["content"].as_array_mut() else {
-                continue;
-            };
-            for b in blocks.iter_mut() {
-                if b["type"] == "tool_result"
-                    && b["content"]
-                        .as_str()
-                        .map(|s| s.len() > 200)
-                        .unwrap_or(false)
-                {
-                    let before = estimate_tokens(b);
-                    b["content"] = Value::String(
-                        "Output exceeded the available model context and was truncated".into(),
-                    );
-                    total = total.saturating_sub(before - estimate_tokens(b));
-                    changed = true;
-                    if total <= usable {
-                        break 'outer;
-                    }
+/// Rewrite tool_result bodies to a one-line placeholder, oldest first, until
+/// the estimated size fits `usable`. Operates on a working copy so a
+/// pre-trim that doesn't get far enough never leaks into the ledger.
+fn pre_trim_tool_results(msgs: &mut [Value], usable: u64) {
+    let mut total: u64 = msgs.iter().map(estimate_tokens).sum();
+    if total <= usable {
+        return;
+    }
+    'outer: for m in msgs.iter_mut() {
+        let Some(blocks) = m["content"].as_array_mut() else {
+            continue;
+        };
+        for b in blocks.iter_mut() {
+            if b["type"] == "tool_result"
+                && b["content"]
+                    .as_str()
+                    .map(|s| s.len() > 200)
+                    .unwrap_or(false)
+            {
+                let before = estimate_tokens(b);
+                b["content"] = Value::String(
+                    "Output exceeded the available model context and was truncated".into(),
+                );
+                total = total.saturating_sub(before.saturating_sub(estimate_tokens(b)));
+                if total <= usable {
+                    break 'outer;
                 }
             }
         }
-        if changed {
-            // Install the trimmed projection in place (no checkpoint: this is
-            // a pre-summarize working copy; replace_all follows right after).
-            self.ledger.overwrite_in_memory(msgs);
+    }
+}
+
+/// Drop the oldest message, then keep dropping until the front is a valid
+/// history start: a user turn whose first block is not a tool_result.
+/// (Compaction overflow-recovery — spec §7.2.) Operates on a working copy,
+/// never the ledger directly — see `ContextManager::compact`.
+fn drop_oldest_message(msgs: &mut Vec<Value>) {
+    if msgs.is_empty() {
+        return;
+    }
+    msgs.remove(0);
+    while let Some(front) = msgs.first() {
+        let role_ok = front["role"] == "user";
+        let first_block_type = front["content"][0]["type"].as_str().unwrap_or("");
+        if role_ok && first_block_type != "tool_result" {
+            break;
         }
+        msgs.remove(0);
     }
 }
 
@@ -143,7 +163,10 @@ fn build_replacement(messages: &[Value], summary: &str) -> Vec<Value> {
         if m["role"] != "user" {
             continue;
         }
-        let Some(text) = m["content"][0]["text"].as_str() else {
+        // User turns with attachments carry image blocks before the text
+        // block (see `runner::user_content_blocks`), so the text can't be
+        // assumed to live at `content[0]` — scan for the first text block.
+        let Some(text) = first_text_block(&m["content"]) else {
             continue; // tool_result turns don't survive compaction
         };
         if text.starts_with(SUMMARY_PREFIX) {
@@ -152,10 +175,13 @@ fn build_replacement(messages: &[Value], summary: &str) -> Vec<Value> {
         let cost = estimate_tokens(m);
         if cost <= budget {
             budget -= cost;
-            retained.push(m.clone());
+            retained.push(m.clone()); // full clone: attachments retained
         } else if budget > 100 {
             let max_bytes = (budget as usize) * 4;
             let truncated = super::truncate_for_context(text, max_bytes);
+            // Middle-truncation rebuilds a text-only message — any image or
+            // other non-text blocks on this one oldest overflowing message
+            // are dropped here (acceptable: only ever affects one message).
             retained.push(json!({
                 "role": "user",
                 "content": [{"type": "text", "text": truncated}]
@@ -171,6 +197,15 @@ fn build_replacement(messages: &[Value], summary: &str) -> Vec<Value> {
         "content": [{"type": "text", "text": format!("{SUMMARY_PREFIX}\n{summary}")}]
     }));
     retained
+}
+
+/// The text of the first `"type": "text"` block in a content array, if any.
+fn first_text_block(content: &Value) -> Option<&str> {
+    content
+        .as_array()?
+        .iter()
+        .find(|b| b["type"] == "text")
+        .and_then(|b| b["text"].as_str())
 }
 
 #[cfg(test)]
@@ -284,5 +319,114 @@ mod tests {
         let before = cm.messages_for_request();
         assert!(cm.compact(&llm, "test/model", "manual").await.is_err());
         assert_eq!(cm.messages_for_request().len(), before.len());
+    }
+
+    #[tokio::test]
+    async fn retains_attachment_bearing_user_turns() {
+        let mut cm = ContextManager::ephemeral("s", ContextConfig::with_meta(meta()));
+        // Image blocks precede the text block, matching
+        // `runner::user_content_blocks`.
+        cm.append_user(json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc123"}},
+            {"type": "text", "text": "look at this screenshot"}
+        ]))
+        .await
+        .unwrap();
+        cm.append_assistant(json!([{"type":"text","text":"got it, I see the screenshot"}]))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            cm.append_user(json!([{"type":"text","text": format!("follow up {i}")}]))
+                .await
+                .unwrap();
+            cm.append_assistant(json!([{"type":"text","text": format!("reply {i}")}]))
+                .await
+                .unwrap();
+        }
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![vec![
+            text_delta("summary of the conversation"),
+            message_stop(),
+        ]]));
+        cm.compact(&llm, "test/model", "manual").await.unwrap();
+        let text = serde_json::to_string(&cm.messages_for_request()).unwrap();
+        assert!(
+            text.contains("look at this screenshot"),
+            "attachment-bearing user turn's text must survive compaction"
+        );
+        assert!(
+            text.contains("\"image\""),
+            "the image block itself must be retained, not just the text"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_overflow_leaves_history_unchanged() {
+        // A tiny context window so pre-trim fires against the oversized
+        // tool_result below.
+        let tiny_meta = ModelMeta {
+            context_window: 40,
+            max_output_tokens: 8_192,
+            supports_prompt_cache: false,
+            supports_reasoning: false,
+        };
+        let mut cm = ContextManager::ephemeral("s", ContextConfig::with_meta(tiny_meta));
+        cm.append_user(json!([{"type":"text","text":"start task"}]))
+            .await
+            .unwrap();
+        cm.append_assistant(json!([{"type":"tool_use","id":"t1","name":"bash","input":{}}]))
+            .await
+            .unwrap();
+        cm.append_user(json!([
+            {"type":"tool_result","tool_use_id":"t1","content":"x".repeat(300),"is_error":false}
+        ]))
+        .await
+        .unwrap();
+        cm.append_assistant(json!([{"type":"text","text":"done"}]))
+            .await
+            .unwrap();
+        cm.append_user(json!([{"type":"text","text":"continue"}]))
+            .await
+            .unwrap();
+
+        // 5 messages in the ledger: at most 4 retries plus the initial
+        // attempt, so 5 scripted overflow turns exhausts every retry.
+        let overflow_turn = || {
+            vec![(
+                "error".to_string(),
+                json!({"type":"error","error":{"message":"prompt is too long: 999999 tokens"}}),
+            )]
+        };
+        let scripts: Vec<Vec<_>> = (0..5).map(|_| overflow_turn()).collect();
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(scripts));
+
+        let before = cm.messages_for_request();
+        let before_json = serde_json::to_string(&before).unwrap();
+        let result = cm.compact(&llm, "test/model", "manual").await;
+        match result {
+            Err(e) => assert!(is_context_overflow(&e.to_string())),
+            Ok(_) => panic!("expected compaction to fail on persistent overflow"),
+        }
+
+        let after = cm.messages_for_request();
+        assert_eq!(after.len(), before.len(), "pre-trim must not leak either");
+        assert_eq!(serde_json::to_string(&after).unwrap(), before_json);
+    }
+
+    #[test]
+    fn drop_oldest_message_preserves_a_valid_history_start() {
+        let mut msgs = vec![
+            json!({"role":"user","content":[{"type":"text","text":"u0"}]}),
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{}}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"out","is_error":false}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"a1"}]}),
+            json!({"role":"user","content":[{"type":"text","text":"u1"}]}),
+        ];
+        // Dropping u0 must also drop the now-orphaned assistant tool_use AND
+        // its tool_result AND the trailing assistant, landing on the next
+        // real user turn.
+        drop_oldest_message(&mut msgs);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(msgs[0]["content"][0]["text"], "u1");
     }
 }

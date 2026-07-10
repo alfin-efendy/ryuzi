@@ -123,24 +123,6 @@ impl Ledger {
         self.window_number
     }
 
-    /// Drop the oldest message, then keep dropping until the front is a valid
-    /// history start: a user turn whose first block is not a tool_result.
-    /// (Compaction overflow-recovery — spec §7.2.)
-    pub fn drop_oldest(&mut self) {
-        if self.turns.is_empty() {
-            return;
-        }
-        self.turns.remove(0);
-        while let Some(front) = self.turns.first() {
-            let role_ok = front.msg["role"] == "user";
-            let first_block_type = front.msg["content"][0]["type"].as_str().unwrap_or("");
-            if role_ok && first_block_type != "tool_result" {
-                break;
-            }
-            self.turns.remove(0);
-        }
-    }
-
     /// Install a compacted replacement history. Persistent ledgers write a
     /// durable checkpoint so `load` never replays the replaced turns again;
     /// the provider_turns rows stay untouched (append-only audit record).
@@ -165,15 +147,6 @@ impl Ledger {
             })
             .collect();
         Ok(self.window_number)
-    }
-
-    /// Replace the in-memory projection without touching persistence — used
-    /// by compaction's pre-trim, which is immediately followed by
-    /// `replace_all` (the durable step). Seqs are preserved positionally.
-    pub(super) fn overwrite_in_memory(&mut self, msgs: Vec<Value>) {
-        for (turn, msg) in self.turns.iter_mut().zip(msgs) {
-            turn.msg = msg;
-        }
     }
 }
 
@@ -266,38 +239,5 @@ mod tests {
             .unwrap();
         assert_eq!(w, 1);
         assert_eq!(ledger.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn drop_oldest_preserves_a_valid_history_start() {
-        let mut ledger = Ledger::ephemeral("s");
-        ledger
-            .append_user(json!([{"type":"text","text":"u0"}]))
-            .await
-            .unwrap();
-        ledger
-            .append_assistant(json!([{"type":"tool_use","id":"t1","name":"bash","input":{}}]))
-            .await
-            .unwrap();
-        ledger
-            .append_user(
-                json!([{"type":"tool_result","tool_use_id":"t1","content":"out","is_error":false}]),
-            )
-            .await
-            .unwrap();
-        ledger
-            .append_assistant(json!([{"type":"text","text":"a1"}]))
-            .await
-            .unwrap();
-        ledger
-            .append_user(json!([{"type":"text","text":"u1"}]))
-            .await
-            .unwrap();
-        // Dropping u0 must also drop the now-orphaned assistant tool_use AND its
-        // tool_result AND the trailing assistant, landing on the next real user turn.
-        ledger.drop_oldest();
-        assert_eq!(ledger.messages()[0]["role"], "user");
-        assert_eq!(ledger.messages()[0]["content"][0]["type"], "text");
-        assert_eq!(ledger.messages()[0]["content"][0]["text"], "u1");
     }
 }
