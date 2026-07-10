@@ -419,6 +419,156 @@ async fn backfill_install_records_in(
     Ok(backfilled)
 }
 
+/// Result of attempting to bring an installed pack up to date with its
+/// recorded source. `Failed` carries a human-readable reason (rather than
+/// propagating an `Err`) so `update_all_packs` can report a per-pack outcome
+/// without one bad pack aborting the whole batch. `#[serde(tag/content)]`
+/// keeps this a clean discriminated union for the daemon/Tauri layers that
+/// consume it later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "detail")]
+pub enum UpdateOutcome {
+    Updated,
+    AlreadyCurrent,
+    SkippedPinned,
+    LocalEdits,
+    Failed(String),
+}
+
+/// Update one installed pack to its latest upstream commit, guarding against
+/// clobbering local edits and pinned packs. See `update_installed_pack_with`
+/// for the full decision order.
+pub async fn update_installed_pack(
+    id: &str,
+    force: bool,
+    store: &crate::store::Store,
+) -> Result<UpdateOutcome> {
+    let roots = InstallRoots::for_user()?;
+    let cloner = GitRepoCloner;
+    update_installed_pack_with(id, force, &roots, &cloner, store).await
+}
+
+/// Decision order: missing ledger record → `Failed`; pinned → `SkippedPinned`
+/// (pinning is an explicit, unconditional user choice — `force` does not
+/// override it); on-disk fingerprint drifted from the recorded one →
+/// `LocalEdits` (unless `force`); re-clone resolves to the same commit
+/// already recorded → `AlreadyCurrent` (unless `force`); otherwise reinstall
+/// (staged), clean up stale refresh artifacts, and rewrite the ledger row
+/// with the new commit/fingerprint/`updated_at`, preserving
+/// `installed_at`/pin/trust fields from the old row.
+async fn update_installed_pack_with(
+    id: &str,
+    force: bool,
+    roots: &InstallRoots,
+    cloner: &impl RepoCloner,
+    store: &crate::store::Store,
+) -> Result<UpdateOutcome> {
+    let Some(rec) = store.get_plugin_install(id).await? else {
+        return Ok(UpdateOutcome::Failed(format!("no install record for {id}")));
+    };
+    if rec.pinned {
+        return Ok(UpdateOutcome::SkippedPinned);
+    }
+
+    // Local-edit guard: the current on-disk fingerprint must match the one
+    // recorded at the last install/update, or an update would silently
+    // overwrite whatever the user changed by hand.
+    let installed = read_installed_pack(roots, id)?;
+    let dir = installed_pack_dir(roots, &installed);
+    if !force {
+        let current_fp = fingerprint_dir(&dir).unwrap_or_default();
+        if current_fp != rec.fingerprint {
+            return Ok(UpdateOutcome::LocalEdits);
+        }
+    }
+
+    // Re-resolve from the recorded source spec into a temp clone and detect
+    // a no-op update by commit equality BEFORE touching the live install.
+    let parsed = parse_skill_source(&rec.source_spec)?;
+    let temp = tempfile::tempdir()?;
+    let repo_dir = temp.path().join("repo");
+    let new_commit = cloner.clone_repo(&parsed, &repo_dir).await?;
+    if !force && new_commit.is_some() && new_commit == rec.resolved_commit {
+        return Ok(UpdateOutcome::AlreadyCurrent);
+    }
+
+    // Perform the reinstall (staged, atomic) + stale-artifact cleanup, then
+    // rewrite the ledger row to reflect the new install.
+    let discovered = discover_install_target(&repo_dir, &parsed)?;
+    let refreshed = match discovered {
+        Discovery::Single(skill) => install_single_skill(roots, &parsed, skill)?,
+        Discovery::Pack(pack) => install_plugin_pack(roots, &parsed, *pack)?,
+    };
+    remove_stale_refresh_artifacts(roots, &installed, &refreshed)?;
+
+    let new_dir = installed_pack_dir(roots, &refreshed);
+    let now = crate::paths::now_ms();
+    let updated = crate::store::PluginInstallRecord {
+        plugin_id: refreshed.id.clone(),
+        kind: if refreshed.plugin_id.is_some() {
+            "plugin_pack".into()
+        } else {
+            "single_skill".into()
+        },
+        source_spec: rec.source_spec.clone(),
+        resolved_commit: new_commit,
+        fingerprint: fingerprint_dir(&new_dir)?,
+        installed_at: rec.installed_at,
+        updated_at: now,
+        pinned: rec.pinned,
+        pin_reason: rec.pin_reason.clone(),
+        trust_tier: rec.trust_tier.clone(),
+        trust_ack_at: rec.trust_ack_at,
+        trust_ack_summary: rec.trust_ack_summary.clone(),
+    };
+    // The pack's identity (id) can change across an update (e.g. an upstream
+    // rename of the plugin id). When it does, drop the old row instead of
+    // leaving a stale duplicate behind.
+    if refreshed.id != rec.plugin_id {
+        store.delete_plugin_install(&rec.plugin_id).await?;
+    }
+    store.upsert_plugin_install(&updated).await?;
+    Ok(UpdateOutcome::Updated)
+}
+
+/// Update every installed pack, skipping pinned ones. Never fails as a whole:
+/// a single pack's error becomes `UpdateOutcome::Failed` for that pack so the
+/// rest of the batch still runs.
+pub async fn update_all_packs(store: &crate::store::Store) -> Result<Vec<(String, UpdateOutcome)>> {
+    let roots = InstallRoots::for_user()?;
+    let cloner = GitRepoCloner;
+    update_all_packs_with(&roots, &cloner, store).await
+}
+
+async fn update_all_packs_with(
+    roots: &InstallRoots,
+    cloner: &impl RepoCloner,
+    store: &crate::store::Store,
+) -> Result<Vec<(String, UpdateOutcome)>> {
+    let mut out = Vec::new();
+    for rec in store.list_plugin_installs().await? {
+        let outcome =
+            match update_installed_pack_with(&rec.plugin_id, false, roots, cloner, store).await {
+                Ok(o) => o,
+                Err(e) => UpdateOutcome::Failed(e.to_string()),
+            };
+        out.push((rec.plugin_id, outcome));
+    }
+    Ok(out)
+}
+
+/// Pin (or unpin) an installed pack against future updates. A thin
+/// passthrough to the store — the ledger row is the single source of truth
+/// for pin state, checked by `update_installed_pack_with` above.
+pub async fn set_pack_pin(
+    id: &str,
+    pinned: bool,
+    reason: Option<&str>,
+    store: &crate::store::Store,
+) -> Result<()> {
+    store.set_plugin_install_pin(id, pinned, reason).await
+}
+
 async fn refresh_installed_skill_with(
     id: &str,
     roots: &InstallRoots,
@@ -2940,6 +3090,112 @@ path = "skills/focus"
         assert_eq!(
             backfill_install_records_in(&roots, &store).await.unwrap(),
             0
+        );
+    }
+
+    /// The fixture repo directory `recorded_setup` writes the source skill
+    /// into. Kept as a fixed sibling of the skills/plugins roots under the
+    /// same temp config root so a second `FakeRepoCloner` can be built
+    /// against the same fixture content later in a test (simulating a
+    /// re-clone of the same upstream repo at a new commit).
+    fn roots_repo(roots: &InstallRoots) -> PathBuf {
+        roots.config_root.join("_fixture_repo")
+    }
+
+    /// A `FakeRepoCloner` that resolves `source` to `repo_path` and reports
+    /// `commit` as the resolved HEAD.
+    fn fake_cloner(source: &str, repo_path: &Path, commit: &str) -> FakeRepoCloner {
+        let parsed = parse_skill_source(source).unwrap();
+        let mut repos = BTreeMap::new();
+        repos.insert(parsed.repo, repo_path.to_path_buf());
+        FakeRepoCloner {
+            repos,
+            commit: Some(commit.to_string()),
+        }
+    }
+
+    /// Shared setup for the update tests: an `InstallRoots` over a temp
+    /// config root, a `FakeRepoCloner` resolving `source` to a temp fixture
+    /// repo (one skill named "P") at `commit`, and a temp `Store`. Tempdirs
+    /// are leaked with `.keep()` so they outlive this function — acceptable
+    /// for short-lived test processes.
+    async fn recorded_setup(
+        source: &str,
+        commit: &str,
+    ) -> (InstallRoots, FakeRepoCloner, crate::store::Store) {
+        let config_root = tempfile::tempdir().unwrap().keep();
+        let roots = InstallRoots::new(config_root);
+        let repo_dir = roots_repo(&roots);
+        write_skill(&repo_dir, "P", "d", "body");
+        let cloner = fake_cloner(source, &repo_dir, commit);
+
+        let db_path = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let store = crate::store::Store::open(&db_path).await.unwrap();
+        (roots, cloner, store)
+    }
+
+    #[tokio::test]
+    async fn update_detects_already_current_by_commit() {
+        let (roots, cloner, store) = recorded_setup("https://github.com/acme/p", "c1").await;
+        install_skill_source_with_recorded("https://github.com/acme/p", &roots, &cloner, &store)
+            .await
+            .unwrap();
+        // Same commit on re-clone → AlreadyCurrent, no swap.
+        let outcome = update_installed_pack_with("p", false, &roots, &cloner, &store)
+            .await
+            .unwrap();
+        assert_eq!(outcome, UpdateOutcome::AlreadyCurrent);
+    }
+
+    #[tokio::test]
+    async fn update_refuses_local_edits_without_force() {
+        let (roots, cloner_c1, store) = recorded_setup("https://github.com/acme/p", "c1").await;
+        let pack = install_skill_source_with_recorded(
+            "https://github.com/acme/p",
+            &roots,
+            &cloner_c1,
+            &store,
+        )
+        .await
+        .unwrap();
+        // Simulate a local edit to the installed tree.
+        let dir = installed_pack_dir(&roots, &pack);
+        std::fs::write(dir.join("SKILL.md"), "locally edited").unwrap();
+        let cloner_c2 = fake_cloner("https://github.com/acme/p", &roots_repo(&roots), "c2");
+        assert_eq!(
+            update_installed_pack_with("p", false, &roots, &cloner_c2, &store)
+                .await
+                .unwrap(),
+            UpdateOutcome::LocalEdits
+        );
+        // force overrides.
+        assert_eq!(
+            update_installed_pack_with("p", true, &roots, &cloner_c2, &store)
+                .await
+                .unwrap(),
+            UpdateOutcome::Updated
+        );
+    }
+
+    #[tokio::test]
+    async fn update_all_skips_pinned() {
+        let (roots, cloner, store) = recorded_setup("https://github.com/acme/p", "c1").await;
+        install_skill_source_with_recorded("https://github.com/acme/p", &roots, &cloner, &store)
+            .await
+            .unwrap();
+        set_pack_pin("p", true, Some("frozen"), &store)
+            .await
+            .unwrap();
+        let outcomes = update_all_packs_with(&roots, &cloner, &store)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            vec![("p".to_string(), UpdateOutcome::SkippedPinned)]
         );
     }
 }
