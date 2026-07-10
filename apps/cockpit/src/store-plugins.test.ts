@@ -9,7 +9,6 @@ function reset() {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
-    pinnedIds: new Set(),
   });
 }
 
@@ -35,6 +34,12 @@ const builtin: PluginInfo = {
   kind: "integration",
   installed: false,
   family: null,
+  pinned: false,
+  sourceSpec: null,
+  resolvedCommit: null,
+  installedAt: null,
+  updatedAt: null,
+  trustTier: null,
 };
 
 const github: PluginInfo = {
@@ -52,6 +57,12 @@ const github: PluginInfo = {
   kind: "integration",
   installed: true,
   family: null,
+  pinned: false,
+  sourceSpec: null,
+  resolvedCommit: null,
+  installedAt: null,
+  updatedAt: null,
+  trustTier: null,
 };
 
 const skillPack: PluginInfo = {
@@ -254,36 +265,73 @@ test("update toasts the error and still reloads when updatePlugin itself errors"
   restartSpy.mockRestore();
 });
 
-test("pin calls setPluginPin, tracks the id optimistically, and reloads", async () => {
+test("pin optimistically flips the plugin's pinned flag, calls the command, then reconciles via reload", async () => {
   reset();
   usePlugins.setState({ plugins: [skillPack], loaded: true });
   const pinSpy = spyOn(commands, "setPluginPin").mockResolvedValue({ status: "ok", data: null });
-  const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [skillPack] });
+  const listSpy = spyOn(commands, "listPlugins");
   const restartSpy = stubRestartRequired();
 
-  await usePlugins.getState().pin("acme", true, "vendored fork");
+  listSpy.mockResolvedValueOnce({ status: "ok", data: [{ ...skillPack, pinned: true }] });
+  const p = usePlugins.getState().pin("acme", true, "vendored fork");
+  // Optimistic update lands synchronously before the awaited command resolves.
+  expect(usePlugins.getState().plugins[0].pinned).toBe(true);
+  await p;
 
   expect(pinSpy).toHaveBeenCalledWith("acme", true, "vendored fork");
-  expect(usePlugins.getState().pinnedIds.has("acme")).toBe(true);
+  expect(listSpy).toHaveBeenCalled();
+  // The source of truth after reload is the server's `pinned` ledger flag,
+  // not the transient optimistic paint.
+  expect(usePlugins.getState().plugins[0].pinned).toBe(true);
 
+  listSpy.mockResolvedValueOnce({ status: "ok", data: [{ ...skillPack, pinned: false }] });
   await usePlugins.getState().pin("acme", false);
   expect(pinSpy).toHaveBeenCalledWith("acme", false, null);
-  expect(usePlugins.getState().pinnedIds.has("acme")).toBe(false);
+  expect(usePlugins.getState().plugins[0].pinned).toBe(false);
 
   pinSpy.mockRestore();
   listSpy.mockRestore();
   restartSpy.mockRestore();
 });
 
-test("pin failure toasts and leaves pinnedIds untouched", async () => {
+test("pin failure toasts and reloads, reconciling the flag back to the server's (unchanged) value", async () => {
   reset();
+  // skillPack.pinned is false; the write below fails, so it should never
+  // have actually flipped server-side — the post-reload value stays false.
   usePlugins.setState({ plugins: [skillPack], loaded: true });
   const pinSpy = spyOn(commands, "setPluginPin").mockResolvedValue({ status: "error", error: { message: "denied" } });
+  const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [skillPack] });
+  const restartSpy = stubRestartRequired();
 
   await usePlugins.getState().pin("acme", true);
 
-  expect(usePlugins.getState().pinnedIds.has("acme")).toBe(false);
+  expect(usePlugins.getState().plugins[0].pinned).toBe(false);
   pinSpy.mockRestore();
+  listSpy.mockRestore();
+  restartSpy.mockRestore();
+});
+
+test("load carries a persisted pinned flag straight from the server — no pin() call needed for it to survive a reload", async () => {
+  reset();
+  const pinnedFixture: PluginInfo = {
+    ...skillPack,
+    pinned: true,
+    sourceSpec: "https://github.com/acme/pack",
+    resolvedCommit: "deadbeefcafe",
+    trustTier: "acknowledged",
+  };
+  const spy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [pinnedFixture] });
+  const restartSpy = stubRestartRequired();
+
+  await usePlugins.getState().load();
+
+  const reloaded = usePlugins.getState().plugins[0];
+  expect(reloaded.pinned).toBe(true);
+  expect(reloaded.sourceSpec).toBe("https://github.com/acme/pack");
+  expect(reloaded.trustTier).toBe("acknowledged");
+
+  spy.mockRestore();
+  restartSpy.mockRestore();
 });
 
 test("summarizeUpdateAll counts updated/needsReack/failed outcomes", () => {

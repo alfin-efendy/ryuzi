@@ -147,7 +147,6 @@ export function PluginsView() {
     uninstall,
     update: updatePlugin,
     pin: pinPlugin,
-    pinnedIds,
     doctorFindings,
     doctorLoaded,
     loadDoctor,
@@ -237,8 +236,7 @@ export function PluginsView() {
   };
 
   const runTogglePin = (plugin: PluginInfo) => {
-    const isPinned = pinnedIds.has(plugin.id);
-    void pinPlugin(plugin.id, !isPinned, isPinned ? undefined : "Pinned from Cockpit");
+    void pinPlugin(plugin.id, !plugin.pinned, plugin.pinned ? undefined : "Pinned from Cockpit");
   };
 
   const runUpdateAll = async () => {
@@ -357,7 +355,7 @@ export function PluginsView() {
                   onUninstall={() => uninstallPlugin(plugin)}
                   onUpdate={() => void runUpdate(plugin)}
                   onTogglePin={() => runTogglePin(plugin)}
-                  pinned={pinnedIds.has(plugin.id)}
+                  pinned={plugin.pinned}
                   attachFailed={attachFailedIds.has(plugin.id)}
                   updating={updatingIds.has(plugin.id)}
                 />

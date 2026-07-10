@@ -72,6 +72,20 @@ pub struct PluginInfo {
     /// Provider family head id (providers only) — the Models `providerDetail`
     /// navigation target. `None` for other kinds.
     pub family: Option<String>,
+    /// Mirrors `crate::store::PluginInstallRecord.pinned` — `false` when the
+    /// plugin has no `plugin_installs` ledger row (never installed via the
+    /// tracked git-clone path, e.g. builtins/catalog integrations with no
+    /// skill-pack install).
+    pub pinned: bool,
+    /// The ledger row's git origin (`PluginInstallRecord.source_spec`).
+    /// Distinct from `source` (the stable builtin/catalog/skill-pack enum
+    /// label) — the daemon's `/plugins` route (`serve::merge_install_record`)
+    /// draws the same distinction.
+    pub source_spec: Option<String>,
+    pub resolved_commit: Option<String>,
+    pub installed_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub trust_tier: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -311,14 +325,57 @@ fn installed_flag(
     }
 }
 
+/// Populate `PluginInfo`'s ledger-derived fields (`pinned`, `sourceSpec`,
+/// `resolvedCommit`, `installedAt`, `updatedAt`, `trustTier`) from an
+/// optional `plugin_installs` row — `None` leaves them at their "no ledger
+/// row" defaults (`pinned: false`, the rest `None`).
+struct InstallLedgerFields {
+    pinned: bool,
+    source_spec: Option<String>,
+    resolved_commit: Option<String>,
+    installed_at: Option<i64>,
+    updated_at: Option<i64>,
+    trust_tier: Option<String>,
+}
+
+impl InstallLedgerFields {
+    fn absent() -> Self {
+        Self {
+            pinned: false,
+            source_spec: None,
+            resolved_commit: None,
+            installed_at: None,
+            updated_at: None,
+            trust_tier: None,
+        }
+    }
+
+    fn from_record(rec: &ryuzi_core::store::PluginInstallRecord) -> Self {
+        Self {
+            pinned: rec.pinned,
+            source_spec: Some(rec.source_spec.clone()),
+            resolved_commit: rec.resolved_commit.clone(),
+            installed_at: Some(rec.installed_at),
+            updated_at: Some(rec.updated_at),
+            trust_tier: Some(rec.trust_tier.clone()),
+        }
+    }
+
+    fn from_option(rec: Option<&ryuzi_core::store::PluginInstallRecord>) -> Self {
+        rec.map(Self::from_record).unwrap_or_else(Self::absent)
+    }
+}
+
 fn plugin_info(
     plugin: &CorePlugin,
     enabled: bool,
     configured: bool,
     kind: &str,
     installed: bool,
+    install: Option<&ryuzi_core::store::PluginInstallRecord>,
 ) -> PluginInfo {
     let m = &plugin.manifest;
+    let ledger = InstallLedgerFields::from_option(install);
     PluginInfo {
         id: m.id.clone(),
         name: m.name.clone(),
@@ -338,6 +395,12 @@ fn plugin_info(
         kind: kind.to_string(),
         installed,
         family: (kind == "provider").then(|| provider_family(&m.id)),
+        pinned: ledger.pinned,
+        source_spec: ledger.source_spec,
+        resolved_commit: ledger.resolved_commit,
+        installed_at: ledger.installed_at,
+        updated_at: ledger.updated_at,
+        trust_tier: ledger.trust_tier,
     }
 }
 
@@ -1022,9 +1085,25 @@ async fn compute_installed(
     ))
 }
 
+/// Fetch every `plugin_installs` ledger row ONCE and index it by plugin id —
+/// mirrors `serve.rs`'s `list_plugins` single-query-then-index approach so
+/// list assembly stays O(1) round-trips regardless of the plugin count
+/// (never a per-plugin `get_plugin_install` inside the loop below).
+async fn install_ledger_index(
+    store: &Store,
+) -> anyhow::Result<HashMap<String, ryuzi_core::store::PluginInstallRecord>> {
+    Ok(store
+        .list_plugin_installs()
+        .await?
+        .into_iter()
+        .map(|r| (r.plugin_id.clone(), r))
+        .collect())
+}
+
 async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let settings = SettingsStore::new(cp.store().clone());
     let ctx = installed_ctx(cp.store()).await?;
+    let installs = install_ledger_index(cp.store()).await?;
     let mut out = Vec::new();
     for plugin in cp.plugins().list() {
         let Some(kind) = derive_kind(&plugin) else {
@@ -1042,7 +1121,10 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
         .await?;
         let installed =
             compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
-        out.push(plugin_info(&plugin, enabled, configured, kind, installed));
+        let record = installs.get(&plugin.manifest.id);
+        out.push(plugin_info(
+            &plugin, enabled, configured, kind, installed, record,
+        ));
     }
     for pack in ryuzi_core::skills_install::curated_skill_packs() {
         if cp.plugins().get(pack.id).is_some() || out.iter().any(|p| p.id == pack.id) {
@@ -1052,6 +1134,7 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             .installed_skills
             .iter()
             .any(|s| s.id == pack.id || s.source == pack.id || s.source == pack.repo);
+        let ledger = InstallLedgerFields::from_option(installs.get(pack.id));
         out.push(PluginInfo {
             id: pack.id.to_string(),
             name: pack.name.to_string(),
@@ -1070,6 +1153,12 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             kind: "skill-pack".to_string(),
             installed,
             family: None,
+            pinned: ledger.pinned,
+            source_spec: ledger.source_spec,
+            resolved_commit: ledger.resolved_commit,
+            installed_at: ledger.installed_at,
+            updated_at: ledger.updated_at,
+            trust_tier: ledger.trust_tier,
         });
     }
     Ok(out)
@@ -1094,9 +1183,19 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
     let kind = derive_kind(&plugin).unwrap_or("integration");
     let ctx = installed_ctx(cp.store()).await?;
     let installed = compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
+    // Single-plugin lookup is fine here — unlike `assemble_list`, there is
+    // only ever one id to resolve for a detail view.
+    let record = cp.store().get_plugin_install(id).await?;
 
     Ok(PluginDetail {
-        info: plugin_info(&plugin, enabled, configured, kind, installed),
+        info: plugin_info(
+            &plugin,
+            enabled,
+            configured,
+            kind,
+            installed,
+            record.as_ref(),
+        ),
         auth,
         settings: settings_info,
         mcp,
@@ -2124,7 +2223,7 @@ mod tests {
     #[test]
     fn plugin_info_maps_identity_and_enabled_flag_through() {
         let plugin = harness_only("native");
-        let info = plugin_info(&plugin, true, false, "integration", false);
+        let info = plugin_info(&plugin, true, false, "integration", false, None);
         assert_eq!(info.id, "native");
         assert_eq!(info.name, "Plugin native");
         assert!(info.enabled);
@@ -2134,9 +2233,46 @@ mod tests {
         assert_eq!(info.kind, "integration");
         assert!(!info.installed);
         assert!(info.family.is_none());
+        // No ledger row: pinned/sourceSpec/etc default to the "never
+        // installed via the tracked git-clone path" shape.
+        assert!(!info.pinned);
+        assert!(info.source_spec.is_none());
+        assert!(info.resolved_commit.is_none());
+        assert!(info.installed_at.is_none());
+        assert!(info.updated_at.is_none());
+        assert!(info.trust_tier.is_none());
 
-        let info_disabled = plugin_info(&plugin, false, false, "integration", false);
+        let info_disabled = plugin_info(&plugin, false, false, "integration", false, None);
         assert!(!info_disabled.enabled);
+    }
+
+    #[test]
+    fn plugin_info_carries_ledger_fields_when_a_record_is_present() {
+        let plugin = harness_only("native");
+        let record = ryuzi_core::store::PluginInstallRecord {
+            plugin_id: "native".to_string(),
+            kind: "plugin_pack".to_string(),
+            source_spec: "https://github.com/acme/native-pack".to_string(),
+            resolved_commit: Some("abc123".to_string()),
+            fingerprint: "sha256:deadbeef".to_string(),
+            installed_at: 1_700_000_000,
+            updated_at: 1_700_000_500,
+            pinned: true,
+            pin_reason: Some("manual pin".to_string()),
+            trust_tier: "acknowledged".to_string(),
+            trust_ack_at: Some(1_700_000_000),
+            trust_ack_summary: None,
+        };
+        let info = plugin_info(&plugin, true, false, "integration", false, Some(&record));
+        assert!(info.pinned);
+        assert_eq!(
+            info.source_spec.as_deref(),
+            Some("https://github.com/acme/native-pack")
+        );
+        assert_eq!(info.resolved_commit.as_deref(), Some("abc123"));
+        assert_eq!(info.installed_at, Some(1_700_000_000));
+        assert_eq!(info.updated_at, Some(1_700_000_500));
+        assert_eq!(info.trust_tier.as_deref(), Some("acknowledged"));
     }
 
     #[tokio::test]
@@ -2155,6 +2291,64 @@ mod tests {
         let anthropic = list.iter().find(|p| p.id == "anthropic").expect("provider");
         assert_eq!(anthropic.kind, "provider");
         assert_eq!(anthropic.family.as_deref(), Some("anthropic"));
+    }
+
+    /// `assemble_list`/`assemble_detail` fetch `plugin_installs` once and
+    /// index by plugin id (`install_ledger_index`) rather than a per-plugin
+    /// `get_plugin_install` — this is the end-to-end (ControlPlane-backed)
+    /// regression guard for that enrichment, mirroring `serve.rs`'s
+    /// `get_plugin_enrichment_keeps_source_enum_and_adds_source_spec`.
+    #[tokio::test]
+    async fn assemble_list_and_detail_carry_install_ledger_fields() {
+        let cp = test_cp().await;
+        cp.store()
+            .upsert_plugin_install(&ryuzi_core::store::PluginInstallRecord {
+                plugin_id: "anthropic".to_string(),
+                kind: "plugin_pack".to_string(),
+                source_spec: "https://github.com/acme/anthropic-pack".to_string(),
+                resolved_commit: Some("abc123".to_string()),
+                fingerprint: "sha256:deadbeef".to_string(),
+                installed_at: 1_700_000_000,
+                updated_at: 1_700_000_500,
+                pinned: true,
+                pin_reason: Some("manual pin".to_string()),
+                trust_tier: "acknowledged".to_string(),
+                trust_ack_at: Some(1_700_000_000),
+                trust_ack_summary: None,
+            })
+            .await
+            .unwrap();
+
+        let list = assemble_list(&cp).await.unwrap();
+        let anthropic = list.iter().find(|p| p.id == "anthropic").unwrap();
+        assert!(anthropic.pinned);
+        assert_eq!(
+            anthropic.source_spec.as_deref(),
+            Some("https://github.com/acme/anthropic-pack")
+        );
+        assert_eq!(anthropic.resolved_commit.as_deref(), Some("abc123"));
+        assert_eq!(anthropic.installed_at, Some(1_700_000_000));
+        assert_eq!(anthropic.updated_at, Some(1_700_000_500));
+        assert_eq!(anthropic.trust_tier.as_deref(), Some("acknowledged"));
+
+        // A plugin with no ledger row stays at the "never installed via the
+        // tracked git-clone path" defaults.
+        let notion = list.iter().find(|p| p.id == "notion").unwrap();
+        assert!(!notion.pinned);
+        assert!(notion.source_spec.is_none());
+        assert!(notion.trust_tier.is_none());
+
+        let detail = assemble_detail(&cp, "anthropic").await.unwrap();
+        assert!(detail.info.pinned);
+        assert_eq!(
+            detail.info.source_spec.as_deref(),
+            Some("https://github.com/acme/anthropic-pack")
+        );
+        assert_eq!(detail.info.trust_tier.as_deref(), Some("acknowledged"));
+
+        let notion_detail = assemble_detail(&cp, "notion").await.unwrap();
+        assert!(!notion_detail.info.pinned);
+        assert!(notion_detail.info.source_spec.is_none());
     }
 
     // ---------- auth_kind_label / auth_configured ----------

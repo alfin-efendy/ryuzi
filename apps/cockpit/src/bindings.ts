@@ -1537,7 +1537,21 @@ installed: boolean;
  * Provider family head id (providers only) — the Models `providerDetail`
  * navigation target. `None` for other kinds.
  */
-family: string | null }
+family: string | null; 
+/**
+ * Mirrors `crate::store::PluginInstallRecord.pinned` — `false` when the
+ * plugin has no `plugin_installs` ledger row (never installed via the
+ * tracked git-clone path, e.g. builtins/catalog integrations with no
+ * skill-pack install).
+ */
+pinned: boolean; 
+/**
+ * The ledger row's git origin (`PluginInstallRecord.source_spec`).
+ * Distinct from `source` (the stable builtin/catalog/skill-pack enum
+ * label) — the daemon's `/plugins` route (`serve::merge_install_record`)
+ * draws the same distinction.
+ */
+sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null }
 export type PluginInstallBeginResult = { 
 /**
  * `none` | `api-key` | `token` | `oauth`.

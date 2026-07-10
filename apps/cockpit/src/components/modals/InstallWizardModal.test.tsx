@@ -52,6 +52,12 @@ function detailFixture(
       kind: "integration",
       installed: false,
       family: null,
+      pinned: false,
+      sourceSpec: null,
+      resolvedCommit: null,
+      installedAt: null,
+      updatedAt: null,
+      trustTier: null,
     },
     auth: overrides.auth ?? null,
     settings: overrides.settings ?? [],
@@ -170,7 +176,6 @@ beforeEach(() => {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
-    pinnedIds: new Set(),
   });
 });
 
@@ -182,7 +187,6 @@ afterEach(() => {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
-    pinnedIds: new Set(),
   });
 });
 

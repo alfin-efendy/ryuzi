@@ -23,6 +23,19 @@ import { usePlugins } from "@/store-plugins";
 
 const WARN = "#F59E0B";
 
+/** First 8 characters of a resolved git commit SHA — the ledger stores the
+ *  full hash; only a short prefix is useful in the UI (matches `git log
+ *  --oneline`'s convention). */
+function shortCommit(commit: string): string {
+  return commit.slice(0, 8);
+}
+
+/** Localized date for a `plugin_installs` ledger timestamp (unix ms, per
+ *  `PluginInfo.installedAt`/`updatedAt`). */
+function formatLedgerTimestamp(ms: number): string {
+  return new Date(ms).toLocaleDateString();
+}
+
 // One label+input+Save row, shared by the auth credential and every
 // manifest-declared settings field. Values are never pre-filled from the
 // engine (it never sends them back) — only a `valueSet` boolean decides the
@@ -73,16 +86,7 @@ function FieldRow({
 
 export function PluginDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const {
-    setEnabled,
-    load: reloadPlugins,
-    update: updatePlugin,
-    pin: pinPlugin,
-    pinnedIds,
-    doctorFindings,
-    doctorLoaded,
-    loadDoctor,
-  } = usePlugins();
+  const { setEnabled, load: reloadPlugins, update: updatePlugin, pin: pinPlugin, doctorFindings, doctorLoaded, loadDoctor } = usePlugins();
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [authValue, setAuthValue] = useState("");
@@ -192,7 +196,10 @@ export function PluginDetailView({ id }: { id: string }) {
   const { info } = detail;
   const Icon = pluginIcon(info.icon);
   const experimental = info.experimental;
-  const pinned = pinnedIds.has(id);
+  // The source of truth on load is the ledger's persisted `pinned` flag —
+  // `pin()` still paints `usePlugins`' state optimistically before this
+  // view's next `load()` brings back the authoritative value.
+  const pinned = info.pinned;
   // Doctor's `attach-failed` finding is the only signal today for a
   // connector that failed to attach — `PluginDetail` itself carries no
   // attach-status field (see the Task 11 report's DTO-gap note).
@@ -212,8 +219,12 @@ export function PluginDetailView({ id }: { id: string }) {
     await load();
   };
 
-  const onTogglePin = () => {
-    void pinPlugin(id, !pinned, pinned ? undefined : "Pinned from Cockpit");
+  const onTogglePin = async () => {
+    // `pin()` reloads the LIST store; this view's `detail.info.pinned` comes
+    // from a separate `pluginDetail` fetch, so reload it too or the pill/
+    // button would stay on the pre-toggle value until the next navigation.
+    await pinPlugin(id, !pinned, pinned ? undefined : "Pinned from Cockpit");
+    await load();
   };
 
   const scrollToConfigure = () => {
@@ -320,7 +331,7 @@ export function PluginDetailView({ id }: { id: string }) {
                 <RefreshCw aria-hidden size={13} strokeWidth={2} className={updatingPack ? "animate-spin" : undefined} />
                 {updatingPack ? "Updating…" : "Update"}
               </Button>
-              <Button variant="outline" size="sm" onClick={onTogglePin}>
+              <Button variant="outline" size="sm" onClick={() => void onTogglePin()}>
                 {pinned ? <PinOff aria-hidden size={13} strokeWidth={2} /> : <Pin aria-hidden size={13} strokeWidth={2} />}
                 {pinned ? "Unpin" : "Pin"}
               </Button>
@@ -345,6 +356,36 @@ export function PluginDetailView({ id }: { id: string }) {
             </Badge>
           ))}
         </div>
+
+        <Card className="mb-3">
+          <CardHeader>
+            <CardTitle>Provenance</CardTitle>
+          </CardHeader>
+          <CardRow>
+            <span className="w-[100px] shrink-0 text-[13px] font-medium">Source</span>
+            <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">
+              {info.sourceSpec || detail.publisher || info.id}
+            </span>
+          </CardRow>
+          {info.resolvedCommit && (
+            <CardRow>
+              <span className="w-[100px] shrink-0 text-[13px] font-medium">Commit</span>
+              <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{shortCommit(info.resolvedCommit)}</span>
+            </CardRow>
+          )}
+          {info.installedAt != null && (
+            <CardRow>
+              <span className="w-[100px] shrink-0 text-[13px] font-medium">Installed</span>
+              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{formatLedgerTimestamp(info.installedAt)}</span>
+            </CardRow>
+          )}
+          {info.updatedAt != null && (
+            <CardRow>
+              <span className="w-[100px] shrink-0 text-[13px] font-medium">Updated</span>
+              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{formatLedgerTimestamp(info.updatedAt)}</span>
+            </CardRow>
+          )}
+        </Card>
 
         {attachFailure && (
           <Card className="mb-3 flex items-start gap-3 px-[18px] py-3.5">

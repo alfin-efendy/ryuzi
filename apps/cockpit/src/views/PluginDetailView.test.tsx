@@ -23,6 +23,12 @@ const githubDetail: PluginDetail = {
     kind: "integration",
     installed: false,
     family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
   },
   auth: {
     kind: "token",
@@ -58,6 +64,12 @@ const ollamaDetail: PluginDetail = {
     kind: "integration",
     installed: false,
     family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
   },
   auth: null,
   settings: [
@@ -92,6 +104,12 @@ const sandboxDetail: PluginDetail = {
     kind: "integration",
     installed: false,
     family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
   },
   auth: null,
   settings: [],
@@ -100,6 +118,13 @@ const sandboxDetail: PluginDetail = {
   homepage: "https://vercel.com/docs/vercel-sandbox",
   publisher: "Vercel (no MCP surface)",
 };
+
+// Installed via the tracked git-clone path — carries a full
+// `plugin_installs` ledger row, exercising the Provenance block (source,
+// short commit, installed/updated timestamps) and the real (persisted)
+// `pinned` flag the Pin/Unpin action reads and writes.
+const SKILL_PACK_INSTALLED_AT = 1_751_500_800_000; // 2025-07-03T00:00:00.000Z
+const SKILL_PACK_UPDATED_AT = 1_751_587_200_000; // 2025-07-04T00:00:00.000Z
 
 const skillPackDetail: PluginDetail = {
   info: {
@@ -117,6 +142,12 @@ const skillPackDetail: PluginDetail = {
     kind: "skill-pack",
     installed: true,
     family: null,
+    pinned: false,
+    sourceSpec: "https://github.com/acme/pack",
+    resolvedCommit: "deadbeefcafe1234",
+    installedAt: SKILL_PACK_INSTALLED_AT,
+    updatedAt: SKILL_PACK_UPDATED_AT,
+    trustTier: "acknowledged",
   },
   auth: null,
   settings: [],
@@ -142,6 +173,12 @@ const oauthDetail: PluginDetail = {
     kind: "integration",
     installed: false,
     family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
   },
   auth: {
     kind: "oauth",
@@ -164,12 +201,18 @@ const oauthDetail: PluginDetail = {
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 const err = (message: string) => Promise.resolve({ status: "error" as const, error: { message } });
 
+// Mutable so `setPluginPin` below can flip it and a subsequent
+// `pluginDetail("acme-pack")` reload reflects the persisted value —
+// the real behavior being tested (pin toggles the ledger; the view rereads
+// it, it doesn't just paint a session-only flag).
+let acmePackPinned = false;
+
 const pluginDetail = mock((id: string) => {
   if (id === "github") return ok(githubDetail);
   if (id === "ollama") return ok(ollamaDetail);
   if (id === "acme-oauth") return ok(oauthDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
-  if (id === "acme-pack") return ok(skillPackDetail);
+  if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
   return err("unknown plugin");
 });
 const setPluginEnabled = mock((_id: string, _enabled: boolean) => ok(null));
@@ -188,7 +231,10 @@ const pluginsRestartRequired = mock(() => ok(false));
 let doctorFindingsFixture: DoctorFinding[] = [];
 const pluginDoctor = mock(() => ok(doctorFindingsFixture));
 const updatePlugin = mock((_id: string, _force: boolean) => ok({ kind: "updated" as const }));
-const setPluginPin = mock((_id: string, _pinned: boolean, _reason: string | null) => ok(null));
+const setPluginPin = mock((id: string, pinned: boolean, _reason: string | null) => {
+  if (id === "acme-pack") acmePackPinned = pinned;
+  return ok(null);
+});
 const openUrl = mock(async (_url: string) => {});
 const pluginOauthAuthorizeUrlMsgListen = mock(
   async (_cb: (event: { payload: { pluginId: string; authorizeUrl: string } }) => void) => () => {},
@@ -251,6 +297,7 @@ beforeEach(() => {
   updatePlugin.mockClear();
   setPluginPin.mockClear();
   doctorFindingsFixture = [];
+  acmePackPinned = false;
   openUrl.mockClear();
   usePlugins.setState({
     plugins: [],
@@ -258,7 +305,6 @@ beforeEach(() => {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
-    pinnedIds: new Set(),
   });
 });
 
@@ -270,7 +316,6 @@ afterEach(() => {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
-    pinnedIds: new Set(),
   });
 });
 
@@ -279,7 +324,9 @@ test("renders identity, about, and category/status badges from the manifest deta
   await screen.findByText("GitHub");
 
   expect(pluginDetail).toHaveBeenCalledWith("github");
-  expect(screen.getByText("GitHub (official)")).toBeTruthy();
+  // "GitHub (official)" appears as both the header subtitle and (no ledger
+  // row) the Provenance card's publisher-fallback Source value.
+  expect(screen.getAllByText("GitHub (official)").length).toBeGreaterThanOrEqual(1);
   expect(screen.getByText(/Repos, issues, and pull requests/)).toBeTruthy();
   expect(screen.getByText("Verified")).toBeTruthy();
   expect(screen.getByText("vcs")).toBeTruthy();
@@ -403,10 +450,45 @@ test("skill-pack plugins show Update and Pin actions that call updatePlugin/setP
   fireEvent.click(screen.getByRole("button", { name: "Pin" }));
   await waitFor(() => expect(setPluginPin).toHaveBeenCalledWith("acme-pack", true, "Pinned from Cockpit"));
 
-  // The store's `pin()` optimistically tracks the id and re-renders the
-  // pill/button once the command resolves.
+  // Pin toggles the ledger, then this view reloads `pluginDetail` — the
+  // pill/button reflect the REAL persisted `info.pinned`, not a session-only
+  // flag. (Calls so far: mount, post-Update reload, post-Pin reload.)
+  await waitFor(() => expect(pluginDetail).toHaveBeenCalledTimes(3));
   expect(await screen.findByText("Pinned")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Unpin" })).toBeTruthy();
+});
+
+test("pin survives a reload — a fresh pluginDetail fetch reports the persisted pinned flag without any pin() call", async () => {
+  acmePackPinned = true;
+  render(<PluginDetailView id="acme-pack" />);
+  await screen.findByText("Acme Pack");
+
+  expect(screen.getByText("Pinned")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Unpin" })).toBeTruthy();
+  expect(setPluginPin).not.toHaveBeenCalled();
+});
+
+test("renders the Provenance block: source spec, short commit, and installed/updated dates", async () => {
+  render(<PluginDetailView id="acme-pack" />);
+  await screen.findByText("Acme Pack");
+
+  expect(screen.getByText("Provenance")).toBeTruthy();
+  expect(screen.getByText("https://github.com/acme/pack")).toBeTruthy();
+  // Short commit is the first 8 characters of the ledger's full hash.
+  expect(screen.getByText("deadbeef")).toBeTruthy();
+  expect(screen.getByText(new Date(SKILL_PACK_INSTALLED_AT).toLocaleDateString())).toBeTruthy();
+  expect(screen.getByText(new Date(SKILL_PACK_UPDATED_AT).toLocaleDateString())).toBeTruthy();
+});
+
+test("Provenance falls back to the publisher when a plugin has no install ledger row", async () => {
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  expect(screen.getByText("Provenance")).toBeTruthy();
+  // "GitHub (official)" also appears as the header's subtitle — the
+  // Provenance card's Source row falls back to the same publisher string, so
+  // two nodes now carry it.
+  expect(screen.getAllByText("GitHub (official)").length).toBeGreaterThanOrEqual(2);
 });
 
 test("non-skill-pack plugins render no Update/Pin actions", async () => {

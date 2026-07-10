@@ -18,6 +18,12 @@ function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}
     kind: "integration",
     installed: false,
     family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
     ...over,
   };
 }
@@ -68,7 +74,13 @@ const pluginsRestartRequired = mock(async () => ({ status: "ok" as const, data: 
 const pluginDoctor = mock(async () => ({ status: "ok" as const, data: doctorFindingsFixture }));
 const updatePlugin = mock(async (_id: string, _force: boolean) => ({ status: "ok" as const, data: { kind: "updated" as const } }));
 const updateAllPlugins = mock(async () => ({ status: "ok" as const, data: [] as { id: string; outcome: { kind: string } }[] }));
-const setPluginPin = mock(async (_id: string, _pinned: boolean, _reason: string | null) => ({ status: "ok" as const, data: null }));
+// Mutates the fixture list that `listPlugins` reads from, so `pin()`'s
+// internal reload comes back with the real persisted flag — the same
+// authoritative-reload behavior being exercised, not a session-only mock.
+const setPluginPin = mock(async (id: string, pinned: boolean, _reason: string | null) => {
+  pluginsFixture = pluginsFixture.map((p) => (p.id === id ? { ...p, pinned } : p));
+  return { status: "ok" as const, data: null };
+});
 
 const beginSkillInstall = mock(async (_source: string) => ({
   status: "ok" as const,
@@ -224,7 +236,6 @@ function resetPluginsStore() {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
-    pinnedIds: new Set(),
   });
 }
 
@@ -418,6 +429,24 @@ test("an installed skill pack shows Update/Pin actions, which call the store's c
 
   expect(await screen.findByText("Pinned")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Unpin superpowers" })).toBeTruthy();
+});
+
+test("a pinned skill pack's Pinned pill/button reflects info.pinned straight from listPlugins — no pin() call, so it survives a reload", async () => {
+  // Simulates the persisted ledger state coming back on a fresh load (e.g.
+  // after an app restart) rather than through this session's `pin()` call.
+  const pinnedPack = { ...superpowers, installed: true, pinned: true };
+  pluginsFixture = [pinnedPack];
+  await renderView();
+
+  expect(await screen.findByText("Pinned")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Unpin superpowers" })).toBeTruthy();
+  expect(setPluginPin).not.toHaveBeenCalled();
+
+  // A second reload (`usePlugins.load()`, same fixture) keeps it pinned.
+  await act(async () => {
+    await usePlugins.getState().load();
+  });
+  expect(screen.getByText("Pinned")).toBeTruthy();
 });
 
 test("a non-skill-pack installed plugin shows no Update/Pin actions", async () => {

@@ -16,11 +16,6 @@ type PluginsState = {
    *  snapshot instead of triggering their own redundant fetches. */
   doctorFindings: DoctorFinding[];
   doctorLoaded: boolean;
-  /** Packs pinned this session. `PluginInfo`/`PluginDetail` carry no
-   *  persisted `pinned` boolean today (see store-plugins.test.ts and the
-   *  Task 11 report for the gap) — this is an optimistic, session-only
-   *  mirror of `pin()` calls, not a value read back from the engine. */
-  pinnedIds: Set<string>;
   load: () => Promise<void>;
   loadDoctor: () => Promise<void>;
   setEnabled: (id: string, on: boolean) => Promise<void>;
@@ -47,7 +42,6 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   restartRequired: false,
   doctorFindings: [],
   doctorLoaded: false,
-  pinnedIds: new Set(),
 
   load: async () => {
     const res = await commands.listPlugins();
@@ -117,16 +111,14 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   },
 
   pin: async (id, pinned, reason) => {
+    // Optimistic paint (mirrors `setEnabled`) so the toggle feels instant;
+    // the reload below reconciles with the engine's persisted
+    // `plugin_installs.pinned` ledger flag either way — success or error —
+    // so a failed write never leaves a stale optimistic pin behind.
+    set({ plugins: get().plugins.map((p) => (p.id === id ? { ...p, pinned } : p)) });
     const res = await commands.setPluginPin(id, pinned, reason ?? null);
-    if (res.status === "error") {
-      toast.error(`Pin update failed: ${res.error.message}`);
-      return;
-    }
-    const next = new Set(get().pinnedIds);
-    if (pinned) next.add(id);
-    else next.delete(id);
-    set({ pinnedIds: next });
-    toast.success(pinned ? "Pinned" : "Unpinned");
+    if (res.status === "error") toast.error(`Pin update failed: ${res.error.message}`);
+    else toast.success(pinned ? "Pinned" : "Unpinned");
     await get().load();
   },
 }));
