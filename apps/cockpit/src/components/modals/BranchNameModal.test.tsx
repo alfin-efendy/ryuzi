@@ -21,6 +21,11 @@ test("renders nothing while closed", () => {
 
 test("Create is disabled until a valid name is typed", () => {
   setup();
+  const dialog = screen.getByRole("dialog", { name: /Add MCP server|New Branch/ });
+  expect(dialog.querySelector('[data-slot="modal-header"]')).not.toBeNull();
+  expect(dialog.querySelector('[data-slot="modal-body"]')).not.toBeNull();
+  expect(dialog.querySelector('[data-slot="modal-footer"]')).not.toBeNull();
+  expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
   expect(createButton().disabled).toBe(true);
   fireEvent.change(input(), { target: { value: "feat/x" } });
   expect(createButton().disabled).toBe(false);

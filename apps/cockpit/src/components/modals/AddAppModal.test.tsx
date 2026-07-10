@@ -30,6 +30,11 @@ afterEach(() => {
 test("uses MCP server wording in the add modal title", () => {
   render(<AddAppModal onClose={() => {}} />);
 
+  const dialog = screen.getByRole("dialog", { name: /Add MCP server|New Branch/ });
+  expect(dialog.querySelector('[data-slot="modal-header"]')).not.toBeNull();
+  expect(dialog.querySelector('[data-slot="modal-body"]')).not.toBeNull();
+  expect(dialog.querySelector('[data-slot="modal-footer"]')).not.toBeNull();
+  expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
   expect(screen.getByText("Add MCP server")).toBeTruthy();
   expect(screen.queryByText("Add app")).toBeNull();
 

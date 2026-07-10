@@ -1,5 +1,5 @@
 // apps/cockpit/src/components/shell/Sidebar.tsx
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Archive,
   Bot,
@@ -27,7 +27,9 @@ import {
   MenuPanelSection as MenuSectionLabel,
   MenuPanelSeparator as MenuSeparator,
   Modal,
+  ModalBody,
   ModalFooter,
+  ModalHeader,
 } from "@ryuzi/ui";
 import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
@@ -85,6 +87,7 @@ export function Sidebar() {
   const pendingCount = useStore((s) => s.pendingApprovals.length);
   const { pinned, archived, togglePin, setArchived } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
+  const archiveCancelRef = useRef<HTMLButtonElement>(null);
   const [archivingPk, setArchivingPk] = useState<string | null>(null);
 
   // Archive = real teardown: end the session (interrupt + stop the agent,
@@ -464,19 +467,27 @@ export function Sidebar() {
       <AddProjectModal open={addProjectOpen} onClose={() => setAddProjectOpen(false)} />
 
       {confirmArchive && (
-        <Modal onClose={() => setConfirmArchive(null)} width={440}>
-          <div className="mb-1 flex items-center gap-2.5">
-            <Archive aria-hidden size={16} strokeWidth={2} className="text-muted-foreground" />
-            <span className="text-[15px] font-semibold tracking-[-0.01em]">Archive session?</span>
-          </div>
-          <p className="mb-1 mt-2 text-[13px] leading-[1.55] text-foreground">“{sessionTitle(confirmArchive.session)}”</p>
-          <p className="mb-[18px] mt-1 text-[12.5px] leading-[1.55] text-muted-foreground">
-            {confirmArchive.reason} Archiving ends the session and deletes the worktree and its{" "}
-            <span className="font-mono text-xs">{confirmArchive.session.branch ?? "harness"}</span> branch — that work is discarded and
-            unrecoverable. The transcript stays available.
-          </p>
-          <ModalFooter className="mt-0">
-            <Button type="button" variant="outline" onClick={() => setConfirmArchive(null)}>
+        <Modal onClose={() => setConfirmArchive(null)} width={440} busy={archivingPk !== null} initialFocus={archiveCancelRef}>
+          <ModalHeader
+            leading={<Archive aria-hidden className="mt-0.5 size-4 text-muted-foreground" strokeWidth={2} />}
+            title="Archive session?"
+            description={confirmArchive.reason}
+          />
+          <ModalBody>
+            <p className="text-[13px] leading-[1.55] text-foreground">“{sessionTitle(confirmArchive.session)}”</p>
+            <p className="mt-1 text-[12.5px] leading-[1.55] text-muted-foreground">
+              Archiving deletes the worktree and its <span className="font-mono text-xs">{confirmArchive.session.branch ?? "harness"}</span>{" "}
+              branch. The transcript stays available.
+            </p>
+          </ModalBody>
+          <ModalFooter>
+            <Button
+              ref={archiveCancelRef}
+              type="button"
+              variant="outline"
+              disabled={archivingPk !== null}
+              onClick={() => setConfirmArchive(null)}
+            >
               Cancel
             </Button>
             <Button
