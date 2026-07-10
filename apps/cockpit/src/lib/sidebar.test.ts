@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Project, Session } from "../bindings";
-import { archivedCount, orderProjects, sessionTitle, sessionsForProject } from "./sidebar";
+import { archivedCount, isUnreadVisible, orderProjects, sessionTitle, sessionsForProject } from "./sidebar";
 
 function sess(pk: string, projectId: string, title: string | null, lastActive = 0): Session {
   return {
@@ -57,5 +57,43 @@ describe("sidebar sessions", () => {
     const projects = [{ projectId: "z", name: "zeta" } as Project, { projectId: "a", name: "alpha" } as Project];
     expect(orderProjects(projects, "updated").map((p) => p.projectId)).toEqual(["z", "a"]);
     expect(orderProjects(projects, "name").map((p) => p.projectId)).toEqual(["a", "z"]);
+  });
+});
+
+// Distinct from the `sess` helper above (different field defaults); named to
+// avoid colliding with it while matching the read-state brief fixtures.
+function unreadSess(pk: string, lastActive: number | null): Session {
+  return {
+    sessionPk: pk,
+    projectId: "p",
+    agentSessionId: null,
+    worktreePath: null,
+    branch: null,
+    title: pk,
+    status: "idle",
+    startedBy: null,
+    createdAt: 0,
+    lastActive,
+    resumeAttempts: 0,
+    branchOwned: false,
+  };
+}
+
+describe("isUnreadVisible", () => {
+  test("unread when lastActive is newer than the cursor", () => {
+    expect(isUnreadVisible(unreadSess("s1", 500), { s1: 100 }, null)).toBe(true);
+  });
+  test("read when lastActive is at or before the cursor", () => {
+    expect(isUnreadVisible(unreadSess("s1", 100), { s1: 100 }, null)).toBe(false);
+    expect(isUnreadVisible(unreadSess("s1", 50), { s1: 100 }, null)).toBe(false);
+  });
+  test("absent cursor is not unread", () => {
+    expect(isUnreadVisible(unreadSess("s1", 500), {}, null)).toBe(false);
+  });
+  test("null lastActive is not unread", () => {
+    expect(isUnreadVisible(unreadSess("s1", null), { s1: 0 }, null)).toBe(false);
+  });
+  test("the focused session is never unread", () => {
+    expect(isUnreadVisible(unreadSess("s1", 500), { s1: 100 }, "s1")).toBe(false);
   });
 });

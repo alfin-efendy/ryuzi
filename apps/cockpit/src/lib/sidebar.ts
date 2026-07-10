@@ -43,3 +43,16 @@ export function sessionsForProject(
 export function archivedCount(sessions: Session[], projectId: string, archived: Record<string, true>): number {
   return sessions.filter((s) => s.projectId === projectId && archived[s.sessionPk]).length;
 }
+
+/** A session has unseen activity iff its last-active timestamp is newer than
+ *  the stored read cursor. Absent cursor → not unread (seeded on first sight);
+ *  the currently-focused session is never unread — you are looking at it. */
+export function isUnreadVisible(
+  session: Session,
+  readAt: Record<string, number>,
+  focusedSessionPk: string | null,
+): boolean {
+  if (session.sessionPk === focusedSessionPk) return false;
+  const cursor = readAt[session.sessionPk];
+  return cursor != null && session.lastActive != null && session.lastActive > cursor;
+}
