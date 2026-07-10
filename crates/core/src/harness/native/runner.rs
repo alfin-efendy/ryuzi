@@ -254,7 +254,8 @@ async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::R
         return Ok(());
     }
     let model = deps.model.clone().unwrap_or_default();
-    match cm.compact(&deps.llm, &model, "manual").await {
+    let cmodel = super::llm::aux_model(&deps.store, "compaction", &model).await;
+    match cm.compact(&deps.llm, &cmodel, "manual").await {
         Ok(outcome) => {
             emit_compaction(deps, "manual", &outcome, true).await;
             // Display-only: `compact()` never calls `commit_response()`, so
@@ -377,7 +378,12 @@ async fn maybe_generate_title(deps: &RunnerDeps, first_prompt: &str) {
         Ok(Some(session)) if session.title.is_none() => {}
         _ => return, // no session row, or already titled
     }
-    let model = deps.model.clone().unwrap_or_default();
+    let model = super::llm::aux_model(
+        &deps.store,
+        "title",
+        &deps.model.clone().unwrap_or_default(),
+    )
+    .await;
     if model.is_empty() {
         return;
     }
@@ -489,7 +495,8 @@ async fn drive(
             } else {
                 "mid_turn"
             };
-            match cm.compact(&deps.llm, &model, trigger).await {
+            let cmodel = super::llm::aux_model(&deps.store, "compaction", &model).await;
+            match cm.compact(&deps.llm, &cmodel, trigger).await {
                 Ok(outcome) => emit_compaction(deps, trigger, &outcome, display.text()).await,
                 Err(e) => {
                     tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
