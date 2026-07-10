@@ -7,14 +7,6 @@
 # reason = "dev-only dependency; upstream fix tracked in <issue link>"
 
 [[IgnoredVulns]]
-id = "RUSTSEC-2026-0002"
-reason = "lru 0.12.x IterMut soundness; lru is pinned to ^0.12 by ratatui 0.29 (CLI TUI). Not upgradable until ratatui bumps; dependabot reports security_update_not_possible. Revisit on ratatui upgrade."
-
-[[IgnoredVulns]]
-id = "GHSA-rhfx-m35p-ff5j"
-reason = "GHSA alias of RUSTSEC-2026-0002 (lru IterMut soundness) — same acceptance."
-
-[[IgnoredVulns]]
 id = "GHSA-82j2-j2ch-gfr8"
 reason = "rustls-webpki <0.103.13 DoS panic on malformed CRL. Only reachable when CRL revocation checking is explicitly enabled, which ryuzi never does. Transitively pinned on main by PR #32 deps; dependabot reports security_update_not_possible. Revisit when the parent unpins."
 
@@ -72,7 +64,7 @@ reason = "glib 0.18 pinned by the same GTK3 stack as the other Tauri v2/wry Linu
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
-reason = "paste is an unmaintained transitive proc-macro crate; no vulnerable runtime path; revisit on parent upgrades. Tracked in #40."
+reason = "paste is an unmaintained transitive proc-macro crate pinned by specta 2.0.0-rc.x; no vulnerable runtime path; revisit on specta upgrades. Tracked in #40."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0370"
