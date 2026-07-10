@@ -6,9 +6,8 @@ project_name: ryuzi
 # but NO Apple framework stubs, and keyring (OS keychain, #57) links
 # Security.framework + CoreFoundation, so zigbuild-linked darwin binaries die
 # at link time with "undefined symbol: _SecKeychain*" (killed the v0.5.0
-# goreleaser job). The release workflow installs zig + cargo-zigbuild and
-# embeds the freshly built sidecar manifest into crates/core BEFORE goreleaser
-# runs; goreleaser itself runs `rustup target add` per declared target.
+# goreleaser job). The release workflow installs zig + cargo-zigbuild;
+# goreleaser itself runs `rustup target add` per declared target.
 
 builds:
   - id: ryuzi

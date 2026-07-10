@@ -1,3 +1,0 @@
-# Ignore locally built sidecar binaries; keep only this file tracked.
-*
-!.gitignore

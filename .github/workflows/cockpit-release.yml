@@ -71,19 +71,6 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
-      # The tracked crates/core/sidecar.manifest.json pins release_tag v0.0.0;
-      # shipping it means every sidecar download from a released Cockpit 404s.
-      # The `sidecar` job in release.yml uploads the real manifest.json as a
-      # release asset before this workflow runs (and it stays there for manual
-      # re-dispatches), so embed it from the release itself.
-      - name: Embed the release sidecar manifest (pins adapter version + sha256)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
-            --pattern manifest.json --output crates/core/sidecar.manifest.json --clobber
-          cat crates/core/sidecar.manifest.json
       # Absent secrets evaluate to "" but the env var is still SET, and Tauri
       # keys "should I sign?" on presence alone — it then feeds the empty cert
       # to `security import`, which fails the build. Export the signing env

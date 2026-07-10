@@ -49,35 +49,8 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-  sidecar:
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
-      - run: bun install --frozen-lockfile
-      - run: >
-          bun scripts/build-acp-sidecar.ts --bundle --all-targets
-          --manifest dist/sidecar/manifest.json
-          --release-tag "${{ needs.release-please.outputs.tag_name }}"
-      - name: Upload sidecar assets to the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/sidecar/* --clobber
-      - name: Hand the manifest to the goreleaser job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: sidecar-manifest
-          path: dist/sidecar/manifest.json
-          retention-days: 1
-
   goreleaser:
-    needs: [release-please, sidecar]
+    needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
     # macos-latest: the ONLY host that can link the darwin targets (needs the
     # macOS SDK); the 4 linux targets cross-compile mac->linux via zigbuild.
@@ -94,20 +67,9 @@ jobs:
         with:
           version: 0.13.0
       - run: cargo install --locked cargo-zigbuild
-      - name: Embed the release sidecar manifest (pins adapter version + sha256 into the binaries)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: sidecar-manifest
-          path: /tmp/sidecar
-      - run: cp /tmp/sidecar/manifest.json crates/core/sidecar.manifest.json
-      - name: Validate the injected manifest parses (same serde path the binary uses)
-        run: cargo test -p ryuzi-core sidecar
-      # The step above deliberately overwrites the TRACKED crates/core/sidecar.manifest.json,
-      # which leaves the git tree dirty. `goreleaser release --clean` (without --skip=validate)
-      # refuses to run against a dirty tree AND cross-checks the current commit's tag, but this
-      # job only ever runs on the release-please merge commit, so we lose little by skipping
-      # that validation — the manifest correctness itself is already gated by the cargo test
-      # step above, which exercises the exact serde path the released binaries use.
+      # `--skip=validate` (on the goreleaser step below) is kept deliberately:
+      # this job only runs on the release-please merge commit, where goreleaser's
+      # tag cross-check adds nothing but flake surface.
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
@@ -215,11 +177,9 @@ jobs:
   # Cockpit rides the same vX.Y.Z release as the CLI ("one release" model):
   # installers are built from the release tag (whose tree carries the cockpit
   # version release-please stamped into tauri.conf.json) and uploaded onto the
-  # CLI release. Needs `sidecar` so manifest.json is already a release asset —
-  # cockpit-release.yml embeds it (the tracked manifest pins v0.0.0 and would
-  # 404 every sidecar download from a released Cockpit).
+  # CLI release.
   cockpit:
-    needs: [release-please, sidecar]
+    needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
     permissions:
       contents: write
@@ -229,8 +189,9 @@ jobs:
     secrets: inherit
 
   # The release is only "done" when every artifact family is present — a
-  # partial upload (like v0.4.0: sidecar only, no CLI binaries, no installers)
-  # must fail loudly here instead of shipping silently. Also appends the
+  # partial upload (like v0.4.0, which died mid-pipeline with only some
+  # artifact families uploaded) must fail loudly here instead of shipping
+  # silently. Also appends the
   # Cockpit section to the release notes (release-please only writes the CLI
   # changelog into the release body).
   finalize:
@@ -257,7 +218,6 @@ jobs:
             'ryuzi-.+-x86_64-apple-darwin\.tar\.gz' \
             'ryuzi-.+-aarch64-apple-darwin\.tar\.gz' \
             '^checksums\.txt$' \
-            '^manifest\.json$' \
             '-setup\.exe$' \
             '\.dmg$' \
             '\.deb$' \
