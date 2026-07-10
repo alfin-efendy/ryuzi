@@ -5,7 +5,7 @@
 //! until the proxy rewrite in Tasks 15-16.
 
 use super::{ok, params, ApiError};
-use crate::domain::{Message, NewMessage, NewProviderTurn, Session, SessionStatus};
+use crate::domain::{Message, NewMessage, NewProviderTurn, Session, SessionKind, SessionStatus};
 use crate::paths::{new_id, now_ms};
 use crate::serve::ApiState;
 use crate::store::Store;
@@ -104,7 +104,7 @@ async fn apply_import(
 ) -> anyhow::Result<Session> {
     let session = Session {
         session_pk: new_id(),
-        project_id: project_id.to_string(),
+        project_id: Some(project_id.to_string()),
         agent_session_id: None,
         worktree_path: None,
         branch: None,
@@ -116,6 +116,10 @@ async fn apply_import(
         resume_attempts: 0,
         // Imported sessions never own a branch to clean up on end.
         branch_owned: false,
+        kind: SessionKind::Project,
+        speaker: None,
+        agent: None,
+        parent_session_pk: None,
     };
     store.insert_session(session.clone()).await?;
     for m in export.messages {
@@ -270,7 +274,7 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
-                project_id: "p".into(),
+                project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -281,6 +285,10 @@ mod tests {
                 last_active: Some(0),
                 resume_attempts: 0,
                 branch_owned: false,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();

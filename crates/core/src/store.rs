@@ -1,6 +1,6 @@
 use crate::domain::{
-    Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionStatus,
-    Surface, ToolPolicyRow,
+    Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionKind,
+    SessionStatus, Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -512,6 +512,45 @@ fn migrations() -> Migrations<'static> {
             DROP TABLE plugin_oauth_clients;\
             ALTER TABLE plugin_oauth_clients_rebuild RENAME TO plugin_oauth_clients;",
         ),
+        // Chat-first sessions (design: docs/superpowers/specs/
+        // 2026-07-11-chat-first-sessions-design.md, Phase 2 Task A1):
+        // sessions.project_id becomes nullable (chat/worker/review sessions
+        // aren't bound to a project) and gains `kind` + `speaker`/`agent`/
+        // `parent_session_pk` lineage columns. SQLite can't drop a NOT NULL
+        // constraint in place, so rebuild the table: create the new shape,
+        // copy every existing column, drop, rename. Existing rows all get
+        // kind='project' with null lineage columns — correct, they were all
+        // project sessions before this migration.
+        M::up(
+            r#"
+            CREATE TABLE sessions_new (
+                session_pk TEXT PRIMARY KEY,
+                project_id TEXT,
+                agent_session_id TEXT,
+                worktree_path TEXT,
+                branch TEXT,
+                title TEXT,
+                status TEXT NOT NULL DEFAULT 'idle',
+                created_at INTEGER,
+                last_active INTEGER,
+                started_by TEXT,
+                resume_attempts INTEGER NOT NULL DEFAULT 0,
+                branch_owned INTEGER NOT NULL DEFAULT 1,
+                kind TEXT NOT NULL DEFAULT 'project',
+                speaker TEXT,
+                agent TEXT,
+                parent_session_pk TEXT
+            );
+            INSERT INTO sessions_new
+                (session_pk, project_id, agent_session_id, worktree_path, branch, title,
+                 status, created_at, last_active, started_by, resume_attempts, branch_owned)
+            SELECT session_pk, project_id, agent_session_id, worktree_path, branch, title,
+                   status, created_at, last_active, started_by, resume_attempts, branch_owned
+            FROM sessions;
+            DROP TABLE sessions;
+            ALTER TABLE sessions_new RENAME TO sessions;
+            "#,
+        ),
     ])
 }
 
@@ -951,12 +990,13 @@ impl Store {
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,kind,speaker,agent,parent_session_pk) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
                     s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
-                    s.started_by, s.resume_attempts, s.branch_owned
+                    s.started_by, s.resume_attempts, s.branch_owned,
+                    s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk
                 ],
             )
         })
@@ -1006,6 +1046,21 @@ impl Store {
                 .query_map(params![status], row_to_session)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
+        })
+        .await
+    }
+
+    /// List sessions of a given `kind` (`"project"|"chat"|"worker"|"review"`),
+    /// most-recently-created first — used by chat-first surfaces that only
+    /// care about one session kind at a time.
+    pub async fn list_sessions_by_kind(&self, kind: &str) -> anyhow::Result<Vec<Session>> {
+        let kind = kind.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SESSION_COLS} FROM sessions WHERE kind=?1 ORDER BY created_at DESC"
+            ))?;
+            let rows = stmt.query_map([kind], row_to_session)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .await
     }
@@ -1932,10 +1987,11 @@ impl Store {
 }
 
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,kind,speaker,agent,parent_session_pk";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     let status: String = r.get(6)?;
+    let kind: String = r.get(12)?;
     Ok(Session {
         session_pk: r.get(0)?,
         project_id: r.get(1)?,
@@ -1949,6 +2005,10 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
         started_by: r.get(9)?,
         resume_attempts: r.get(10)?,
         branch_owned: r.get(11)?,
+        kind: SessionKind::from_db(&kind),
+        speaker: r.get(13)?,
+        agent: r.get(14)?,
+        parent_session_pk: r.get(15)?,
     })
 }
 
@@ -2070,7 +2130,7 @@ mod tests {
     fn sample_session() -> Session {
         Session {
             session_pk: "s1".into(),
-            project_id: "p1".into(),
+            project_id: Some("p1".into()),
             agent_session_id: None,
             worktree_path: Some("/tmp/wt".into()),
             branch: Some("harness/abcdef01".into()),
@@ -2081,6 +2141,10 @@ mod tests {
             last_active: Some(1),
             resume_attempts: 0,
             branch_owned: true,
+            kind: SessionKind::Project,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         }
     }
 
@@ -2304,6 +2368,50 @@ mod tests {
             !got.branch_owned,
             "user-named branches persist as not-owned"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_session_persists_with_null_project() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(crate::domain::Session {
+                session_pk: "chat-1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("hello".into()),
+                status: crate::domain::SessionStatus::Idle,
+                started_by: Some("cockpit".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        let got = store.get_session("chat-1").await.unwrap().unwrap();
+        assert_eq!(got.project_id, None);
+        assert_eq!(got.kind, crate::domain::SessionKind::Chat);
+        // list_sessions(None) still returns it; project filter excludes it.
+        assert!(store
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.session_pk == "chat-1"));
+        assert!(store
+            .list_sessions_by_kind("chat")
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.session_pk == "chat-1"));
     }
 
     #[tokio::test]
@@ -2926,21 +3034,26 @@ mod tests {
     #[tokio::test]
     async fn migration_13_rewrites_claude_code_defaults_to_native() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back seven so the
+        // DB, seed the old values, then wind user_version back eight so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
         // CREATE TABLE IF NOT EXISTS; 17 context_checkpoints + session_context —
         // CREATE TABLE IF NOT EXISTS; 18 plugin_oauth_clients — CREATE TABLE
         // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
-        // copy-drop-rename; all no-ops on replay) re-run on the next open.
+        // copy-drop-rename; 20 sessions rebuild (nullable project_id + kind/
+        // speaker/agent/parent_session_pk) — copies every existing column
+        // forward, so it's also a no-op on replay) re-run on the next open.
         // `Migrations` always fast-forwards to the latest defined version,
         // so there is no way to replay 13 alone once something is appended
-        // after it.
+        // after it. Bump this offset by one for every migration appended
+        // after 13 — a stale offset silently skips migration 13 (the DB
+        // opens fine, but this test starts failing its assertions, as
+        // migration 20 did until this comment/offset were updated with it).
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 7)
+            c.pragma_update(None, "user_version", v - 8)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();

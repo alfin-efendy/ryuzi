@@ -142,7 +142,7 @@ impl Harness for NativeHarness {
         // project; without a session row (bare tests) both features are
         // simply off, keeping runs hermetic.
         let session_row = ctx.store.get_session(&ctx.session_pk).await.ok().flatten();
-        let project_id = session_row.as_ref().map(|s| s.project_id.clone());
+        let project_id = session_row.as_ref().and_then(|s| s.project_id.clone());
         let memory_store = project_id
             .as_deref()
             .map(|pid| Arc::new(memory::MemoryStore::at_default(Some(pid))));

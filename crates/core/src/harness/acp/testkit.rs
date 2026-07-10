@@ -1552,7 +1552,7 @@ pub async fn run_perm_mock_via_harness(
     use std::sync::Arc;
 
     use crate::approval::ApprovalHub;
-    use crate::domain::{CoreEvent, PermMode, Project, Session, SessionStatus};
+    use crate::domain::{CoreEvent, PermMode, Project, Session, SessionKind, SessionStatus};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
     use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
@@ -1579,7 +1579,7 @@ pub async fn run_perm_mock_via_harness(
     let session_pk = "perm-bridge-session-pk".to_string();
     let session = Session {
         session_pk: session_pk.clone(),
-        project_id: project_id.to_string(),
+        project_id: Some(project_id.to_string()),
         agent_session_id: None,
         worktree_path: None,
         branch: None,
@@ -1590,6 +1590,10 @@ pub async fn run_perm_mock_via_harness(
         last_active: None,
         resume_attempts: 0,
         branch_owned: true,
+        kind: SessionKind::Project,
+        speaker: None,
+        agent: None,
+        parent_session_pk: None,
     };
     store.insert_session(session).await.unwrap();
 

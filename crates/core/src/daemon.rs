@@ -591,7 +591,7 @@ pub(crate) async fn handle_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{NewMessage, PermMode, Project, Session, SessionStatus};
+    use crate::domain::{NewMessage, PermMode, Project, Session, SessionKind, SessionStatus};
     use crate::gateway::MessageRef;
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::telemetry::NoopTelemetry;
@@ -666,7 +666,7 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: session_pk.to_string(),
-                project_id: project_id.to_string(),
+                project_id: Some(project_id.to_string()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -677,6 +677,10 @@ mod tests {
                 last_active: Some(now),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
@@ -1470,7 +1474,7 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
-                project_id: "p1".into(),
+                project_id: Some("p1".into()),
                 agent_session_id: Some("acp-123".into()),
                 worktree_path: None,
                 branch: None,
@@ -1481,6 +1485,10 @@ mod tests {
                 last_active: Some(now),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();

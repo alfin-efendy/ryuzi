@@ -1,6 +1,7 @@
 use super::*;
 use crate::domain::{
-    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionStatus,
+    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionKind,
+    SessionStatus,
 };
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::now_ms;
@@ -613,7 +614,7 @@ async fn seed_session(
     store
         .insert_session(Session {
             session_pk: session_pk.to_string(),
-            project_id: project_id.to_string(),
+            project_id: Some(project_id.to_string()),
             agent_session_id: agent_session_id.map(|s| s.to_string()),
             worktree_path: None,
             branch: None,
@@ -624,6 +625,10 @@ async fn seed_session(
             last_active: Some(now),
             resume_attempts: 0,
             branch_owned: true,
+            kind: SessionKind::Project,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         })
         .await
         .unwrap();
@@ -1367,7 +1372,7 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
     let session_pk = crate::paths::new_id();
     let session = Session {
         session_pk: session_pk.clone(),
-        project_id: project.project_id.clone(),
+        project_id: Some(project.project_id.clone()),
         agent_session_id: None,
         worktree_path: None,
         branch: None,
@@ -1378,6 +1383,10 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         last_active: Some(now_ms()),
         resume_attempts: 0,
         branch_owned: false,
+        kind: SessionKind::Project,
+        speaker: None,
+        agent: None,
+        parent_session_pk: None,
     };
     store.insert_session(session).await.unwrap();
 

@@ -3,7 +3,9 @@
 
 use super::{ControlPlane, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
-use crate::domain::{AttachmentRef, CoreEvent, Project, Session, SessionGitOptions, SessionStatus};
+use crate::domain::{
+    AttachmentRef, CoreEvent, Project, Session, SessionGitOptions, SessionKind, SessionStatus,
+};
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::settings::SettingsStore;
@@ -96,7 +98,7 @@ impl ControlPlane {
         // of any git options passed.
         let session = Session {
             session_pk: session_pk.clone(),
-            project_id: project.project_id.clone(),
+            project_id: Some(project.project_id.clone()),
             agent_session_id: None,
             worktree_path: None,
             branch: if project.is_git {
@@ -111,6 +113,10 @@ impl ControlPlane {
             last_active: Some(now),
             resume_attempts: 0,
             branch_owned: project.is_git && git.create_branch && git.branch_name.is_none(),
+            kind: SessionKind::Project,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         };
         self.store.insert_session(session.clone()).await?;
         let _ = self.events.send(CoreEvent::SessionCreated {
@@ -206,13 +212,14 @@ impl ControlPlane {
                 // app restart). Start a FRESH session that resumes the prior
                 // conversation via `session/load` using the persisted agent id.
                 let resume = async {
+                    let project_id = session.project_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("session {session_pk} has no bound project")
+                    })?;
                     let project = self
                         .store
-                        .get_project(&session.project_id)
+                        .get_project(project_id)
                         .await?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("unknown project: {}", session.project_id)
-                        })?;
+                        .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
                     let work_dir = session
                         .worktree_path
                         .clone()
@@ -248,8 +255,10 @@ impl ControlPlane {
         // effect NOW — without this the warm handle keeps whatever mode it
         // started with (ACP delegates permission externally, so its default
         // no-op set_perm_mode simply does nothing).
-        if let Ok(Some(project)) = self.store.get_project(&session.project_id).await {
-            handle.set_perm_mode(project.perm_mode);
+        if let Some(project_id) = session.project_id.as_deref() {
+            if let Ok(Some(project)) = self.store.get_project(project_id).await {
+                handle.set_perm_mode(project.perm_mode);
+            }
         }
         let prepared = self
             .prepare_attachments(session_pk, &prompt.agent, attachments)
@@ -501,7 +510,10 @@ impl ControlPlane {
         let Some(session) = self.store.get_session(session_pk).await? else {
             return Ok(());
         };
-        let Some(project) = self.store.get_project(&session.project_id).await? else {
+        let Some(project_id) = session.project_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(project) = self.store.get_project(project_id).await? else {
             return Ok(());
         };
         if session.agent_session_id.is_none() {
@@ -840,7 +852,10 @@ impl ControlPlane {
             let _ = handle.end().await;
         }
         if let Some(session) = self.store.get_session(session_pk).await? {
-            if let Some(project) = self.store.get_project(&session.project_id).await? {
+            if let Some(project) = match session.project_id.as_deref() {
+                Some(project_id) => self.store.get_project(project_id).await?,
+                None => None,
+            } {
                 if let Some(wt) = &session.worktree_path {
                     let short: String = session_pk.chars().take(8).collect();
                     // Delete the branch only when the engine generated its

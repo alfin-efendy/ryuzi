@@ -40,9 +40,13 @@ pub(crate) async fn session_root(cp: &ControlPlane, session_pk: &str) -> anyhow:
             return Ok(PathBuf::from(wt));
         }
     }
+    let project_id = session
+        .project_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("session {session_pk} has no bound project"))?;
     let project = cp
         .store()
-        .get_project(&session.project_id)
+        .get_project(project_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("unknown project"))?;
     Ok(PathBuf::from(project.workdir))

@@ -704,15 +704,16 @@ impl Harness for AcpHarness {
         });
 
         // Resolve the project_id for per-project policy lookups. If the session
-        // is not found (e.g. in tests that don't pre-seed the store), fall back
-        // to an empty string — the lookup will simply return None.
+        // is not found (e.g. in tests that don't pre-seed the store) or is a
+        // chat-first session with no bound project, fall back to an empty
+        // string — the lookup will simply return None.
         let project_id = ctx
             .store
             .get_session(&ctx.session_pk)
             .await
             .ok()
             .flatten()
-            .map(|s| s.project_id)
+            .and_then(|s| s.project_id)
             .unwrap_or_default();
 
         let perm = PermissionContext {

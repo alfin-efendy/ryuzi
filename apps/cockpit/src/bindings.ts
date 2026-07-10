@@ -1549,13 +1549,40 @@ export type RuntimeInfo = { id: string; name: string; color: string; initial: st
  */
 runnable: boolean }
 export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
-export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
+export type Session = { sessionPk: string; 
+/**
+ * `None` for chat-first sessions (`kind != Project`); a project-bound
+ * session always has this set.
+ */
+projectId: string | null; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
 /**
  * True when the engine auto-generated the branch name (`harness/{short}`).
  * `end_session` deletes the branch ONLY when this is set; user-named and
  * pre-existing branches survive teardown.
  */
-branchOwned: boolean }
+branchOwned: boolean; kind: SessionKind; 
+/**
+ * Who is speaking in this session (chat-first; e.g. a Discord user id
+ * or `"cockpit"`). Unused for `Project` sessions.
+ */
+speaker: string | null; 
+/**
+ * Which agent persona/config is driving this session. Unused for
+ * `Project` sessions.
+ */
+agent: string | null; 
+/**
+ * The session this one was spawned from (`Worker`/`Review` lineage).
+ */
+parentSessionPk: string | null }
+/**
+ * What a session represents. `Project` is the pre-Phase-2 default (bound to
+ * a project workdir); `Chat`, `Worker`, and `Review` are chat-first kinds
+ * added in Phase 2 — `project_id` is `None` for all three, and `Worker`/
+ * `Review` additionally carry `parent_session_pk` lineage back to the chat
+ * or project session that spawned them.
+ */
+export type SessionKind = "project" | "chat" | "worker" | "review"
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 

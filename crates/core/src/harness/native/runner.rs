@@ -343,7 +343,8 @@ async fn refresh_turn_model(deps: &RunnerDeps) -> RunnerDeps {
 
 /// `Some(project.model)` when the session's project row is reachable — the
 /// inner Option is the pin itself, which may legitimately be unset. `None`
-/// when there is no session/project row to read.
+/// when there is no session/project row to read, or the session has no
+/// bound project (chat-first sessions).
 async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
     let session = deps
         .store
@@ -353,7 +354,7 @@ async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
         .flatten()?;
     let project = deps
         .store
-        .get_project(&session.project_id)
+        .get_project(&session.project_id?)
         .await
         .ok()
         .flatten()?;
@@ -1623,7 +1624,7 @@ mod tests {
     /// per-turn snapshot has rows to read while title generation stays off
     /// (an untitled session row would consume an extra scripted LLM turn).
     async fn seed_pinned_project(store: &Store, model: Option<&str>) {
-        use crate::domain::{Project, Session, SessionStatus};
+        use crate::domain::{Project, Session, SessionKind, SessionStatus};
         store
             .insert_project(Project {
                 project_id: "p".into(),
@@ -1642,7 +1643,7 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
-                project_id: "p".into(),
+                project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -1653,6 +1654,10 @@ mod tests {
                 last_active: Some(0),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
@@ -2938,7 +2943,7 @@ mod tests {
 
     #[tokio::test]
     async fn generates_a_title_for_a_fresh_session() {
-        use crate::domain::{Project, Session, SessionStatus};
+        use crate::domain::{Project, Session, SessionKind, SessionStatus};
         let dir = tempfile::tempdir().unwrap();
         // Turn 0: the actual reply. Turn 1: the title generation.
         let main = vec![
@@ -2973,7 +2978,7 @@ mod tests {
         deps.store
             .insert_session(Session {
                 session_pk: "s1".into(),
-                project_id: "p".into(),
+                project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -2984,6 +2989,10 @@ mod tests {
                 last_active: Some(0),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();

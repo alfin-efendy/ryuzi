@@ -74,11 +74,46 @@ pub struct Project {
     pub is_git: bool,
 }
 
+/// What a session represents. `Project` is the pre-Phase-2 default (bound to
+/// a project workdir); `Chat`, `Worker`, and `Review` are chat-first kinds
+/// added in Phase 2 — `project_id` is `None` for all three, and `Worker`/
+/// `Review` additionally carry `parent_session_pk` lineage back to the chat
+/// or project session that spawned them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionKind {
+    Project,
+    Chat,
+    Worker,
+    Review,
+}
+
+impl SessionKind {
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "chat" => SessionKind::Chat,
+            "worker" => SessionKind::Worker,
+            "review" => SessionKind::Review,
+            _ => SessionKind::Project,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionKind::Project => "project",
+            SessionKind::Chat => "chat",
+            SessionKind::Worker => "worker",
+            SessionKind::Review => "review",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub session_pk: String,
-    pub project_id: String,
+    /// `None` for chat-first sessions (`kind != Project`); a project-bound
+    /// session always has this set.
+    pub project_id: Option<String>,
     pub agent_session_id: Option<String>,
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
@@ -92,6 +127,15 @@ pub struct Session {
     /// `end_session` deletes the branch ONLY when this is set; user-named and
     /// pre-existing branches survive teardown.
     pub branch_owned: bool,
+    pub kind: SessionKind,
+    /// Who is speaking in this session (chat-first; e.g. a Discord user id
+    /// or `"cockpit"`). Unused for `Project` sessions.
+    pub speaker: Option<String>,
+    /// Which agent persona/config is driving this session. Unused for
+    /// `Project` sessions.
+    pub agent: Option<String>,
+    /// The session this one was spawned from (`Worker`/`Review` lineage).
+    pub parent_session_pk: Option<String>,
 }
 
 /// How a new session's git workspace is prepared (branch controls).
