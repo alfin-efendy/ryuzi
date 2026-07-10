@@ -293,6 +293,23 @@ mod cost_tests {
             0.0
         );
     }
+
+    #[test]
+    fn a_known_vendored_model_has_nonzero_rates() {
+        // After the snapshot regen, a mainstream priced model resolves with
+        // real rates. anthropic's sonnet is a stable entry in models.dev.
+        let m = super::vendored()
+            .iter()
+            .find(|(k, _)| k.contains("claude") && k.contains("sonnet"))
+            .map(|(_, m)| *m)
+            .expect("a claude sonnet entry in the vendored snapshot");
+        assert!(
+            m.cost_input > 0.0,
+            "expected non-zero input rate, got {}",
+            m.cost_input
+        );
+        assert!(m.cost_output > 0.0);
+    }
 }
 
 #[cfg(test)]

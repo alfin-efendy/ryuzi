@@ -5,6 +5,10 @@ type Meta = {
   max_output_tokens: number;
   supports_prompt_cache: boolean;
   supports_reasoning: boolean;
+  cost_input: number;
+  cost_output: number;
+  cost_cache_read: number;
+  cost_cache_write: number;
 };
 
 const api = (await (await fetch("https://models.dev/api.json")).json()) as Record<string, { models?: Record<string, any> }>;
@@ -16,6 +20,10 @@ for (const provider of Object.values(api)) {
       max_output_tokens: m.limit?.output ?? 8_192,
       supports_prompt_cache: m.cost?.cache_read != null,
       supports_reasoning: m.reasoning === true,
+      cost_input: m.cost?.input ?? 0,
+      cost_output: m.cost?.output ?? 0,
+      cost_cache_read: m.cost?.cache_read ?? 0,
+      cost_cache_write: m.cost?.cache_write ?? 0,
     };
     const prev = out[id];
     // The same model id can appear under several providers; keep the entry
