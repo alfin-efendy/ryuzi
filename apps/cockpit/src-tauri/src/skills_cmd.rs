@@ -1,52 +1,51 @@
+//! Skills screen commands: thin proxies to the engine daemon's
+//! `crates/core/src/api/skills_api.rs` RPC family (list/install/remove/refresh
+//! git-backed native skills and plugin-bundled skill packs). DTOs stay
+//! imported from `ryuzi_core::skills_install` — that's their real home, it
+//! was never moved to `ryuzi_core::api::types`.
+
+use crate::engine::EngineClient;
 use ryuzi_core::skills_install::{InstalledSkillInfo, InstalledSkillPack};
+use std::sync::Arc;
+use tauri::State;
 
-fn command_result<T>(result: anyhow::Result<T>) -> Result<T, String> {
-    result.map_err(|err| err.to_string())
+type Engine<'a> = State<'a, Arc<EngineClient>>;
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_skills(engine: Engine<'_>) -> Result<Vec<InstalledSkillInfo>, String> {
+    engine
+        .rpc("list_skills", serde_json::json!({}))
+        .await
+        .map_err(|e| e.message)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_skills() -> Result<Vec<InstalledSkillInfo>, String> {
-    command_result(ryuzi_core::skills_install::list_installed_skills())
+pub async fn install_skill(
+    engine: Engine<'_>,
+    source: String,
+) -> Result<InstalledSkillPack, String> {
+    engine
+        .rpc("install_skill", serde_json::json!({ "source": source }))
+        .await
+        .map_err(|e| e.message)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn install_skill(source: String) -> Result<InstalledSkillPack, String> {
-    command_result(ryuzi_core::skills_install::install_skill_source(&source).await)
+pub async fn remove_skill(engine: Engine<'_>, id: String) -> Result<(), String> {
+    engine
+        .rpc("remove_skill", serde_json::json!({ "id": id }))
+        .await
+        .map_err(|e| e.message)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn remove_skill(id: String) -> Result<(), String> {
-    command_result(ryuzi_core::skills_install::remove_installed_skill(&id))
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn refresh_skill(id: String) -> Result<InstalledSkillPack, String> {
-    command_result(ryuzi_core::skills_install::refresh_installed_skill(&id).await)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn command_result_maps_invalid_source_errors_to_strings() {
-        let err = command_result::<InstalledSkillPack>(Err(anyhow::anyhow!(
-            "unsupported skill source: not a valid source"
-        )))
-        .expect_err("invalid source should error");
-        assert!(err.contains("unsupported skill source"));
-    }
-
-    #[test]
-    fn command_result_maps_unknown_skill_errors_to_strings() {
-        let err = command_result::<()>(Err(anyhow::anyhow!(
-            "unknown installed skill: missing-skill"
-        )))
-        .expect_err("missing install should error");
-        assert!(err.contains("unknown installed skill"));
-    }
+pub async fn refresh_skill(engine: Engine<'_>, id: String) -> Result<InstalledSkillPack, String> {
+    engine
+        .rpc("refresh_skill", serde_json::json!({ "id": id }))
+        .await
+        .map_err(|e| e.message)
 }
