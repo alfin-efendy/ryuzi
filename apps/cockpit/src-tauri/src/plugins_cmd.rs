@@ -1260,7 +1260,13 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
         else {
             anyhow::bail!("unknown plugin: {id}");
         };
-        return ryuzi_core::skills_install::remove_installed_skill(&pack.id);
+        // Recorded variant: also drop the pack's `plugin_installs` +
+        // `plugin_attach_status` rows, so an uninstalled pack doesn't leave a
+        // ghost ledger row (which would make every future `update_all_packs`
+        // report `Failed("unknown installed skill: <id>")` for it and bleed
+        // stale trust/pin/attach metadata into the reappeared Browse card).
+        return ryuzi_core::skills_install::remove_installed_skill_recorded(&pack.id, cp.store())
+            .await;
     };
     match derive_kind(&plugin) {
         Some("provider") => {
@@ -1287,7 +1293,9 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
             else {
                 anyhow::bail!("skill pack not installed: {id}");
             };
-            ryuzi_core::skills_install::remove_installed_skill(&pack.id)
+            // Recorded variant — drops the ledger row too (see the
+            // not-in-host fallback above for why a ghost row is harmful).
+            ryuzi_core::skills_install::remove_installed_skill_recorded(&pack.id, cp.store()).await
         }
         _ => {
             if let Some(auth) = &plugin.manifest.auth {
@@ -2889,15 +2897,21 @@ mod tests {
     }
 
     // The positive skill-pack uninstall path (a real pack on disk being
-    // removed via `remove_installed_skill`) is deliberately NOT exercised
-    // here: it requires the `ryuzi_core::skills_install` install seam
-    // (`InstallRoots`, `install_skill_source_with`) which is private to the
-    // `ryuzi-core` crate and unreachable from `ryuzi-cockpit`, and the public
-    // API resolves through `InstallRoots::for_user()`, i.e. the real user
-    // skills install dir — network/git-touching and environment-dependent.
-    // That path is covered by `ryuzi_core::skills_install` unit tests plus the
-    // frontend `PluginsView` uninstall test. The cockpit-level tests below
-    // assert only the hermetic, deterministic bail paths.
+    // removed via `remove_installed_skill_recorded`) is deliberately NOT
+    // exercised here: it requires the `ryuzi_core::skills_install` install
+    // seam (`InstallRoots`, `install_skill_source_with_recorded`) which is
+    // private to the `ryuzi-core` crate and unreachable from `ryuzi-cockpit`,
+    // and the public API resolves through `InstallRoots::for_user()`, i.e. the
+    // real user skills install dir — network/git-touching and
+    // environment-dependent (and, being under real `$HOME`, unsafe to touch
+    // from a test). The ledger-row + attach-row deletion that `uninstall()`
+    // now performs (via the recorded variant — the ghost-row fix) is covered
+    // hermetically in-crate by
+    // `ryuzi_core::skills_install::tests::remove_recorded_deletes_ledger_and_attach_rows_and_artifacts`,
+    // which asserts `store.get_plugin_install(id)` is `None` after the
+    // recorded uninstall. Plus the frontend `PluginsView` uninstall test. The
+    // cockpit-level tests below assert only the hermetic, deterministic bail
+    // paths.
 
     #[tokio::test]
     async fn uninstall_skill_pack_unknown_id_errors() {

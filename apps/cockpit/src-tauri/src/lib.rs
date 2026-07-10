@@ -449,6 +449,11 @@ pub fn run() {
                 ryuzi_core::llm_router::secrets::init_and_sweep(&store).await;
                 let registries = build_registries();
                 let cp = ControlPlane::new(store, registries).await;
+                // Real app startup: run the one-time install-ledger backfill +
+                // crash-leftover sweep here (never in the ControlPlane
+                // constructor, which the cockpit test binary's `test_cp()`
+                // helper also drives — see `run_startup_maintenance`'s doc).
+                cp.run_startup_maintenance().await;
                 // Computed here (rather than a second `block_on`) because the
                 // async runtime does not support nested `block_on` calls.
                 let attachments_root = cp.attachments_root().await;

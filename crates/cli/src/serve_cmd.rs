@@ -47,6 +47,9 @@ async fn run_serve(port: u16, deps: &mut Deps) -> u8 {
         }
     };
     let cp = ControlPlane::new(store, registries).await;
+    // Real long-running host: run one-time install-ledger backfill +
+    // crash-leftover sweep (see `ControlPlane::run_startup_maintenance`).
+    cp.run_startup_maintenance().await;
     // The orch dispatcher runs here so `ryuzi orch submit` works headless.
     // (Its SQL claim transactions are safe if Cockpit's dispatcher is also
     // running.) The cron scheduler stays Cockpit-only: its last-fired

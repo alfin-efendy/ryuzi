@@ -112,27 +112,17 @@ impl ControlPlane {
     ) -> Arc<ControlPlane> {
         let (events, _) = broadcast::channel(1024);
 
-        // One-time: create ledger rows for any skill packs installed before
-        // the ledger existed. Best-effort — a backfill failure must not
-        // block startup (mirrors the plugin path's warn-and-continue
-        // discipline). Runs here (rather than in `new`/`new_with_telemetry`)
-        // so every real construction path — daemon, Cockpit, and any future
-        // caller — gets it exactly once, while `store` is still an
-        // `Arc<Store>` we can borrow before it's moved into the struct below.
-        // A no-op under the crate's own `#[cfg(test)]` build so the ~56
-        // in-crate `control::tests` stay hermetic instead of reading the
-        // operator's real `$HOME/.config/ryuzi/skills` via
-        // `InstallRoots::for_user()`; the two Task 4 unit tests exercise
-        // `backfill_install_records_in` directly, so coverage is preserved.
-        Self::backfill_install_ledger(&store).await;
-
-        // Best-effort: remove any staging/backup leftovers a prior process
-        // crashed mid-install/update without cleaning up (see
-        // `skills_install::sweep_stale_install_leftovers`). Same
-        // warn-and-continue discipline and the same reason for being
-        // compiled out under the crate's own `#[cfg(test)]` build as the
-        // backfill above — it also touches `InstallRoots::for_user()`.
-        Self::sweep_stale_install_leftovers();
+        // Startup maintenance (install-ledger backfill + crash-leftover
+        // sweep) deliberately does NOT run here. Both touch the operator's
+        // real `$HOME/.config/ryuzi/{skills,plugins}` via
+        // `InstallRoots::for_user()`, and the sweep is destructive
+        // (`remove_dir_all`). This constructor is called by every crate's
+        // `test_cp()` helper — including `ryuzi-cockpit`'s, where `ryuzi-core`
+        // is compiled WITHOUT `test` cfg, so a `#[cfg(test)]` no-op guard
+        // here would not fire and tests would delete real user files. Instead
+        // the real long-running hosts call `run_startup_maintenance()`
+        // explicitly after construction; no test path ever does. See that
+        // method's doc comment.
 
         Arc::new(ControlPlane {
             store,
@@ -149,35 +139,31 @@ impl ControlPlane {
         })
     }
 
-    /// Best-effort one-time install-ledger backfill (see the call site in
-    /// `new_full`). In a real (non-`test`) build this reads the operator's
-    /// installed packs via `InstallRoots::for_user()` and warns-and-continues
-    /// on any error. Compiled out entirely under the crate's own unit tests so
-    /// they never touch the real `$HOME`.
-    #[cfg(not(test))]
-    async fn backfill_install_ledger(store: &Arc<Store>) {
-        if let Err(e) = crate::skills_install::backfill_install_records(store).await {
+    /// One-time, best-effort startup maintenance for the install ledger and
+    /// on-disk skill/plugin trees. Call this EXACTLY ONCE, from a real
+    /// long-running host, AFTER the `ControlPlane` is built — never from
+    /// `new`/`new_full` (which every crate's `test_cp()` helper calls) and
+    /// never from a unit test. Both steps read (and the sweep deletes) files
+    /// under the operator's real `$HOME/.config/ryuzi/{skills,plugins}` via
+    /// `InstallRoots::for_user()`, so running it from a constructor would let
+    /// `cargo test` (in particular `ryuzi-cockpit`'s test binary, where
+    /// `ryuzi-core` is a non-`test`-cfg dependency) touch and delete real
+    /// user files.
+    ///
+    /// Steps, each best-effort (warn-and-continue — a maintenance failure
+    /// must never block startup):
+    /// 1. Backfill `plugin_installs` rows for any on-disk pack installed
+    ///    before the ledger existed (idempotent; read + insert only).
+    /// 2. Sweep `.stage-`/`.backup-`/`.tmp-` crash leftovers from an
+    ///    interrupted install/update (destructive `remove_dir_all`).
+    pub async fn run_startup_maintenance(&self) {
+        if let Err(e) = crate::skills_install::backfill_install_records(&self.store).await {
             tracing::warn!("plugin install-ledger backfill failed: {e}");
         }
-    }
-
-    #[cfg(test)]
-    async fn backfill_install_ledger(_store: &Arc<Store>) {}
-
-    /// Best-effort one-time crash-leftover sweep (see the call site in
-    /// `new_full`). In a real (non-`test`) build this removes stale staging/
-    /// backup directories under the operator's `InstallRoots::for_user()` and
-    /// warns-and-continues on any error. Compiled out entirely under the
-    /// crate's own unit tests so they never touch the real `$HOME`.
-    #[cfg(not(test))]
-    fn sweep_stale_install_leftovers() {
         if let Err(e) = crate::skills_install::sweep_stale_install_leftovers() {
             tracing::warn!("plugin install-leftover sweep failed: {e}");
         }
     }
-
-    #[cfg(test)]
-    fn sweep_stale_install_leftovers() {}
 
     /// Shared handle to the persistence layer — used by daemon wiring,
     /// the domain modules (scheduler/mcp/providers/gateways), and the Tauri

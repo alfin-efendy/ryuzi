@@ -246,7 +246,21 @@ pub fn remove_installed_skill(id: &str) -> Result<()> {
 /// clean ledger state instead of resurrecting stale trust/pin metadata.
 pub async fn remove_installed_skill_recorded(id: &str, store: &crate::store::Store) -> Result<()> {
     let roots = InstallRoots::for_user()?;
-    remove_installed_skill_in(&roots, id)?;
+    remove_installed_skill_recorded_with(id, &roots, store).await
+}
+
+/// Injectable core of `remove_installed_skill_recorded` — takes explicit
+/// `roots` so a hermetic test can install a pack into a tempdir and prove the
+/// ledger + attach rows are deleted alongside its artifacts (the public
+/// wrapper resolves `InstallRoots::for_user()`, which reads the operator's
+/// real `$HOME`; the install seam that would set one up is crate-private, so
+/// this deletion can only be tested in-crate).
+async fn remove_installed_skill_recorded_with(
+    id: &str,
+    roots: &InstallRoots,
+    store: &crate::store::Store,
+) -> Result<()> {
+    remove_installed_skill_in(roots, id)?;
     store.delete_plugin_install(id).await?;
     store
         .with_conn({
@@ -3670,6 +3684,56 @@ path = "skills/focus"
             .await
             .unwrap();
         assert_eq!(outcome, UpdateOutcome::AlreadyCurrent);
+    }
+
+    #[tokio::test]
+    async fn remove_recorded_deletes_ledger_and_attach_rows_and_artifacts() {
+        // The deletion path the Cockpit skill-pack Uninstall button now
+        // delegates to: after a recorded uninstall, no ghost `plugin_installs`
+        // row survives (which would otherwise make every future
+        // `update_all_packs` report `Failed("unknown installed skill: p")`)
+        // and no stale `plugin_attach_status` row bleeds into a reappeared
+        // Browse card. Driven with injected `roots` because the install seam
+        // is crate-private and unreachable from `ryuzi-cockpit`.
+        let (roots, cloner, store) = recorded_setup("https://github.com/acme/p", "c1").await;
+        let pack = install_skill_source_with_recorded(
+            "https://github.com/acme/p",
+            &roots,
+            &cloner,
+            &store,
+        )
+        .await
+        .unwrap();
+        // Seed an attach-status row for the same id, as a real attach would.
+        store
+            .record_plugin_attach(&crate::store::PluginAttachStatus {
+                plugin_id: pack.id.clone(),
+                last_attach_at: 1,
+                outcome: "failed".to_string(),
+                reason: Some("p failed to attach".to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(store.get_plugin_install("p").await.unwrap().is_some());
+        assert!(store.get_plugin_attach("p").await.unwrap().is_some());
+        assert!(installed_pack_dir(&roots, &pack).exists());
+
+        remove_installed_skill_recorded_with("p", &roots, &store)
+            .await
+            .unwrap();
+
+        assert!(
+            store.get_plugin_install("p").await.unwrap().is_none(),
+            "the plugin_installs ledger row must be gone after a recorded uninstall"
+        );
+        assert!(
+            store.get_plugin_attach("p").await.unwrap().is_none(),
+            "the plugin_attach_status row must be gone too"
+        );
+        assert!(
+            !installed_pack_dir(&roots, &pack).exists(),
+            "on-disk artifacts must be removed"
+        );
     }
 
     #[tokio::test]
