@@ -33,7 +33,3 @@ name = "datadog"
 transport = "http"
 url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
 headers = { DD-API-KEY = "${auth}", DD-APPLICATION-KEY = "${setting:plugin.datadog.app_key}" }
-
-[menu]
-section = "plugins"
-label = "Datadog"

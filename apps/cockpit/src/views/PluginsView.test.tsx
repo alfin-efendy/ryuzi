@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AddAppInput, AppInfo, PluginInfo, RegistryEntry } from "@/bindings";
+import type { AddAppInput, AppInfo, PluginDetail, PluginInfo, PluginInstallBeginResult } from "@/bindings";
 
 function plugin(id: string, categories: string[]): PluginInfo {
   return {
@@ -14,6 +14,7 @@ function plugin(id: string, categories: string[]): PluginInfo {
     enabled: false,
     source: "catalog",
     capabilities: ["connector"],
+    configured: false,
   };
 }
 
@@ -56,28 +57,6 @@ let appsFixture: AppInfo[] = [];
 const listApps = mock(async () => ({ status: "ok" as const, data: appsFixture }));
 const addApp = mock(async (_input: AddAppInput) => ({ status: "ok" as const, data: appsFixture }));
 const listPlugins = mock(async () => ({ status: "ok" as const, data: [github, notion, builtin] as PluginInfo[] }));
-
-const registrySearch = mock(async (_query: string | null, _cursor: string | null) => ({
-  status: "ok" as const,
-  data: {
-    entries: [
-      {
-        ...entry("io.github/org/alpha", "1.1.0", {
-          name: "Alpha Server",
-          desc: "Registry alpha",
-          installTarget: "@alpha/server@1.1.0",
-          website: "https://alpha.example",
-          isLatest: true,
-        }),
-        versions: [
-          { version: "1.1.0", installTarget: "@alpha/server@1.1.0", website: "https://alpha.example", isLatest: true },
-          { version: "1.0.0", installTarget: "@alpha/server@1.0.0", website: "https://alpha-old.example", isLatest: false },
-        ],
-      },
-    ],
-    nextCursor: null,
-  },
-}));
 
 const listSkills = mock(async () => ({
   status: "ok" as const,
@@ -141,19 +120,66 @@ const refreshSkill = mock(async (_id: string) => ({
   },
 }));
 
+// The wizard mounts inside PluginsView, so its IPC surface needs benign
+// defaults here: begin resolves to authKind "none" with no settings, which
+// routes the wizard straight to done.
+const wizardDetail: PluginDetail = {
+  info: notion,
+  auth: null,
+  settings: [],
+  mcp: [],
+  models: [],
+  homepage: null,
+  publisher: "Notion",
+};
+const wizardBegin: PluginInstallBeginResult = {
+  authKind: "none",
+  envVarPresent: false,
+  envVarName: null,
+  oauthAvailable: false,
+  oauthExternal: false,
+  needsClientId: false,
+  dcrSucceeded: false,
+  callbackMode: "auto",
+  oauthBegin: null,
+  dcrError: null,
+};
+const pluginDetail = mock(async (_id: string) => ({ status: "ok" as const, data: wizardDetail }));
+const beginPluginInstall = mock(async (_pluginId: string) => ({ status: "ok" as const, data: wizardBegin }));
+const setPluginOauthClientId = mock(async (_pluginId: string, _clientId: string) => ({ status: "ok" as const, data: null }));
+const cancelPluginInstall = mock(async (_pluginId: string, _stateToken: string | null) => ({ status: "ok" as const, data: null }));
+const completePluginOauth = mock(async (_pluginId: string, _code: string, _stateToken: string) => ({
+  status: "ok" as const,
+  data: null,
+}));
+const setPluginSetting = mock(async (_key: string, _value: string) => ({ status: "ok" as const, data: null }));
+const setPluginEnabled = mock(async (_id: string, _enabled: boolean) => ({ status: "ok" as const, data: null }));
+const pluginOauthCompletedMsgListen = mock(
+  async (_cb: (event: { payload: { pluginId: string; ok: boolean; error: string | null } }) => void) => () => {},
+);
+
 // Mock the Tauri IPC boundary before the component (and the real stores it
 // pulls in) resolve "@/bindings"; the stores themselves are real zustand
 // singletons, seeded/reset around each test below.
 mock.module("@/bindings", () => ({
+  events: {
+    pluginOauthCompletedMsg: { listen: pluginOauthCompletedMsgListen },
+  },
   commands: {
     listApps,
     addApp,
     listPlugins,
-    registrySearch,
     listSkills,
     installSkill,
     removeSkill,
     refreshSkill,
+    pluginDetail,
+    beginPluginInstall,
+    setPluginOauthClientId,
+    cancelPluginInstall,
+    completePluginOauth,
+    setPluginSetting,
+    setPluginEnabled,
   },
 }));
 
@@ -163,40 +189,7 @@ const { usePlugins } = await import("@/store-plugins");
 const { useRuntimes } = await import("@/store-runtimes");
 const { useGateways } = await import("@/store-gateways");
 const { useNav } = await import("@/store-nav");
-const { filterByCategory, mergeRegistryEntries, PluginsView } = await import("./PluginsView");
-
-function entry(
-  id: string,
-  version: string,
-  options: {
-    name?: string;
-    desc?: string;
-    installTarget?: string | null;
-    website?: string | null;
-    publisher?: string | null;
-    kind?: string;
-    isLatest?: boolean;
-  } = {},
-): RegistryEntry {
-  return {
-    id,
-    name: options.name ?? "Server",
-    desc: options.desc ?? "A server.",
-    version,
-    publisher: options.publisher ?? "Acme",
-    kind: options.kind ?? "stdio",
-    installTarget: options.installTarget ?? `npx ${id}@${version}`,
-    website: options.website ?? null,
-    versions: [
-      {
-        version,
-        installTarget: options.installTarget ?? `npx ${id}@${version}`,
-        website: options.website ?? null,
-        isLatest: options.isLatest ?? false,
-      },
-    ],
-  };
-}
+const { filterByCategory, PluginsView } = await import("./PluginsView");
 
 const all = [github, notion, builtin];
 
@@ -212,11 +205,18 @@ beforeEach(() => {
   listApps.mockClear();
   addApp.mockClear();
   listPlugins.mockClear();
-  registrySearch.mockClear();
   listSkills.mockClear();
   installSkill.mockClear();
   removeSkill.mockClear();
   refreshSkill.mockClear();
+  pluginDetail.mockClear();
+  beginPluginInstall.mockClear();
+  setPluginOauthClientId.mockClear();
+  cancelPluginInstall.mockClear();
+  completePluginOauth.mockClear();
+  setPluginSetting.mockClear();
+  setPluginEnabled.mockClear();
+  pluginOauthCompletedMsgListen.mockClear();
   useApps.setState({ apps: [], loaded: false, probing: null });
   usePlugins.setState({ plugins: [github, notion, builtin], loaded: true });
   useRuntimes.setState({ runtimes: [], loaded: false, refreshing: false, updating: {}, updateLog: {} });
@@ -257,38 +257,63 @@ test("access tab uses plugin wording for installed MCP server controls", async (
   expect(screen.queryByRole("button", { name: "Add app" })).toBeNull();
 });
 
-test("browse combines catalog cards with live registry results from the same view", async () => {
+test("browse shows a pure catalog grid with no registry UI", async () => {
   await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Browse" }));
 
-  await waitFor(() => expect(registrySearch).toHaveBeenCalledWith(null, null));
   expect(await screen.findByText("notion")).toBeTruthy();
-  expect(await screen.findByText("Alpha Server")).toBeTruthy();
   expect(screen.getAllByText("Catalog").length).toBeGreaterThan(0);
-  expect(screen.getAllByText("Registry").length).toBeGreaterThan(0);
+  expect(screen.queryByText("Registry")).toBeNull();
+  expect(screen.queryByRole("textbox", { name: "Search the registry" })).toBeNull();
 });
 
-test("registry install uses the selected version install target from browse", async () => {
+test("browse shows Install for unconfigured disabled catalog plugins and opens the wizard", async () => {
   await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  await screen.findByText("Alpha Server");
+  await screen.findByText("notion");
 
-  fireEvent.click(screen.getByRole("combobox", { name: "Version for Alpha Server" }));
-  fireEvent.click(await screen.findByRole("option", { name: "1.0.0" }));
-  fireEvent.click(screen.getByRole("button", { name: "Install Alpha Server" }));
+  expect(screen.queryByRole("button", { name: "Open notion" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Install notion" }));
 
-  await waitFor(() =>
-    expect(addApp).toHaveBeenCalledWith(
-      expect.objectContaining({
-        name: "Alpha Server",
-        version: "1.0.0",
-        command: "npx",
-        args: ["-y", "@alpha/server@1.0.0"],
-      }),
-    ),
-  );
+  expect(await screen.findByText("Install notion", { selector: "span" })).toBeTruthy();
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith("notion"));
+});
+
+test("single-flight guard: opening the wizard blocks background Install clicks on another plugin", async () => {
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("notion");
+
+  // Open the wizard for plugin A (github) via its Install button.
+  fireEvent.click(screen.getByRole("button", { name: "Install github" }));
+  await screen.findByText("Install github", { selector: "span" });
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith("github"));
+  beginPluginInstall.mockClear();
+
+  // The Modal scrim blocks mouse clicks on background content, but jsdom
+  // has no focus trap and dispatches this click regardless — exactly
+  // simulating a keyboard user tabbing to plugin B's card and pressing
+  // Enter on its Install button while the wizard is open.
+  fireEvent.click(screen.getByRole("button", { name: "Install notion" }));
+
+  // installingPlugin must be unchanged: the wizard still shows plugin A's
+  // header, and no begin call was made for plugin B.
+  expect(screen.getByText("Install github", { selector: "span" })).toBeTruthy();
+  expect(beginPluginInstall).not.toHaveBeenCalledWith("notion");
+});
+
+test("browse shows Open plus the enable switch for configured plugins", async () => {
+  usePlugins.setState({ plugins: [{ ...github, configured: true }, notion, builtin], loaded: true });
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+
+  expect(await screen.findByRole("button", { name: "Open github" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Install github" })).toBeNull();
+  expect(screen.getByRole("switch", { name: "github enabled" })).toBeTruthy();
 });
 
 test("skills tab renders installed skills from listSkills", async () => {
@@ -363,78 +388,4 @@ test("filterByCategory matches a plugin tagged with several categories from any 
 
 test("filterByCategory returns an empty list when nothing matches", () => {
   expect(filterByCategory(all, "sandbox")).toEqual([]);
-});
-
-test("mergeRegistryEntries de-dupes by id, keeps first-seen order, and uses isLatest-aware winner", () => {
-  const pageOne: RegistryEntry[] = [
-    { ...entry("io.github/org/alpha", "1.0.0", { desc: "alpha old", installTarget: "@alpha/server@1.0.0", isLatest: false }) },
-    { ...entry("io.github/org/beta", "0.9.0", { installTarget: "@beta/server@0.9.0" }) },
-  ];
-  const pageTwo: RegistryEntry[] = [
-    {
-      ...entry("io.github/org/alpha", "1.1.0", {
-        desc: "alpha latest",
-        installTarget: "@alpha/server@1.1.0",
-        website: "https://alpha.example",
-        isLatest: true,
-      }),
-      versions: [{ version: "1.1.0", installTarget: "@alpha/server@1.1.0", website: "https://alpha.example", isLatest: true }],
-    },
-    { ...entry("io.github/org/gamma", "2.0.0", { installTarget: "@gamma/server@2.0.0" }) },
-  ];
-
-  const merged = mergeRegistryEntries(pageOne, pageTwo);
-
-  expect(merged).toHaveLength(3);
-  expect(merged.map((row) => row.id)).toEqual(["io.github/org/alpha", "io.github/org/beta", "io.github/org/gamma"]);
-
-  const alpha = merged[0];
-  expect(alpha.version).toBe("1.1.0");
-  expect(alpha.desc).toBe("alpha latest");
-  expect(alpha.installTarget).toBe("@alpha/server@1.1.0");
-  expect(alpha.website).toBe("https://alpha.example");
-  expect(alpha.versions.map((v) => v.version)).toEqual(["1.1.0", "1.0.0"]);
-  expect(new Set(alpha.versions.map((v) => v.version)).size).toBe(2);
-});
-
-test("mergeRegistryEntries selects top-level winner by isLatest when newer version is not top-level", () => {
-  const pageOne: RegistryEntry[] = [
-    {
-      ...entry("io.github/org/alpha", "2.0.0", {
-        name: "Alpha Core",
-        desc: "Original top-level name",
-        installTarget: "@alpha/server@2.0.0",
-        website: "https://old.example",
-        isLatest: false,
-      }),
-      versions: [{ version: "2.0.0", installTarget: "@alpha/server@2.0.0", website: "https://old.example", isLatest: false }],
-    },
-  ];
-
-  const pageTwo: RegistryEntry[] = [
-    {
-      ...entry("io.github/org/alpha", "2.0.0", {
-        name: "Incoming name",
-        desc: "Incoming top-level name",
-        installTarget: "@alpha/server@2.0.0-new",
-        website: "https://incoming.example",
-        isLatest: false,
-      }),
-      versions: [
-        { version: "2.0.0", installTarget: "@alpha/server@2.0.0-new", website: "https://incoming.example", isLatest: false },
-        { version: "1.9.0", installTarget: "@alpha/server@1.9.0", website: "https://latest-only.example", isLatest: true },
-      ],
-    },
-  ];
-
-  const merged = mergeRegistryEntries(pageOne, pageTwo);
-
-  expect(merged).toHaveLength(1);
-  expect(merged[0].version).toBe("1.9.0");
-  expect(merged[0].installTarget).toBe("@alpha/server@1.9.0");
-  expect(merged[0].website).toBe("https://latest-only.example");
-  expect(merged[0].name).toBe("Alpha Core");
-  expect(merged[0].desc).toBe("Original top-level name");
-  expect(merged[0].publisher).toBe("Acme");
-  expect(merged[0].versions.map((v) => v.version)).toEqual(["1.9.0", "2.0.0"]);
 });

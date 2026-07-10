@@ -10,7 +10,7 @@
 //! and is registered in [`CATALOG_MANIFESTS`] below. [`catalog_plugins`]
 //! parses and validates every one of them eagerly; a broken embedded
 //! manifest is a build-time bug (it shipped inside the binary, so there is
-//! no "skip and log" recovery the way `plugins::load_user_plugins_from`
+//! no "skip and log" recovery the way `plugins::load_skill_pack_plugins_from`
 //! recovers from a bad on-disk user manifest) — hence the `expect()` naming
 //! the offending id.
 //!
@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn every_non_experimental_entry_has_mcp_and_menu() {
+    fn every_non_experimental_entry_has_mcp() {
         for plugin in catalog_plugins() {
             if plugin.manifest.experimental {
                 continue;
@@ -188,10 +188,6 @@ mod tests {
             assert!(
                 !plugin.manifest.mcp.is_empty(),
                 "{id} is not experimental so it must declare at least one [[mcp]] server"
-            );
-            assert!(
-                plugin.manifest.menu.is_some(),
-                "{id} is not experimental so it must declare a [menu] contribution"
             );
         }
     }
@@ -317,5 +313,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn vercel_opts_into_dynamic_registration() {
+        let vercel = catalog_plugins()
+            .into_iter()
+            .find(|p| p.manifest.id == "vercel")
+            .expect("vercel catalog plugin");
+        assert!(
+            vercel
+                .manifest
+                .auth
+                .as_ref()
+                .expect("vercel declares [auth]")
+                .dynamic_registration,
+            "vercel must attempt DCR (failure falls back to the manual client-id form)"
+        );
     }
 }

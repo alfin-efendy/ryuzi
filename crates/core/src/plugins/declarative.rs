@@ -2,7 +2,7 @@
 //! working `Connector` via placeholder substitution — no bespoke Rust code
 //! required per plugin. Used both for manifest-authored builtins/catalog
 //! entries and for user plugins discovered from disk
-//! (`plugins::load_user_plugins`).
+//! (`plugins::load_skill_pack_plugins`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -232,7 +232,17 @@ impl DeclarativeConnector {
             store.mark_plugin_oauth_reconnect_required(id).await?;
             return Err(self.http_oauth_auth_required_error(true));
         };
-        let Some(token_url) = auth.token_url.as_deref().filter(|value| !value.is_empty()) else {
+        // Endpoint resolution per column: table value → manifest (the
+        // wizard's discovery/DCR persists endpoints into
+        // plugin_oauth_clients; manifests like slack's declare none).
+        let client_row = store.get_plugin_oauth_client(id).await?;
+        let row_token_url = client_row
+            .as_ref()
+            .and_then(|row| row.token_url.clone())
+            .filter(|value| !value.is_empty());
+        let Some(token_url) =
+            row_token_url.or_else(|| auth.token_url.clone().filter(|value| !value.is_empty()))
+        else {
             store.mark_plugin_oauth_reconnect_required(id).await?;
             return Err(self.http_oauth_auth_required_error(true));
         };
@@ -241,13 +251,25 @@ impl DeclarativeConnector {
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
         ];
-        self.push_refresh_setting(
-            &mut form,
-            ctx,
-            auth.client_id_setting.as_deref(),
-            "client_id",
-        )
-        .await?;
+        // Client id resolution order: plugin_oauth_clients row (DCR/manual)
+        // first, then the manifest's client_id_setting (existing behavior,
+        // including its mark-reconnect-on-missing semantics).
+        match client_row
+            .as_ref()
+            .and_then(|row| row.client_id.clone())
+            .filter(|value| !value.is_empty())
+        {
+            Some(client_id) => form.push(("client_id".to_string(), client_id)),
+            None => {
+                self.push_refresh_setting(
+                    &mut form,
+                    ctx,
+                    auth.client_id_setting.as_deref(),
+                    "client_id",
+                )
+                .await?
+            }
+        }
         self.push_refresh_setting(
             &mut form,
             ctx,
@@ -263,7 +285,7 @@ impl DeclarativeConnector {
         }
 
         let http = reqwest::Client::new();
-        let response = http.post(token_url).form(&form).send().await?;
+        let response = http.post(&token_url).form(&form).send().await?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -933,6 +955,78 @@ headers = { Authorization = "Bearer ${auth}" }
     }
 
     #[tokio::test]
+    async fn http_oauth_refresh_uses_table_token_url_and_client_id_when_manifest_has_none() {
+        use axum::{extract::Form, routing::post, Json, Router};
+        use serde_json::json;
+
+        use_test_key_file();
+        let app = Router::new().route(
+            "/token",
+            post(|Form(form): Form<HashMap<String, String>>| async move {
+                assert_eq!(
+                    form.get("grant_type").map(String::as_str),
+                    Some("refresh_token")
+                );
+                assert_eq!(
+                    form.get("client_id").map(String::as_str),
+                    Some("dcr-client-9")
+                );
+                Json(json!({
+                    "access_token": "oauth-new",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_url = format!("http://{}/token", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (store, settings, _tmp) = open_settings().await;
+        // ACME_HTTP_OAUTH_MANIFEST declares NO token-url and NO
+        // client-id-setting — the plugin_oauth_clients row must supply both.
+        store
+            .upsert_plugin_oauth_client(&crate::store::PluginOauthClient {
+                plugin_id: "acme-http-oauth".into(),
+                authorize_url: None,
+                token_url: Some(token_url),
+                client_id: Some("dcr-client-9".into()),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_token(&PluginOauthToken {
+                plugin_id: "acme-http-oauth".into(),
+                access_token: "oauth-old".into(),
+                refresh_token: Some("refresh-old".into()),
+                token_type: "Bearer".into(),
+                expires_at: Some(crate::paths::now_ms() - 1),
+                scopes: vec![],
+                reconnect_required: false,
+            })
+            .await
+            .unwrap();
+
+        let manifest = PluginManifest::from_toml(ACME_HTTP_OAUTH_MANIFEST).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let connector = plugin.connector.clone().unwrap();
+
+        let servers = connector.mcp_servers(&ctx(settings)).await.unwrap();
+        match &servers[0].transport {
+            McpTransport::Http { headers, .. } => {
+                let header_map: HashMap<String, String> = headers.iter().cloned().collect();
+                assert_eq!(
+                    header_map.get("Authorization"),
+                    Some(&"Bearer oauth-new".to_string())
+                );
+            }
+            other => panic!("expected http transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn http_oauth_manifest_marks_expired_token_without_refresh_as_reconnect_required() {
         use_test_key_file();
         let (store, settings, _tmp) = open_settings().await;
@@ -1147,7 +1241,6 @@ name = "Meta Only"
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         };

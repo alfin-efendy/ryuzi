@@ -13,12 +13,13 @@ verified = true
 kind = "oauth"
 help_url = "https://vercel.com/docs"
 resource = "https://mcp.vercel.com"
+# Vercel restricts OAuth to approved clients (see description), but its
+# metadata document has exposed a registration_endpoint — attempting DCR
+# costs nothing: a rejected registration degrades to the install wizard's
+# manual client-id form.
+dynamic-registration = true
 
 [[mcp]]
 name = "vercel"
 transport = "http"
 url = "https://mcp.vercel.com"
-
-[menu]
-section = "plugins"
-label = "Vercel"

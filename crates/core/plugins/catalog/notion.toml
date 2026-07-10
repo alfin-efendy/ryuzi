@@ -19,7 +19,3 @@ dynamic-registration = true
 name = "notion"
 transport = "http"
 url = "https://mcp.notion.com/mcp"
-
-[menu]
-section = "plugins"
-label = "Notion"

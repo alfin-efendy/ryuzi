@@ -35,7 +35,6 @@ fn minimal_manifest(id: &str, name: &str) -> PluginManifest {
         settings: vec![],
         mcp: vec![],
         skills: vec![],
-        menu: None,
         provider: None,
         runtime: None,
     }

@@ -19,7 +19,3 @@ dynamic-registration = true
 name = "cloudflare"
 transport = "http"
 url = "https://mcp.cloudflare.com/mcp"
-
-[menu]
-section = "plugins"
-label = "Cloudflare"

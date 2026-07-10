@@ -21,7 +21,3 @@ transport = "stdio"
 command = "npx"
 args = ["-y", "@brave/brave-search-mcp-server", "--transport", "stdio"]
 env = { BRAVE_API_KEY = "${auth}" }
-
-[menu]
-section = "plugins"
-label = "Brave Search"

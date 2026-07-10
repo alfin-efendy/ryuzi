@@ -25,7 +25,3 @@ name = "honcho"
 transport = "http"
 url = "https://mcp.honcho.dev"
 headers = { Authorization = "Bearer ${auth}", X-Honcho-User-Name = "${setting:plugin.honcho.user}" }
-
-[menu]
-section = "plugins"
-label = "Honcho"

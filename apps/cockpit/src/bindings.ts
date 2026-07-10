@@ -400,14 +400,6 @@ async toggleAppAgent(id: string, agentId: string, allowed: boolean) : Promise<Re
     else return { status: "error", error: e  as any };
 }
 },
-async registrySearch(query: string | null, cursor: string | null) : Promise<Result<RegistryPage, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("registry_search", { query, cursor }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async listDir(sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_dir", { sessionPk, rel }) };
@@ -970,6 +962,44 @@ async pluginModels(id: string) : Promise<Result<string[], CmdError>> {
 }
 },
 /**
+ * The install wizard's entry point (spec 8-step resolution order). Steps
+ * 1-6 live in `resolve_plugin_install`; this command adds step 7 (bind
+ * 8976 — retried briefly — + background callback/exchange task, degrading
+ * to `callback_mode: "manual"` only when the port is still taken after
+ * the retries) and step 8 (emit `PluginOauthAuthorizeUrlMsg` + open the
+ * browser), exactly like `begin_plugin_oauth` does for the detail view.
+ */
+async beginPluginInstall(pluginId: string) : Promise<Result<PluginInstallBeginResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("begin_plugin_install", { pluginId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setPluginOauthClientId(pluginId: string, clientId: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_oauth_client_id", { pluginId, clientId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel the pending OAuth flow for this plugin, if any: shuts down the
+ * callback listener and removes the flow-map entry. `state_token` narrows
+ * to a specific flow when known; `None` cancels whatever is pending for
+ * the id.
+ */
+async cancelPluginInstall(pluginId: string, stateToken: string | null) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_plugin_install", { pluginId, stateToken }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Export a session as a pretty JSON string.
  */
 async exportSession(sessionPk: string) : Promise<Result<string, CmdError>> {
@@ -1087,6 +1117,7 @@ accentChangedMsg: AccentChangedMsg,
 coreEventMsg: CoreEventMsg,
 oauthAuthorizeUrlMsg: OauthAuthorizeUrlMsg,
 pluginOauthAuthorizeUrlMsg: PluginOauthAuthorizeUrlMsg,
+pluginOauthCompletedMsg: PluginOauthCompletedMsg,
 termExitMsg: TermExitMsg,
 termOutputMsg: TermOutputMsg
 }>({
@@ -1094,6 +1125,7 @@ accentChangedMsg: "accent-changed-msg",
 coreEventMsg: "core-event-msg",
 oauthAuthorizeUrlMsg: "oauth-authorize-url-msg",
 pluginOauthAuthorizeUrlMsg: "plugin-oauth-authorize-url-msg",
+pluginOauthCompletedMsg: "plugin-oauth-completed-msg",
 termExitMsg: "term-exit-msg",
 termOutputMsg: "term-output-msg"
 })
@@ -1285,7 +1317,7 @@ kind: string; setting: string | null; env: string | null; helpUrl: string | null
  * the process environment. Never reveals the value itself.
  */
 configured: boolean; oauthConnectAvailable: boolean; oauthConnectError: string | null; oauthTokenStored: boolean; oauthReconnectRequired: boolean }
-export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; menuLabel: string | null; homepage: string | null; publisher: string }
+export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; homepage: string | null; publisher: string }
 export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean; 
 /**
  * A persisted (non-empty) row exists for `key`. Never the value itself.
@@ -1293,13 +1325,57 @@ export type PluginFieldInfo = { key: string; label: string; help: string; secret
 valueSet: boolean }
 export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[]; verified: boolean; experimental: boolean; enabled: boolean; 
 /**
- * `builtin` | `catalog` | `user`.
+ * Same semantics as `PluginAuthInfo.configured` (oauth: token stored &&
+ * !reconnect_required; else a persisted `auth.setting` row or `auth.env`
+ * set). `false` when the manifest declares no `[auth]` block. On the
+ * LIST payload (not just `plugin_detail`) because the Browse grid's
+ * Install/Open split needs it — note this adds per-plugin store lookups
+ * to list assembly.
+ */
+configured: boolean; 
+/**
+ * `builtin` | `catalog` | `skill-pack`.
  */
 source: string; 
 /**
  * Any of `provider` | `runtime` | `gateway` | `connector`.
  */
 capabilities: string[] }
+export type PluginInstallBeginResult = { 
+/**
+ * `none` | `api-key` | `token` | `oauth`.
+ */
+authKind: string; 
+/**
+ * `auth.env` is declared AND set in the environment.
+ */
+envVarPresent: boolean; envVarName: string | null; 
+/**
+ * Endpoints + client id resolved; the browser flow started.
+ */
+oauthAvailable: boolean; 
+/**
+ * OAuth brokered outside Cockpit (kind=oauth, no `auth.resource`, no
+ * manifest `authorize_url` — google-workspace).
+ */
+oauthExternal: boolean; 
+/**
+ * oauth, endpoints may be known, but no client id and DCR not
+ * applicable / failed.
+ */
+needsClientId: boolean; 
+/**
+ * This call performed a successful registration.
+ */
+dcrSucceeded: boolean; 
+/**
+ * `auto` (callback server bound) | `manual` (bind failed → paste).
+ */
+callbackMode: string; oauthBegin: PluginOauthBeginResult | null; 
+/**
+ * Discovery/DCR failure detail (shown on the manual client id form).
+ */
+dcrError: string | null }
 export type PluginMcpInfo = { name: string; 
 /**
  * `stdio` | `http`.
@@ -1312,6 +1388,13 @@ transport: string;
 commandOrUrl: string }
 export type PluginOauthAuthorizeUrlMsg = { pluginId: string; authorizeUrl: string }
 export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string; redirectUri: string }
+/**
+ * Emitted by `begin_plugin_install`'s background callback task when the
+ * loopback OAuth flow finishes: `ok: true` after the token is stored;
+ * `ok: false` (with `error`) on timeout, state mismatch, or exchange
+ * failure — the flow entry survives failures so manual paste still works.
+ */
+export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —
@@ -1322,21 +1405,6 @@ export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteS
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
-export type RegistryEntry = { 
-/**
- * Registry name, e.g. `io.github.owner/server`.
- */
-id: string; name: string; desc: string; version: string; publisher: string | null; 
-/**
- * stdio (npm package) | http (remote)
- */
-kind: string; 
-/**
- * npm identifier for stdio entries; URL for remotes.
- */
-installTarget: string | null; website: string | null; versions: RegistryEntryVersion[] }
-export type RegistryEntryVersion = { version: string; installTarget: string | null; website: string | null; isLatest: boolean }
-export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
 /**

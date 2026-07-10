@@ -49,7 +49,7 @@ fn main() -> ExitCode {
             // unregistered made that setting refer to an "unknown plugin".
             registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
             ryuzi_core::plugins::install_builtins(&mut registries);
-            ryuzi_core::plugins::load_user_plugins(&mut registries);
+            ryuzi_core::plugins::load_skill_pack_plugins(&mut registries);
             Ok(registries)
         }),
     };

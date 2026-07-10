@@ -929,7 +929,6 @@ fn claude_code_plugin_with_factory(factory: Arc<dyn HarnessFactory>) -> CorePlug
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         },

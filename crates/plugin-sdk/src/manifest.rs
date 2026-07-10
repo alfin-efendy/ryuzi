@@ -47,8 +47,6 @@ pub struct PluginManifest {
     #[serde(default)]
     pub skills: Vec<SkillDef>,
     #[serde(default)]
-    pub menu: Option<MenuContribution>,
-    #[serde(default)]
     pub provider: Option<ProviderMeta>,
     #[serde(default)]
     pub runtime: Option<RuntimeMeta>,
@@ -140,18 +138,6 @@ pub struct SkillDef {
     #[serde(default)]
     pub description: String,
     pub path: String,
-}
-
-fn default_section() -> String {
-    "plugins".to_string()
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MenuContribution {
-    #[serde(default = "default_section")]
-    pub section: String,
-    #[serde(default)]
-    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -324,10 +310,6 @@ env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${auth}" }
 name = "github-triage"
 description = "Triage issues into labeled buckets"
 path = "skills/github-triage"
-
-[menu]
-section = "plugins"
-label = "GitHub"
 "#;
 
     #[test]
@@ -388,10 +370,6 @@ label = "GitHub"
         assert_eq!(skill.name, "github-triage");
         assert_eq!(skill.description, "Triage issues into labeled buckets");
         assert_eq!(skill.path, "skills/github-triage");
-
-        let menu = manifest.menu.expect("menu block");
-        assert_eq!(menu.section, "plugins");
-        assert_eq!(menu.label.as_deref(), Some("GitHub"));
     }
 
     #[test]

@@ -50,9 +50,10 @@ for a given `id` wins — see `PluginHost::add`):
 2. **The embedded integration catalog** — 24 TOML manifests baked into the
    binary via `include_str!`, at `crates/core/plugins/catalog/*.toml`
    (`crates/core/src/plugins/catalog.rs`).
-3. **User plugins** — TOML manifests on disk at
+3. **Skill packs** — TOML manifests the skills installer materialized at
    `~/.config/ryuzi/plugins/<id>/ryuzi-plugin.toml`
-   (`crates/core::plugins::load_user_plugins`).
+   (`crates/core::plugins::load_skill_pack_plugins`), each gated on a
+   `.ryuzi-skill.json` provenance stamp.
 
 A real `ryuzi` process wires all of this at startup
 (`crates/cli/src/main.rs`'s `build_registries`, mirrored by
@@ -60,10 +61,9 @@ A real `ryuzi` process wires all of this at startup
 register `claude-code` if the ACP sidecar resolves, register `discord`,
 then call `ryuzi_core::plugins::install_builtins` (providers, then CLI
 agents, then the embedded catalog) and finally
-`ryuzi_core::plugins::load_user_plugins`. Because this all runs once at
-process startup, adding or editing a user plugin's manifest requires
-restarting `ryuzi` (or the Cockpit app) to pick it up — there is no
-hot-reload.
+`ryuzi_core::plugins::load_skill_pack_plugins`. Because this all runs once at
+process startup, installing or refreshing a skill pack requires restarting
+`ryuzi` (or the Cockpit app) to pick it up — there is no hot-reload.
 
 ---
 
@@ -77,31 +77,37 @@ split into four tabs backed by thin Tauri commands:
 - **Installed** — DB-backed MCP apps already added to the local machine
   (`apps_cmd.rs` / `useApps`).
 - **Access** — which runtimes are allowed to call each installed app.
-- **Browse** — a combined browser for the embedded **catalog** manifests and
-  the live MCP **registry** (`registry_cmd.rs`).
+- **Browse** — a pure grid of the embedded **catalog** manifests with a
+  category filter. The old MCP-registry browser (`registry_cmd.rs` /
+  `registry_search`) has been removed entirely; MCP-server apps installed
+  through it keep working as ordinary Apps rows. Hand-adding an MCP server
+  stays available via **Add MCP server** (AddAppModal).
 - **Skills** — Ryuzi-native skill-pack install / refresh / removal
   (`skills_cmd.rs`, backed by `crates/core/src/skills_install.rs`).
 
-The Browse tab intentionally mixes two sources in one place:
-
-- **Catalog** cards come from `list_plugins` filtered to non-builtin plugins.
-- **Registry** cards come from `registry_search`, which queries
-  `https://registry.modelcontextprotocol.io/v0/servers`.
-
-Registry results are grouped by logical server identity (`server.name`), not
-raw response row, so multiple published versions render as one card with a
-version picker. The entry marked `isLatest` wins the top-level install target
-when the registry exposes several versions for the same plugin; otherwise the
-newest semantic-ish version sorts first. Installing a registry entry still
-creates a normal DB-backed app row (`npx -y <package>` for stdio, URL for
-remote HTTP), so after install it behaves the same as any hand-added MCP
-server.
+Catalog plugins are installed through the **Install wizard**: clicking
+Install runs `begin_plugin_install`, which routes by the manifest's
+`[auth]` kind — env var already set (zero input), token/api-key entry,
+or OAuth. For OAuth plugins Cockpit performs RFC 8414 discovery against
+`auth.resource` and, when the manifest declares
+`dynamic-registration = true`, RFC 7591 Dynamic Client Registration —
+falling back to a manual client-id form when registration is impossible.
+The browser callback lands on a loopback server Cockpit runs at
+`http://127.0.0.1:8976/plugin-oauth/<id>/callback`, so the happy path
+needs no manual code paste (paste remains the fallback when the port is
+taken or the callback times out). External-OAuth plugins (`auth.kind =
+"oauth"` with neither an `auth.resource` nor a manifest `authorize-url` —
+e.g. `google-workspace`) skip discovery, DCR, and the callback entirely:
+the wizard only collects the client id, and the child server brokers
+sign-in itself at first use. Required `[[settings]]` are collected before
+the plugin is enabled.
 
 ---
 
 ## Manifest reference
 
-One plugin = one manifest, `ryuzi-plugin.toml` for catalog/user plugins.
+One plugin = one manifest, `ryuzi-plugin.toml` for catalog plugins and
+installer-materialized skill packs.
 Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 
 | Field | Type | Default | Notes |
@@ -121,7 +127,6 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `settings` | `[[settings]]` array | `[]` | Extra non-auth settings fields. |
 | `mcp` | `[[mcp]]` array | `[]` | See [MCP server defs](#mcp-server-defs). |
 | `skills` | `[[skills]]` array | `[]` | See [Skills bundling](#skills-bundling). |
-| `menu` | `[menu]` table \| null | `None` | See [Menu contributions](#menu-contributions). |
 | `provider` | `[provider]` table \| null | `None` | Model-provider capability block — see below. |
 | `runtime` | `[runtime]` table \| null | `None` | CLI-agent capability block — see below. |
 
@@ -139,7 +144,7 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `scopes` | string[] | `[]` | Requested OAuth scopes. |
 | `client-id-setting` | string \| null | `None` | Settings-store key that holds the OAuth client id. |
 | `client-secret-setting` | string \| null | `None` | Optional settings-store key for the OAuth client secret. |
-| `dynamic-registration` | bool | `false` | Parsed and preserved in the manifest today; Cockpit's v1 plugin sign-in still expects a saved client id. |
+| `dynamic-registration` | bool | `false` | When `true`, the install wizard attempts RFC 7591 Dynamic Client Registration against the `registration_endpoint` discovered via RFC 8414; failure degrades to a manual client-id form. |
 | `extra-authorize-params` | table (string → string) | `{}` | Extra query params appended to the authorize URL. |
 | `extra-token-params` | table (string → string) | `{}` | Extra form fields appended to the token exchange request. |
 
@@ -165,13 +170,6 @@ See [MCP server defs](#mcp-server-defs) for the full field table.
 | `name` | string | *(required)* |
 | `description` | string | `""` |
 | `path` | string | *(required)* — relative to the manifest's own directory |
-
-### `[menu]`
-
-| Field | Type | Default |
-| --- | --- | --- |
-| `section` | string | `"plugins"` |
-| `label` | string \| null | `None` |
 
 ### `[provider]` (model-provider plugins)
 
@@ -222,10 +220,6 @@ name = "github"
 transport = "http"
 url = "https://api.githubcopilot.com/mcp/"
 headers = { Authorization = "Bearer ${auth}" }
-
-[menu]
-section = "plugins"
-label = "GitHub"
 ```
 
 Validating it:
@@ -243,7 +237,6 @@ capabilities: connector
 enabled: disabled
 auth: kind=Token setting=plugin.github.token env=GITHUB_PERSONAL_ACCESS_TOKEN help_url=https://github.com/settings/tokens
 mcp: github transport=Http target=https://api.githubcopilot.com/mcp/
-menu: section=plugins label=GitHub
 ```
 
 (`status` is `verified` when `verified = true`; otherwise `experimental` when
@@ -359,9 +352,20 @@ rather than relying on a session-time warning.
 When a plugin detail screen sees `auth.kind = "oauth"`, Cockpit asks the Tauri
 backend for a richer `PluginAuthInfo`:
 
-- `oauthConnectAvailable = true` only when the manifest has enough metadata
-  for Cockpit to start the flow, currently `authorize-url`, `token-url`, and a
-  non-empty saved value under `client-id-setting`.
+- `oauthConnectAvailable = true` only when `resolve_plugin_oauth`
+  (`plugins_cmd.rs`) can resolve an authorize URL, a token URL, and a client
+  id. Resolution is **table-first**, not manifest-first: it reads this
+  plugin's row in the same `plugin_oauth_clients` table the Install wizard
+  populates via RFC 8414 discovery, RFC 7591 DCR, or the wizard's manual
+  client-id form (see above) — falling back to the manifest's
+  `authorize-url`/`token-url` for the endpoints, then to the saved value
+  under `client-id-setting` for the client id, and, for external-OAuth
+  plugins only, to the saved value under `auth.setting` as a last resort
+  (`google-workspace`'s client-id setting key *is* its `auth.setting`). The
+  manual client-id form (`set_plugin_oauth_client_id`) upserts straight into
+  the `plugin_oauth_clients` row for non-external plugins — it deliberately
+  never writes a `plugin.*` setting, since none of these manifests declare
+  one.
 - `begin_plugin_oauth` builds a PKCE authorize URL, opens it in the browser,
   emits `plugin-oauth-authorize-url-msg`, and shows the callback URL Cockpit
   expects (`http://127.0.0.1:8976/plugin-oauth/<id>/callback`).
@@ -371,11 +375,11 @@ backend for a richer `PluginAuthInfo`:
   an unconfigured state.
 
 Today this native sign-in path is available to plugin manifests whose
-`auth.kind = "oauth"` block carries the full OAuth metadata and points at a
-saved client id, regardless of MCP transport. Declarative HTTP MCP entries use
-the stored token automatically as an `Authorization: Bearer ...` header; other
-transports still need their manifests or provider-specific host support to map
-the stored credential into the runtime process.
+`auth.kind = "oauth"` resolves (table or manifest, per above) to full OAuth
+metadata and a client id, regardless of MCP transport. Declarative HTTP MCP
+entries use the stored token automatically as an `Authorization: Bearer ...`
+header; other transports still need their manifests or provider-specific host
+support to map the stored credential into the runtime process.
 
 For declarative HTTP MCP entries, the connector checks token expiry before
 injecting the bearer. If the token is due and a refresh token is available, it
@@ -431,8 +435,8 @@ see [Enabling plugins](#enabling-plugins)): `ngrok`, `vercel-sandbox`, `zep`.
 manifest's **own directory** on disk, and must be a *leaf* skill directory
 (a `SKILL.md` file directly inside it, not a directory of subdirectories).
 
-This only works for `PluginSource::User` plugins: `PluginHost::
-enabled_skill_dirs` walks every **enabled** user-sourced plugin, resolves
+This only works for `PluginSource::SkillPack` plugins: `PluginHost::
+enabled_skill_dirs` walks every **enabled** skill-pack-sourced plugin, resolves
 each `skills[].path` against that plugin's own directory, and keeps only the
 ones that exist on disk. Catalog and built-in plugins carry no on-disk base
 directory, so their `skills[]` (if any) never surface this way even though
@@ -455,8 +459,10 @@ description = "Triage issues into labeled buckets"
 path = "skills/github-triage"   # relative to this manifest's own directory
 ```
 
-The separate Cockpit **Skills** tab uses a different install path from
-manifest-authored user plugins. `crates/core/src/skills_install.rs` installs:
+The separate Cockpit **Skills** tab drives the skills installer — now the
+only path that produces plugin directories under `~/.config/ryuzi/plugins/`
+(manifest-authored user plugins no longer load).
+`crates/core/src/skills_install.rs` installs:
 
 - **Single native skill repos** to `~/.config/ryuzi/skills/<skill-id>/`
 - **Plugin skill packs** to `~/.config/ryuzi/plugins/<plugin-id>/`
@@ -471,52 +477,38 @@ directories without guessing.
 
 ---
 
-## Menu contributions
+## Installing skill packs
 
-`[menu] { section = "plugins", label = "..." }` declares a plugin's Cockpit
-sidebar contribution. In the current Cockpit build:
+Hand-authored user plugins are no longer loaded — the only supported way
+to get a plugin directory under `~/.config/ryuzi/plugins/` is the skills
+installer (Cockpit's Plugins → Skills tab, or the same core path in
+`crates/core/src/skills_install.rs`). `install_plugin_pack` writes:
 
-- The sidebar's "Plugins" section (`apps/cockpit/src/components/shell/
-  Sidebar.tsx`) shows **every enabled plugin whose `source` is `catalog` or
-  `user`** — it doesn't currently check for a `[menu]` block at all (the
-  bulk `list_plugins`/`listPlugins` response doesn't carry `menu` data), so
-  in practice every enabled integration gets a row. The row's label is
-  always the manifest's `name`, not `menu.label` — `menu.label` is only
-  exposed via `ryuzi plugins info`/`GET /plugins/{id}`/`plugin_detail`'s
-  `menuLabel` field today, not consumed by the sidebar's own rendering.
-- `menu.section` is not read for grouping either — there is one fixed
-  "Plugins" header. `section` defaults to `"plugins"` and every catalog
-  manifest uses that default.
-- Every non-experimental catalog manifest is required to declare `[menu]`
-  (enforced by a test in `crates/core/src/plugins/catalog.rs`), so treat it
-  as required for any integration you author, even though today's sidebar
-  render doesn't strictly depend on its contents.
+- the pack repo to `~/.config/ryuzi/plugins/<plugin-id>/` (including its
+  `ryuzi-plugin.toml`),
+- a `.ryuzi-skill.json` provenance stamp **into that plugin directory**,
+- and each bundled skill, materialized to
+  `~/.config/ryuzi/skills/<plugin-id>--<skill-id>/` with its own
+  provenance file.
 
----
+`load_skill_pack_plugins` (called at startup by the CLI, `ryuzi daemon`,
+and Cockpit) scans `~/.config/ryuzi/plugins/*/ryuzi-plugin.toml` and
+registers a directory only when:
 
-## Installing user plugins
+- it contains the `.ryuzi-skill.json` stamp, **or**
+- (legacy packs installed before the stamp existed) the skills root holds
+  a materialized skill whose provenance names the plugin id — in which
+  case the stamp is healed into the plugin directory one time.
 
-Drop a manifest at:
+Directories matching neither (hand-authored manifests) are skipped with a
+`tracing::warn!` — release-notes-worthy, by design.
 
-```
-~/.config/ryuzi/plugins/<id>/ryuzi-plugin.toml
-```
-
-Any bundled skill directories go alongside it, referenced by a path
-relative to that same directory (see [Skills bundling](#skills-bundling)).
-
-- A missing `~/.config/ryuzi/plugins` directory is not an error — most
-  installs have none.
-- A manifest that fails to parse or fails `validate()` is logged via
-  `tracing::warn!` and skipped — it never panics and never blocks the rest
-  of the scan (a broken sibling plugin still loads).
-- An `id` that collides with any built-in or embedded-catalog plugin loses:
-  built-ins and the catalog are registered first, and `PluginHost::add`
-  keeps the first registration for a given id.
-- User plugins are disabled by default, exactly like catalog plugins (see
-  below).
-- Discovery happens once, at process startup — restart `ryuzi` (or the
-  Cockpit app) after adding or editing a manifest.
+Unchanged behaviors: a missing `~/.config/ryuzi/plugins` directory is not
+an error; a manifest that fails to parse or fails `validate()` is logged
+and skipped without blocking its siblings; an `id` colliding with any
+built-in or embedded-catalog plugin loses (first registration wins); skill
+packs are disabled by default like catalog plugins; discovery happens once
+at process startup.
 
 ---
 
@@ -535,7 +527,7 @@ enablement by capability, in this priority order:
    a stray `plugin.<id>.enabled = true` row exists.
 5. No harness/gateway/connector capability at all (every model-provider and
    CLI-agent plugin) → always `true`.
-6. Otherwise (every catalog/user integration with a connector) →
+6. Otherwise (every catalog/skill-pack integration with a connector) →
    `plugin.<id>.enabled == "true"`, defaulting to `false`.
 
 Three equivalent ways to flip it:
@@ -547,11 +539,12 @@ ryuzi plugins disable github
 ```
 
 - **Cockpit**: the dedicated **Plugins** screen's **Browse** tab lists every
-  catalog/user plugin with source and category filters plus an
-  enable/disable `Switch` per catalog card (disabled — greyed out — for
-  `experimental` entries, since there's nothing to enable); the plugin
-  detail screen (reached from the sidebar's Plugins section or the
-  Browse card's "Configure" button) has the same switch.
+  catalog plugin with a category filter; new installs go through the
+  Install wizard, and each installed card keeps the enable/disable
+  `Switch` (disabled — greyed out — for `experimental` entries, since
+  there's nothing to enable); the plugin detail screen (reached from the
+  sidebar's Plugins section or the Browse card's "Configure" button) has
+  the same switch.
 - **Settings keys directly**: `enabled_runtimes`/`enabled_gateways` are CSV
   strings (add/remove `id`, preserving order, no duplicates —
   `toggle_enabled`'s `toggle_csv` helper); everything else is
@@ -621,60 +614,43 @@ a hard failure.
 
 ## Authoring walkthrough
 
-1. Write a manifest at `~/.config/ryuzi/plugins/<id>/ryuzi-plugin.toml`
-   (see the [full example](#full-annotated-example) above for the shape).
-2. Validate it:
+Hand-authored manifests under `~/.config/ryuzi/plugins/` are no longer
+loaded (no installer provenance → skipped). To author a plugin:
 
-   ```sh
-   ryuzi plugins info <id>
+1. **Catalog contribution** — add a TOML manifest under
+   `crates/core/plugins/catalog/` and register it in `CATALOG_MANIFESTS`
+   (see [Catalog contribution guidelines](#catalog-contribution-guidelines)).
+2. **Skill pack** — publish a GitHub repo the skills installer
+   understands (a `.codex-plugin/plugin.json` pack or a repo of leaf
+   `SKILL.md` directories) and install it from Cockpit's Skills tab; the
+   installer materializes `ryuzi-plugin.toml` and the provenance stamp
+   for you.
+
+   Minimal example — no `.codex-plugin/plugin.json`, just a `skills/`
+   directory of leaf `SKILL.md` dirs:
+
+   ```
+   my-skills-repo/
+   └── skills/
+       └── code-review/
+           └── SKILL.md
    ```
 
-   A parse or `validate()` failure is logged (`tracing::warn!`) and the
-   plugin simply won't appear in `ryuzi plugins list`/`info` — rerun with
-   `RUST_LOG=warn` if you need to see why.
-3. Enable it:
+   Paste `owner/my-skills-repo` (or the full GitHub URL) into the Skills
+   tab's **Install source** field. `discover_install_target` finds no
+   `plugin.json` or top-level `SKILL.md`, scans `skills/*/SKILL.md`, and
+   generates `~/.config/ryuzi/plugins/my-skills-repo/ryuzi-plugin.toml`
+   with `id = "my-skills-repo"` and one `[[skills]]` entry
+   (`path = "skills/code-review"`), plus the `.ryuzi-skill.json` provenance
+   stamp — then materializes the skill to
+   `~/.config/ryuzi/skills/my-skills-repo--code-review/`.
 
-   ```sh
-   ryuzi plugins enable <id>
-   ```
-
-4. If it declares `[auth]`, set the credential first (a settings-store row
-   under `auth.setting`, or the `auth.env` environment variable) — check
-   with `ryuzi plugins info <id>` that `auth:` shows the key you expect.
-5. Start (or resume) a session in a project. The plugin's `[[mcp]]` servers
-   are attached at session start (`control::lifecycle::
-   attach_plugin_mcp_servers`) alongside any DB-configured Apps servers — a
-   DB-configured server of the same name always wins over a plugin's. Any
-   bundled `[[skills]]` (leaf dirs with a `SKILL.md`) show up in the
-   session's skill list, behind the worktree's own skills on a name clash.
-
-Minimal example, verified end-to-end against the built binary:
-
-```toml
-# ~/.config/ryuzi/plugins/acme/ryuzi-plugin.toml
-contract = 1
-id = "acme-user"
-name = "Acme User Plugin"
-description = "Example user-authored plugin"
-categories = ["productivity"]
-
-[[mcp]]
-name = "acme"
-transport = "stdio"
-command = "acme-mcp"
-```
-
-```sh
-$ ryuzi plugins list | grep acme
-acme-user       Acme User Plugin       productivity    disabled        community
-$ ryuzi plugins info acme-user
-id: acme-user
-name: Acme User Plugin
-...
-capabilities: connector
-enabled: disabled
-mcp: acme transport=Stdio target=acme-mcp
-```
+Then validate with `ryuzi plugins info <id>`, enable with
+`ryuzi plugins enable <id>`, configure any `[auth]` credential, and start
+a session — the plugin's `[[mcp]]` servers attach at session start
+(`control::lifecycle::attach_plugin_mcp_servers`), with DB-configured
+Apps servers of the same name winning, and bundled `[[skills]]` surfacing
+behind worktree skills on a name clash.
 
 ---
 
@@ -713,5 +689,5 @@ Adding an entry to `crates/core/plugins/catalog/*.toml` (and
   module parses/validates every embedded manifest, checks id uniqueness
   (including against every built-in provider/CLI-agent/`native`/
   `claude-code`/`discord` id), requires every non-experimental entry to
-  have both `[[mcp]]` and `[menu]`, and requires every `experimental`
-  entry to have neither.
+  have `[[mcp]]`, and requires every `experimental` entry to have no
+  `[[mcp]]`.

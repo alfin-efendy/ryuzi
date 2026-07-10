@@ -19,7 +19,3 @@ dynamic-registration = true
 name = "figma"
 transport = "http"
 url = "https://mcp.figma.com/mcp"
-
-[menu]
-section = "plugins"
-label = "Figma"

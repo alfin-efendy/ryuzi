@@ -4,7 +4,7 @@ import { commands, type PluginInfo } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
 // embedded catalog, or user-authored — and this store mirrors the flattened
-// `PluginInfo` list Cockpit needs for the catalog and sidebar screens.
+// `PluginInfo` list Cockpit needs for the Plugins hub screens.
 
 type PluginsState = {
   plugins: PluginInfo[];
@@ -39,23 +39,11 @@ export function pluginById(plugins: PluginInfo[], id: string): PluginInfo | unde
 }
 
 /**
- * Plugins the sidebar shows as their own menu row: enabled integrations
- * (catalog or user-authored). Core builtins (native, claude-code, discord,
- * providers) never get a row here — they're wired into the fixed NAV items
- * above, and `PluginInfo` itself carries no menu-contribution field (that
- * lives on `PluginDetail.menuLabel`, only available per-plugin via
- * `pluginDetail`, not in the bulk `listPlugins` response the sidebar uses).
- */
-export function sidebarPlugins(plugins: PluginInfo[]): PluginInfo[] {
-  return plugins.filter((p) => p.enabled && (p.source === "catalog" || p.source === "user"));
-}
-
-/**
- * Plugins the Apps → Catalog tab lists: every catalog or user-authored entry,
- * enabled or not (unlike `sidebarPlugins`, which only surfaces the ones
- * already enabled). Core builtins (native, claude-code, discord, providers)
- * keep their own dedicated screens instead of a catalog row.
+ * Plugins the Plugins hub's Browse tab lists: every embedded-catalog
+ * entry, enabled or not. Skill packs (`source === "skill-pack"`) surface
+ * in the Skills tab instead; core builtins keep their own dedicated
+ * screens.
  */
 export function catalogPlugins(plugins: PluginInfo[]): PluginInfo[] {
-  return plugins.filter((p) => p.source === "catalog" || p.source === "user");
+  return plugins.filter((p) => p.source === "catalog");
 }

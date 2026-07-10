@@ -17,11 +17,15 @@
 //! persisted (or an auth env var is set), never the value itself.
 
 use crate::error::CmdError;
-use crate::events::PluginOauthAuthorizeUrlMsg;
+use crate::events::{PluginOauthAuthorizeUrlMsg, PluginOauthCompletedMsg};
 use reqwest::Url;
-use ryuzi_core::plugins::oauth::{generate_pkce_verifier, pkce_challenge_s256, PluginOauthToken};
+use ryuzi_core::plugins::oauth::{
+    discover_oauth_server_metadata, generate_pkce_verifier, pkce_challenge_s256,
+    register_oauth_client, OauthServerMetadata, PluginOauthToken,
+};
 use ryuzi_core::plugins::providers;
 use ryuzi_core::settings::SettingsStore;
+use ryuzi_core::store::PluginOauthClient;
 use ryuzi_core::{ControlPlane, CorePlugin, PluginSource, Store};
 use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, SettingField};
 use serde::{Deserialize, Serialize};
@@ -45,7 +49,14 @@ pub struct PluginInfo {
     pub verified: bool,
     pub experimental: bool,
     pub enabled: bool,
-    /// `builtin` | `catalog` | `user`.
+    /// Same semantics as `PluginAuthInfo.configured` (oauth: token stored &&
+    /// !reconnect_required; else a persisted `auth.setting` row or `auth.env`
+    /// set). `false` when the manifest declares no `[auth]` block. On the
+    /// LIST payload (not just `plugin_detail`) because the Browse grid's
+    /// Install/Open split needs it — note this adds per-plugin store lookups
+    /// to list assembly.
+    pub configured: bool,
+    /// `builtin` | `catalog` | `skill-pack`.
     pub source: String,
     /// Any of `provider` | `runtime` | `gateway` | `connector`.
     pub capabilities: Vec<String>,
@@ -74,6 +85,48 @@ pub struct PluginOauthBeginResult {
     pub state_token: String,
     pub authorize_url: String,
     pub redirect_uri: String,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInstallBeginResult {
+    /// `none` | `api-key` | `token` | `oauth`.
+    pub auth_kind: String,
+    /// `auth.env` is declared AND set in the environment.
+    pub env_var_present: bool,
+    pub env_var_name: Option<String>,
+    /// Endpoints + client id resolved; the browser flow started.
+    pub oauth_available: bool,
+    /// OAuth brokered outside Cockpit (kind=oauth, no `auth.resource`, no
+    /// manifest `authorize_url` — google-workspace).
+    pub oauth_external: bool,
+    /// oauth, endpoints may be known, but no client id and DCR not
+    /// applicable / failed.
+    pub needs_client_id: bool,
+    /// This call performed a successful registration.
+    pub dcr_succeeded: bool,
+    /// `auto` (callback server bound) | `manual` (bind failed → paste).
+    pub callback_mode: String,
+    pub oauth_begin: Option<PluginOauthBeginResult>,
+    /// Discovery/DCR failure detail (shown on the manual client id form).
+    pub dcr_error: Option<String>,
+}
+
+impl PluginInstallBeginResult {
+    fn new(auth_kind: &str) -> Self {
+        Self {
+            auth_kind: auth_kind.to_string(),
+            env_var_present: false,
+            env_var_name: None,
+            oauth_available: false,
+            oauth_external: false,
+            needs_client_id: false,
+            dcr_succeeded: false,
+            callback_mode: "manual".to_string(),
+            oauth_begin: None,
+            dcr_error: None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -107,7 +160,6 @@ pub struct PluginDetail {
     pub settings: Vec<PluginFieldInfo>,
     pub mcp: Vec<PluginMcpInfo>,
     pub models: Vec<String>,
-    pub menu_label: Option<String>,
     pub homepage: Option<String>,
     pub publisher: String,
 }
@@ -134,15 +186,71 @@ fn plugin_oauth_flows() -> &'static Mutex<HashMap<String, PluginOauthFlowState>>
     PLUGIN_OAUTH_FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Cancellation handles for pending loopback callback servers, keyed by the
+/// same `{plugin_id}:{state_token}` key as `PLUGIN_OAUTH_FLOWS`. Firing (or
+/// dropping) one makes the background task exit without emitting a
+/// completion event.
+static PLUGIN_INSTALL_CANCELS: OnceLock<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>> =
+    OnceLock::new();
+
+fn plugin_install_cancels() -> &'static Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>> {
+    PLUGIN_INSTALL_CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop pending flow state (and shut down any live callback server) for
+/// `plugin_id` — all of its flows when `state_token` is `None`, else just
+/// that one flow.
+fn cancel_pending_plugin_flows(plugin_id: &str, state_token: Option<&str>) {
+    let prefix = format!("{plugin_id}:");
+    let keys: Vec<String> = {
+        let mut flows = plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match state_token {
+            Some(token) => {
+                let key = plugin_oauth_flow_key(plugin_id, token);
+                flows.remove(&key);
+                vec![key]
+            }
+            None => {
+                let keys: Vec<String> = flows
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                for key in &keys {
+                    flows.remove(key);
+                }
+                keys
+            }
+        }
+    };
+    let mut cancels = plugin_install_cancels()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // A cancel sender can exist for a flow already removed (and vice versa)
+    // — sweep by prefix as well as by the exact keys.
+    let cancel_keys: Vec<String> = cancels
+        .keys()
+        .filter(|k| keys.contains(k) || (state_token.is_none() && k.starts_with(&prefix)))
+        .cloned()
+        .collect();
+    for key in cancel_keys {
+        if let Some(tx) = cancels.remove(&key) {
+            let _ = tx.send(());
+        }
+    }
+}
+
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
         PluginSource::Catalog => "catalog",
-        PluginSource::User(_) => "user",
+        PluginSource::SkillPack(_) => "skill-pack",
     }
 }
 
-fn plugin_info(plugin: &CorePlugin, enabled: bool) -> PluginInfo {
+fn plugin_info(plugin: &CorePlugin, enabled: bool, configured: bool) -> PluginInfo {
     let m = &plugin.manifest;
     PluginInfo {
         id: m.id.clone(),
@@ -153,6 +261,7 @@ fn plugin_info(plugin: &CorePlugin, enabled: bool) -> PluginInfo {
         verified: m.verified,
         experimental: m.experimental,
         enabled,
+        configured,
         source: source_label(&plugin.source).to_string(),
         capabilities: plugin
             .capabilities()
@@ -175,33 +284,100 @@ fn plugin_oauth_flow_key(plugin_id: &str, state_token: &str) -> String {
     format!("{plugin_id}:{state_token}")
 }
 
+/// The wizard's loopback callback server port. Registered redirect URIs use
+/// it, so it can never change without re-registering every DCR client.
+const PLUGIN_OAUTH_CALLBACK_PORT: u16 = 8976;
+
+fn plugin_oauth_callback_path(plugin_id: &str) -> String {
+    format!("/plugin-oauth/{plugin_id}/callback")
+}
+
 fn plugin_oauth_redirect_uri(plugin_id: &str) -> String {
-    format!("http://127.0.0.1:8976/plugin-oauth/{plugin_id}/callback")
+    format!(
+        "http://127.0.0.1:{PLUGIN_OAUTH_CALLBACK_PORT}{}",
+        plugin_oauth_callback_path(plugin_id)
+    )
 }
 
 fn plugin_oauth_requested_scopes(auth: &AuthSpec) -> Vec<String> {
     auth.scopes.clone()
 }
 
+/// The effective OAuth config after the resolution order. Endpoints:
+/// `plugin_oauth_clients` row (discovery/DCR/manual cache) → manifest.
+/// Client id: row → saved value of the manifest's `auth.client_id_setting`
+/// → for EXTERNAL OAuth plugins only, the saved `auth.setting` value
+/// (google-workspace's client id key IS its auth.setting).
+#[derive(Clone)]
+struct ResolvedPluginOauth {
+    authorize_url: Option<String>,
+    token_url: Option<String>,
+    client_id: Option<String>,
+}
+
+/// External OAuth: sign-in is brokered outside Cockpit by the child server —
+/// kind=oauth with neither an `auth.resource` to discover against nor a
+/// manifest `authorize_url` (google-workspace).
+fn is_external_oauth(auth: &AuthSpec) -> bool {
+    auth.kind == AuthKind::Oauth
+        && auth.resource.as_deref().is_none_or(str::is_empty)
+        && auth.authorize_url.as_deref().is_none_or(str::is_empty)
+}
+
+async fn resolve_plugin_oauth(
+    store: &Store,
+    plugin_id: &str,
+    auth: &AuthSpec,
+) -> anyhow::Result<ResolvedPluginOauth> {
+    let row = store.get_plugin_oauth_client(plugin_id).await?;
+    let (row_authorize, row_token, row_client) = match row {
+        Some(row) => (row.authorize_url, row.token_url, row.client_id),
+        None => (None, None, None),
+    };
+    let non_empty = |value: Option<String>| value.filter(|v| !v.is_empty());
+    let authorize_url =
+        non_empty(row_authorize).or_else(|| auth.authorize_url.clone().filter(|v| !v.is_empty()));
+    let token_url =
+        non_empty(row_token).or_else(|| auth.token_url.clone().filter(|v| !v.is_empty()));
+    let mut client_id = non_empty(row_client);
+    if client_id.is_none() {
+        if let Some(key) = auth.client_id_setting.as_deref() {
+            client_id = store.get_setting_raw(key).await?.filter(|v| !v.is_empty());
+        }
+    }
+    if client_id.is_none() && is_external_oauth(auth) {
+        if let Some(key) = auth.setting.as_deref() {
+            client_id = store.get_setting_raw(key).await?.filter(|v| !v.is_empty());
+        }
+    }
+    Ok(ResolvedPluginOauth {
+        authorize_url,
+        token_url,
+        client_id,
+    })
+}
+
+/// Prereq check over RESOLVED values (table already consulted). Two client-id
+/// message variants preserved: missing `auth.client_id_setting` declaration
+/// vs missing "saved value for {key}" — the wizard branches on structured
+/// fields, never on this text.
 fn plugin_oauth_prereq_error(
     plugin_id: &str,
     auth: &AuthSpec,
-    client_id_value: Option<&str>,
+    resolved: &ResolvedPluginOauth,
 ) -> Option<String> {
     let mut missing = Vec::new();
-    if auth.authorize_url.as_deref().is_none_or(str::is_empty) {
+    if resolved.authorize_url.is_none() {
         missing.push("auth.authorize_url".to_string());
     }
-    if auth.token_url.as_deref().is_none_or(str::is_empty) {
+    if resolved.token_url.is_none() {
         missing.push("auth.token_url".to_string());
     }
-    match auth.client_id_setting.as_deref() {
-        Some(key) => {
-            if client_id_value.is_none_or(str::is_empty) {
-                missing.push(format!("saved value for {key}"));
-            }
+    if resolved.client_id.is_none() {
+        match auth.client_id_setting.as_deref() {
+            Some(key) => missing.push(format!("saved value for {key}")),
+            None => missing.push("auth.client_id_setting".to_string()),
         }
-        None => missing.push("auth.client_id_setting".to_string()),
     }
     if missing.is_empty() {
         None
@@ -211,16 +387,6 @@ fn plugin_oauth_prereq_error(
             missing.join(", ")
         ))
     }
-}
-
-async fn plugin_oauth_client_id(store: &Store, auth: &AuthSpec) -> anyhow::Result<Option<String>> {
-    let Some(key) = auth.client_id_setting.as_deref() else {
-        return Ok(None);
-    };
-    Ok(store
-        .get_setting_raw(key)
-        .await?
-        .filter(|value| !value.is_empty()))
 }
 
 async fn plugin_oauth_client_secret(
@@ -243,18 +409,30 @@ async fn build_plugin_oauth_begin_result(
     verifier: &str,
     state_token: &str,
 ) -> anyhow::Result<PluginOauthBeginResult> {
-    let client_id = plugin_oauth_client_id(store, auth).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}",
-            plugin_oauth_prereq_error(plugin_id, auth, None)
-                .unwrap_or_else(|| format!("{plugin_id} OAuth sign-in isn't ready"))
-        )
-    })?;
-    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, Some(client_id.as_str())) {
+    let resolved = resolve_plugin_oauth(store, plugin_id, auth).await?;
+    build_plugin_oauth_begin_result_with(plugin_id, auth, &resolved, verifier, state_token)
+}
+
+/// Build the authorize URL from already-resolved endpoints/client id —
+/// table values take precedence over manifest fields (see
+/// [`resolve_plugin_oauth`]). `begin_plugin_install` calls this directly
+/// with its post-DCR resolution; `begin_plugin_oauth` goes through the
+/// async wrapper above.
+fn build_plugin_oauth_begin_result_with(
+    plugin_id: &str,
+    auth: &AuthSpec,
+    resolved: &ResolvedPluginOauth,
+    verifier: &str,
+    state_token: &str,
+) -> anyhow::Result<PluginOauthBeginResult> {
+    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, resolved) {
         anyhow::bail!(message);
     }
-
-    let authorize_url = auth.authorize_url.as_deref().ok_or_else(|| {
+    let client_id = resolved
+        .client_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{plugin_id} OAuth sign-in is missing a client id"))?;
+    let authorize_url = resolved.authorize_url.as_deref().ok_or_else(|| {
         anyhow::anyhow!("{plugin_id} OAuth sign-in is missing auth.authorize_url")
     })?;
     let redirect_uri = plugin_oauth_redirect_uri(plugin_id);
@@ -263,7 +441,7 @@ async fn build_plugin_oauth_begin_result(
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("response_type", "code");
-        query.append_pair("client_id", &client_id);
+        query.append_pair("client_id", client_id);
         query.append_pair("redirect_uri", &redirect_uri);
         query.append_pair("state", state_token);
         query.append_pair("code_challenge", &pkce_challenge_s256(verifier));
@@ -286,6 +464,156 @@ async fn build_plugin_oauth_begin_result(
     })
 }
 
+/// Steps 1-6 of the install resolution order: env var → non-oauth kinds →
+/// external OAuth → endpoint discovery (regardless of the
+/// dynamic-registration flag) → client id / DCR → authorize URL + flow
+/// state. Kept free of the Tauri runtime so tests can drive it against a
+/// mock vendor; `begin_plugin_install` wraps it with the callback server
+/// (step 7) and browser open (step 8).
+async fn resolve_plugin_install(
+    store: &Store,
+    http: &reqwest::Client,
+    plugin_id: &str,
+    auth: Option<&AuthSpec>,
+) -> anyhow::Result<PluginInstallBeginResult> {
+    // A manifest without [auth] behaves as kind "none".
+    let Some(auth) = auth else {
+        return Ok(PluginInstallBeginResult::new("none"));
+    };
+    let mut result = PluginInstallBeginResult::new(auth_kind_label(auth.kind));
+    result.env_var_name = auth.env.clone();
+
+    // 1. Env var short-circuit: install completes with zero auth input (the
+    // wizard still routes through the settings step before enabling).
+    if auth
+        .env
+        .as_deref()
+        .is_some_and(|e| std::env::var_os(e).is_some())
+    {
+        result.env_var_present = true;
+        return Ok(result);
+    }
+
+    // 2. Non-OAuth kinds: the wizard routes to token input or settings.
+    if auth.kind != AuthKind::Oauth {
+        return Ok(result);
+    }
+
+    // 3. External OAuth (google-workspace): no discovery, no browser, no
+    // callback — the child server brokers sign-in at first use. The wizard
+    // only collects the client id when none is saved yet.
+    if is_external_oauth(auth) {
+        let resolved = resolve_plugin_oauth(store, plugin_id, auth).await?;
+        result.oauth_external = true;
+        result.needs_client_id = resolved.client_id.is_none();
+        return Ok(result);
+    }
+
+    // 4. Endpoint resolution: discover when either endpoint COLUMN is
+    // missing — regardless of the dynamic-registration flag (Slack needs
+    // endpoints too). Manifest endpoints can still rescue a failure.
+    let row = store.get_plugin_oauth_client(plugin_id).await?;
+    let row_has_endpoints = row.as_ref().is_some_and(|row| {
+        row.authorize_url.as_deref().is_some_and(|v| !v.is_empty())
+            && row.token_url.as_deref().is_some_and(|v| !v.is_empty())
+    });
+    let mut discovered: Option<OauthServerMetadata> = None;
+    if !row_has_endpoints {
+        if let Some(resource) = auth.resource.as_deref().filter(|v| !v.is_empty()) {
+            match discover_oauth_server_metadata(http, resource).await {
+                Ok(metadata) => {
+                    // Persist endpoints even when registration is impossible
+                    // — the manual client-id path needs an authorize URL.
+                    // Network I/O above, store write here: never inside
+                    // with_conn.
+                    store
+                        .upsert_plugin_oauth_client(&PluginOauthClient {
+                            plugin_id: plugin_id.to_string(),
+                            authorize_url: Some(metadata.authorization_endpoint.clone()),
+                            token_url: Some(metadata.token_endpoint.clone()),
+                            client_id: None,
+                        })
+                        .await?;
+                    discovered = Some(metadata);
+                }
+                Err(err) => result.dcr_error = Some(err.to_string()),
+            }
+        }
+    }
+    let mut resolved = resolve_plugin_oauth(store, plugin_id, auth).await?;
+    if resolved.authorize_url.is_none() || resolved.token_url.is_none() {
+        // Discovery failed and neither cache nor manifest supplies
+        // endpoints — nothing else is possible; the wizard shows dcr_error
+        // with Retry.
+        return Ok(result);
+    }
+
+    // 5. Client id: any existing id (row → client_id_setting) permanently
+    // suppresses DCR. DCR runs only when the manifest opts in AND this
+    // call's discovery document exposed a registration_endpoint.
+    if resolved.client_id.is_none() {
+        let registration_endpoint = discovered
+            .as_ref()
+            .and_then(|m| m.registration_endpoint.clone())
+            .filter(|_| auth.dynamic_registration);
+        let Some(registration_endpoint) = registration_endpoint else {
+            result.needs_client_id = true;
+            return Ok(result);
+        };
+        match register_oauth_client(
+            http,
+            &registration_endpoint,
+            &plugin_oauth_redirect_uri(plugin_id),
+        )
+        .await
+        {
+            Ok(client_id) => {
+                store
+                    .upsert_plugin_oauth_client(&PluginOauthClient {
+                        plugin_id: plugin_id.to_string(),
+                        authorize_url: None,
+                        token_url: None,
+                        client_id: Some(client_id.clone()),
+                    })
+                    .await?;
+                result.dcr_succeeded = true;
+                resolved.client_id = Some(client_id);
+            }
+            Err(err) => {
+                result.dcr_error = Some(err.to_string());
+                result.needs_client_id = true;
+                return Ok(result);
+            }
+        }
+    }
+
+    // 6. Authorize URL + flow state; a new begin cancels whatever flow was
+    // pending for this plugin first.
+    cancel_pending_plugin_flows(plugin_id, None);
+    let verifier = generate_pkce_verifier();
+    let state_token = ryuzi_core::paths::new_id();
+    let begin =
+        build_plugin_oauth_begin_result_with(plugin_id, auth, &resolved, &verifier, &state_token)?;
+    plugin_oauth_flows()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(
+            plugin_oauth_flow_key(plugin_id, &state_token),
+            PluginOauthFlowState {
+                verifier,
+                redirect_uri: begin.redirect_uri.clone(),
+                requested_scopes: plugin_oauth_requested_scopes(auth),
+            },
+        );
+    result.oauth_available = true;
+    result.oauth_begin = Some(begin);
+    // Step 6 succeeded: any earlier dcr_error (e.g. discovery failed but the
+    // manifest's endpoints rescued the flow) is stale — never let the DTO
+    // carry oauthAvailable:true alongside a leftover dcrError.
+    result.dcr_error = None;
+    Ok(result)
+}
+
 /// Whether an auth block's credential is configured: a persisted, non-empty
 /// value under `auth.setting`, or — fallback — the `auth.env` var set in the
 /// process environment. Pure so it's testable without a `Store` or a real
@@ -293,6 +621,32 @@ async fn build_plugin_oauth_begin_result(
 /// (see `build_auth_info`).
 fn auth_configured(setting_value: Option<&str>, env_is_set: bool) -> bool {
     setting_value.is_some_and(|v| !v.is_empty()) || env_is_set
+}
+
+/// `PluginAuthInfo.configured` for the list payload without building the
+/// whole auth DTO: oauth → a token is stored and reconnect isn't required;
+/// otherwise the `auth.setting`-row / `auth.env` check. No `[auth]` → false.
+async fn plugin_auth_configured(
+    store: &Store,
+    plugin_id: &str,
+    auth: Option<&AuthSpec>,
+) -> anyhow::Result<bool> {
+    let Some(auth) = auth else {
+        return Ok(false);
+    };
+    if auth.kind == AuthKind::Oauth {
+        let token = store.get_plugin_oauth_token(plugin_id).await?;
+        return Ok(token.is_some_and(|token| !token.reconnect_required));
+    }
+    let setting_value = match &auth.setting {
+        Some(key) => store.get_setting_raw(key).await?,
+        None => None,
+    };
+    let env_is_set = auth
+        .env
+        .as_deref()
+        .is_some_and(|e| std::env::var_os(e).is_some());
+    Ok(auth_configured(setting_value.as_deref(), env_is_set))
 }
 
 async fn build_auth_info(
@@ -308,8 +662,8 @@ async fn build_auth_info(
         .env
         .as_deref()
         .is_some_and(|e| std::env::var_os(e).is_some());
-    let client_id_value = if auth.kind == AuthKind::Oauth {
-        plugin_oauth_client_id(store, auth).await?
+    let resolved_oauth = if auth.kind == AuthKind::Oauth {
+        Some(resolve_plugin_oauth(store, plugin_id, auth).await?)
     } else {
         None
     };
@@ -322,11 +676,9 @@ async fn build_auth_info(
         .as_ref()
         .is_some_and(|token| token.reconnect_required);
     let oauth_token_stored = oauth_token.is_some();
-    let oauth_connect_error = if auth.kind == AuthKind::Oauth {
-        plugin_oauth_prereq_error(plugin_id, auth, client_id_value.as_deref())
-    } else {
-        None
-    };
+    let oauth_connect_error = resolved_oauth
+        .as_ref()
+        .and_then(|resolved| plugin_oauth_prereq_error(plugin_id, auth, resolved));
     Ok(PluginAuthInfo {
         kind: auth_kind_label(auth.kind).to_string(),
         setting: auth.setting.clone(),
@@ -413,18 +765,15 @@ async fn exchange_plugin_oauth_code(
     flow: &PluginOauthFlowState,
     code: &str,
 ) -> anyhow::Result<PluginOauthToken> {
-    let client_id = plugin_oauth_client_id(store, auth).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}",
-            plugin_oauth_prereq_error(plugin_id, auth, None)
-                .unwrap_or_else(|| format!("{plugin_id} OAuth sign-in isn't ready"))
-        )
-    })?;
-    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, Some(client_id.as_str())) {
+    let resolved = resolve_plugin_oauth(store, plugin_id, auth).await?;
+    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, &resolved) {
         anyhow::bail!(message);
     }
-
-    let token_url = auth
+    let client_id = resolved
+        .client_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("{plugin_id} OAuth sign-in is missing a client id"))?;
+    let token_url = resolved
         .token_url
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("{plugin_id} OAuth sign-in is missing auth.token_url"))?;
@@ -498,6 +847,48 @@ async fn exchange_plugin_oauth_code(
     })
 }
 
+/// Consume a captured loopback callback: validate `state` BEFORE touching
+/// the flow map (a mismatched code is discarded but the flow entry stays
+/// usable for retry/manual paste), exchange the code, store the token.
+/// Exchange failure restores the flow entry — the same retry-safe mechanism
+/// as `complete_plugin_oauth`.
+async fn finish_plugin_oauth_callback(
+    store: &Store,
+    plugin_id: &str,
+    auth: &AuthSpec,
+    state_token: &str,
+    callback: ryuzi_core::oauth_loopback::CallbackResult,
+) -> anyhow::Result<()> {
+    let code = callback
+        .code
+        .ok_or_else(|| anyhow::anyhow!("OAuth callback did not include a `code` parameter"))?;
+    let state = callback
+        .state
+        .ok_or_else(|| anyhow::anyhow!("OAuth callback did not include a `state` parameter"))?;
+    if state != state_token {
+        anyhow::bail!("OAuth state mismatch — the sign-in response did not match this install");
+    }
+    let flow_key = plugin_oauth_flow_key(plugin_id, state_token);
+    let flow = plugin_oauth_flows()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&flow_key)
+        .ok_or_else(|| anyhow::anyhow!("plugin sign-in flow not found — start again"))?;
+    match exchange_plugin_oauth_code(store, plugin_id, auth, &flow, code.trim()).await {
+        Ok(token) => {
+            store.upsert_plugin_oauth_token(&token).await?;
+            Ok(())
+        }
+        Err(err) => {
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(flow_key, flow);
+            Err(err)
+        }
+    }
+}
+
 async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let settings = SettingsStore::new(cp.store().clone());
     let mut out = Vec::new();
@@ -506,7 +897,13 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             .plugins()
             .is_enabled(&settings, &plugin.manifest.id)
             .await?;
-        out.push(plugin_info(&plugin, enabled));
+        let configured = plugin_auth_configured(
+            cp.store(),
+            &plugin.manifest.id,
+            plugin.manifest.auth.as_ref(),
+        )
+        .await?;
+        out.push(plugin_info(&plugin, enabled, configured));
     }
     Ok(out)
 }
@@ -526,14 +923,14 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
     let settings_info = build_settings_info(cp.store(), &m.settings).await?;
     let mcp = m.mcp.iter().map(mcp_info).collect();
     let models = providers::list_models(cp.store(), id).await?;
+    let configured = plugin_auth_configured(cp.store(), id, m.auth.as_ref()).await?;
 
     Ok(PluginDetail {
-        info: plugin_info(&plugin, enabled),
+        info: plugin_info(&plugin, enabled, configured),
         auth,
         settings: settings_info,
         mcp,
         models,
-        menu_label: m.menu.as_ref().and_then(|menu| menu.label.clone()),
         homepage: m.homepage.clone(),
         publisher: m.publisher.clone(),
     })
@@ -664,6 +1061,222 @@ pub async fn plugin_models(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Ve
     Ok(providers::list_models(cp.store(), &id).await?)
 }
 
+/// The install wizard's entry point (spec 8-step resolution order). Steps
+/// 1-6 live in `resolve_plugin_install`; this command adds step 7 (bind
+/// 8976 — retried briefly — + background callback/exchange task, degrading
+/// to `callback_mode: "manual"` only when the port is still taken after
+/// the retries) and step 8 (emit `PluginOauthAuthorizeUrlMsg` + open the
+/// browser), exactly like `begin_plugin_oauth` does for the detail view.
+#[tauri::command]
+#[specta::specta]
+pub async fn begin_plugin_install(
+    app: AppHandle,
+    cp: State<'_, Arc<ControlPlane>>,
+    plugin_id: String,
+) -> R<PluginInstallBeginResult> {
+    let plugin = cp.plugins().get(&plugin_id).ok_or_else(|| CmdError {
+        message: format!("unknown plugin: {plugin_id}"),
+    })?;
+    let auth = plugin.manifest.auth.clone();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
+    let mut result = resolve_plugin_install(cp.store(), &http, &plugin_id, auth.as_ref()).await?;
+    let Some(begin) = result.oauth_begin.clone() else {
+        return Ok(result);
+    };
+    let auth = auth.expect("a prepared oauth flow implies an auth block");
+
+    // 7. Register a cancel handle for this flow BEFORE the bind-retry loop
+    // below: cancel_plugin_install can arrive while that loop is still
+    // running (worst case ~300ms across the 3 attempts), and if the sender
+    // isn't in the map yet, cancel_pending_plugin_flows finds nothing to
+    // signal — the flow entry is removed but the eventually-spawned
+    // background task never learns it was canceled and holds the port for
+    // the full 5-minute timeout. Registering first means a cancel that
+    // fires during the bind window pre-fires cancel_rx, and the spawned
+    // task's `tokio::select!` on an already-fired oneshot resolves on its
+    // first poll — no window is lost.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let flow_key = plugin_oauth_flow_key(&plugin_id, &begin.state_token);
+    plugin_install_cancels()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(flow_key.clone(), cancel_tx);
+
+    // Callback server on the fixed wizard port. A same-plugin re-begin
+    // (Retry) has just SIGNALED the previous flow's callback server via
+    // cancel_pending_plugin_flows (step 6), but that axum server shuts down
+    // asynchronously — the port can still be held for a moment. Retry the
+    // bind briefly (3 attempts, 100ms apart) before concluding the port is
+    // genuinely taken by another flow.
+    let mut bound = ryuzi_core::oauth_loopback::bind_fixed(PLUGIN_OAUTH_CALLBACK_PORT).await;
+    for _ in 0..2 {
+        if bound.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        bound = ryuzi_core::oauth_loopback::bind_fixed(PLUGIN_OAUTH_CALLBACK_PORT).await;
+    }
+    match bound {
+        Ok(listener) => {
+            result.callback_mode = "auto".to_string();
+            let (server, result_rx, shutdown_tx) =
+                ryuzi_core::oauth_loopback::spawn_callback_server(
+                    listener,
+                    &plugin_oauth_callback_path(&plugin_id),
+                );
+            let store = cp.store().clone();
+            let app_handle = app.clone();
+            let task_plugin_id = plugin_id.clone();
+            let state_token = begin.state_token.clone();
+            tauri::async_runtime::spawn(async move {
+                let outcome = tokio::select! {
+                    res = ryuzi_core::oauth_loopback::await_callback(
+                        server,
+                        result_rx,
+                        shutdown_tx,
+                        std::time::Duration::from_secs(5 * 60),
+                    ) => Some(res),
+                    // Cancellation (wizard closed / re-begin): dropping the
+                    // await_callback future drops shutdown_tx, which shuts
+                    // the axum server down gracefully.
+                    _ = cancel_rx => None,
+                };
+                plugin_install_cancels()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&flow_key);
+                // Canceled: exit silently — the wizard initiated it.
+                let Some(res) = outcome else { return };
+                let msg = match res {
+                    Ok(callback) => {
+                        match finish_plugin_oauth_callback(
+                            &store,
+                            &task_plugin_id,
+                            &auth,
+                            &state_token,
+                            callback,
+                        )
+                        .await
+                        {
+                            Ok(()) => PluginOauthCompletedMsg {
+                                plugin_id: task_plugin_id.clone(),
+                                ok: true,
+                                error: None,
+                            },
+                            Err(err) => PluginOauthCompletedMsg {
+                                plugin_id: task_plugin_id.clone(),
+                                ok: false,
+                                error: Some(err.to_string()),
+                            },
+                        }
+                    }
+                    Err(err) => PluginOauthCompletedMsg {
+                        plugin_id: task_plugin_id.clone(),
+                        ok: false,
+                        error: Some(err.to_string()),
+                    },
+                };
+                let _ = msg.emit(&app_handle);
+            });
+        }
+        Err(_) => {
+            // Port still taken after the retries — e.g. another plugin's
+            // flow is pending. No background task will ever be spawned to
+            // consume cancel_rx in this branch, so remove the sender
+            // registered above to avoid leaking it in the cancels map. The
+            // wizard explains why; completion goes through
+            // complete_plugin_oauth.
+            plugin_install_cancels()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&flow_key);
+            result.callback_mode = "manual".to_string();
+        }
+    }
+
+    // 8. Emit the authorize URL and open the browser (as begin_plugin_oauth
+    // does today).
+    let _ = PluginOauthAuthorizeUrlMsg {
+        plugin_id: plugin_id.clone(),
+        authorize_url: begin.authorize_url.clone(),
+    }
+    .emit(&app);
+    let _ = app
+        .opener()
+        .open_url(begin.authorize_url.clone(), None::<&str>);
+    Ok(result)
+}
+
+/// Persist a manually-entered client id. External-OAuth plugins store it
+/// under the declared `auth.setting` via the validated SettingsStore path
+/// (`validate_setting`/`register_plugin_fields` only accept
+/// manifest-declared keys); everyone else upserts
+/// `plugin_oauth_clients.client_id` — deliberately NOT a `plugin.*` setting,
+/// since none of these manifests declare one.
+async fn set_plugin_oauth_client_id_inner(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    client_id: &str,
+) -> anyhow::Result<()> {
+    let auth = plugin_oauth_auth(cp, plugin_id)?;
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        anyhow::bail!("client id must not be empty");
+    }
+    if is_external_oauth(&auth) {
+        let Some(key) = auth.setting.as_deref() else {
+            anyhow::bail!("{plugin_id} declares no auth.setting to hold a client id");
+        };
+        let settings = SettingsStore::new(cp.store().clone());
+        settings.set(key, client_id).await?;
+        return Ok(());
+    }
+    cp.store()
+        .upsert_plugin_oauth_client(&PluginOauthClient {
+            plugin_id: plugin_id.to_string(),
+            authorize_url: None,
+            token_url: None,
+            client_id: Some(client_id.to_string()),
+        })
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_plugin_oauth_client_id(
+    cp: State<'_, Arc<ControlPlane>>,
+    plugin_id: String,
+    client_id: String,
+) -> R<()> {
+    Ok(set_plugin_oauth_client_id_inner(&cp, &plugin_id, &client_id).await?)
+}
+
+/// Cancel the pending OAuth flow for this plugin, if any: shuts down the
+/// callback listener and removes the flow-map entry. `state_token` narrows
+/// to a specific flow when known; `None` cancels whatever is pending for
+/// the id.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_plugin_install(
+    cp: State<'_, Arc<ControlPlane>>,
+    plugin_id: String,
+    state_token: Option<String>,
+) -> R<()> {
+    if cp.plugins().get(&plugin_id).is_none() {
+        return Err(CmdError {
+            message: format!("unknown plugin: {plugin_id}"),
+        });
+    }
+    cancel_pending_plugin_flows(&plugin_id, state_token.as_deref());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +1287,7 @@ mod tests {
     use ryuzi_core::Registries;
     use ryuzi_plugin_sdk::{AuthSpec, ModelDef, PluginManifest, ProviderMeta, RuntimeMeta};
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- minimal fakes, self-contained to this test module ----
 
@@ -784,7 +1398,6 @@ mod tests {
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         }
@@ -816,7 +1429,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            source: PluginSource::User(std::path::PathBuf::from("/tmp/whatever")),
+            source: PluginSource::SkillPack(std::path::PathBuf::from("/tmp/whatever")),
         }
     }
 
@@ -908,8 +1521,8 @@ mod tests {
         assert_eq!(source_label(&PluginSource::Builtin), "builtin");
         assert_eq!(source_label(&PluginSource::Catalog), "catalog");
         assert_eq!(
-            source_label(&PluginSource::User(std::path::PathBuf::from("/x"))),
-            "user"
+            source_label(&PluginSource::SkillPack(std::path::PathBuf::from("/x"))),
+            "skill-pack"
         );
     }
 
@@ -918,14 +1531,15 @@ mod tests {
     #[test]
     fn plugin_info_maps_identity_and_enabled_flag_through() {
         let plugin = harness_only("native");
-        let info = plugin_info(&plugin, true);
+        let info = plugin_info(&plugin, true, false);
         assert_eq!(info.id, "native");
         assert_eq!(info.name, "Plugin native");
         assert!(info.enabled);
         assert_eq!(info.source, "builtin");
         assert_eq!(info.capabilities, vec!["runtime".to_string()]);
+        assert!(!info.configured);
 
-        let info_disabled = plugin_info(&plugin, false);
+        let info_disabled = plugin_info(&plugin, false, false);
         assert!(!info_disabled.enabled);
     }
 
@@ -1017,6 +1631,106 @@ mod tests {
             query.get("redirect_uri").map(String::as_str),
             Some(begin.redirect_uri.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_plugin_oauth_orders_row_then_setting_then_external_auth_setting() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        store
+            .set_setting_raw("plugin.gw.client_id", "setting-client")
+            .await
+            .unwrap();
+
+        // External plugin (no resource, no authorize_url): auth.setting IS
+        // the client id key (google-workspace shape).
+        let external = AuthSpec {
+            kind: AuthKind::Oauth,
+            setting: Some("plugin.gw.client_id".into()),
+            ..Default::default()
+        };
+        assert!(is_external_oauth(&external));
+        let resolved = resolve_plugin_oauth(&store, "gw", &external).await.unwrap();
+        assert_eq!(resolved.client_id.as_deref(), Some("setting-client"));
+
+        // Non-external (resource declared): auth.setting is NOT consulted.
+        let non_external = AuthSpec {
+            kind: AuthKind::Oauth,
+            setting: Some("plugin.gw.client_id".into()),
+            resource: Some("https://vendor.test/mcp".into()),
+            ..Default::default()
+        };
+        assert!(!is_external_oauth(&non_external));
+        let resolved = resolve_plugin_oauth(&store, "gw", &non_external)
+            .await
+            .unwrap();
+        assert_eq!(resolved.client_id, None);
+
+        // client_id_setting is second in the order…
+        let with_setting = AuthSpec {
+            client_id_setting: Some("plugin.gw.client_id".into()),
+            ..non_external.clone()
+        };
+        let resolved = resolve_plugin_oauth(&store, "gw", &with_setting)
+            .await
+            .unwrap();
+        assert_eq!(resolved.client_id.as_deref(), Some("setting-client"));
+
+        // …and the plugin_oauth_clients row wins over everything, endpoints
+        // included (table → manifest).
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "gw".into(),
+                authorize_url: Some("https://discovered.test/authorize".into()),
+                token_url: Some("https://discovered.test/token".into()),
+                client_id: Some("row-client".into()),
+            })
+            .await
+            .unwrap();
+        let resolved = resolve_plugin_oauth(&store, "gw", &with_setting)
+            .await
+            .unwrap();
+        assert_eq!(resolved.client_id.as_deref(), Some("row-client"));
+        assert_eq!(
+            resolved.authorize_url.as_deref(),
+            Some("https://discovered.test/authorize")
+        );
+        assert_eq!(
+            resolved.token_url.as_deref(),
+            Some("https://discovered.test/token")
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_result_prefers_table_endpoints_over_manifest() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "acme-table".into(),
+                authorize_url: Some("https://discovered.test/authorize".into()),
+                token_url: Some("https://discovered.test/token".into()),
+                client_id: Some("row-client".into()),
+            })
+            .await
+            .unwrap();
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            authorize_url: Some("https://manifest.test/authorize".into()),
+            token_url: Some("https://manifest.test/token".into()),
+            ..Default::default()
+        };
+        let begin = build_plugin_oauth_begin_result(&store, "acme-table", &auth, "v-1", "s-1")
+            .await
+            .unwrap();
+        assert!(
+            begin
+                .authorize_url
+                .starts_with("https://discovered.test/authorize?"),
+            "{}",
+            begin.authorize_url
+        );
+        assert!(begin.authorize_url.contains("client_id=row-client"));
     }
 
     // ---------- field_value_set ----------
@@ -1120,6 +1834,68 @@ mod tests {
         );
     }
 
+    /// Same seam as core's `secrets::use_test_key_file` (pub(crate) there;
+    /// separate crates keep their own copy): point the process-global cipher
+    /// at a throwaway key file BEFORE the first encrypt/decrypt so tests
+    /// never touch the OS keychain or a real secret.key.
+    fn use_cockpit_test_key_file() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let path = std::env::temp_dir().join(format!(
+                "ryuzi-cockpit-test-secret-{}.key",
+                std::process::id()
+            ));
+            std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
+        });
+    }
+
+    #[tokio::test]
+    async fn plugin_info_configured_matches_auth_info_semantics_for_non_oauth() {
+        let cp = test_cp().await;
+        let list = assemble_list(&cp).await.unwrap();
+        let anthropic = list.iter().find(|p| p.id == "anthropic").unwrap();
+        assert!(!anthropic.configured, "fresh store: nothing configured");
+        let detail = assemble_detail(&cp, "anthropic").await.unwrap();
+        assert_eq!(
+            detail.info.configured,
+            detail.auth.expect("anthropic declares auth").configured
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_info_configured_for_oauth_requires_stored_token_without_reconnect() {
+        use_cockpit_test_key_file();
+        let cp = test_cp().await;
+        // notion is a catalog kind=oauth plugin.
+        let before = assemble_detail(&cp, "notion").await.unwrap();
+        assert!(!before.info.configured);
+
+        cp.store()
+            .upsert_plugin_oauth_token(&PluginOauthToken {
+                plugin_id: "notion".into(),
+                access_token: "tok".into(),
+                refresh_token: None,
+                token_type: "Bearer".into(),
+                expires_at: None,
+                scopes: vec![],
+                reconnect_required: false,
+            })
+            .await
+            .unwrap();
+        let with_token = assemble_detail(&cp, "notion").await.unwrap();
+        assert!(with_token.info.configured);
+
+        cp.store()
+            .mark_plugin_oauth_reconnect_required("notion")
+            .await
+            .unwrap();
+        let reconnect = assemble_detail(&cp, "notion").await.unwrap();
+        assert!(
+            !reconnect.info.configured,
+            "reconnect_required must unset configured"
+        );
+    }
+
     #[tokio::test]
     async fn set_plugin_enabled_and_setting_round_trip_through_the_control_plane() {
         let cp = test_cp().await;
@@ -1141,6 +1917,541 @@ mod tests {
         assert_eq!(
             settings.get("default_perm_mode").await.unwrap().as_deref(),
             Some("acceptEdits")
+        );
+    }
+
+    // ---------- begin_plugin_install resolution (steps 1-6) ----------
+
+    /// Minimal hand-rolled HTTP mock on std::net (this crate has no axum —
+    /// core's axum-mock convention doesn't apply here; adding axum would be
+    /// a new dependency). Serves the RFC 8414 root + path-inserted documents
+    /// (both spellings share the well-known prefix) pointing endpoints (and,
+    /// when `with_registration`, the registration endpoint) at itself, plus
+    /// an RFC 7591 register endpoint; counts hits per route.
+    fn spawn_mock_vendor(
+        with_registration: bool,
+        discovery_hits: Arc<AtomicUsize>,
+        register_hits: Arc<AtomicUsize>,
+    ) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served_base = base.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let base = served_base.clone();
+                let discovery_hits = discovery_hits.clone();
+                let register_hits = register_hits.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    let header_end = loop {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                    // Drain any request body so the client never sees a
+                    // reset while still writing.
+                    if let Some(len) = head.lines().find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    }) {
+                        let mut have = buf.len() - header_end;
+                        while have < len {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => have += n,
+                            }
+                        }
+                    }
+                    let request_line = head.lines().next().unwrap_or_default().to_string();
+                    let (status, body) = if request_line
+                        .starts_with("GET /.well-known/oauth-authorization-server")
+                    {
+                        discovery_hits.fetch_add(1, Ordering::SeqCst);
+                        let registration = if with_registration {
+                            format!(r#","registration_endpoint":"{base}/register""#)
+                        } else {
+                            String::new()
+                        };
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/token"{registration}}}"#
+                            ),
+                        )
+                    } else if request_line.starts_with("POST /register") {
+                        register_hits.fetch_add(1, Ordering::SeqCst);
+                        ("200 OK", r#"{"client_id":"dcr-client-123"}"#.to_string())
+                    } else {
+                        ("404 Not Found", String::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        base
+    }
+
+    async fn test_store() -> (ryuzi_core::Store, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        (store, tmp)
+    }
+
+    #[tokio::test]
+    async fn begin_env_var_short_circuits_before_any_oauth_work() {
+        let (store, _tmp) = test_store().await;
+        let var = "RYUZI_TEST_WIZ_ENV_7a91";
+        std::env::set_var(var, "present");
+        let auth = AuthSpec {
+            kind: AuthKind::ApiKey,
+            env: Some(var.to_string()),
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+        let result = resolve_plugin_install(&store, &http, "wiz-env", Some(&auth))
+            .await
+            .unwrap();
+        assert_eq!(result.auth_kind, "api-key");
+        assert!(result.env_var_present);
+        assert_eq!(result.env_var_name.as_deref(), Some(var));
+        assert!(result.oauth_begin.is_none());
+        std::env::remove_var(var);
+    }
+
+    #[tokio::test]
+    async fn begin_non_oauth_kind_reports_kind_only() {
+        let (store, _tmp) = test_store().await;
+        let auth = AuthSpec {
+            kind: AuthKind::Token,
+            setting: Some("plugin.wiz-token.token".into()),
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+        let result = resolve_plugin_install(&store, &http, "wiz-token", Some(&auth))
+            .await
+            .unwrap();
+        assert_eq!(result.auth_kind, "token");
+        assert!(!result.env_var_present);
+        assert!(!result.oauth_available && !result.oauth_external && !result.needs_client_id);
+        // And no [auth] block at all behaves as "none".
+        let result = resolve_plugin_install(&store, &http, "wiz-none", None)
+            .await
+            .unwrap();
+        assert_eq!(result.auth_kind, "none");
+    }
+
+    #[tokio::test]
+    async fn begin_external_oauth_never_discovers_and_tracks_saved_client_id() {
+        let (store, _tmp) = test_store().await;
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            setting: Some("plugin.wiz-external.client_id".into()),
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+        let result = resolve_plugin_install(&store, &http, "wiz-external", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.oauth_external);
+        assert!(result.needs_client_id, "no saved auth.setting value yet");
+        assert!(!result.oauth_available);
+        assert!(result.oauth_begin.is_none());
+
+        store
+            .set_setting_raw("plugin.wiz-external.client_id", "google-client")
+            .await
+            .unwrap();
+        let result = resolve_plugin_install(&store, &http, "wiz-external", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.oauth_external);
+        assert!(!result.needs_client_id);
+        assert!(
+            result.oauth_begin.is_none(),
+            "external never opens a browser"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_runs_discovery_then_dcr_then_reuses_the_cache() {
+        let (store, _tmp) = test_store().await;
+        let discovery_hits = Arc::new(AtomicUsize::new(0));
+        let register_hits = Arc::new(AtomicUsize::new(0));
+        let base = spawn_mock_vendor(true, discovery_hits.clone(), register_hits.clone());
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            resource: Some(format!("{base}/mcp")),
+            dynamic_registration: true,
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+
+        let result = resolve_plugin_install(&store, &http, "wiz-dcr", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.dcr_succeeded);
+        assert!(result.oauth_available);
+        assert!(!result.needs_client_id);
+        let begin = result.oauth_begin.expect("browser flow prepared");
+        assert!(
+            begin
+                .authorize_url
+                .starts_with(&format!("{base}/authorize?")),
+            "{}",
+            begin.authorize_url
+        );
+        assert!(begin.authorize_url.contains("client_id=dcr-client-123"));
+        assert_eq!(discovery_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(register_hits.load(Ordering::SeqCst), 1);
+        // Flow state was stored for the callback/exchange.
+        assert!(plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_key(&plugin_oauth_flow_key("wiz-dcr", &begin.state_token)));
+
+        // Endpoints + client id persisted.
+        let row = store
+            .get_plugin_oauth_client("wiz-dcr")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.authorize_url.as_deref(),
+            Some(format!("{base}/authorize").as_str())
+        );
+        assert_eq!(
+            row.token_url.as_deref(),
+            Some(format!("{base}/token").as_str())
+        );
+        assert_eq!(row.client_id.as_deref(), Some("dcr-client-123"));
+
+        // Second begin: cached endpoints reused (no second discovery) and a
+        // client id on the row permanently suppresses DCR.
+        let result2 = resolve_plugin_install(&store, &http, "wiz-dcr", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result2.oauth_available);
+        assert!(!result2.dcr_succeeded);
+        assert_eq!(
+            discovery_hits.load(Ordering::SeqCst),
+            1,
+            "no second discovery"
+        );
+        assert_eq!(
+            register_hits.load(Ordering::SeqCst),
+            1,
+            "no second registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_without_registration_endpoint_persists_endpoints_then_manual_id_skips_dcr() {
+        let (store, _tmp) = test_store().await;
+        let discovery_hits = Arc::new(AtomicUsize::new(0));
+        let register_hits = Arc::new(AtomicUsize::new(0));
+        // Slack shape: endpoints discoverable, registration closed, manifest
+        // does not opt into dynamic-registration.
+        let base = spawn_mock_vendor(false, discovery_hits.clone(), register_hits.clone());
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            resource: Some(format!("{base}/mcp")),
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+
+        let result = resolve_plugin_install(&store, &http, "wiz-slack", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.needs_client_id);
+        assert!(!result.oauth_available);
+        assert!(!result.dcr_succeeded);
+        assert_eq!(register_hits.load(Ordering::SeqCst), 0);
+        // Endpoints survive even though registration is impossible.
+        let row = store
+            .get_plugin_oauth_client("wiz-slack")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.token_url.as_deref(),
+            Some(format!("{base}/token").as_str())
+        );
+        assert!(row.client_id.is_none());
+
+        // Manual client id → re-begin goes straight to the browser flow.
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "wiz-slack".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("manual-client".into()),
+            })
+            .await
+            .unwrap();
+        let result = resolve_plugin_install(&store, &http, "wiz-slack", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.oauth_available);
+        assert!(!result.needs_client_id);
+        assert!(result
+            .oauth_begin
+            .unwrap()
+            .authorize_url
+            .contains("client_id=manual-client"));
+        assert_eq!(
+            discovery_hits.load(Ordering::SeqCst),
+            1,
+            "cached endpoints reused"
+        );
+        assert_eq!(
+            register_hits.load(Ordering::SeqCst),
+            0,
+            "DCR never attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_discovery_failure_with_no_endpoints_reports_only_the_error() {
+        let (store, _tmp) = test_store().await;
+        // Bind then drop: requests to this port are refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            resource: Some(format!("{base}/mcp")),
+            dynamic_registration: true,
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+        let result = resolve_plugin_install(&store, &http, "wiz-down", Some(&auth))
+            .await
+            .unwrap();
+        assert!(!result.oauth_available);
+        assert!(
+            !result.needs_client_id,
+            "nothing to enter without endpoints"
+        );
+        assert!(result.dcr_error.is_some());
+        assert!(result.oauth_begin.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_plugin_oauth_client_id_routes_external_to_auth_setting_and_others_to_the_row() {
+        let cp = test_cp().await;
+        // google-workspace is the external-OAuth catalog plugin — its client
+        // id key IS its auth.setting (validated write path).
+        set_plugin_oauth_client_id_inner(&cp, "google-workspace", " google-client-1 ")
+            .await
+            .unwrap();
+        assert_eq!(
+            cp.store()
+                .get_setting_raw("plugin.google-workspace.client_id")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("google-client-1"),
+            "trimmed value stored under the declared auth.setting"
+        );
+        assert!(
+            cp.store()
+                .get_plugin_oauth_client("google-workspace")
+                .await
+                .unwrap()
+                .is_none(),
+            "external plugins never write the row"
+        );
+
+        // notion (resource-declared oauth) goes to plugin_oauth_clients.
+        set_plugin_oauth_client_id_inner(&cp, "notion", "notion-client-1")
+            .await
+            .unwrap();
+        let row = cp
+            .store()
+            .get_plugin_oauth_client("notion")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.client_id.as_deref(), Some("notion-client-1"));
+        assert!(row.authorize_url.is_none());
+
+        // Empty input is rejected.
+        assert!(set_plugin_oauth_client_id_inner(&cp, "notion", "  ")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_plugin_flows_narrows_by_state_token_or_sweeps_the_plugin() {
+        let insert = |token: &str| {
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(
+                    plugin_oauth_flow_key("wiz-cancel", token),
+                    PluginOauthFlowState {
+                        verifier: "v".into(),
+                        redirect_uri: plugin_oauth_redirect_uri("wiz-cancel"),
+                        requested_scopes: vec![],
+                    },
+                );
+        };
+        insert("s1");
+        insert("s2");
+        cancel_pending_plugin_flows("wiz-cancel", Some("s1"));
+        {
+            let flows = plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            assert!(!flows.contains_key(&plugin_oauth_flow_key("wiz-cancel", "s1")));
+            assert!(flows.contains_key(&plugin_oauth_flow_key("wiz-cancel", "s2")));
+        }
+        cancel_pending_plugin_flows("wiz-cancel", None);
+        let flows = plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(!flows.contains_key(&plugin_oauth_flow_key("wiz-cancel", "s2")));
+    }
+
+    // ---------- finish_plugin_oauth_callback ----------
+
+    fn insert_test_flow(plugin_id: &str, state_token: &str, verifier: &str) -> String {
+        let flow_key = plugin_oauth_flow_key(plugin_id, state_token);
+        plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                flow_key.clone(),
+                PluginOauthFlowState {
+                    verifier: verifier.to_string(),
+                    redirect_uri: plugin_oauth_redirect_uri(plugin_id),
+                    requested_scopes: vec![],
+                },
+            );
+        flow_key
+    }
+
+    #[tokio::test]
+    async fn finish_callback_missing_code_errors_and_preserves_the_flow() {
+        let (store, _tmp) = test_store().await;
+        let flow_key = insert_test_flow("wiz-cb-code", "state-a", "verifier-a");
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let callback = ryuzi_core::oauth_loopback::CallbackResult {
+            code: None,
+            state: Some("state-a".into()),
+        };
+        let err = finish_plugin_oauth_callback(&store, "wiz-cb-code", &auth, "state-a", callback)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("code"), "{err}");
+        assert!(
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains_key(&flow_key),
+            "a missing-code callback must leave the flow entry in place for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_callback_missing_state_errors_and_preserves_the_flow() {
+        let (store, _tmp) = test_store().await;
+        let flow_key = insert_test_flow("wiz-cb-state", "state-b", "verifier-b");
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let callback = ryuzi_core::oauth_loopback::CallbackResult {
+            code: Some("auth-code".into()),
+            state: None,
+        };
+        let err = finish_plugin_oauth_callback(&store, "wiz-cb-state", &auth, "state-b", callback)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("state"), "{err}");
+        assert!(
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains_key(&flow_key),
+            "a missing-state callback must leave the flow entry in place for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_callback_state_mismatch_errors_and_preserves_the_flow() {
+        let (store, _tmp) = test_store().await;
+        let flow_key = insert_test_flow("wiz-cb-mismatch", "state-c", "verifier-c");
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let callback = ryuzi_core::oauth_loopback::CallbackResult {
+            code: Some("auth-code".into()),
+            state: Some("not-state-c".into()),
+        };
+        let err =
+            finish_plugin_oauth_callback(&store, "wiz-cb-mismatch", &auth, "state-c", callback)
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("state mismatch"), "{err}");
+        assert!(
+            plugin_oauth_flows()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains_key(&flow_key),
+            "a state-mismatch callback must leave the flow entry in place — it wasn't this \
+             install's response, so the pending install can still complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_callback_exchange_failure_reinserts_the_flow_for_retry() {
+        let (store, _tmp) = test_store().await;
+        let flow_key = insert_test_flow("wiz-cb-exchange", "state-d", "verifier-d");
+        // No table row and no manifest endpoints/client id source at all —
+        // exchange fails deterministically inside `exchange_plugin_oauth_code`
+        // (via `plugin_oauth_prereq_error`) before any network call.
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            ..Default::default()
+        };
+        let callback = ryuzi_core::oauth_loopback::CallbackResult {
+            code: Some("auth-code".into()),
+            state: Some("state-d".into()),
+        };
+        let err =
+            finish_plugin_oauth_callback(&store, "wiz-cb-exchange", &auth, "state-d", callback)
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("isn't ready"), "{err}");
+        let flows = plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let flow = flows
+            .get(&flow_key)
+            .expect("exchange failure must re-insert the flow so the wizard can retry");
+        assert_eq!(
+            flow.verifier, "verifier-d",
+            "the re-inserted flow must be the same one that was removed, not a blank default"
         );
     }
 }
