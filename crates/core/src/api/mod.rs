@@ -3,6 +3,11 @@
 //! names match the Tauri command names 1:1; params objects use the Rust
 //! snake_case parameter names. One submodule per command family.
 
+pub mod apps_api;
+pub mod gateways_api;
+pub mod native_api;
+pub mod scheduler_api;
+pub mod session_io_api;
 pub mod sessions;
 pub mod types;
 
@@ -62,6 +67,11 @@ pub(crate) fn ok<T: serde::Serialize>(v: T) -> Result<Value, ApiError> {
 pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     match method {
         m if sessions::HANDLES.contains(&m) => sessions::dispatch(state, m, p).await,
+        m if scheduler_api::HANDLES.contains(&m) => scheduler_api::dispatch(state, m, p).await,
+        m if gateways_api::HANDLES.contains(&m) => gateways_api::dispatch(state, m, p).await,
+        m if apps_api::HANDLES.contains(&m) => apps_api::dispatch(state, m, p).await,
+        m if native_api::HANDLES.contains(&m) => native_api::dispatch(state, m, p).await,
+        m if session_io_api::HANDLES.contains(&m) => session_io_api::dispatch(state, m, p).await,
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }

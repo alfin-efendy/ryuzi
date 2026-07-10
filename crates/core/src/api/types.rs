@@ -138,3 +138,183 @@ pub(crate) fn sanitize_file_name(name: &str) -> String {
         trimmed.to_string()
     }
 }
+
+// --- scheduler_api (moved verbatim from apps/cockpit/src-tauri/src/scheduler_cmd.rs) ---
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RunInfo {
+    pub id: String,
+    pub status: String,
+    pub started_at_ms: i64,
+    pub duration_ms: Option<i64>,
+    pub add_lines: Option<i64>,
+    pub del_lines: Option<i64>,
+    pub note: Option<String>,
+    pub error: Option<String>,
+    pub session_pk: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct JobInfo {
+    pub id: String,
+    pub name: String,
+    pub cron: String,
+    pub mode: String,
+    pub natural: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub branch: String,
+    pub agent: String,
+    pub gateway: String,
+    pub enabled: bool,
+    pub prompt: String,
+    pub notify_success: bool,
+    pub notify_fail: bool,
+    pub next_run_ms: Option<i64>,
+    pub history: Vec<RunInfo>,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct JobInput {
+    pub name: String,
+    pub mode: String,
+    pub natural: String,
+    pub cron: String,
+    pub project_id: String,
+    pub branch: String,
+    pub agent: String,
+    pub gateway: String,
+    pub prompt: String,
+    pub notify_success: bool,
+    pub notify_fail: bool,
+}
+
+// --- gateways_api (moved verbatim from apps/cockpit/src-tauri/src/gateways_cmd.rs) ---
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayResourceInfo {
+    pub label: String,
+    pub sub: String,
+    pub pct: u32,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayInfo {
+    pub id: String,
+    pub name: String,
+    pub badge: String,
+    /// local | wsl | ssh
+    pub kind: String,
+    pub detail: String,
+    pub meta_line: String,
+    /// connected | offline
+    pub status: String,
+    pub latency: Option<String>,
+    pub daemon_version: String,
+    pub uptime: Option<String>,
+    pub last_seen_ms: Option<i64>,
+    pub resources: Vec<GatewayResourceInfo>,
+    pub fingerprint: Option<String>,
+    pub fs_mode: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayEventInfo {
+    pub at: i64,
+    pub level: String,
+    pub text: String,
+}
+
+// --- apps_api (moved verbatim from apps/cockpit/src-tauri/src/apps_cmd.rs) ---
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolInfo {
+    pub name: String,
+    pub desc: String,
+    pub perm: String,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAccessInfo {
+    pub agent_id: String,
+    pub allowed: bool,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInfo {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub initial: String,
+    pub color: String,
+    pub desc: String,
+    pub transport: String,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub url: Option<String>,
+    pub scope: String,
+    pub scope_gateways: Vec<String>,
+    pub status: String,
+    pub status_detail: Option<String>,
+    pub version: Option<String>,
+    pub publisher: Option<String>,
+    pub auth_kind: String,
+    pub auth_detail: Option<String>,
+    pub tools: Vec<ToolInfo>,
+    pub agent_access: Vec<AgentAccessInfo>,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AddAppInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub kind: Option<String>,
+    /// stdio | http
+    pub transport: String,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    /// KEY=VALUE pairs.
+    pub env: Vec<String>,
+    pub url: Option<String>,
+    pub version: Option<String>,
+    pub publisher: Option<String>,
+    pub color: Option<String>,
+}
+
+// --- native_api (moved verbatim from apps/cockpit/src-tauri/src/native_cmd.rs) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInfo {
+    pub name: String,
+    pub description: String,
+    pub mode: String,
+    pub builtin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoItem {
+    pub content: String,
+    pub status: String,
+}
