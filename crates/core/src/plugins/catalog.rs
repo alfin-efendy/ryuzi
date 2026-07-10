@@ -318,4 +318,21 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn vercel_opts_into_dynamic_registration() {
+        let vercel = catalog_plugins()
+            .into_iter()
+            .find(|p| p.manifest.id == "vercel")
+            .expect("vercel catalog plugin");
+        assert!(
+            vercel
+                .manifest
+                .auth
+                .as_ref()
+                .expect("vercel declares [auth]")
+                .dynamic_registration,
+            "vercel must attempt DCR (failure falls back to the manual client-id form)"
+        );
+    }
 }
