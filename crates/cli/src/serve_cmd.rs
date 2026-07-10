@@ -53,7 +53,15 @@ async fn run_serve(port: u16, deps: &mut Deps) -> u8 {
     // read-check-write anchor is NOT cross-process safe, so a second host
     // could double-fire jobs.
     ryuzi_core::orch::spawn_runner(cp.clone());
-    let bound = match serve::serve(cp, port).await {
+    let router_server = std::sync::Arc::new(ryuzi_core::llm_router::server::RouterServer::new(
+        cp.store().clone(),
+    ));
+    let state = serve::ApiState {
+        cp: cp.clone(),
+        router_server,
+        token: None,
+    };
+    let bound = match serve::serve(state, port).await {
         Ok(p) => p,
         Err(e) => {
             (deps.err)(&format!("✗ could not bind :{port}: {e}"));
