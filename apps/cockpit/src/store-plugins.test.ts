@@ -1,5 +1,5 @@
 import { test, expect, spyOn } from "bun:test";
-import { usePlugins, sidebarPlugins, catalogPlugins } from "./store-plugins";
+import { usePlugins, browsePlugins, installedPlugins } from "./store-plugins";
 import { commands, type PluginInfo } from "./bindings";
 
 function reset() {
@@ -17,6 +17,10 @@ const builtin: PluginInfo = {
   enabled: true,
   source: "builtin",
   capabilities: ["runtime"],
+  configured: false,
+  kind: "integration",
+  installed: false,
+  family: null,
 };
 
 const github: PluginInfo = {
@@ -30,16 +34,27 @@ const github: PluginInfo = {
   enabled: true,
   source: "catalog",
   capabilities: ["connector"],
+  configured: false,
+  kind: "integration",
+  installed: true,
+  family: null,
 };
 
-const userPlugin: PluginInfo = {
+const skillPack: PluginInfo = {
   ...github,
   id: "acme",
   name: "Acme",
-  source: "user",
+  source: "skill-pack",
+  kind: "skill-pack",
 };
 
-const disabledCatalog: PluginInfo = { ...github, id: "linear", name: "Linear", enabled: false };
+const disabledCatalog: PluginInfo = {
+  ...github,
+  id: "linear",
+  name: "Linear",
+  enabled: false,
+  installed: false,
+};
 
 test("load populates plugins from listPlugins", async () => {
   reset();
@@ -97,12 +112,36 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
   listSpy.mockRestore();
 });
 
-test("sidebarPlugins keeps only enabled catalog/user plugins, hiding builtins and disabled ones", () => {
-  const result = sidebarPlugins([builtin, github, userPlugin, disabledCatalog]);
-  expect(result.map((p) => p.id)).toEqual(["github", "acme"]);
+test("browsePlugins keeps only not-installed entries", () => {
+  expect(browsePlugins([builtin, github, skillPack, disabledCatalog]).map((p) => p.id)).toEqual(["native", "linear"]);
 });
 
-test("catalogPlugins keeps every catalog/user plugin regardless of enabled state, hiding builtins", () => {
-  const result = catalogPlugins([builtin, github, userPlugin, disabledCatalog]);
-  expect(result.map((p) => p.id)).toEqual(["github", "acme", "linear"]);
+test("installedPlugins keeps only installed entries", () => {
+  expect(installedPlugins([builtin, github, skillPack]).map((p) => p.id)).toEqual(["github", "acme"]);
+});
+
+test("uninstall swaps in the returned list", async () => {
+  reset();
+  usePlugins.setState({ plugins: [github], loaded: true });
+  const spy = spyOn(commands, "uninstallPlugin").mockResolvedValue({
+    status: "ok",
+    data: [{ ...github, installed: false, enabled: false, configured: false }],
+  });
+  const ok = await usePlugins.getState().uninstall("github");
+  expect(ok).toBe(true);
+  expect(usePlugins.getState().plugins[0].installed).toBe(false);
+  spy.mockRestore();
+});
+
+test("uninstall failure toasts and keeps state", async () => {
+  reset();
+  usePlugins.setState({ plugins: [github], loaded: true });
+  const spy = spyOn(commands, "uninstallPlugin").mockResolvedValue({
+    status: "error",
+    error: { message: "boom" },
+  });
+  const ok = await usePlugins.getState().uninstall("github");
+  expect(ok).toBe(false);
+  expect(usePlugins.getState().plugins[0].installed).toBe(true);
+  spy.mockRestore();
 });

@@ -18,7 +18,3 @@ resource = "https://mcp.slack.com/mcp"
 name = "slack"
 transport = "http"
 url = "https://mcp.slack.com/mcp"
-
-[menu]
-section = "plugins"
-label = "Slack"

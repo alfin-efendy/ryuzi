@@ -20,7 +20,3 @@ name = "cavemem"
 transport = "stdio"
 command = "cavemem"
 args = ["mcp"]
-
-[menu]
-section = "plugins"
-label = "Cavemem"

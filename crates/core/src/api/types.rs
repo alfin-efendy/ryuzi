@@ -522,10 +522,27 @@ pub struct PluginInfo {
     pub verified: bool,
     pub experimental: bool,
     pub enabled: bool,
-    /// `builtin` | `catalog` | `user`.
+    /// Same semantics as `PluginAuthInfo.configured` (oauth: token stored &&
+    /// !reconnect_required; else a persisted `auth.setting` row or `auth.env`
+    /// set). `false` when the manifest declares no `[auth]` block. On the
+    /// LIST payload (not just `plugin_detail`) because the Browse grid's
+    /// Install/Open split needs it — note this adds per-plugin store lookups
+    /// to list assembly.
+    pub configured: bool,
+    /// `builtin` | `catalog` | `skill-pack`.
     pub source: String,
     /// Any of `provider` | `runtime` | `gateway` | `connector`.
     pub capabilities: Vec<String>,
+    /// `integration` | `provider` | `gateway` | `skill-pack`. Runtime-kind
+    /// plugins are excluded from the list — the Runtime page owns them.
+    pub kind: String,
+    /// Kind-specific "already set up" flag: integration = configured ||
+    /// enabled; provider = ≥1 connection in the provider's family; gateway =
+    /// all manifest settings present; skill-pack = installed on disk.
+    pub installed: bool,
+    /// Provider family head id (providers only) — the Models `providerDetail`
+    /// navigation target. `None` for other kinds.
+    pub family: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -551,6 +568,31 @@ pub struct PluginOauthBeginResult {
     pub state_token: String,
     pub authorize_url: String,
     pub redirect_uri: String,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInstallBeginResult {
+    /// `none` | `api-key` | `token` | `oauth`.
+    pub auth_kind: String,
+    /// `auth.env` is declared AND set in the environment.
+    pub env_var_present: bool,
+    pub env_var_name: Option<String>,
+    /// Endpoints + client id resolved; the browser flow started.
+    pub oauth_available: bool,
+    /// OAuth brokered outside Cockpit (kind=oauth, no `auth.resource`, no
+    /// manifest `authorize_url` — google-workspace).
+    pub oauth_external: bool,
+    /// oauth, endpoints may be known, but no client id and DCR not
+    /// applicable / failed.
+    pub needs_client_id: bool,
+    /// This call performed a successful registration.
+    pub dcr_succeeded: bool,
+    /// `auto` (callback server bound) | `manual` (bind failed → paste).
+    pub callback_mode: String,
+    pub oauth_begin: Option<PluginOauthBeginResult>,
+    /// Discovery/DCR failure detail (shown on the manual client id form).
+    pub dcr_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -584,7 +626,6 @@ pub struct PluginDetail {
     pub settings: Vec<PluginFieldInfo>,
     pub mcp: Vec<PluginMcpInfo>,
     pub models: Vec<String>,
-    pub menu_label: Option<String>,
     pub homepage: Option<String>,
     pub publisher: String,
 }

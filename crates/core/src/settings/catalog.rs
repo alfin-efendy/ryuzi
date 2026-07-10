@@ -142,7 +142,6 @@ mod tests {
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         };

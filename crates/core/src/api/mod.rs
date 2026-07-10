@@ -189,11 +189,13 @@ mod tests {
         let r = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/approvals/req-9"))
             .bearer_auth("t")
-            .json(&json!({ "allow": true }))
+            .json(
+                &json!({ "response": { "decision": "allowOnce", "scope": null, "payload": null } }),
+            )
             .send()
             .await
             .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::OK);
-        assert!(rx.await.unwrap());
+        assert!(rx.await.unwrap().allowed());
     }
 }

@@ -437,6 +437,7 @@ pub async fn run_pre_check(cmd: &str, workdir: Option<&str>) -> PreCheckOutcome 
     // A timed-out future is dropped: without kill_on_drop the child would
     // keep running detached (the spawn convention everywhere else in core).
     c.kill_on_drop(true);
+    crate::process_util::no_window(&mut c);
     match tokio::time::timeout(Duration::from_secs(60), c.output()).await {
         Err(_) => PreCheckOutcome::Skip("pre-check timed out after 60s".into()),
         Ok(Err(e)) => PreCheckOutcome::Skip(format!("pre-check failed to spawn: {e}")),
@@ -460,11 +461,10 @@ pub async fn run_pre_check(cmd: &str, workdir: Option<&str>) -> PreCheckOutcome 
 
 /// Sum of `git diff --numstat HEAD` in `workdir` → (added, deleted).
 pub async fn diff_totals(workdir: &str) -> Option<(i64, i64)> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", workdir, "diff", "--numstat", "HEAD"])
-        .output()
-        .await
-        .ok()?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["-C", workdir, "diff", "--numstat", "HEAD"]);
+    crate::process_util::no_window(&mut cmd);
+    let out = cmd.output().await.ok()?;
     if !out.status.success() {
         return None;
     }

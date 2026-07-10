@@ -1,6 +1,6 @@
 use crate::domain::{
     Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionStatus,
-    Surface,
+    Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -8,6 +8,7 @@ use crate::plugins::oauth::PluginOauthToken;
 use deadpool_sqlite::{Config, Pool, Runtime};
 use rusqlite::{params, OptionalExtension, Row};
 use rusqlite_migration::{Migrations, M};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::path::{Path, PathBuf};
 
@@ -475,6 +476,42 @@ fn migrations() -> Migrations<'static> {
                 updated_at INTEGER NOT NULL\
             );",
         ),
+        // Plugin OAuth client cache (install wizard): a partial cache that
+        // accretes — discovery fills the endpoint columns, DCR *or* manual
+        // entry fills client_id. A PUBLIC client id is not a secret (it is
+        // handed to the browser in the authorize URL), so no encryption.
+        // IF NOT EXISTS: the rewind-and-replay test re-runs appended
+        // migrations on a DB that already has this table.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_oauth_clients (\
+                plugin_id TEXT PRIMARY KEY NOT NULL,\
+                authorize_url TEXT,\
+                token_url TEXT,\
+                client_id TEXT,\
+                updated_at INTEGER NOT NULL\
+            );",
+        ),
+        // Rebuild plugin_oauth_clients to the nullable shape. Some dev DBs
+        // carry a pre-release v1 table (every column NOT NULL, created by an
+        // uncommitted experimental build); IF NOT EXISTS above never heals an
+        // existing table, so the discovery-first upsert (client_id = NULL)
+        // failed its NOT NULL constraint. Copy-drop-rename is idempotent —
+        // replay on an already-nullable table is a harmless rebuild — which
+        // the rewind-and-replay migration test relies on.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_oauth_clients_rebuild (\
+                plugin_id TEXT PRIMARY KEY NOT NULL,\
+                authorize_url TEXT,\
+                token_url TEXT,\
+                client_id TEXT,\
+                updated_at INTEGER NOT NULL\
+            );\
+            INSERT OR REPLACE INTO plugin_oauth_clients_rebuild \
+                SELECT plugin_id, authorize_url, token_url, client_id, updated_at \
+                FROM plugin_oauth_clients;\
+            DROP TABLE plugin_oauth_clients;\
+            ALTER TABLE plugin_oauth_clients_rebuild RENAME TO plugin_oauth_clients;",
+        ),
     ])
 }
 
@@ -669,6 +706,19 @@ fn decode_plugin_oauth_token(plugin_id: &str, raw: &str) -> anyhow::Result<Plugi
         scopes,
         reconnect_required,
     })
+}
+
+/// One row per plugin in `plugin_oauth_clients` — a partial cache that
+/// accretes: discovery fills the endpoint columns, DCR or the user's manual
+/// entry fills `client_id`. `upsert_plugin_oauth_client` merges per column
+/// (`Some` overwrites, `None` preserves), so callers never have to
+/// read-modify-write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginOauthClient {
+    pub plugin_id: String,
+    pub authorize_url: Option<String>,
+    pub token_url: Option<String>,
+    pub client_id: Option<String>,
 }
 
 /// Check out a pooled connection and run `f` on its dedicated blocking
@@ -1382,6 +1432,41 @@ impl Store {
         Ok(())
     }
 
+    /// Every persisted tool policy, ordered for stable display.
+    pub async fn list_tool_policies(&self) -> anyhow::Result<Vec<ToolPolicyRow>> {
+        self.with_conn(|c| -> rusqlite::Result<Vec<ToolPolicyRow>> {
+            let mut stmt = c.prepare(
+                "SELECT project_id, tool, decision FROM tool_policies \
+                 ORDER BY project_id, tool",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(ToolPolicyRow {
+                        project_id: r.get(0)?,
+                        tool: r.get(1)?,
+                        decision: r.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Remove one persisted tool policy (the Settings "revoke" action).
+    pub async fn delete_tool_policy(&self, project_id: &str, tool: &str) -> anyhow::Result<()> {
+        let project_id = project_id.to_string();
+        let tool = tool.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM tool_policies WHERE project_id=?1 AND tool=?2",
+                params![project_id, tool],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Merge `patch` into the tool_call row's payload (SQLite `json_patch`,
     /// so the original `{name, input}` survives an `{output: …}` update),
     /// optionally flip status, and return the row's seq, the merged payload,
@@ -1444,6 +1529,14 @@ impl Store {
             )
         })
         .await?;
+        Ok(())
+    }
+
+    /// Delete a settings row. A missing key is a no-op.
+    pub async fn delete_setting_raw(&self, key: &str) -> anyhow::Result<()> {
+        let key = key.to_string();
+        self.with_conn(move |c| c.execute("DELETE FROM settings WHERE key = ?1", params![key]))
+            .await?;
         Ok(())
     }
 
@@ -1767,6 +1860,75 @@ impl Store {
         })
         .await
     }
+
+    /// Column-merge upsert: `Some` overwrites, `None` preserves the
+    /// existing column (COALESCE against the stored row).
+    pub async fn upsert_plugin_oauth_client(
+        &self,
+        client: &PluginOauthClient,
+    ) -> anyhow::Result<()> {
+        let client = client.clone();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO plugin_oauth_clients(plugin_id, authorize_url, token_url, client_id, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(plugin_id) DO UPDATE SET \
+                   authorize_url=COALESCE(excluded.authorize_url, plugin_oauth_clients.authorize_url), \
+                   token_url=COALESCE(excluded.token_url, plugin_oauth_clients.token_url), \
+                   client_id=COALESCE(excluded.client_id, plugin_oauth_clients.client_id), \
+                   updated_at=excluded.updated_at",
+                params![
+                    client.plugin_id,
+                    client.authorize_url,
+                    client.token_url,
+                    client.client_id,
+                    updated_at
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_plugin_oauth_client(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<PluginOauthClient>> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT plugin_id, authorize_url, token_url, client_id \
+                 FROM plugin_oauth_clients WHERE plugin_id=?1",
+                params![plugin_id],
+                |r| {
+                    Ok(PluginOauthClient {
+                        plugin_id: r.get(0)?,
+                        authorize_url: r.get(1)?,
+                        token_url: r.get(2)?,
+                        client_id: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// For a future "Reset OAuth client" affordance; nothing calls it from
+    /// the wizard (disconnect keeps the row — client registration is
+    /// vendor-side state and reconnect must not re-register).
+    pub async fn delete_plugin_oauth_client(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM plugin_oauth_clients WHERE plugin_id=?1",
+                params![plugin_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
 }
 
 const SESSION_COLS: &str =
@@ -1844,6 +2006,20 @@ mod tests {
             created_at: Some(123),
             is_git: false,
         }
+    }
+
+    #[tokio::test]
+    async fn delete_setting_raw_removes_the_row_and_tolerates_missing_keys() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .set_setting_raw("discord.token", "secret")
+            .await
+            .unwrap();
+        store.delete_setting_raw("discord.token").await.unwrap();
+        assert_eq!(store.get_setting_raw("discord.token").await.unwrap(), None);
+        // Deleting a key that doesn't exist is a no-op, not an error.
+        store.delete_setting_raw("discord.token").await.unwrap();
     }
 
     #[tokio::test]
@@ -2334,6 +2510,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_and_delete_tool_policies() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .set_tool_policy("p1", "Bash", "allowAlways")
+            .await
+            .unwrap();
+        store
+            .set_tool_policy("p2", "Edit", "rejectAlways")
+            .await
+            .unwrap();
+        let rows = store.list_tool_policies().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        store.delete_tool_policy("p1", "Bash").await.unwrap();
+        let rows = store.list_tool_policies().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project_id, "p2");
+        assert_eq!(rows[0].decision, "rejectAlways");
+    }
+
+    #[tokio::test]
     async fn settings_kv_upserts_and_reads_back() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -2590,21 +2787,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_oauth_client_upsert_merges_columns_and_roundtrips() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store
+            .get_plugin_oauth_client("acme")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Discovery fills the endpoints; client_id stays NULL.
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "acme".into(),
+                authorize_url: Some("https://vendor.test/authorize".into()),
+                token_url: Some("https://vendor.test/token".into()),
+                client_id: None,
+            })
+            .await
+            .unwrap();
+        // DCR (or manual entry) later fills client_id; None endpoints must
+        // NOT clobber the discovered values.
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "acme".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("client-1".into()),
+            })
+            .await
+            .unwrap();
+        let row = store
+            .get_plugin_oauth_client("acme")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row,
+            PluginOauthClient {
+                plugin_id: "acme".into(),
+                authorize_url: Some("https://vendor.test/authorize".into()),
+                token_url: Some("https://vendor.test/token".into()),
+                client_id: Some("client-1".into()),
+            }
+        );
+
+        // Some overwrites; untouched columns persist.
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "acme".into(),
+                authorize_url: Some("https://vendor.test/authorize2".into()),
+                token_url: None,
+                client_id: None,
+            })
+            .await
+            .unwrap();
+        let row = store
+            .get_plugin_oauth_client("acme")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.authorize_url.as_deref(),
+            Some("https://vendor.test/authorize2")
+        );
+        assert_eq!(row.token_url.as_deref(), Some("https://vendor.test/token"));
+        assert_eq!(row.client_id.as_deref(), Some("client-1"));
+
+        store.delete_plugin_oauth_client("acme").await.unwrap();
+        assert!(store
+            .get_plugin_oauth_client("acme")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_clients_v1_not_null_table_is_rebuilt_on_open() {
+        // Some dev DBs carry the pre-release v1 shape of plugin_oauth_clients
+        // (every column NOT NULL, from an uncommitted experimental build).
+        // CREATE TABLE IF NOT EXISTS never heals an existing table, so the
+        // discovery-first upsert (client_id = NULL) died with "NOT NULL
+        // constraint failed: plugin_oauth_clients.client_id". The rebuild
+        // migration must swap such a table to the nullable shape on the next
+        // open, preserving any rows it holds.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        "DROP TABLE plugin_oauth_clients;\
+                         CREATE TABLE plugin_oauth_clients (\
+                             plugin_id TEXT PRIMARY KEY NOT NULL,\
+                             authorize_url TEXT NOT NULL,\
+                             token_url TEXT NOT NULL,\
+                             client_id TEXT NOT NULL,\
+                             updated_at INTEGER NOT NULL\
+                         );\
+                         INSERT INTO plugin_oauth_clients \
+                             VALUES ('legacy', 'https://v.test/a', 'https://v.test/t', 'cid-1', 1);\
+                         -- Rewind past the rebuild slot so it re-runs on the
+                         -- next open, exactly like a dev DB that migrated up
+                         -- to the slot before it.
+                         PRAGMA user_version = 18;",
+                    )
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        // The v1-era row survives the rebuild...
+        let legacy = store
+            .get_plugin_oauth_client("legacy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.client_id.as_deref(), Some("cid-1"));
+        // ...and the discovery-first upsert (no client id yet) now works.
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "atlassian".into(),
+                authorize_url: Some("https://v.test/authorize".into()),
+                token_url: Some("https://v.test/token".into()),
+                client_id: None,
+            })
+            .await
+            .unwrap();
+        let row = store
+            .get_plugin_oauth_client("atlassian")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.client_id.is_none());
+    }
+
+    #[tokio::test]
     async fn migration_13_rewrites_claude_code_defaults_to_native() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back five so the
+        // DB, seed the old values, then wind user_version back seven so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
         // CREATE TABLE IF NOT EXISTS; 17 context_checkpoints + session_context —
-        // CREATE TABLE IF NOT EXISTS; all no-ops on replay) re-run on the
-        // next open. `Migrations` always fast-forwards to the latest defined
-        // version, so there is no way to replay 13 alone once something is
-        // appended after it.
+        // CREATE TABLE IF NOT EXISTS; 18 plugin_oauth_clients — CREATE TABLE
+        // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
+        // copy-drop-rename; all no-ops on replay) re-run on the next open.
+        // `Migrations` always fast-forwards to the latest defined version,
+        // so there is no way to replay 13 alone once something is appended
+        // after it.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 5)
+            c.pragma_update(None, "user_version", v - 7)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();

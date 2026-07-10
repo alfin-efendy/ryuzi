@@ -204,10 +204,13 @@ function Combobox({
       </ComboboxPrimitive.Trigger>
       <ComboboxPrimitive.Portal>
         <ComboboxPrimitive.Positioner align="start" sideOffset={6} className="z-50 outline-none">
+          {/* Base UI's Positioner exposes --available-height (anchor→viewport-edge space);
+              the popup caps to it and the flex list (min-h-0) shrinks first, keeping the
+              search, create-hint, and footer rows visible. */}
           <ComboboxPrimitive.Popup
             data-slot="combobox-popup"
             className={cn(
-              "w-[max(var(--anchor-width),11rem)] max-w-[var(--available-width)] origin-(--transform-origin) rounded-xl border border-border surface-acrylic text-popover-foreground shadow-lg outline-none",
+              "flex max-h-[var(--available-height)] w-[max(var(--anchor-width),11rem)] max-w-[var(--available-width)] flex-col origin-(--transform-origin) overflow-hidden rounded-xl border border-border surface-acrylic text-popover-foreground shadow-lg outline-none",
               "data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
               popupClassName,
             )}
@@ -228,7 +231,7 @@ function Combobox({
             </ComboboxPrimitive.Empty>
             <ComboboxPrimitive.List
               data-slot="combobox-list"
-              className="max-h-[min(60vh,380px)] overflow-y-auto overscroll-contain p-1.5 empty:p-0"
+              className="min-h-0 max-h-[380px] overflow-y-auto overscroll-contain p-1.5 empty:p-0"
             >
               {(entry: ComboboxItemData | ComboboxGroupData) =>
                 "items" in entry ? (

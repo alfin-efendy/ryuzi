@@ -26,19 +26,29 @@ test("Create is disabled until a valid name is typed", () => {
   expect(createButton().disabled).toBe(false);
 });
 
-test("whitespace and existing names show an error and keep Create disabled", () => {
+test("typed spaces normalize to dashes; existing names show an error and keep Create disabled", () => {
   setup();
   fireEvent.change(input(), { target: { value: "has space" } });
-  expect(screen.getByText("Branch names can't contain spaces")).toBeTruthy();
-  expect(createButton().disabled).toBe(true);
+  expect((input() as HTMLInputElement).value).toBe("has-space");
+  expect(createButton().disabled).toBe(false);
   fireEvent.change(input(), { target: { value: "main" } });
   expect(screen.getByText('Branch "main" already exists')).toBeTruthy();
   expect(createButton().disabled).toBe(true);
 });
 
-test("Create submits the trimmed name and closes; no git command is involved", () => {
+test("Create submits the normalized name and closes; no git command is involved", () => {
   const { onClose, onCreate } = setup();
-  fireEvent.change(input(), { target: { value: "  feat/login  " } });
+  fireEvent.change(input(), { target: { value: "my new feature" } });
+  fireEvent.click(createButton());
+  expect(onCreate).toHaveBeenCalledWith("my-new-feature");
+  expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("pasted surrounding whitespace normalizes to dashes in the input but submits the dash-stripped name", () => {
+  const { onClose, onCreate } = setup();
+  fireEvent.change(input(), { target: { value: "  feat/login " } });
+  expect((input() as HTMLInputElement).value).toBe("-feat/login-");
+  expect(createButton().disabled).toBe(false);
   fireEvent.click(createButton());
   expect(onCreate).toHaveBeenCalledWith("feat/login");
   expect(onClose).toHaveBeenCalledTimes(1);
@@ -46,7 +56,7 @@ test("Create submits the trimmed name and closes; no git command is involved", (
 
 test("Enter submits a valid name; Enter on an invalid name does nothing", () => {
   const { onClose, onCreate } = setup();
-  fireEvent.change(input(), { target: { value: "bad name" } });
+  fireEvent.change(input(), { target: { value: "main" } });
   fireEvent.keyDown(input(), { key: "Enter" });
   expect(onCreate).not.toHaveBeenCalled();
   fireEvent.change(input(), { target: { value: "feat/ok" } });

@@ -35,6 +35,21 @@ pub async fn session_workdir(engine: Engine<'_>, session_pk: String) -> R<String
         .await
 }
 
+/// Whether `rel` names an existing regular file inside the session's
+/// working tree. Jailed like every fsview path: absolute paths and `..`
+/// escapes are simply "not found" (false), never an error — chat file-links
+/// must fail silent.
+#[tauri::command]
+#[specta::specta]
+pub async fn file_exists(engine: Engine<'_>, session_pk: String, rel: String) -> R<bool> {
+    engine
+        .rpc(
+            "file_exists",
+            serde_json::json!({ "session_pk": session_pk, "rel": rel }),
+        )
+        .await
+}
+
 /// What the session's OWN worktree would lose on teardown — the archive flow
 /// asks before discarding either kind of work. Sessions whose worktree is
 /// gone (or isn't a repo, e.g. an emptied leftover dir) report clean —

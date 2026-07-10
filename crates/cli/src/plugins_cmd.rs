@@ -210,14 +210,6 @@ async fn cmd_info(id: &str, deps: &mut Deps) -> u8 {
         ));
     }
 
-    if let Some(menu) = &m.menu {
-        (deps.out)(&format!(
-            "menu: section={} label={}",
-            menu.section,
-            menu.label.as_deref().unwrap_or("-")
-        ));
-    }
-
     0
 }
 

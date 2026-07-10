@@ -58,6 +58,7 @@ pub async fn spawn_adapter(
         cmd.env(key, value);
     }
 
+    crate::process_util::no_window(&mut cmd);
     cmd.spawn()
 }
 

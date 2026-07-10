@@ -96,7 +96,6 @@ fn provider_plugin(d: &ProviderDescriptor) -> CorePlugin {
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: Some(ProviderMeta {
                 format: format_label(d.format).to_string(),
                 base_url: d.base_url.map(|s| s.to_string()),

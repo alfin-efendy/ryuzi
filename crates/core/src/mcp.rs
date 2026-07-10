@@ -453,11 +453,7 @@ async fn probe_stdio_inner(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::process_util::no_window(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { PluginDetail } from "@/bindings";
 
 // The view fetches straight from `commands.pluginDetail` (bypassing the
@@ -19,6 +19,10 @@ const githubDetail: PluginDetail = {
     enabled: false,
     source: "catalog",
     capabilities: ["connector"],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
   },
   auth: {
     kind: "token",
@@ -34,7 +38,6 @@ const githubDetail: PluginDetail = {
   settings: [],
   mcp: [{ name: "github", transport: "http", commandOrUrl: "https://api.githubcopilot.com/mcp/" }],
   models: [],
-  menuLabel: "GitHub",
   homepage: "https://github.com/github/github-mcp-server",
   publisher: "GitHub (official)",
 };
@@ -51,6 +54,10 @@ const ollamaDetail: PluginDetail = {
     enabled: true,
     source: "builtin",
     capabilities: ["provider"],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
   },
   auth: null,
   settings: [
@@ -65,7 +72,6 @@ const ollamaDetail: PluginDetail = {
   ],
   mcp: [],
   models: ["llama3", "mistral"],
-  menuLabel: null,
   homepage: null,
   publisher: "Ollama (local)",
 };
@@ -82,12 +88,15 @@ const sandboxDetail: PluginDetail = {
     enabled: false,
     source: "catalog",
     capabilities: [],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
   },
   auth: null,
   settings: [],
   mcp: [],
   models: [],
-  menuLabel: null,
   homepage: "https://vercel.com/docs/vercel-sandbox",
   publisher: "Vercel (no MCP surface)",
 };
@@ -104,6 +113,10 @@ const oauthDetail: PluginDetail = {
     enabled: true,
     source: "catalog",
     capabilities: ["connector"],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
   },
   auth: {
     kind: "oauth",
@@ -119,7 +132,6 @@ const oauthDetail: PluginDetail = {
   settings: [],
   mcp: [{ name: "acme", transport: "http", commandOrUrl: "https://api.acme.example.com/mcp" }],
   models: [],
-  menuLabel: "Acme",
   homepage: "https://acme.example.com",
   publisher: "Acme",
 };
@@ -151,10 +163,22 @@ const pluginOauthAuthorizeUrlMsgListen = mock(
   async (_cb: (event: { payload: { pluginId: string; authorizeUrl: string } }) => void) => () => {},
 );
 
+type OauthCompletedEvent = { payload: { pluginId: string; ok: boolean; error: string | null } };
+let oauthCompletedListener: ((event: OauthCompletedEvent) => void) | null = null;
+const pluginOauthCompletedMsgListen = mock(async (cb: (event: OauthCompletedEvent) => void) => {
+  oauthCompletedListener = cb;
+  return () => {
+    oauthCompletedListener = null;
+  };
+});
+
 mock.module("@/bindings", () => ({
   events: {
     pluginOauthAuthorizeUrlMsg: {
       listen: pluginOauthAuthorizeUrlMsgListen,
+    },
+    pluginOauthCompletedMsg: {
+      listen: pluginOauthCompletedMsgListen,
     },
   },
   commands: {
@@ -180,6 +204,8 @@ beforeEach(() => {
   completePluginOauth.mockClear();
   disconnectPluginOauth.mockClear();
   pluginOauthAuthorizeUrlMsgListen.mockClear();
+  pluginOauthCompletedMsgListen.mockClear();
+  oauthCompletedListener = null;
   listPlugins.mockClear();
   openUrl.mockClear();
   usePlugins.setState({ plugins: [], loaded: false });
@@ -282,4 +308,29 @@ test("shows a not-found state for an unknown plugin id", async () => {
   render(<PluginDetailView id="ghost" />);
   await waitFor(() => expect(pluginDetail).toHaveBeenCalledWith("ghost"));
   expect(await screen.findByText("Plugin not found.")).toBeTruthy();
+});
+
+test("pluginOauthCompletedMsg auto-completes the pending connect flow", async () => {
+  render(<PluginDetailView id="acme-oauth" />);
+  await screen.findByText("Acme OAuth");
+  await waitFor(() => expect(pluginOauthCompletedMsgListen).toHaveBeenCalled());
+
+  await act(async () => {
+    oauthCompletedListener?.({ payload: { pluginId: "acme-oauth", ok: true, error: null } });
+  });
+
+  await waitFor(() => expect(pluginDetail).toHaveBeenCalledTimes(2));
+  expect(completePluginOauth).not.toHaveBeenCalled();
+});
+
+test("pluginOauthCompletedMsg for another plugin is ignored", async () => {
+  render(<PluginDetailView id="acme-oauth" />);
+  await screen.findByText("Acme OAuth");
+  await waitFor(() => expect(pluginOauthCompletedMsgListen).toHaveBeenCalled());
+
+  await act(async () => {
+    oauthCompletedListener?.({ payload: { pluginId: "other", ok: true, error: null } });
+  });
+
+  expect(pluginDetail).toHaveBeenCalledTimes(1);
 });

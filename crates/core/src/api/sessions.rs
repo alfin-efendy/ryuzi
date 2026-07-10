@@ -30,6 +30,8 @@ pub(crate) const HANDLES: &[&str] = &[
     "list_messages",
     "stage_attachment",
     "attachments_root",
+    "list_tool_policies",
+    "delete_tool_policy",
 ];
 
 /// Largest pasted attachment accepted from the webview (decoded size).
@@ -89,6 +91,11 @@ struct SessionPkP {
 struct StageP {
     name: String,
     data_base64: String,
+}
+#[derive(Deserialize)]
+struct DeleteToolPolicyP {
+    project_id: String,
+    tool: String,
 }
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
@@ -161,6 +168,11 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             .await
             .to_string_lossy()
             .into_owned()),
+        "list_tool_policies" => ok(cp.list_tool_policies().await?),
+        "delete_tool_policy" => {
+            let a: DeleteToolPolicyP = params(p)?;
+            ok(cp.delete_tool_policy(&a.project_id, &a.tool).await?)
+        }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }

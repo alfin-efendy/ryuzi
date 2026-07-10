@@ -14,7 +14,3 @@ name = "graphiti"
 transport = "stdio"
 command = "uv"
 args = ["run", "main.py", "--transport", "stdio"]
-
-[menu]
-section = "plugins"
-label = "Graphiti"

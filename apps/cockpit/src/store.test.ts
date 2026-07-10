@@ -241,7 +241,15 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
 test("approval.requested adds a pending approval; resolving removes it", () => {
   reset();
   const s = useStore.getState();
-  s.applyCoreEvent({ kind: "approvalRequested", session_pk: "s1", request_id: "r1", tool: "Bash", summary: "Bash: rm" });
+  s.applyCoreEvent({
+    kind: "approvalRequested",
+    session_pk: "s1",
+    request_id: "r1",
+    tool: "Bash",
+    summary: "Bash: rm",
+    approval_kind: "tool",
+    input: {},
+  });
   expect(useStore.getState().pendingApprovals).toHaveLength(1);
   useStore.getState().clearApproval("r1");
   expect(useStore.getState().pendingApprovals).toHaveLength(0);
@@ -250,8 +258,24 @@ test("approval.requested adds a pending approval; resolving removes it", () => {
 test("pending approvals from different sessions both count", () => {
   useStore.setState({ projects: [], sessions: [], transcripts: {}, pendingApprovals: [], focusedSessionPk: null });
   const s = useStore.getState();
-  s.applyCoreEvent({ kind: "approvalRequested", session_pk: "s1", request_id: "r1", tool: "Bash", summary: "x" });
-  s.applyCoreEvent({ kind: "approvalRequested", session_pk: "s2", request_id: "r2", tool: "Write", summary: "y" });
+  s.applyCoreEvent({
+    kind: "approvalRequested",
+    session_pk: "s1",
+    request_id: "r1",
+    tool: "Bash",
+    summary: "x",
+    approval_kind: "tool",
+    input: {},
+  });
+  s.applyCoreEvent({
+    kind: "approvalRequested",
+    session_pk: "s2",
+    request_id: "r2",
+    tool: "Write",
+    summary: "y",
+    approval_kind: "tool",
+    input: {},
+  });
   expect(useStore.getState().pendingApprovals).toHaveLength(2);
 });
 

@@ -20,7 +20,3 @@ name = "render"
 transport = "http"
 url = "https://mcp.render.com/mcp"
 headers = { Authorization = "Bearer ${auth}" }
-
-[menu]
-section = "plugins"
-label = "Render"

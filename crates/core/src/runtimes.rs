@@ -247,11 +247,7 @@ async fn run_version_probe(path: &PathBuf) -> Option<String> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::process_util::no_window(&mut cmd);
     let out = tokio::time::timeout(Duration::from_secs(5), cmd.output())
         .await
         .ok()?
@@ -267,11 +263,7 @@ pub async fn ollama_models(path: &str) -> Vec<String> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::process_util::no_window(&mut cmd);
     let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await else {
         return vec![];
     };
@@ -455,11 +447,7 @@ pub async fn run_npm_update(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::process_util::no_window(&mut cmd);
     let mut child = cmd.spawn()?;
     let mut out = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
     let mut errl = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();

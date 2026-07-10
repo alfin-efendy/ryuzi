@@ -1,6 +1,7 @@
 use crate::engine::EngineClient;
 use crate::error::CmdError;
 use ryuzi_core::branches::BranchList;
+use ryuzi_core::domain::{ApprovalResponse, ToolPolicyRow};
 use ryuzi_core::{Message, PermMode, Project, Session};
 use std::path::Path;
 use std::sync::Arc;
@@ -168,7 +169,30 @@ pub async fn end_session(engine: Engine<'_>, session_pk: String) -> R<()> {
 
 #[tauri::command]
 #[specta::specta]
-pub fn resolve_approval(engine: Engine<'_>, request_id: String, allow: bool) -> bool {
+pub async fn list_tool_policies(engine: Engine<'_>) -> R<Vec<ToolPolicyRow>> {
+    engine
+        .rpc("list_tool_policies", serde_json::json!({}))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_tool_policy(engine: Engine<'_>, project_id: String, tool: String) -> R<()> {
+    engine
+        .rpc(
+            "delete_tool_policy",
+            serde_json::json!({ "project_id": project_id, "tool": tool }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn resolve_approval(
+    engine: Engine<'_>,
+    request_id: String,
+    response: ApprovalResponse,
+) -> bool {
     // Tauri requires async commands that take a reference input (`State<'_,
     // _>` included) to return `Result` — `bool` doesn't qualify, so this stays
     // sync (bindings-stable: specta emits `Promise<boolean>` either way) and
@@ -176,7 +200,7 @@ pub fn resolve_approval(engine: Engine<'_>, request_id: String, allow: bool) -> 
     // which is safe here because command handlers already run on a blocking
     // thread of the tauri async runtime.
     tokio::task::block_in_place(|| {
-        tauri::async_runtime::block_on(engine.resolve_approval(&request_id, allow))
+        tauri::async_runtime::block_on(engine.resolve_approval(&request_id, response))
     })
 }
 

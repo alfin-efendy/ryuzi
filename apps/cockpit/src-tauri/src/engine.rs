@@ -56,12 +56,16 @@ impl EngineClient {
         }
     }
 
-    pub async fn resolve_approval(&self, request_id: &str, allow: bool) -> bool {
+    pub async fn resolve_approval(
+        &self,
+        request_id: &str,
+        response: ryuzi_core::domain::ApprovalResponse,
+    ) -> bool {
         let r = self
             .http
             .post(format!("{}/approvals/{}", self.base_url, request_id))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "allow": allow }))
+            .json(&serde_json::json!({ "response": response }))
             .send()
             .await;
         match r {

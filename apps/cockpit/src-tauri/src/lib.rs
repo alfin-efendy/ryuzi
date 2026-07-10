@@ -13,7 +13,6 @@ mod gateways_cmd;
 mod native_cmd;
 mod open_cmd;
 mod plugins_cmd;
-mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
 mod session_io;
@@ -83,9 +82,7 @@ pub(crate) fn resolve_acp_adapter() -> anyhow::Result<(String, Vec<String>)> {
 /// exists to run it.
 #[cfg(debug_assertions)]
 fn dev_sidecar_bundle() -> Option<String> {
-    if ryuzi_core::sidecar::default_bun_probe().is_none() {
-        return None;
-    }
+    ryuzi_core::sidecar::default_bun_probe()?;
     let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dist/sidecar");
     let mut bundles: Vec<std::path::PathBuf> = std::fs::read_dir(dist)
         .ok()?
@@ -223,6 +220,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::continue_session,
             commands::stop_session,
             commands::end_session,
+            commands::list_tool_policies,
+            commands::delete_tool_policy,
             commands::resolve_approval,
             commands::read_file,
             commands::stage_attachment,
@@ -263,9 +262,9 @@ fn make_builder() -> Builder<tauri::Wry> {
             apps_cmd::update_app_scope,
             apps_cmd::set_app_tool_perm,
             apps_cmd::toggle_app_agent,
-            registry_cmd::registry_search,
             fsview_cmd::list_dir,
             fsview_cmd::session_workdir,
+            fsview_cmd::file_exists,
             fsview_cmd::worktree_dirty,
             fsview_cmd::git_diff,
             fsview_cmd::search_files,
@@ -321,10 +320,14 @@ fn make_builder() -> Builder<tauri::Wry> {
             plugins_cmd::plugin_detail,
             plugins_cmd::set_plugin_enabled,
             plugins_cmd::set_plugin_setting,
+            plugins_cmd::uninstall_plugin,
             plugins_cmd::begin_plugin_oauth,
             plugins_cmd::complete_plugin_oauth,
             plugins_cmd::disconnect_plugin_oauth,
             plugins_cmd::plugin_models,
+            plugins_cmd::begin_plugin_install,
+            plugins_cmd::set_plugin_oauth_client_id,
+            plugins_cmd::cancel_plugin_install,
             session_io::export_session,
             session_io::import_session,
             session_io::share_session,
@@ -338,6 +341,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             events::CoreEventMsg,
             events::OauthAuthorizeUrlMsg,
             events::PluginOauthAuthorizeUrlMsg,
+            events::PluginOauthCompletedMsg,
             accent::AccentChangedMsg,
             term::TermOutputMsg,
             term::TermExitMsg

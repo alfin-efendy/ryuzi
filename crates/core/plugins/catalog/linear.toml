@@ -19,7 +19,3 @@ name = "linear"
 transport = "http"
 url = "https://mcp.linear.app/mcp"
 headers = { Authorization = "Bearer ${auth}" }
-
-[menu]
-section = "plugins"
-label = "Linear"

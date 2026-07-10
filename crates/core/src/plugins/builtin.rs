@@ -61,7 +61,6 @@ pub fn discord_plugin() -> CorePlugin {
             settings: fields_to_sdk(crate::settings::catalog::DISCORD_FIELDS),
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         },

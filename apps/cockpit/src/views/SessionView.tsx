@@ -15,10 +15,11 @@ import { headerAgentLine } from "@/lib/session-header";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
-import { ApprovalPrompt } from "@/components/ApprovalPrompt";
+import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
 import { ModelPicker } from "@/components/ModelPicker";
 import { Transcript } from "@/components/transcript/Transcript";
+import { TranscriptFileContext } from "@/components/transcript/TranscriptFileContext";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
@@ -97,6 +98,27 @@ export function SessionView() {
     prevSessionRunning.current = sessionRunning;
   }, [sessionRunning, session?.sessionPk, fetchDiff]);
 
+  // Session working directory, used to linkify workspace file paths in the
+  // transcript's markdown (see TranscriptFileContext).
+  const [workdir, setWorkdir] = useState<string | null>(null);
+  useEffect(() => {
+    setWorkdir(null);
+    if (!session?.sessionPk) return;
+    let alive = true;
+    void commands.sessionWorkdir(session.sessionPk).then((res) => {
+      if (alive && res.status === "ok") setWorkdir(res.data);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [session?.sessionPk]);
+  // Provider value for TranscriptFileContext — memoized so the Transcript's
+  // WorkspacePathCode instances don't all re-render on every SessionView render.
+  const transcriptFileCtx = useMemo(
+    () => (workdir && session?.sessionPk ? { sessionPk: session.sessionPk, workdir } : null),
+    [session?.sessionPk, workdir],
+  );
+
   // ArrowUp/Down history over this session's sent messages. A ref (not state)
   // holds the navigation cursor — it never drives rendering.
   const historyRef = useRef<HistoryState>(HISTORY_IDLE);
@@ -157,7 +179,7 @@ export function SessionView() {
   const meta = statusMeta(session.status);
   const running = session.status === "running";
   const usage = contextUsage[session.sessionPk];
-  const hasApproval = pendingApprovals.some((a) => a.sessionPk === session.sessionPk);
+  const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(project?.permMode ?? "default");
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
   const selectedModel = project?.model || agent?.model || "";
@@ -256,15 +278,21 @@ export function SessionView() {
         <TodoPanel sessionPk={session.sessionPk} running={running} />
 
         {/* Transcript */}
-        <Transcript
-          sessionPk={session.sessionPk}
-          rows={rows}
-          agentName={agent?.name ?? "Agent"}
-          agentColor={agent?.color ?? "var(--muted-foreground)"}
-          running={running}
-        >
-          {hasApproval && <ApprovalPrompt sessionPk={session.sessionPk} />}
-        </Transcript>
+        <TranscriptFileContext.Provider value={transcriptFileCtx}>
+          <Transcript
+            sessionPk={session.sessionPk}
+            rows={rows}
+            agentName={agent?.name ?? "Agent"}
+            agentColor={agent?.color ?? "var(--muted-foreground)"}
+            running={running}
+          >
+            {pendingForSession.map((a, i) => (
+              <div key={a.requestId} className="px-4 pb-2">
+                <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
+              </div>
+            ))}
+          </Transcript>
+        </TranscriptFileContext.Provider>
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">

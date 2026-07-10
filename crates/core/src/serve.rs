@@ -215,16 +215,22 @@ async fn rpc(
 }
 
 /// `POST /approvals/{request_id}` — resolve a pending tool-permission
-/// approval (see `ApprovalHub`) with body `{"allow": bool}`. `resolved` is
-/// `false` if no approval with this id was pending (already resolved,
-/// unknown id, or the request timed out).
+/// approval (see `ApprovalHub`) with body `{"response": ApprovalResponse}`.
+/// A missing or malformed `response` leniently denies via
+/// `ApprovalResponse::once(false)`. `resolved` is `false` if no approval with
+/// this id was pending (already resolved, unknown id, or the request timed
+/// out).
 async fn resolve_approval_route(
     State(state): State<ApiState>,
     Path(request_id): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let allow = body.get("allow").and_then(|v| v.as_bool()).unwrap_or(false);
-    let resolved = state.cp.resolve_approval(&request_id, allow);
+    let response = body
+        .get("response")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<crate::domain::ApprovalResponse>(v).ok())
+        .unwrap_or_else(|| crate::domain::ApprovalResponse::once(false));
+    let resolved = state.cp.resolve_approval(&request_id, response);
     Json(json!({ "resolved": resolved })).into_response()
 }
 
@@ -248,7 +254,7 @@ fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
         PluginSource::Catalog => "catalog",
-        PluginSource::User(_) => "user",
+        PluginSource::SkillPack(_) => "skill-pack",
     }
 }
 
@@ -336,7 +342,6 @@ mod tests {
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         }

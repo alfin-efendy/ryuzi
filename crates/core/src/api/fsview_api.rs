@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 pub(crate) const HANDLES: &[&str] = &[
     "list_dir",
+    "file_exists",
     "session_workdir",
     "worktree_dirty",
     "git_diff",
@@ -106,6 +107,10 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: ListDirP = params(p)?;
             ok(list_dir(cp, &a.session_pk, a.rel).await?)
         }
+        "file_exists" => {
+            let a: ListDirP = params(p)?;
+            ok(file_exists(cp, &a.session_pk, &a.rel).await?)
+        }
         "session_workdir" => {
             let a: SessionPkP = params(p)?;
             ok(session_root(cp, &a.session_pk)
@@ -154,6 +159,20 @@ async fn list_dir(
             dir: e.dir,
         })
         .collect())
+}
+
+/// Does `rel` resolve to an existing regular file inside the session's jailed
+/// worktree root? Escapes, absolute paths, and non-files fail silently to
+/// `false` (used by the chat file-link preview, which must never error).
+async fn file_exists(cp: &ControlPlane, session_pk: &str, rel: &str) -> Result<bool, ApiError> {
+    let root = session_root(cp, session_pk).await?;
+    let Ok(path) = fsview::jail(&root, rel) else {
+        return Ok(false);
+    };
+    Ok(tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false))
 }
 
 /// What the session's OWN worktree would lose on teardown — the archive flow

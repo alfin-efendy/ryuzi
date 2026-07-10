@@ -103,13 +103,9 @@ impl Tool for Bash {
                 }
             }
         }
-        // Repo-wide Windows spawn convention (see crate::mcp, crate::runtimes):
+        // Repo-wide Windows spawn convention (see crate::process_util):
         // never flash a console window when the Cockpit GUI runs a tool call.
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        crate::process_util::no_window(&mut cmd);
 
         let child = match cmd.spawn() {
             Ok(c) => c,
