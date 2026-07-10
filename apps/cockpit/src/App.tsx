@@ -8,6 +8,7 @@ import { TitleBar } from "./components/shell/TitleBar";
 import { Sidebar } from "./components/shell/Sidebar";
 import { ProjectSettingsModal } from "./components/modals/ProjectSettingsModal";
 import { HomeView } from "./views/HomeView";
+import { InboxView } from "./views/InboxView";
 import { SessionView } from "./views/SessionView";
 import { ModelsView } from "./views/ModelsView";
 import { ProviderDetailView } from "./views/ProviderDetailView";
@@ -23,13 +24,15 @@ import { GatewaysView } from "./views/GatewaysView";
 import { GatewayDetailView } from "./views/GatewayDetailView";
 import { PluginDetailView } from "./views/PluginDetailView";
 import { SettingsView } from "./views/SettingsView";
-import { Badge, Toaster } from "@ryuzi/ui";
+import { Toaster } from "@ryuzi/ui";
 
 function MainView() {
   const view = useNav((s) => s.history.current);
   switch (view.kind) {
     case "home":
       return <HomeView />;
+    case "inbox":
+      return <InboxView />;
     case "session":
       return <SessionView />;
     case "models":
@@ -67,7 +70,6 @@ export default function App() {
   const init = useStore((s) => s.init);
   const hydrateAgents = useRuntimes((s) => s.hydrate);
   const hydrateModelStatuses = useModelStatuses((s) => s.hydrate);
-  const pending = useStore((s) => s.pendingApprovals.length);
   useDisableContextMenu();
   useEffect(() => {
     init();
@@ -81,11 +83,6 @@ export default function App() {
       {/* Full-window glass layer — one blur pass for the whole chrome. */}
       <div aria-hidden className="acrylic-chrome absolute inset-0 z-0" />
       <TitleBar />
-      {pending > 0 && (
-        <div className="relative z-10 flex shrink-0 items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-700 dark:text-amber-300">
-          <Badge variant="secondary">{pending}</Badge> session(s) need approval
-        </div>
-      )}
       <div className="relative z-10 flex min-h-0 flex-1">
         <Sidebar />
         <main className="acrylic-main mx-2.5 mb-2.5 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-border shadow-sm">

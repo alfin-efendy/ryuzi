@@ -7,6 +7,7 @@ export type AgentId = string;
 // store (focusedSessionPk); this store only decides which screen is showing.
 export type View =
   | { kind: "home" }
+  | { kind: "inbox" }
   | { kind: "session" }
   | { kind: "models" }
   | { kind: "providerDetail"; provider: string }

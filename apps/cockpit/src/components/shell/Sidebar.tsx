@@ -10,6 +10,7 @@ import {
   FolderOpen,
   FolderPlus,
   Grip,
+  Inbox,
   LayoutGrid,
   ListFilter,
   Pencil,
@@ -19,6 +20,7 @@ import {
   Settings,
 } from "lucide-react";
 import {
+  Badge,
   Button,
   MenuPanel,
   MenuPanelItem as MenuItem,
@@ -42,6 +44,7 @@ import { AddProjectModal } from "@/components/modals/AddProjectModal";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
+  { label: "Inbox", icon: Inbox, view: { kind: "inbox" }, group: ["inbox"] },
   { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail", "connectionDetail"] },
   { label: "Runtime", icon: Bot, view: { kind: "runtime" }, group: ["runtime", "runtimeDetail"] },
   { label: "Scheduler", icon: CalendarClock, view: { kind: "scheduler" }, group: ["scheduler", "jobDetail", "jobNew"] },
@@ -81,6 +84,7 @@ function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
 
 export function Sidebar() {
   const { projects, sessions, setFocused, focusedSessionPk, selectProject, end } = useStore();
+  const pendingCount = useStore((s) => s.pendingApprovals.length);
   const { pinned, archived, togglePin, setArchived } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
   const [archivingPk, setArchivingPk] = useState<string | null>(null);
@@ -187,6 +191,11 @@ export function Sidebar() {
             >
               <Icon aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
               {item.label}
+              {item.view.kind === "inbox" && pendingCount > 0 && (
+                <Badge variant="secondary" className="ml-auto h-4 min-w-4 px-1 text-[10px]">
+                  {pendingCount}
+                </Badge>
+              )}
             </Button>
           );
         })}
