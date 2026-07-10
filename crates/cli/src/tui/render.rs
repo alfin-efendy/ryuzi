@@ -96,32 +96,13 @@ pub fn draw_wizard(frame: &mut Frame, state: &WizardState, _ctx: &RenderCtx) {
                 &items,
                 &state.gw_sel,
                 state.cursor,
-                None,
-            );
-        }
-        WizardPhase::Runtimes => {
-            let items: Vec<(&str, &str, &str)> = CATALOG
-                .runtimes
-                .iter()
-                .map(|r| (r.id, r.label, r.description))
-                .collect();
-            draw_wizard_list(
-                frame,
-                chunks[1],
-                "Choose runtimes",
-                &items,
-                &state.rt_sel,
-                state.cursor,
-                Some(&state.detected),
             );
         }
         WizardPhase::Fields => draw_wizard_fields(frame, chunks[1], state),
     }
 }
 
-/// Multi-select list: `{caret|"  "}[x] {label} — {description}  {right}`
-/// per row; `right` (runtime detect string) only on the runtimes list.
-#[allow(clippy::too_many_arguments)]
+/// Multi-select list: `{caret|"  "}[x] {label} — {description}` per row.
 fn draw_wizard_list(
     frame: &mut Frame,
     area: Rect,
@@ -129,7 +110,6 @@ fn draw_wizard_list(
     items: &[(&str, &str, &str)],
     selected: &[String],
     cursor: usize,
-    detected: Option<&HashMap<String, String>>,
 ) {
     let block = widgets::panel(title, false);
     let inner = block.inner(area);
@@ -158,10 +138,6 @@ fn draw_wizard_list(
         let mut text = format!("{prefix}[{checked}] {label}");
         if !description.is_empty() {
             text.push_str(&format!(" — {description}"));
-        }
-        if let Some(map) = detected {
-            let right = map.get(*id).cloned().unwrap_or_else(|| "…".to_string());
-            text.push_str(&format!("  {right}"));
         }
         let style = if is_cursor {
             theme::tone(Tone::Signature)

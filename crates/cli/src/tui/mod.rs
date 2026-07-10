@@ -51,7 +51,7 @@ enum Mode {
 
 /// The wizard runs first-run, the dashboard once settings are complete
 /// (`is_configured`); re-checked on every `AppController::new` (the wizard
-/// pre-checks whichever gateways/runtimes are already enabled).
+/// pre-checks whichever gateways are already enabled).
 async fn initial_mode(controller: &AppController) -> Mode {
     if controller.is_configured().await {
         Mode::Dashboard
