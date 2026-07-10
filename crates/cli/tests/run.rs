@@ -2,7 +2,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ryuzi_core::domain::{ApprovalDecision, ApprovalKind, ApprovalResponse, NewMessage};
+use ryuzi_core::domain::{
+    ApprovalDecision, ApprovalKind, ApprovalResponse, ApprovalScope, NewMessage,
+};
 use ryuzi_core::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use ryuzi_core::{CoreEvent, Registries};
 use serial_test::serial;
@@ -695,6 +697,84 @@ fn question_numeric_answer_maps_to_option_label() {
         response.payload,
         Some(serde_json::json!({"answers": {"Which DB?": ["SQLite"]}}))
     );
+}
+
+#[test]
+#[serial]
+fn tool_approval_scripted_capital_n_persists_reject_always_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let resolved = Arc::new(std::sync::Mutex::new(None));
+    let mut deps = deps_with_approval_fake(
+        &tmp.path().join("ryuzi.sqlite"),
+        out.clone(),
+        errs.clone(),
+        ApprovalKind::Tool,
+        serde_json::json!({}),
+        vec!["N"],
+        resolved.clone(),
+    );
+
+    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+
+    assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
+    let response = resolved
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the tool approval must resolve");
+    assert_eq!(response.decision, ApprovalDecision::RejectAlways);
+    assert_eq!(response.scope, Some(ApprovalScope::Project));
+}
+
+#[test]
+#[serial]
+fn tool_approval_scripted_lowercase_s_allows_always_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let resolved = Arc::new(std::sync::Mutex::new(None));
+    let mut deps = deps_with_approval_fake(
+        &tmp.path().join("ryuzi.sqlite"),
+        out.clone(),
+        errs.clone(),
+        ApprovalKind::Tool,
+        serde_json::json!({}),
+        vec!["s"],
+        resolved.clone(),
+    );
+
+    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+
+    assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
+    let response = resolved
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the tool approval must resolve");
+    assert_eq!(response.decision, ApprovalDecision::AllowAlways);
+    assert_eq!(response.scope, Some(ApprovalScope::Session));
 }
 
 #[test]

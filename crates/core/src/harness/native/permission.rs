@@ -362,6 +362,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reject_always_project_reply_persists_a_rule() {
+        let f = Fixture::new().await;
+        let approvals = f.approvals.clone();
+        let mut rx = f.events.subscribe();
+        let waiter = tokio::spawn(async move {
+            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+                approvals.resolve(
+                    &request_id,
+                    ApprovalResponse {
+                        decision: ApprovalDecision::RejectAlways,
+                        scope: Some(ApprovalScope::Project),
+                        payload: None,
+                    },
+                );
+            }
+        });
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({}),
+            &f.gate(PermMode::Default, Some("p1")),
+        )
+        .await;
+        waiter.await.unwrap();
+        assert_eq!(d, PermDecision::Deny);
+        assert_eq!(
+            f.store
+                .get_tool_policy("p1", "Bash")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("rejectAlways")
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_always_session_reply_fills_the_deny_set() {
+        let f = Fixture::new().await;
+        let approvals = f.approvals.clone();
+        let mut rx = f.events.subscribe();
+        tokio::spawn(async move {
+            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+                approvals.resolve(
+                    &request_id,
+                    ApprovalResponse {
+                        decision: ApprovalDecision::RejectAlways,
+                        scope: Some(ApprovalScope::Session),
+                        payload: None,
+                    },
+                );
+            }
+        });
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({}),
+            &f.gate(PermMode::Default, None),
+        )
+        .await;
+        assert_eq!(d, PermDecision::Deny);
+        assert_eq!(
+            f.overrides.lock().unwrap().decision_for("Bash"),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_less_always_degrades_to_once() {
+        let f = Fixture::new().await;
+        let approvals = f.approvals.clone();
+        let mut rx = f.events.subscribe();
+        tokio::spawn(async move {
+            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+                approvals.resolve(
+                    &request_id,
+                    ApprovalResponse {
+                        decision: ApprovalDecision::AllowAlways,
+                        scope: None,
+                        payload: None,
+                    },
+                );
+            }
+        });
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({}),
+            &f.gate(PermMode::Default, Some("p1")),
+        )
+        .await;
+        assert_eq!(d, PermDecision::Allow);
+        assert_eq!(
+            f.store.get_tool_policy("p1", "Bash").await.unwrap(),
+            None,
+            "a scope-less AllowAlways must not persist a project rule"
+        );
+        assert_eq!(
+            f.overrides.lock().unwrap().decision_for("Bash"),
+            None,
+            "a scope-less AllowAlways must not fill the session override set either"
+        );
+    }
+
+    #[tokio::test]
     async fn deny_reply_denies() {
         let f = Fixture::new().await;
         let approvals = f.approvals.clone();
