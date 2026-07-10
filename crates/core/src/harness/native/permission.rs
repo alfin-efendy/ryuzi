@@ -81,6 +81,8 @@ fn key_to_policy_tool(key: &str) -> &str {
         "edit" => "Edit",
         "bash" => "Bash",
         "webfetch" => "WebFetch",
+        "exitplanmode" => "ExitPlanMode",
+        "askuserquestion" => "AskUserQuestion",
         other => other,
     }
 }

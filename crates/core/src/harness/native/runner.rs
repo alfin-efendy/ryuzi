@@ -984,6 +984,13 @@ async fn run_tool_call(
         spawn: spawn.clone(),
         memory: deps.memory.clone(),
         snapshots: deps.snapshots.clone(),
+        tool_call_id: t.id.clone(),
+        interaction: Some(Arc::new(super::tools::Interaction {
+            approvals: deps.approvals.clone(),
+            events: deps.events.clone(),
+            perm_mode: deps.perm_mode.clone(),
+            project_id: deps.project_id.clone(),
+        })),
     };
     match tool.execute(&ctx, input).await {
         Ok(out) => {

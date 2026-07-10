@@ -1,6 +1,17 @@
 use crate::domain::PermMode;
 
-const SAFE_TOOLS: &[&str] = &["Read", "Grep", "Glob", "LS", "NotebookRead", "TodoWrite"];
+const SAFE_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "LS",
+    "NotebookRead",
+    "TodoWrite",
+    // Interaction tools: their execution IS the prompt, so the gate itself
+    // never needs to ask — and they must work inside Plan mode.
+    "ExitPlanMode",
+    "AskUserQuestion",
+];
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
 /// `true` = auto-allow without asking the user.
