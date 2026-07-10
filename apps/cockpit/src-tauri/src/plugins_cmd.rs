@@ -60,6 +60,16 @@ pub struct PluginInfo {
     pub source: String,
     /// Any of `provider` | `runtime` | `gateway` | `connector`.
     pub capabilities: Vec<String>,
+    /// `integration` | `provider` | `gateway` | `skill-pack`. Runtime-kind
+    /// plugins are excluded from the list — the Runtime page owns them.
+    pub kind: String,
+    /// Kind-specific "already set up" flag: integration = configured ||
+    /// enabled; provider = ≥1 connection in the provider's family; gateway =
+    /// all manifest settings present; skill-pack = installed on disk.
+    pub installed: bool,
+    /// Provider family head id (providers only) — the Models `providerDetail`
+    /// navigation target. `None` for other kinds.
+    pub family: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -250,7 +260,62 @@ fn source_label(source: &PluginSource) -> &'static str {
     }
 }
 
-fn plugin_info(plugin: &CorePlugin, enabled: bool, configured: bool) -> PluginInfo {
+/// The catalog kind for a plugin, or `None` when it must not be listed
+/// (runtimes). Order matters: a provider manifest wins over runtime meta
+/// (ollama is both), and a skill-pack source wins over connector shape.
+fn derive_kind(plugin: &CorePlugin) -> Option<&'static str> {
+    if plugin.manifest.provider.is_some() {
+        return Some("provider");
+    }
+    if plugin.harness.is_some() || plugin.manifest.runtime.is_some() {
+        return None;
+    }
+    if matches!(plugin.source, PluginSource::SkillPack(_)) {
+        return Some("skill-pack");
+    }
+    if plugin.gateway.is_some()
+        || plugin
+            .manifest
+            .categories
+            .iter()
+            .any(|c| c == "chat-gateway")
+    {
+        return Some("gateway");
+    }
+    Some("integration")
+}
+
+/// Family head id for a provider plugin (`anthropic-oauth` → `anthropic`).
+fn provider_family(id: &str) -> String {
+    ryuzi_core::llm_router::registry::descriptor(id)
+        .map(|d| d.family.to_string())
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// Pure kind → installed decision. Inputs are pre-computed by the caller.
+fn installed_flag(
+    kind: &str,
+    enabled: bool,
+    configured: bool,
+    has_family_connection: bool,
+    gateway_settings_complete: bool,
+    skill_pack_installed: bool,
+) -> bool {
+    match kind {
+        "provider" => has_family_connection,
+        "gateway" => gateway_settings_complete,
+        "skill-pack" => skill_pack_installed,
+        _ => configured || enabled,
+    }
+}
+
+fn plugin_info(
+    plugin: &CorePlugin,
+    enabled: bool,
+    configured: bool,
+    kind: &str,
+    installed: bool,
+) -> PluginInfo {
     let m = &plugin.manifest;
     PluginInfo {
         id: m.id.clone(),
@@ -268,6 +333,9 @@ fn plugin_info(plugin: &CorePlugin, enabled: bool, configured: bool) -> PluginIn
             .into_iter()
             .map(str::to_string)
             .collect(),
+        kind: kind.to_string(),
+        installed,
+        family: (kind == "provider").then(|| provider_family(&m.id)),
     }
 }
 
@@ -889,10 +957,69 @@ async fn finish_plugin_oauth_callback(
     }
 }
 
+struct InstalledCtx {
+    connections: Vec<ryuzi_core::llm_router::connections::ConnectionRow>,
+    installed_skills: Vec<ryuzi_core::skills_install::InstalledSkillInfo>,
+}
+
+async fn installed_ctx(store: &Store) -> anyhow::Result<InstalledCtx> {
+    Ok(InstalledCtx {
+        connections: ryuzi_core::llm_router::connections::list_connections(store).await?,
+        installed_skills: ryuzi_core::skills_install::list_installed_skills().unwrap_or_default(),
+    })
+}
+
+async fn compute_installed(
+    store: &Store,
+    plugin: &CorePlugin,
+    kind: &str,
+    enabled: bool,
+    configured: bool,
+    ctx: &InstalledCtx,
+) -> anyhow::Result<bool> {
+    let id = &plugin.manifest.id;
+    let has_family_connection = kind == "provider" && {
+        let family = provider_family(id);
+        ctx.connections
+            .iter()
+            .any(|c| provider_family(&c.provider) == family)
+    };
+    let gateway_settings_complete = if kind == "gateway" {
+        let mut complete = !plugin.manifest.settings.is_empty();
+        for field in &plugin.manifest.settings {
+            let value = store.get_setting_raw(&field.key).await?;
+            if value.as_deref().map(str::trim).is_none_or(str::is_empty) {
+                complete = false;
+                break;
+            }
+        }
+        complete
+    } else {
+        false
+    };
+    let skill_pack_installed = kind == "skill-pack"
+        && ctx
+            .installed_skills
+            .iter()
+            .any(|s| s.plugin_id.as_deref() == Some(id.as_str()) || &s.id == id);
+    Ok(installed_flag(
+        kind,
+        enabled,
+        configured,
+        has_family_connection,
+        gateway_settings_complete,
+        skill_pack_installed,
+    ))
+}
+
 async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let settings = SettingsStore::new(cp.store().clone());
+    let ctx = installed_ctx(cp.store()).await?;
     let mut out = Vec::new();
     for plugin in cp.plugins().list() {
+        let Some(kind) = derive_kind(&plugin) else {
+            continue;
+        };
         let enabled = cp
             .plugins()
             .is_enabled(&settings, &plugin.manifest.id)
@@ -903,7 +1030,34 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             plugin.manifest.auth.as_ref(),
         )
         .await?;
-        out.push(plugin_info(&plugin, enabled, configured));
+        let installed =
+            compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
+        out.push(plugin_info(&plugin, enabled, configured, kind, installed));
+    }
+    for pack in ryuzi_core::skills_install::curated_skill_packs() {
+        if cp.plugins().get(pack.id).is_some() || out.iter().any(|p| p.id == pack.id) {
+            continue;
+        }
+        let installed = ctx
+            .installed_skills
+            .iter()
+            .any(|s| s.id == pack.id || s.source == pack.id || s.source == pack.repo);
+        out.push(PluginInfo {
+            id: pack.id.to_string(),
+            name: pack.name.to_string(),
+            description: pack.description.to_string(),
+            icon: Some("sparkles".to_string()),
+            categories: vec!["skills".to_string()],
+            verified: true,
+            experimental: false,
+            enabled: installed,
+            configured: installed,
+            source: "skill-pack".to_string(),
+            capabilities: vec![],
+            kind: "skill-pack".to_string(),
+            installed,
+            family: None,
+        });
     }
     Ok(out)
 }
@@ -924,9 +1078,12 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
     let mcp = m.mcp.iter().map(mcp_info).collect();
     let models = providers::list_models(cp.store(), id).await?;
     let configured = plugin_auth_configured(cp.store(), id, m.auth.as_ref()).await?;
+    let kind = derive_kind(&plugin).unwrap_or("integration");
+    let ctx = installed_ctx(cp.store()).await?;
+    let installed = compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
 
     Ok(PluginDetail {
-        info: plugin_info(&plugin, enabled, configured),
+        info: plugin_info(&plugin, enabled, configured, kind, installed),
         auth,
         settings: settings_info,
         mcp,
@@ -1526,21 +1683,116 @@ mod tests {
         );
     }
 
+    // ---------- derive_kind ----------
+
+    #[test]
+    fn derive_kind_classifies_each_capability_shape() {
+        assert_eq!(derive_kind(&provider_only("anthropic")), Some("provider"));
+        assert_eq!(derive_kind(&gateway_only("discord")), Some("gateway"));
+        assert_eq!(derive_kind(&connector_only("slack")), Some("integration"));
+        assert_eq!(derive_kind(&harness_only("native")), None);
+        assert_eq!(derive_kind(&manifest_only_with_runtime_meta("codex")), None);
+    }
+
+    #[test]
+    fn derive_kind_skill_pack_from_source() {
+        let mut plugin = connector_only("acme-pack");
+        plugin.source = PluginSource::SkillPack(std::path::PathBuf::from("/tmp/p"));
+        assert_eq!(derive_kind(&plugin), Some("skill-pack"));
+    }
+
+    // ---------- installed_flag ----------
+
+    #[test]
+    fn installed_flag_per_kind() {
+        assert!(installed_flag(
+            "integration",
+            true,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(installed_flag(
+            "integration",
+            false,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(!installed_flag(
+            "integration",
+            false,
+            false,
+            true,
+            true,
+            true
+        ));
+        assert!(installed_flag("provider", false, false, true, false, false));
+        assert!(!installed_flag("provider", true, true, false, false, false));
+        assert!(installed_flag("gateway", false, false, false, true, false));
+        assert!(!installed_flag("gateway", true, false, false, false, false));
+        assert!(installed_flag(
+            "skill-pack",
+            false,
+            false,
+            false,
+            false,
+            true
+        ));
+        assert!(!installed_flag(
+            "skill-pack",
+            true,
+            true,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn provider_family_falls_back_to_id() {
+        assert_eq!(provider_family("anthropic-oauth"), "anthropic");
+        assert_eq!(provider_family("not-a-provider"), "not-a-provider");
+    }
+
     // ---------- plugin_info ----------
 
     #[test]
     fn plugin_info_maps_identity_and_enabled_flag_through() {
         let plugin = harness_only("native");
-        let info = plugin_info(&plugin, true, false);
+        let info = plugin_info(&plugin, true, false, "integration", false);
         assert_eq!(info.id, "native");
         assert_eq!(info.name, "Plugin native");
         assert!(info.enabled);
         assert_eq!(info.source, "builtin");
         assert_eq!(info.capabilities, vec!["runtime".to_string()]);
         assert!(!info.configured);
+        assert_eq!(info.kind, "integration");
+        assert!(!info.installed);
+        assert!(info.family.is_none());
 
-        let info_disabled = plugin_info(&plugin, false, false);
+        let info_disabled = plugin_info(&plugin, false, false, "integration", false);
         assert!(!info_disabled.enabled);
+    }
+
+    #[tokio::test]
+    async fn assemble_list_excludes_runtimes_and_synthesizes_curated_packs() {
+        let cp = test_cp().await;
+        let list = assemble_list(&cp).await.unwrap();
+        assert!(list
+            .iter()
+            .all(|p| p.id != "native" && p.id != "claude-code"));
+        assert!(list
+            .iter()
+            .any(|p| p.kind == "skill-pack" && p.id == "superpowers"));
+        let discord = list.iter().find(|p| p.id == "discord").expect("discord");
+        assert_eq!(discord.kind, "gateway");
+        assert!(!discord.installed, "no discord settings persisted yet");
+        let anthropic = list.iter().find(|p| p.id == "anthropic").expect("provider");
+        assert_eq!(anthropic.kind, "provider");
+        assert_eq!(anthropic.family.as_deref(), Some("anthropic"));
     }
 
     // ---------- auth_kind_label / auth_configured ----------
