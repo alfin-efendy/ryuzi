@@ -1,5 +1,6 @@
-import { test, expect } from "bun:test";
+import { test, expect, beforeEach } from "bun:test";
 import { openFileTab, closeTab, normalizeActive, setTabMode, useUi, type DockTab } from "./store-ui";
+import type { Session } from "./bindings";
 
 const fileTab = (path: string): DockTab => ({ id: path, kind: "file", path, title: path.split("/").pop() ?? path });
 
@@ -77,4 +78,62 @@ test("hideInvalidModels toggle flips state and persists to localStorage", () => 
   useUi.getState().toggleHideInvalidModels();
   expect(useUi.getState().hideInvalidModels).toBe(false);
   expect(localStorage.getItem("cockpit.ui.hideInvalidModels")).toBe("0");
+});
+
+function sess(pk: string, lastActive: number | null): Session {
+  return {
+    sessionPk: pk,
+    projectId: "p",
+    agentSessionId: null,
+    worktreePath: null,
+    branch: null,
+    title: pk,
+    status: "idle",
+    startedBy: null,
+    createdAt: 0,
+    lastActive,
+    resumeAttempts: 0,
+    branchOwned: false,
+  };
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  useUi.setState({ readAt: {} });
+});
+
+test("markRead sets and persists the cursor", () => {
+  useUi.getState().markRead("s1", 1000);
+  expect(useUi.getState().readAt.s1).toBe(1000);
+  expect(JSON.parse(localStorage.getItem("cockpit.ui.readAt")!)).toEqual({ s1: 1000 });
+});
+
+test("seedReadState fills only absent keys, never overwriting an advanced cursor", () => {
+  useUi.getState().markRead("s1", 5000); // already read at 5000
+  useUi.getState().seedReadState([sess("s1", 9000), sess("s2", 200)]);
+  // s1 keeps its advanced cursor; s2 seeded to its lastActive.
+  expect(useUi.getState().readAt).toEqual({ s1: 5000, s2: 200 });
+});
+
+test("seedReadState treats null lastActive as 0", () => {
+  useUi.getState().seedReadState([sess("s3", null)]);
+  expect(useUi.getState().readAt.s3).toBe(0);
+});
+
+test("markAllRead advances every session to its lastActive", () => {
+  useUi.setState({ readAt: { s1: 1 } });
+  useUi.getState().markAllRead([sess("s1", 400), sess("s2", 700)]);
+  expect(useUi.getState().readAt).toEqual({ s1: 400, s2: 700 });
+});
+
+test("toggleStatusFilter and toggleUnreadOnly persist", () => {
+  useUi.setState({ sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.getState().toggleStatusFilter("running");
+  useUi.getState().toggleUnreadOnly();
+  expect(useUi.getState().sessionFilter).toEqual({ statuses: { running: true }, unreadOnly: true });
+  const saved = JSON.parse(localStorage.getItem("cockpit.ui.sessionFilter")!);
+  expect(saved).toEqual({ statuses: { running: true }, unreadOnly: true });
+  // toggling again removes the status
+  useUi.getState().toggleStatusFilter("running");
+  expect(useUi.getState().sessionFilter.statuses).toEqual({});
 });
