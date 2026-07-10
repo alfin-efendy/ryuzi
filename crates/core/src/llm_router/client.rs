@@ -1175,6 +1175,12 @@ fn deliver_probed(
 /// error arriving before the first content event rotates too. Once content
 /// has been delivered, a later error is delivered in-stream — failing over
 /// then would duplicate output.
+///
+/// Route continuation: for family/model-pinned requests (`"provider/model"`),
+/// once every same-family target from the initial routing pass has failed
+/// retryably, routing continues once down the first matching Model Route's
+/// targets, tried in their configured order while skipping any (connection,
+/// model) pair already attempted.
 pub async fn anthropic_messages_stream(
     ctx: &UpstreamCtx,
     body: Value,
