@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, ChevronRight, Plus, RefreshCw, TestTube2 } from "lucide-react";
 import { toast } from "sonner";
-import { commands, type ConnectionInfo, type ModelRouteStrategy, type UsageSeries } from "@/bindings";
+import { commands, type ConnectionInfo, type ModelRouteStrategy, type SelectableModelInfo, type UsageSeries } from "@/bindings";
 import { useConnections } from "@/store-connections";
 import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
@@ -22,6 +22,8 @@ import { Chip, Pill } from "@/components/common/bits";
 import { UsageChart } from "@/components/common/UsageChart";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
+import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { useStore } from "@/store";
 
 function accountLabel(count: number): string {
   return `${count} account${count === 1 ? "" : "s"}`;
@@ -33,6 +35,15 @@ function modelLabel(count: number, prefix = ""): string {
 
 function strategyText(strategy: ModelRouteStrategy): string {
   return strategy === "round-robin" ? "Round robin" : "By order";
+}
+
+export function modelEffortDefaultOptions(metadata: SelectableModelInfo) {
+  const inheritedLabel =
+    metadata.defaultSource === "variesByTarget" ? "Default: varies by target" : `Default: ${metadata.resolvedDefault ?? "provider"}`;
+  return [
+    { value: "__model_default__", label: inheritedLabel },
+    ...metadata.supported.map((option) => ({ value: option.value, label: option.label, description: option.description ?? undefined })),
+  ];
 }
 
 function aggregateUsage(series: Array<UsageSeries | undefined>): UsageSeries | null {
@@ -175,6 +186,9 @@ function ProviderModelsCard({
   const hideInvalid = useUi((s) => s.hideInvalidModels);
   const toggleHideInvalid = useUi((s) => s.toggleHideInvalidModels);
   const hydrate = useConnections((s) => s.hydrate);
+  const selectableModels = useRuntimes((s) => runtimeById(s.runtimes, "native")?.selectableModels ?? []);
+  const setModelEffortPreference = useStore((s) => s.setModelEffortPreference);
+  const refreshModelConfiguration = useStore((s) => s.refreshModelConfiguration);
   const models = useMemo(() => {
     const set = new Set<string>();
     for (const conn of connections) {
@@ -266,6 +280,7 @@ function ProviderModelsCard({
     setRefreshErrors(failures.map((item) => ({ connectionId: item.connectionId, message: item.message })));
     if (failures.length === 0) toast.success("Models refreshed");
     await hydrate();
+    await refreshModelConfiguration();
   };
 
   return (
@@ -294,11 +309,29 @@ function ProviderModelsCard({
       {visible.map((model) => {
         const entry = results.get(model);
         const testing = inFlight.has(model);
+        const metadata = selectableModels.find(
+          (candidate) =>
+            candidate.kind === "concrete" &&
+            candidate.preferenceKey?.family === family &&
+            candidate.preferenceKey.model === model &&
+            candidate.supported.length > 0,
+        );
         return (
           <div key={model} className="flex min-h-11 items-center gap-2 border-b border-border px-[18px] py-2.5 last:border-b-0">
             <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{model}</span>
             {entry && <StatusBadge entry={entry} />}
             <ModelCapabilityIcons model={model} compact />
+            {metadata?.preferenceKey ? (
+              <Combobox
+                aria-label={`Default effort for ${model}`}
+                options={modelEffortDefaultOptions(metadata)}
+                value={metadata.configuredDefault ?? "__model_default__"}
+                onValueChange={(value) =>
+                  void setModelEffortPreference(metadata.preferenceKey!, value === "__model_default__" ? null : value)
+                }
+                className="w-[180px]"
+              />
+            ) : null}
             <Button
               variant="outline"
               size="sm"

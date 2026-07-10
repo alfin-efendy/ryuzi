@@ -144,18 +144,18 @@ test("modelStatusKey returns null for bare route aliases and unknown prefixes", 
   expect(modelStatusKey("mystery/whatever", catalog)).toBeNull();
 });
 
-test("modelStatusKey strips codex effort/review variants to the base model (mirrors codex_base_model)", () => {
-  expect(modelStatusKey("openai/gpt-5.5-codex-low", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
-  expect(modelStatusKey("openai/gpt-5.5-codex-medium", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
-  expect(modelStatusKey("openai/gpt-5.5-codex-high", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
+test("model_groups_never_strip_effort_suffixes", () => {
+  expect(modelStatusKey("openai/gpt-5.5-codex-low", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex-low" });
+  expect(modelStatusKey("openai/gpt-5.5-codex-medium", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex-medium" });
+  expect(modelStatusKey("openai/gpt-5.5-codex-high", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex-high" });
   // "-xhigh" must strip whole, not leave "…-x" behind by matching "-high".
-  expect(modelStatusKey("openai/gpt-5.5-codex-xhigh", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
-  expect(modelStatusKey("openai/gpt-5.6-luna-none", catalog)).toEqual({ family: "openai", model: "gpt-5.6-luna" });
-  expect(modelStatusKey("openai/gpt-5.6-luna-review", catalog)).toEqual({ family: "openai", model: "gpt-5.6-luna" });
+  expect(modelStatusKey("openai/gpt-5.5-codex-xhigh", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex-xhigh" });
+  expect(modelStatusKey("openai/gpt-5.6-luna-none", catalog)).toEqual({ family: "openai", model: "gpt-5.6-luna-none" });
+  expect(modelStatusKey("openai/gpt-5.6-luna-review", catalog)).toEqual({ family: "openai", model: "gpt-5.6-luna-review" });
   // Review strips first, then ONE effort suffix — same one-pass order as Rust.
-  expect(modelStatusKey("openai/gpt-5.5-codex-high-review", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
+  expect(modelStatusKey("openai/gpt-5.5-codex-high-review", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex-high-review" });
   // Suffix stripping applies to route-target keys too.
-  expect(modelStatusKey("openai::gpt-5.5-codex-review", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
+  expect(modelStatusKey("openai::gpt-5.5-codex-review", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex-review" });
   // Non-variant models pass through untouched.
   expect(modelStatusKey("anthropic/claude-fable-5", catalog)).toEqual({ family: "anthropic", model: "claude-fable-5" });
 });
@@ -220,7 +220,7 @@ test("the ungrouped fallback honors hide-invalid too (no resurrection)", () => {
   expect(flat).toEqual([{ value: "smart", label: "smart", mono: true }]);
 });
 
-test("hideInvalid resolves bare ids via connections; codex variants inherit the base verdict", () => {
+test("hideInvalid resolves bare ids without applying a base verdict to effort suffixes", () => {
   const statuses = { [statusKey("openai", "gpt-5.5-codex")]: "invalid" as const };
   const groups = groupModelOptions(
     ["gpt-5.5-codex", "openai/gpt-5.5-codex-high", "claude-fable-5"],
@@ -228,5 +228,8 @@ test("hideInvalid resolves bare ids via connections; codex variants inherit the 
     [conn("openai", ["gpt-5.5-codex"]), conn("anthropic-oauth", ["claude-fable-5"])],
     { statuses, hideInvalid: true },
   );
-  expect(groups).toEqual([{ label: "Anthropic", options: [{ value: "claude-fable-5", label: "claude-fable-5", mono: true }] }]);
+  expect(groups).toEqual([
+    { label: "OpenAI", options: [{ value: "openai/gpt-5.5-codex-high", label: "gpt-5.5-codex-high", mono: true }] },
+    { label: "Anthropic", options: [{ value: "claude-fable-5", label: "claude-fable-5", mono: true }] },
+  ]);
 });

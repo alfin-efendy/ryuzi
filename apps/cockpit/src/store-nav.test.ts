@@ -73,12 +73,10 @@ test("readClampedPanelSize parses, defaults, and clamps a persisted size to the 
   expect(readClampedPanelSize("2000", 900, BOTTOM_HEIGHT)).toBe(540); // 60% of 900
 });
 
-test("composer model starts unset and round-trips through setComposerModel", () => {
-  expect(useNav.getState().composerModel).toBeNull();
-  useNav.getState().setComposerModel("openrouter/qwen3:free");
-  expect(useNav.getState().composerModel).toBe("openrouter/qwen3:free");
-  useNav.getState().setComposerModel(null);
-  expect(useNav.getState().composerModel).toBeNull();
+test("composer_model_has_one_project_runtime_source", () => {
+  const nav = useNav.getState() as unknown as Record<string, unknown>;
+  expect(nav.composerModel).toBeUndefined();
+  expect(nav.setComposerModel).toBeUndefined();
 });
 
 test("composer git controls default to worktree ON, no branch until the list loads", () => {

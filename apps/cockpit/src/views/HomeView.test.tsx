@@ -1,14 +1,35 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { BranchList, CatalogEntry, CmdError, CommandInfo, ConnectionInfo, Project, Result, RuntimeInfo } from "@/bindings";
+import type {
+  BranchList,
+  CatalogEntry,
+  CmdError,
+  CommandInfo,
+  ConnectionInfo,
+  Project,
+  ProjectRuntimeInfo,
+  Result,
+  RuntimeInfo,
+} from "@/bindings";
 
 const branchListData: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
 const listBranches = mock((): Promise<Result<BranchList, CmdError>> => Promise.resolve({ status: "ok", data: branchListData }));
 const nativeCommands = mock((): Promise<Result<CommandInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const searchFiles = mock((): Promise<Result<string[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
+const runtimeInfo: ProjectRuntimeInfo = {
+  projectId: "p1",
+  model: null,
+  storedEffort: null,
+  effectiveEffort: null,
+  effectiveEffortLabel: null,
+  effectiveSource: "none",
+  storedEffortStatus: "valid",
+  modelInfo: null,
+};
+const projectRuntimeInfo = mock(() => Promise.resolve({ status: "ok" as const, data: runtimeInfo }));
 
 mock.module("@/bindings", () => ({
-  commands: { listBranches, nativeCommands, searchFiles },
+  commands: { listBranches, nativeCommands, searchFiles, projectRuntimeInfo },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // useComposerAttachments registers a Tauri drag-drop listener on mount.
@@ -51,7 +72,28 @@ const nativeRuntime: RuntimeInfo = {
   latestVersion: null,
   npmPackage: null,
   models: ["anthropic/claude-opus-4", "anthropic/claude-sonnet-4"],
-  selectableModels: [],
+  selectableModels: [
+    {
+      kind: "concrete",
+      requestValue: "anthropic/claude-opus-4",
+      displayName: "claude-opus-4",
+      preferenceKey: { family: "anthropic", model: "claude-opus-4" },
+      supported: [],
+      configuredDefault: null,
+      resolvedDefault: null,
+      defaultSource: "none",
+    },
+    {
+      kind: "concrete",
+      requestValue: "anthropic/claude-sonnet-4",
+      displayName: "claude-sonnet-4",
+      preferenceKey: { family: "anthropic", model: "claude-sonnet-4" },
+      supported: [],
+      configuredDefault: null,
+      resolvedDefault: null,
+      defaultSource: "none",
+    },
+  ],
   enabled: true,
   model: "",
   permMode: "ask",
@@ -96,13 +138,13 @@ const anthropicConnection: ConnectionInfo = {
 };
 
 beforeEach(() => {
-  useStore.setState({ projects: [project()], selectedProjectId: "p1" });
+  useStore.setState({ projects: [project()], selectedProjectId: "p1", projectRuntimeById: { p1: runtimeInfo } });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ catalog: catalogEntries, connections: [anthropicConnection], loaded: true });
   useRuntimes.setState({ runtimes: [nativeRuntime], loaded: true });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
-  useNav.setState({ composerBranch: null, composerModel: null });
+  useNav.setState({ composerBranch: null });
   listBranches.mockClear();
   nativeCommands.mockClear();
 });
@@ -152,21 +194,20 @@ test("composer text is read from the persisted draft map (key home:{projectId})"
   });
 });
 
-test("composer model chip: shared ModelPicker look — no Ryuzi suffix, search always available", async () => {
+test("composer model chip opens the structured model and effort menu", async () => {
   render(<HomeView />);
-  const chip = screen.getByRole("combobox", { name: "Model" });
+  const chip = screen.getByRole("button", { name: "Model and effort" });
   expect(chip.textContent).toContain("Default model");
   expect(chip.textContent).not.toContain("Ryuzi");
   fireEvent.click(chip);
-  expect(await screen.findByPlaceholderText("Search…")).toBeTruthy();
-  expect(screen.getByRole("option", { name: "claude-opus-4" })).toBeTruthy();
+  expect(await screen.findByText("claude-opus-4")).toBeTruthy();
 });
 
-test("hide-invalid filters the composer model list, keeping untested models", async () => {
+test("structured composer model list comes from native metadata", async () => {
   useModelStatuses.setState({ byKey: { [statusKey("anthropic", "claude-sonnet-4")]: "invalid" } });
   useUi.setState({ hideInvalidModels: true });
   render(<HomeView />);
-  fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
-  expect(await screen.findByRole("option", { name: "claude-opus-4" })).toBeTruthy();
-  expect(screen.queryByRole("option", { name: "claude-sonnet-4" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Model and effort" }));
+  expect(await screen.findByText("claude-opus-4")).toBeTruthy();
+  expect(screen.getByText("claude-sonnet-4")).toBeTruthy();
 });

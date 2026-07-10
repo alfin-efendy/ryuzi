@@ -317,7 +317,6 @@ impl From<GitOptions> for SessionGitOptions {
 #[serde(rename_all = "camelCase")]
 pub struct ChatRequestOptions {
     pub runtime_id: Option<String>,
-    pub model: Option<String>,
     pub context: Option<ChatContextArg>,
     #[serde(default)]
     pub attachments: Vec<String>,
@@ -337,14 +336,9 @@ async fn apply_runtime_choice(
     cp: &ControlPlane,
     project_id: &str,
     runtime_id: Option<&str>,
-    model: Option<&str>,
 ) -> R<()> {
     let runtime_id = runtime_id.filter(|v| !v.trim().is_empty());
-    let model = model
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string);
-    if runtime_id.is_none() && model.is_none() {
+    if runtime_id.is_none() {
         return Ok(());
     };
     let harness = match runtime_id {
@@ -361,14 +355,9 @@ async fn apply_runtime_choice(
     } else {
         harness
     };
-    let current_model = project.model.clone();
-    // Ryuzi-only: a runtime choice no longer implies a model reset — the
-    // composer always sends runtimeId "native", so `model: null` must keep
-    // the project's pinned model instead of clearing it.
-    let next_model = model.or_else(|| current_model.clone());
-    if project.harness != next_harness || current_model != next_model {
+    if project.harness != next_harness {
         cp.store()
-            .update_project(project_id, next_model, project.perm_mode, next_harness)
+            .update_project(project_id, project.model, project.perm_mode, next_harness)
             .await?;
     }
     Ok(())
@@ -473,13 +462,7 @@ pub async fn start_session(
     options: Option<ChatRequestOptions>,
 ) -> R<Session> {
     let options = options.unwrap_or_default();
-    apply_runtime_choice(
-        &cp,
-        &project_id,
-        options.runtime_id.as_deref(),
-        options.model.as_deref(),
-    )
-    .await?;
+    apply_runtime_choice(&cp, &project_id, options.runtime_id.as_deref()).await?;
     let git: Option<SessionGitOptions> = options.git.clone().map(Into::into);
     let attachments = attachment_refs_from_paths(&options.attachments).await?;
     let agent_prompt = chat_agent_prompt(&prompt, options.context.as_ref());
@@ -723,7 +706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_runtime_choice_keeps_the_pinned_model_when_none_is_sent() {
+    async fn chat_submission_contains_no_model_and_cannot_overwrite_atomic_runtime_state() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
         let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
@@ -735,7 +718,7 @@ mod tests {
                 source: None,
                 harness: "claude-code".into(),
                 model: Some("openrouter/qwen3:free".into()),
-                effort: None,
+                effort: Some("high".into()),
                 perm_mode: PermMode::Default,
                 created_at: None,
                 is_git: false,
@@ -744,7 +727,7 @@ mod tests {
             .unwrap();
 
         // The composer always sends runtimeId "native"; model may be null.
-        apply_runtime_choice(&cp, "p1", Some("native"), None)
+        apply_runtime_choice(&cp, "p1", Some("native"))
             .await
             .unwrap();
 
@@ -756,8 +739,9 @@ mod tests {
         assert_eq!(
             got.model.as_deref(),
             Some("openrouter/qwen3:free"),
-            "model:null must not clear the pinned model"
+            "chat runtime canonicalization must not change the committed model"
         );
+        assert_eq!(got.effort.as_deref(), Some("high"));
     }
 
     #[tokio::test]
@@ -889,12 +873,12 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_options_deserializes_model() {
-        let opts: ChatRequestOptions =
-            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
-                .unwrap();
+    fn chat_request_options_ignore_legacy_model_field() {
+        let raw = serde_json::json!({"runtimeId": "native", "model": "fable"});
+        let opts: ChatRequestOptions = serde_json::from_value(raw).unwrap();
         assert_eq!(opts.runtime_id.as_deref(), Some("native"));
-        assert_eq!(opts.model.as_deref(), Some("fable"));
+        let serialized = serde_json::to_value(opts).unwrap();
+        assert!(serialized.get("model").is_none());
     }
 
     #[test]

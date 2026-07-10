@@ -17,7 +17,7 @@ import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/const
 import { composerMode } from "@/components/composerMode";
 import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
-import { ModelPicker } from "@/components/ModelPicker";
+import { ComposerModelEffortMenu } from "@/components/ComposerModelEffortMenu";
 import { Transcript } from "@/components/transcript/Transcript";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
@@ -37,7 +37,9 @@ export function SessionView() {
     stop,
     pendingApprovals,
     projects,
-    setProjectModel,
+    setProjectRuntime,
+    projectRuntimeById,
+    loadProjectRuntime,
     setProjectPermMode,
     contextUsage,
   } = useStore();
@@ -80,6 +82,10 @@ export function SessionView() {
   useEffect(() => {
     if (projectId) void loadCommands(projectId);
   }, [projectId, loadCommands]);
+
+  useEffect(() => {
+    if (projectId) void loadProjectRuntime(projectId);
+  }, [projectId, loadProjectRuntime]);
 
   useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
@@ -160,10 +166,11 @@ export function SessionView() {
   const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(project?.permMode ?? "default");
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
-  const selectedModel = project?.model || agent?.model || "";
-  const modelOptions = agent?.models ?? [];
+  const projectRuntime = projectId ? (projectRuntimeById[projectId] ?? null) : null;
+  const modelOptions = agent?.selectableModels ?? [];
 
   const submit = () => {
+    if (running) return;
     const t = draft.trim();
     if (!t && composerFiles.attachments.length === 0) return;
     const key = session.sessionPk;
@@ -366,16 +373,14 @@ export function SessionView() {
                   {usage.percentLeft}% context left
                 </span>
               )}
-              <ModelPicker
-                ariaLabel="Model"
-                variant="chip"
+              <ComposerModelEffortMenu
                 models={modelOptions}
-                value={selectedModel}
-                onValueChange={(m) => {
-                  if (projectId) void setProjectModel(projectId, m);
+                runtime={projectRuntime}
+                onChange={(model, effort) => {
+                  if (projectId) void setProjectRuntime(projectId, model, effort);
                 }}
                 disabled={modelOptions.length === 0}
-                placeholder="Default model"
+                running={running}
               />
               <Button
                 variant="ghost"

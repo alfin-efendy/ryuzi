@@ -2,6 +2,7 @@ import { test, expect, mock, spyOn } from "bun:test";
 import { useStore } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
+import { useRuntimes } from "./store-runtimes";
 
 function reset() {
   useStore.setState({
@@ -14,8 +15,97 @@ function reset() {
     lastSeq: {},
     loaded: {},
     contextUsage: {},
+    projectRuntimeById: {},
   });
 }
+
+test("composer_model_has_one_project_runtime_source", () => {
+  const state = useStore.getState() as unknown as Record<string, unknown>;
+  expect(state.setProjectModel).toBeUndefined();
+  expect(state.setProjectRuntime).toBeFunction();
+});
+
+test("chat_submission_contains_no_model_and_cannot_overwrite_atomic_runtime_state", async () => {
+  reset();
+  const start = spyOn(commands, "startSession").mockResolvedValue({ status: "error", error: { message: "stop" } });
+  await useStore.getState().start("p1", "hello", { runtimeId: "native" });
+  const payload = start.mock.calls[0]?.[2] as unknown as Record<string, unknown>;
+  expect(payload).not.toHaveProperty("model");
+  start.mockRestore();
+});
+
+const runtimeSnapshot = {
+  projectId: "p1",
+  model: "openai/gpt-5",
+  storedEffort: "high",
+  effectiveEffort: "high",
+  effectiveEffortLabel: "High",
+  effectiveSource: "project" as const,
+  storedEffortStatus: "valid" as const,
+  modelInfo: null,
+};
+
+test("failed_runtime_save_rolls_back_both_snapshots", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "openai/gpt-5",
+    effort: "high",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  const update = spyOn(commands, "updateProjectRuntime").mockResolvedValue({ status: "error", error: { message: "boom" } });
+  const ok = await useStore.getState().setProjectRuntime("p1", "openai/gpt-5-mini", "low");
+  expect(ok).toBe(false);
+  expect(useStore.getState().projects[0]).toEqual(project);
+  expect(useStore.getState().projectRuntimeById.p1).toEqual(runtimeSnapshot);
+  update.mockRestore();
+});
+
+test("global_preference_and_metadata_refresh_refetch_loaded_project_runtime_status", async () => {
+  reset();
+  useStore.setState({ projectRuntimeById: { p1: runtimeSnapshot } });
+  const reload = spyOn(useRuntimes.getState(), "reloadList").mockResolvedValue(undefined);
+  const fresh = { ...runtimeSnapshot, storedEffortStatus: "unsupported" as const, effectiveEffort: "medium" };
+  const info = spyOn(commands, "projectRuntimeInfo").mockResolvedValue({ status: "ok", data: fresh });
+  await useStore.getState().refreshModelConfiguration();
+  expect(reload).toHaveBeenCalledTimes(1);
+  expect(info).toHaveBeenCalledWith("p1");
+  expect(useStore.getState().projectRuntimeById.p1).toEqual(fresh);
+  reload.mockRestore();
+  info.mockRestore();
+});
+
+test("older_model_configuration_refresh_cannot_overwrite_newer_state", async () => {
+  reset();
+  useStore.setState({ projectRuntimeById: { p1: runtimeSnapshot } });
+  let releaseOlder!: () => void;
+  const olderGate = new Promise<void>((resolve) => {
+    releaseOlder = resolve;
+  });
+  const reload = spyOn(useRuntimes.getState(), "reloadList")
+    .mockImplementationOnce(() => olderGate)
+    .mockResolvedValueOnce(undefined);
+  const newer = { ...runtimeSnapshot, effectiveEffort: "medium" };
+  const older = { ...runtimeSnapshot, effectiveEffort: "low" };
+  const info = spyOn(commands, "projectRuntimeInfo")
+    .mockResolvedValueOnce({ status: "ok", data: newer })
+    .mockResolvedValueOnce({ status: "ok", data: older });
+  const first = useStore.getState().refreshModelConfiguration();
+  const second = useStore.getState().refreshModelConfiguration();
+  await second;
+  releaseOlder();
+  await first;
+  expect(useStore.getState().projectRuntimeById.p1.effectiveEffort).toBe("medium");
+  reload.mockRestore();
+  info.mockRestore();
+});
 
 test("selectProject sets the selected project and clears the focused session", () => {
   reset();
@@ -416,7 +506,7 @@ test("error event appends no transient row — the durable error row arrives via
   listSessions.mockRestore();
 });
 
-test("start forwards chat options so composer runtime, context, and attachments reach IPC", async () => {
+test("start forwards chat options without a model override", async () => {
   reset();
   const start = spyOn(commands, "startSession").mockResolvedValue({
     status: "ok",
@@ -440,14 +530,12 @@ test("start forwards chat options so composer runtime, context, and attachments 
 
   await useStore.getState().start("p1", "/review", {
     runtimeId: "native",
-    model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
   });
 
   expect(start).toHaveBeenCalledWith("p1", "/review", {
     runtimeId: "native",
-    model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
     git: null,
@@ -487,7 +575,6 @@ test("start forwards composer git options to IPC", async () => {
 
   expect(start).toHaveBeenCalledWith("p1", "go", {
     runtimeId: null,
-    model: null,
     context: null,
     attachments: [],
     git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },

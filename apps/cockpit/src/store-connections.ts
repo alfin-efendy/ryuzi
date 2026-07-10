@@ -11,6 +11,7 @@ import {
   type CmdError,
 } from "./bindings";
 import { KIRO_IMPORT_ACTION, KIRO_SIGNIN_ACTION } from "./constants";
+import { useStore } from "./store";
 
 // Providers tab: catalog + credentialed provider connections.
 
@@ -55,6 +56,7 @@ type ConnectionsState = {
 function apply(set: (p: Partial<ConnectionsState>) => void, res: Result<ConnectionInfo[], CmdError>, action: string): boolean {
   if (res.status === "ok") {
     set({ connections: res.data });
+    void useStore.getState().refreshModelConfiguration();
     return true;
   }
   toast.error(`${action} failed: ${res.error.message}`);

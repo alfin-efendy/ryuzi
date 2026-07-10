@@ -12,6 +12,8 @@ import {
   type PermMode,
   type ApprovalKind,
   type ApprovalResponse,
+  type ModelPreferenceKey,
+  type ProjectRuntimeInfo,
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
@@ -28,7 +30,6 @@ export type PendingApproval = {
 };
 export type ChatOptions = {
   runtimeId?: string | null;
-  model?: string | null;
   context?: {
     branch?: string | null;
     voiceTranscript?: string | null;
@@ -49,6 +50,7 @@ type State = {
   loaded: Record<string, boolean>;
   /** Per-session context-window usage from the latest `contextUsage` event. */
   contextUsage: Record<string, { activeTokens: number; usableWindow: number; percentLeft: number }>;
+  projectRuntimeById: Record<string, ProjectRuntimeInfo>;
   applyCoreEvent: (e: CoreEvent) => void;
   clearApproval: (requestId: string) => void;
   setFocused: (pk: string | null) => void;
@@ -58,8 +60,10 @@ type State = {
   addProject: () => Promise<boolean>;
   /** Clone `url` into `<destParent>/<repo-name>` via the backend. */
   cloneProject: (url: string, destParent: string) => Promise<boolean>;
-  /** Pin (or clear, with null) the model future turns of this project use. */
-  setProjectModel: (projectId: string, model: string | null) => Promise<void>;
+  loadProjectRuntime: (projectId: string) => Promise<void>;
+  setProjectRuntime: (projectId: string, model: string | null, effort: string | null) => Promise<boolean>;
+  setModelEffortPreference: (key: ModelPreferenceKey, effort: string | null) => Promise<boolean>;
+  refreshModelConfiguration: () => Promise<void>;
   /** Change the permission mode future turns of this project run under. */
   setProjectPermMode: (projectId: string, permMode: PermMode) => Promise<void>;
   /** Resolves true as soon as the backend accepts — navigate immediately;
@@ -84,7 +88,6 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
   if (!options) return null;
   return {
     runtimeId: options.runtimeId ?? null,
-    model: options.model ?? null,
     context: options.context
       ? {
           branch: options.context.branch ?? null,
@@ -97,6 +100,8 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
   };
 }
 
+let modelConfigurationGeneration = 0;
+
 export const useStore = create<State>((set, get) => ({
   projects: [],
   sessions: [],
@@ -107,6 +112,7 @@ export const useStore = create<State>((set, get) => ({
   lastSeq: {},
   loaded: {},
   contextUsage: {},
+  projectRuntimeById: {},
 
   applyCoreEvent: (e) =>
     set((st) => {
@@ -263,18 +269,71 @@ export const useStore = create<State>((set, get) => ({
     return false;
   },
 
-  setProjectModel: async (projectId, model) => {
+  loadProjectRuntime: async (projectId) => {
+    const res = await commands.projectRuntimeInfo(projectId);
+    if (res.status === "ok") set((st) => ({ projectRuntimeById: { ...st.projectRuntimeById, [projectId]: res.data } }));
+  },
+  setProjectRuntime: async (projectId, model, effort) => {
     const project = get().projects.find((p) => p.projectId === projectId);
-    if (!project) return;
-    const next = model ?? null;
-    if ((project.model ?? null) === next) return;
-    // Optimistic paint so the composer label updates immediately.
-    set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, model: next } : p)) });
-    const res = await commands.updateProject(projectId, next, project.permMode, project.harness);
+    if (!project) return false;
+    const previousProject = project;
+    const previousRuntime = get().projectRuntimeById[projectId];
+    const optimisticRuntime: ProjectRuntimeInfo = previousRuntime
+      ? { ...previousRuntime, model, storedEffort: effort }
+      : {
+          projectId,
+          model,
+          storedEffort: effort,
+          effectiveEffort: effort,
+          effectiveEffortLabel: effort,
+          effectiveSource: effort ? "project" : "none",
+          storedEffortStatus: "valid",
+          modelInfo: null,
+        };
+    set((st) => ({
+      projects: st.projects.map((p) => (p.projectId === projectId ? { ...p, model, effort } : p)),
+      projectRuntimeById: { ...st.projectRuntimeById, [projectId]: optimisticRuntime },
+    }));
+    const res = await commands.updateProjectRuntime(projectId, model, effort);
     if (res.status === "error") {
-      toast.error("Couldn't set model: " + res.error.message);
-      await get().refresh();
+      set((st) => {
+        const projectRuntimeById = { ...st.projectRuntimeById };
+        if (previousRuntime) projectRuntimeById[projectId] = previousRuntime;
+        else delete projectRuntimeById[projectId];
+        return {
+          projects: st.projects.map((p) => (p.projectId === projectId ? previousProject : p)),
+          projectRuntimeById,
+        };
+      });
+      toast.error("Couldn't set model and effort: " + res.error.message);
+      return false;
     }
+    set((st) => ({
+      projects: st.projects.map((p) => (p.projectId === projectId ? { ...p, model: res.data.model, effort: res.data.storedEffort } : p)),
+      projectRuntimeById: { ...st.projectRuntimeById, [projectId]: res.data },
+    }));
+    return true;
+  },
+  refreshModelConfiguration: async () => {
+    const generation = ++modelConfigurationGeneration;
+    await useRuntimes.getState().reloadList();
+    const projectIds = Object.keys(get().projectRuntimeById);
+    const entries = await Promise.all(projectIds.map(async (id) => [id, await commands.projectRuntimeInfo(id)] as const));
+    if (generation !== modelConfigurationGeneration) return;
+    set((st) => {
+      const next = { ...st.projectRuntimeById };
+      for (const [id, result] of entries) if (result.status === "ok") next[id] = result.data;
+      return { projectRuntimeById: next };
+    });
+  },
+  setModelEffortPreference: async (key, effort) => {
+    const res = await commands.setModelEffortPreference(key, effort);
+    if (res.status === "error") {
+      toast.error("Couldn't set model default: " + res.error.message);
+      return false;
+    }
+    await get().refreshModelConfiguration();
+    return true;
   },
   setProjectPermMode: async (projectId, permMode) => {
     const project = get().projects.find((p) => p.projectId === projectId);
