@@ -93,9 +93,22 @@ export function SessionView() {
   // holds the navigation cursor — it never drives rendering.
   const historyRef = useRef<HistoryState>(HISTORY_IDLE);
   const history = useMemo(() => historyEntries(rows), [rows]);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off the focused session
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the cleanup writes back to the *previous* session (closed over from this render); reset is edge-triggered off the focused session
   useEffect(() => {
     historyRef.current = HISTORY_IDLE;
+    return () => {
+      // Leaving this session while history navigation is active (switching
+      // sessions/views, or unmounting) would otherwise strand the
+      // pre-recall draft in this in-memory ref forever — write it back to
+      // the persisted drafts map so it survives. This cleanup runs on both
+      // dependency change and unmount, covering both loss paths with one
+      // code path. A completed send resets historyRef to HISTORY_IDLE
+      // synchronously in submit() — without a session change — so that
+      // path never reaches this cleanup with a stale pending value.
+      if (historyRef.current.index >= 0) {
+        useNav.getState().setDraft(draftKey, historyRef.current.pending);
+      }
+    };
   }, [focusedSessionPk]);
 
   const slashQuery = useMemo(() => {
