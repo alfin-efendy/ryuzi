@@ -75,8 +75,16 @@ impl EngineClient {
         }
     }
 
-    /// Line-parse the SSE stream: accumulate bytes, split on '\n', strip
+    /// Line-parse the SSE stream: accumulate raw bytes, split on '\n', strip
     /// "data: " prefixes, parse JSON. Ignores comments/keep-alives.
+    ///
+    /// Bytes are buffered as `Vec<u8>` (not `String`) because reqwest chunk
+    /// boundaries do not respect UTF-8 character boundaries: a multi-byte
+    /// sequence (emoji, CJK, accented text in a Notice/Message payload) can
+    /// legitimately split across two chunks. Decoding each chunk
+    /// independently would replace the truncated tail with U+FFFD before the
+    /// completing bytes ever arrive. Decoding only complete, newline-terminated
+    /// lines guarantees every decode sees a full UTF-8 boundary.
     pub async fn events(&self) -> Result<impl Stream<Item = Value>, CmdError> {
         use futures::StreamExt;
         let resp = self
@@ -88,28 +96,41 @@ impl EngineClient {
             .map_err(|e| CmdError {
                 message: format!("engine events unreachable: {e}"),
             })?;
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let stream = resp
             .bytes_stream()
             .filter_map(move |chunk| {
                 let mut out: Vec<Value> = Vec::new();
                 if let Ok(bytes) = chunk {
-                    buf.push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(nl) = buf.find('\n') {
-                        let line: String = buf.drain(..=nl).collect();
-                        let line = line.trim_end();
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                                out.push(v);
-                            }
-                        }
-                    }
+                    buf.extend_from_slice(&bytes);
+                    out = drain_lines(&mut buf);
                 }
                 async move { Some(futures::stream::iter(out)) }
             })
             .flatten();
         Ok(stream)
     }
+}
+
+/// Drain complete (`\n`-terminated) lines from `buf`, decode each as UTF-8,
+/// strip the SSE `"data: "` prefix, and parse the payload as JSON. Bytes
+/// after the last newline are left in `buf` for the next call so a
+/// multi-byte UTF-8 sequence split across chunk boundaries is only decoded
+/// once all of its bytes have arrived. Non-data and unparseable lines are
+/// skipped.
+fn drain_lines(buf: &mut Vec<u8>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+        let line = String::from_utf8_lossy(&line_bytes);
+        let line = line.trim_end();
+        if let Some(data) = line.strip_prefix("data: ") {
+            if let Ok(v) = serde_json::from_str::<Value>(data) {
+                out.push(v);
+            }
+        }
+    }
+    out
 }
 
 const SPAWN_TIMEOUT_MS: u64 = 30_000;
@@ -254,5 +275,40 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ev["kind"], "notice");
+    }
+
+    /// A multi-byte UTF-8 char (emoji, 4 bytes) split across two reqwest
+    /// chunks must survive intact — not get replaced with U+FFFD by
+    /// per-chunk lossy decoding.
+    #[test]
+    fn drain_lines_reassembles_utf8_split_across_chunks() {
+        let payload = json!({"kind": "notice", "text": "hello 🎉 world"});
+        let line = format!("data: {}\n", payload);
+        let bytes = line.into_bytes();
+        // Split the buffer mid-sequence, inside the 4-byte emoji encoding,
+        // so neither half is valid UTF-8 on its own.
+        let emoji_pos = bytes
+            .windows(4)
+            .position(|w| w == "🎉".as_bytes())
+            .expect("emoji bytes present in payload");
+        let split_at = emoji_pos + 2; // land inside the 4-byte sequence
+
+        let mut buf: Vec<u8> = Vec::new();
+        // First chunk: ends mid-character. No complete line yet, so no
+        // events should be produced (and no premature lossy decode).
+        buf.extend_from_slice(&bytes[..split_at]);
+        let first = drain_lines(&mut buf);
+        assert!(first.is_empty(), "no newline yet, nothing should drain");
+
+        // Second chunk: completes the character and the line.
+        buf.extend_from_slice(&bytes[split_at..]);
+        let events = drain_lines(&mut buf);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["text"], "hello 🎉 world");
+        assert!(
+            !events[0]["text"].as_str().unwrap().contains('\u{FFFD}'),
+            "multi-byte char must not be corrupted into U+FFFD"
+        );
     }
 }
