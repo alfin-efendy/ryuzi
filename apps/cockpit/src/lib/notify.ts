@@ -123,7 +123,7 @@ export function badgeCountFor(
 
 let permissionChecked = false;
 let cachedGranted = false;
-async function ensurePermission(): Promise<boolean> {
+export async function ensurePermission(): Promise<boolean> {
   if (permissionChecked) return cachedGranted;
   permissionChecked = true;
   try {
