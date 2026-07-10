@@ -7,8 +7,14 @@ use ryuzi_core::daemon::{build_daemon, BuildDaemonOpts, Daemon};
 use ryuzi_core::daemon_status::{clear_status, write_status, DaemonFileState, DaemonStatusFile};
 use ryuzi_core::settings::SettingsStore;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const DEFAULT_CONTROL_PORT: u16 = 4483;
+
+/// How long the daemon gets to build and start before this process gives up
+/// and reports a "timed out connecting" error — mirrors `ryuzi-cli`'s
+/// `daemon_cmd::CONNECT_TIMEOUT_MS`.
+const CONNECT_TIMEOUT_MS: u64 = 30_000;
 
 pub fn run() -> i32 {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -51,11 +57,15 @@ async fn run_inner() -> i32 {
     let opts = BuildDaemonOpts {
         db_path,
         adapter: Box::new(|| {
+            let mut env = Vec::new();
+            if let Some(cli) = crate::resolve_claude_code_executable() {
+                env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
+            }
             let (command, args) = crate::resolve_acp_adapter()?;
             Ok(ryuzi_core::AcpAdapterDescriptor {
                 command,
                 args,
-                env: vec![],
+                env,
                 env_remove: vec!["CLAUDECODE".to_string()],
             })
         }),
@@ -64,12 +74,27 @@ async fn run_inner() -> i32 {
         extra_harness_factories: vec![],
     };
 
-    let daemon = match build_daemon(opts).await {
-        Ok(d) => match d.start().await {
-            Ok(()) => std::sync::Arc::new(d),
-            Err(e) => return fail(&dir, pid, started_at, version, &e.to_string()),
-        },
-        Err(e) => return fail(&dir, pid, started_at, version, &e.to_string()),
+    let daemon = match tokio::time::timeout(Duration::from_millis(CONNECT_TIMEOUT_MS), async {
+        let d = build_daemon(opts).await?;
+        // `Daemon::start`'s own rollback already unwinds any gateway it
+        // managed to start before hitting the one that failed, so no extra
+        // stop() is needed on this branch.
+        d.start().await?;
+        Ok::<Daemon, anyhow::Error>(d)
+    })
+    .await
+    {
+        Ok(Ok(d)) => std::sync::Arc::new(d),
+        Ok(Err(e)) => return fail(&dir, pid, started_at, version, &e.to_string()),
+        Err(_elapsed) => {
+            return fail(
+                &dir,
+                pid,
+                started_at,
+                version,
+                &format!("timed out connecting after {CONNECT_TIMEOUT_MS}ms"),
+            )
+        }
     };
 
     // The daemon has already started (gateways claimed, reconcile() may have
@@ -121,8 +146,8 @@ async fn run_inner() -> i32 {
     println!("engine-daemon: running on 127.0.0.1:{bound}");
 
     // Signal-driven shutdown (mirror daemon_cmd's shape, without the updater).
-    let dir2 = dir.clone();
-    let d2 = daemon.clone();
+    // Nothing is spawned here, so `daemon`/`dir` can be used directly instead
+    // of cloning them for a separate task.
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -137,8 +162,8 @@ async fn run_inner() -> i32 {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-    d2.stop().await;
-    clear_status(&dir2);
+    daemon.stop().await;
+    clear_status(&dir);
     0
 }
 

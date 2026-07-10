@@ -153,7 +153,7 @@ fn sdk_platform_package(os: &str, arch: &str) -> String {
 ///
 /// Returns None when nothing is found — the adapter then falls back to its
 /// own resolution, which works when it runs un-compiled under bun/node.
-fn resolve_claude_code_executable() -> Option<String> {
+pub(crate) fn resolve_claude_code_executable() -> Option<String> {
     // 1. Operator-provided override — the child inherits it either way, so
     // don't shadow it with our own resolution.
     if std::env::var_os("CLAUDE_CODE_EXECUTABLE").is_some() {
