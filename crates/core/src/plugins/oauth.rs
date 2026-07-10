@@ -430,6 +430,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_falls_back_past_a_2xx_invalid_json_path_inserted_document() {
+        use axum::{response::Html, routing::get, Json, Router};
+        // Path-inserted candidate responds 200 but with a body that isn't
+        // RFC 8414 JSON at all (e.g. a vendor's HTML error/landing page) —
+        // "first 2xx-with-VALID-JSON wins" must keep going to the root form
+        // rather than treating this 2xx as the winner and bailing.
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server/v1/mcp/authv2",
+                get(|| async { Html("<html><body>not json</body></html>") }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "authorization_endpoint": "https://vendor.test/authorize",
+                        "token_endpoint": "https://vendor.test/token"
+                    }))
+                }),
+            );
+        let base = serve(app).await;
+        let http = reqwest::Client::new();
+        let metadata = discover_oauth_server_metadata(&http, &format!("{base}/v1/mcp/authv2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.authorization_endpoint,
+            "https://vendor.test/authorize"
+        );
+        assert_eq!(metadata.token_endpoint, "https://vendor.test/token");
+    }
+
+    #[tokio::test]
     async fn discovery_fails_when_both_forms_404() {
         use axum::Router;
         let base = serve(Router::new()).await;
