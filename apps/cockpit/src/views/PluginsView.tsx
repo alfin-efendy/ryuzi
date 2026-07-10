@@ -1,18 +1,22 @@
 import { useEffect, useState } from "react";
-import { Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { CircleAlert, MonitorUp, Pin, PinOff, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { toast } from "sonner";
 import { Badge, Button, Combobox, Segmented, SettingsCard as Card } from "@ryuzi/ui";
-import type { AppInfo, PluginInfo } from "@/bindings";
+import { commands, type AppInfo, type PluginInfo } from "@/bindings";
 import { Chip, IconChip, Pill, PluginStatusBadge, StatusDot } from "@/components/common/bits";
+import { DoctorPanel } from "@/components/DoctorPanel";
 import { useApps } from "@/store-apps";
 import { useGateways } from "@/store-gateways";
-import { browsePlugins, installedPlugins, usePlugins } from "@/store-plugins";
+import { browsePlugins, installedPlugins, summarizeUpdateAll, usePlugins } from "@/store-plugins";
 import { useSkills } from "@/store-skills";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { AddAppModal } from "@/components/modals/AddAppModal";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
-import { AddSkillSourceModal } from "@/components/modals/AddSkillSourceModal";
 import { InstallWizardModal } from "@/components/modals/InstallWizardModal";
+import { SkillInstallModal } from "@/components/modals/SkillInstallModal";
 import { useNav } from "@/store-nav";
+
+const WARN = "#F59E0B";
 
 type PluginsTab = "installed" | "browse";
 
@@ -64,12 +68,23 @@ function InstalledPluginCard({
   plugin,
   onOpen,
   onUninstall,
+  onUpdate,
+  onTogglePin,
+  pinned,
+  attachFailed,
+  updating,
 }: {
   plugin: PluginInfo;
   onOpen: (() => void) | null;
   onUninstall: () => void;
+  onUpdate: () => void;
+  onTogglePin: () => void;
+  pinned: boolean;
+  attachFailed: boolean;
+  updating: boolean;
 }) {
   const Icon = pluginIcon(plugin.icon);
+  const isSkillPack = plugin.kind === "skill-pack";
   return (
     <Card className="flex flex-col gap-3 px-[18px] py-4">
       <div className="flex items-start gap-3">
@@ -82,12 +97,35 @@ function InstalledPluginCard({
         </span>
         <Badge variant="outline">{plugin.kind}</Badge>
       </div>
+      {(pinned || attachFailed) && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {pinned && (
+            <Pill variant="mono">
+              <Pin aria-hidden size={9} strokeWidth={2} className="mr-1 inline align-[-1px]" />
+              Pinned
+            </Pill>
+          )}
+          {attachFailed && <Pill variant="warn">Attach failed</Pill>}
+        </div>
+      )}
       <div className="flex items-center gap-2 pt-0.5">
         <span className="flex-1" />
         {onOpen && (
           <Button variant="outline" size="sm" onClick={onOpen} aria-label={`Open ${plugin.name}`}>
             Open
           </Button>
+        )}
+        {isSkillPack && (
+          <>
+            <Button variant="outline" size="sm" onClick={onUpdate} disabled={updating} aria-label={`Update ${plugin.name}`}>
+              <RefreshCw aria-hidden size={13} strokeWidth={2} className={updating ? "animate-spin" : undefined} />
+              {updating ? "Updating…" : "Update"}
+            </Button>
+            <Button variant="outline" size="sm" onClick={onTogglePin} aria-label={`${pinned ? "Unpin" : "Pin"} ${plugin.name}`}>
+              {pinned ? <PinOff aria-hidden size={13} strokeWidth={2} /> : <Pin aria-hidden size={13} strokeWidth={2} />}
+              {pinned ? "Unpin" : "Pin"}
+            </Button>
+          </>
         )}
         <Button variant="outline" size="sm" onClick={onUninstall} aria-label={`Uninstall ${plugin.name}`}>
           <Trash2 aria-hidden size={13} strokeWidth={2} />
@@ -102,19 +140,32 @@ export function PluginsView() {
   const nav = useNav();
   const { apps, loaded, hydrate } = useApps();
   const gateways = useGateways((s) => s.gateways);
-  const { plugins, loaded: pluginsLoaded, load: loadPlugins, uninstall } = usePlugins();
+  const {
+    plugins,
+    loaded: pluginsLoaded,
+    load: loadPlugins,
+    uninstall,
+    update: updatePlugin,
+    pin: pinPlugin,
+    pinnedIds,
+    doctorFindings,
+    doctorLoaded,
+    loadDoctor,
+  } = usePlugins();
   const skills = useSkills((s) => s.skills);
   const skillsLoading = useSkills((s) => s.loading);
   const refreshSkills = useSkills((s) => s.refresh);
-  const installSkillSource = useSkills((s) => s.installSource);
   const refreshSkillPack = useSkills((s) => s.refreshSkillPack);
   const removeSkillPack = useSkills((s) => s.remove);
   const [tab, setTab] = useState<PluginsTab>("installed");
   const [category, setCategory] = useState("all");
   const [addAppOpen, setAddAppOpen] = useState(false);
-  const [addSkillOpen, setAddSkillOpen] = useState(false);
+  const [skillInstall, setSkillInstall] = useState<{ initialSource?: string } | null>(null);
   const [installingPlugin, setInstallingPlugin] = useState<PluginInfo | null>(null);
   const [connectingFamily, setConnectingFamily] = useState<string | null>(null);
+  const [updatingIds, setUpdatingIds] = useState<Set<string>>(new Set());
+  const [updatingAll, setUpdatingAll] = useState(false);
+  const [doctorOpen, setDoctorOpen] = useState(false);
 
   useEffect(() => {
     void hydrate();
@@ -125,23 +176,31 @@ export function PluginsView() {
   }, [pluginsLoaded, loadPlugins]);
 
   useEffect(() => {
+    if (!doctorLoaded) void loadDoctor();
+  }, [doctorLoaded, loadDoctor]);
+
+  useEffect(() => {
     void refreshSkills();
   }, [refreshSkills]);
 
   const browse = filterByCategory(browsePlugins(plugins), category);
   const categories = Array.from(new Set(browsePlugins(plugins).flatMap((p) => p.categories))).sort();
   const installed = installedPlugins(plugins);
+  const installedSkillPacks = installed.filter((p) => p.kind === "skill-pack");
+  const attachFailedIds = new Set(doctorFindings.filter((f) => f.kind === "attach-failed").map((f) => f.pluginId));
+  const issueCount = doctorFindings.length;
 
-  const installBusy = installingPlugin !== null || connectingFamily !== null;
+  const installBusy = installingPlugin !== null || connectingFamily !== null || skillInstall !== null;
 
   const startInstall = (plugin: PluginInfo) => {
-    if (installBusy || skillsLoading) return;
+    if (installBusy) return;
     if (plugin.kind === "provider") {
       setConnectingFamily(plugin.family ?? plugin.id);
     } else if (plugin.kind === "skill-pack") {
-      void installSkillSource(plugin.id).then((ok) => {
-        if (ok) void loadPlugins();
-      });
+      // Curated catalog packs resolve `completed: true` immediately; the
+      // trust step only ever shows up for arbitrary sources (see
+      // `SkillInstallModal`'s doc comment) — same two-phase gate either way.
+      setSkillInstall({ initialSource: plugin.id });
     } else {
       setInstallingPlugin(plugin);
     }
@@ -166,6 +225,36 @@ export function PluginsView() {
     });
   };
 
+  const runUpdate = async (plugin: PluginInfo) => {
+    if (updatingIds.has(plugin.id)) return;
+    setUpdatingIds((s) => new Set(s).add(plugin.id));
+    await updatePlugin(plugin.id, false);
+    setUpdatingIds((s) => {
+      const next = new Set(s);
+      next.delete(plugin.id);
+      return next;
+    });
+  };
+
+  const runTogglePin = (plugin: PluginInfo) => {
+    const isPinned = pinnedIds.has(plugin.id);
+    void pinPlugin(plugin.id, !isPinned, isPinned ? undefined : "Pinned from Cockpit");
+  };
+
+  const runUpdateAll = async () => {
+    if (updatingAll) return;
+    setUpdatingAll(true);
+    const res = await commands.updateAllPlugins();
+    setUpdatingAll(false);
+    if (res.status === "error") {
+      toast.error(`Update all failed: ${res.error.message}`);
+      return;
+    }
+    toast.success(`Update all — ${summarizeUpdateAll(res.data)}`);
+    await loadPlugins();
+    if (doctorLoaded) void loadDoctor();
+  };
+
   const scopeLabel = (app: AppInfo): string => {
     if (app.scope === "global") return "Global";
     const names = gateways.filter((w) => app.scopeGateways.includes(w.id)).map((w) => w.name);
@@ -185,7 +274,7 @@ export function PluginsView() {
               Tools and MCP servers your agents can call — attached to every session they're allowed in.
             </p>
           </div>
-          <Button variant="outline" onClick={() => setAddSkillOpen(true)}>
+          <Button variant="outline" onClick={() => setSkillInstall({})}>
             <Sparkles aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             Add skill source
           </Button>
@@ -193,6 +282,23 @@ export function PluginsView() {
             <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             Add MCP server
           </Button>
+        </div>
+
+        <div className="mb-3 flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void runUpdateAll()}
+            disabled={updatingAll || installedSkillPacks.length === 0}
+          >
+            <MonitorUp aria-hidden size={13} strokeWidth={2} className={updatingAll ? "animate-spin" : undefined} />
+            {updatingAll ? "Updating…" : "Update all"}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setDoctorOpen(true)}>
+            <CircleAlert aria-hidden size={13} strokeWidth={2} style={issueCount > 0 ? { color: WARN } : undefined} />
+            {issueCount > 0 ? `${issueCount} issue${issueCount === 1 ? "" : "s"}` : "Doctor: OK"}
+          </Button>
+          <span className="flex-1" />
         </div>
 
         <div className="mb-4">
@@ -249,6 +355,11 @@ export function PluginsView() {
                   plugin={plugin}
                   onOpen={openInstalled(plugin)}
                   onUninstall={() => uninstallPlugin(plugin)}
+                  onUpdate={() => void runUpdate(plugin)}
+                  onTogglePin={() => runTogglePin(plugin)}
+                  pinned={pinnedIds.has(plugin.id)}
+                  attachFailed={attachFailedIds.has(plugin.id)}
+                  updating={updatingIds.has(plugin.id)}
                 />
               ))}
             </div>
@@ -325,11 +436,13 @@ export function PluginsView() {
         )}
       </div>
       {addAppOpen && <AddAppModal onClose={() => setAddAppOpen(false)} />}
-      {addSkillOpen && (
-        <AddSkillSourceModal
+      {skillInstall && (
+        <SkillInstallModal
+          initialSource={skillInstall.initialSource}
           onClose={() => {
-            setAddSkillOpen(false);
+            setSkillInstall(null);
             void loadPlugins();
+            void refreshSkills();
           }}
         />
       )}
@@ -349,6 +462,7 @@ export function PluginsView() {
         }}
         family={connectingFamily ?? ""}
       />
+      {doctorOpen && <DoctorPanel onClose={() => setDoctorOpen(false)} />}
     </div>
   );
 }

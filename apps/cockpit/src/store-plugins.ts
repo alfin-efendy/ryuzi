@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, type PluginInfo } from "./bindings";
+import { commands, type DoctorFinding, type PluginInfo } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
 // embedded catalog, or user-authored — and this store mirrors the flattened
@@ -9,19 +9,61 @@ import { commands, type PluginInfo } from "./bindings";
 type PluginsState = {
   plugins: PluginInfo[];
   loaded: boolean;
+  /** Whether an install/update since app start needs a restart to apply. */
+  restartRequired: boolean;
+  /** `plugin_doctor` findings, cached so the Installed grid, the plugin
+   *  detail attach-failure banner, and `DoctorPanel` all read the same
+   *  snapshot instead of triggering their own redundant fetches. */
+  doctorFindings: DoctorFinding[];
+  doctorLoaded: boolean;
+  /** Packs pinned this session. `PluginInfo`/`PluginDetail` carry no
+   *  persisted `pinned` boolean today (see store-plugins.test.ts and the
+   *  Task 11 report for the gap) — this is an optimistic, session-only
+   *  mirror of `pin()` calls, not a value read back from the engine. */
+  pinnedIds: Set<string>;
   load: () => Promise<void>;
+  loadDoctor: () => Promise<void>;
   setEnabled: (id: string, on: boolean) => Promise<void>;
   uninstall: (id: string) => Promise<boolean>;
+  update: (id: string, force: boolean) => Promise<void>;
+  pin: (id: string, pinned: boolean, reason?: string) => Promise<void>;
 };
+
+/** `update_all_plugins`'s outcome summary, shared so the store action and any
+ *  ad hoc caller (Update-all button) report the same counts. */
+export function summarizeUpdateAll(entries: { id: string; outcome: { kind: string; detail?: unknown } }[]): string {
+  const updated = entries.filter((e) => e.outcome.kind === "updated").length;
+  const failed = entries.filter((e) => e.outcome.kind === "failed").length;
+  const needsReack = entries.filter((e) => e.outcome.kind === "needsReack").length;
+  const parts = [`${updated} updated`];
+  if (needsReack > 0) parts.push(`${needsReack} need re-review`);
+  if (failed > 0) parts.push(`${failed} failed`);
+  return parts.join(", ");
+}
 
 export const usePlugins = create<PluginsState>((set, get) => ({
   plugins: [],
   loaded: false,
+  restartRequired: false,
+  doctorFindings: [],
+  doctorLoaded: false,
+  pinnedIds: new Set(),
 
   load: async () => {
     const res = await commands.listPlugins();
     if (res.status === "ok") set({ plugins: res.data, loaded: true });
     else toast.error(`Plugin list failed: ${res.error.message}`);
+
+    // Best-effort: a failure here shouldn't block the plugin list itself, so
+    // it's silently skipped (the restart banner just stays as it was).
+    const restartRes = await commands.pluginsRestartRequired();
+    if (restartRes.status === "ok") set({ restartRequired: restartRes.data });
+  },
+
+  loadDoctor: async () => {
+    const res = await commands.pluginDoctor();
+    if (res.status === "ok") set({ doctorFindings: res.data, doctorLoaded: true });
+    else toast.error(`Doctor check failed: ${res.error.message}`);
   },
 
   setEnabled: async (id, on) => {
@@ -42,6 +84,50 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     }
     set({ plugins: res.data, loaded: true });
     return true;
+  },
+
+  update: async (id, force) => {
+    const res = await commands.updatePlugin(id, force);
+    if (res.status === "error") {
+      toast.error(`Update failed: ${res.error.message}`);
+    } else {
+      switch (res.data.kind) {
+        case "updated":
+          toast.success("Plugin updated");
+          break;
+        case "alreadyCurrent":
+          toast.info("Already up to date");
+          break;
+        case "skippedPinned":
+          toast.info("Skipped — plugin is pinned");
+          break;
+        case "localEdits":
+          toast.warning("Skipped — local edits detected on disk");
+          break;
+        case "failed":
+          toast.error(`Update failed: ${res.data.detail}`);
+          break;
+        case "needsReack":
+          toast.warning("This update adds hook scripts — reinstall the source to review and accept them.");
+          break;
+      }
+    }
+    await get().load();
+    if (get().doctorLoaded) await get().loadDoctor();
+  },
+
+  pin: async (id, pinned, reason) => {
+    const res = await commands.setPluginPin(id, pinned, reason ?? null);
+    if (res.status === "error") {
+      toast.error(`Pin update failed: ${res.error.message}`);
+      return;
+    }
+    const next = new Set(get().pinnedIds);
+    if (pinned) next.add(id);
+    else next.delete(id);
+    set({ pinnedIds: next });
+    toast.success(pinned ? "Pinned" : "Unpinned");
+    await get().load();
   },
 }));
 

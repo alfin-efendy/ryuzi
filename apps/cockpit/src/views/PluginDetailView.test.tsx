@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { PluginDetail } from "@/bindings";
+import type { DoctorFinding, PluginDetail } from "@/bindings";
 
 // The view fetches straight from `commands.pluginDetail` (bypassing the
 // `usePlugins` list store, which only carries the flattened `PluginInfo`)
@@ -101,6 +101,31 @@ const sandboxDetail: PluginDetail = {
   publisher: "Vercel (no MCP surface)",
 };
 
+const skillPackDetail: PluginDetail = {
+  info: {
+    id: "acme-pack",
+    name: "Acme Pack",
+    description: "A skill pack installed from a git source.",
+    icon: "sparkles",
+    categories: ["skills"],
+    verified: false,
+    experimental: false,
+    enabled: true,
+    source: "skill-pack",
+    capabilities: [],
+    configured: false,
+    kind: "skill-pack",
+    installed: true,
+    family: null,
+  },
+  auth: null,
+  settings: [],
+  mcp: [],
+  models: [],
+  homepage: null,
+  publisher: "acme/pack",
+};
+
 const oauthDetail: PluginDetail = {
   info: {
     id: "acme-oauth",
@@ -144,6 +169,7 @@ const pluginDetail = mock((id: string) => {
   if (id === "ollama") return ok(ollamaDetail);
   if (id === "acme-oauth") return ok(oauthDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
+  if (id === "acme-pack") return ok(skillPackDetail);
   return err("unknown plugin");
 });
 const setPluginEnabled = mock((_id: string, _enabled: boolean) => ok(null));
@@ -158,6 +184,11 @@ const beginPluginOauth = mock((_pluginId: string) =>
 const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken: string) => ok(oauthDetail.auth));
 const disconnectPluginOauth = mock((_pluginId: string) => ok({ ...oauthDetail.auth, configured: false, oauthTokenStored: false }));
 const listPlugins = mock(() => ok([]));
+const pluginsRestartRequired = mock(() => ok(false));
+let doctorFindingsFixture: DoctorFinding[] = [];
+const pluginDoctor = mock(() => ok(doctorFindingsFixture));
+const updatePlugin = mock((_id: string, _force: boolean) => ok({ kind: "updated" as const }));
+const setPluginPin = mock((_id: string, _pinned: boolean, _reason: string | null) => ok(null));
 const openUrl = mock(async (_url: string) => {});
 const pluginOauthAuthorizeUrlMsgListen = mock(
   async (_cb: (event: { payload: { pluginId: string; authorizeUrl: string } }) => void) => () => {},
@@ -189,9 +220,17 @@ mock.module("@/bindings", () => ({
     completePluginOauth,
     disconnectPluginOauth,
     listPlugins,
+    pluginsRestartRequired,
+    pluginDoctor,
+    updatePlugin,
+    setPluginPin,
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
+
+// happy-dom doesn't implement `scrollIntoView` — stub it so the attach-failure
+// banner's "Configure" click doesn't throw.
+Element.prototype.scrollIntoView = mock(() => {});
 
 const { PluginDetailView } = await import("@/views/PluginDetailView");
 const { usePlugins } = await import("@/store-plugins");
@@ -207,13 +246,32 @@ beforeEach(() => {
   pluginOauthCompletedMsgListen.mockClear();
   oauthCompletedListener = null;
   listPlugins.mockClear();
+  pluginsRestartRequired.mockClear();
+  pluginDoctor.mockClear();
+  updatePlugin.mockClear();
+  setPluginPin.mockClear();
+  doctorFindingsFixture = [];
   openUrl.mockClear();
-  usePlugins.setState({ plugins: [], loaded: false });
+  usePlugins.setState({
+    plugins: [],
+    loaded: false,
+    restartRequired: false,
+    doctorFindings: [],
+    doctorLoaded: false,
+    pinnedIds: new Set(),
+  });
 });
 
 afterEach(() => {
   cleanup();
-  usePlugins.setState({ plugins: [], loaded: false });
+  usePlugins.setState({
+    plugins: [],
+    loaded: false,
+    restartRequired: false,
+    doctorFindings: [],
+    doctorLoaded: false,
+    pinnedIds: new Set(),
+  });
 });
 
 test("renders identity, about, and category/status badges from the manifest detail", async () => {
@@ -333,4 +391,59 @@ test("pluginOauthCompletedMsg for another plugin is ignored", async () => {
   });
 
   expect(pluginDetail).toHaveBeenCalledTimes(1);
+});
+
+test("skill-pack plugins show Update and Pin actions that call updatePlugin/setPluginPin", async () => {
+  render(<PluginDetailView id="acme-pack" />);
+  await screen.findByText("Acme Pack");
+
+  fireEvent.click(screen.getByRole("button", { name: "Update" }));
+  await waitFor(() => expect(updatePlugin).toHaveBeenCalledWith("acme-pack", false));
+
+  fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+  await waitFor(() => expect(setPluginPin).toHaveBeenCalledWith("acme-pack", true, "Pinned from Cockpit"));
+
+  // The store's `pin()` optimistically tracks the id and re-renders the
+  // pill/button once the command resolves.
+  expect(await screen.findByText("Pinned")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Unpin" })).toBeTruthy();
+});
+
+test("non-skill-pack plugins render no Update/Pin actions", async () => {
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Pin" })).toBeNull();
+});
+
+test("renders an attach-failed doctor finding as a banner with a Configure action", async () => {
+  doctorFindingsFixture = [
+    {
+      pluginId: "github",
+      severity: "warn",
+      kind: "attach-failed",
+      message: "github: authentication failed",
+      suggestedAction: "Check github's configuration",
+    },
+  ];
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  expect(await screen.findByText("Attach failed")).toBeTruthy();
+  expect(screen.getByText("github: authentication failed")).toBeTruthy();
+  expect(screen.getByText("Check github's configuration")).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+  expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+});
+
+test("omits the attach-failed banner when doctor has no finding for this plugin", async () => {
+  doctorFindingsFixture = [
+    { pluginId: "other-plugin", severity: "warn", kind: "attach-failed", message: "other failed", suggestedAction: "Check other" },
+  ];
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  expect(screen.queryByText("Attach failed")).toBeNull();
 });

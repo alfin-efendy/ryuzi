@@ -99,6 +99,7 @@ const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken:
 const setPluginSetting = mock((_key: string, _value: string) => ok(null));
 const setPluginEnabled = mock((_id: string, _enabled: boolean) => ok(null));
 const listPlugins = mock(() => ok([]));
+const pluginsRestartRequired = mock(() => ok(false));
 const openUrl = mock(async (_url: string) => {});
 const toastError = mock((_message: string) => {});
 
@@ -124,6 +125,7 @@ mock.module("@/bindings", () => ({
     setPluginSetting,
     setPluginEnabled,
     listPlugins,
+    pluginsRestartRequired,
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
@@ -157,16 +159,31 @@ beforeEach(() => {
   setPluginSetting.mockClear();
   setPluginEnabled.mockClear();
   listPlugins.mockClear();
+  pluginsRestartRequired.mockClear();
   openUrl.mockClear();
   toastError.mockClear();
   pluginOauthCompletedMsgListen.mockClear();
   onClose.mockClear();
-  usePlugins.setState({ plugins: [], loaded: false });
+  usePlugins.setState({
+    plugins: [],
+    loaded: false,
+    restartRequired: false,
+    doctorFindings: [],
+    doctorLoaded: false,
+    pinnedIds: new Set(),
+  });
 });
 
 afterEach(() => {
   cleanup();
-  usePlugins.setState({ plugins: [], loaded: false });
+  usePlugins.setState({
+    plugins: [],
+    loaded: false,
+    restartRequired: false,
+    doctorFindings: [],
+    doctorLoaded: false,
+    pinnedIds: new Set(),
+  });
 });
 
 test("calls beginPluginInstall on mount and shows the checking spinner", async () => {
