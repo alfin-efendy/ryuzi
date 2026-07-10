@@ -1,3 +1,4 @@
+use crate::domain::ApprovalResponse;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::sync::oneshot;
@@ -6,7 +7,7 @@ use tokio::sync::oneshot;
 /// the owning session, so a session-wide stop can deny everything it parked.
 struct Pending {
     session_pk: Option<String>,
-    tx: oneshot::Sender<bool>,
+    tx: oneshot::Sender<ApprovalResponse>,
 }
 
 /// Shared registry of pending tool-permission requests. The ACP permission
@@ -23,7 +24,7 @@ impl ApprovalHub {
         }
     }
 
-    pub fn register(&self, request_id: String) -> oneshot::Receiver<bool> {
+    pub fn register(&self, request_id: String) -> oneshot::Receiver<ApprovalResponse> {
         self.register_inner(None, request_id)
     }
 
@@ -33,7 +34,7 @@ impl ApprovalHub {
         &self,
         session_pk: &str,
         request_id: String,
-    ) -> oneshot::Receiver<bool> {
+    ) -> oneshot::Receiver<ApprovalResponse> {
         self.register_inner(Some(session_pk.to_string()), request_id)
     }
 
@@ -41,7 +42,7 @@ impl ApprovalHub {
         &self,
         session_pk: Option<String>,
         request_id: String,
-    ) -> oneshot::Receiver<bool> {
+    ) -> oneshot::Receiver<ApprovalResponse> {
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
@@ -51,13 +52,19 @@ impl ApprovalHub {
     }
 
     /// Returns true if a pending request with this id existed.
-    pub fn resolve(&self, request_id: &str, allow: bool) -> bool {
+    pub fn resolve(&self, request_id: &str, response: ApprovalResponse) -> bool {
         if let Some(p) = self.pending.lock().unwrap().remove(request_id) {
-            let _ = p.tx.send(allow);
+            let _ = p.tx.send(response);
             true
         } else {
             false
         }
+    }
+
+    /// Binary convenience for callers that only know allow/deny (CLI y/N,
+    /// gateway fan-out, cancellation cleanup).
+    pub fn resolve_bool(&self, request_id: &str, allow: bool) -> bool {
+        self.resolve(request_id, ApprovalResponse::once(allow))
     }
 
     /// Resolve every pending approval registered for `session_pk` (see
@@ -72,7 +79,7 @@ impl ApprovalHub {
             .collect();
         for id in &ids {
             if let Some(p) = pending.remove(id) {
-                let _ = p.tx.send(allow);
+                let _ = p.tx.send(ApprovalResponse::once(allow));
             }
         }
         ids.len()
@@ -100,10 +107,10 @@ mod tests {
     async fn register_then_resolve_completes_the_receiver() {
         let hub = ApprovalHub::new();
         let rx = hub.register("req-1".into());
-        assert!(hub.resolve("req-1", true));
-        assert!(rx.await.unwrap());
+        assert!(hub.resolve_bool("req-1", true));
+        assert!(rx.await.unwrap().allowed());
         // resolving an unknown id returns false
-        assert!(!hub.resolve("nope", true));
+        assert!(!hub.resolve_bool("nope", true));
     }
 
     #[tokio::test]
@@ -115,16 +122,46 @@ mod tests {
         let rx_plain = hub.register("req-4".into());
 
         assert_eq!(hub.resolve_session("sess-a", false), 2);
-        assert!(!rx_a.await.unwrap());
-        assert!(!rx_b.await.unwrap());
+        assert!(!rx_a.await.unwrap().allowed());
+        assert!(!rx_b.await.unwrap().allowed());
 
         // sess-b and the unscoped (ACP-path) registration are untouched.
-        assert!(hub.resolve("req-3", true));
-        assert!(rx_c.await.unwrap());
-        assert!(hub.resolve("req-4", true));
-        assert!(rx_plain.await.unwrap());
+        assert!(hub.resolve_bool("req-3", true));
+        assert!(rx_c.await.unwrap().allowed());
+        assert!(hub.resolve_bool("req-4", true));
+        assert!(rx_plain.await.unwrap().allowed());
 
         // Nothing left for a second sweep.
         assert_eq!(hub.resolve_session("sess-a", false), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_carries_a_structured_response() {
+        use crate::domain::{ApprovalDecision, ApprovalResponse, ApprovalScope};
+        let hub = ApprovalHub::new();
+        let rx = hub.register("req-s".into());
+        assert!(hub.resolve(
+            "req-s",
+            ApprovalResponse {
+                decision: ApprovalDecision::AllowAlways,
+                scope: Some(ApprovalScope::Project),
+                payload: Some(serde_json::json!({"mode": "acceptEdits"})),
+            },
+        ));
+        let got = rx.await.unwrap();
+        assert_eq!(got.decision, ApprovalDecision::AllowAlways);
+        assert_eq!(got.scope, Some(ApprovalScope::Project));
+        assert!(got.allowed());
+    }
+
+    #[tokio::test]
+    async fn resolve_bool_maps_to_once_decisions() {
+        use crate::domain::ApprovalDecision;
+        let hub = ApprovalHub::new();
+        let rx = hub.register("req-b".into());
+        assert!(hub.resolve_bool("req-b", false));
+        let got = rx.await.unwrap();
+        assert_eq!(got.decision, ApprovalDecision::RejectOnce);
+        assert!(!got.allowed());
     }
 }
