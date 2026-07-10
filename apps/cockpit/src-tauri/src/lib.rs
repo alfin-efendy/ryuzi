@@ -11,7 +11,6 @@ mod gateways_cmd;
 mod native_cmd;
 mod open_cmd;
 mod plugins_cmd;
-mod registry_cmd;
 mod runtimes_cmd;
 mod scheduler_cmd;
 mod session_io;
@@ -307,7 +306,6 @@ fn make_builder() -> Builder<tauri::Wry> {
             apps_cmd::update_app_scope,
             apps_cmd::set_app_tool_perm,
             apps_cmd::toggle_app_agent,
-            registry_cmd::registry_search,
             fsview_cmd::list_dir,
             fsview_cmd::session_workdir,
             fsview_cmd::worktree_dirty,
