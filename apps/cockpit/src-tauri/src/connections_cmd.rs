@@ -539,7 +539,7 @@ pub async fn test_connection(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<
             message: e.to_string(),
         })?;
     let result = match models::fetch_connection_models(cp.store(), &client, desc, &mut row).await {
-        Ok((status, discovered)) => {
+        Ok((status, discovered, _metadata)) => {
             if status.is_success() && !discovered.is_empty() {
                 row.data.models_override = Some(discovered);
                 row.updated_at = ryuzi_core::paths::now_ms();

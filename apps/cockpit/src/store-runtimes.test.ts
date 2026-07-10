@@ -14,6 +14,7 @@ function makeRuntime(overrides: Partial<RuntimeInfo> = {}): RuntimeInfo {
     latestVersion: null,
     npmPackage: null,
     models: ["anthropic/claude-opus-4"],
+    selectableModels: [],
     enabled: true,
     model: "anthropic/claude-opus-4",
     permMode: "ask",

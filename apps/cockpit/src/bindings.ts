@@ -162,6 +162,30 @@ async updateProject(projectId: string, model: string | null, permMode: PermMode,
     else return { status: "error", error: e  as any };
 }
 },
+async setModelEffortPreference(key: ModelPreferenceKey, effort: string | null) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_model_effort_preference", { key, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async projectRuntimeInfo(projectId: string) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("project_runtime_info", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProjectRuntime(projectId: string, model: string | null, effort: string | null) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project_runtime", { projectId, model, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listBranches(projectId: string) : Promise<Result<BranchList, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_branches", { projectId }) };
@@ -1290,6 +1314,7 @@ export type CoreEventMsg = { event: CoreEvent }
  */
 export type DeviceFlowInfo = { flowId: string; userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number; interval: number }
 export type DirEntryInfo = { name: string; dir: boolean }
+export type EffectiveEffortSource = "project" | "routeCompatibility" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
 export type GatewayEventInfo = { at: number; level: string; text: string }
@@ -1341,6 +1366,8 @@ export type MediaFile = { dataBase64: string; contentType: string | null }
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
  */
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
+export type ModelDefaultSource = "configured" | "provider" | "variesByTarget" | "none"
+export type ModelPreferenceKey = { family: string; model: string }
 export type ModelRouteInfo = { id: string; name: string; enabled: boolean; strategy: ModelRouteStrategy; targets: ModelRouteTarget[]; createdAt: number; updatedAt: number }
 export type ModelRouteStrategy = "fallback" | "round-robin"
 export type ModelRouteTarget = { 
@@ -1349,7 +1376,12 @@ export type ModelRouteTarget = {
  * connection id. The router expands this to every enabled account in
  * the family serving `model`, at request time.
  */
-provider: string; model: string }
+provider: string; model: string; 
+/**
+ * Compatibility-only storage for legacy Codex virtual model suffixes.
+ * New route writes cannot edit this value directly.
+ */
+effort?: string | null }
 /**
  * One persisted probe verdict row across ALL families — hydrates the
  * app-wide model-status store consumed by every model picker.
@@ -1456,9 +1488,11 @@ export type Project = { projectId: string; name: string; workdir: string; source
  * NOT a DB column. Self-corrects if the user later runs `git init`.
  */
 isGit: boolean }
+export type ProjectRuntimeInfo = { projectId: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
+export type ReasoningEffortOption = { value: string; label: string; description: string | null }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
@@ -1466,12 +1500,14 @@ export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; con
  * False for runtimes without an F1 handler (gemini, ollama).
  */
 supported: boolean }
-export type RuntimeInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
+export type RuntimeInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; selectableModels: SelectableModelInfo[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
 /**
  * Whether Cockpit has a session harness for this agent today.
  */
 runnable: boolean }
 export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
+export type SelectableModelInfo = { kind: SelectableModelKind; requestValue: string; displayName: string; preferenceKey: ModelPreferenceKey | null; supported: ReasoningEffortOption[]; configuredDefault: string | null; resolvedDefault: string | null; defaultSource: ModelDefaultSource }
+export type SelectableModelKind = "concrete" | "namedRoute"
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
 /**
  * True when the engine auto-generated the branch name (`harness/{short}`).
@@ -1480,6 +1516,7 @@ export type Session = { sessionPk: string; projectId: string; agentSessionId: st
  */
 branchOwned: boolean }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
+export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 
 /**

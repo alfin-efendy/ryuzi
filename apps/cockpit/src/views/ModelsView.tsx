@@ -383,7 +383,7 @@ function newRoute(targets: TargetOption[]): ModelRouteInfo {
     name: "",
     enabled: true,
     strategy: "fallback",
-    targets: first ? [{ provider: first.provider, model: first.model }] : [],
+    targets: first ? [{ provider: first.provider, model: first.model, effort: null }] : [],
     createdAt: 0,
     updatedAt: 0,
   };
@@ -421,7 +421,9 @@ function RouteForm({
     if (!option) return;
     setDraft((current) => ({
       ...current,
-      targets: current.targets.map((target, i) => (i === index ? { provider: option.provider, model: option.model } : target)),
+      targets: current.targets.map((target, i) =>
+        i === index ? { provider: option.provider, model: option.model, effort: null } : target,
+      ),
     }));
   };
 
@@ -430,7 +432,7 @@ function RouteForm({
     if (!option) return;
     setDraft((current) => ({
       ...current,
-      targets: [...current.targets, { provider: option.provider, model: option.model }],
+      targets: [...current.targets, { provider: option.provider, model: option.model, effort: null }],
     }));
   };
 

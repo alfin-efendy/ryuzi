@@ -1,6 +1,10 @@
 use crate::error::CmdError;
 use ryuzi_core::branches::BranchList;
 use ryuzi_core::domain::{AttachmentRef, ToolPolicyRow};
+use ryuzi_core::llm_router::model_effort::{
+    EffectiveEffortSource, ModelDefaultSource, ModelPreferenceKey, ProjectRuntimeInfo,
+    StoredEffortStatus,
+};
 use ryuzi_core::{
     ControlPlane, Message, PermMode, Project, Session, SessionGitOptions, TurnPrompt,
 };
@@ -40,6 +44,169 @@ pub async fn update_project(
         .ok_or_else(|| CmdError {
             message: format!("unknown project: {project_id}"),
         })
+}
+
+fn clean_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn project_runtime_info_inner(
+    cp: &ControlPlane,
+    project_id: String,
+) -> R<ProjectRuntimeInfo> {
+    let project_id = project_id.trim().to_string();
+    let project = cp
+        .store()
+        .get_project(&project_id)
+        .await?
+        .ok_or_else(|| CmdError {
+            message: format!("unknown project: {project_id}"),
+        })?;
+    let model_info = match project.model.as_deref() {
+        Some(model) => ryuzi_core::llm_router::client::selectable_native_models(cp.store())
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.request_value == model),
+        None => None,
+    };
+    let stored_effort_status = match (project.effort.as_deref(), model_info.as_ref()) {
+        (None, _) => StoredEffortStatus::Valid,
+        (Some(_), None) => StoredEffortStatus::UnknownMetadata,
+        (Some(_), Some(info)) if info.supported.is_empty() => StoredEffortStatus::UnknownMetadata,
+        (Some(effort), Some(info))
+            if info.supported.iter().any(|option| option.value == effort) =>
+        {
+            StoredEffortStatus::Valid
+        }
+        (Some(_), Some(_)) => StoredEffortStatus::Unsupported,
+    };
+    let project_effort = project.effort.as_ref().filter(|effort| {
+        model_info
+            .as_ref()
+            .is_some_and(|info| info.supported.iter().any(|option| &option.value == *effort))
+    });
+    let (effective_effort, effective_source) = if let Some(effort) = project_effort {
+        (Some(effort.clone()), EffectiveEffortSource::Project)
+    } else if let Some(info) = &model_info {
+        let source = match info.default_source {
+            ModelDefaultSource::Configured => EffectiveEffortSource::Configured,
+            ModelDefaultSource::Provider => EffectiveEffortSource::Provider,
+            ModelDefaultSource::VariesByTarget | ModelDefaultSource::None => {
+                EffectiveEffortSource::None
+            }
+        };
+        (info.resolved_default.clone(), source)
+    } else {
+        (None, EffectiveEffortSource::None)
+    };
+    let effective_effort_label = effective_effort.as_ref().and_then(|value| {
+        model_info.as_ref().and_then(|info| {
+            info.supported
+                .iter()
+                .find(|option| &option.value == value)
+                .map(|option| option.label.clone())
+        })
+    });
+    Ok(ProjectRuntimeInfo {
+        project_id,
+        model: project.model,
+        stored_effort: project.effort,
+        effective_effort,
+        effective_effort_label,
+        effective_source,
+        stored_effort_status,
+        model_info,
+    })
+}
+
+async fn update_project_runtime_inner(
+    cp: &ControlPlane,
+    project_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> R<ProjectRuntimeInfo> {
+    let project_id = project_id.trim().to_string();
+    let model = clean_optional(model);
+    let effort = match effort {
+        Some(value) if value.trim().is_empty() => {
+            return Err(CmdError {
+                message: "effort cannot be empty".into(),
+            });
+        }
+        value => clean_optional(value),
+    };
+    if cp.store().get_project(&project_id).await?.is_none() {
+        return Err(CmdError {
+            message: format!("unknown project: {project_id}"),
+        });
+    }
+    if let Some(value) = effort.as_deref() {
+        let selected = ryuzi_core::llm_router::client::selectable_native_models(cp.store())
+            .await?
+            .into_iter()
+            .find(|candidate| model.as_deref() == Some(candidate.request_value.as_str()));
+        if !selected.is_some_and(|selected| {
+            selected
+                .supported
+                .iter()
+                .any(|option| option.value == value)
+        }) {
+            return Err(CmdError {
+                message: format!("effort {value:?} is not supported for the selected model"),
+            });
+        }
+    }
+    cp.store()
+        .update_project_runtime(&project_id, model, effort)
+        .await?;
+    project_runtime_info_inner(cp, project_id).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_model_effort_preference(
+    cp: State<'_, Arc<ControlPlane>>,
+    key: ModelPreferenceKey,
+    effort: Option<String>,
+) -> R<()> {
+    let key = ModelPreferenceKey {
+        family: key.family.trim().to_string(),
+        model: key.model.trim().to_string(),
+    };
+    let effort = match effort {
+        Some(value) if value.trim().is_empty() => {
+            return Err(CmdError {
+                message: "effort cannot be empty".into(),
+            });
+        }
+        value => clean_optional(value),
+    };
+    Ok(
+        ryuzi_core::llm_router::model_effort::set_preference(cp.store(), &key, effort.as_deref())
+            .await?,
+    )
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn project_runtime_info(
+    cp: State<'_, Arc<ControlPlane>>,
+    project_id: String,
+) -> R<ProjectRuntimeInfo> {
+    project_runtime_info_inner(&cp, project_id).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_project_runtime(
+    cp: State<'_, Arc<ControlPlane>>,
+    project_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> R<ProjectRuntimeInfo> {
+    update_project_runtime_inner(&cp, project_id, model, effort).await
 }
 
 #[tauri::command]
@@ -577,6 +744,47 @@ mod tests {
             got.model.as_deref(),
             Some("openrouter/qwen3:free"),
             "model:null must not clear the pinned model"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_effort_commands_trim_values_and_reject_empty_explicit_effort() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
+        cp.store()
+            .insert_project(Project {
+                project_id: "p1".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                harness: "native".into(),
+                model: None,
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+
+        let error = update_project_runtime_inner(
+            &cp,
+            " p1 ".into(),
+            Some(" model ".into()),
+            Some("   ".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("effort cannot be empty"));
+
+        let info = update_project_runtime_inner(&cp, " p1 ".into(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(info.project_id, "p1");
+        assert_eq!(
+            info.stored_effort_status,
+            ryuzi_core::llm_router::model_effort::StoredEffortStatus::Valid
         );
     }
 

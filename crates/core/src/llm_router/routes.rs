@@ -142,6 +142,30 @@ pub async fn ordered_provider_connection_ids(
         .collect())
 }
 
+pub async fn peek_provider_connection_ids(
+    store: &Store,
+    provider: &str,
+    scope: &str,
+    ids: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let route = provider_account_route(store, provider).await?;
+    if route.strategy != ModelRouteStrategy::RoundRobin || ids.len() <= 1 {
+        return Ok(ids.to_vec());
+    }
+    let key = format!("{ACCOUNT_ROUND_ROBIN_KEY_PREFIX}{provider}.{scope}");
+    let start = store
+        .get_setting(&key)
+        .await?
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0)
+        % ids.len();
+    Ok(ids[start..]
+        .iter()
+        .chain(ids[..start].iter())
+        .cloned()
+        .collect())
+}
+
 pub async fn save_model_route(
     store: &Store,
     route: ModelRouteInfo,
@@ -222,6 +246,27 @@ pub async fn ordered_targets(
     let next = (start + 1) % route.targets.len();
     store.set_setting(&key, &next.to_string()).await?;
 
+    Ok(route.targets[start..]
+        .iter()
+        .chain(route.targets[..start].iter())
+        .cloned()
+        .collect())
+}
+
+pub async fn peek_ordered_targets(
+    store: &Store,
+    route: &ModelRouteInfo,
+) -> anyhow::Result<Vec<ModelRouteTarget>> {
+    if route.strategy != ModelRouteStrategy::RoundRobin || route.targets.len() <= 1 {
+        return Ok(route.targets.clone());
+    }
+    let key = format!("{ROUND_ROBIN_KEY_PREFIX}{}", route.id);
+    let start = store
+        .get_setting(&key)
+        .await?
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0)
+        % route.targets.len();
     Ok(route.targets[start..]
         .iter()
         .chain(route.targets[..start].iter())
@@ -442,5 +487,59 @@ mod tests {
 
         assert_eq!(first, vec!["c1".to_string(), "c2".to_string()]);
         assert_eq!(second, vec!["c2".to_string(), "c1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn peek_helpers_preserve_round_robin_cursors() {
+        let store = mem_store().await;
+        save_provider_account_route(&store, "openai", ModelRouteStrategy::RoundRobin)
+            .await
+            .unwrap();
+        let ids = vec!["c1".to_string(), "c2".to_string()];
+        let mut model_route = route("smart");
+        model_route.strategy = ModelRouteStrategy::RoundRobin;
+        model_route.targets.push(ModelRouteTarget {
+            provider: "anthropic".into(),
+            model: "m2".into(),
+            effort: None,
+        });
+        let model_route = save_model_route(&store, model_route).await.unwrap();
+
+        assert_eq!(
+            peek_provider_connection_ids(&store, "openai", "gpt", &ids)
+                .await
+                .unwrap(),
+            ids
+        );
+        assert_eq!(
+            peek_provider_connection_ids(&store, "openai", "gpt", &ids)
+                .await
+                .unwrap(),
+            ids
+        );
+        assert_eq!(
+            peek_ordered_targets(&store, &model_route)
+                .await
+                .unwrap()
+                .iter()
+                .map(|target| target.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+        assert_eq!(
+            ordered_provider_connection_ids(&store, "openai", "gpt", &ids)
+                .await
+                .unwrap(),
+            ids
+        );
+        assert_eq!(
+            ordered_targets(&store, &model_route)
+                .await
+                .unwrap()
+                .iter()
+                .map(|target| target.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
     }
 }

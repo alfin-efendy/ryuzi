@@ -8,7 +8,7 @@ const route: ModelRouteInfo = {
   name: "smart",
   enabled: true,
   strategy: "fallback",
-  targets: [{ provider: "anthropic", model: "claude-opus-4" }],
+  targets: [{ provider: "anthropic", model: "claude-opus-4", effort: null }],
   createdAt: 100,
   updatedAt: 100,
 };

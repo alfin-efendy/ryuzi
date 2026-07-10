@@ -23,6 +23,7 @@ const claudeRuntime: RuntimeInfo = {
   latestVersion: "2.1.0",
   npmPackage: "@anthropic-ai/claude-code",
   models: ["claude-opus-4", "claude-sonnet-4"],
+  selectableModels: [],
   enabled: true,
   model: "sonnet",
   permMode: "ask",

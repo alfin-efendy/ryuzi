@@ -486,17 +486,11 @@ fn normalize_codex_tools(body: &mut Value) {
     });
 }
 
-/// The base model id Codex actually serves, with any `-review` / effort
-/// (`-low/-medium/-high/-xhigh/-none`) suffix removed. Used by routing so a
-/// picker entry like `gpt-5.5-high` still matches the connection's `gpt-5.5`.
+/// The base model id Codex actually serves for a canonical review identity.
+/// Legacy effort suffixes are parsed at the routing boundary, where provider
+/// identity and the connection's real model catalog are available.
 pub fn codex_base_model(model: &str) -> &str {
-    let base = model.strip_suffix("-review").unwrap_or(model);
-    for effort in ["-xhigh", "-high", "-medium", "-low", "-none"] {
-        if let Some(stripped) = base.strip_suffix(effort) {
-            return stripped;
-        }
-    }
-    base
+    model.strip_suffix("-review").unwrap_or(model)
 }
 
 pub fn codex_virtual_model_to_upstream(model: &str) -> (String, Option<&'static str>) {
@@ -841,9 +835,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_base_model_strips_effort_and_review() {
-        assert_eq!(codex_base_model("gpt-5.5-high"), "gpt-5.5");
-        assert_eq!(codex_base_model("gpt-5.2-codex-xhigh"), "gpt-5.2-codex");
+    fn codex_base_model_only_resolves_canonical_review_identity() {
+        assert_eq!(codex_base_model("gpt-5.5-high"), "gpt-5.5-high");
+        assert_eq!(
+            codex_base_model("gpt-5.2-codex-xhigh"),
+            "gpt-5.2-codex-xhigh"
+        );
         assert_eq!(codex_base_model("gpt-5.5-review"), "gpt-5.5");
         assert_eq!(codex_base_model("gpt-5.5"), "gpt-5.5");
     }

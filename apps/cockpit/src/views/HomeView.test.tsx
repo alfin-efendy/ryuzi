@@ -51,6 +51,7 @@ const nativeRuntime: RuntimeInfo = {
   latestVersion: null,
   npmPackage: null,
   models: ["anthropic/claude-opus-4", "anthropic/claude-sonnet-4"],
+  selectableModels: [],
   enabled: true,
   model: "",
   permMode: "ask",

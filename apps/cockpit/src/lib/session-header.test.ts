@@ -14,6 +14,7 @@ function runtime(model: string): RuntimeInfo {
     latestVersion: null,
     npmPackage: null,
     models: [],
+    selectableModels: [],
     enabled: true,
     model,
     permMode: "default",

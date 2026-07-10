@@ -5,6 +5,7 @@
 //! re-probes binaries and asks npm, then persists the snapshot in settings.
 
 use crate::error::CmdError;
+use ryuzi_core::llm_router::model_effort::SelectableModelInfo;
 use ryuzi_core::llm_router::{keys, server::RouterServer};
 use ryuzi_core::runtime_config::{self, ConfigStatus, EndpointInfo, RuntimeMapping};
 use ryuzi_core::runtimes::{self, RuntimeConfig};
@@ -42,6 +43,7 @@ pub struct RuntimeInfo {
     pub latest_version: Option<String>,
     pub npm_package: Option<String>,
     pub models: Vec<String>,
+    pub selectable_models: Vec<SelectableModelInfo>,
     pub enabled: bool,
     pub model: String,
     pub perm_mode: String,
@@ -98,11 +100,17 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
         };
         let detected = binary_path.is_some();
         let mut models: Vec<String> = desc.models.iter().map(|m| m.to_string()).collect();
+        let mut selectable_models = Vec::new();
         if is_native {
             // The native runtime has no fixed catalog: its selectable models
             // are the user's enabled routes + provider connections, so the
             // picker reflects what the router can actually reach today.
-            models = ryuzi_core::llm_router::client::selectable_native_models(cp.store()).await;
+            selectable_models =
+                ryuzi_core::llm_router::client::selectable_native_models(cp.store()).await?;
+            models = selectable_models
+                .iter()
+                .map(|model| model.request_value.clone())
+                .collect();
         } else if models.is_empty() {
             models = snap.local_models.clone();
         }
@@ -131,6 +139,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<RuntimeInfo>> {
             latest_version: snap.latest_version,
             npm_package: desc.npm_package.map(|s| s.to_string()),
             models,
+            selectable_models,
             // Zero-config default: detected agents start enabled.
             enabled: cfg.map(|c| c.enabled).unwrap_or(detected),
             model,

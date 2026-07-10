@@ -143,7 +143,7 @@ const routes: ModelRouteInfo[] = [
     name: "smart",
     enabled: true,
     strategy: "fallback",
-    targets: [{ provider: "openai", model: "gpt-4.1" }],
+    targets: [{ provider: "openai", model: "gpt-4.1", effort: null }],
     createdAt: 1751500800000,
     updatedAt: 1751500800000,
   },
@@ -495,7 +495,7 @@ test("route form saves targets as {provider, model} scoped to the family, not th
 
   await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
   const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
-  expect(savedRoute.targets).toEqual([{ provider: "openai", model: "gpt-4.1" }]);
+  expect(savedRoute.targets).toEqual([{ provider: "openai", model: "gpt-4.1", effort: null }]);
 });
 
 test("connection detail back returns to its provider detail", () => {
@@ -619,5 +619,7 @@ test("route target adapter round-trips a slash-containing model id (cloudflare-a
 
   await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
   const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
-  expect(savedRoute.targets).toEqual([{ provider: "cloudflare-ai", model: "@cf/meta/llama-3.1-8b-instruct" }]);
+  expect(savedRoute.targets).toEqual([
+    { provider: "cloudflare-ai", model: "@cf/meta/llama-3.1-8b-instruct", effort: null },
+  ]);
 });
