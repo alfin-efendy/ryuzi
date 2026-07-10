@@ -2354,6 +2354,34 @@ mod tests {
         assert!(uninstall(&cp, "definitely-not-a-plugin").await.is_err());
     }
 
+    // The positive skill-pack uninstall path (a real pack on disk being
+    // removed via `remove_installed_skill`) is deliberately NOT exercised
+    // here: it requires the `ryuzi_core::skills_install` install seam
+    // (`InstallRoots`, `install_skill_source_with`) which is private to the
+    // `ryuzi-core` crate and unreachable from `ryuzi-cockpit`, and the public
+    // API resolves through `InstallRoots::for_user()`, i.e. the real user
+    // skills install dir — network/git-touching and environment-dependent.
+    // That path is covered by `ryuzi_core::skills_install` unit tests plus the
+    // frontend `PluginsView` uninstall test. The cockpit-level tests below
+    // assert only the hermetic, deterministic bail paths.
+
+    #[tokio::test]
+    async fn uninstall_skill_pack_unknown_id_errors() {
+        // No skill packs installed and the id is not a registered plugin, so
+        // the not-in-host fallback resolves through `list_installed_skills()`,
+        // finds nothing, and bails.
+        let cp = test_cp().await;
+        assert!(uninstall(&cp, "definitely-not-installed-pack")
+            .await
+            .is_err());
+    }
+
+    // `uninstall_plugin` only runs `assemble_list` after a successful
+    // `uninstall`, so the unknown-id bail above propagates unchanged through
+    // the command wrapper via the `?` on `uninstall(...).await`. The wrapper
+    // itself takes a `tauri::State`, which has no hermetic constructor outside
+    // a running Tauri app, so it is not driven directly here.
+
     // ---------- begin_plugin_install resolution (steps 1-6) ----------
 
     /// Minimal hand-rolled HTTP mock on std::net (this crate has no axum —

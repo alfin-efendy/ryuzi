@@ -312,6 +312,41 @@ test("browse install routes a skill pack to installSource", async () => {
   await waitFor(() => expect(installSkill).toHaveBeenCalledWith("superpowers"));
 });
 
+test("browse skill-pack install is guarded while skills are loading", async () => {
+  pluginsFixture = [github, anthropic, superpowers];
+  await renderView();
+
+  // A skills install is already in flight: installSource sets loading:true
+  // synchronously at the start, so a rapid second click must be a no-op.
+  act(() => {
+    useSkills.setState({ loading: true });
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("superpowers");
+
+  fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
+
+  await act(async () => {});
+  expect(installSkill).not.toHaveBeenCalled();
+});
+
+test("browse skill-pack install fires when skills are not loading", async () => {
+  pluginsFixture = [github, anthropic, superpowers];
+  await renderView();
+
+  act(() => {
+    useSkills.setState({ loading: false });
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("superpowers");
+
+  fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
+
+  await waitFor(() => expect(installSkill).toHaveBeenCalledWith("superpowers"));
+});
+
 test("installed aggregates apps and installed plugins with uninstall", async () => {
   appsFixture = [githubApp];
   pluginsFixture = [notion];

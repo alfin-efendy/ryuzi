@@ -135,7 +135,7 @@ export function PluginsView() {
   const installBusy = installingPlugin !== null || connectingFamily !== null;
 
   const startInstall = (plugin: PluginInfo) => {
-    if (installBusy) return;
+    if (installBusy || skillsLoading) return;
     if (plugin.kind === "provider") {
       setConnectingFamily(plugin.family ?? plugin.id);
     } else if (plugin.kind === "skill-pack") {
