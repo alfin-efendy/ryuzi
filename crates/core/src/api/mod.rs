@@ -4,11 +4,13 @@
 //! snake_case parameter names. One submodule per command family.
 
 pub mod apps_api;
+pub mod fsview_api;
 pub mod gateways_api;
 pub mod native_api;
 pub mod scheduler_api;
 pub mod session_io_api;
 pub mod sessions;
+pub mod skills_api;
 pub mod types;
 
 use crate::serve::ApiState;
@@ -72,6 +74,8 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if apps_api::HANDLES.contains(&m) => apps_api::dispatch(state, m, p).await,
         m if native_api::HANDLES.contains(&m) => native_api::dispatch(state, m, p).await,
         m if session_io_api::HANDLES.contains(&m) => session_io_api::dispatch(state, m, p).await,
+        m if fsview_api::HANDLES.contains(&m) => fsview_api::dispatch(state, m, p).await,
+        m if skills_api::HANDLES.contains(&m) => skills_api::dispatch(state, m, p).await,
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }
