@@ -112,6 +112,12 @@ export function SessionView() {
       alive = false;
     };
   }, [session?.sessionPk]);
+  // Provider value for TranscriptFileContext — memoized so the Transcript's
+  // WorkspacePathCode instances don't all re-render on every SessionView render.
+  const transcriptFileCtx = useMemo(
+    () => (workdir && session?.sessionPk ? { sessionPk: session.sessionPk, workdir } : null),
+    [session?.sessionPk, workdir],
+  );
 
   // ArrowUp/Down history over this session's sent messages. A ref (not state)
   // holds the navigation cursor — it never drives rendering.
@@ -272,7 +278,7 @@ export function SessionView() {
         <TodoPanel sessionPk={session.sessionPk} running={running} />
 
         {/* Transcript */}
-        <TranscriptFileContext.Provider value={workdir ? { sessionPk: session.sessionPk, workdir } : null}>
+        <TranscriptFileContext.Provider value={transcriptFileCtx}>
           <Transcript
             sessionPk={session.sessionPk}
             rows={rows}

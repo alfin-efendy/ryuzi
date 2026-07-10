@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState } from "react";
-import { cn } from "@ryuzi/ui";
+import { Button, cn } from "@ryuzi/ui";
 import { joinPath, looksLikeWorkspaceFilePath, toWorkspaceRelativePath } from "@/lib/paths";
 import { workspaceFileExists } from "@/lib/file-probe";
 import { useUi } from "@/store-ui";
@@ -29,10 +29,10 @@ export function useOpenWorkspaceFile(): ((rel: string) => void) | null {
 }
 
 /** Inline code span that linkifies real workspace file paths. Renders a plain
- *  <code> until the (cached) existence probe confirms; then a native <button>
- *  styled like inline code — real button semantics give free keyboard
- *  (Enter/Space) activation and satisfy a11y linting, unlike a role="button"
- *  <code> span. */
+ *  <code> until the (cached) existence probe confirms; then a design-system
+ *  `Button` re-skinned to look like inline code — real button semantics give
+ *  free keyboard (Enter/Space) activation and satisfy a11y linting, unlike a
+ *  role="button" <code> span. */
 export function WorkspacePathCode({ text, className }: { text: string; className?: string }) {
   const ctx = useContext(TranscriptFileContext);
   const open = useOpenWorkspaceFile();
@@ -55,15 +55,16 @@ export function WorkspacePathCode({ text, className }: { text: string; className
 
   if (!ctx || candidate === null || !exists || open === null) return <code className={className}>{text}</code>;
   return (
-    <button
-      type="button"
+    <Button
+      variant="ghost"
+      size="xs"
       className={cn(
-        "cursor-pointer rounded-[4px] border border-border bg-code px-[0.35em] py-[0.1em] font-mono text-[12px] text-code-foreground underline decoration-dotted underline-offset-2",
+        "h-auto cursor-pointer rounded-[4px] border border-border bg-code px-[0.35em] py-[0.1em] font-mono text-[12px] text-code-foreground underline decoration-dotted underline-offset-2",
         className,
       )}
       onClick={() => open(candidate)}
     >
       {text}
-    </button>
+    </Button>
   );
 }
