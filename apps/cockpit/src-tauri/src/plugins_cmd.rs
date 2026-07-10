@@ -22,6 +22,7 @@ use reqwest::Url;
 use ryuzi_core::plugins::oauth::{generate_pkce_verifier, pkce_challenge_s256, PluginOauthToken};
 use ryuzi_core::plugins::providers;
 use ryuzi_core::settings::SettingsStore;
+use ryuzi_core::store::PluginOauthClient;
 use ryuzi_core::{ControlPlane, CorePlugin, PluginSource, Store};
 use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, SettingField};
 use serde::{Deserialize, Serialize};
@@ -183,25 +184,81 @@ fn plugin_oauth_requested_scopes(auth: &AuthSpec) -> Vec<String> {
     auth.scopes.clone()
 }
 
+/// The effective OAuth config after the resolution order. Endpoints:
+/// `plugin_oauth_clients` row (discovery/DCR/manual cache) → manifest.
+/// Client id: row → saved value of the manifest's `auth.client_id_setting`
+/// → for EXTERNAL OAuth plugins only, the saved `auth.setting` value
+/// (google-workspace's client id key IS its auth.setting).
+#[derive(Clone)]
+struct ResolvedPluginOauth {
+    authorize_url: Option<String>,
+    token_url: Option<String>,
+    client_id: Option<String>,
+}
+
+/// External OAuth: sign-in is brokered outside Cockpit by the child server —
+/// kind=oauth with neither an `auth.resource` to discover against nor a
+/// manifest `authorize_url` (google-workspace).
+fn is_external_oauth(auth: &AuthSpec) -> bool {
+    auth.kind == AuthKind::Oauth
+        && auth.resource.as_deref().is_none_or(str::is_empty)
+        && auth.authorize_url.as_deref().is_none_or(str::is_empty)
+}
+
+async fn resolve_plugin_oauth(
+    store: &Store,
+    plugin_id: &str,
+    auth: &AuthSpec,
+) -> anyhow::Result<ResolvedPluginOauth> {
+    let row = store.get_plugin_oauth_client(plugin_id).await?;
+    let (row_authorize, row_token, row_client) = match row {
+        Some(row) => (row.authorize_url, row.token_url, row.client_id),
+        None => (None, None, None),
+    };
+    let non_empty = |value: Option<String>| value.filter(|v| !v.is_empty());
+    let authorize_url =
+        non_empty(row_authorize).or_else(|| auth.authorize_url.clone().filter(|v| !v.is_empty()));
+    let token_url =
+        non_empty(row_token).or_else(|| auth.token_url.clone().filter(|v| !v.is_empty()));
+    let mut client_id = non_empty(row_client);
+    if client_id.is_none() {
+        if let Some(key) = auth.client_id_setting.as_deref() {
+            client_id = store.get_setting_raw(key).await?.filter(|v| !v.is_empty());
+        }
+    }
+    if client_id.is_none() && is_external_oauth(auth) {
+        if let Some(key) = auth.setting.as_deref() {
+            client_id = store.get_setting_raw(key).await?.filter(|v| !v.is_empty());
+        }
+    }
+    Ok(ResolvedPluginOauth {
+        authorize_url,
+        token_url,
+        client_id,
+    })
+}
+
+/// Prereq check over RESOLVED values (table already consulted). Two client-id
+/// message variants preserved: missing `auth.client_id_setting` declaration
+/// vs missing "saved value for {key}" — the wizard branches on structured
+/// fields, never on this text.
 fn plugin_oauth_prereq_error(
     plugin_id: &str,
     auth: &AuthSpec,
-    client_id_value: Option<&str>,
+    resolved: &ResolvedPluginOauth,
 ) -> Option<String> {
     let mut missing = Vec::new();
-    if auth.authorize_url.as_deref().is_none_or(str::is_empty) {
+    if resolved.authorize_url.is_none() {
         missing.push("auth.authorize_url".to_string());
     }
-    if auth.token_url.as_deref().is_none_or(str::is_empty) {
+    if resolved.token_url.is_none() {
         missing.push("auth.token_url".to_string());
     }
-    match auth.client_id_setting.as_deref() {
-        Some(key) => {
-            if client_id_value.is_none_or(str::is_empty) {
-                missing.push(format!("saved value for {key}"));
-            }
+    if resolved.client_id.is_none() {
+        match auth.client_id_setting.as_deref() {
+            Some(key) => missing.push(format!("saved value for {key}")),
+            None => missing.push("auth.client_id_setting".to_string()),
         }
-        None => missing.push("auth.client_id_setting".to_string()),
     }
     if missing.is_empty() {
         None
@@ -211,16 +268,6 @@ fn plugin_oauth_prereq_error(
             missing.join(", ")
         ))
     }
-}
-
-async fn plugin_oauth_client_id(store: &Store, auth: &AuthSpec) -> anyhow::Result<Option<String>> {
-    let Some(key) = auth.client_id_setting.as_deref() else {
-        return Ok(None);
-    };
-    Ok(store
-        .get_setting_raw(key)
-        .await?
-        .filter(|value| !value.is_empty()))
 }
 
 async fn plugin_oauth_client_secret(
@@ -243,18 +290,30 @@ async fn build_plugin_oauth_begin_result(
     verifier: &str,
     state_token: &str,
 ) -> anyhow::Result<PluginOauthBeginResult> {
-    let client_id = plugin_oauth_client_id(store, auth).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}",
-            plugin_oauth_prereq_error(plugin_id, auth, None)
-                .unwrap_or_else(|| format!("{plugin_id} OAuth sign-in isn't ready"))
-        )
-    })?;
-    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, Some(client_id.as_str())) {
+    let resolved = resolve_plugin_oauth(store, plugin_id, auth).await?;
+    build_plugin_oauth_begin_result_with(plugin_id, auth, &resolved, verifier, state_token)
+}
+
+/// Build the authorize URL from already-resolved endpoints/client id —
+/// table values take precedence over manifest fields (see
+/// [`resolve_plugin_oauth`]). `begin_plugin_install` calls this directly
+/// with its post-DCR resolution; `begin_plugin_oauth` goes through the
+/// async wrapper above.
+fn build_plugin_oauth_begin_result_with(
+    plugin_id: &str,
+    auth: &AuthSpec,
+    resolved: &ResolvedPluginOauth,
+    verifier: &str,
+    state_token: &str,
+) -> anyhow::Result<PluginOauthBeginResult> {
+    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, resolved) {
         anyhow::bail!(message);
     }
-
-    let authorize_url = auth.authorize_url.as_deref().ok_or_else(|| {
+    let client_id = resolved
+        .client_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{plugin_id} OAuth sign-in is missing a client id"))?;
+    let authorize_url = resolved.authorize_url.as_deref().ok_or_else(|| {
         anyhow::anyhow!("{plugin_id} OAuth sign-in is missing auth.authorize_url")
     })?;
     let redirect_uri = plugin_oauth_redirect_uri(plugin_id);
@@ -263,7 +322,7 @@ async fn build_plugin_oauth_begin_result(
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("response_type", "code");
-        query.append_pair("client_id", &client_id);
+        query.append_pair("client_id", client_id);
         query.append_pair("redirect_uri", &redirect_uri);
         query.append_pair("state", state_token);
         query.append_pair("code_challenge", &pkce_challenge_s256(verifier));
@@ -308,8 +367,8 @@ async fn build_auth_info(
         .env
         .as_deref()
         .is_some_and(|e| std::env::var_os(e).is_some());
-    let client_id_value = if auth.kind == AuthKind::Oauth {
-        plugin_oauth_client_id(store, auth).await?
+    let resolved_oauth = if auth.kind == AuthKind::Oauth {
+        Some(resolve_plugin_oauth(store, plugin_id, auth).await?)
     } else {
         None
     };
@@ -322,11 +381,9 @@ async fn build_auth_info(
         .as_ref()
         .is_some_and(|token| token.reconnect_required);
     let oauth_token_stored = oauth_token.is_some();
-    let oauth_connect_error = if auth.kind == AuthKind::Oauth {
-        plugin_oauth_prereq_error(plugin_id, auth, client_id_value.as_deref())
-    } else {
-        None
-    };
+    let oauth_connect_error = resolved_oauth
+        .as_ref()
+        .and_then(|resolved| plugin_oauth_prereq_error(plugin_id, auth, resolved));
     Ok(PluginAuthInfo {
         kind: auth_kind_label(auth.kind).to_string(),
         setting: auth.setting.clone(),
@@ -413,18 +470,15 @@ async fn exchange_plugin_oauth_code(
     flow: &PluginOauthFlowState,
     code: &str,
 ) -> anyhow::Result<PluginOauthToken> {
-    let client_id = plugin_oauth_client_id(store, auth).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}",
-            plugin_oauth_prereq_error(plugin_id, auth, None)
-                .unwrap_or_else(|| format!("{plugin_id} OAuth sign-in isn't ready"))
-        )
-    })?;
-    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, Some(client_id.as_str())) {
+    let resolved = resolve_plugin_oauth(store, plugin_id, auth).await?;
+    if let Some(message) = plugin_oauth_prereq_error(plugin_id, auth, &resolved) {
         anyhow::bail!(message);
     }
-
-    let token_url = auth
+    let client_id = resolved
+        .client_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("{plugin_id} OAuth sign-in is missing a client id"))?;
+    let token_url = resolved
         .token_url
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("{plugin_id} OAuth sign-in is missing auth.token_url"))?;
@@ -1017,6 +1071,106 @@ mod tests {
             query.get("redirect_uri").map(String::as_str),
             Some(begin.redirect_uri.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_plugin_oauth_orders_row_then_setting_then_external_auth_setting() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        store
+            .set_setting_raw("plugin.gw.client_id", "setting-client")
+            .await
+            .unwrap();
+
+        // External plugin (no resource, no authorize_url): auth.setting IS
+        // the client id key (google-workspace shape).
+        let external = AuthSpec {
+            kind: AuthKind::Oauth,
+            setting: Some("plugin.gw.client_id".into()),
+            ..Default::default()
+        };
+        assert!(is_external_oauth(&external));
+        let resolved = resolve_plugin_oauth(&store, "gw", &external).await.unwrap();
+        assert_eq!(resolved.client_id.as_deref(), Some("setting-client"));
+
+        // Non-external (resource declared): auth.setting is NOT consulted.
+        let non_external = AuthSpec {
+            kind: AuthKind::Oauth,
+            setting: Some("plugin.gw.client_id".into()),
+            resource: Some("https://vendor.test/mcp".into()),
+            ..Default::default()
+        };
+        assert!(!is_external_oauth(&non_external));
+        let resolved = resolve_plugin_oauth(&store, "gw", &non_external)
+            .await
+            .unwrap();
+        assert_eq!(resolved.client_id, None);
+
+        // client_id_setting is second in the order…
+        let with_setting = AuthSpec {
+            client_id_setting: Some("plugin.gw.client_id".into()),
+            ..non_external.clone()
+        };
+        let resolved = resolve_plugin_oauth(&store, "gw", &with_setting)
+            .await
+            .unwrap();
+        assert_eq!(resolved.client_id.as_deref(), Some("setting-client"));
+
+        // …and the plugin_oauth_clients row wins over everything, endpoints
+        // included (table → manifest).
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "gw".into(),
+                authorize_url: Some("https://discovered.test/authorize".into()),
+                token_url: Some("https://discovered.test/token".into()),
+                client_id: Some("row-client".into()),
+            })
+            .await
+            .unwrap();
+        let resolved = resolve_plugin_oauth(&store, "gw", &with_setting)
+            .await
+            .unwrap();
+        assert_eq!(resolved.client_id.as_deref(), Some("row-client"));
+        assert_eq!(
+            resolved.authorize_url.as_deref(),
+            Some("https://discovered.test/authorize")
+        );
+        assert_eq!(
+            resolved.token_url.as_deref(),
+            Some("https://discovered.test/token")
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_result_prefers_table_endpoints_over_manifest() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "acme-table".into(),
+                authorize_url: Some("https://discovered.test/authorize".into()),
+                token_url: Some("https://discovered.test/token".into()),
+                client_id: Some("row-client".into()),
+            })
+            .await
+            .unwrap();
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            authorize_url: Some("https://manifest.test/authorize".into()),
+            token_url: Some("https://manifest.test/token".into()),
+            ..Default::default()
+        };
+        let begin = build_plugin_oauth_begin_result(&store, "acme-table", &auth, "v-1", "s-1")
+            .await
+            .unwrap();
+        assert!(
+            begin
+                .authorize_url
+                .starts_with("https://discovered.test/authorize?"),
+            "{}",
+            begin.authorize_url
+        );
+        assert!(begin.authorize_url.contains("client_id=row-client"));
     }
 
     // ---------- field_value_set ----------
