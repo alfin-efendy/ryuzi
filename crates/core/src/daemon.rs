@@ -325,7 +325,14 @@ fn spawn_approval_fanout(
                     request_id,
                     tool,
                     summary,
+                    approval_kind,
+                    input: _,
                 }) => {
+                    // Gateways only render binary tool prompts. Plan/Question
+                    // prompts are Cockpit/CLI-only surfaces.
+                    if approval_kind != crate::domain::ApprovalKind::Tool {
+                        continue;
+                    }
                     let cp = Arc::clone(&cp);
                     let store = Arc::clone(&store);
                     let gateways = gateways.clone();
@@ -991,6 +998,8 @@ mod tests {
                 request_id: request_id.clone(),
                 tool: "Bash".into(),
                 summary: "ls -la".into(),
+                approval_kind: crate::domain::ApprovalKind::Tool,
+                input: serde_json::json!({}),
             });
             let rx = self.approvals.register(request_id);
             let allow = rx.await.map(|r| r.allowed()).unwrap_or(false);
@@ -1072,6 +1081,7 @@ mod tests {
                     request_id,
                     tool,
                     summary,
+                    ..
                 })) => {
                     // Bind the surface now (we know the session_pk is live —
                     // the harness is already blocked awaiting the hub).

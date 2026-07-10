@@ -929,6 +929,7 @@ async fn run_tool_call(
     let spec = tool.permission(&input);
     let decision = evaluate(
         &spec,
+        &input,
         perm_mode,
         deps.project_policy.as_deref(),
         &deps.session_pk,

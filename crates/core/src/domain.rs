@@ -376,6 +376,13 @@ pub enum CoreEvent {
         request_id: String,
         tool: String,
         summary: String,
+        /// What the prompt is: a tool permission, a plan review, or a question
+        /// form. Named `approval_kind` — `kind` would collide with the enum's
+        /// serde tag.
+        approval_kind: ApprovalKind,
+        /// Raw kind-specific payload: the tool's input JSON (Tool), the plan
+        /// markdown (Plan), or the questions spec (Question).
+        input: serde_json::Value,
     },
     Error {
         session_pk: String,

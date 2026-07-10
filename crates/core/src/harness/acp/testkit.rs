@@ -917,6 +917,8 @@ pub async fn run_prompt_with_permission(
                         request_id: request_id.clone(),
                         tool,
                         summary,
+                        approval_kind: crate::domain::ApprovalKind::Tool,
+                        input: serde_json::json!({}),
                     });
 
                     // Register with the hub, then resolve immediately (binary 3A

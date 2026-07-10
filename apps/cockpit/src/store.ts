@@ -10,13 +10,21 @@ import {
   type ChatRequestOptions,
   type GitOptions,
   type PermMode,
+  type ApprovalKind,
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
 import { useNative } from "./store-native";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 
-export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
+export type PendingApproval = {
+  sessionPk: string;
+  requestId: string;
+  tool: string;
+  summary: string;
+  kind: ApprovalKind;
+  input: unknown;
+};
 export type ChatOptions = {
   runtimeId?: string | null;
   model?: string | null;
@@ -151,7 +159,14 @@ export const useStore = create<State>((set, get) => ({
           return {
             pendingApprovals: [
               ...st.pendingApprovals,
-              { sessionPk: e.session_pk, requestId: e.request_id, tool: e.tool, summary: e.summary },
+              {
+                sessionPk: e.session_pk,
+                requestId: e.request_id,
+                tool: e.tool,
+                summary: e.summary,
+                kind: e.approval_kind,
+                input: e.input,
+              },
             ],
           };
         case "result":

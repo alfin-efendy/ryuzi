@@ -238,6 +238,8 @@ async fn run_client_loop(
                         request_id: request_id.clone(),
                         tool,
                         summary,
+                        approval_kind: crate::domain::ApprovalKind::Tool,
+                        input: serde_json::json!({}),
                     });
 
                     let rx = hub.register(request_id.clone());

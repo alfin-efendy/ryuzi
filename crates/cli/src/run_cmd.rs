@@ -255,6 +255,7 @@ async fn run_session(
                 request_id,
                 tool,
                 summary,
+                ..
             } if session_pk == session.session_pk => {
                 let answer = (deps.prompt)(&format!("approve {tool}? {summary} [y/N] "));
                 cp.resolve_approval(&request_id, answer.trim().eq_ignore_ascii_case("y"));

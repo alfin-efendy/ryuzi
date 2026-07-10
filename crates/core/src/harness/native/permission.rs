@@ -43,6 +43,7 @@ fn key_to_policy_tool(key: &str) -> &str {
 #[allow(clippy::too_many_arguments)]
 pub async fn evaluate(
     spec: &PermissionSpec,
+    input: &serde_json::Value,
     perm_mode: PermMode,
     project_policy: Option<&str>,
     session_pk: &str,
@@ -66,6 +67,8 @@ pub async fn evaluate(
         request_id: tool_call_id.to_string(),
         tool: spec.key.clone(),
         summary: spec.summary.clone(),
+        approval_kind: crate::domain::ApprovalKind::Tool,
+        input: input.clone(),
     });
     tokio::select! {
         biased;
@@ -97,6 +100,7 @@ mod tests {
         for key in ["read", "todoread", "todowrite"] {
             let d = evaluate(
                 &spec(key),
+                &serde_json::json!({}),
                 PermMode::Default,
                 None,
                 "s",
@@ -118,6 +122,7 @@ mod tests {
         // Read-class tools still auto-allow under Plan.
         let read = evaluate(
             &spec("read"),
+            &serde_json::json!({}),
             PermMode::Plan,
             None,
             "s",
@@ -132,6 +137,7 @@ mod tests {
         for key in ["edit", "bash"] {
             let d = evaluate(
                 &spec(key),
+                &serde_json::json!({}),
                 PermMode::Plan,
                 None,
                 "s",
@@ -152,6 +158,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(4);
         let d = evaluate(
             &spec("edit"),
+            &serde_json::json!({}),
             PermMode::AcceptEdits,
             None,
             "s",
@@ -170,6 +177,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(4);
         let d = evaluate(
             &spec("bash"),
+            &serde_json::json!({}),
             PermMode::Default,
             Some("allowAlways"),
             "s",
@@ -202,6 +210,7 @@ mod tests {
         });
         let d = evaluate(
             &spec("bash"),
+            &serde_json::json!({}),
             PermMode::Default,
             None,
             "s",
@@ -227,6 +236,7 @@ mod tests {
         });
         let d = evaluate(
             &spec("bash"),
+            &serde_json::json!({}),
             PermMode::Default,
             None,
             "s",
@@ -245,8 +255,10 @@ mod tests {
         let (tx, _rx) = broadcast::channel(4);
         let cancel = CancellationToken::new();
         let bash_spec = spec("bash");
+        let no_input = serde_json::json!({});
         let fut = evaluate(
             &bash_spec,
+            &no_input,
             PermMode::Default,
             None,
             "s",
@@ -265,5 +277,41 @@ mod tests {
             !hub.has_pending(),
             "a cancelled prompt must be deregistered so it can't be resolved later"
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_event_carries_kind_and_input() {
+        use crate::domain::ApprovalKind;
+        let hub = std::sync::Arc::new(ApprovalHub::new());
+        let (tx, mut rx) = broadcast::channel(4);
+        let hub2 = hub.clone();
+        let waiter = tokio::spawn(async move {
+            match rx.recv().await.unwrap() {
+                CoreEvent::ApprovalRequested {
+                    approval_kind,
+                    input,
+                    ..
+                } => {
+                    assert_eq!(approval_kind, ApprovalKind::Tool);
+                    assert_eq!(input["command"], "rm -rf ./x");
+                    hub2.resolve_bool("call-k", true);
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        });
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({"command": "rm -rf ./x"}),
+            PermMode::Default,
+            None,
+            "s",
+            "call-k",
+            &hub,
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await;
+        waiter.await.unwrap();
+        assert_eq!(d, PermDecision::Allow);
     }
 }
