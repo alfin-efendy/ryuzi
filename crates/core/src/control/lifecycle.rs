@@ -652,6 +652,11 @@ impl ControlPlane {
     /// fails to resolve its servers is logged via `tracing::warn!` and
     /// skipped: a broken plugin integration must never prevent a session
     /// from starting.
+    ///
+    /// Each plugin's outcome (`"ok"`/`"failed"`, plus a secret-free reason on
+    /// failure) is also recorded via [`Self::record_attach`] for
+    /// `plugin_doctor` to surface later — recording is best-effort and never
+    /// changes this loop's control flow or its warn-and-continue discipline.
     async fn attach_plugin_mcp_servers(
         &self,
         project_id: &str,
@@ -671,6 +676,7 @@ impl ControlPlane {
                 Ok(false) => continue,
                 Err(e) => {
                     tracing::warn!(plugin = %id, "plugin connector failed: {e}");
+                    self.record_attach(id, "failed", Some(&e.to_string())).await;
                     continue;
                 }
             }
@@ -681,6 +687,7 @@ impl ControlPlane {
             };
             if let Err(e) = connector.ensure_auth(&ctx).await {
                 tracing::warn!(plugin = %id, "plugin connector not ready: {e}");
+                self.record_attach(id, "failed", Some(&e.to_string())).await;
                 continue;
             }
             match connector.mcp_servers(&ctx).await {
@@ -691,12 +698,31 @@ impl ControlPlane {
                         }
                         mcp_servers.push(spec);
                     }
+                    self.record_attach(id, "ok", None).await;
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %id, "plugin connector failed: {e}");
+                    self.record_attach(id, "failed", Some(&e.to_string())).await;
                 }
             }
         }
+    }
+
+    /// Best-effort record of a plugin's session-attach outcome into
+    /// `plugin_attach_status`, for `plugin_doctor` to read back later. Never
+    /// surfaces its own failure — a store write failing here must not turn
+    /// into a session-start error, mirroring the warn-and-continue discipline
+    /// of the loop that calls it.
+    async fn record_attach(&self, id: &str, outcome: &str, reason: Option<&str>) {
+        let _ = self
+            .store
+            .record_plugin_attach(&crate::store::PluginAttachStatus {
+                plugin_id: id.to_string(),
+                last_attach_at: crate::paths::now_ms(),
+                outcome: outcome.to_string(),
+                reason: reason.map(str::to_string),
+            })
+            .await;
     }
 
     /// Drive a prompt on `handle` in the background. `send_prompt` blocks until
