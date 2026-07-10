@@ -99,9 +99,7 @@ test("loadTodos drops out-of-order responses (a stale fetch can't clobber newer 
   reset();
   type TodosResult = Awaited<ReturnType<typeof commands.sessionTodos>>;
   const resolvers: Array<(v: TodosResult) => void> = [];
-  const spy = spyOn(commands, "sessionTodos").mockImplementation(
-    () => new Promise<TodosResult>((resolve) => resolvers.push(resolve)),
-  );
+  const spy = spyOn(commands, "sessionTodos").mockImplementation(() => new Promise<TodosResult>((resolve) => resolvers.push(resolve)));
   const first = useNative.getState().loadTodos("s1"); // older fetch…
   const second = useNative.getState().loadTodos("s1"); // …superseded by this one
   // The newer fetch resolves first with the fresh list.
@@ -118,9 +116,7 @@ test("loadTodos tokens are per-session — one session's fetch never invalidates
   reset();
   type TodosResult = Awaited<ReturnType<typeof commands.sessionTodos>>;
   const resolvers: Array<(v: TodosResult) => void> = [];
-  const spy = spyOn(commands, "sessionTodos").mockImplementation(
-    () => new Promise<TodosResult>((resolve) => resolvers.push(resolve)),
-  );
+  const spy = spyOn(commands, "sessionTodos").mockImplementation(() => new Promise<TodosResult>((resolve) => resolvers.push(resolve)));
   const a = useNative.getState().loadTodos("s1");
   const b = useNative.getState().loadTodos("s2"); // different session, issued later
   resolvers[1]({ status: "ok", data: [{ content: "other", status: "pending" }] });

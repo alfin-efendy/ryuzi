@@ -89,9 +89,33 @@ test("consecutive tool_call/status rows cluster into one activity group", () => 
   expect(groups.map((g) => g.type)).toEqual(["activity", "agent"]);
   if (groups[0].type !== "activity") throw new Error("expected activity group");
   expect(groups[0].items).toEqual([
-    { type: "tool", key: "s1", name: "Bash", kind: "execute", status: "completed", output: "ok", path: null, input: null, durationMs: null, exitCode: null, summary: null },
+    {
+      type: "tool",
+      key: "s1",
+      name: "Bash",
+      kind: "execute",
+      status: "completed",
+      output: "ok",
+      path: null,
+      input: null,
+      durationMs: null,
+      exitCode: null,
+      summary: null,
+    },
     { type: "status", key: "s2", text: "wrote a.txt" },
-    { type: "tool", key: "s4", name: "Tool", kind: null, status: "pending", output: null, path: null, input: null, durationMs: null, exitCode: null, summary: null },
+    {
+      type: "tool",
+      key: "s4",
+      name: "Tool",
+      kind: null,
+      status: "pending",
+      output: null,
+      path: null,
+      input: null,
+      durationMs: null,
+      exitCode: null,
+      summary: null,
+    },
   ]);
 });
 
@@ -339,10 +363,28 @@ test("messageToRow carries tool input, duration_ms, exit_code and summary from t
   expect(r.toolDurationMs).toBe(1234);
   expect(r.toolExitCode).toBe(0);
   expect(r.toolSummary).toBeNull(); // empty string never renders
-  const todo = messageToRow(3, "assistant", "tool_call", { name: "todowrite", summary: "todos: 1/2 done" }, "t2", "completed", "other", null);
+  const todo = messageToRow(
+    3,
+    "assistant",
+    "tool_call",
+    { name: "todowrite", summary: "todos: 1/2 done" },
+    "t2",
+    "completed",
+    "other",
+    null,
+  );
   expect(todo.toolSummary).toBe("todos: 1/2 done");
   // Wrong types and non-tool_call rows stay null.
-  const junk = messageToRow(4, "assistant", "tool_call", { name: "x", duration_ms: "fast", exit_code: "zero" }, "t3", "completed", null, null);
+  const junk = messageToRow(
+    4,
+    "assistant",
+    "tool_call",
+    { name: "x", duration_ms: "fast", exit_code: "zero" },
+    "t3",
+    "completed",
+    null,
+    null,
+  );
   expect(junk.toolDurationMs).toBeNull();
   expect(junk.toolExitCode).toBeNull();
   const text = messageToRow(5, "assistant", "text", { text: "hi", duration_ms: 5 }, null, null, null, null);
@@ -351,8 +393,20 @@ test("messageToRow carries tool input, duration_ms, exit_code and summary from t
 });
 
 test("mergeToolRow overlays duration/exit/summary/input from the merged payload and keeps prior values otherwise", () => {
-  const prev = row({ seq: 1, blockType: "tool_call", toolCallId: "t1", toolName: "bash", toolStatus: "in_progress", toolInput: { command: "ls" } });
-  const merged = mergeToolRow(prev, { name: "bash", input: { command: "ls" }, output: "ok", duration_ms: 88, exit_code: 1, summary: "" }, "failed", "execute");
+  const prev = row({
+    seq: 1,
+    blockType: "tool_call",
+    toolCallId: "t1",
+    toolName: "bash",
+    toolStatus: "in_progress",
+    toolInput: { command: "ls" },
+  });
+  const merged = mergeToolRow(
+    prev,
+    { name: "bash", input: { command: "ls" }, output: "ok", duration_ms: 88, exit_code: 1, summary: "" },
+    "failed",
+    "execute",
+  );
   expect(merged.toolDurationMs).toBe(88);
   expect(merged.toolExitCode).toBe(1);
   expect(merged.toolInput).toEqual({ command: "ls" });
