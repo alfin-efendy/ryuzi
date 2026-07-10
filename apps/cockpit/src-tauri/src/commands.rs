@@ -15,8 +15,8 @@ use tauri_plugin_dialog::DialogExt;
 pub use ryuzi_core::api::types::ChatRequestOptions;
 
 type R<T> = Result<T, CmdError>;
-// `State<'_, Arc<ControlPlane>>` becomes `State<'_, Arc<EngineClient>>`: every
-// engine command below is a thin proxy over the daemon's control API.
+// The old in-process `ControlPlane` state extractor is gone: every engine
+// command below is a thin proxy over the daemon's HTTP control API instead.
 type Engine<'a> = State<'a, Arc<EngineClient>>;
 
 #[tauri::command]

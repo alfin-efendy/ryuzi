@@ -38,9 +38,10 @@ const ADAPTER_BIN: &str = "claude-agent-acp";
 /// Resolve the ACP adapter via the shared tiered resolver (Spec 4 §4):
 /// RYUZI_ACP_PATH override → cached artifact → download (bun bundle if a
 /// host bun exists, else the standalone binary). First resolve needs network
-/// or Bun — the same contract as the CLI. Runs lazily on the first
-/// `claude-code` session start (never at app launch — see
-/// [`build_registries`]).
+/// or Bun — the same contract as the CLI. The engine daemon runs this once,
+/// while building its registries, only when `claude-code` is an enabled
+/// runtime — never during Cockpit's own app launch, which no longer builds
+/// registries itself (see [`ryuzi_core::daemon::build_daemon`]).
 ///
 /// On resolver failure (dev builds embed `release_tag: v0.0.0`, so the
 /// download tier always 404s) we try, in order:
