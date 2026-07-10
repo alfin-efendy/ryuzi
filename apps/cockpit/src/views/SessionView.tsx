@@ -11,6 +11,7 @@ import { useConnections } from "@/store-connections";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
+import { headerAgentLine } from "@/lib/session-header";
 import { groupModelOptions } from "@/lib/model-groups";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
@@ -167,7 +168,7 @@ export function SessionView() {
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
             <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-              <span>{agent ? `${agent.name} · ${agent.model || agent.connection}` : "No agent detected"}</span>
+              <span>{headerAgentLine(agent, project)}</span>
               {session.branch && (
                 <span className="inline-flex items-center gap-1">
                   <GitBranch aria-hidden size={11} strokeWidth={2} />
