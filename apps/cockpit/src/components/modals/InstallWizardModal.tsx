@@ -34,6 +34,7 @@ export function InstallWizardModal({
   const [begin, setBegin] = useState<PluginInstallBeginResult | null>(null);
   const [checkError, setCheckError] = useState<string | null>(null);
   const [tokenValue, setTokenValue] = useState("");
+  const [clientId, setClientId] = useState("");
   const [busy, setBusy] = useState(false);
 
   const Icon = iconFor(pluginIcon ?? null);
@@ -53,6 +54,38 @@ export function InstallWizardModal({
       return;
     }
     setStep(settingsOrDone(detail));
+  };
+
+  const submitClientId = async () => {
+    if (clientId.trim().length === 0 || busy) return;
+    setBusy(true);
+    const saved = await commands.setPluginOauthClientId(pluginId, clientId.trim());
+    if (saved.status === "error") {
+      setBusy(false);
+      toast.error(saved.error.message);
+      return;
+    }
+    if (begin?.oauthExternal) {
+      // The child server brokers the actual sign-in at first use — no
+      // browser flow from Cockpit for external-OAuth plugins.
+      setBusy(false);
+      setStep(settingsOrDone(detail));
+      return;
+    }
+    // Re-begin: the client id is on the row now, DCR is permanently
+    // suppressed, and the backend goes straight to the browser flow.
+    const res = await commands.beginPluginInstall(pluginId);
+    setBusy(false);
+    if (res.status === "error") {
+      toast.error(res.error.message);
+      return;
+    }
+    setBegin(res.data);
+    if (res.data.oauthAvailable) {
+      setStep("waitingOauth");
+    } else {
+      toast.error(res.data.dcrError ?? "Couldn't start the sign-in flow.");
+    }
   };
 
   // Single resolution call: the backend runs env-var detection, RFC 8414
@@ -188,9 +221,39 @@ export function InstallWizardModal({
               ? `${pluginName} brokers its own sign-in the first time it runs. Create an OAuth client with the vendor and paste its client ID here.`
               : `${pluginName} doesn't support automatic app registration. Create an OAuth app with the vendor and paste its client ID here.`}
           </p>
+          {begin?.dcrError && (
+            <div
+              className="mb-3 flex items-start gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]"
+              style={{ color: "#F59E0B" }}
+            >
+              <CircleAlert aria-hidden size={14} strokeWidth={2} className="mt-0.5 shrink-0" />
+              {begin.dcrError}
+            </div>
+          )}
+          <FormField label="OAuth client ID">
+            <Input
+              value={clientId}
+              onChange={(e) => setClientId(e.target.value)}
+              placeholder="Paste the client ID from the vendor's console"
+            />
+          </FormField>
+          {detail?.auth?.helpUrl && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void openUrl(detail.auth?.helpUrl as string)}
+              className="mt-2 px-0 text-[12px] text-muted-foreground"
+            >
+              <ExternalLink aria-hidden size={12} strokeWidth={2} className="size-3" />
+              Where do I find this?
+            </Button>
+          )}
           <ModalFooter>
             <Button variant="outline" onClick={close}>
               Cancel
+            </Button>
+            <Button disabled={busy || clientId.trim().length === 0} onClick={() => void submitClientId()}>
+              {busy ? "Saving…" : "Continue"}
             </Button>
           </ModalFooter>
         </>

@@ -292,3 +292,35 @@ test("tokenInput renders the help link and opens it via openUrl", async () => {
   fireEvent.click(screen.getByRole("button", { name: /Get a token at/ }));
   expect(openUrl).toHaveBeenCalledWith("https://notion.example/help");
 });
+
+test("manualClientId shows dcrError, saves the id, and re-begin starts the browser flow", async () => {
+  beginData = beginResult({ authKind: "oauth", needsClientId: true, dcrError: "registration rejected" });
+  await renderWizard();
+
+  expect(await screen.findByText("registration rejected")).toBeTruthy();
+
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  fireEvent.change(screen.getByPlaceholderText("Paste the client ID from the vendor's console"), {
+    target: { value: "client-abc" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith("notion", "client-abc"));
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledTimes(2));
+  expect(await screen.findByText("Browser opened — finish signing in there.")).toBeTruthy();
+});
+
+test("external oauth collects the client id and continues without a browser flow", async () => {
+  detailData = detailFixture({ settings: [field("plugin.notion.user", "User")] });
+  beginData = beginResult({ authKind: "oauth", oauthExternal: true, needsClientId: true });
+  await renderWizard();
+
+  fireEvent.change(screen.getByPlaceholderText("Paste the client ID from the vendor's console"), {
+    target: { value: "google-client" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith("notion", "google-client"));
+  expect(await screen.findByText(/Required fields are marked/)).toBeTruthy();
+  expect(beginPluginInstall).toHaveBeenCalledTimes(1);
+});
