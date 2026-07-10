@@ -1171,7 +1171,17 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 /**
  * A runtime npm install/update finished (ok=false → message has detail).
  */
-{ kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null }
+{ kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null } | 
+/**
+ * Per-response context usage for a native session (drives the
+ * "% context left" indicator).
+ */
+{ kind: "contextUsage"; session_pk: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; output_tokens: number } | 
+/**
+ * The native runtime compacted a session's history
+ * (trigger: pre_turn|mid_turn|manual).
+ */
+{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number }
 export type CoreEventMsg = { event: CoreEvent }
 /**
  * Device-code flow info shown to the user while they complete the browser

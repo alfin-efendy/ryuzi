@@ -37,6 +37,8 @@ type State = {
   selectedProjectId: string | null;
   lastSeq: Record<string, number>;
   loaded: Record<string, boolean>;
+  /** Per-session context-window usage from the latest `contextUsage` event. */
+  contextUsage: Record<string, { activeTokens: number; usableWindow: number; percentLeft: number }>;
   applyCoreEvent: (e: CoreEvent) => void;
   clearApproval: (requestId: string) => void;
   setFocused: (pk: string | null) => void;
@@ -92,6 +94,7 @@ export const useStore = create<State>((set, get) => ({
   selectedProjectId: null,
   lastSeq: {},
   loaded: {},
+  contextUsage: {},
 
   applyCoreEvent: (e) =>
     set((st) => {
@@ -157,6 +160,21 @@ export const useStore = create<State>((set, get) => ({
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
         case "sessionEnded":
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "ended" as const } : s)) };
+        case "contextUsage":
+          return {
+            contextUsage: {
+              ...st.contextUsage,
+              [e.session_pk]: {
+                activeTokens: e.active_tokens,
+                usableWindow: e.usable_window,
+                percentLeft: e.percent_left,
+              },
+            },
+          };
+        case "contextCompacted":
+          // The transcript notice arrives as a persisted message row; no
+          // extra state to keep here.
+          return {};
         default:
           return {};
       }

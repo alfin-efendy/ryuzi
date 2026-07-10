@@ -12,6 +12,7 @@ function reset() {
     selectedProjectId: null,
     lastSeq: {},
     loaded: {},
+    contextUsage: {},
   });
 }
 

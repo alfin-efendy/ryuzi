@@ -156,6 +156,13 @@ test("error rows and unknown block types: error gets its own group, unknown rend
   expect(groups[1].key).toBe("s2"); // persisted rows key by seq
 });
 
+test("notice rows (e.g. compaction) get their own group, distinct from errors and agent text", () => {
+  const groups = groupRows([
+    row({ seq: 1, blockType: "notice", text: "Context compacted: ~100k → ~20k tokens", role: "system" }),
+  ]);
+  expect(groups).toEqual([{ type: "notice", key: "s1", text: "Context compacted: ~100k → ~20k tokens" }]);
+});
+
 test("closeDanglingFence closes an odd number of line-start fences and leaves balanced ones alone", () => {
   expect(closeDanglingFence("```ts\nconst x = 1;")).toBe("```ts\nconst x = 1;\n```");
   expect(closeDanglingFence("```ts\nx\n```")).toBe("```ts\nx\n```");
