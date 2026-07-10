@@ -7,7 +7,11 @@ import type { ModelTestStatus } from "./model-testing";
  *  model's probe verdict. Mirror of `codex_base_model`
  *  (crates/core/src/llm_router/codex.rs): strip one trailing "-review", then
  *  one effort suffix — "xhigh" checked before "high" so "-xhigh" strips
- *  whole. */
+ *  whole. Scoped to the `openai` family ONLY — Rust's `codex_base_model` runs
+ *  exclusively on the openai-oauth probe, so only `openai`-family ids carry
+ *  synthetic effort/-review picker variants. Applying this to other
+ *  families' ids (e.g. OpenRouter's `openai/o3-mini-high`) would truncate a
+ *  real, distinct model id into the wrong verdict key. */
 function stripCodexVariant(model: string): string {
   let base = model.endsWith("-review") ? model.slice(0, -"-review".length) : model;
   for (const effort of ["xhigh", "high", "medium", "low", "none"]) {
@@ -25,16 +29,23 @@ function stripCodexVariant(model: string): string {
  *  route-target keys, `family/model` runtime ids, and `entry-id/model`
  *  endpoint-card ids (resolved to the entry's family via the catalog).
  *  Bare values are route aliases and unknown prefixes are unmappable —
- *  both return null so callers never filter them. */
+ *  both return null so callers never filter them. Codex suffix stripping
+ *  (see `stripCodexVariant`) applies only when the resolved family is
+ *  `"openai"`. */
 export function modelStatusKey(value: string, catalog: CatalogEntry[]): { family: string; model: string } | null {
   const sep = value.indexOf("::");
-  if (sep > 0) return { family: value.slice(0, sep), model: stripCodexVariant(value.slice(sep + 2)) };
+  if (sep > 0) {
+    const family = value.slice(0, sep);
+    const rawModel = value.slice(sep + 2);
+    return { family, model: family === "openai" ? stripCodexVariant(rawModel) : rawModel };
+  }
   const slash = value.indexOf("/");
   if (slash <= 0) return null;
   const prefix = value.slice(0, slash);
   const entry = catalog.find((e) => e.family === prefix) ?? catalog.find((e) => e.id === prefix);
   if (!entry) return null;
-  return { family: entry.family, model: stripCodexVariant(value.slice(slash + 1)) };
+  const rawModel = value.slice(slash + 1);
+  return { family: entry.family, model: entry.family === "openai" ? stripCodexVariant(rawModel) : rawModel };
 }
 
 /** Group the composer's runtime model ids by provider family (PR #70 data).
@@ -100,7 +111,8 @@ export function groupModelOptions(
     const key = modelStatusKey(m, catalog);
     if (key !== null) return statuses[statusKey(key.family, key.model)];
     const family = familyByModel.get(m);
-    return family === undefined ? undefined : statuses[statusKey(family, stripCodexVariant(m))];
+    if (family === undefined) return undefined;
+    return statuses[statusKey(family, family === "openai" ? stripCodexVariant(m) : m)];
   };
 
   const byFamily = new Map<string, ComboboxOption[]>();

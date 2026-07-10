@@ -50,9 +50,9 @@ type ComboboxProps = {
    */
   trigger?: React.ReactNode;
   className?: string;
-  /** Extra classes merged into the popup panel (e.g. "min-w-[320px]" so long
-   *  mono ids aren't clipped behind a narrow trigger). The anchor-width
-   *  default formula stays in force. */
+  /** Extra classes merged into the popup panel via `cn` (tailwind-merge):
+   *  non-conflicting classes merge alongside the anchor-width default; a
+   *  conflicting w-* class replaces it (tailwind-merge semantics). */
   popupClassName?: string;
   /** Pinned "+ <label>" row below the list that clears + focuses the search
    *  input — an affordance for allowCreate (typing a new name creates it). */
@@ -93,6 +93,7 @@ function ComboboxItemView({ item }: { item: ComboboxItemData }) {
           <span className="flex items-center gap-1.5 text-amber-500">
             <TriangleAlert aria-hidden className="size-3.5 shrink-0" />
             <span className={cn("truncate", item.mono && "font-mono text-[12.5px]")}>{item.label}</span>
+            <span className="sr-only">(invalid)</span>
           </span>
         ) : (
           <span className={cn("block truncate", item.mono && "font-mono text-[12.5px]")}>{item.label}</span>

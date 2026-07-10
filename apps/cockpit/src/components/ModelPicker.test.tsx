@@ -84,7 +84,8 @@ test("the selected invalid model stays visible, flagged with the warning tone", 
   useUi.setState({ hideInvalidModels: true });
   render(<ModelPicker value="anthropic/claude-sonnet-4" onValueChange={() => {}} models={models} variant="field" ariaLabel="Model" />);
   await openPicker("Model");
-  const kept = screen.getByRole("option", { name: "claude-sonnet-4" });
+  // The sr-only "(invalid)" suffix is part of the accessible name.
+  const kept = screen.getByRole("option", { name: /^claude-sonnet-4 \(invalid\)$/ });
   expect(kept.querySelector(".text-amber-500")).not.toBeNull();
 });
 

@@ -106,7 +106,15 @@ beforeEach(() => {
   nativeCommands.mockClear();
 });
 
-afterEach(cleanup);
+// Reset the shared zustand singletons so later test files in the same bun
+// process don't inherit this file's fixtures (mirrors ModelPicker.test.tsx).
+afterEach(() => {
+  cleanup();
+  useConnections.setState({ catalog: [], connections: [], loaded: false });
+  useRuntimes.setState({ runtimes: [], loaded: false });
+  useModelStatuses.setState({ byKey: {} });
+  useUi.setState({ hideInvalidModels: false });
+});
 
 test("git project: branch pill shows and branches are fetched", async () => {
   render(<HomeView />);

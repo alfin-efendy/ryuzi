@@ -322,6 +322,14 @@ test("popupClassName lands on the popup element", async () => {
   expect(popup?.className).toContain("w-[max(var(--anchor-width),11rem)]");
 });
 
+test("a conflicting w-* popupClassName replaces the anchor-width default (tailwind-merge semantics)", async () => {
+  render(<Combobox options={few} popupClassName="w-64" value={null} onValueChange={() => {}} aria-label="Fruit" />);
+  await openCombobox("Fruit");
+  const popup = document.querySelector('[data-slot="combobox-popup"]');
+  expect(popup?.className).toContain("w-64");
+  expect(popup?.className).not.toContain("w-[max(var(--anchor-width),11rem)]");
+});
+
 test("invalid option renders the warning tone and triangle icon; valid option does not", async () => {
   const options: ComboboxOption[] = [
     { value: "good-model", label: "good-model" },
@@ -329,7 +337,8 @@ test("invalid option renders the warning tone and triangle icon; valid option do
   ];
   render(<Combobox options={options} value={null} onValueChange={() => {}} aria-label="Model" />);
   await openCombobox("Model");
-  const bad = screen.getByRole("option", { name: "bad-model" });
+  // The sr-only "(invalid)" suffix is part of the accessible name.
+  const bad = screen.getByRole("option", { name: /^bad-model \(invalid\)$/ });
   expect(bad.querySelector(".text-amber-500")).not.toBeNull();
   // Nothing is selected, so the only possible svg inside an option is the warning icon.
   expect(bad.querySelector("svg")).not.toBeNull();

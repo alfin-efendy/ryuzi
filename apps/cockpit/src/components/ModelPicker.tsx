@@ -52,7 +52,7 @@ export function ModelPicker({ value, onValueChange, models, leading, variant, pl
       placeholder={placeholder}
       disabled={disabled}
       searchThreshold={0}
-      popupClassName="min-w-[320px]"
+      popupClassName="min-w-[min(320px,var(--available-width))]"
       className={variant === "field" ? "min-w-0 flex-1" : undefined}
       trigger={
         variant === "chip" ? (

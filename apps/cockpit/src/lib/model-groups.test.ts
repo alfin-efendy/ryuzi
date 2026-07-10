@@ -37,6 +37,7 @@ const catalog = [
   entry("anthropic", "anthropic", "Anthropic", ["claude-fable-5"]),
   entry("anthropic-oauth", "anthropic", "Anthropic (OAuth)", []),
   entry("openai", "openai", "OpenAI", []),
+  entry("openrouter", "openrouter", "OpenRouter", []),
 ];
 
 test("groups runtime models by connected provider family; unmatched bare ids are routes, first", () => {
@@ -143,7 +144,7 @@ test("modelStatusKey returns null for bare route aliases and unknown prefixes", 
   expect(modelStatusKey("mystery/whatever", catalog)).toBeNull();
 });
 
-test("modelStatusKey strips codex effort/review variants to the base model (mirrors codex_probe_model)", () => {
+test("modelStatusKey strips codex effort/review variants to the base model (mirrors codex_base_model)", () => {
   expect(modelStatusKey("openai/gpt-5.5-codex-low", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
   expect(modelStatusKey("openai/gpt-5.5-codex-medium", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
   expect(modelStatusKey("openai/gpt-5.5-codex-high", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
@@ -157,6 +158,18 @@ test("modelStatusKey strips codex effort/review variants to the base model (mirr
   expect(modelStatusKey("openai::gpt-5.5-codex-review", catalog)).toEqual({ family: "openai", model: "gpt-5.5-codex" });
   // Non-variant models pass through untouched.
   expect(modelStatusKey("anthropic/claude-fable-5", catalog)).toEqual({ family: "anthropic", model: "claude-fable-5" });
+});
+
+test("modelStatusKey scopes codex suffix stripping to the openai family — non-openai ids keep their suffix", () => {
+  // OpenRouter's `openai/o3-mini-high` is a real, distinct model id, not a
+  // Codex effort-variant of `openai/o3-mini`. Only the `openai` family has
+  // synthetic effort/-review picker variants (Rust's codex_base_model runs
+  // only on the openai-oauth probe), so a genuine non-openai id ending in
+  // "-high" must NOT be truncated.
+  expect(modelStatusKey("openrouter/openai/o3-mini-high", catalog)).toEqual({
+    family: "openrouter",
+    model: "openai/o3-mini-high",
+  });
 });
 
 test("hideInvalid drops options with a persisted invalid verdict; untested stay", () => {
