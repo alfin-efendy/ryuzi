@@ -23,12 +23,32 @@ export type Row = {
   attachments: RowAttachment[];
   /** Target file of an edit/delete/move tool call, from its input. */
   toolPath: string | null;
+  /** Raw tool input object from the payload (tool_call rows only). */
+  toolInput: unknown;
+  /** Wall-clock tool duration in ms (payload.duration_ms, native runner). */
+  toolDurationMs: number | null;
+  /** Structured process exit code (payload.exit_code, bash tool). */
+  toolExitCode: number | null;
+  /** One-line display summary (payload.summary — todo/task/memory tools). */
+  toolSummary: string | null;
 };
 
 export type RowAttachment = { name: string; path: string; contentType: string | null; size: number };
 
 export type ActivityItem =
-  | { type: "tool"; key: string; name: string; kind: string | null; status: string | null; output: string | null; path: string | null }
+  | {
+      type: "tool";
+      key: string;
+      name: string;
+      kind: string | null;
+      status: string | null;
+      output: string | null;
+      path: string | null;
+      input: unknown;
+      durationMs: number | null;
+      exitCode: number | null;
+      summary: string | null;
+    }
   | { type: "status"; key: string; text: string };
 
 export type Group =
@@ -115,6 +135,10 @@ export function messageToRow(
     createdAt,
     attachments: rowAttachments(p),
     toolPath: blockType === "tool_call" ? toolPathOf(p) : null,
+    toolInput: blockType === "tool_call" && p.input !== undefined ? p.input : null,
+    toolDurationMs: blockType === "tool_call" && typeof p.duration_ms === "number" ? p.duration_ms : null,
+    toolExitCode: blockType === "tool_call" && typeof p.exit_code === "number" ? p.exit_code : null,
+    toolSummary: blockType === "tool_call" && typeof p.summary === "string" && p.summary ? p.summary : null,
   };
 }
 
@@ -127,6 +151,10 @@ export function mergeToolRow(prev: Row, payload: unknown, status: string | null,
     toolKind: toolKind ?? prev.toolKind,
     toolName: typeof p.name === "string" && p.name ? p.name : prev.toolName,
     toolOutput: outputPreview(p.output) ?? prev.toolOutput,
+    toolInput: p.input !== undefined ? p.input : prev.toolInput,
+    toolDurationMs: typeof p.duration_ms === "number" ? p.duration_ms : prev.toolDurationMs,
+    toolExitCode: typeof p.exit_code === "number" ? p.exit_code : prev.toolExitCode,
+    toolSummary: typeof p.summary === "string" && p.summary ? p.summary : prev.toolSummary,
   };
 }
 
@@ -169,6 +197,10 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
               status: row.toolStatus,
               output: row.toolOutput,
               path: row.toolPath,
+              input: row.toolInput,
+              durationMs: row.toolDurationMs,
+              exitCode: row.toolExitCode,
+              summary: row.toolSummary,
             }
           : { type: "status", key, text: row.text };
       if (item.type === "status" && !item.text.trim()) return;
@@ -201,6 +233,53 @@ export function formatTurnDuration(ms: number | null): string {
   const secs = Math.max(0, Math.round(ms / 1000));
   if (secs < 60) return `${secs}s`;
   return `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, "0")}s`;
+}
+
+/** First line of a string, hard-capped for a card header. */
+function headerLine(s: string): string {
+  const line = s.trim().split("\n", 1)[0] ?? "";
+  return line.length > 120 ? `${line.slice(0, 117)}…` : line;
+}
+
+/**
+ * One-line input summary for a tool card header, keyed on the INPUT SHAPE so
+ * native, ACP and MCP tools all work: command → "$ cmd", pattern → the
+ * pattern, file tools → target path, url/query → that string, anything else →
+ * compact JSON. Null when there is nothing meaningful to show.
+ */
+export function toolInputSummary(input: unknown, path: string | null): string | null {
+  const i = (input && typeof input === "object" && !Array.isArray(input) ? input : {}) as Record<string, unknown>;
+  if (typeof i.command === "string" && i.command.trim()) return `$ ${headerLine(i.command)}`;
+  if (typeof i.pattern === "string" && i.pattern.trim()) return headerLine(i.pattern);
+  if (path) return path;
+  if (typeof i.url === "string" && i.url.trim()) return headerLine(i.url);
+  if (typeof i.query === "string" && i.query.trim()) return headerLine(i.query);
+  if (Object.keys(i).length === 0) return null;
+  return headerLine(JSON.stringify(i));
+}
+
+/**
+ * Header parts for a tool card. `summary` display extras (todo/task/memory)
+ * win over the derived input summary. ACP rows use the adapter's human title
+ * as `name`, which may already embed the command/path — the detail is dropped
+ * when the title already contains it, so headers never double-print.
+ */
+export function toolCardHeader(item: { name: string; input: unknown; path: string | null; summary: string | null }): {
+  title: string;
+  detail: string | null;
+} {
+  const raw = item.summary ?? toolInputSummary(item.input, item.path);
+  if (!raw) return { title: item.name, detail: null };
+  const core = raw.replace(/^\$\s*/, "");
+  return { title: item.name, detail: core && item.name.includes(core) ? null : raw };
+}
+
+/** "312ms" under a second, "1.4s" under ten, then the turn format ("36s", "3m 59s"). */
+export function formatToolDuration(ms: number | null): string {
+  if (ms === null) return "";
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+  if (ms < 10_000) return `${(ms / 1000).toFixed(1)}s`;
+  return formatTurnDuration(ms);
 }
 
 /**

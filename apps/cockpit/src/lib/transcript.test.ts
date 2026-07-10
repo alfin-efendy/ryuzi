@@ -3,9 +3,13 @@ import {
   buildTranscript,
   closeDanglingFence,
   editCardsForGroups,
+  formatToolDuration,
   formatTurnDuration,
   groupRows,
+  mergeToolRow,
   messageToRow,
+  toolCardHeader,
+  toolInputSummary,
   turnDurationMs,
   type Row,
   type TurnBlock,
@@ -24,6 +28,10 @@ const row = (partial: Partial<Row>): Row => ({
   createdAt: null,
   attachments: [],
   toolPath: null,
+  toolInput: null,
+  toolDurationMs: null,
+  toolExitCode: null,
+  toolSummary: null,
   ...partial,
 });
 
@@ -81,9 +89,33 @@ test("consecutive tool_call/status rows cluster into one activity group", () => 
   expect(groups.map((g) => g.type)).toEqual(["activity", "agent"]);
   if (groups[0].type !== "activity") throw new Error("expected activity group");
   expect(groups[0].items).toEqual([
-    { type: "tool", key: "s1", name: "Bash", kind: "execute", status: "completed", output: "ok", path: null },
+    {
+      type: "tool",
+      key: "s1",
+      name: "Bash",
+      kind: "execute",
+      status: "completed",
+      output: "ok",
+      path: null,
+      input: null,
+      durationMs: null,
+      exitCode: null,
+      summary: null,
+    },
     { type: "status", key: "s2", text: "wrote a.txt" },
-    { type: "tool", key: "s4", name: "Tool", kind: null, status: "pending", output: null, path: null },
+    {
+      type: "tool",
+      key: "s4",
+      name: "Tool",
+      kind: null,
+      status: "pending",
+      output: null,
+      path: null,
+      input: null,
+      durationMs: null,
+      exitCode: null,
+      summary: null,
+    },
   ]);
 });
 
@@ -319,4 +351,136 @@ test("only the last agent text of a completed turn is flagged turnEnd", () => {
   // and never while the turn is live:
   const live = buildTranscript(rows, true).filter((b) => b.type === "agent");
   expect(live.every((a) => !("turnEnd" in a) || a.turnEnd !== true)).toBe(true);
+});
+
+test("messageToRow carries tool input, duration_ms, exit_code and summary from tool_call payloads", () => {
+  const r = messageToRow(
+    2,
+    "assistant",
+    "tool_call",
+    { name: "bash", input: { command: "ls -la" }, output: "total 0", duration_ms: 1234, exit_code: 0, summary: "" },
+    "t1",
+    "completed",
+    "execute",
+    null,
+  );
+  expect(r.toolInput).toEqual({ command: "ls -la" });
+  expect(r.toolDurationMs).toBe(1234);
+  expect(r.toolExitCode).toBe(0);
+  expect(r.toolSummary).toBeNull(); // empty string never renders
+  const todo = messageToRow(
+    3,
+    "assistant",
+    "tool_call",
+    { name: "todowrite", summary: "todos: 1/2 done" },
+    "t2",
+    "completed",
+    "other",
+    null,
+  );
+  expect(todo.toolSummary).toBe("todos: 1/2 done");
+  // Wrong types and non-tool_call rows stay null.
+  const junk = messageToRow(
+    4,
+    "assistant",
+    "tool_call",
+    { name: "x", duration_ms: "fast", exit_code: "zero" },
+    "t3",
+    "completed",
+    null,
+    null,
+  );
+  expect(junk.toolDurationMs).toBeNull();
+  expect(junk.toolExitCode).toBeNull();
+  const text = messageToRow(5, "assistant", "text", { text: "hi", duration_ms: 5 }, null, null, null, null);
+  expect(text.toolDurationMs).toBeNull();
+  expect(text.toolInput).toBeNull();
+});
+
+test("mergeToolRow overlays duration/exit/summary/input from the merged payload and keeps prior values otherwise", () => {
+  const prev = row({
+    seq: 1,
+    blockType: "tool_call",
+    toolCallId: "t1",
+    toolName: "bash",
+    toolStatus: "in_progress",
+    toolInput: { command: "ls" },
+  });
+  const merged = mergeToolRow(
+    prev,
+    { name: "bash", input: { command: "ls" }, output: "ok", duration_ms: 88, exit_code: 1, summary: "" },
+    "failed",
+    "execute",
+  );
+  expect(merged.toolDurationMs).toBe(88);
+  expect(merged.toolExitCode).toBe(1);
+  expect(merged.toolInput).toEqual({ command: "ls" });
+  expect(merged.toolSummary).toBeNull();
+  const keep = mergeToolRow(merged, { output: "more" }, "failed", "execute");
+  expect(keep.toolDurationMs).toBe(88);
+  expect(keep.toolExitCode).toBe(1);
+  expect(keep.toolInput).toEqual({ command: "ls" });
+});
+
+test("groupRows tool items carry input/duration/exitCode/summary", () => {
+  const groups = groupRows([
+    row({
+      seq: 1,
+      blockType: "tool_call",
+      toolCallId: "t1",
+      toolName: "bash",
+      toolKind: "execute",
+      toolStatus: "completed",
+      toolOutput: "ok",
+      toolInput: { command: "ls" },
+      toolDurationMs: 42,
+      toolExitCode: 0,
+      toolSummary: null,
+    }),
+  ]);
+  if (groups[0].type !== "activity" || groups[0].items[0].type !== "tool") throw new Error("expected a tool item");
+  expect(groups[0].items[0].input).toEqual({ command: "ls" });
+  expect(groups[0].items[0].durationMs).toBe(42);
+  expect(groups[0].items[0].exitCode).toBe(0);
+  expect(groups[0].items[0].summary).toBeNull();
+});
+
+test("toolInputSummary derives a header line from the input shape", () => {
+  expect(toolInputSummary({ command: "bun test\n# second line" }, null)).toBe("$ bun test");
+  expect(toolInputSummary({ pattern: "TODO|FIXME" }, null)).toBe("TODO|FIXME");
+  expect(toolInputSummary({ file_path: "src/a.ts" }, "src/a.ts")).toBe("src/a.ts");
+  expect(toolInputSummary({ url: "https://example.com" }, null)).toBe("https://example.com");
+  expect(toolInputSummary({ frobnicate: true, depth: 2 }, null)).toBe('{"frobnicate":true,"depth":2}');
+  expect(toolInputSummary({}, null)).toBeNull();
+  expect(toolInputSummary(null, null)).toBeNull();
+});
+
+test("toolCardHeader prefers summary extras and dedupes details already in the title", () => {
+  // todo/task/memory: the summary display extra is the collapsed one-liner.
+  expect(toolCardHeader({ name: "todowrite", input: { todos: [] }, path: null, summary: "todos: 1/2 done" })).toEqual({
+    title: "todowrite",
+    detail: "todos: 1/2 done",
+  });
+  // Native bash: name is the bare tool id, detail is the command.
+  expect(toolCardHeader({ name: "bash", input: { command: "ls -la" }, path: null, summary: null })).toEqual({
+    title: "bash",
+    detail: "$ ls -la",
+  });
+  // ACP: the title already embeds the command — never double-print.
+  expect(toolCardHeader({ name: "ls -la", input: { command: "ls -la" }, path: null, summary: null })).toEqual({
+    title: "ls -la",
+    detail: null,
+  });
+  expect(toolCardHeader({ name: "Read README.md", input: {}, path: "README.md", summary: null })).toEqual({
+    title: "Read README.md",
+    detail: null,
+  });
+});
+
+test("formatToolDuration", () => {
+  expect(formatToolDuration(312)).toBe("312ms");
+  expect(formatToolDuration(1400)).toBe("1.4s");
+  expect(formatToolDuration(36000)).toBe("36s");
+  expect(formatToolDuration(239000)).toBe("3m 59s");
+  expect(formatToolDuration(null)).toBe("");
 });

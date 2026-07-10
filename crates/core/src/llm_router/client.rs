@@ -241,6 +241,60 @@ async fn expanded_route_targets(
         .collect())
 }
 
+/// Continuation targets once a `family/model`-pinned request has exhausted
+/// every same-family account with retryable failures: the targets of the
+/// first enabled Model Route (in `list_model_routes` order — the Models →
+/// Route tab ordering) whose target list contains that exact (family, model)
+/// pair, expanded to concrete connections in the route's CONFIGURED target
+/// order, minus (connection id, model) pairs already attempted.
+///
+/// `route.targets` is used directly rather than `routes::ordered_targets`,
+/// which would advance a RoundRobin route's cursor as a side effect of a
+/// mere continuation lookup — the locked product decision is "continue in
+/// the target order configured in the Route tab".
+///
+/// Empty when the request isn't `family/model`-pinned (named routes and bare
+/// models don't continue) or no enabled route lists the pinned model.
+async fn route_continuation_targets(
+    store: &Store,
+    requested: &str,
+    attempted: &std::collections::HashSet<(String, String)>,
+) -> anyhow::Result<Vec<RouteTarget>> {
+    let Some((family, model)) = requested.split_once('/') else {
+        return Ok(Vec::new());
+    };
+    let route_list = routes::list_model_routes(store).await?;
+    let Some(route) = route_list.iter().find(|route| {
+        route.enabled
+            && route
+                .targets
+                .iter()
+                .any(|t| t.provider == family && t.model == model)
+    }) else {
+        return Ok(Vec::new());
+    };
+    let conns = connections::list_connections(store).await?;
+    let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
+    let mut seen = attempted.clone();
+    let mut out = Vec::new();
+    for target in &route.targets {
+        for route_target in
+            expanded_route_targets(store, &enabled, target, anthropic_messages_target_allowed)
+                .await?
+        {
+            let key = (
+                route_target.conn.id.clone(),
+                route_target.upstream_model.clone(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            out.push(route_target);
+        }
+    }
+    Ok(out)
+}
+
 fn route_target_has_candidate(
     enabled: &[connections::ConnectionRow],
     target: &routes::ModelRouteTarget,
@@ -863,15 +917,32 @@ pub(crate) struct UpstreamAttemptFailure {
     pub(crate) provider: String,
     pub(crate) message: String,
     pub(crate) status: Option<u16>,
+    /// Failure below (or without) an HTTP status: DNS/TLS/connect errors,
+    /// resets, and pre-content stream errors. Always worth trying the next
+    /// target — a different account/endpoint may well be reachable.
+    pub(crate) transport: bool,
 }
 
 impl UpstreamAttemptFailure {
+    /// Build a transport-class failure (no HTTP status, always retryable).
+    pub(crate) fn transport(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            message: message.into(),
+            status: None,
+            transport: true,
+        }
+    }
+
     fn display(&self) -> String {
         format!("[{}] {}", self.provider, self.message)
     }
 }
 
 pub(crate) fn should_try_next_target(failure: &UpstreamAttemptFailure) -> bool {
+    if failure.transport {
+        return true;
+    }
     let status_retryable = matches!(
         failure.status,
         Some(401 | 403 | 408 | 409 | 425 | 429 | 500..=599)
@@ -932,6 +1003,7 @@ pub(crate) async fn ensure_fresh_for_attempt(
                 target.conn.provider
             ),
             status: Some(401),
+            transport: false,
         });
     }
     Ok(())
@@ -952,6 +1024,7 @@ pub(crate) async fn upstream_status_failure(
         provider,
         message,
         status: Some(status),
+        transport: false,
     }
 }
 
@@ -1108,6 +1181,85 @@ impl MessageStreamEvent {
     }
 }
 
+/// Outcome of probing the head of an attempt's event stream before anything
+/// has been handed to the consumer.
+enum StreamProbe {
+    /// Content (or a clean end) was observed — deliver `buffered` then `rest`.
+    Deliver {
+        buffered: Vec<anyhow::Result<AnthropicEvent>>,
+        rest: mpsc::Receiver<anyhow::Result<AnthropicEvent>>,
+    },
+    /// The stream failed before producing any content — safe to fail over.
+    Failover(UpstreamAttemptFailure),
+}
+
+/// Watch the first events of a freshly-started attempt stream. Nothing has
+/// been forwarded to the consumer yet, so an error arriving before the first
+/// content event (`content_block_start`/`content_block_delta`) can still be
+/// converted into an attempt failure and the next target tried. From the
+/// first content event on, the stream belongs to the consumer — later errors
+/// flow through verbatim (failing over then would duplicate output).
+async fn probe_stream_head(
+    provider: &str,
+    mut rx: mpsc::Receiver<anyhow::Result<AnthropicEvent>>,
+) -> StreamProbe {
+    let mut buffered: Vec<anyhow::Result<AnthropicEvent>> = Vec::new();
+    loop {
+        let Some(item) = rx.recv().await else {
+            // Ended without content and without an error event — a valid
+            // (empty) completion; deliver whatever arrived.
+            return StreamProbe::Deliver { buffered, rest: rx };
+        };
+        let error_message = match &item {
+            Err(e) => Some(e.to_string()),
+            Ok((name, data)) if name == "error" => Some(
+                data.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("upstream error")
+                    .to_string(),
+            ),
+            Ok(_) => None,
+        };
+        if let Some(message) = error_message {
+            return StreamProbe::Failover(UpstreamAttemptFailure::transport(provider, message));
+        }
+        let is_content = matches!(
+            &item,
+            Ok((name, _)) if name == "content_block_start" || name == "content_block_delta"
+        );
+        buffered.push(item);
+        if is_content {
+            return StreamProbe::Deliver { buffered, rest: rx };
+        }
+    }
+}
+
+/// Re-join a probed stream: emit the buffered head events, then forward the
+/// rest of the upstream receiver.
+fn deliver_probed(
+    buffered: Vec<anyhow::Result<AnthropicEvent>>,
+    mut rest: mpsc::Receiver<anyhow::Result<AnthropicEvent>>,
+) -> mpsc::Receiver<anyhow::Result<AnthropicEvent>> {
+    if buffered.is_empty() {
+        return rest;
+    }
+    let (tx, out) = mpsc::channel(64);
+    tokio::spawn(async move {
+        for item in buffered {
+            if tx.send(item).await.is_err() {
+                return;
+            }
+        }
+        while let Some(item) = rest.recv().await {
+            if tx.send(item).await.is_err() {
+                return;
+            }
+        }
+    });
+    out
+}
+
 /// Route + send an Anthropic-Messages-format request exactly like
 /// `/v1/messages` (stream forced on) and yield Anthropic SSE events. The
 /// returned channel closes when the upstream stream ends. Both Anthropic-
@@ -1115,9 +1267,18 @@ impl MessageStreamEvent {
 /// (request translated, chunks re-encoded via
 /// [`translate::OpenAiToAnthropicStream`]) produce the same event shape.
 ///
-/// Errors surfaced BEFORE streaming (routing miss, dead OAuth token, a non-2xx
-/// upstream status) fail the call directly; a mid-stream transport error is
-/// delivered as a trailing `Err` in the channel.
+/// Failover: errors surfaced BEFORE streaming (routing miss, dead OAuth
+/// token, transport send failure, non-2xx status) rotate to the next target,
+/// and each attempt's stream head is probed ([`probe_stream_head`]) so an
+/// error arriving before the first content event rotates too. Once content
+/// has been delivered, a later error is delivered in-stream — failing over
+/// then would duplicate output.
+///
+/// Route continuation: for family/model-pinned requests (`"provider/model"`),
+/// once every same-family target from the initial routing pass has failed
+/// retryably, routing continues once down the first matching Model Route's
+/// targets, tried in their configured order while skipping any (connection,
+/// model) pair already attempted.
 pub async fn anthropic_messages_stream(
     ctx: &UpstreamCtx,
     body: Value,
@@ -1129,7 +1290,25 @@ pub async fn anthropic_messages_stream(
     }
 
     let mut failures = Vec::new();
-    for mut target in targets {
+    let mut attempted = std::collections::HashSet::<(String, String)>::new();
+    let mut queue = std::collections::VecDeque::from(targets);
+    let mut continued = false;
+    loop {
+        let Some(mut target) = queue.pop_front() else {
+            // Initial targets exhausted with only retryable failures
+            // (non-retryable ones returned early above): continue down the
+            // first Model Route containing the pinned (family, model) — once.
+            if continued {
+                break;
+            }
+            continued = true;
+            queue.extend(route_continuation_targets(&ctx.store, &requested, &attempted).await?);
+            if queue.is_empty() {
+                break;
+            }
+            continue;
+        };
+        attempted.insert((target.conn.id.clone(), target.upstream_model.clone()));
         if let Err(failure) = ensure_fresh_for_attempt(ctx, &mut target).await {
             let try_next = should_try_next_target(&failure);
             failures.push(failure);
@@ -1152,7 +1331,15 @@ pub async fn anthropic_messages_stream(
         if target.conn.provider == "kiro" {
             strip_thinking(&mut attempt_body);
             match kiro_stream(ctx, &mut target, &attempt_body, started).await {
-                Ok(rx) => return Ok(rx),
+                Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
+                    StreamProbe::Deliver { buffered, rest } => {
+                        return Ok(deliver_probed(buffered, rest));
+                    }
+                    StreamProbe::Failover(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                },
                 Err(failure) => {
                     let try_next = should_try_next_target(&failure);
                     failures.push(failure);
@@ -1169,7 +1356,15 @@ pub async fn anthropic_messages_stream(
         // match via its own translation + upstream pipeline.
         if target.conn.provider == "openai-oauth" {
             match codex_stream(ctx, &mut target, &attempt_body, started).await {
-                Ok(rx) => return Ok(rx),
+                Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
+                    StreamProbe::Deliver { buffered, rest } => {
+                        return Ok(deliver_probed(buffered, rest));
+                    }
+                    StreamProbe::Failover(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                },
                 Err(failure) => {
                     let try_next = should_try_next_target(&failure);
                     failures.push(failure);
@@ -1190,7 +1385,18 @@ pub async fn anthropic_messages_stream(
             ApiFormat::Anthropic => {
                 strip_thinking(&mut attempt_body);
                 let tool_map = claude_cloak_map_for(&target, &attempt_body);
-                let resp = send_upstream(ctx, &mut target, &attempt_body).await?;
+                let resp = match send_upstream(ctx, &mut target, &attempt_body).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        // Transport-level send failure (DNS/TLS/connect/reset):
+                        // record it and rotate instead of failing the call.
+                        failures.push(UpstreamAttemptFailure::transport(
+                            provider,
+                            format!("upstream send failed: {e}"),
+                        ));
+                        continue;
+                    }
+                };
                 if !resp.status().is_success() {
                     let failure = upstream_status_failure(provider, resp).await;
                     let try_next = should_try_next_target(&failure);
@@ -1214,14 +1420,33 @@ pub async fn anthropic_messages_stream(
                     )
                     .await;
                 });
-                return Ok(rx);
+                match probe_stream_head(&target.conn.provider, rx).await {
+                    StreamProbe::Deliver { buffered, rest } => {
+                        return Ok(deliver_probed(buffered, rest));
+                    }
+                    StreamProbe::Failover(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                }
             }
             ApiFormat::OpenAi => {
                 // Not stripped here: `anthropic_to_openai_request` translates
                 // `thinking` into `reasoning_effort` for this wire format.
                 let mut upstream_body = translate::anthropic_to_openai_request(&attempt_body)?;
                 apply_max_completion_tokens(target.desc, &mut upstream_body);
-                let resp = send_upstream(ctx, &mut target, &upstream_body).await?;
+                let resp = match send_upstream(ctx, &mut target, &upstream_body).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        // Transport-level send failure (DNS/TLS/connect/reset):
+                        // record it and rotate instead of failing the call.
+                        failures.push(UpstreamAttemptFailure::transport(
+                            provider,
+                            format!("upstream send failed: {e}"),
+                        ));
+                        continue;
+                    }
+                };
                 if !resp.status().is_success() {
                     let failure = upstream_status_failure(provider, resp).await;
                     let try_next = should_try_next_target(&failure);
@@ -1246,7 +1471,15 @@ pub async fn anthropic_messages_stream(
                     )
                     .await;
                 });
-                return Ok(rx);
+                match probe_stream_head(&target.conn.provider, rx).await {
+                    StreamProbe::Deliver { buffered, rest } => {
+                        return Ok(deliver_probed(buffered, rest));
+                    }
+                    StreamProbe::Failover(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -1262,7 +1495,25 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
     }
 
     let mut failures = Vec::new();
-    for mut target in targets {
+    let mut attempted = std::collections::HashSet::<(String, String)>::new();
+    let mut queue = std::collections::VecDeque::from(targets);
+    let mut continued = false;
+    loop {
+        let Some(mut target) = queue.pop_front() else {
+            // Initial targets exhausted with only retryable failures
+            // (non-retryable ones returned early above): continue down the
+            // first Model Route containing the pinned (family, model) — once.
+            if continued {
+                break;
+            }
+            continued = true;
+            queue.extend(route_continuation_targets(&ctx.store, &requested, &attempted).await?);
+            if queue.is_empty() {
+                break;
+            }
+            continue;
+        };
+        attempted.insert((target.conn.id.clone(), target.upstream_model.clone()));
         if let Err(failure) = ensure_fresh_for_attempt(ctx, &mut target).await {
             let try_next = should_try_next_target(&failure);
             failures.push(failure);
@@ -1279,7 +1530,18 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
             ApiFormat::Anthropic => {
                 let provider = target.conn.provider.clone();
                 let tool_map = claude_cloak_map_for(&target, &attempt_body);
-                let resp = send_upstream(ctx, &mut target, &attempt_body).await?;
+                let resp = match send_upstream(ctx, &mut target, &attempt_body).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        // Transport-level send failure (DNS/TLS/connect/reset):
+                        // record it and rotate instead of failing the call.
+                        failures.push(UpstreamAttemptFailure::transport(
+                            provider,
+                            format!("upstream send failed: {e}"),
+                        ));
+                        continue;
+                    }
+                };
                 if !resp.status().is_success() {
                     let failure = upstream_status_failure(provider, resp).await;
                     let try_next = should_try_next_target(&failure);
@@ -1298,7 +1560,18 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
                     .or_else(|_| translate::anthropic_to_openai_request(&attempt_body))?;
                 apply_max_completion_tokens(target.desc, &mut upstream_body);
                 let provider = target.conn.provider.clone();
-                let resp = send_upstream(ctx, &mut target, &upstream_body).await?;
+                let resp = match send_upstream(ctx, &mut target, &upstream_body).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        // Transport-level send failure (DNS/TLS/connect/reset):
+                        // record it and rotate instead of failing the call.
+                        failures.push(UpstreamAttemptFailure::transport(
+                            provider,
+                            format!("upstream send failed: {e}"),
+                        ));
+                        continue;
+                    }
+                };
                 if !resp.status().is_success() {
                     let failure = upstream_status_failure(provider, resp).await;
                     let try_next = should_try_next_target(&failure);
@@ -1317,6 +1590,13 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
 }
 
 /// Pump an Anthropic-format upstream SSE response into `(name, Value)` events.
+///
+/// Mirrors the OpenAI-translated pump's `saw_terminal` guard
+/// (`translate::OpenAiToAnthropicStream::saw_terminal`): a 2xx stream that
+/// ends without `message_stop` (or an explicit `error` event) is a truncated
+/// stream, not a completed one — emit a terminal error event instead of
+/// ending silently as a "(no output)" turn. Emitted before any content, the
+/// error also lets `probe_stream_head` rotate to the next target.
 #[allow(clippy::too_many_arguments)]
 async fn pump_anthropic(
     resp: reqwest::Response,
@@ -1335,6 +1615,7 @@ async fn pump_anthropic(
     let mut input_tokens = 0i64;
     let mut output_tokens = 0i64;
     let mut errored = false;
+    let mut saw_terminal = false;
     'pump: while let Some(item) = stream.next().await {
         let chunk = match item {
             Ok(c) => c,
@@ -1361,10 +1642,23 @@ async fn pump_anthropic(
             if let Some(u) = v.get("usage") {
                 output_tokens += u.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
             }
+            if name == "message_stop" || name == "error" {
+                saw_terminal = true;
+            }
             if tx.send(Ok((name, v))).await.is_err() {
                 break 'pump; // consumer dropped
             }
         }
+    }
+    if !errored && !saw_terminal {
+        let _ = tx
+            .send(Ok((
+                "error".to_string(),
+                json!({"type": "error", "error": {"type": "api_error",
+                       "message": "upstream stream ended without a terminal event"}}),
+            )))
+            .await;
+        errored = true;
     }
     crate::llm_router::usage::record(
         &store,
@@ -1557,13 +1851,12 @@ async fn kiro_stream(
         &target.conn.data,
         &conversation_id,
     );
-    let resp = send_kiro(ctx, target, &kiro_body)
-        .await
-        .map_err(|e| UpstreamAttemptFailure {
-            provider: target.conn.provider.clone(),
-            message: format!("upstream kiro: {e}"),
-            status: None,
-        })?;
+    let resp = send_kiro(ctx, target, &kiro_body).await.map_err(|e| {
+        UpstreamAttemptFailure::transport(
+            target.conn.provider.clone(),
+            format!("upstream kiro: {e}"),
+        )
+    })?;
     if !resp.status().is_success() {
         return Err(upstream_status_failure(target.conn.provider.clone(), resp).await);
     }
@@ -1663,11 +1956,7 @@ async fn codex_stream(
     // immutably borrowed across the `send_upstream(ctx, target, ...)` call
     // below, which needs `&mut target`.
     let provider = target.conn.provider.clone();
-    let fail = |e: String| UpstreamAttemptFailure {
-        provider: provider.clone(),
-        message: e,
-        status: None,
-    };
+    let fail = |e: String| UpstreamAttemptFailure::transport(provider.clone(), e);
     let chat = translate::anthropic_to_openai_request(body).map_err(|e| fail(e.to_string()))?;
     let mut responses = crate::llm_router::codex::openai_chat_to_responses_request(&chat);
     crate::llm_router::codex::normalize_codex_responses_body(
@@ -1801,6 +2090,507 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         UpstreamCtx::new(store)
+    }
+
+    /// Drain an `anthropic_messages_stream` receiver, panicking on transport
+    /// `Err` items (none of these tests expect one).
+    async fn collect_stream(
+        mut rx: mpsc::Receiver<anyhow::Result<AnthropicEvent>>,
+    ) -> Vec<AnthropicEvent> {
+        let mut out = Vec::new();
+        while let Some(item) = rx.recv().await {
+            out.push(item.expect("stream must not carry transport Err items in this test"));
+        }
+        out
+    }
+
+    /// Concatenated text of every text_delta in the collected events.
+    fn stream_text(events: &[AnthropicEvent]) -> String {
+        events
+            .iter()
+            .filter(|(name, _)| name.as_str() == "content_block_delta")
+            .filter_map(|(_, data)| data["delta"]["text"].as_str())
+            .collect()
+    }
+
+    /// A complete, well-terminated Anthropic SSE stream ("rotated").
+    const SSE_OK_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ok\",\"model\":\"claude-t\",\"usage\":{\"input_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"rotated\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    #[test]
+    fn transport_failures_are_always_retryable() {
+        let transport = UpstreamAttemptFailure::transport("anthropic", "connection refused");
+        assert!(should_try_next_target(&transport));
+
+        // A plain 400 without a retryable message stays non-retryable.
+        let bad_request = UpstreamAttemptFailure {
+            provider: "anthropic".into(),
+            message: "invalid request".into(),
+            status: Some(400),
+            transport: false,
+        };
+        assert!(!should_try_next_target(&bad_request));
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_rotates_past_transport_send_error() {
+        use axum::{routing::post, Json, Router};
+
+        async fn ok(Json(body): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": body["model"].clone(),
+                "content": [{"type": "text", "text": "fallback worked"}],
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }))
+        }
+
+        // A port with nothing listening: bind, read the port, drop the listener.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let app = Router::new().route("/messages", post(ok));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "dead",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-dead".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{dead_port}")),
+                    models_override: Some(vec!["claude-t".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "live",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-live".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["claude-t".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let response = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "anthropic/claude-t",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["content"][0]["text"], "fallback worked");
+    }
+
+    #[tokio::test]
+    async fn stream_rotates_past_transport_send_error() {
+        use axum::{routing::post, Router};
+
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let app = Router::new().route(
+            "/messages",
+            post(|| async { ([("content-type", "text/event-stream")], SSE_OK_STREAM) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "dead",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-dead".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{dead_port}")),
+                    models_override: Some(vec!["claude-t".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "live",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-live".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["claude-t".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({
+                "model": "anthropic/claude-t",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        assert_eq!(stream_text(&events), "rotated");
+    }
+
+    /// 2xx stream that errors before any content event.
+    const SSE_ERROR_BEFORE_CONTENT: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+
+    /// 2xx stream that errors AFTER content already flowed.
+    const SSE_CONTENT_THEN_ERROR: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+
+    /// Two anthropic api_key accounts serving `claude-t`, first→/first,
+    /// second→/second on the given mock port.
+    async fn add_two_anthropic_accounts(ctx: &UpstreamCtx, port: u16) {
+        for (id, path) in [("first", "first"), ("second", "second")] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    "anthropic",
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some(format!("sk-{id}")),
+                        base_url_override: Some(format!("http://127.0.0.1:{port}/{path}")),
+                        models_override: Some(vec!["claude-t".into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_rotates_on_error_event_before_first_content() {
+        use axum::{routing::post, Router};
+
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_ERROR_BEFORE_CONTENT,
+                    )
+                }),
+            )
+            .route(
+                "/second/messages",
+                post(|| async { ([("content-type", "text/event-stream")], SSE_OK_STREAM) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        assert_eq!(stream_text(&events), "rotated");
+        assert!(
+            !events.iter().any(|(name, _)| name.as_str() == "error"),
+            "the first target's pre-content error must not leak to the consumer: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_rotate_after_first_content_token() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits_handler = second_hits.clone();
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_CONTENT_THEN_ERROR,
+                    )
+                }),
+            )
+            .route(
+                "/second/messages",
+                post(move || {
+                    let hits = second_hits_handler.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        ([("content-type", "text/event-stream")], SSE_OK_STREAM)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        assert_eq!(stream_text(&events), "partial");
+        assert!(
+            events
+                .iter()
+                .any(|(name, data)| name.as_str() == "error"
+                    && data["error"]["message"] == "Overloaded"),
+            "post-content errors surface to the consumer instead of rotating: {events:?}"
+        );
+        assert_eq!(
+            second_hits.load(Ordering::SeqCst),
+            0,
+            "must not fail over once content has been delivered"
+        );
+    }
+
+    /// When every target's stream errors before any content, the call
+    /// returns `Err` (the aggregated fallback error) instead of handing back
+    /// a stream that would carry the last target's error event verbatim.
+    #[tokio::test]
+    async fn stream_returns_err_when_every_target_fails_pre_content() {
+        use axum::{routing::post, Router};
+
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_ERROR_BEFORE_CONTENT,
+                    )
+                }),
+            )
+            .route(
+                "/second/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_ERROR_BEFORE_CONTENT,
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+
+        let err = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Overloaded"),
+            "expected the aggregated fallback error to mention both attempts' failures: {err}"
+        );
+    }
+
+    /// 2xx stream with content but NO terminal event (no message_stop).
+    const SSE_TRUNCATED_NO_TERMINAL: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half\"}}\n\n",
+    );
+
+    /// 2xx stream that ends after message_start — no content, no terminal.
+    const SSE_MESSAGE_START_ONLY: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+    );
+
+    #[tokio::test]
+    async fn stream_surfaces_error_when_2xx_stream_ends_without_terminal_event() {
+        use axum::{routing::post, Router};
+
+        let app = Router::new().route(
+            "/messages",
+            post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    SSE_TRUNCATED_NO_TERMINAL,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "only",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-only".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["claude-t".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        // The content that DID arrive is preserved…
+        assert_eq!(stream_text(&events), "half");
+        // …and the silent truncation becomes an explicit terminal error.
+        let (last_name, last_data) = events.last().expect("stream must not be empty");
+        assert_eq!(last_name, "error");
+        assert_eq!(
+            last_data["error"]["message"],
+            "upstream stream ended without a terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_rotates_past_stream_missing_terminal_before_content() {
+        use axum::{routing::post, Router};
+
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async {
+                    (
+                        [("content-type", "text/event-stream")],
+                        SSE_MESSAGE_START_ONLY,
+                    )
+                }),
+            )
+            .route(
+                "/second/messages",
+                post(|| async { ([("content-type", "text/event-stream")], SSE_OK_STREAM) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        // The empty first stream (no terminal event, no content) triggers the
+        // guard's error event, which the pre-content probe converts into a
+        // rotation to the second account.
+        assert_eq!(stream_text(&events), "rotated");
+        assert!(
+            !events.iter().any(|(name, _)| name.as_str() == "error"),
+            "empty truncated stream must rotate, not surface: {events:?}"
+        );
     }
 
     #[test]
@@ -3356,6 +4146,267 @@ mod tests {
             MessageStreamEvent::from_event(&stop),
             Some(MessageStreamEvent::MessageStop)
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_family_exhaustion_continues_down_matching_route() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let quota_hits = Arc::new(AtomicUsize::new(0));
+        let quota_hits_handler = quota_hits.clone();
+
+        async fn ok(Json(body): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": body["model"].clone(),
+                "content": [{"type": "text", "text": "route continuation worked"}],
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }))
+        }
+
+        let app = Router::new()
+            .route(
+                "/quota/messages",
+                post(move || {
+                    let hits = quota_hits_handler.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({"error": {"message": "You're out of extra usage."}})),
+                        )
+                    }
+                }),
+            )
+            .route("/backup/messages", post(ok));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        // The only account serving the pinned model — quota'd out.
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "pinned-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-a".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/quota")),
+                    models_override: Some(vec!["claude-a".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        // Serves only the route's second target model.
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "backup-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-b".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/backup")),
+                    models_override: Some(vec!["claude-b".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "task".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-a".into(),
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-b".into(),
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "anthropic/claude-a",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["content"][0]["text"], "route continuation worked");
+        assert_eq!(response["model"], "claude-b");
+        // The (pinned-acct, claude-a) pair was already attempted in the
+        // family pass — the route continuation must not retry it.
+        assert_eq!(quota_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_continues_down_route_after_family_exhaustion() {
+        use axum::{routing::post, Json, Router};
+
+        let app = Router::new()
+            .route(
+                "/quota/messages",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({"error": {"message": "You're out of extra usage."}})),
+                    )
+                }),
+            )
+            .route(
+                "/backup/messages",
+                post(|| async { ([("content-type", "text/event-stream")], SSE_OK_STREAM) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "pinned-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-a".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/quota")),
+                    models_override: Some(vec!["claude-a".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "backup-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-b".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/backup")),
+                    models_override: Some(vec!["claude-b".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "task".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-a".into(),
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-b".into(),
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let rx = anthropic_messages_stream(
+            &ctx,
+            json!({
+                "model": "anthropic/claude-a",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap();
+        let events = collect_stream(rx).await;
+
+        assert_eq!(stream_text(&events), "rotated");
+    }
+
+    #[tokio::test]
+    async fn pinned_family_exhaustion_without_matching_route_surfaces_failures() {
+        use axum::{routing::post, Json, Router};
+
+        let app = Router::new().route(
+            "/messages",
+            post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error": {"message": "You're out of extra usage."}})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "only-acct",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-a".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["claude-a".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let err = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "anthropic/claude-a",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("out of extra usage"), "got: {err}");
     }
 
     #[test]

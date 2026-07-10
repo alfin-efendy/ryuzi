@@ -134,10 +134,14 @@ impl ContextManager {
         self.append_user(Value::Array(truncated)).await
     }
 
-    /// Request messages: the history, with a moving `cache_control` breakpoint
-    /// on the final message's last block when the model supports caching.
+    /// Request messages: the history — first sanitized so any dangling
+    /// `tool_use` from an interrupted prior turn is repaired (Anthropic 400s
+    /// an unpaired `tool_use`; see [`Ledger::messages_for_request`]) — then
+    /// with a moving `cache_control` breakpoint on the final message's last
+    /// block when the model supports caching. The sanitize runs first so the
+    /// cache breakpoint lands on the actual last block of the sent body.
     pub fn messages_for_request(&self) -> Vec<Value> {
-        let mut msgs = self.ledger.messages();
+        let mut msgs = self.ledger.messages_for_request();
         if self.cfg.meta.supports_prompt_cache {
             if let Some(last) = msgs.last_mut() {
                 if let Some(blocks) = last["content"].as_array_mut() {

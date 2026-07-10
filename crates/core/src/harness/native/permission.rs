@@ -13,6 +13,7 @@ use crate::domain::{CoreEvent, PermMode};
 use crate::harness::native::tools::PermissionSpec;
 use crate::policy::{decide_tool_permission, PolicyOutcome};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 /// The outcome of a permission check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +37,9 @@ fn key_to_policy_tool(key: &str) -> &str {
 
 /// Decide whether a native tool call may proceed. Auto-allows via
 /// `PermMode`/project policy where possible; otherwise prompts the user and
-/// blocks on their reply.
+/// blocks on their reply — or on the turn's cancellation token, so a stopped
+/// turn is denied ("interrupted") instead of parking forever with a dangling
+/// `tool_use` in the ledger.
 #[allow(clippy::too_many_arguments)]
 pub async fn evaluate(
     spec: &PermissionSpec,
@@ -46,6 +49,7 @@ pub async fn evaluate(
     tool_call_id: &str,
     approvals: &ApprovalHub,
     events: &broadcast::Sender<CoreEvent>,
+    cancel: &CancellationToken,
 ) -> PermDecision {
     let tool = key_to_policy_tool(&spec.key);
     match decide_tool_permission(perm_mode, project_policy, tool) {
@@ -54,18 +58,28 @@ pub async fn evaluate(
         PolicyOutcome::Deny => return PermDecision::Deny,
         PolicyOutcome::Prompt => {}
     }
-    // Prompt: register a pending approval, surface it, and await the reply.
-    let rx = approvals.register(tool_call_id.to_string());
+    // Prompt: register a pending approval (scoped to the session so a
+    // session-wide stop can deny it), surface it, and await the reply.
+    let rx = approvals.register_for_session(session_pk, tool_call_id.to_string());
     let _ = events.send(CoreEvent::ApprovalRequested {
         session_pk: session_pk.to_string(),
         request_id: tool_call_id.to_string(),
         tool: spec.key.clone(),
         summary: spec.summary.clone(),
     });
-    match rx.await {
-        Ok(true) => PermDecision::Allow,
-        // Explicit deny, or the sender was dropped (session ended) — deny.
-        Ok(false) | Err(_) => PermDecision::Deny,
+    tokio::select! {
+        biased;
+        // Turn stopped while parked: deny, and deregister the abandoned
+        // prompt so a later resolve() can't hit a stale entry.
+        _ = cancel.cancelled() => {
+            approvals.resolve(tool_call_id, false);
+            PermDecision::Deny
+        }
+        res = rx => match res {
+            Ok(true) => PermDecision::Allow,
+            // Explicit deny, or the sender was dropped (session ended) — deny.
+            Ok(false) | Err(_) => PermDecision::Deny,
+        },
     }
 }
 
@@ -82,7 +96,17 @@ mod tests {
         let hub = ApprovalHub::new();
         let (tx, _rx) = broadcast::channel(4);
         for key in ["read", "todoread", "todowrite"] {
-            let d = evaluate(&spec(key), PermMode::Default, None, "s", "t1", &hub, &tx).await;
+            let d = evaluate(
+                &spec(key),
+                PermMode::Default,
+                None,
+                "s",
+                "t1",
+                &hub,
+                &tx,
+                &CancellationToken::new(),
+            )
+            .await;
             assert_eq!(d, PermDecision::Allow, "key {key} should auto-allow");
         }
         assert!(!hub.has_pending(), "no prompt should have been registered");
@@ -93,11 +117,31 @@ mod tests {
         let hub = ApprovalHub::new();
         let (tx, _rx) = broadcast::channel(4);
         // Read-class tools still auto-allow under Plan.
-        let read = evaluate(&spec("read"), PermMode::Plan, None, "s", "t1", &hub, &tx).await;
+        let read = evaluate(
+            &spec("read"),
+            PermMode::Plan,
+            None,
+            "s",
+            "t1",
+            &hub,
+            &tx,
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(read, PermDecision::Allow);
         // Edit + bash are hard-denied WITHOUT registering a prompt.
         for key in ["edit", "bash"] {
-            let d = evaluate(&spec(key), PermMode::Plan, None, "s", "t2", &hub, &tx).await;
+            let d = evaluate(
+                &spec(key),
+                PermMode::Plan,
+                None,
+                "s",
+                "t2",
+                &hub,
+                &tx,
+                &CancellationToken::new(),
+            )
+            .await;
             assert_eq!(d, PermDecision::Deny, "{key} must be denied in Plan mode");
         }
         assert!(!hub.has_pending(), "Plan denial must not prompt the user");
@@ -115,6 +159,7 @@ mod tests {
             "t1",
             &hub,
             &tx,
+            &CancellationToken::new(),
         )
         .await;
         assert_eq!(d, PermDecision::Allow);
@@ -132,6 +177,7 @@ mod tests {
             "t1",
             &hub,
             &tx,
+            &CancellationToken::new(),
         )
         .await;
         assert_eq!(d, PermDecision::Allow);
@@ -163,6 +209,7 @@ mod tests {
             "call-1",
             &hub,
             &tx,
+            &CancellationToken::new(),
         )
         .await;
         waiter.await.unwrap();
@@ -187,8 +234,37 @@ mod tests {
             "call-2",
             &hub,
             &tx,
+            &CancellationToken::new(),
         )
         .await;
         assert_eq!(d, PermDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn cancellation_unblocks_a_parked_prompt_as_deny_and_deregisters() {
+        let hub = ApprovalHub::new();
+        let (tx, _rx) = broadcast::channel(4);
+        let cancel = CancellationToken::new();
+        let bash_spec = spec("bash");
+        let fut = evaluate(
+            &bash_spec,
+            PermMode::Default,
+            None,
+            "s",
+            "call-3",
+            &hub,
+            &tx,
+            &cancel,
+        );
+        tokio::pin!(fut);
+        // First poll drives evaluate up to the parked prompt.
+        assert!(futures::poll!(fut.as_mut()).is_pending());
+        assert!(hub.has_pending(), "the prompt was registered");
+        cancel.cancel();
+        assert_eq!(fut.await, PermDecision::Deny);
+        assert!(
+            !hub.has_pending(),
+            "a cancelled prompt must be deregistered so it can't be resolved later"
+        );
     }
 }

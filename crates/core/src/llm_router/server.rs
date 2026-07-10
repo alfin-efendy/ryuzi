@@ -319,7 +319,7 @@ async fn handle_messages(
         let outcome: Result<Response, AttemptError> = match target.desc.format {
             ApiFormat::Anthropic => {
                 let started = crate::paths::now_ms();
-                match proxy_passthrough(&state, &mut target, &attempt_body, anthropic_error).await {
+                match proxy_passthrough(&state, &mut target, &attempt_body).await {
                     Ok(resp) => {
                         crate::llm_router::usage::record(
                             &state.store,
@@ -359,7 +359,7 @@ async fn handle_messages(
                         .await
                 } else {
                     let started = crate::paths::now_ms();
-                    match send_json(&state, &mut target, &upstream_body, anthropic_error).await {
+                    match send_json(&state, &mut target, &upstream_body).await {
                         Ok(v) => {
                             let u = crate::llm_router::usage::usage_from_openai(&v);
                             crate::llm_router::usage::record(
@@ -465,7 +465,7 @@ async fn handle_chat(
         let outcome: Result<Response, AttemptError> = match target.desc.format {
             ApiFormat::OpenAi => {
                 let started = crate::paths::now_ms();
-                match proxy_passthrough(&state, &mut target, &attempt_body, openai_error).await {
+                match proxy_passthrough(&state, &mut target, &attempt_body).await {
                     Ok(resp) => {
                         crate::llm_router::usage::record(
                             &state.store,
@@ -500,7 +500,7 @@ async fn handle_chat(
                         .await
                 } else {
                     let started = crate::paths::now_ms();
-                    match send_json(&state, &mut target, &upstream_body, openai_error).await {
+                    match send_json(&state, &mut target, &upstream_body).await {
                         Ok(v) => {
                             let u = crate::llm_router::usage::usage_from_anthropic(&v);
                             crate::llm_router::usage::record(
@@ -599,7 +599,7 @@ async fn handle_responses(
             let mut passthrough_body = body.clone();
             normalize_codex_responses_body(&mut passthrough_body, &target.upstream_model, None);
             let started = crate::paths::now_ms();
-            match proxy_passthrough(&state, &mut target, &passthrough_body, openai_error).await {
+            match proxy_passthrough(&state, &mut target, &passthrough_body).await {
                 Ok(resp) => {
                     crate::llm_router::usage::record(
                         &state.store,
@@ -659,7 +659,7 @@ async fn handle_responses(
         let outcome: Result<Response, AttemptError> = if stream {
             stream_responses(&state, &mut target, &upstream_body, started).await
         } else {
-            match send_json(&state, &mut target, &upstream_body, openai_error).await {
+            match send_json(&state, &mut target, &upstream_body).await {
                 Ok(v) => {
                     // normalize to OpenAI chat shape first
                     let chat_resp = match target.desc.format {
@@ -775,7 +775,14 @@ async fn handle_count_tokens(
 
 /// The outcome of a single upstream attempt that didn't succeed.
 enum AttemptError {
-    /// Return to the client immediately (transport error, translation error).
+    /// Return to the client immediately, bypassing failover. Transport-level
+    /// send errors no longer take this arm (see `connect_upstream`/
+    /// `send_json`, which now classify them as retryable `Failed` instead) —
+    /// nothing constructs `Fatal` today, but the variant and its match arms
+    /// are kept as the non-retryable escape hatch for a future error class
+    /// that genuinely shouldn't fail over (e.g. a request-shape/translation
+    /// error caught here rather than earlier).
+    #[allow(dead_code)]
     Fatal(Response),
     /// Candidate for failover — try the next target if the predicate allows.
     Failed(crate::llm_router::client::UpstreamAttemptFailure),
@@ -802,13 +809,13 @@ fn give_up(
 }
 
 /// Send the upstream request and pre-check status. A non-2xx becomes a
-/// retryable `Failed`; a transport error is `Fatal` (matches the native
-/// path, which aborts on send errors rather than failing over).
+/// retryable `Failed`; a transport-level send error (DNS/TLS/connect/reset)
+/// is also a retryable `Failed` of the transport class — matching the native
+/// path, which rotates past send errors.
 async fn connect_upstream(
     state: &AppState,
     target: &mut RouteTarget,
     body: &Value,
-    err: fn(StatusCode, &str) -> Response,
 ) -> Result<reqwest::Response, AttemptError> {
     match send_upstream(&state.ctx(), target, body).await {
         Ok(resp) if resp.status().is_success() => Ok(resp),
@@ -816,10 +823,12 @@ async fn connect_upstream(
             crate::llm_router::client::upstream_status_failure(target.conn.provider.clone(), resp)
                 .await,
         )),
-        Err(e) => Err(AttemptError::Fatal(err(
-            StatusCode::BAD_GATEWAY,
-            &format!("upstream {}: {e}", target.conn.provider),
-        ))),
+        Err(e) => Err(AttemptError::Failed(
+            crate::llm_router::client::UpstreamAttemptFailure::transport(
+                target.conn.provider.clone(),
+                format!("upstream send failed: {e}"),
+            ),
+        )),
     }
 }
 
@@ -827,16 +836,17 @@ async fn send_json(
     state: &AppState,
     target: &mut RouteTarget,
     body: &Value,
-    err: fn(StatusCode, &str) -> Response,
 ) -> Result<Value, AttemptError> {
     let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
     let resp = send_upstream(&state.ctx(), target, body)
         .await
         .map_err(|e| {
-            AttemptError::Fatal(err(
-                StatusCode::BAD_GATEWAY,
-                &format!("upstream {}: {e}", target.conn.provider),
-            ))
+            AttemptError::Failed(
+                crate::llm_router::client::UpstreamAttemptFailure::transport(
+                    target.conn.provider.clone(),
+                    format!("upstream send failed: {e}"),
+                ),
+            )
         })?;
     let status = resp.status();
     let mut v: Value = resp.json().await.unwrap_or(json!({}));
@@ -847,6 +857,7 @@ async fn send_json(
                 provider: target.conn.provider.clone(),
                 message: msg.to_string(),
                 status: Some(status.as_u16()),
+                transport: false,
             },
         ));
     }
@@ -871,10 +882,9 @@ async fn proxy_passthrough(
     state: &AppState,
     target: &mut RouteTarget,
     body: &Value,
-    err: fn(StatusCode, &str) -> Response,
 ) -> Result<Response, AttemptError> {
     let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
-    let resp = connect_upstream(state, target, body, err).await?;
+    let resp = connect_upstream(state, target, body).await?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ct = resp
         .headers()
@@ -1097,7 +1107,7 @@ async fn stream_openai_upstream_to_anthropic(
     ctx: RecordCtx,
 ) -> Result<Response, AttemptError> {
     let model = upstream_body["model"].as_str().unwrap_or("").to_string();
-    let resp = connect_upstream(state, target, upstream_body, anthropic_error).await?;
+    let resp = connect_upstream(state, target, upstream_body).await?;
     Ok(sse_response(spawn_openai_to_anthropic_pump(
         resp,
         model,
@@ -1115,7 +1125,7 @@ async fn stream_anthropic_upstream_to_openai(
 ) -> Result<Response, AttemptError> {
     let tool_map =
         claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);
-    let resp = connect_upstream(state, target, upstream_body, openai_error).await?;
+    let resp = connect_upstream(state, target, upstream_body).await?;
     Ok(sse_response(spawn_anthropic_to_openai_pump(
         resp,
         state.store.clone(),
@@ -1133,7 +1143,7 @@ async fn stream_responses(
     upstream_body: &Value,
     started: i64,
 ) -> Result<Response, AttemptError> {
-    let resp = connect_upstream(state, target, upstream_body, openai_error).await?;
+    let resp = connect_upstream(state, target, upstream_body).await?;
     let anthropic_upstream = matches!(target.desc.format, ApiFormat::Anthropic);
     let tool_map =
         claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);

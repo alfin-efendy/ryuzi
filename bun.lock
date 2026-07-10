@@ -32,6 +32,8 @@
         "@xterm/addon-search": "^0.16.0",
         "@xterm/addon-webgl": "^0.19.0",
         "@xterm/xterm": "^6.0.0",
+        "hast-util-to-jsx-runtime": "^2.3.6",
+        "lowlight": "^3.3.0",
         "lucide-react": "^1.22.0",
         "react": "^19",
         "react-dom": "^19",

@@ -91,6 +91,36 @@ function persist(key: string, value: string): void {
   if (typeof localStorage !== "undefined") localStorage.setItem(key, value);
 }
 
+const KEY_DRAFTS = "cockpit.composer.drafts";
+
+/** Parse the persisted composer-drafts map. Malformed JSON, non-object shapes,
+ *  and non-string/empty entries collapse away — a corrupt localStorage value
+ *  must never take the composer down. Pure so it is directly testable. */
+export function readDrafts(raw: string | null): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "string" && v !== "") out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** Set/replace one draft. Empty text deletes the key (identity-preserving no-op
+ *  when absent) so the persisted map only holds composers with real unsent text. */
+export function upsertDraft(drafts: Record<string, string>, key: string, text: string): Record<string, string> {
+  if (text === "") {
+    if (!(key in drafts)) return drafts;
+    return Object.fromEntries(Object.entries(drafts).filter(([k]) => k !== key));
+  }
+  return { ...drafts, [key]: text };
+}
+
 type NavState = {
   history: NavHistory;
   sidebarOpen: boolean;
@@ -107,6 +137,9 @@ type NavState = {
   composerUseWorktree: boolean;
   /** Model the next composed session should run on; null = project/runtime default. */
   composerModel: string | null;
+  /** Unsent composer text keyed by composer identity: a sessionPk (SessionView)
+   *  or `home:{projectId}` (HomeView). Persisted so drafts survive restarts. */
+  drafts: Record<string, string>;
   projectSettingsFor: string | null;
   view: () => View;
   navigate: (view: View) => void;
@@ -124,6 +157,10 @@ type NavState = {
   setComposerBranch: (b: string | null) => void;
   setComposerUseWorktree: (v: boolean) => void;
   setComposerModel: (model: string | null) => void;
+  setDraft: (key: string, text: string) => void;
+  clearDraft: (key: string) => void;
+  /** Refill a draft after a failed send — no-op if the user already typed anew. */
+  restoreDraft: (key: string, text: string) => void;
   setProjectSettingsFor: (id: string | null) => void;
 };
 
@@ -144,6 +181,7 @@ export const useNav = create<NavState>((set, get) => ({
   composerBranch: null,
   composerUseWorktree: true,
   composerModel: null,
+  drafts: readDrafts(readStored(KEY_DRAFTS)),
   projectSettingsFor: null,
 
   view: () => get().history.current,
@@ -190,5 +228,15 @@ export const useNav = create<NavState>((set, get) => ({
   setComposerBranch: (b) => set({ composerBranch: b }),
   setComposerUseWorktree: (v) => set({ composerUseWorktree: v }),
   setComposerModel: (model) => set({ composerModel: model }),
+  setDraft: (key, text) =>
+    set((s) => {
+      const drafts = upsertDraft(s.drafts, key, text);
+      if (drafts !== s.drafts) persist(KEY_DRAFTS, JSON.stringify(drafts));
+      return { drafts };
+    }),
+  clearDraft: (key) => get().setDraft(key, ""),
+  restoreDraft: (key, text) => {
+    if ((get().drafts[key] ?? "") === "") get().setDraft(key, text);
+  },
   setProjectSettingsFor: (id) => set({ projectSettingsFor: id }),
 }));

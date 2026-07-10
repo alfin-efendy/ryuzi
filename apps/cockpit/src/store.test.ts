@@ -1,6 +1,7 @@
-import { test, expect, spyOn } from "bun:test";
+import { test, expect, mock, spyOn } from "bun:test";
 import { useStore } from "./store";
 import { commands } from "./bindings";
+import { useNative } from "./store-native";
 
 function reset() {
   useStore.setState({
@@ -217,7 +218,7 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
     },
   ];
   await useStore.getState().hydrateTranscript("s1", async () => {
-    // Simulates events landing while listMessages is in flight.
+    // Simulates an event landing while listMessages is in flight.
     useStore.getState().applyCoreEvent({
       kind: "message",
       session_pk: "s1",
@@ -229,24 +230,12 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
       status: null,
       tool_kind: null,
     });
-    useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "transient" });
     return dbRows;
   });
   const st = useStore.getState();
-  expect(st.transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3, 0]);
+  expect(st.transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3]);
   expect(st.transcripts.s1[2].text).toBe("live");
-  expect(st.transcripts.s1[3].blockType).toBe("error");
   expect(st.lastSeq.s1).toBe(3);
-});
-
-test("transient error events append a seq-0 error row", () => {
-  reset();
-  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "spawn failed" });
-  const rows = useStore.getState().transcripts.s1;
-  expect(rows).toHaveLength(1);
-  expect(rows[0].seq).toBe(0);
-  expect(rows[0].blockType).toBe("error");
-  expect(rows[0].text).toBe("spawn failed");
 });
 
 test("approval.requested adds a pending approval; resolving removes it", () => {
@@ -332,6 +321,73 @@ test("result event leaves other sessions' status untouched", () => {
   useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
   const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
   expect(byPk).toEqual({ s1: "idle", s2: "running" });
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("error event flips the failed session back to idle and leaves others untouched", () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1"), runningSession("s2")] });
+  // error also fires a fire-and-forget refresh(); stub its IPC calls (never
+  // resolving, like the "result" tests do) so nothing hits the real Tauri
+  // binding after this test ends.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "upstream quota exhausted" });
+  const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
+  expect(byPk).toEqual({ s1: "idle", s2: "running" });
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("error event triggers a refresh so the DB-side demotion lands in the UI", async () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const demoted = { ...runningSession("s1"), status: "idle" as const };
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [demoted] });
+
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "boom" });
+  // refresh() is fire-and-forget; let its microtasks flush.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(listProjects).toHaveBeenCalled();
+  expect(listSessions).toHaveBeenCalled();
+  expect(useStore.getState().sessions[0].status).toBe("idle");
+
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("error event appends no transient row — the durable error row arrives via the message event", () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
+
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "upstream quota exhausted" });
+  expect(useStore.getState().transcripts.s1 ?? []).toHaveLength(0);
+
+  // The backend persists the same text via emit_error and broadcasts it as a
+  // normal message row (role=system, block_type=error) — THAT renders it.
+  useStore.getState().applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 7,
+    role: "system",
+    block_type: "error",
+    payload: { message: "upstream quota exhausted" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  });
+  const rows = useStore.getState().transcripts.s1;
+  expect(rows).toHaveLength(1);
+  expect(rows[0].blockType).toBe("error");
+  expect(rows[0].text).toBe("upstream quota exhausted");
+  expect(rows[0].seq).toBe(7);
+
   listProjects.mockRestore();
   listSessions.mockRestore();
 });
@@ -492,6 +548,71 @@ test("cloneProject clones via IPC and refreshes on success", async () => {
   expect(listProjects).toHaveBeenCalled();
 
   clone.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("a completed todowrite tool_call triggers a todo refetch for its session", () => {
+  reset();
+  const original = useNative.getState().loadTodos;
+  const loadTodos = mock((_pk: string) => Promise.resolve());
+  useNative.setState({ loadTodos });
+  const s = useStore.getState();
+  // Initial in_progress insert: the tool hasn't executed yet — no fetch.
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 4,
+    role: "assistant",
+    block_type: "tool_call",
+    payload: { name: "todowrite", input: { todos: [{ content: "a", status: "pending" }] } },
+    tool_call_id: "tc-todo",
+    status: "in_progress",
+    tool_kind: "other",
+  });
+  expect(loadTodos).not.toHaveBeenCalled();
+  // Completion re-emit (same seq, merged by toolCallId): the DB changed — refetch.
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 4,
+    role: "assistant",
+    block_type: "tool_call",
+    payload: { name: "todowrite", input: { todos: [{ content: "a", status: "pending" }] }, output: "Updated todo list (0/1 done)" },
+    tool_call_id: "tc-todo",
+    status: "completed",
+    tool_kind: "other",
+  });
+  expect(loadTodos).toHaveBeenCalledTimes(1);
+  expect(loadTodos).toHaveBeenCalledWith("s1");
+  // Other completed tools never trigger a todo fetch.
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 5,
+    role: "assistant",
+    block_type: "tool_call",
+    payload: { name: "bash", input: { command: "ls" }, output: "ok" },
+    tool_call_id: "tc-bash",
+    status: "completed",
+    tool_kind: "execute",
+  });
+  expect(loadTodos).toHaveBeenCalledTimes(1);
+  useNative.setState({ loadTodos: original });
+});
+
+test("send resolves true on success and false on backend error (drives composer draft restore)", async () => {
+  reset();
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(true);
+
+  cont.mockResolvedValue({ status: "error", error: { message: "quota exhausted" } });
+  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(false);
+
+  cont.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
 });

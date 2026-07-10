@@ -126,6 +126,17 @@ pub async fn run_turn(
     )
     .await;
 
+    // Per-turn model snapshot: re-read the project's pinned model fresh from
+    // the store and resolve it for THIS turn, so a picker change mid-chat
+    // applies on the next turn without restarting the session. Everything
+    // below — request bodies, compaction, title generation, and the sub-agent
+    // spawner — reads the snapshot; the original `deps` is never mutated, so
+    // in-flight turns and running subagents keep the model they started with.
+    // Only `model` is refreshed here; `meta` (context window / output caps /
+    // prompt-cache support) stays at the session-start value.
+    let turn_deps = refresh_turn_model(deps).await;
+    let deps = &turn_deps;
+
     // 2. Load history + context state and append the user turn.
     let cfg = ContextConfig::load(&deps.store, deps.meta).await;
     let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
@@ -264,6 +275,62 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
     }
 }
 
+/// Build this turn's `RunnerDeps`: a clone of `deps` carrying the freshest
+/// resolution of the project's pinned model. Falls back to the session-start
+/// model when no project row is reachable (bare tests, ephemeral contexts) or
+/// when nothing resolves at all (empty store / no routable connection), so
+/// those contexts behave exactly as before. When the pinned model fails
+/// routing and a substitute is resolved, a status row announces the
+/// substitution — no silent swap.
+async fn refresh_turn_model(deps: &RunnerDeps) -> RunnerDeps {
+    let pinned = match project_pinned_model(deps).await {
+        Some(pinned) => pinned,
+        None => deps.model.clone(),
+    };
+    let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
+    if let (Some(pinned), Some(resolved)) = (pinned.as_deref(), resolved.as_deref()) {
+        if !pinned.trim().is_empty() && pinned != resolved {
+            emit_row(
+                deps,
+                "system",
+                "status",
+                json!({
+                    "summary":
+                        format!("model `{pinned}` is not routable, using `{resolved}`")
+                }),
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+    }
+    let mut turn = deps.clone();
+    if resolved.is_some() {
+        turn.model = resolved;
+    }
+    turn
+}
+
+/// `Some(project.model)` when the session's project row is reachable — the
+/// inner Option is the pin itself, which may legitimately be unset. `None`
+/// when there is no session/project row to read.
+async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
+    let session = deps
+        .store
+        .get_session(&deps.session_pk)
+        .await
+        .ok()
+        .flatten()?;
+    let project = deps
+        .store
+        .get_project(&session.project_id)
+        .await
+        .ok()
+        .flatten()?;
+    Some(project.model)
+}
+
 /// If this session has no title yet, generate a terse one from the first
 /// prompt via a short non-streaming model call. Best-effort: any failure is
 /// swallowed so it never affects the turn's outcome.
@@ -379,6 +446,10 @@ async fn drive(
         let mut body = json!({
             "model": model,
             "system": system_value,
+            // `cm.messages_for_request()` applies the sanitized projection:
+            // dangling tool_use ids from an interrupted prior turn get
+            // synthesized error tool_results, or Anthropic 400s the whole
+            // request (and the session stays poisoned).
             "messages": cm.messages_for_request(),
             "tools": tool_defs,
             "max_tokens": max_tokens,
@@ -555,7 +626,7 @@ async fn drive(
                 }
                 break;
             }
-            results.push(run_tool_call(deps, agent, t, emit_display, &spawn).await);
+            results.push(run_tool_call(deps, agent, t, emit_display, &spawn, cancel).await);
         }
         cm.append_tool_results(results).await?;
 
@@ -608,8 +679,10 @@ fn thinking_budget(
 
 /// Tools delegated children may never use regardless of filters. `task` is
 /// re-armed for delegator agents (the orchestrator role); `memory` never is —
-/// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`.
-const SUBAGENT_BLOCKLIST: &[&str] = &["task", "memory"];
+/// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`. The todo
+/// tools are blocked because the list is keyed by the parent's session_pk: a
+/// child's `todowrite` would silently clobber the user-visible plan.
+const SUBAGENT_BLOCKLIST: &[&str] = &["task", "memory", "todowrite", "todoread"];
 /// Cap on one delegated child's model-visible report (protects the parent's
 /// context from runaway child output).
 const MAX_SUBTASK_REPORT_CHARS: usize = 16_000;
@@ -807,6 +880,7 @@ async fn run_tool_call(
     t: &ToolAccum,
     emit_display: bool,
     spawn: &Option<Arc<dyn SubagentSpawner>>,
+    cancel: &CancellationToken,
 ) -> Value {
     let input = t.parsed_input();
     let Some(tool) = deps.tools.get(&t.name) else {
@@ -861,12 +935,17 @@ async fn run_tool_call(
         &t.id,
         &deps.approvals,
         &deps.events,
+        cancel,
     )
     .await;
     if decision == PermDecision::Deny {
         // Plan mode denies mutations outright (no prompt) — tell the model why
         // so it plans instead of retrying, rather than showing "Denied by user".
-        let msg = if perm_mode == PermMode::Plan && !matches!(tool.kind(), "read") {
+        let msg = if cancel.is_cancelled() {
+            // Stopped while gated/parked: pair the tool_use with an
+            // interrupted tool_result, not a user denial.
+            "Interrupted by user"
+        } else if perm_mode == PermMode::Plan && !matches!(tool.kind(), "read") {
             "Plan mode is read-only: file edits and shell commands are disabled. \
              Propose a plan for the user to review; they can switch to Ask/Edit/Full to execute it."
         } else {
@@ -887,13 +966,15 @@ async fn run_tool_call(
         }
     }
 
-    // Execute.
+    // Execute. Timed from here — after the permission gate — so a long human
+    // approval wait never inflates the card's duration badge.
+    let started = std::time::Instant::now();
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
         work_dir: deps.work_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
         store: deps.store.clone(),
-        cancel: CancellationToken::new(),
+        cancel: cancel.clone(),
         caps: OutputCaps::default(),
         spawn: spawn.clone(),
         memory: deps.memory.clone(),
@@ -902,12 +983,13 @@ async fn run_tool_call(
     match tool.execute(&ctx, input).await {
         Ok(out) => {
             if emit_display {
+                let display = merge_display_duration(out.display, elapsed_ms(started));
                 finish_tool_row_with_display(
                     deps,
                     &t.id,
                     &out.for_model,
                     out.is_error,
-                    out.display,
+                    Some(display),
                 )
                 .await;
             }
@@ -916,7 +998,8 @@ async fn run_tool_call(
         Err(e) => {
             let msg = format!("{}: {e}", t.name);
             if emit_display {
-                finish_tool_row(deps, &t.id, &msg, true).await;
+                let display = merge_display_duration(None, elapsed_ms(started));
+                finish_tool_row_with_display(deps, &t.id, &msg, true, Some(display)).await;
             }
             tool_result(&t.id, &msg, true)
         }
@@ -976,6 +1059,25 @@ async fn finish_tool_row_with_display(
         }
         Err(e) => tracing::warn!("native: update_tool_call({tool_call_id}) failed: {e}"),
     }
+}
+
+/// Milliseconds elapsed since `started`, saturating into a JSON-safe u64.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Fold the measured duration into a tool's display extras (`{"summary": …}`,
+/// `{"exit_code": …}`, …). The result is json_patch-merged into the persisted
+/// tool_call payload by [`finish_tool_row_with_display`], so `duration_ms`
+/// and the other extras survive session hydration. Non-object extras are
+/// discarded — a scalar would corrupt the payload merge.
+fn merge_display_duration(display: Option<Value>, duration_ms: u64) -> Value {
+    let mut extras = match display {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    extras.insert("duration_ms".to_string(), Value::from(duration_ms));
+    Value::Object(extras)
 }
 
 /// Flush any buffered streaming text as one delta-shaped `text` row (only when
@@ -1310,6 +1412,192 @@ mod tests {
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Seed a project (pinned to `model`) plus a TITLED session "s1" so the
+    /// per-turn snapshot has rows to read while title generation stays off
+    /// (an untitled session row would consume an extra scripted LLM turn).
+    async fn seed_pinned_project(store: &Store, model: Option<&str>) {
+        use crate::domain::{Project, Session, SessionStatus};
+        store
+            .insert_project(Project {
+                project_id: "p".into(),
+                name: "p".into(),
+                workdir: "/w".into(),
+                source: None,
+                harness: "native".into(),
+                model: model.map(str::to_string),
+                effort: None,
+                perm_mode: PermMode::BypassPermissions,
+                created_at: Some(0),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: "p".into(),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("titled".into()),
+                status: SessionStatus::Running,
+                started_by: None,
+                created_at: Some(0),
+                last_active: Some(0),
+                resume_attempts: 0,
+                branch_owned: true,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// An enabled anthropic API-key connection serving exactly `models`, so
+    /// `family/model` pins like "anthropic/model-a" resolve through routing.
+    async fn add_anthropic_conn(store: &Store, models: &[&str]) {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+        connections::add_connection(
+            store,
+            ConnectionRow {
+                id: "claude".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "claude".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    models_override: Some(models.iter().map(|m| m.to_string()).collect()),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_turn_picks_up_a_mid_chat_model_change() {
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![text_delta("one"), message_delta("end_turn"), message_stop()];
+        let turn2 = vec![text_delta("two"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        // Simulate what start_session froze into RunnerDeps at session start.
+        deps.model = Some("anthropic/model-a".into());
+        add_anthropic_conn(&deps.store, &["model-a", "model-b"]).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("one", "one"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // The user repins the model mid-chat (exactly what the composer's
+        // model picker writes via update_project).
+        deps.store
+            .update_project(
+                "p",
+                Some("anthropic/model-b".into()),
+                PermMode::BypassPermissions,
+                "native",
+            )
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("two", "two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        {
+            let bodies = llm.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2);
+            assert_eq!(bodies[0]["model"], "anthropic/model-a");
+            assert_eq!(
+                bodies[1]["model"], "anthropic/model-b",
+                "the next turn must re-read the project's pinned model"
+            );
+        }
+
+        // Negative invariant: both pins (model-a, then model-b) are routable
+        // via the connection seeded above, so neither turn should have
+        // announced a substitution.
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        assert!(
+            !msgs.iter().any(|m| m.payload["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("is not routable"))),
+            "a routable pin must never emit a not-routable status row"
+        );
+    }
+
+    #[tokio::test]
+    async fn unroutable_pinned_model_surfaces_a_status_row() {
+        use crate::llm_router::routes::{
+            self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
+        };
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        add_anthropic_conn(&deps.store, &["model-a"]).await;
+        // A route the default-model fallback resolves to (mirrors
+        // native/mod.rs::native_model_resolution_falls_back_from_an_unresolvable_model).
+        routes::save_model_route(
+            &deps.store,
+            ModelRouteInfo {
+                id: "r1".into(),
+                name: "fable".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::Fallback,
+                targets: vec![ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "model-a".into(),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        // The project pins a model no connection serves.
+        seed_pinned_project(&deps.store, Some("anthropic/ghost")).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // The request really used the substitute...
+        assert_eq!(llm.bodies.lock().unwrap()[0]["model"], "fable");
+        // ...and the substitution is announced instead of silent.
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        let status = msgs
+            .iter()
+            .find(|m| m.role == "system" && m.block_type == "status")
+            .expect("a status transcript row");
+        assert_eq!(
+            status.payload["summary"],
+            "model `anthropic/ghost` is not routable, using `fable`"
+        );
+        // It lands after the user's message, where the turn it affects starts.
+        let user_seq = msgs.iter().find(|m| m.role == "user").unwrap().seq;
+        assert!(status.seq > user_seq);
     }
 
     fn tiny_meta() -> crate::llm_router::model_meta::ModelMeta {
@@ -1717,6 +2005,67 @@ mod tests {
     }
 
     #[test]
+    fn merge_display_duration_folds_duration_into_existing_extras() {
+        let merged = merge_display_duration(Some(json!({ "summary": "todos: 1/2 done" })), 1234);
+        assert_eq!(
+            merged,
+            json!({ "summary": "todos: 1/2 done", "duration_ms": 1234 })
+        );
+    }
+
+    #[test]
+    fn merge_display_duration_handles_missing_or_non_object_extras() {
+        assert_eq!(merge_display_duration(None, 7), json!({ "duration_ms": 7 }));
+        // A non-object display value would corrupt the json_patch — drop it.
+        assert_eq!(
+            merge_display_duration(Some(json!("junk")), 7),
+            json!({ "duration_ms": 7 })
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_payload_carries_duration_and_display_extras() {
+        let dir = tempfile::tempdir().unwrap();
+        // todowrite exercises timing + summary extras WITHOUT spawning any
+        // process (bash-based turns fail on sh-less Windows dev boxes).
+        let turn1 = vec![
+            tool_use_start(0, "call-1", "todowrite"),
+            input_json_delta(
+                0,
+                "{\"todos\":[{\"content\":\"first\",\"status\":\"completed\"},{\"content\":\"second\",\"status\":\"pending\"}]}",
+            ),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("plan it", "plan it"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        let row = msgs
+            .iter()
+            .find(|m| m.block_type == "tool_call")
+            .expect("a tool_call row");
+        assert_eq!(row.payload["name"], "todowrite");
+        // The tool's own display extras still land in the payload...
+        assert_eq!(row.payload["summary"], "todos: 1/2 done");
+        // ...and the runner's timing is merged in beside them.
+        assert!(
+            row.payload["duration_ms"].is_u64(),
+            "payload missing duration_ms: {}",
+            row.payload
+        );
+    }
+
+    #[test]
     fn cap_report_truncates_head_and_tail_with_marker() {
         let long = "x".repeat(40_000);
         let capped = cap_report(&long);
@@ -1743,6 +2092,27 @@ mod tests {
         let eff = effective_child_filter(&ToolFilter::All, &ToolFilter::All, &names, &["memory"]);
         assert!(eff.allows("task") && eff.allows("read"));
         assert!(!eff.allows("memory"));
+    }
+
+    #[test]
+    fn subagent_blocklist_blocks_todo_tools() {
+        use super::super::agents::ToolFilter;
+        let names: Vec<String> = ["read", "bash", "todowrite", "todoread"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let eff = effective_child_filter(
+            &ToolFilter::All,
+            &ToolFilter::All,
+            &names,
+            SUBAGENT_BLOCKLIST,
+        );
+        assert!(eff.allows("read") && eff.allows("bash"));
+        assert!(
+            !eff.allows("todowrite"),
+            "a sub-agent todowrite would clobber the parent session's plan"
+        );
+        assert!(!eff.allows("todoread"));
     }
 
     #[tokio::test]
@@ -2263,5 +2633,98 @@ mod tests {
         let msgs = deps.store.list_messages("s1").await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
+    }
+
+    #[tokio::test]
+    async fn request_body_repairs_a_dangling_tool_use_from_a_prior_interrupted_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        // Simulate a prior turn interrupted mid-tools: the assistant tool_use
+        // turn was persisted but its tool_result user turn never was.
+        {
+            let mut ledger = Ledger::load(deps.store.clone(), "s1").await.unwrap();
+            ledger
+                .append_user(json!([{"type": "text", "text": "earlier"}]))
+                .await
+                .unwrap();
+            ledger
+                .append_assistant(json!([
+                    {"type": "tool_use", "id": "tu-dangling", "name": "bash", "input": {}}
+                ]))
+                .await
+                .unwrap();
+        }
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("next", "next"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        let messages = bodies[0]["messages"].as_array().unwrap();
+        // user(earlier), assistant(tool_use), user(tool_result + "next") —
+        // the repair is folded into the immediately-following user message.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "tu-dangling");
+        assert_eq!(messages[2]["content"][0]["is_error"], true);
+        assert_eq!(messages[2]["content"][1]["type"], "text");
+        assert_eq!(messages[2]["content"][1]["text"], "next");
+    }
+
+    #[tokio::test]
+    async fn cancel_during_parked_approval_still_appends_a_paired_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![
+            tool_use_start(0, "call-park", "bash"),
+            input_json_delta(0, "{\"command\":\"echo hi\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm).await;
+        // Default mode: bash prompts, and nobody will ever answer.
+        deps.set_perm_mode(PermMode::Default);
+        let mut rx = deps.events.subscribe();
+        let cancel = CancellationToken::new();
+        let run = {
+            let deps = deps.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                run_turn(&deps, TurnPrompt::text("run it", "run it"), cancel).await
+            })
+        };
+        // Wait for the approval prompt, then stop the turn instead of answering.
+        loop {
+            if let CoreEvent::ApprovalRequested { request_id, .. } = rx.recv().await.unwrap() {
+                assert_eq!(request_id, "call-park");
+                break;
+            }
+        }
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("turn must settle after cancel (approval gate must observe the turn token)")
+            .unwrap()
+            .unwrap();
+
+        // The ledger is PAIRED: user, assistant(tool_use), user(tool_result).
+        let turns = deps.store.list_provider_turns("s1").await.unwrap();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[2].role, "user");
+        assert_eq!(turns[2].payload[0]["type"], "tool_result");
+        assert_eq!(turns[2].payload[0]["tool_use_id"], "call-park");
+        assert_eq!(turns[2].payload[0]["is_error"], true);
+        assert!(turns[2].payload[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Interrupted"));
     }
 }

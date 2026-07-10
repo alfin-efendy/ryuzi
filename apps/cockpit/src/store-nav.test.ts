@@ -98,3 +98,47 @@ test("composer git setters update and reset state", () => {
   // restore defaults for other tests in this file
   useNav.getState().setComposerUseWorktree(true);
 });
+
+import { readDrafts, upsertDraft } from "./store-nav";
+
+test("readDrafts parses the persisted map and collapses garbage to {}", () => {
+  expect(readDrafts(null)).toEqual({});
+  expect(readDrafts("not json")).toEqual({});
+  expect(readDrafts('["a"]')).toEqual({});
+  expect(readDrafts('{"s1":"hello","home:p1":"hi","bad":42,"empty":""}')).toEqual({ s1: "hello", "home:p1": "hi" });
+});
+
+test("upsertDraft sets, replaces, and deletes-on-empty per key", () => {
+  const a = upsertDraft({}, "s1", "hello");
+  expect(a).toEqual({ s1: "hello" });
+  const b = upsertDraft(a, "home:p1", "hi");
+  expect(b).toEqual({ s1: "hello", "home:p1": "hi" });
+  expect(upsertDraft(b, "s1", "edited")).toEqual({ s1: "edited", "home:p1": "hi" });
+  expect(upsertDraft(b, "s1", "")).toEqual({ "home:p1": "hi" });
+  expect(upsertDraft(b, "missing", "")).toBe(b); // identity no-op: nothing to delete
+});
+
+test("draft actions: per-key isolation, clear, restore only into an empty slot", () => {
+  useNav.setState({ drafts: {} });
+  useNav.getState().setDraft("s1", "draft one");
+  useNav.getState().setDraft("home:p1", "draft two");
+  expect(useNav.getState().drafts).toEqual({ s1: "draft one", "home:p1": "draft two" });
+  useNav.getState().clearDraft("s1");
+  expect(useNav.getState().drafts).toEqual({ "home:p1": "draft two" });
+  // Failed send: restore refills the cleared key…
+  useNav.getState().restoreDraft("s1", "draft one");
+  expect(useNav.getState().drafts.s1).toBe("draft one");
+  // …but never clobbers text the user typed in the meantime.
+  useNav.getState().restoreDraft("home:p1", "stale resend");
+  expect(useNav.getState().drafts["home:p1"]).toBe("draft two");
+  useNav.setState({ drafts: {} });
+});
+
+test("setDraft persists the map to localStorage", () => {
+  useNav.setState({ drafts: {} });
+  useNav.getState().setDraft("s9", "keep me");
+  expect(JSON.parse(localStorage.getItem("cockpit.composer.drafts") ?? "{}")).toEqual({ s9: "keep me" });
+  useNav.getState().clearDraft("s9");
+  expect(JSON.parse(localStorage.getItem("cockpit.composer.drafts") ?? "{}")).toEqual({});
+  useNav.setState({ drafts: {} });
+});
