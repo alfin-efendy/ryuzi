@@ -691,6 +691,18 @@ async fn drive(
         cm.append_assistant(json!(content)).await?;
 
         if tool_calls.is_empty() {
+            // The model answered in plain text with no tool call — normally
+            // end_turn. But a steer that landed during this round must not be
+            // dropped: the only other drain site rides the tool-result batch
+            // below, which this branch never reaches. Drain it as a user
+            // message and loop once more so the model actually responds to the
+            // steer, instead of losing it — or leaking it, stale, into a later
+            // unrelated turn's tool-result batch.
+            if let Some(block) = deps.steer.take_block() {
+                cm.append_user_text(&block).await?;
+                provider_turn += 1;
+                continue;
+            }
             return Ok(final_text); // end_turn
         }
 
@@ -721,6 +733,14 @@ async fn drive(
             return Ok(final_text);
         }
         provider_turn += 1;
+    }
+    // A steer that landed after the loop's last drain — or while the final
+    // tool round was still pending when the budget ran out — is still buffered.
+    // Fold it into `cm` so the terminal summary call (and, when no model is
+    // configured, the ledger the next turn resumes from) sees it rather than
+    // dropping it silently.
+    if let Some(block) = deps.steer.take_block() {
+        cm.append_user_text(&block).await?;
     }
     // Budget exhausted with tool calls still pending: make one tool-less
     // call asking the model for a final summary instead of leaving the user
@@ -2535,6 +2555,55 @@ mod tests {
         assert!(rendered.contains("stop and check the tests first"));
 
         // Drained: a later turn would not see it again.
+        assert!(deps.steer.take_block().is_none());
+    }
+
+    #[tokio::test]
+    async fn steer_on_a_tool_less_turn_forces_a_delivery_round() {
+        use super::super::steer::{STEER_MARKER_CLOSE, STEER_MARKER_OPEN};
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1: plain-text answer, no tool call — the model would end here.
+        let turn1 = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        // Turn 2: the steer forced one more round; the model acknowledges + ends.
+        let turn2 = vec![
+            text_delta("ok, stopping"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+
+        deps.steer.push("actually, stop".into());
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "the tool-less turn, then the forced steer-delivery round"
+        );
+        // The second request carries the drained steer block as its last
+        // message — the model gets to answer the steer, not drop it.
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let last = messages.last().expect("at least one message");
+        assert_eq!(last["role"], "user");
+        let rendered = serde_json::to_string(last).unwrap();
+        assert!(rendered.contains(STEER_MARKER_OPEN));
+        assert!(rendered.contains(STEER_MARKER_CLOSE));
+        assert!(rendered.contains("actually, stop"));
+        // Drained exactly once — a later turn will not see it again.
         assert!(deps.steer.take_block().is_none());
     }
 
