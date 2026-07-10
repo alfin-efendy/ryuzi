@@ -296,6 +296,39 @@ mod tests {
     }
 
     #[test]
+    fn tauri_contracts_serialize_with_required_camel_case_spellings() {
+        let surface = serde_json::to_value(ExecutionSurfaceKey {
+            provider_id: "provider".into(),
+            connection_id: None,
+            model: "model".into(),
+        })
+        .unwrap();
+        assert!(surface.get("providerId").is_some());
+        assert!(surface.get("provider_id").is_none());
+
+        let selectable = serde_json::to_value(SelectableModelInfo {
+            kind: SelectableModelKind::NamedRoute,
+            request_value: "route".into(),
+            display_name: "Route".into(),
+            preference_key: None,
+            supported: vec![],
+            configured_default: None,
+            resolved_default: None,
+            default_source: ModelDefaultSource::VariesByTarget,
+        })
+        .unwrap();
+        assert_eq!(selectable["kind"], "namedRoute");
+        assert!(selectable.get("requestValue").is_some());
+        assert!(selectable.get("request_value").is_none());
+        assert_eq!(selectable["defaultSource"], "variesByTarget");
+
+        assert_eq!(
+            serde_json::to_value(StoredEffortStatus::UnknownMetadata).unwrap(),
+            "unknownMetadata"
+        );
+    }
+
+    #[test]
     fn raw_value_is_the_label_when_provider_has_no_friendly_label() {
         let parsed = models::parse_models(
             "openai-oauth",

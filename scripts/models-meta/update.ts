@@ -12,6 +12,8 @@ type Meta = {
 
 const api = (await (await fetch("https://models.dev/api.json")).json()) as Record<string, { models?: Record<string, any> }>;
 const out: Record<string, Meta> = {};
+const exactKey = (providerId: string, modelId: string) => `provider::${providerId}::model::${modelId}`;
+const genericKey = (modelId: string) => `generic::${modelId}`;
 for (const [providerId, provider] of Object.entries(api)) {
   for (const [id, m] of Object.entries(provider.models ?? {})) {
     const meta: Meta = {
@@ -21,11 +23,12 @@ for (const [providerId, provider] of Object.entries(api)) {
       supports_reasoning: m.reasoning === true,
       ...(typeof m.name === "string" ? { display_name: m.name } : {}),
     };
-    out[`${providerId}/${id}`] = meta;
-    const prev = out[id];
+    out[exactKey(providerId, id)] = meta;
+    const generic = genericKey(id);
+    const prev = out[generic];
     // The same model id can appear under several providers; keep the entry
     // with the largest window (first-party listings are the most accurate).
-    if (!prev || meta.context_window > prev.context_window) out[id] = meta;
+    if (!prev || meta.context_window > prev.context_window) out[generic] = meta;
   }
 }
 
@@ -39,15 +42,15 @@ type CodexSource = {
 };
 const codex = (await Bun.file("scripts/models-meta/codex-effort-source.json").json()) as CodexSource;
 for (const model of codex.models ?? []) {
-  const generic = out[model.slug];
-  const exactKey = `openai-oauth/${model.slug}`;
-  const existing = out[exactKey] ?? generic ?? {
+  const generic = out[genericKey(model.slug)];
+  const codexExactKey = exactKey("openai-oauth", model.slug);
+  const existing = out[codexExactKey] ?? generic ?? {
     context_window: 128_000,
     max_output_tokens: 8_192,
     supports_prompt_cache: false,
     supports_reasoning: true,
   };
-  out[exactKey] = {
+  out[codexExactKey] = {
     ...existing,
     ...(model.display_name ? { display_name: model.display_name } : {}),
     supports_reasoning: true,

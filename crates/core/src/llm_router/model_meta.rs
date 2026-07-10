@@ -48,13 +48,74 @@ impl ModelMeta {
 
 static VENDORED: &str = include_str!("model_meta_snapshot.json");
 
-fn vendored() -> &'static HashMap<String, ModelMeta> {
-    static CACHE: std::sync::OnceLock<HashMap<String, ModelMeta>> = std::sync::OnceLock::new();
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CatalogModelMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supports_prompt_cache: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supports_reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_efforts: Option<Vec<ReasoningEffortOption>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_reasoning_effort: Option<String>,
+}
+
+impl CatalogModelMeta {
+    fn merge_over(&self, mut base: ModelMeta, empty_effort_is_advertised: bool) -> ModelMeta {
+        if let Some(value) = self.context_window {
+            base.context_window = value;
+        }
+        if let Some(value) = self.max_output_tokens {
+            base.max_output_tokens = value;
+        }
+        if let Some(value) = self.supports_prompt_cache {
+            base.supports_prompt_cache = value;
+        }
+        if let Some(value) = self.supports_reasoning {
+            base.supports_reasoning = value;
+        }
+        if let Some(value) = &self.display_name {
+            base.display_name = Some(value.clone());
+        }
+        if let Some(options) = &self.reasoning_efforts {
+            if empty_effort_is_advertised || !options.is_empty() {
+                base.reasoning_efforts = options.clone();
+            }
+        }
+        if let Some(value) = &self.default_reasoning_effort {
+            base.default_reasoning_effort = Some(value.clone());
+        }
+        base
+    }
+}
+
+const EXACT_PREFIX: &str = "provider::";
+const EXACT_SEPARATOR: &str = "::model::";
+const GENERIC_PREFIX: &str = "generic::";
+
+fn exact_catalog_key(provider: &str, model: &str) -> String {
+    format!("{EXACT_PREFIX}{provider}{EXACT_SEPARATOR}{model}")
+}
+
+fn generic_catalog_key(model: &str) -> String {
+    format!("{GENERIC_PREFIX}{model}")
+}
+
+fn vendored() -> &'static HashMap<String, CatalogModelMeta> {
+    static CACHE: std::sync::OnceLock<HashMap<String, CatalogModelMeta>> =
+        std::sync::OnceLock::new();
     CACHE.get_or_init(|| serde_json::from_str(VENDORED).unwrap_or_default())
 }
 
 /// Lowercase, strip a `provider/` prefix, a `-latest` suffix, and trailing
 /// date stamps (`-20250929` / `-2025-09-29`) so dated ids hit base entries.
+#[cfg(test)]
 fn normalize(id: &str) -> String {
     let mut s = id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
     if let Some(base) = s.strip_suffix("-latest") {
@@ -85,22 +146,101 @@ fn normalize(id: &str) -> String {
     s
 }
 
+fn normalize_model_id(id: &str) -> String {
+    let mut s = id.to_ascii_lowercase();
+    if let Some(base) = s.strip_suffix("-latest") {
+        s = base.to_string();
+    }
+    let (base, tail) = s.rsplit_once('-').unwrap_or((&s, ""));
+    if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) {
+        return base.to_string();
+    }
+    let parts: Vec<&str> = s.rsplitn(4, '-').collect();
+    if parts.len() == 4
+        && parts[0].len() == 2
+        && parts[1].len() == 2
+        && parts[2].len() == 4
+        && parts[..3]
+            .iter()
+            .all(|part| part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return parts[3].to_string();
+    }
+    s
+}
+
 /// Ties among normalized-key matches resolve to the lexicographically
 /// smallest key, so the result is deterministic regardless of `HashMap`
 /// iteration order.
-fn lookup(map: &HashMap<String, ModelMeta>, id: &str) -> Option<ModelMeta> {
-    if let Some(m) = map.get(id) {
-        return Some(m.clone());
+fn lookup_generic_catalog(
+    map: &HashMap<String, CatalogModelMeta>,
+    id: &str,
+) -> Option<CatalogModelMeta> {
+    if let Some(meta) = map.get(&generic_catalog_key(id)) {
+        return Some(meta.clone());
     }
-    let norm = normalize(id);
-    if let Some(m) = map.get(&norm) {
-        return Some(m.clone());
+    // Backward compatibility for pre-namespace generic snapshots. Direct
+    // lookup is safe even when the model id itself contains slashes.
+    if let Some(meta) = map.get(id) {
+        return Some(meta.clone());
     }
-    // Normalized key match on both sides (snapshot ids may carry dates too).
+    let normalized = normalize_model_id(id);
     map.iter()
-        .filter(|(k, _)| normalize(k) == norm)
+        .filter_map(|(key, meta)| {
+            let model = key.strip_prefix(GENERIC_PREFIX).or_else(|| {
+                (!key.contains('/') && !key.starts_with(EXACT_PREFIX)).then_some(key.as_str())
+            })?;
+            (normalize_model_id(model) == normalized).then_some((key, meta))
+        })
         .min_by(|a, b| a.0.cmp(b.0))
-        .map(|(_, m)| m.clone())
+        .map(|(_, meta)| meta.clone())
+}
+
+fn lookup_exact_catalog(
+    map: &HashMap<String, CatalogModelMeta>,
+    provider: &str,
+    model: &str,
+) -> Option<CatalogModelMeta> {
+    map.get(&exact_catalog_key(provider, model))
+        .or_else(|| map.get(&format!("{provider}/{model}")))
+        .cloned()
+}
+
+fn finalize_default(mut meta: ModelMeta) -> ModelMeta {
+    if meta
+        .default_reasoning_effort
+        .as_ref()
+        .is_some_and(|default| !meta.reasoning_efforts.iter().any(|o| &o.value == default))
+    {
+        meta.default_reasoning_effort = None;
+    }
+    if meta.default_reasoning_effort.is_none() && meta.reasoning_efforts.len() == 1 {
+        meta.default_reasoning_effort = Some(meta.reasoning_efforts[0].value.clone());
+    }
+    meta
+}
+
+fn resolve_catalog_meta(
+    surface: &ExecutionSurfaceKey,
+    refreshed: Option<&HashMap<String, CatalogModelMeta>>,
+    vendored: &HashMap<String, CatalogModelMeta>,
+) -> ModelMeta {
+    let mut resolved = lookup_generic_catalog(vendored, &surface.model).map_or_else(
+        || FALLBACK.clone(),
+        |meta| meta.merge_over(FALLBACK.clone(), true),
+    );
+    if let Some(exact) = lookup_exact_catalog(vendored, &surface.provider_id, &surface.model) {
+        resolved = exact.merge_over(resolved, true);
+    }
+    if let Some(exact) =
+        refreshed.and_then(|map| lookup_exact_catalog(map, &surface.provider_id, &surface.model))
+    {
+        // The models.dev refresh used to serialize an omitted effort field as
+        // `[]`; treat that legacy cache shape as absent. Live connection
+        // metadata retains authoritative `Some(vec![])` semantics separately.
+        resolved = exact.merge_over(resolved, false);
+    }
+    finalize_default(resolved)
 }
 
 /// Merge a partial JSON override (any subset of ModelMeta's fields) over base.
@@ -116,32 +256,10 @@ fn apply_override(base: ModelMeta, v: &serde_json::Value) -> ModelMeta {
         supports_reasoning: v["supports_reasoning"]
             .as_bool()
             .unwrap_or(base.supports_reasoning),
-        display_name: v
-            .get("display_name")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-            .or(base.display_name),
-        reasoning_efforts: v
-            .get("reasoning_efforts")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or(base.reasoning_efforts),
-        default_reasoning_effort: v
-            .get("default_reasoning_effort")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-            .or(base.default_reasoning_effort),
+        display_name: base.display_name,
+        reasoning_efforts: base.reasoning_efforts,
+        default_reasoning_effort: base.default_reasoning_effort,
     }
-}
-
-fn apply_surface_settings_override(base: ModelMeta, v: &serde_json::Value) -> ModelMeta {
-    let display_name = base.display_name.clone();
-    let reasoning_efforts = base.reasoning_efforts.clone();
-    let default_reasoning_effort = base.default_reasoning_effort.clone();
-    let mut merged = apply_override(base, v);
-    merged.display_name = display_name;
-    merged.reasoning_efforts = reasoning_efforts;
-    merged.default_reasoning_effort = default_reasoning_effort;
-    merged
 }
 
 /// `~/.config/ryuzi/models-meta.json` — the refreshed snapshot location
@@ -150,15 +268,15 @@ fn refreshed_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".config/ryuzi/models-meta.json"))
 }
 
-fn refreshed() -> Option<HashMap<String, ModelMeta>> {
+fn refreshed() -> Option<HashMap<String, CatalogModelMeta>> {
     let text = std::fs::read_to_string(refreshed_path()?).ok()?;
     serde_json::from_str(&text).ok()
 }
 
 /// Prune a full models.dev api.json into our snapshot map (same logic as
 /// scripts/models-meta/update.ts).
-fn prune_models_dev(api: &serde_json::Value) -> HashMap<String, ModelMeta> {
-    let mut out: HashMap<String, ModelMeta> = HashMap::new();
+fn prune_models_dev(api: &serde_json::Value) -> HashMap<String, CatalogModelMeta> {
+    let mut out: HashMap<String, CatalogModelMeta> = HashMap::new();
     let Some(providers) = api.as_object() else {
         return out;
     };
@@ -167,20 +285,23 @@ fn prune_models_dev(api: &serde_json::Value) -> HashMap<String, ModelMeta> {
             continue;
         };
         for (id, m) in models {
-            let meta = ModelMeta {
-                context_window: m["limit"]["context"].as_u64().unwrap_or(128_000),
-                max_output_tokens: m["limit"]["output"].as_u64().unwrap_or(8_192),
-                supports_prompt_cache: !m["cost"]["cache_read"].is_null(),
-                supports_reasoning: m["reasoning"].as_bool().unwrap_or(false),
+            let meta = CatalogModelMeta {
+                context_window: Some(m["limit"]["context"].as_u64().unwrap_or(128_000)),
+                max_output_tokens: Some(m["limit"]["output"].as_u64().unwrap_or(8_192)),
+                supports_prompt_cache: Some(!m["cost"]["cache_read"].is_null()),
+                supports_reasoning: Some(m["reasoning"].as_bool().unwrap_or(false)),
                 display_name: m["name"].as_str().map(str::to_string),
-                reasoning_efforts: Vec::new(),
+                reasoning_efforts: None,
                 default_reasoning_effort: None,
             };
-            out.insert(format!("{provider_id}/{id}"), meta.clone());
-            match out.get(id) {
-                Some(prev) if prev.context_window >= meta.context_window => {}
+            out.insert(exact_catalog_key(provider_id, id), meta.clone());
+            let generic_key = generic_catalog_key(id);
+            match out.get(&generic_key) {
+                Some(prev)
+                    if prev.context_window.unwrap_or_default()
+                        >= meta.context_window.unwrap_or_default() => {}
                 _ => {
-                    out.insert(id.clone(), meta);
+                    out.insert(generic_key, meta);
                 }
             }
         }
@@ -240,10 +361,23 @@ pub async fn resolve(store: &Store, requested: &str) -> ModelMeta {
     let base = candidates
         .iter()
         .find_map(|c| {
-            refreshed_map
-                .as_ref()
-                .and_then(|m| lookup(m, c))
-                .or_else(|| lookup(vendored(), c))
+            let lookup_requested = |map: &HashMap<String, CatalogModelMeta>| {
+                lookup_generic_catalog(map, c).or_else(|| {
+                    c.split_once('/')
+                        .and_then(|(_, model)| lookup_generic_catalog(map, model))
+                })
+            };
+            let vendored_meta = lookup_requested(vendored());
+            let refreshed_meta = refreshed_map.as_ref().and_then(lookup_requested);
+            (vendored_meta.is_some() || refreshed_meta.is_some()).then(|| {
+                let base = vendored_meta.map_or_else(
+                    || FALLBACK.clone(),
+                    |meta| meta.merge_over(FALLBACK.clone(), true),
+                );
+                finalize_default(
+                    refreshed_meta.map_or(base.clone(), |meta| meta.merge_over(base, false)),
+                )
+            })
         })
         .unwrap_or_else(|| FALLBACK.clone());
     // Settings override (raw key, JSON object value) — checked per candidate.
@@ -259,16 +393,8 @@ pub async fn resolve(store: &Store, requested: &str) -> ModelMeta {
 
 /// Resolve metadata for one exact provider/connection/model execution surface.
 pub async fn resolve_for_surface(store: &Store, surface: &ExecutionSurfaceKey) -> ModelMeta {
-    let exact_key = format!("{}/{}", surface.provider_id, surface.model);
     let refreshed_map = refreshed();
-    let base = refreshed_map
-        .as_ref()
-        .and_then(|map| map.get(&exact_key).cloned())
-        .or_else(|| vendored().get(&exact_key).cloned())
-        .or_else(|| lookup(vendored(), &surface.model))
-        .unwrap_or_else(|| FALLBACK.clone());
-
-    let mut resolved = base;
+    let mut resolved = resolve_catalog_meta(surface, refreshed_map.as_ref(), vendored());
     if let Some(connection_id) = &surface.connection_id {
         if let Ok(Some(connection)) =
             crate::llm_router::connections::get_connection(store, connection_id).await
@@ -290,7 +416,7 @@ pub async fn resolve_for_surface(store: &Store, surface: &ExecutionSurfaceKey) -
         .await
     {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
-            resolved = apply_surface_settings_override(resolved, &value);
+            resolved = apply_override(resolved, &value);
         }
     }
     resolved
@@ -299,6 +425,10 @@ pub async fn resolve_for_surface(store: &Store, surface: &ExecutionSurfaceKey) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog(json: serde_json::Value) -> HashMap<String, CatalogModelMeta> {
+        serde_json::from_value(json).unwrap()
+    }
 
     #[test]
     fn normalize_strips_provider_prefix_dates_and_latest() {
@@ -312,32 +442,93 @@ mod tests {
     fn vendored_snapshot_parses_and_lookup_hits_normalized_ids() {
         let map = vendored();
         assert!(!map.is_empty());
-        let meta = lookup(map, "anthropic/claude-sonnet-4-5-20250929")
+        let meta = lookup_generic_catalog(map, "claude-sonnet-4-5-20250929")
             .expect("normalized lookup should hit claude-sonnet-4-5");
-        assert!(meta.context_window >= 200_000);
-        assert!(meta.supports_prompt_cache);
+        assert!(meta.context_window.unwrap_or_default() >= 200_000);
+        assert_eq!(meta.supports_prompt_cache, Some(true));
     }
 
     #[test]
     fn lookup_fallback_tie_break_is_deterministic() {
-        let older = ModelMeta {
-            context_window: 100,
-            ..FALLBACK
+        let older = CatalogModelMeta {
+            context_window: Some(100),
+            ..Default::default()
         };
-        let newer = ModelMeta {
-            context_window: 200,
-            ..FALLBACK
+        let newer = CatalogModelMeta {
+            context_window: Some(200),
+            ..Default::default()
         };
         let mut map = HashMap::new();
-        map.insert("m-20240101".to_string(), older);
-        map.insert("m-20250101".to_string(), newer);
+        map.insert(generic_catalog_key("m-20240101"), older);
+        map.insert(generic_catalog_key("m-20250101"), newer);
         for _ in 0..20 {
-            let meta = lookup(&map, "m").expect("normalized fallback match");
+            let meta = lookup_generic_catalog(&map, "m").expect("normalized fallback match");
             assert_eq!(
-                meta.context_window, 100,
+                meta.context_window,
+                Some(100),
                 "must always resolve to the lexicographically smallest key (m-20240101)"
             );
         }
+    }
+
+    #[test]
+    fn refreshed_exact_fills_missing_effort_from_vendored_exact() {
+        let surface = ExecutionSurfaceKey {
+            provider_id: "openai-oauth".into(),
+            connection_id: None,
+            model: "gpt-review-fix".into(),
+        };
+        let refreshed = catalog(serde_json::json!({
+            exact_catalog_key("openai-oauth", "gpt-review-fix"): {
+                "context_window": 999000,
+                "display_name": "Fresh display",
+                "reasoning_efforts": [],
+                "default_reasoning_effort": null
+            }
+        }));
+        let vendored = catalog(serde_json::json!({
+            exact_catalog_key("openai-oauth", "gpt-review-fix"): {
+                "context_window": 128000,
+                "reasoning_efforts": [{"value":"ultra","label":"ultra","description":"Deep"}],
+                "default_reasoning_effort": "ultra"
+            }
+        }));
+
+        let resolved = resolve_catalog_meta(&surface, Some(&refreshed), &vendored);
+        assert_eq!(resolved.context_window, 999_000);
+        assert_eq!(resolved.display_name.as_deref(), Some("Fresh display"));
+        assert_eq!(resolved.reasoning_efforts[0].value, "ultra");
+        assert_eq!(resolved.default_reasoning_effort.as_deref(), Some("ultra"));
+    }
+
+    #[test]
+    fn generic_fallback_never_scans_provider_qualified_entries() {
+        let model = "org/shared-model-20250101";
+        let vendored = catalog(serde_json::json!({
+            exact_catalog_key("provider-a", "org/shared-model"): {
+                "context_window": 111,
+                "display_name": "Provider A",
+                "reasoning_efforts": [{"value":"leaked","label":"leaked","description":null}]
+            },
+            exact_catalog_key("provider-b", "org/shared-model"): {
+                "context_window": 222,
+                "display_name": "Provider B"
+            },
+            generic_catalog_key("org/shared-model"): {
+                "context_window": 333,
+                "display_name": "Generic"
+            }
+        }));
+        let surface = ExecutionSurfaceKey {
+            provider_id: "provider-c".into(),
+            connection_id: None,
+            model: model.into(),
+        };
+
+        let resolved = resolve_catalog_meta(&surface, None, &vendored);
+        assert_eq!(resolved.context_window, 333);
+        assert_eq!(resolved.display_name.as_deref(), Some("Generic"));
+        assert!(resolved.reasoning_efforts.is_empty());
     }
 
     #[test]
@@ -380,12 +571,15 @@ mod tests {
         store
             .set_setting_raw(
                 "models.meta.no-such-model-xyz",
-                r#"{"context_window": 32000}"#,
+                r#"{"context_window":32000,"display_name":"Injected","reasoning_efforts":[{"value":"high","label":"High","description":null}],"default_reasoning_effort":"high"}"#,
             )
             .await
             .unwrap();
         let meta = resolve(&store, "no-such-model-xyz").await;
         assert_eq!(meta.context_window, 32_000);
         assert_eq!(meta.max_output_tokens, FALLBACK.max_output_tokens);
+        assert_eq!(meta.display_name, None);
+        assert!(meta.reasoning_efforts.is_empty());
+        assert_eq!(meta.default_reasoning_effort, None);
     }
 }
