@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn detect_platform_is_some_on_supported_hosts() {
-        // On CI (linux/mac x86_64/aarch64) this must resolve to a triple.
+        // On CI (linux/mac x86_64/aarch64) this must resolve to a platform tag.
         let p = detect_platform().expect("supported host");
         assert!(platform_tag(p).is_some());
     }

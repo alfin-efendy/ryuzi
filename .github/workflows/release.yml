@@ -176,9 +176,9 @@ jobs:
       - name: Download the released binaries (no rebuild — one provenance per release)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Triple-anchored pattern: the unified release also carries Cockpit
+        # Anchored pattern: the unified release also carries Cockpit
         # installers; this must only ever match the goreleaser CLI tarballs
-        # (ryuzi-<ver>-<triple>.tar.gz), never a future cockpit .tar.gz bundle.
+        # (ryuzi-<ver>-<platform-tag>.tar.gz), never a future cockpit .tar.gz bundle.
         run: gh release download "${{ needs.release-please.outputs.tag_name }}" --pattern 'ryuzi-*-*-*.tar.gz' -D out/
       - name: Stamp version + assemble packages
         run: |

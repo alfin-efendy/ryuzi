@@ -8,7 +8,7 @@
 
 [[IgnoredVulns]]
 id = "GHSA-82j2-j2ch-gfr8"
-reason = "rustls-webpki <0.103.13 DoS panic on malformed CRL. Only reachable when CRL revocation checking is explicitly enabled, which ryuzi never does. Transitively pinned on main by PR #32 deps; dependabot reports security_update_not_possible. Revisit when the parent unpins."
+reason = "rustls-webpki <0.103.13 DoS panic on malformed CRL. Only reachable when CRL revocation checking is explicitly enabled, which ryuzi never does. Pinned by serenity 0.12.5 (latest as of 2026-07-10) via tokio-tungstenite 0.21 -> rustls 0.22; revisit when serenity releases past 0.12.5. Tracked in #40."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0104"
@@ -92,24 +92,24 @@ reason = "unic-* is an unmaintained transitive util crate; no vulnerable runtime
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0049"
-reason = "rustls-webpki 0.102 parent-pinned (per dependabot security_update_not_possible); CRL checking never enabled by ryuzi. Tracked in #40."
+reason = "rustls-webpki 0.102 pinned by serenity 0.12.5 (latest as of 2026-07-10) via tokio-tungstenite 0.21 -> rustls 0.22; CRL checking never enabled by ryuzi. Revisit when serenity releases past 0.12.5. Tracked in #40."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0098"
-reason = "rustls-webpki 0.102 parent-pinned (per dependabot security_update_not_possible); CRL checking never enabled by ryuzi. Tracked in #40."
+reason = "rustls-webpki 0.102 pinned by serenity 0.12.5 (latest as of 2026-07-10) via tokio-tungstenite 0.21 -> rustls 0.22; CRL checking never enabled by ryuzi. Revisit when serenity releases past 0.12.5. Tracked in #40."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0099"
-reason = "rustls-webpki 0.102 parent-pinned (per dependabot security_update_not_possible); CRL checking never enabled by ryuzi. Tracked in #40."
+reason = "rustls-webpki 0.102 pinned by serenity 0.12.5 (latest as of 2026-07-10) via tokio-tungstenite 0.21 -> rustls 0.22; CRL checking never enabled by ryuzi. Revisit when serenity releases past 0.12.5. Tracked in #40."
 
 [[IgnoredVulns]]
 id = "GHSA-965h-392x-2mh5"
-reason = "rustls-webpki 0.102 parent-pinned (per dependabot security_update_not_possible); CRL checking never enabled by ryuzi. Tracked in #40."
+reason = "rustls-webpki 0.102 pinned by serenity 0.12.5 (latest as of 2026-07-10) via tokio-tungstenite 0.21 -> rustls 0.22; CRL checking never enabled by ryuzi. Revisit when serenity releases past 0.12.5. Tracked in #40."
 
 [[IgnoredVulns]]
 id = "GHSA-pwjx-qhcg-rvj4"
-reason = "rustls-webpki 0.102 parent-pinned (per dependabot security_update_not_possible); CRL checking never enabled by ryuzi. Tracked in #40."
+reason = "rustls-webpki 0.102 pinned by serenity 0.12.5 (latest as of 2026-07-10) via tokio-tungstenite 0.21 -> rustls 0.22; CRL checking never enabled by ryuzi. Revisit when serenity releases past 0.12.5. Tracked in #40."
 
 [[IgnoredVulns]]
 id = "GHSA-xgp8-3hg3-c2mh"
-reason = "rustls-webpki 0.102 parent-pinned (per dependabot security_update_not_possible); CRL checking never enabled by ryuzi. Tracked in #40."
+reason = "rustls-webpki 0.102 pinned by serenity 0.12.5 (latest as of 2026-07-10) via tokio-tungstenite 0.21 -> rustls 0.22; CRL checking never enabled by ryuzi. Revisit when serenity releases past 0.12.5. Tracked in #40."
