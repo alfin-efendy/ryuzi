@@ -25,6 +25,21 @@ export function fileBadge(path: string): string {
   return BADGES[ext] ?? ext.slice(0, 4).toUpperCase();
 }
 
+/** Parse a backticked chat token that looks like a file path (`src/a.ts`,
+ *  `crates\core\lib.rs:42`, `C:\w\p\a.ts:10:5`). Requires a separator and a
+ *  dotted final segment; strips an optional :line[:col] suffix. Returns null
+ *  for URLs, tokens with whitespace, and everything else non-path-like. */
+export function parsePathToken(token: string): { path: string; line: number | null } | null {
+  if (/\s/.test(token) || token.includes("://")) return null;
+  const m = token.match(/^(.+?)(?::(\d+)(?::\d+)?)?$/);
+  if (!m) return null;
+  const path = m[1];
+  if (!/[\\/]/.test(path)) return null;
+  const last = basename(path);
+  if (!/\.[A-Za-z0-9]{1,8}$/.test(last)) return null;
+  return { path, line: m[2] ? Number(m[2]) : null };
+}
+
 /** Join a workdir and a repo-relative posix path using the workdir's separator. */
 export function joinPath(workdir: string, rel: string): string {
   const sep = workdir.includes("\\") ? "\\" : "/";
