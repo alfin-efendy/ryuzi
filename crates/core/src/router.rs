@@ -324,7 +324,9 @@ impl Router {
             // OAuth authorize-URL events are a Cockpit-only browser-open
             // signal — Discord has no matching surface.
             | CoreEvent::OauthAuthorizeUrl { .. }
-            | CoreEvent::PluginOauthAuthorizeUrl { .. } => {}
+            | CoreEvent::PluginOauthAuthorizeUrl { .. }
+            // Per-session cost telemetry is a Cockpit-only surface too.
+            | CoreEvent::SessionCost { .. } => {}
         }
     }
 

@@ -1323,7 +1323,20 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 /**
  * Same for a plugin OAuth flow.
  */
-{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string }
+{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } | 
+/**
+ * Per-session accumulated cost: total USD and a per-model token+dollar
+ * breakdown. Emitted alongside `ContextUsage`.
+ * 
+ * Like its sibling context-telemetry variants above, this variant's own
+ * fields stay snake_case (`session_pk`, `total_usd`): the enum-level
+ * `rename_all = "camelCase"` on `CoreEvent` only renames the `kind` tag
+ * value, not each variant's field names (see `ContextUsage`'s
+ * `session_pk`). The nested `ModelCost` struct carries its own
+ * `rename_all = "camelCase"`, so its fields (e.g. `cache_read` →
+ * `cacheRead`) are camelCased independently.
+ */
+{ kind: "sessionCost"; session_pk: string; total_usd: number; models: ModelCost[] }
 export type CoreEventMsg = { event: CoreEvent }
 /**
  * Device-code flow info shown to the user while they complete the browser
@@ -1383,6 +1396,12 @@ export type MediaFile = { dataBase64: string; contentType: string | null }
  * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
  */
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
+/**
+ * One model's accumulated billed tokens + computed dollar cost within a
+ * session. Token fields are the durable truth; `usd` is derived from the
+ * current price table at emit time.
+ */
+export type ModelCost = { model: string; input: number; output: number; cacheRead: number; cacheCreation: number; usd: number }
 export type ModelRouteInfo = { id: string; name: string; enabled: boolean; strategy: ModelRouteStrategy; targets: ModelRouteTarget[]; createdAt: number; updatedAt: number }
 export type ModelRouteStrategy = "fallback" | "round-robin"
 export type ModelRouteTarget = { 
