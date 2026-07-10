@@ -1,6 +1,6 @@
 //! System-context assembly for the native runtime.
 //!
-//! Builds the Anthropic `system` string each turn from the base ryuzi agent
+//! Builds the Anthropic `system` string each turn from the base agent
 //! prompt plus discovered instruction files (`AGENTS.md` / `CLAUDE.md`),
 //! mirroring opencode's instruction model (simplified for Phase 1: rebuilt per
 //! turn, no context epochs).
@@ -8,8 +8,8 @@
 use std::path::Path;
 
 const BASE_PROMPT: &str = "\
-You are ryuzi, an autonomous software engineering agent running in a native \
-Rust runtime. You operate inside a git worktree and act by calling tools.
+You are an autonomous software engineering agent running in a native Rust \
+runtime. You operate inside a git worktree and act by calling tools.
 
 Guidelines:
 - Prefer the provided tools (read, ls, glob, grep, edit, write, bash, \
@@ -20,7 +20,9 @@ for new files or full rewrites.
 - Use `bash` for builds, tests, and git; keep commands scoped to the worktree.
 - For multi-step work, keep a plan with `todowrite` and update it as you go.
 - When the task is complete, stop and summarize what you did. Do not ask for \
-confirmation to proceed with reversible work.";
+confirmation to proceed with reversible work.
+- Never prefix your replies with a name, label, or speaker tag, and never \
+refer to yourself by a name; start responses directly with the content.";
 
 /// Assemble the system prompt for a session rooted at `work_dir`.
 /// `extra_skill_dirs` (plugin-bundled skill directories — see
@@ -97,9 +99,28 @@ mod tests {
     fn includes_base_prompt_and_environment() {
         let dir = tempfile::tempdir().unwrap();
         let sys = assemble_system(dir.path(), &[], None);
-        assert!(sys.contains("You are ryuzi"));
+        assert!(sys.contains("You are an autonomous software engineering agent"));
         assert!(sys.contains("Working directory"));
         assert!(sys.contains(&dir.path().display().to_string()));
+    }
+
+    #[test]
+    fn base_prompt_is_nameless_and_forbids_self_naming() {
+        // Assert on the const itself, not on assemble_system output: the
+        // assembled system may legitimately contain "ryuzi" through
+        // instruction-file path headers (e.g. ~/.config/ryuzi/AGENTS.md),
+        // so the persona check must target the injection point directly.
+        let lower = BASE_PROMPT.to_lowercase();
+        assert!(
+            !lower.contains("ryuzi"),
+            "persona name leaked into BASE_PROMPT"
+        );
+        assert!(
+            !lower.contains("ruzi"),
+            "persona misspelling leaked into BASE_PROMPT"
+        );
+        assert!(BASE_PROMPT.contains("Never prefix your replies with a name"));
+        assert!(BASE_PROMPT.contains("never refer to yourself by a name"));
     }
 
     #[test]
