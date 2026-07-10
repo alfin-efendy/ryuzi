@@ -11,6 +11,7 @@ type PluginsState = {
   loaded: boolean;
   load: () => Promise<void>;
   setEnabled: (id: string, on: boolean) => Promise<void>;
+  uninstall: (id: string) => Promise<boolean>;
 };
 
 export const usePlugins = create<PluginsState>((set, get) => ({
@@ -32,18 +33,29 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     if (res.status === "error") toast.error(`Plugin update failed: ${res.error.message}`);
     await get().load();
   },
+
+  uninstall: async (id) => {
+    const res = await commands.uninstallPlugin(id);
+    if (res.status === "error") {
+      toast.error(`Uninstall failed: ${res.error.message}`);
+      return false;
+    }
+    set({ plugins: res.data, loaded: true });
+    return true;
+  },
 }));
 
 export function pluginById(plugins: PluginInfo[], id: string): PluginInfo | undefined {
   return plugins.find((p) => p.id === id);
 }
 
-/**
- * Plugins the Plugins hub's Browse tab lists: every embedded-catalog
- * entry, enabled or not. Skill packs (`source === "skill-pack"`) surface
- * in the Skills tab instead; core builtins keep their own dedicated
- * screens.
- */
-export function catalogPlugins(plugins: PluginInfo[]): PluginInfo[] {
-  return plugins.filter((p) => p.source === "catalog");
+/** Browse tab: only entries not yet installed — installing removes the card. */
+export function browsePlugins(plugins: PluginInfo[]): PluginInfo[] {
+  return plugins.filter((p) => !p.installed);
+}
+
+/** Installed tab: providers, gateways, and skill packs that are set up.
+ *  MCP apps render from `useApps` separately. */
+export function installedPlugins(plugins: PluginInfo[]): PluginInfo[] {
+  return plugins.filter((p) => p.installed);
 }
