@@ -891,6 +891,17 @@ pub(crate) fn stamp_legacy_skill_pack_provenance(
     plugin_dir: &Path,
     plugin_id: &str,
 ) -> bool {
+    // `install_plugin_pack` always writes packs at `plugins_root/<plugin_id>`
+    // (see `checked_child(&roots.plugins_root, &pack.plugin_id)` above), so a
+    // legitimate legacy pack's directory name always equals its plugin id.
+    // Without this guard, a hand-authored directory under any other name
+    // could claim an installed pack's id in its manifest and ride that
+    // pack's materialized skills-root provenance to get itself healed and
+    // permanently trusted — same-id spoofing. Reject anything whose
+    // directory name doesn't match before even looking at the skills root.
+    if plugin_dir.file_name().and_then(|n| n.to_str()) != Some(plugin_id) {
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir(skills_root) else {
         return false;
     };
@@ -1188,6 +1199,37 @@ mod tests {
             &roots.skills_root,
             &plugin_dir,
             "hand-authored"
+        ));
+        assert!(!plugin_dir.join(PROVENANCE_FILE).exists());
+    }
+
+    #[test]
+    fn stamp_legacy_skill_pack_provenance_rejects_dir_name_spoofing_an_installed_id() {
+        // `install_plugin_pack` always writes packs at `plugins_root/<plugin_id>`,
+        // so a directory named anything else claiming a real pack's id via its
+        // manifest — even when that id's materialized skills-root provenance is
+        // genuine — must not be healed or trusted.
+        let config = tempfile::tempdir().unwrap();
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        roots.ensure_exists().unwrap();
+        let plugin_dir = roots.plugins_root.join("impostor");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        write_installed_skill(
+            &roots,
+            "acme-user--triage",
+            "triage",
+            "Real pack skill.",
+            SkillInstallProvenance {
+                source: "https://github.com/acme/acme-user".to_string(),
+                plugin_id: Some("acme-user".to_string()),
+                installed_at: "2026-01-01T00:00:00.000Z".to_string(),
+            },
+        );
+
+        assert!(!stamp_legacy_skill_pack_provenance(
+            &roots.skills_root,
+            &plugin_dir,
+            "acme-user"
         ));
         assert!(!plugin_dir.join(PROVENANCE_FILE).exists());
     }

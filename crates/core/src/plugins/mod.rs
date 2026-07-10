@@ -93,10 +93,13 @@ pub fn register_builtin_plugin_fields() {
 /// Only directories the skills installer produced are accepted: the
 /// directory must carry a `.ryuzi-skill.json` provenance stamp
 /// (`skills_install::install_plugin_pack` writes it), or — legacy packs
-/// installed before the stamp existed — the skills root must hold
-/// materialized provenance naming the plugin id, in which case the stamp
-/// is healed into the plugin directory one time. Hand-authored manifests
-/// match neither and are skipped with a `tracing::warn!`.
+/// installed before the stamp existed — the directory's own name must
+/// equal the manifest's plugin id *and* the skills root must hold
+/// materialized provenance naming that same id, in which case the stamp
+/// is healed into the plugin directory one time. The dir-name check
+/// blocks a hand-authored directory from spoofing another installed
+/// pack's id to ride its materialized provenance into a heal. Hand-authored
+/// manifests match neither and are skipped with a `tracing::warn!`.
 ///
 /// A missing config directory is not an error (most installs have none).
 /// A plugin directory that fails to parse or fails manifest validation is
@@ -614,7 +617,12 @@ command = "acme-mcp"
     fn legacy_pack_with_skills_root_provenance_loads_and_gets_stamped() {
         let plugins_root = tempfile::tempdir().unwrap();
         let skills_root = tempfile::tempdir().unwrap();
-        write_manifest(plugins_root.path(), "acme", VALID_MANIFEST);
+        // The heal only trusts a directory whose name equals the manifest's
+        // plugin id (see `stamp_legacy_skill_pack_provenance`), matching
+        // `install_plugin_pack`'s invariant that packs always live at
+        // `plugins_root/<plugin_id>` — so this legacy-layout fixture uses
+        // "acme-user" for both the directory and the manifest id.
+        write_manifest(plugins_root.path(), "acme-user", VALID_MANIFEST);
         write_legacy_skills_provenance(skills_root.path(), "acme-user");
 
         let mut regs = Registries::new();
@@ -625,8 +633,36 @@ command = "acme-mcp"
             "legacy pack must load"
         );
         assert!(
-            plugins_root.path().join("acme/.ryuzi-skill.json").is_file(),
+            plugins_root
+                .path()
+                .join("acme-user/.ryuzi-skill.json")
+                .is_file(),
             "one-time heal must stamp the plugin directory"
+        );
+    }
+
+    #[test]
+    fn legacy_heal_rejects_dir_name_spoofing_an_installed_id() {
+        // A hand-authored directory named anything other than the manifest's
+        // plugin id must not be healed or loaded, even when it claims a real
+        // installed pack's id and that id has genuine materialized
+        // skills-root provenance — otherwise a spoofed manifest could ride
+        // another pack's provenance to get itself permanently trusted.
+        let plugins_root = tempfile::tempdir().unwrap();
+        let skills_root = tempfile::tempdir().unwrap();
+        write_manifest(plugins_root.path(), "impostor", VALID_MANIFEST);
+        write_legacy_skills_provenance(skills_root.path(), "acme-user");
+
+        let mut regs = Registries::new();
+        load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
+
+        assert!(
+            regs.plugins.get("acme-user").is_none(),
+            "dir name mismatching the claimed plugin id must not be healed or loaded"
+        );
+        assert!(
+            !plugins_root.path().join("impostor/.ryuzi-skill.json").is_file(),
+            "the impostor directory must not receive a provenance stamp"
         );
     }
 
