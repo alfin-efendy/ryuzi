@@ -177,7 +177,13 @@ pub async fn run_turn(
                 emit_session_cost(deps, &tally).await;
             }
         }
-        _ => emit_context_usage(deps, &cm, true).await,
+        // No persisted tally yet (fresh session) or a read error — either
+        // way this is a display re-emit, never an accumulation: `cm` hasn't
+        // committed any response yet, so `cm.last_*` would be all-zero at
+        // best and stale at worst. `emit_context_usage` would otherwise
+        // persist a spurious zero-token model entry (and a `total_usd=0`
+        // `SessionCost`) on every brand-new session.
+        _ => emit_context_display(deps, &cm, true).await,
     }
     cm.append_user(user_content_blocks(&prompt.blocks, &agent_text))
         .await?;
@@ -243,7 +249,11 @@ async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::R
     match cm.compact(&deps.llm, &model, "manual").await {
         Ok(outcome) => {
             emit_compaction(deps, "manual", &outcome, true).await;
-            emit_context_usage(deps, &cm, true).await;
+            // Display-only: `compact()` never calls `commit_response()`, so
+            // `cm.last_*` still hold whatever the last real assistant turn
+            // committed (or nothing, if none has run yet this session) —
+            // re-accumulating them here would double-count that response.
+            emit_context_display(deps, &cm, true).await;
             Ok(())
         }
         Err(e) => {
@@ -507,7 +517,10 @@ async fn drive(
             Ok(rx) => rx,
             Err(e) if is_context_overflow(&e.to_string()) => {
                 cm.mark_full();
-                emit_context_usage(deps, cm, display.text()).await;
+                // Display-only: `mark_full` does not reset `cm.last_*`, so
+                // they still hold the PREVIOUS committed response's buckets
+                // — accumulating here would double-count it.
+                emit_context_display(deps, cm, display.text()).await;
                 anyhow::bail!(
                     "context window exceeded — send another message and the session \
                      will compact before retrying: {e}"
@@ -530,7 +543,8 @@ async fn drive(
                     flush_text(deps, &mut text_buf, display.text()).await;
                     if is_context_overflow(&e.to_string()) {
                         cm.mark_full();
-                        emit_context_usage(deps, cm, display.text()).await;
+                        // Display-only — see the comment on the `deps.llm.stream` overflow arm above.
+                        emit_context_display(deps, cm, display.text()).await;
                         anyhow::bail!(
                             "context window exceeded — send another message and the session \
                              will compact before retrying: {e}"
@@ -612,7 +626,8 @@ async fn drive(
                     flush_text(deps, &mut text_buf, display.text()).await;
                     if is_context_overflow(&msg) {
                         cm.mark_full();
-                        emit_context_usage(deps, cm, display.text()).await;
+                        // Display-only — see the comment on the `deps.llm.stream` overflow arm above.
+                        emit_context_display(deps, cm, display.text()).await;
                         anyhow::bail!(
                             "context window exceeded — send another message and the session \
                              will compact before retrying: {msg}"
@@ -1187,6 +1202,16 @@ async fn emit_row(
 /// (ephemeral) loops skip both — their usage must not clobber the session's.
 /// Also folds this response's billed buckets into the per-session, per-model
 /// cost tally and emits `SessionCost` alongside `ContextUsage`.
+///
+/// Call this ONLY immediately after a fresh `cm.commit_response()` — it is
+/// the single site allowed to accumulate, because `cm.last_input()` /
+/// `last_output()` / `last_cache_read()` / `last_cache_creation()` hold
+/// exactly the response that was just committed there and nowhere else.
+/// Every other `ContextUsage` re-emit (context-overflow `mark_full`, manual
+/// `/compact`, the pre-turn resume/fallback seed) reads those same stale
+/// accessors from a PREVIOUS commit and must go through
+/// [`emit_context_display`] instead, or that response's buckets get added to
+/// the tally a second time.
 async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) {
     if !emit {
         return;
@@ -1205,12 +1230,20 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
     // Accumulate this response's billed buckets into the per-model tally, then
     // emit the session cost. Read-modify-write is race-free: native turns are
     // serialized by the session turn_lock.
-    let saved = deps
-        .store
-        .get_session_context(&deps.session_pk)
-        .await
-        .ok()
-        .flatten();
+    let saved = match deps.store.get_session_context(&deps.session_pk).await {
+        Ok(saved) => saved,
+        Err(e) => {
+            // A transient read error must never be treated as "no tally yet"
+            // — that would drop everything accumulated so far the moment we
+            // write back. Skip this emit's accumulation/persist entirely and
+            // let the next successful read pick the tally back up.
+            tracing::warn!(
+                "native: get_session_context failed, skipping cost accumulation to avoid \
+                 clobbering the persisted tally: {e}"
+            );
+            return;
+        }
+    };
     let mut tally = saved
         .as_ref()
         .map(super::cost::Tally::from_payload)
@@ -1223,6 +1256,71 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
         cm.last_cache_creation(),
     );
     emit_session_cost(deps, &tally).await;
+
+    let payload = json!({
+        "active_tokens": st.active_tokens,
+        "usable_window": st.usable_window,
+        "percent_left": st.percent_left,
+        "models": tally.to_payload_value(),
+    });
+    if let Err(e) = deps
+        .store
+        .upsert_session_context(&deps.session_pk, &payload)
+        .await
+    {
+        tracing::warn!("native: upsert_session_context failed: {e}");
+    }
+}
+
+/// Display-only `ContextUsage` re-emit, for every site that is NOT
+/// immediately after a fresh `cm.commit_response()`: the context-overflow
+/// `mark_full` sites, manual `/compact`, and the pre-turn resume/fallback
+/// seed. `cm.last_*` at those sites still hold whatever the last real
+/// committed response left behind (`mark_full` and `compact()` never reset
+/// them), so this function never calls `Tally::add` — it only re-broadcasts
+/// the tally exactly as already persisted (if any) and refreshes the context
+/// snapshot fields (`active_tokens`/`usable_window`/`percent_left`), leaving
+/// `"models"` byte-for-byte untouched.
+async fn emit_context_display(deps: &RunnerDeps, cm: &ContextManager, emit: bool) {
+    if !emit {
+        return;
+    }
+    let st = cm.status();
+    let _ = deps.events.send(CoreEvent::ContextUsage {
+        session_pk: deps.session_pk.clone(),
+        active_tokens: st.active_tokens,
+        context_window: st.context_window,
+        usable_window: st.usable_window,
+        percent_left: st.percent_left,
+        cache_read_tokens: cm.last_cache_read(),
+        output_tokens: cm.last_output(),
+    });
+
+    let saved = match deps.store.get_session_context(&deps.session_pk).await {
+        Ok(saved) => saved,
+        Err(e) => {
+            // Same clobber hazard as `emit_context_usage`: without a good
+            // read we don't know what's already persisted, so skip the
+            // persist for this emit rather than writing a models-less
+            // payload over a real tally.
+            tracing::warn!(
+                "native: get_session_context failed, skipping context-display persist to avoid \
+                 clobbering the persisted tally: {e}"
+            );
+            return;
+        }
+    };
+    // `Ok(None)` (genuinely no tally yet) is a legitimate empty base.
+    let tally = saved
+        .as_ref()
+        .map(super::cost::Tally::from_payload)
+        .unwrap_or_default();
+    // Keep the UI in sync with the resume block: re-emit from the UNCHANGED
+    // saved tally when there's something to show — no accumulation, just
+    // pricing it at current rates like the resume re-emit does.
+    if !tally.is_empty() {
+        emit_session_cost(deps, &tally).await;
+    }
 
     let payload = json!({
         "active_tokens": st.active_tokens,
@@ -1883,6 +1981,135 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "emit=false must not write session_context"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_display_reemit_does_not_double_count_committed_cost() {
+        // Regression test for the commit-3c284b0 bug: `emit_context_usage`
+        // used to be called from BOTH the post-commit site AND the
+        // context-overflow `mark_full` re-emit sites, sharing the same
+        // accumulation logic. `mark_full` never resets `cm.last_*`, so on
+        // overflow those accessors still held the PREVIOUS committed
+        // response's buckets — which then got added to the persisted tally
+        // a SECOND time. This drives the REAL overflow path (a mid-stream
+        // `MessageStreamEvent::Error` after a committed response) and
+        // asserts the tally reflects that response's buckets exactly ONCE.
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1: commits a real response (buckets B: input 5_000, output 1,
+        // cache_read 1_000) with a tool_use so the drive loop continues into
+        // a second provider turn instead of returning.
+        let turn1 = vec![
+            message_start_with_usage(5_000, 1_000),
+            text_delta("Working on it.\n"),
+            tool_use_start(1, "call-1", "bash"),
+            input_json_delta(1, "{\"command\":\"echo hi > out.txt\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // Turn 2: a mid-stream overflow error. This hits the
+        // `MessageStreamEvent::Error` `mark_full` + display re-emit path
+        // WITHOUT ever calling `cm.commit_response()` again, so `cm.last_*`
+        // still hold turn 1's buckets when the display re-emit reads them.
+        let turn2 = vec![error_event(
+            "prompt is too long: 500000 tokens > 400000 maximum",
+        )];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm).await;
+        deps.store
+            .set_setting_raw(
+                "models.meta.test/model",
+                &json!({
+                    "cost_input": 3.0,
+                    "cost_output": 15.0,
+                    "cost_cache_read": 1.5,
+                    "cost_cache_write": 0.0
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let mut rx = deps.events.subscribe();
+
+        let err = run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("context"));
+
+        // The overflow pinned the indicator to 0%, proving the display
+        // re-emit did run (this isn't a no-op skip).
+        let ctx = deps.store.get_session_context("s1").await.unwrap().unwrap();
+        assert_eq!(ctx["percent_left"], 0);
+
+        // The per-model tally must equal buckets B exactly ONCE, not 2×B:
+        // input 5_000 (not 10_000), output 1 (not 2), cache_read 1_000 (not
+        // 2_000).
+        let saved = &ctx["models"]["test/model"];
+        assert_eq!(saved["input"], 5_000, "input must not be double-counted");
+        assert_eq!(saved["output"], 1, "output must not be double-counted");
+        assert_eq!(
+            saved["cache_read"], 1_000,
+            "cache_read must not be double-counted"
+        );
+        assert_eq!(saved["cache_creation"], 0);
+
+        // Same invariant on the broadcast side: the last `SessionCost` must
+        // price buckets B once, not twice.
+        let (total, models) = last_session_cost(&mut rx).expect("a SessionCost event");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].input, 5_000);
+        assert_eq!(models[0].output, 1);
+        assert_eq!(models[0].cache_read, 1_000);
+        // 3.0/1e6*5000 + 15.0/1e6*1 + 1.5/1e6*1000 == 0.016515
+        assert!((total - 0.016515).abs() < 1e-9, "total {total}");
+    }
+
+    #[tokio::test]
+    async fn emit_context_display_after_commit_does_not_change_persisted_totals() {
+        // Focused unit test (spec fallback tier): calling the display-only
+        // function after a real accumulation must be a complete no-op on the
+        // persisted tally and totals, even though it re-reads and re-writes
+        // the context snapshot fields.
+        let dir = tempfile::tempdir().unwrap();
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+        let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
+            .await
+            .unwrap();
+        cm.observe_message_start(&json!({
+            "usage": {"input_tokens": 999, "cache_read_input_tokens": 3}
+        }));
+        cm.observe_message_delta(7, None, None, None);
+        cm.commit_response();
+
+        // The one legitimate accumulation.
+        emit_context_usage(&deps, &cm, true).await;
+        let after_commit = deps
+            .store
+            .get_session_context(&deps.session_pk)
+            .await
+            .unwrap()
+            .unwrap();
+        let saved_after_commit = after_commit["models"]["test/model"].clone();
+        assert_eq!(saved_after_commit["input"], 999);
+        assert_eq!(saved_after_commit["output"], 7);
+        assert_eq!(saved_after_commit["cache_read"], 3);
+
+        // `cm.last_*` still report the SAME committed response (nothing
+        // reset them) — exactly the stale-accessor condition at the
+        // overflow/compact/fallback sites. The display-only re-emit must
+        // NOT add them again.
+        emit_context_display(&deps, &cm, true).await;
+        let after_display = deps
+            .store
+            .get_session_context(&deps.session_pk)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_display["models"]["test/model"], saved_after_commit,
+            "display-only re-emit must not change the persisted tally"
         );
     }
 
