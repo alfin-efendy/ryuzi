@@ -213,22 +213,19 @@ impl AppController {
     }
 
     /// No-ops when already running/starting. Blocked (missing required
-    /// settings, or no gateway enabled) writes a synthetic error status
-    /// without spawning. Otherwise clears any stale status and spawns the
-    /// daemon detached, logging to `{data_dir}/daemon.log`.
+    /// settings) writes a synthetic error status without spawning. An empty
+    /// `enabled_gateways` is fine — the daemon is the always-on engine host
+    /// (control API, sessions, scheduler) regardless of whether any gateway
+    /// is enabled. Otherwise clears any stale status and spawns the daemon
+    /// detached, logging to `{data_dir}/daemon.log`.
     pub async fn start_daemon(&self) -> anyhow::Result<()> {
         let cur = self.daemon();
         if cur.running || cur.starting {
             return Ok(());
         }
         let missing = self.missing_required().await;
-        let gateways = self.enabled_gateways().await;
-        if !missing.is_empty() || gateways.is_empty() {
-            let why = if !missing.is_empty() {
-                format!("missing settings: {}", missing.join(", "))
-            } else {
-                "no gateways enabled".to_string()
-            };
+        if !missing.is_empty() {
+            let why = format!("missing settings: {}", missing.join(", "));
             let _ = write_status(
                 &self.deps.data_dir,
                 &DaemonStatusFile {
@@ -354,6 +351,27 @@ mod tests {
         assert!(spawns.lock().unwrap().is_empty());
         let err = c.daemon().last_error.unwrap();
         assert!(err.to_lowercase().contains("missing"), "{err}");
+    }
+
+    /// The daemon is the always-on engine host regardless of gateways: with
+    /// `enabled_gateways` cleared to empty (previously refused with "no
+    /// gateways enabled") and no required setting missing, `start_daemon`
+    /// now proceeds to spawn.
+    #[tokio::test]
+    async fn start_daemon_spawns_even_with_no_gateways_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawns: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let mut c = controller_in(dir.path()).await;
+        let log = spawns.clone();
+        c.deps.spawn_daemon = Some(Box::new(move |cmd, _log_path| {
+            log.lock().unwrap().push(cmd.to_vec());
+            Ok(4242)
+        }));
+        c.set_enabled_gateways(&[]).await.unwrap();
+        c.set("workdir_root", "/repos").await.unwrap();
+        c.start_daemon().await.unwrap();
+        assert_eq!(spawns.lock().unwrap().len(), 1);
+        assert!(c.daemon().last_error.is_none());
     }
 
     #[tokio::test]

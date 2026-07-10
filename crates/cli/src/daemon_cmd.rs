@@ -34,6 +34,11 @@ use crate::dispatch::Deps;
 /// and exits with a "timed out connecting" error.
 const CONNECT_TIMEOUT_MS: u64 = 30_000;
 
+/// Default localhost control-API port; overridden by the `control_port`
+/// setting. `ryuzi_core::serve::serve` falls back to an ephemeral port if
+/// this one is already busy — see its doc.
+pub(crate) const DEFAULT_CONTROL_PORT: u16 = 4483;
+
 pub fn cmd_daemon(args: &[String], deps: &mut Deps) -> u8 {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -129,6 +134,18 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
     let version = Some(env!("CARGO_PKG_VERSION").to_string());
     let pid = std::process::id() as i32;
 
+    // Real mutual exclusion (daemon.json's pid is only advisory — see its
+    // doc). Acquired before any status is written so a second `__daemon`
+    // invocation in the same state dir fails fast instead of clobbering the
+    // first one's "connecting" file.
+    let _lock = match ryuzi_core::daemon_lock::DaemonLock::acquire(&dir) {
+        Ok(l) => l,
+        Err(e) => {
+            (deps.err)(&format!("daemon: {e}"));
+            return 1;
+        }
+    };
+
     let _ = write_status(
         &dir,
         &DaemonStatusFile {
@@ -162,6 +179,37 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
         }
     };
 
+    // Control API: bearer token, then the bound port, written into daemon.json
+    // BEFORE the daemon is reported running so clients that poll the status
+    // file never observe a "running" daemon with no reachable control API.
+    let token = match ryuzi_core::control_token::write_token(&dir) {
+        Ok(t) => t,
+        Err(e) => {
+            (deps.err)(&format!("daemon: could not write control token: {e}"));
+            return 1;
+        }
+    };
+    let settings = SettingsStore::new(daemon.store.clone());
+    let control_port: u16 = settings
+        .get("control_port")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_CONTROL_PORT);
+    let state = ryuzi_core::serve::ApiState {
+        cp: daemon.cp.clone(),
+        router_server: daemon.router_server.clone(),
+        token: Some(token),
+    };
+    let bound = match ryuzi_core::serve::serve(state, control_port).await {
+        Ok(p) => p,
+        Err(e) => {
+            (deps.err)(&format!("daemon: control api failed to bind: {e}"));
+            return 1;
+        }
+    };
+
     let _ = write_status(
         &dir,
         &DaemonStatusFile {
@@ -170,7 +218,7 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
             started_at,
             last_error: None,
             version,
-            port: None,
+            port: Some(bound),
         },
     );
     (deps.out)("daemon: running");
@@ -512,9 +560,60 @@ async fn run_canary(deps: &mut Deps) -> u8 {
         .await
         .take()
         .expect("promote() built the daemon");
+
+    // The old applier process is still alive (and still holding
+    // `DaemonLock`) at the instant `promote()` returns — the
+    // applier/canary handoff, not the lock, is what excludes the two during
+    // the swap (see `ProdCanaryHost::promote`'s doc). Acquiring the lock
+    // inline here would deadlock against that still-live process, so poll
+    // for it in the background instead: once the old process exits and its
+    // flock is released, forget the guard so this process holds the lock
+    // for the rest of its lifetime, matching `run_daemon`'s singleton-lock
+    // invariant. A wedged old process just means the lock is never taken —
+    // logged once, but not fatal to the now-promoted canary.
+    spawn_lock_acquire_retry(dir.clone());
+
     install_signal_handlers(dir, Arc::new(daemon), None);
     std::future::pending::<()>().await;
     unreachable!("shutdown_once exits the process before this future can resolve")
+}
+
+/// How often [`spawn_lock_acquire_retry`] retries
+/// [`ryuzi_core::daemon_lock::DaemonLock::acquire`].
+const LOCK_RETRY_INTERVAL_MS: u64 = 500;
+
+/// How long [`spawn_lock_acquire_retry`] retries before giving up and
+/// logging a warning.
+const LOCK_RETRY_WINDOW_MS: u64 = 120_000;
+
+/// Background task: retry [`ryuzi_core::daemon_lock::DaemonLock::acquire`]
+/// for `dir` every [`LOCK_RETRY_INTERVAL_MS`] until it succeeds or
+/// [`LOCK_RETRY_WINDOW_MS`] elapses. On success the guard is
+/// `std::mem::forget`-ten so the lock is held for the rest of the process
+/// lifetime, exactly like [`run_daemon`]'s own lock. On timeout, logs one
+/// warning and returns — the promoted canary keeps running either way.
+fn spawn_lock_acquire_retry(dir: PathBuf) {
+    tokio::spawn(async move {
+        let mut waited_ms = 0u64;
+        loop {
+            match ryuzi_core::daemon_lock::DaemonLock::acquire(&dir) {
+                Ok(lock) => {
+                    std::mem::forget(lock);
+                    return;
+                }
+                Err(_) if waited_ms < LOCK_RETRY_WINDOW_MS => {
+                    tokio::time::sleep(Duration::from_millis(LOCK_RETRY_INTERVAL_MS)).await;
+                    waited_ms += LOCK_RETRY_INTERVAL_MS;
+                }
+                Err(e) => {
+                    println!(
+                        "daemon: canary could not acquire the daemon lock within {LOCK_RETRY_WINDOW_MS}ms after promotion ({e}); the old process may be wedged"
+                    );
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// Production `CanaryHost` — opens a real `Daemon` (deferring `start()`
@@ -540,10 +639,32 @@ impl CanaryHost for ProdCanaryHost {
         *self.daemon.lock().await = Some(daemon);
         Ok(())
     }
+    // NOTE: does NOT acquire `DaemonLock` — the old applier process still
+    // holds it at this point in the handoff (the applier/canary handshake,
+    // not the flock, is what excludes the two during the swap). `run_canary`
+    // acquires the lock itself, in the background, once `promote` returns —
+    // see `spawn_lock_acquire_retry`.
     async fn promote(&self) -> anyhow::Result<()> {
         let guard = self.daemon.lock().await;
         let daemon = guard.as_ref().expect("open_db succeeded before promote");
         daemon.start().await?; // claims gateways + fires reconcile() for interrupted sessions
+
+        let token = ryuzi_core::control_token::write_token(&self.dir)?;
+        let settings = SettingsStore::new(daemon.store.clone());
+        let control_port: u16 = settings
+            .get("control_port")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_CONTROL_PORT);
+        let state = ryuzi_core::serve::ApiState {
+            cp: daemon.cp.clone(),
+            router_server: daemon.router_server.clone(),
+            token: Some(token),
+        };
+        let bound = ryuzi_core::serve::serve(state, control_port).await?;
+
         let _ = write_status(
             &self.dir,
             &DaemonStatusFile {
@@ -552,7 +673,7 @@ impl CanaryHost for ProdCanaryHost {
                 started_at: ryuzi_core::paths::now_ms(),
                 last_error: None,
                 version: Some(self.version.clone()),
-                port: None,
+                port: Some(bound),
             },
         );
         Ok(())
@@ -661,6 +782,14 @@ mod tests {
     use ryuzi_core::daemon_status::{read_status, DaemonFileState};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+
+    // ---------- DEFAULT_CONTROL_PORT ----------
+
+    #[test]
+    fn control_port_default_is_4483() {
+        // Documented default; EngineClient and docs reference it.
+        assert_eq!(super::DEFAULT_CONTROL_PORT, 4483);
+    }
 
     // ---------- is_canary ----------
 
