@@ -277,7 +277,13 @@ export function Sidebar() {
       <div className="box-border flex w-[260px] min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2.5">
         {projList.map((p) => {
           const showArch = archivedGlobal || !!showArchived[p.projectId];
-          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived);
+          // TODO(task 4): replace with the real store-driven sessionFilter.
+          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, {
+            statuses: {},
+            unreadOnly: false,
+            readAt: {},
+            focusedSessionPk: null,
+          });
           const archCount = archivedCount(sessions, p.projectId, archived);
           const open = q.trim() ? sess.length > 0 : (expanded[p.projectId] ?? true);
           return (

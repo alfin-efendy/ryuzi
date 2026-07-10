@@ -18,8 +18,15 @@ export function sessionTitle(s: Session): string {
   return s.title?.trim() || "Untitled session";
 }
 
+export type SessionFilterCtx = {
+  statuses: Record<string, true>;
+  unreadOnly: boolean;
+  readAt: Record<string, number>;
+  focusedSessionPk: string | null;
+};
+
 // Sessions shown under one project row: query-filtered, archived hidden unless
-// revealed, pinned first, newest first within each group.
+// revealed, status/unread filtered, pinned first, newest first within each group.
 export function sessionsForProject(
   sessions: Session[],
   projectId: string,
@@ -27,12 +34,16 @@ export function sessionsForProject(
   showArchived: boolean,
   pinned: Record<string, true>,
   archived: Record<string, true>,
+  filter: SessionFilterCtx,
 ): Session[] {
   const q = query.trim().toLowerCase();
+  const statusActive = Object.keys(filter.statuses).length > 0;
   return sessions
     .filter((s) => s.projectId === projectId)
     .filter((s) => !q || sessionTitle(s).toLowerCase().includes(q))
     .filter((s) => showArchived || !archived[s.sessionPk])
+    .filter((s) => !statusActive || filter.statuses[s.status])
+    .filter((s) => !filter.unreadOnly || isUnreadVisible(s, filter.readAt, filter.focusedSessionPk))
     .sort((a, b) => {
       const pin = (pinned[b.sessionPk] ? 1 : 0) - (pinned[a.sessionPk] ? 1 : 0);
       if (pin !== 0) return pin;

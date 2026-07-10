@@ -125,3 +125,15 @@ test("markAllRead advances every session to its lastActive", () => {
   useUi.getState().markAllRead([sess("s1", 400), sess("s2", 700)]);
   expect(useUi.getState().readAt).toEqual({ s1: 400, s2: 700 });
 });
+
+test("toggleStatusFilter and toggleUnreadOnly persist", () => {
+  useUi.setState({ sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.getState().toggleStatusFilter("running");
+  useUi.getState().toggleUnreadOnly();
+  expect(useUi.getState().sessionFilter).toEqual({ statuses: { running: true }, unreadOnly: true });
+  const saved = JSON.parse(localStorage.getItem("cockpit.ui.sessionFilter")!);
+  expect(saved).toEqual({ statuses: { running: true }, unreadOnly: true });
+  // toggling again removes the status
+  useUi.getState().toggleStatusFilter("running");
+  expect(useUi.getState().sessionFilter.statuses).toEqual({});
+});
