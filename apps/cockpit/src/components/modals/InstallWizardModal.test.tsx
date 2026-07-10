@@ -90,9 +90,7 @@ let beginData: PluginInstallBeginResult = beginResult();
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 
 const pluginDetail = mock((_id: string): Promise<Result<PluginDetail, CmdError>> => ok(detailData));
-const beginPluginInstall = mock(
-  (_pluginId: string): Promise<Result<PluginInstallBeginResult, CmdError>> => ok(beginData),
-);
+const beginPluginInstall = mock((_pluginId: string): Promise<Result<PluginInstallBeginResult, CmdError>> => ok(beginData));
 const setPluginOauthClientId = mock((_pluginId: string, _clientId: string): Promise<Result<null, CmdError>> => ok(null));
 const cancelPluginInstall = mock((_pluginId: string, _stateToken: string | null) => ok(null));
 const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken: string) => ok(oauthAuthInfo));
@@ -353,9 +351,7 @@ test("manualClientId toasts and stays put with no dead end when the re-begin cal
   const input = screen.getByPlaceholderText("Paste the client ID from the vendor's console") as HTMLInputElement;
   fireEvent.change(input, { target: { value: "client-xyz" } });
 
-  beginPluginInstall.mockImplementationOnce(() =>
-    Promise.resolve({ status: "error" as const, error: { message: "network unreachable" } }),
-  );
+  beginPluginInstall.mockImplementationOnce(() => Promise.resolve({ status: "error" as const, error: { message: "network unreachable" } }));
   fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
   await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith("notion", "client-xyz"));
@@ -558,9 +554,7 @@ test("experimental plugins are not auto-enabled at done", async () => {
 });
 
 test("a null detail (pluginDetail failed, begin still routed to done) shows neutral copy and skips enable", async () => {
-  pluginDetail.mockImplementationOnce(() =>
-    Promise.resolve({ status: "error" as const, error: { message: "manifest read failed" } }),
-  );
+  pluginDetail.mockImplementationOnce(() => Promise.resolve({ status: "error" as const, error: { message: "manifest read failed" } }));
   beginData = beginResult({ authKind: "none" });
   await renderWizard();
 

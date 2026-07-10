@@ -138,9 +138,7 @@ export function InstallWizardModal({
   const settingsFields = detail?.settings ?? [];
   // valueSet counts (a saved value satisfies the requirement without ever
   // being echoed); a non-empty typed value counts because Continue saves it.
-  const requiredSatisfied = settingsFields.every(
-    (f) => !f.required || f.valueSet || (fieldValues[f.key] ?? "").trim().length > 0,
-  );
+  const requiredSatisfied = settingsFields.every((f) => !f.required || f.valueSet || (fieldValues[f.key] ?? "").trim().length > 0);
 
   const submitSettings = async () => {
     if (busy || !requiredSatisfied) return;
@@ -295,8 +293,8 @@ export function InstallWizardModal({
       {step === "tokenInput" && (
         <>
           <p className="mb-[18px] mt-0 text-[12.5px] text-muted-foreground">
-            {pluginName} authenticates with {begin?.authKind === "api-key" ? "an API key" : "a token"}. Paste it below — Cockpit
-            stores it locally and never shows it again.
+            {pluginName} authenticates with {begin?.authKind === "api-key" ? "an API key" : "a token"}. Paste it below — Cockpit stores it
+            locally and never shows it again.
           </p>
           {detail?.auth?.setting ? (
             <FormField label={begin?.authKind === "api-key" ? "API key" : "Token"}>
@@ -310,8 +308,8 @@ export function InstallWizardModal({
           ) : (
             <p className="m-0 text-[12.5px] text-muted-foreground">
               This plugin reads its credential from the{" "}
-              <span className="font-mono text-xs">{detail?.auth?.env ?? begin?.envVarName ?? "required"}</span> environment
-              variable. Set it, restart Cockpit, and install again.
+              <span className="font-mono text-xs">{detail?.auth?.env ?? begin?.envVarName ?? "required"}</span> environment variable. Set
+              it, restart Cockpit, and install again.
             </p>
           )}
           {detail?.auth?.helpUrl && (
@@ -384,14 +382,9 @@ export function InstallWizardModal({
       {step === "waitingOauth" && (
         <>
           <p className="mb-2 mt-0 text-[13px] font-medium">Browser opened — finish signing in there.</p>
-          <p className="m-0 text-[12.5px] text-muted-foreground">
-            Cockpit is listening for the redirect and will finish automatically.
-          </p>
+          <p className="m-0 text-[12.5px] text-muted-foreground">Cockpit is listening for the redirect and will finish automatically.</p>
           {oauthError && (
-            <div
-              className="mt-3 flex flex-col gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]"
-              style={{ color: "#F59E0B" }}
-            >
+            <div className="mt-3 flex flex-col gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]" style={{ color: "#F59E0B" }}>
               <span className="flex items-start gap-2">
                 <CircleAlert aria-hidden size={14} strokeWidth={2} className="mt-0.5 shrink-0" />
                 {oauthError}
@@ -417,11 +410,7 @@ export function InstallWizardModal({
                 </p>
               )}
               <FormField label="Authorization code">
-                <Input
-                  value={code}
-                  onChange={(e) => setCode(e.target.value)}
-                  placeholder="Paste the code value from the callback URL"
-                />
+                <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="Paste the code value from the callback URL" />
               </FormField>
               <div className="mt-2 flex justify-end">
                 <Button size="sm" disabled={busy || code.trim().length === 0} onClick={() => void submitCode()}>
@@ -431,12 +420,7 @@ export function InstallWizardModal({
             </div>
           )}
           {!pasteOpen && begin?.callbackMode !== "manual" && !oauthError && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setPasteOpen(true)}
-              className="mt-3 px-0 text-[12px] text-muted-foreground"
-            >
+            <Button variant="ghost" size="sm" onClick={() => setPasteOpen(true)} className="mt-3 px-0 text-[12px] text-muted-foreground">
               Having trouble? Paste the code manually
             </Button>
           )}
