@@ -1,6 +1,6 @@
 //! `DashboardState` — pure, terminal-free state machine for the main app
 //! view: tab navigation, the sessions list/detail, and inline config editing
-//! with provider (gateway/runtime) toggles. Rendering lives in `render.rs`.
+//! with gateway provider toggles. Rendering lives in `render.rs`.
 
 use ryuzi_core::settings::ConfigField;
 
@@ -10,13 +10,11 @@ use crate::tui::Key;
 pub const TABS: [&str; 4] = ["Status", "Daemon", "Sessions", "Config"];
 
 /// One row of the Config tab's flattened row list. Headers are never
-/// selectable; `config_cursor` walks only the `Field`/`ToggleGateway`/
-/// `ToggleRuntime` rows.
+/// selectable; `config_cursor` walks only the `Field`/`ToggleGateway` rows.
 pub enum ConfigRow {
     Header(String),
     Field(&'static ConfigField),
     ToggleGateway { id: String, label: String },
-    ToggleRuntime { id: String, label: String },
 }
 
 pub struct DashboardState {
@@ -255,11 +253,11 @@ impl DashboardState {
             Key::Space => {
                 let row_idx = selectable[self.config_cursor.min(selectable.len() - 1)];
                 if self.toggle_provider_row(row_idx, controller).await {
-                    // A gateway/runtime toggle can add or remove that
-                    // provider's Header/Field rows (`build_config_rows` only
-                    // includes them while enabled) — rebuild now instead of
-                    // leaving stale rows on screen for up to a second until
-                    // the next tick.
+                    // A gateway toggle can add or remove that provider's
+                    // Header/Field rows (`build_config_rows` only includes
+                    // them while enabled) — rebuild now instead of leaving
+                    // stale rows on screen for up to a second until the next
+                    // tick.
                     self.rebuild_config_rows(controller).await;
                 }
             }
@@ -267,11 +265,9 @@ impl DashboardState {
         }
     }
 
-    /// Flips `id` in the corresponding enabled-CSV setting. A
-    /// runtime toggle also keeps `default_runtime` valid: empty set -> `""`,
-    /// else the first remaining member if the current default fell out.
-    /// Returns whether the toggle was actually persisted (i.e. the CSV write
-    /// succeeded), so the caller only rebuilds `config_rows` on success.
+    /// Flips `id` in the `enabled_gateways` CSV setting. Returns whether the
+    /// toggle was actually persisted (i.e. the CSV write succeeded), so the
+    /// caller only rebuilds `config_rows` on success.
     async fn toggle_provider_row(&mut self, row_idx: usize, controller: &AppController) -> bool {
         match &self.config_rows[row_idx] {
             ConfigRow::ToggleGateway { id, .. } => {
@@ -279,23 +275,6 @@ impl DashboardState {
                 let mut ids = controller.enabled_gateways().await;
                 toggle_id(&mut ids, &id);
                 controller.set_enabled_gateways(&ids).await.is_ok()
-            }
-            ConfigRow::ToggleRuntime { id, .. } => {
-                let id = id.clone();
-                let mut ids = controller.enabled_runtimes().await;
-                toggle_id(&mut ids, &id);
-                let ok = controller.set_enabled_runtimes(&ids).await.is_ok();
-                if ok {
-                    if ids.is_empty() {
-                        let _ = controller.set_default_runtime("").await;
-                    } else {
-                        let current_default = controller.default_runtime().await;
-                        if !ids.iter().any(|i| i == &current_default) {
-                            let _ = controller.set_default_runtime(&ids[0]).await;
-                        }
-                    }
-                }
-                ok
             }
             ConfigRow::Header(_) | ConfigRow::Field(_) => false,
         }
@@ -319,15 +298,6 @@ impl DashboardState {
         self.selectable_indices()
             .into_iter()
             .position(|idx| matches!(&self.config_rows[idx], ConfigRow::Field(f) if f.key == key))
-    }
-
-    /// Test-only lookup: the selectable-index of the `ToggleRuntime` row for
-    /// `id`.
-    #[cfg(test)]
-    pub(crate) fn selectable_index_of_runtime_toggle(&self, id: &str) -> Option<usize> {
-        self.selectable_indices().into_iter().position(|idx| {
-            matches!(&self.config_rows[idx], ConfigRow::ToggleRuntime { id: rid, .. } if rid == id)
-        })
     }
 
     /// Test-only lookup: the selectable-index of the `ToggleGateway` row for
@@ -359,9 +329,9 @@ fn toggle_id(ids: &mut Vec<String>, id: &str) {
 }
 
 /// Builds the Config tab's row list: `Header("General")` + general fields,
-/// then per *enabled* gateway/runtime that has fields a `Header(label)` +
-/// its fields, then `Header("Providers")` + a toggle row for every catalog
-/// gateway/runtime (enabled or not).
+/// then per *enabled* gateway that has fields a `Header(label)` + its
+/// fields, then `Header("Providers")` + a toggle row for every catalog
+/// gateway (enabled or not).
 async fn build_config_rows(controller: &AppController) -> Vec<ConfigRow> {
     let mut rows = vec![ConfigRow::Header("General".to_string())];
     for f in controller.general_fields() {
@@ -377,15 +347,6 @@ async fn build_config_rows(controller: &AppController) -> Vec<ConfigRow> {
         }
     }
 
-    for id in controller.enabled_runtimes().await {
-        if let Some(rt) = controller.runtime_descriptors().iter().find(|r| r.id == id) {
-            if !rt.fields.is_empty() {
-                rows.push(ConfigRow::Header(rt.label.to_string()));
-                rows.extend(rt.fields.iter().map(ConfigRow::Field));
-            }
-        }
-    }
-
     rows.push(ConfigRow::Header("Providers".to_string()));
     rows.extend(
         controller
@@ -394,15 +355,6 @@ async fn build_config_rows(controller: &AppController) -> Vec<ConfigRow> {
             .map(|gw| ConfigRow::ToggleGateway {
                 id: gw.id.to_string(),
                 label: format!("{} (gateway)", gw.label),
-            }),
-    );
-    rows.extend(
-        controller
-            .runtime_descriptors()
-            .iter()
-            .map(|rt| ConfigRow::ToggleRuntime {
-                id: rt.id.to_string(),
-                label: format!("{} (runtime)", rt.label),
             }),
     );
 
@@ -473,22 +425,6 @@ mod tests {
             1,
             "s on the daemon tab toggles the daemon"
         );
-    }
-
-    #[tokio::test]
-    async fn config_toggle_runtime_keeps_default_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let c = controller_in(dir.path()).await; // seeds: enabled_runtimes = native, default = native (ryuzi-only defaults)
-        let mut d = DashboardState::new(&c).await;
-        d.active = 3;
-        // move cursor to the native runtime toggle row and Space it off:
-        let idx = d.selectable_index_of_runtime_toggle("native").unwrap(); // small test helper on DashboardState
-        d.config_cursor = idx;
-        d.handle(Key::Space, &c).await;
-        assert_eq!(c.enabled_runtimes().await, Vec::<String>::new());
-        assert_eq!(c.default_runtime().await, "");
-        d.handle(Key::Space, &c).await; // toggle back on
-        assert_eq!(c.default_runtime().await, "native");
     }
 
     #[tokio::test]

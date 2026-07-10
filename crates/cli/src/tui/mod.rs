@@ -88,7 +88,6 @@ async fn run_ui(deps: &mut crate::dispatch::Deps) -> u8 {
         store: Arc::new(store),
         data_dir,
         detect_git: deps.detect_git,
-        detect_claude: deps.detect_claude,
         spawn_daemon: None,
         kill_daemon: None,
     });
