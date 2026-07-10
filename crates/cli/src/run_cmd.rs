@@ -255,30 +255,113 @@ async fn run_session(
                 request_id,
                 tool,
                 summary,
-                ..
+                approval_kind,
+                input,
             } if session_pk == session.session_pk => {
-                use ryuzi_core::domain::{ApprovalDecision, ApprovalResponse, ApprovalScope};
-                let answer = (deps.prompt)(&format!(
-                    "approve {tool}? {summary} [y=once, s=always this session, a=always this project, n=no, N=never this project] "
-                ));
-                let response = match answer.trim() {
-                    "y" | "Y" | "yes" => ApprovalResponse::once(true),
-                    "s" | "S" => ApprovalResponse {
-                        decision: ApprovalDecision::AllowAlways,
-                        scope: Some(ApprovalScope::Session),
-                        payload: None,
-                    },
-                    "a" | "A" => ApprovalResponse {
-                        decision: ApprovalDecision::AllowAlways,
-                        scope: Some(ApprovalScope::Project),
-                        payload: None,
-                    },
-                    "N" => ApprovalResponse {
-                        decision: ApprovalDecision::RejectAlways,
-                        scope: Some(ApprovalScope::Project),
-                        payload: None,
-                    },
-                    _ => ApprovalResponse::once(false),
+                use ryuzi_core::domain::{
+                    ApprovalDecision, ApprovalKind, ApprovalResponse, ApprovalScope,
+                };
+                let response = match approval_kind {
+                    ApprovalKind::Tool => {
+                        let answer = (deps.prompt)(&format!(
+                            "approve {tool}? {summary} [y=once, s=always this session, a=always this project, n=no, N=never this project] "
+                        ));
+                        match answer.trim() {
+                            "y" | "Y" | "yes" => ApprovalResponse::once(true),
+                            "s" | "S" => ApprovalResponse {
+                                decision: ApprovalDecision::AllowAlways,
+                                scope: Some(ApprovalScope::Session),
+                                payload: None,
+                            },
+                            "a" | "A" => ApprovalResponse {
+                                decision: ApprovalDecision::AllowAlways,
+                                scope: Some(ApprovalScope::Project),
+                                payload: None,
+                            },
+                            "N" => ApprovalResponse {
+                                decision: ApprovalDecision::RejectAlways,
+                                scope: Some(ApprovalScope::Project),
+                                payload: None,
+                            },
+                            _ => ApprovalResponse::once(false),
+                        }
+                    }
+                    ApprovalKind::Plan => {
+                        let plan = input.get("plan").and_then(|p| p.as_str()).unwrap_or("");
+                        (deps.out)("--- proposed plan ---");
+                        (deps.out)(plan);
+                        (deps.out)("----------------------");
+                        let answer = (deps.prompt)(
+                            "approve plan? [a=approve + auto-edits, m=approve, r=reject with feedback] ",
+                        );
+                        match answer.trim() {
+                            "a" | "A" => ApprovalResponse {
+                                decision: ApprovalDecision::AllowOnce,
+                                scope: None,
+                                payload: Some(serde_json::json!({"mode": "acceptEdits"})),
+                            },
+                            "m" | "M" => ApprovalResponse {
+                                decision: ApprovalDecision::AllowOnce,
+                                scope: None,
+                                payload: Some(serde_json::json!({"mode": "default"})),
+                            },
+                            _ => {
+                                let feedback = (deps.prompt)("feedback: ");
+                                ApprovalResponse {
+                                    decision: ApprovalDecision::RejectOnce,
+                                    scope: None,
+                                    payload: Some(serde_json::json!({"feedback": feedback.trim()})),
+                                }
+                            }
+                        }
+                    }
+                    ApprovalKind::Question => {
+                        let mut answers = serde_json::Map::new();
+                        let questions = input
+                            .get("questions")
+                            .and_then(|q| q.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        for q in &questions {
+                            let text = q.get("question").and_then(|v| v.as_str()).unwrap_or("?");
+                            let opts: Vec<&str> = q
+                                .get("options")
+                                .and_then(|o| o.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|o| o.get("label").and_then(|l| l.as_str()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            (deps.out)(text);
+                            for (i, label) in opts.iter().enumerate() {
+                                (deps.out)(&format!("  {}. {label}", i + 1));
+                            }
+                            let picked =
+                                (deps.prompt)("answer (numbers, comma-separated; or free text): ");
+                            let labels: Vec<String> = picked
+                                .split(',')
+                                .filter_map(|part| {
+                                    let part = part.trim();
+                                    part.parse::<usize>()
+                                        .ok()
+                                        .and_then(|n| opts.get(n.saturating_sub(1)))
+                                        .map(|s| s.to_string())
+                                })
+                                .collect();
+                            let labels = if labels.is_empty() && !picked.trim().is_empty() {
+                                vec![picked.trim().to_string()] // free-text "Other"
+                            } else {
+                                labels
+                            };
+                            answers.insert(text.to_string(), serde_json::json!(labels));
+                        }
+                        ApprovalResponse {
+                            decision: ApprovalDecision::AllowOnce,
+                            scope: None,
+                            payload: Some(serde_json::json!({"answers": answers})),
+                        }
+                    }
                 };
                 cp.resolve_approval(&request_id, response);
             }
