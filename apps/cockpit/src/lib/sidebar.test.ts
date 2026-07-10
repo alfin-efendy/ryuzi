@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Project, Session } from "../bindings";
-import { archivedCount, orderProjects, sessionTitle, sessionsForProject } from "./sidebar";
+import { archivedCount, chatSessions, orderProjects, sessionTitle, sessionsForProject } from "./sidebar";
 
 function sess(pk: string, projectId: string, title: string | null, lastActive = 0): Session {
   return {
@@ -16,6 +16,10 @@ function sess(pk: string, projectId: string, title: string | null, lastActive = 
     lastActive,
     resumeAttempts: 0,
     branchOwned: true,
+    kind: "project",
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   };
 }
 
@@ -57,5 +61,14 @@ describe("sidebar sessions", () => {
     const projects = [{ projectId: "z", name: "zeta" } as Project, { projectId: "a", name: "alpha" } as Project];
     expect(orderProjects(projects, "updated").map((p) => p.projectId)).toEqual(["z", "a"]);
     expect(orderProjects(projects, "name").map((p) => p.projectId)).toEqual(["a", "z"]);
+  });
+
+  test("chat sessions bucket separately from project sessions", () => {
+    const sessions = [
+      { sessionPk: "c1", projectId: null, kind: "chat" },
+      { sessionPk: "p1", projectId: "proj", kind: "project" },
+    ] as any;
+    expect(chatSessions(sessions).map((s) => s.sessionPk)).toEqual(["c1"]);
+    expect(sessionsForProject(sessions, "proj", "", false, {}, {}).map((s) => s.sessionPk)).toEqual(["p1"]);
   });
 });

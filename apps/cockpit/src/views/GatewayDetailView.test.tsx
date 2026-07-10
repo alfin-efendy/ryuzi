@@ -39,6 +39,10 @@ const runningSession: Session = {
   lastActive: 1_720_000_000_000,
   resumeAttempts: 0,
   branchOwned: true,
+  kind: "project",
+  speaker: null,
+  agent: null,
+  parentSessionPk: null,
 };
 const endedSession: Session = { ...runningSession, sessionPk: "s-done", title: "Old finished run", status: "ended" };
 

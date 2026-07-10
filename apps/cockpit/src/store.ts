@@ -78,6 +78,9 @@ type State = {
   /** Resolves true as soon as the backend accepts — navigate immediately;
    *  the session list refresh completes in the background. */
   start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
+  /** Same shape as `start`, but for a chat-first session with no project
+   *  (`start_chat_session`) — Home's default when no project is attached. */
+  startChat: (prompt: string, options?: ChatOptions | null) => Promise<boolean>;
   /** Resolves true when the backend accepted the prompt — false lets the
    *  composer restore its optimistically-cleared draft. */
   send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
@@ -320,6 +323,18 @@ export const useStore = create<State>((set, get) => ({
     // Optimistic navigation: the backend returns the session row before its
     // git/harness startup finishes. Seed and focus it now; the full refresh
     // catches up in the background.
+    set({ focusedSessionPk: res.data.sessionPk, sessions: [...get().sessions, res.data] });
+    void get().refresh();
+    return true;
+  },
+  startChat: async (prompt, options) => {
+    const res = await commands.startChatSession(prompt, toChatRequestOptions(options));
+    if (res.status === "error") {
+      toast.error("Couldn't start chat: " + res.error.message);
+      return false;
+    }
+    // Same optimistic-navigation seed as start(): focus the returned row
+    // immediately, then let the background refresh catch up.
     set({ focusedSessionPk: res.data.sessionPk, sessions: [...get().sessions, res.data] });
     void get().refresh();
     return true;
