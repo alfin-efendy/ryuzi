@@ -12,6 +12,7 @@ import {
   type PermMode,
   type ApprovalKind,
   type ApprovalResponse,
+  type ModelCost,
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
@@ -48,7 +49,19 @@ type State = {
   lastSeq: Record<string, number>;
   loaded: Record<string, boolean>;
   /** Per-session context-window usage from the latest `contextUsage` event. */
-  contextUsage: Record<string, { activeTokens: number; usableWindow: number; percentLeft: number }>;
+  contextUsage: Record<
+    string,
+    {
+      activeTokens: number;
+      usableWindow: number;
+      percentLeft: number;
+      contextWindow: number;
+      cacheReadTokens: number;
+      outputTokens: number;
+    }
+  >;
+  /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
+  sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
   applyCoreEvent: (e: CoreEvent) => void;
   clearApproval: (requestId: string) => void;
   setFocused: (pk: string | null) => void;
@@ -107,6 +120,7 @@ export const useStore = create<State>((set, get) => ({
   lastSeq: {},
   loaded: {},
   contextUsage: {},
+  sessionCost: {},
 
   applyCoreEvent: (e) =>
     set((st) => {
@@ -188,7 +202,17 @@ export const useStore = create<State>((set, get) => ({
                 activeTokens: e.active_tokens,
                 usableWindow: e.usable_window,
                 percentLeft: e.percent_left,
+                contextWindow: e.context_window,
+                cacheReadTokens: e.cache_read_tokens,
+                outputTokens: e.output_tokens,
               },
+            },
+          };
+        case "sessionCost":
+          return {
+            sessionCost: {
+              ...st.sessionCost,
+              [e.session_pk]: { totalUsd: e.total_usd, models: e.models },
             },
           };
         case "contextCompacted":

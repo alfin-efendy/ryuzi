@@ -21,6 +21,8 @@ pub struct TokenState {
     pub cache_read: u64,
     pub cache_creation: u64,
     pub last_output: u64,
+    /// The last committed response's non-cached input tokens (server truth).
+    pub last_input: u64,
     // In-flight (uncommitted) response usage.
     pending_input: Option<u64>,
     pending_cache_read: u64,
@@ -65,6 +67,7 @@ impl TokenState {
     /// restart from zero (the server total now covers everything sent).
     pub fn commit(&mut self) {
         if let Some(input) = self.pending_input.take() {
+            self.last_input = input;
             self.cache_read = self.pending_cache_read;
             self.cache_creation = self.pending_cache_creation;
             self.last_output = self.pending_output;
@@ -87,5 +90,38 @@ impl TokenState {
     /// pure estimate when no response has completed yet.
     pub fn active(&self) -> u64 {
         self.last_server_total.unwrap_or(self.baseline) + self.local_appended
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn commit_retains_the_four_billed_buckets() {
+        let mut t = TokenState::default();
+        t.observe_start_usage(&json!({
+            "input_tokens": 100,
+            "cache_read_input_tokens": 20,
+            "cache_creation_input_tokens": 5,
+        }));
+        t.observe_delta_usage(40, None, None, None); // output
+        t.commit();
+        assert_eq!(t.last_input, 100);
+        assert_eq!(t.cache_read, 20);
+        assert_eq!(t.cache_creation, 5);
+        assert_eq!(t.last_output, 40);
+        // Server total is the sum of all four.
+        assert_eq!(t.last_server_total, Some(165));
+    }
+
+    #[test]
+    fn output_only_commit_leaves_input_zero() {
+        let mut t = TokenState::default();
+        t.observe_delta_usage(12, None, None, None);
+        t.commit();
+        assert_eq!(t.last_output, 12);
+        assert_eq!(t.last_input, 0);
     }
 }
