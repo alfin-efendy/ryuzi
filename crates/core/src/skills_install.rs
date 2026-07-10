@@ -7,7 +7,7 @@ use specta::Type;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const PROVENANCE_FILE: &str = ".ryuzi-skill.json";
+pub(crate) const PROVENANCE_FILE: &str = ".ryuzi-skill.json";
 const CURATED_SKILL_SOURCES: &[(&str, &str)] = &[
     ("superpowers", "https://github.com/obra/superpowers"),
     ("obra/superpowers", "https://github.com/obra/superpowers"),
@@ -324,6 +324,19 @@ fn install_plugin_pack(
         .map(|skill| format!("{}--{}", pack.plugin_id, skill.normalized_name))
         .collect::<HashSet<_>>();
     let installed_at = now_rfc3339();
+
+    // Skill-pack provenance in the plugin directory itself: the loader
+    // (`crate::plugins::load_skill_pack_plugins_from`) only registers
+    // directories carrying this stamp (or heals legacy installs from the
+    // materialized skills' provenance below the skills root).
+    write_provenance(
+        &plugin_target.join(PROVENANCE_FILE),
+        &SkillInstallProvenance {
+            source: source.repo.clone(),
+            plugin_id: Some(pack.plugin_id.clone()),
+            installed_at: installed_at.clone(),
+        },
+    )?;
 
     for skill in &materialized {
         let target_id = format!("{}--{}", pack.plugin_id, skill.normalized_name);
@@ -868,6 +881,42 @@ fn plugin_display_name(roots: &InstallRoots, plugin_id: &str) -> Option<String> 
         .map(|manifest| manifest.name)
 }
 
+/// Legacy skill packs installed before `install_plugin_pack` stamped
+/// `.ryuzi-skill.json` into the plugin directory carry provenance only in
+/// their materialized skill dirs under the skills root. When one of those
+/// names `plugin_id`, copy that provenance into `plugin_dir` (one-time
+/// heal) and return `true`; return `false` when nothing names the plugin
+/// (hand-authored manifests — the loader skips them).
+pub(crate) fn stamp_legacy_skill_pack_provenance(
+    skills_root: &Path,
+    plugin_dir: &Path,
+    plugin_id: &str,
+) -> bool {
+    let Ok(entries) = std::fs::read_dir(skills_root) else {
+        return false;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let provenance_path = entry.path().join(PROVENANCE_FILE);
+        let Ok(text) = std::fs::read_to_string(&provenance_path) else {
+            continue;
+        };
+        let Ok(provenance) = serde_json::from_str::<SkillInstallProvenance>(&text) else {
+            continue;
+        };
+        if provenance.plugin_id.as_deref() != Some(plugin_id) {
+            continue;
+        }
+        if let Err(e) = write_provenance(&plugin_dir.join(PROVENANCE_FILE), &provenance) {
+            tracing::warn!(
+                "failed to stamp skill-pack provenance into {}: {e}",
+                plugin_dir.display()
+            );
+        }
+        return true; // provenance exists — the pack is legit even if the stamp write failed
+    }
+    false
+}
+
 fn resolve_within(base_dir: &Path, rel: &str) -> Result<PathBuf> {
     let base_dir = base_dir
         .canonicalize()
@@ -1096,6 +1145,54 @@ mod tests {
         assert_eq!(listed[0].skill_count, 1);
     }
 
+    #[test]
+    fn stamp_legacy_skill_pack_provenance_heals_from_materialized_skills() {
+        let config = tempfile::tempdir().unwrap();
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        roots.ensure_exists().unwrap();
+        let plugin_dir = roots.plugins_root.join("legacy-pack");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        write_installed_skill(
+            &roots,
+            "legacy-pack--triage",
+            "triage",
+            "Old pack skill.",
+            SkillInstallProvenance {
+                source: "https://github.com/acme/legacy-pack".to_string(),
+                plugin_id: Some("legacy-pack".to_string()),
+                installed_at: "2026-01-01T00:00:00.000Z".to_string(),
+            },
+        );
+
+        assert!(stamp_legacy_skill_pack_provenance(
+            &roots.skills_root,
+            &plugin_dir,
+            "legacy-pack"
+        ));
+        let stamped: SkillInstallProvenance = serde_json::from_str(
+            &std::fs::read_to_string(plugin_dir.join(PROVENANCE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stamped.plugin_id.as_deref(), Some("legacy-pack"));
+        assert_eq!(stamped.source, "https://github.com/acme/legacy-pack");
+    }
+
+    #[test]
+    fn stamp_legacy_skill_pack_provenance_rejects_plugin_without_materialized_provenance() {
+        let config = tempfile::tempdir().unwrap();
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        roots.ensure_exists().unwrap();
+        let plugin_dir = roots.plugins_root.join("hand-authored");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+
+        assert!(!stamp_legacy_skill_pack_provenance(
+            &roots.skills_root,
+            &plugin_dir,
+            "hand-authored"
+        ));
+        assert!(!plugin_dir.join(PROVENANCE_FILE).exists());
+    }
+
     #[tokio::test]
     async fn install_plugin_pack_copies_repo_writes_manifest_and_materializes_skills() {
         let config = tempfile::tempdir().unwrap();
@@ -1151,6 +1248,16 @@ mod tests {
         let plugin_dir = roots.plugins_root.join("superpowers");
         assert!(plugin_dir.join(".codex-plugin/plugin.json").is_file());
         assert!(plugin_dir.join("ryuzi-plugin.toml").is_file());
+
+        let pack_provenance: SkillInstallProvenance = serde_json::from_str(
+            &std::fs::read_to_string(plugin_dir.join(PROVENANCE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pack_provenance.source,
+            "https://github.com/obra/superpowers"
+        );
+        assert_eq!(pack_provenance.plugin_id.as_deref(), Some("superpowers"));
 
         let manifest = ryuzi_plugin_sdk::PluginManifest::from_toml(
             &std::fs::read_to_string(plugin_dir.join("ryuzi-plugin.toml")).unwrap(),
