@@ -1226,13 +1226,15 @@ mod tests {
         .await
         .unwrap();
 
-        let bodies = llm.bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 2);
-        assert_eq!(bodies[0]["model"], "anthropic/model-a");
-        assert_eq!(
-            bodies[1]["model"], "anthropic/model-b",
-            "the next turn must re-read the project's pinned model"
-        );
+        {
+            let bodies = llm.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2);
+            assert_eq!(bodies[0]["model"], "anthropic/model-a");
+            assert_eq!(
+                bodies[1]["model"], "anthropic/model-b",
+                "the next turn must re-read the project's pinned model"
+            );
+        }
 
         // Negative invariant: both pins (model-a, then model-b) are routable
         // via the connection seeded above, so neither turn should have
