@@ -140,6 +140,29 @@ pub(crate) fn inject_system_marker(body: &mut Value) {
     messages.insert(0, json!({"role": "system", "content": SYSTEM_MARKER}));
 }
 
+/// Classify a MiMo non-2xx error body. The free tier signals a transient
+/// abuse throttle as HTTP 400 with `{"error":{"code":"441","type":
+/// "risk_control"}}`, and refuses ungated requests with `illegal_access` —
+/// both are transient/environmental (rate limit, IP heat), never a permanent
+/// "bad model" verdict for `mimo-auto` (the only, always-valid MiMo model).
+/// Returns a user-facing message when the body is a known transient block so
+/// the probe can report `unknown` (never persisted, never hidden) instead of
+/// a misleading `invalid`.
+pub(crate) fn transient_block_message(model: &str, body: &str) -> Option<String> {
+    let b = body.to_ascii_lowercase();
+    if b.contains("risk_control") || b.contains("\"441\"") {
+        Some(format!(
+            "Model {model} is temporarily rate-limited by MiMo (risk control) — try again in a few minutes."
+        ))
+    } else if b.contains("illegal_access") {
+        Some(format!(
+            "Model {model} was blocked by MiMo's access gate — try again shortly."
+        ))
+    } else {
+        None
+    }
+}
+
 /// The cached JWT, minting a fresh one from the bootstrap endpoint when the
 /// cache is empty or stale. `url_override` is test plumbing
 /// ([`client::UpstreamCtx::mimo_bootstrap_url_override`]).
@@ -185,6 +208,25 @@ mod tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&json!({"exp": exp_ms / 1000})).unwrap());
         format!("h.{payload}.sig")
+    }
+
+    #[test]
+    fn transient_block_message_flags_risk_control_and_illegal_access() {
+        let risk = r#"{"error":{"code":"441","message":"Detected high-frequency non-compliant requests","type":"risk_control"}}"#;
+        let m = transient_block_message("mimo-auto", risk).unwrap();
+        assert!(m.contains("rate-limited"), "{m}");
+        assert!(m.contains("mimo-auto"));
+
+        let illegal =
+            r#"{"error":{"code":"403","message":"Illegal access","type":"illegal_access"}}"#;
+        assert!(transient_block_message("mimo-auto", illegal)
+            .unwrap()
+            .contains("access gate"));
+
+        // A genuine bad-request body (not a transient block) is NOT reclassified.
+        let real = r#"{"error":{"message":"model not found","type":"invalid_request_error"}}"#;
+        assert!(transient_block_message("mimo-auto", real).is_none());
+        assert!(transient_block_message("mimo-auto", "").is_none());
     }
 
     #[test]
