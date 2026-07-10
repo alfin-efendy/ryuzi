@@ -339,20 +339,26 @@ async fn run_session(
                             }
                             let picked =
                                 (deps.prompt)("answer (numbers, comma-separated; or free text): ");
-                            let labels: Vec<String> = picked
-                                .split(',')
-                                .filter_map(|part| {
-                                    let part = part.trim();
-                                    part.parse::<usize>()
-                                        .ok()
-                                        .and_then(|n| opts.get(n.saturating_sub(1)))
-                                        .map(|s| s.to_string())
-                                })
-                                .collect();
-                            let labels = if labels.is_empty() && !picked.trim().is_empty() {
-                                vec![picked.trim().to_string()] // free-text "Other"
+                            let picked = picked.trim();
+                            // All-or-nothing: every comma-separated segment must parse as a
+                            // 1-based option index, or the whole input falls back to a single
+                            // free-text "Other" answer (e.g. "0", "9", "1,junk" are all
+                            // rejected as option numbers, not partially accepted).
+                            let labels: Vec<String> = if picked.is_empty() {
+                                Vec::new()
                             } else {
-                                labels
+                                picked
+                                    .split(',')
+                                    .map(|part| {
+                                        part.trim()
+                                            .parse::<usize>()
+                                            .ok()
+                                            .filter(|n| *n >= 1 && *n <= opts.len())
+                                            .and_then(|n| opts.get(n - 1))
+                                            .map(|s| s.to_string())
+                                    })
+                                    .collect::<Option<Vec<String>>>()
+                                    .unwrap_or_else(|| vec![picked.to_string()])
                             };
                             answers.insert(text.to_string(), serde_json::json!(labels));
                         }

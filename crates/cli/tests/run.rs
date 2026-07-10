@@ -743,3 +743,192 @@ fn question_free_text_answer_becomes_single_element_other() {
         Some(serde_json::json!({"answers": {"Which DB?": ["my own answer"]}}))
     );
 }
+
+#[test]
+#[serial]
+fn question_zero_is_not_a_valid_option() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let resolved = Arc::new(std::sync::Mutex::new(None));
+    let input = serde_json::json!({"questions": [{
+        "question": "Which DB?",
+        "header": "db",
+        "options": [{"label": "SQLite"}, {"label": "Postgres"}]
+    }]});
+    let mut deps = deps_with_approval_fake(
+        &tmp.path().join("ryuzi.sqlite"),
+        out.clone(),
+        errs.clone(),
+        ApprovalKind::Question,
+        input,
+        vec!["0"],
+        resolved.clone(),
+    );
+
+    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+
+    assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
+    let response = resolved
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the question approval must resolve");
+    assert_eq!(response.decision, ApprovalDecision::AllowOnce);
+    assert_eq!(
+        response.payload,
+        Some(serde_json::json!({"answers": {"Which DB?": ["0"]}}))
+    );
+}
+
+#[test]
+#[serial]
+fn question_out_of_range_number_falls_back_to_free_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let resolved = Arc::new(std::sync::Mutex::new(None));
+    let input = serde_json::json!({"questions": [{
+        "question": "Which DB?",
+        "header": "db",
+        "options": [{"label": "SQLite"}, {"label": "Postgres"}]
+    }]});
+    let mut deps = deps_with_approval_fake(
+        &tmp.path().join("ryuzi.sqlite"),
+        out.clone(),
+        errs.clone(),
+        ApprovalKind::Question,
+        input,
+        vec!["9"],
+        resolved.clone(),
+    );
+
+    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+
+    assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
+    let response = resolved
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the question approval must resolve");
+    assert_eq!(response.decision, ApprovalDecision::AllowOnce);
+    assert_eq!(
+        response.payload,
+        Some(serde_json::json!({"answers": {"Which DB?": ["9"]}}))
+    );
+}
+
+#[test]
+#[serial]
+fn question_mixed_valid_and_junk_falls_back_to_free_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let resolved = Arc::new(std::sync::Mutex::new(None));
+    let input = serde_json::json!({"questions": [{
+        "question": "Which DB?",
+        "header": "db",
+        "options": [{"label": "SQLite"}, {"label": "Postgres"}]
+    }]});
+    let mut deps = deps_with_approval_fake(
+        &tmp.path().join("ryuzi.sqlite"),
+        out.clone(),
+        errs.clone(),
+        ApprovalKind::Question,
+        input,
+        vec!["1,junk"],
+        resolved.clone(),
+    );
+
+    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+
+    assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
+    let response = resolved
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the question approval must resolve");
+    assert_eq!(response.decision, ApprovalDecision::AllowOnce);
+    assert_eq!(
+        response.payload,
+        Some(serde_json::json!({"answers": {"Which DB?": ["1,junk"]}}))
+    );
+}
+
+#[test]
+#[serial]
+fn question_multiple_numbers_map_to_labels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_repo_fixture(&repo);
+    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
+    std::env::set_var("HOME", tmp.path());
+
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let resolved = Arc::new(std::sync::Mutex::new(None));
+    let input = serde_json::json!({"questions": [{
+        "question": "Which DBs?",
+        "header": "db",
+        "multiSelect": true,
+        "options": [{"label": "SQLite"}, {"label": "Postgres"}]
+    }]});
+    let mut deps = deps_with_approval_fake(
+        &tmp.path().join("ryuzi.sqlite"),
+        out.clone(),
+        errs.clone(),
+        ApprovalKind::Question,
+        input,
+        vec!["1,2"],
+        resolved.clone(),
+    );
+
+    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+
+    assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
+    let response = resolved
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the question approval must resolve");
+    assert_eq!(response.decision, ApprovalDecision::AllowOnce);
+    assert_eq!(
+        response.payload,
+        Some(serde_json::json!({"answers": {"Which DBs?": ["SQLite", "Postgres"]}}))
+    );
+}
