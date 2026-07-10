@@ -1154,6 +1154,113 @@ async fn start_session_streams_events_and_records_agent_id() {
 
 #[tokio::test]
 #[serial]
+async fn start_chat_session_runs_without_a_project() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    assert_eq!(session.project_id, None);
+    assert_eq!(session.kind, SessionKind::Chat);
+    // startup ran in the scratch dir (no worktree)
+    assert!(session.worktree_path.is_none());
+
+    // Background startup creates the scratch dir and starts the harness in
+    // it (no git prep, no project).
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let scratch = crate::paths::chat_scratch_dir(&session.session_pk);
+    assert!(scratch.exists(), "expected the scratch dir to be created");
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.project_id, None);
+    assert_eq!(stored.worktree_path, None);
+    assert_eq!(stored.branch, None);
+}
+
+#[tokio::test]
+#[serial]
+async fn end_chat_session_removes_the_scratch_dir() {
+    let _guard = StateDirGuard::new();
+    let (cp, _store, _prompts, _db_guard) = fake_control_plane().await;
+
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let scratch = crate::paths::chat_scratch_dir(&session.session_pk);
+    assert!(scratch.exists());
+
+    cp.end_session(&session.session_pk).await.unwrap();
+
+    assert!(
+        !scratch.exists(),
+        "end_session must remove a chat session's scratch dir"
+    );
+    let stored = cp.list_sessions(None).await.unwrap();
+    let stored = stored
+        .iter()
+        .find(|s| s.session_pk == session.session_pk)
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Ended);
+}
+
+#[tokio::test]
+#[serial]
+async fn resume_session_resumes_a_chat_session() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
+
+    let now = now_ms();
+    store
+        .insert_session(Session {
+            session_pk: "chat-1".to_string(),
+            project_id: None,
+            agent_session_id: Some("agent-1".to_string()),
+            worktree_path: None,
+            branch: None,
+            title: Some("chat".into()),
+            status: SessionStatus::Running,
+            started_by: Some("test".into()),
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        })
+        .await
+        .unwrap();
+
+    cp.resume_session("chat-1", "restart").await.unwrap();
+    wait_for_prompts(&prompt_log, 1).await;
+
+    assert_eq!(prompt_log.lock().unwrap()[0], RESUME_NUDGE);
+    let scratch = crate::paths::chat_scratch_dir("chat-1");
+    assert!(
+        scratch.exists(),
+        "resume must (re)create the chat session's scratch dir"
+    );
+    let mut s = store.get_session("chat-1").await.unwrap().unwrap();
+    for _ in 0..400 {
+        if s.status == SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        s = store.get_session("chat-1").await.unwrap().unwrap();
+    }
+    assert_eq!(s.status, SessionStatus::Idle);
+}
+
+#[tokio::test]
+#[serial]
 async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
     let _guard = StateDirGuard::new();
     let (cp, store, _prompts, _db_guard) = fake_control_plane().await;

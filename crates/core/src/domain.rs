@@ -423,7 +423,8 @@ pub struct ModelCost {
 pub enum CoreEvent {
     SessionCreated {
         session_pk: String,
-        project_id: String,
+        /// `None` for a project-less (chat-first) session.
+        project_id: Option<String>,
     },
     Message {
         session_pk: String,
@@ -585,12 +586,20 @@ mod tests {
     fn core_event_serializes_with_camel_tag_and_snake_fields() {
         let e = CoreEvent::SessionCreated {
             session_pk: "s1".into(),
-            project_id: "p1".into(),
+            project_id: Some("p1".into()),
         };
         let j = serde_json::to_value(&e).unwrap();
         assert_eq!(j["kind"], "sessionCreated");
         assert_eq!(j["session_pk"], "s1");
         assert_eq!(j["project_id"], "p1");
+
+        // A chat (project-less) session serializes project_id as null.
+        let e = CoreEvent::SessionCreated {
+            session_pk: "s2".into(),
+            project_id: None,
+        };
+        let j = serde_json::to_value(&e).unwrap();
+        assert_eq!(j["project_id"], serde_json::Value::Null);
     }
 
     #[test]

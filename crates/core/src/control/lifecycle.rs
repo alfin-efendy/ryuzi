@@ -4,7 +4,8 @@
 use super::{ControlPlane, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
 use crate::domain::{
-    AttachmentRef, CoreEvent, Project, Session, SessionGitOptions, SessionKind, SessionStatus,
+    AttachmentRef, CoreEvent, PermMode, Project, Session, SessionGitOptions, SessionKind,
+    SessionStatus,
 };
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
@@ -121,7 +122,7 @@ impl ControlPlane {
         self.store.insert_session(session.clone()).await?;
         let _ = self.events.send(CoreEvent::SessionCreated {
             session_pk: session_pk.clone(),
-            project_id: project.project_id.clone(),
+            project_id: Some(project.project_id.clone()),
         });
         self.telemetry.count("session.run", vec![]);
         // Sessions run on the local gateway today; its log is the real record.
@@ -146,6 +147,141 @@ impl ControlPlane {
         });
 
         Ok(session)
+    }
+
+    /// Start a project-less (`kind = Chat`) session: no project, no git prep,
+    /// no worktree. Its "workspace" is a managed scratch dir
+    /// (`paths::chat_scratch_dir`) created on first use. Modeled on
+    /// `start_session_with_prompt`, minus everything project/git-specific.
+    pub async fn start_chat_session(
+        self: &Arc<Self>,
+        prompt: TurnPrompt,
+        started_by: &str,
+        attachments: &[AttachmentRef],
+    ) -> anyhow::Result<Session> {
+        if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("daemon is draining for an update; try again shortly");
+        }
+        let session_pk = new_id();
+        let short: String = session_pk.chars().take(8).collect();
+        let now = now_ms();
+        let title: String = prompt.display.chars().take(80).collect();
+        let session = Session {
+            session_pk: session_pk.clone(),
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: Some(title),
+            status: SessionStatus::Running,
+            started_by: Some(started_by.to_string()),
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        };
+        self.store.insert_session(session.clone()).await?;
+        let _ = self.events.send(CoreEvent::SessionCreated {
+            session_pk: session_pk.clone(),
+            project_id: None,
+        });
+        self.telemetry.count("session.run", vec![]);
+        let _ = crate::gateways::add_event(
+            &self.store,
+            "local",
+            "info",
+            &format!("chat session {short} started"),
+        )
+        .await;
+
+        // Everything slow — harness + MCP startup, the first prompt — runs in
+        // the background, streaming progress into the transcript, exactly
+        // like a project session's startup.
+        let me = Arc::clone(self);
+        let attachments = attachments.to_vec();
+        tokio::spawn(async move {
+            me.run_chat_startup(session_pk, prompt, attachments).await;
+        });
+
+        Ok(session)
+    }
+
+    /// Background half of `start_chat_session`. Mirrors
+    /// `run_session_startup`'s `starting`-token bookkeeping so a stop/end
+    /// that lands mid-startup cancels cleanly, the same as a project session.
+    async fn run_chat_startup(
+        self: Arc<Self>,
+        session_pk: String,
+        prompt: TurnPrompt,
+        attachments: Vec<AttachmentRef>,
+    ) {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.starting
+            .lock()
+            .unwrap()
+            .insert(session_pk.clone(), cancel.clone());
+        self.chat_startup_phases(&session_pk, prompt, attachments, &cancel)
+            .await;
+        self.starting.lock().unwrap().remove(&session_pk);
+    }
+
+    /// The chat-session startup phases: create the scratch dir → harness +
+    /// MCP → first prompt. No git/workspace prep — there is no project or
+    /// worktree — so this is a trimmed-down `startup_phases`.
+    async fn chat_startup_phases(
+        self: &Arc<Self>,
+        session_pk: &str,
+        prompt: TurnPrompt,
+        attachments: Vec<AttachmentRef>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) {
+        let work_dir = crate::paths::chat_scratch_dir(session_pk);
+        if let Err(e) = tokio::fs::create_dir_all(&work_dir).await {
+            self.fail_startup(
+                session_pk,
+                &format!("Couldn't prepare the chat workspace: {e}"),
+            )
+            .await;
+            return;
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+
+        self.emit_status(session_pk, "Connecting tools…").await;
+        let handle = match self
+            .start_harness_session(None, session_pk, &work_dir, None)
+            .await
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.fail_startup(session_pk, &format!("Couldn't start the agent: {e}"))
+                    .await;
+                return;
+            }
+        };
+
+        if cancel.is_cancelled() {
+            let _ = handle.cancel().await;
+            return;
+        }
+        let prepared = self
+            .prepare_attachments(session_pk, &prompt.agent, &attachments)
+            .await;
+        self.spawn_prompt(
+            handle,
+            session_pk.to_string(),
+            TurnPrompt {
+                agent: prepared.agent,
+                display: prompt.display,
+                blocks: prepared.image_blocks,
+                attachments: prepared.attachments_meta,
+            },
+        );
     }
 
     /// Send a follow-up prompt on an existing session.
@@ -211,23 +347,32 @@ impl ControlPlane {
                 // Cold-resume path: the in-memory handle is gone (e.g. after an
                 // app restart). Start a FRESH session that resumes the prior
                 // conversation via `session/load` using the persisted agent id.
+                // A chat (project-less) session has no project to resolve — it
+                // cold-resumes straight into its managed scratch dir.
                 let resume = async {
-                    let project_id = session.project_id.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("session {session_pk} has no bound project")
-                    })?;
-                    let project = self
-                        .store
-                        .get_project(project_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
+                    let project = match session.project_id.as_deref() {
+                        Some(project_id) => Some(
+                            self.store
+                                .get_project(project_id)
+                                .await?
+                                .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?,
+                        ),
+                        None => None,
+                    };
                     let work_dir = session
                         .worktree_path
                         .clone()
                         .map(std::path::PathBuf::from)
                         .filter(|p| p.exists())
-                        .unwrap_or_else(|| std::path::PathBuf::from(&project.workdir));
+                        .unwrap_or_else(|| match &project {
+                            Some(p) => std::path::PathBuf::from(&p.workdir),
+                            None => crate::paths::chat_scratch_dir(session_pk),
+                        });
+                    if project.is_none() {
+                        let _ = tokio::fs::create_dir_all(&work_dir).await;
+                    }
                     self.start_harness_session(
-                        &project,
+                        project.as_ref(),
                         session_pk,
                         &work_dir,
                         session.agent_session_id.clone(),
@@ -449,7 +594,7 @@ impl ControlPlane {
 
         self.emit_status(session_pk, "Connecting tools…").await;
         let handle = match self
-            .start_harness_session(project, session_pk, &work_dir, None)
+            .start_harness_session(Some(project), session_pk, &work_dir, None)
             .await
         {
             Ok(handle) => handle,
@@ -502,6 +647,12 @@ impl ControlPlane {
 
     /// Re-drive an interrupted turn after a restart, guarded by the attempts
     /// cap so a session that reliably crashes the daemon cannot loop forever.
+    ///
+    /// A chat (project-less) session resumes the same as a project session —
+    /// only its workspace resolution differs (the managed scratch dir instead
+    /// of a project workdir/worktree). Earlier this bailed out for any
+    /// project-less session, silently leaving a crash-interrupted chat turn
+    /// stuck Running forever; that gap is closed here.
     pub async fn resume_session(
         self: &Arc<Self>,
         session_pk: &str,
@@ -510,11 +661,13 @@ impl ControlPlane {
         let Some(session) = self.store.get_session(session_pk).await? else {
             return Ok(());
         };
-        let Some(project_id) = session.project_id.as_deref() else {
-            return Ok(());
-        };
-        let Some(project) = self.store.get_project(project_id).await? else {
-            return Ok(());
+        let project = match session.project_id.as_deref() {
+            Some(project_id) => match self.store.get_project(project_id).await? {
+                Some(project) => Some(project),
+                // The bound project is gone — nothing sane to resume into.
+                None => return Ok(()),
+            },
+            None => None,
         };
         if session.agent_session_id.is_none() {
             self.store
@@ -547,10 +700,18 @@ impl ControlPlane {
             .worktree_path
             .clone()
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(&project.workdir));
+            .unwrap_or_else(|| match &project {
+                Some(p) => std::path::PathBuf::from(&p.workdir),
+                None => crate::paths::chat_scratch_dir(session_pk),
+            });
+        if project.is_none() {
+            // Chat sessions have no worktree — make sure the managed scratch
+            // dir still exists before the harness starts in it.
+            let _ = tokio::fs::create_dir_all(&work_dir).await;
+        }
         match self
             .start_harness_session(
-                &project,
+                project.as_ref(),
                 session_pk,
                 &work_dir,
                 session.agent_session_id.clone(),
@@ -588,51 +749,110 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Resolve `project.harness` in the registry, create the harness, build a
-    /// `SessionCtx`, and start the session. Records the returned handle in the
-    /// `running` map and returns a clone for driving the first prompt.
+    /// Resolve the harness in the registry, build a `SessionCtx`, and start
+    /// the session. Records the returned handle in the `running` map and
+    /// returns a clone for driving the first prompt.
+    ///
+    /// `project` is `None` for a chat (project-less) session — there is no
+    /// `Project` row to inherit `harness`/`perm_mode`/`model`/`effort` from,
+    /// so those fall back to engine-wide settings: `perm_mode` from the
+    /// `default_perm_mode` setting (the same fallback a brand-new project
+    /// gets at `connect_project` time), `model` from the resolved runtime's
+    /// own persisted config (mirrors how a project without a pinned model
+    /// inherits its runtime card, above in `start_session_with_prompt`), and
+    /// `effort` from `default_effort`. The harness/mcp-agent id itself comes
+    /// from the `default_agent` setting (same fallback `native` that
+    /// `session_defaults` uses), mapped onto the harness registry's id space.
     async fn start_harness_session(
         self: &Arc<Self>,
-        project: &Project,
+        project: Option<&Project>,
         session_pk: &str,
         work_dir: &Path,
         resume: Option<String>,
     ) -> anyhow::Result<Arc<dyn HarnessSession>> {
-        let factory = self
-            .registries
-            .harness
-            .get(&project.harness)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown harness '{}' (registered: {:?})",
-                    project.harness,
-                    self.registries.harness.names()
-                )
-            })?;
+        let settings = SettingsStore::new(self.store.clone());
+        let (harness_id, perm_mode, model, effort): (
+            String,
+            PermMode,
+            Option<String>,
+            Option<String>,
+        ) = match project {
+            Some(p) => (
+                p.harness.clone(),
+                p.perm_mode,
+                p.model.clone(),
+                p.effort.clone(),
+            ),
+            None => {
+                let runtime_id = settings
+                    .get("default_agent")
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "native".to_string());
+                // Runtime ids and harness ids diverge only for Claude:
+                // runtime "claude" ⇒ harness "claude-code" (the inverse of
+                // `runtimes::runtime_id_for_harness`).
+                let harness_id = if runtime_id == "claude" {
+                    "claude-code".to_string()
+                } else {
+                    runtime_id.clone()
+                };
+                let default_perm_raw = settings
+                    .get("default_perm_mode")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "default".to_string());
+                let perm_mode = PermMode::from_db(&default_perm_raw);
+                let model = crate::runtimes::session_defaults_for(&self.store, &runtime_id)
+                    .await
+                    .ok()
+                    .and_then(|d| d.model);
+                let effort = settings
+                    .get("default_effort")
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|v| !v.trim().is_empty());
+                (harness_id, perm_mode, model, effort)
+            }
+        };
+
+        let factory = self.registries.harness.get(&harness_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown harness '{harness_id}' (registered: {:?})",
+                self.registries.harness.names()
+            )
+        })?;
         let harness = factory.create()?;
 
         // Attach the Apps screen's enabled MCP servers to the session. The MCP
         // per-agent allowlist is keyed by runtime id, which differs from the
         // harness id: the claude-code harness maps to the "claude" runtime;
         // other harnesses (e.g. "native") use their own id.
-        let mcp_agent_id = if project.harness == "claude-code" {
+        let mcp_agent_id = if harness_id == "claude-code" {
             "claude"
         } else {
-            project.harness.as_str()
+            harness_id.as_str()
         };
         let mut mcp_servers = crate::mcp::servers_for_session(&self.store, mcp_agent_id)
             .await
             .unwrap_or_default();
-        let settings = SettingsStore::new(self.store.clone());
-        self.attach_plugin_mcp_servers(&project.project_id, work_dir, &settings, &mut mcp_servers)
+        // A chat session has no project to scope plugin connectors by —
+        // `ConnectorCtx.project_id` isn't read by any connector today, so the
+        // session id is a harmless, uniquely-scoped stand-in.
+        let scope_id = project.map(|p| p.project_id.as_str()).unwrap_or(session_pk);
+        self.attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
             .await;
         let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
             work_dir: work_dir.to_path_buf(),
-            perm_mode: project.perm_mode,
-            model: project.model.clone(),
-            effort: project.effort.clone(),
+            perm_mode,
+            model,
+            effort,
             resume,
             mcp_servers,
             extra_skill_dirs,
@@ -852,30 +1072,39 @@ impl ControlPlane {
             let _ = handle.end().await;
         }
         if let Some(session) = self.store.get_session(session_pk).await? {
-            if let Some(project) = match session.project_id.as_deref() {
-                Some(project_id) => self.store.get_project(project_id).await?,
-                None => None,
-            } {
-                if let Some(wt) = &session.worktree_path {
-                    let short: String = session_pk.chars().take(8).collect();
-                    // Delete the branch only when the engine generated its
-                    // name; user-named and pre-existing branches survive.
-                    // No-worktree sessions never reach this block at all —
-                    // the user's checkout is never switched back.
-                    let owned_branch = if session.branch_owned {
-                        session.branch.as_deref()
-                    } else {
-                        None
-                    };
-                    let _ = worktree::remove(
-                        Path::new(&project.workdir),
-                        &short,
-                        owned_branch,
-                        Path::new(wt),
-                    );
-                    // Forget the deleted path so a later continue cold-resumes
-                    // into the project workdir instead of a dead directory.
-                    let _ = self.store.clear_session_worktree(session_pk).await;
+            match session.project_id.as_deref() {
+                Some(project_id) => {
+                    if let Some(project) = self.store.get_project(project_id).await? {
+                        if let Some(wt) = &session.worktree_path {
+                            let short: String = session_pk.chars().take(8).collect();
+                            // Delete the branch only when the engine generated its
+                            // name; user-named and pre-existing branches survive.
+                            // No-worktree sessions never reach this block at all —
+                            // the user's checkout is never switched back.
+                            let owned_branch = if session.branch_owned {
+                                session.branch.as_deref()
+                            } else {
+                                None
+                            };
+                            let _ = worktree::remove(
+                                Path::new(&project.workdir),
+                                &short,
+                                owned_branch,
+                                Path::new(wt),
+                            );
+                            // Forget the deleted path so a later continue cold-resumes
+                            // into the project workdir instead of a dead directory.
+                            let _ = self.store.clear_session_worktree(session_pk).await;
+                        }
+                    }
+                }
+                // Chat sessions have no worktree — their "workspace" is the
+                // managed scratch dir (`paths::chat_scratch_dir`), which is
+                // ephemeral: the durable record is the transcript in the
+                // store, so the on-disk scratch files are removed here.
+                None => {
+                    let _ =
+                        tokio::fs::remove_dir_all(crate::paths::chat_scratch_dir(session_pk)).await;
                 }
             }
         }

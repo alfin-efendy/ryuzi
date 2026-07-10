@@ -1282,7 +1282,7 @@ claudeCloaking: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
