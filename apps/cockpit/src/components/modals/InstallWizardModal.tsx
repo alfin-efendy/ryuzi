@@ -1,6 +1,6 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Check, CircleAlert, ExternalLink } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
 import { commands, events, type PluginDetail, type PluginInstallBeginResult } from "@/bindings";
@@ -57,6 +57,30 @@ export function InstallWizardModal({
     }
     onClose();
   };
+
+  // Latest-ref mirror of pluginId/begin/detail, kept in sync on every render
+  // so the unmount-only effect below can read fresh values in its cleanup
+  // without needing them in its dependency array (which would re-subscribe
+  // the effect — and re-firing on every begin/detail change is not what we
+  // want for an unmount safety net).
+  const wizardStateRef = useRef({ pluginId, begin, detail });
+  wizardStateRef.current = { pluginId, begin, detail };
+
+  // Safety net for unmounts that skip close() entirely — e.g. sidebar
+  // navigation away from the modal's host route (Tab-bypass) — and shrinks
+  // the window where a close-during-begin race could leave a flow dangling.
+  // Mirrors close()'s oauth-cancellation logic exactly. cancel_plugin_install
+  // is an idempotent no-op when nothing is pending, so firing this after a
+  // normal close() already cancelled the same flow is harmless.
+  useEffect(() => {
+    return () => {
+      const { pluginId: pid, begin: b, detail: d } = wizardStateRef.current;
+      const oauthFlow = b ? b.authKind === "oauth" : d?.auth?.kind === "oauth";
+      if (oauthFlow) {
+        void commands.cancelPluginInstall(pid, b?.oauthBegin?.stateToken ?? null);
+      }
+    };
+  }, []);
 
   const submitToken = async () => {
     const key = detail?.auth?.setting;
@@ -413,7 +437,11 @@ export function InstallWizardModal({
                 <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="Paste the code value from the callback URL" />
               </FormField>
               <div className="mt-2 flex justify-end">
-                <Button size="sm" disabled={busy || code.trim().length === 0} onClick={() => void submitCode()}>
+                <Button
+                  size="sm"
+                  disabled={busy || code.trim().length === 0 || !begin?.oauthBegin?.stateToken}
+                  onClick={() => void submitCode()}
+                >
                   {busy ? "Connecting…" : "Finish sign-in"}
                 </Button>
               </div>

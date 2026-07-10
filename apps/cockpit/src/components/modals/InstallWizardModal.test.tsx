@@ -138,8 +138,9 @@ const { usePlugins } = await import("@/store-plugins");
 const onClose = mock(() => {});
 
 async function renderWizard() {
-  render(<InstallWizardModal pluginId="notion" pluginName="Notion" pluginIcon={null} onClose={onClose} />);
+  const result = render(<InstallWizardModal pluginId="notion" pluginName="Notion" pluginIcon={null} onClose={onClose} />);
   await act(async () => {});
+  return result;
 }
 
 beforeEach(() => {
@@ -591,4 +592,43 @@ test("closing a non-oauth wizard never calls cancelPluginInstall", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   expect(cancelPluginInstall).not.toHaveBeenCalled();
   expect(onClose).toHaveBeenCalled();
+});
+
+// Phase 2 whole-branch review (fast follow, non-blocking): unmounting the
+// wizard without going through close() — e.g. sidebar navigation away from
+// the modal's host route — must still tear down a pending oauth flow.
+test("unmounting the wizard mid-oauth cancels the pending install", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  const { unmount } = await renderWizard();
+
+  expect(await screen.findByText("Browser opened — finish signing in there.")).toBeTruthy();
+
+  unmount();
+  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith("notion", "state-123"));
+});
+
+// Phase 2 whole-branch review (fast follow, non-blocking): a failed Retry
+// clears oauthBegin (submitCode's own guard requires begin.oauthBegin.stateToken),
+// so the button must not sit enabled-but-inert once that happens.
+test("Finish sign-in stays disabled when a failed Retry leaves oauthBegin null", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  await renderWizard();
+  await waitFor(() => expect(pluginOauthCompletedMsgListen).toHaveBeenCalled());
+
+  await act(async () => {
+    completedListener?.({ payload: { pluginId: "notion", ok: false, error: "sign-in timed out" } });
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "Paste code instead" }));
+
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: false, dcrError: "still can't verify this client id" });
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledTimes(2));
+
+  fireEvent.change(screen.getByPlaceholderText("Paste the code value from the callback URL"), {
+    target: { value: "authcode-3" },
+  });
+
+  const finish = screen.getByRole("button", { name: "Finish sign-in" }) as HTMLButtonElement;
+  expect(finish.disabled).toBe(true);
 });
