@@ -114,7 +114,8 @@ type UiState = {
    *  runtime config). A picker's current selection always stays visible,
    *  flagged as invalid. */
   hideInvalidModels: boolean;
-  /** Enables OS-level notifications (dock badge, native alerts) for session events. */
+  /** Gates OS/desktop notifications (native alerts) for session events. The
+   *  dock badge always reflects attention regardless of this flag. */
   notificationsEnabled: boolean;
   toggleLeft: () => void;
   toggleRight: () => void;

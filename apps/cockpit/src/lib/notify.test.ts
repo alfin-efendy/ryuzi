@@ -174,3 +174,13 @@ test("badgeCountFor composes attentionCount from store slices", () => {
   // a unread (500>100), b read; +1 pending → 2
   expect(badgeCountFor(sessions, { a: 100, b: 100 }, null, 1)).toBe(2);
 });
+
+test("cancelAllSettles cancels every pending settle (focus-gain path)", () => {
+  const f = fakeDeps();
+  const n = createNotifier(f.deps);
+  n.handle({ sessionPk: "a", kind: "finished", settle: true }, undefined);
+  n.handle({ sessionPk: "b", kind: "finished", settle: true }, undefined);
+  n.cancelAllSettles();
+  f.runTimers();
+  expect(f.sent.length).toBe(0);
+});

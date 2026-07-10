@@ -64,6 +64,8 @@ export function notificationText(intent: NonNullable<NotifyIntent>, session: Ses
 
 export function createNotifier(deps: NotifierDeps): Notifier {
   const settles = new Map<string, () => void>();
+  // Real counts are >= 0, so -1 guarantees the first updateBadge call fires.
+  let lastBadge = -1;
 
   const cancelSettle = (sessionPk: string) => {
     const cancel = settles.get(sessionPk);
@@ -101,6 +103,8 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       settles.clear();
     },
     updateBadge(count) {
+      if (count === lastBadge) return;
+      lastBadge = count;
       deps.setBadgeCount(count || undefined);
     },
   };
@@ -146,7 +150,9 @@ export const notifier = createNotifier({
   },
   setBadgeCount: (n) => {
     try {
-      void getCurrentWindow().setBadgeCount(n);
+      void getCurrentWindow()
+        .setBadgeCount(n)
+        .catch(() => {});
     } catch {
       /* badge unsupported (e.g. Windows) — no-op */
     }
