@@ -40,6 +40,11 @@ pub(crate) async fn session_root(cp: &ControlPlane, session_pk: &str) -> anyhow:
             return Ok(PathBuf::from(wt));
         }
     }
+    if session.project_id.is_none() {
+        let dir = crate::paths::chat_scratch_dir(session_pk);
+        std::fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
     let project_id = session
         .project_id
         .as_deref()
@@ -249,6 +254,36 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[tokio::test]
+    async fn session_root_resolves_chat_scratch_dir() {
+        let s = crate::api::tests_support::state().await;
+        let now = crate::paths::now_ms();
+        s.cp.store()
+            .insert_session(crate::domain::Session {
+                session_pk: "chat-x".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: crate::domain::SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        let root = super::session_root(&s.cp, "chat-x").await.unwrap();
+        assert_eq!(root, crate::paths::chat_scratch_dir("chat-x"));
+        assert!(root.exists(), "scratch dir should be created on resolve");
     }
 
     #[tokio::test]
