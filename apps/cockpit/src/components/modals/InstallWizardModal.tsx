@@ -3,7 +3,7 @@ import { Check, CircleAlert, ExternalLink } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
-import { commands, type PluginDetail, type PluginInstallBeginResult } from "@/bindings";
+import { commands, events, type PluginDetail, type PluginInstallBeginResult } from "@/bindings";
 import { IconChip, StatusDot } from "@/components/common/bits";
 import { pluginIcon as iconFor } from "@/lib/plugin-icons";
 
@@ -35,6 +35,9 @@ export function InstallWizardModal({
   const [checkError, setCheckError] = useState<string | null>(null);
   const [tokenValue, setTokenValue] = useState("");
   const [clientId, setClientId] = useState("");
+  const [oauthError, setOauthError] = useState<string | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
 
   const Icon = iconFor(pluginIcon ?? null);
@@ -88,6 +91,38 @@ export function InstallWizardModal({
     }
   };
 
+  const retryOauth = async () => {
+    if (busy) return;
+    setBusy(true);
+    setOauthError(null);
+    const res = await commands.beginPluginInstall(pluginId);
+    setBusy(false);
+    if (res.status === "error") {
+      setOauthError(res.error.message);
+      return;
+    }
+    setBegin(res.data);
+    if (!res.data.oauthAvailable) setOauthError(res.data.dcrError ?? "Couldn't restart the sign-in flow.");
+  };
+
+  const submitCode = async () => {
+    const stateToken = begin?.oauthBegin?.stateToken;
+    if (!stateToken || code.trim().length === 0 || busy) return;
+    setBusy(true);
+    const res = await commands.completePluginOauth(pluginId, code.trim(), stateToken);
+    setBusy(false);
+    if (res.status === "error") {
+      setOauthError(res.error.message);
+      return;
+    }
+    setOauthError(null);
+    // The loopback callback server is still listening for this flow's
+    // redirect — a manual paste bypasses it, so shut it down explicitly or
+    // it leaks until the flow's own timeout (Phase 1 whole-branch review).
+    await commands.cancelPluginInstall(pluginId, stateToken);
+    setStep(settingsOrDone(detail));
+  };
+
   // Single resolution call: the backend runs env-var detection, RFC 8414
   // discovery, DCR, and (when possible) opens the browser. Used at mount and
   // by the checking-step Retry. manualClientId's submitClientId deliberately
@@ -139,6 +174,35 @@ export function InstallWizardModal({
       active = false;
     };
   }, [pluginId, runBegin]);
+
+  // Phase 1's loopback callback server emits pluginOauthCompletedMsg once it
+  // captured + exchanged the code (or failed). Same listen/cleanup pattern
+  // as PluginDetailView's pluginOauthAuthorizeUrlMsg subscription.
+  useEffect(() => {
+    if (step !== "waitingOauth") return;
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    void events.pluginOauthCompletedMsg
+      .listen((event) => {
+        if (!active || event.payload.pluginId !== pluginId) return;
+        if (event.payload.ok) {
+          setOauthError(null);
+          setStep(settingsOrDone(detail));
+        } else {
+          setOauthError(event.payload.error ?? "Sign-in didn't finish.");
+        }
+      })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [step, pluginId, detail]);
 
   return (
     <Modal onClose={close} width={480}>
@@ -267,9 +331,69 @@ export function InstallWizardModal({
           <p className="m-0 text-[12.5px] text-muted-foreground">
             Cockpit is listening for the redirect and will finish automatically.
           </p>
+          {oauthError && (
+            <div
+              className="mt-3 flex flex-col gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]"
+              style={{ color: "#F59E0B" }}
+            >
+              <span className="flex items-start gap-2">
+                <CircleAlert aria-hidden size={14} strokeWidth={2} className="mt-0.5 shrink-0" />
+                {oauthError}
+              </span>
+              <span className="flex gap-2">
+                <Button variant="outline" size="sm" onClick={() => void retryOauth()} disabled={busy}>
+                  Retry
+                </Button>
+                {!pasteOpen && begin?.callbackMode !== "manual" && (
+                  <Button variant="outline" size="sm" onClick={() => setPasteOpen(true)}>
+                    Paste code instead
+                  </Button>
+                )}
+              </span>
+            </div>
+          )}
+          {(pasteOpen || begin?.callbackMode === "manual") && (
+            <div className="mt-3">
+              {begin?.callbackMode === "manual" && (
+                <p className="mb-2 mt-0 text-xs text-muted-foreground">
+                  Another sign-in is holding the callback port, so Cockpit can't catch the redirect. After signing in, copy the{" "}
+                  <span className="font-mono">code</span> value from the browser's address bar and paste it here.
+                </p>
+              )}
+              <FormField label="Authorization code">
+                <Input
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  placeholder="Paste the code value from the callback URL"
+                />
+              </FormField>
+              <div className="mt-2 flex justify-end">
+                <Button size="sm" disabled={busy || code.trim().length === 0} onClick={() => void submitCode()}>
+                  {busy ? "Connecting…" : "Finish sign-in"}
+                </Button>
+              </div>
+            </div>
+          )}
+          {!pasteOpen && begin?.callbackMode !== "manual" && !oauthError && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setPasteOpen(true)}
+              className="mt-3 px-0 text-[12px] text-muted-foreground"
+            >
+              Having trouble? Paste the code manually
+            </Button>
+          )}
           <ModalFooter>
             <Button variant="outline" onClick={close}>
               Cancel
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => void openUrl(begin?.oauthBegin?.authorizeUrl ?? "")}
+              disabled={!begin?.oauthBegin?.authorizeUrl}
+            >
+              Reopen browser
             </Button>
           </ModalFooter>
         </>

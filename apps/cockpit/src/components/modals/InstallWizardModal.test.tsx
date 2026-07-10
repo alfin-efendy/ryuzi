@@ -129,7 +129,10 @@ mock.module("@/bindings", () => ({
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
 // @ryuzi/ui's barrel also re-exports sonner's `Toaster` (unused here, but
 // its module-eval import must resolve), so the mock stubs it too.
-mock.module("sonner", () => ({ toast: { error: toastError }, Toaster: () => null }));
+mock.module("sonner", () => ({
+  toast: { error: toastError, success: mock(() => {}), info: mock(() => {}), warning: mock(() => {}) },
+  Toaster: () => null,
+}));
 
 const { InstallWizardModal } = await import("./InstallWizardModal");
 const { usePlugins } = await import("@/store-plugins");
@@ -396,4 +399,93 @@ test("external oauth collects the client id and continues without a browser flow
   await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith("notion", "google-client"));
   expect(await screen.findByText(/Required fields are marked/)).toBeTruthy();
   expect(beginPluginInstall).toHaveBeenCalledTimes(1);
+});
+
+test("pluginOauthCompletedMsg ok advances waitingOauth to done", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  await renderWizard();
+  await waitFor(() => expect(pluginOauthCompletedMsgListen).toHaveBeenCalled());
+
+  await act(async () => {
+    completedListener?.({ payload: { pluginId: "notion", ok: true, error: null } });
+  });
+
+  expect(await screen.findByText("Notion is installed.")).toBeTruthy();
+});
+
+test("completion events for another plugin are ignored", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  await renderWizard();
+  await waitFor(() => expect(pluginOauthCompletedMsgListen).toHaveBeenCalled());
+
+  await act(async () => {
+    completedListener?.({ payload: { pluginId: "other", ok: true, error: null } });
+  });
+
+  expect(screen.getByText("Browser opened — finish signing in there.")).toBeTruthy();
+});
+
+test("a failed completion shows an inline error, and paste-code completes via completePluginOauth", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  await renderWizard();
+  await waitFor(() => expect(pluginOauthCompletedMsgListen).toHaveBeenCalled());
+
+  await act(async () => {
+    completedListener?.({ payload: { pluginId: "notion", ok: false, error: "sign-in timed out" } });
+  });
+
+  expect(await screen.findByText("sign-in timed out")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Paste code instead" }));
+  fireEvent.change(screen.getByPlaceholderText("Paste the code value from the callback URL"), {
+    target: { value: "authcode-1" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Finish sign-in" }));
+
+  await waitFor(() => expect(completePluginOauth).toHaveBeenCalledWith("notion", "authcode-1", "state-123"));
+  expect(await screen.findByText("Notion is installed.")).toBeTruthy();
+});
+
+// Phase 1 whole-branch review (HARD requirement): a successful manual paste
+// must shut down the backend's pending loopback listener, or it leaks until
+// the flow's own timeout.
+test("a successful paste-code completion cancels the pending loopback listener", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  await renderWizard();
+
+  fireEvent.click(screen.getByRole("button", { name: "Having trouble? Paste the code manually" }));
+  fireEvent.change(screen.getByPlaceholderText("Paste the code value from the callback URL"), {
+    target: { value: "authcode-2" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Finish sign-in" }));
+
+  await waitFor(() => expect(completePluginOauth).toHaveBeenCalledWith("notion", "authcode-2", "state-123"));
+  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith("notion", "state-123"));
+  expect(await screen.findByText("Notion is installed.")).toBeTruthy();
+});
+
+test("callbackMode manual shows the paste field by default with the port explanation", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, callbackMode: "manual", oauthBegin });
+  await renderWizard();
+
+  expect(screen.getByText(/Another sign-in is holding the callback port/)).toBeTruthy();
+  expect(screen.getByPlaceholderText("Paste the code value from the callback URL")).toBeTruthy();
+});
+
+test("auto callback mode hides the paste field behind a Having trouble link", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  await renderWizard();
+
+  expect(screen.queryByPlaceholderText("Paste the code value from the callback URL")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Having trouble? Paste the code manually" }));
+  expect(screen.getByPlaceholderText("Paste the code value from the callback URL")).toBeTruthy();
+});
+
+test("Reopen browser re-opens the authorize URL", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  await renderWizard();
+
+  fireEvent.click(screen.getByRole("button", { name: "Reopen browser" }));
+  expect(openUrl).toHaveBeenCalledWith("https://vendor.example.com/oauth/authorize?client_id=abc");
 });
