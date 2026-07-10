@@ -91,12 +91,18 @@ fn probe_request(
         }
         // Codex speaks the Responses wire; picker ids may carry effort or
         // `-review` suffixes the upstream doesn't know — probe the base
-        // model (suffixed variants inherit its verdict).
+        // model (suffixed variants inherit its verdict). The ChatGPT backend
+        // rejects shorthand probes (string `input` → "Input must be a list",
+        // `stream: false` → "Stream must be set to true", `max_output_tokens`
+        // → unsupported parameter), so the ping uses the same wire shape as
+        // real Codex chat; only the response STATUS is read, the SSE body is
+        // dropped unread.
         "openai-oauth" => {
             let body = json!({
                 "model": crate::llm_router::codex::codex_base_model(model),
-                "input": "ping",
-                "stream": false,
+                "input": [{"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "ping"}]}],
+                "stream": true,
                 "store": false
             });
             client::upstream_request(ctx, target, &body)
@@ -469,9 +475,19 @@ mod tests {
         assert_eq!(req.headers().get("chatgpt-account-id").unwrap(), "acct-1");
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(sent["model"], "gpt-5.2-codex");
-        assert_eq!(sent["input"], "ping");
+        // The ChatGPT Codex backend rejects shorthand probes (verified live
+        // 2026-07-10): a string `input` 400s with "Input must be a list",
+        // `stream: false` 400s with "Stream must be set to true", and
+        // `max_output_tokens` 400s as an unsupported parameter. The probe
+        // must send the same wire shape real Codex chat uses.
+        assert_eq!(
+            sent["input"],
+            json!([{"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "ping"}]}])
+        );
         assert_eq!(sent["store"], false);
-        assert_eq!(sent["stream"], false);
+        assert_eq!(sent["stream"], true);
+        assert!(sent.get("max_output_tokens").is_none());
     }
 
     #[tokio::test]
