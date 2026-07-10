@@ -37,6 +37,7 @@ const KEY = {
   pinned: "cockpit.ui.pinned",
   archived: "cockpit.ui.archived",
   hideInvalidModels: "cockpit.ui.hideInvalidModels",
+  notificationsEnabled: "cockpit.ui.notificationsEnabled",
   readAt: "cockpit.ui.readAt",
   sessionFilter: "cockpit.ui.sessionFilter",
 };
@@ -113,6 +114,8 @@ type UiState = {
    *  runtime config). A picker's current selection always stays visible,
    *  flagged as invalid. */
   hideInvalidModels: boolean;
+  /** Enables OS-level notifications (dock badge, native alerts) for session events. */
+  notificationsEnabled: boolean;
   toggleLeft: () => void;
   toggleRight: () => void;
   setLeft: (open: boolean) => void;
@@ -126,6 +129,7 @@ type UiState = {
   /** Idempotent write — archive flows must not race a pure toggle. */
   setArchived: (sessionPk: string, on: boolean) => void;
   toggleHideInvalidModels: () => void;
+  toggleNotifications: () => void;
   markRead: (sessionPk: string, ts: number) => void;
   markAllRead: (sessions: Session[]) => void;
   seedReadState: (sessions: Session[]) => void;
@@ -143,6 +147,7 @@ export const useUi = create<UiState>((set, get) => ({
   readAt: readNumMap(KEY.readAt),
   sessionFilter: readSessionFilter(KEY.sessionFilter),
   hideInvalidModels: readBool(KEY.hideInvalidModels, false),
+  notificationsEnabled: readBool(KEY.notificationsEnabled, true),
   toggleLeft: () =>
     set((s) => {
       const v = !s.leftPanelOpen;
@@ -214,6 +219,12 @@ export const useUi = create<UiState>((set, get) => ({
       const v = !s.hideInvalidModels;
       persist(KEY.hideInvalidModels, v ? "1" : "0");
       return { hideInvalidModels: v };
+    }),
+  toggleNotifications: () =>
+    set((s) => {
+      const v = !s.notificationsEnabled;
+      persist(KEY.notificationsEnabled, v ? "1" : "0");
+      return { notificationsEnabled: v };
     }),
   markRead: (sessionPk, ts) => {
     const readAt = { ...get().readAt, [sessionPk]: ts };

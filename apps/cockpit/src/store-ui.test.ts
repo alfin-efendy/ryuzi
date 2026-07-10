@@ -80,6 +80,17 @@ test("hideInvalidModels toggle flips state and persists to localStorage", () => 
   expect(localStorage.getItem("cockpit.ui.hideInvalidModels")).toBe("0");
 });
 
+test("notificationsEnabled defaults on and toggles + persists", () => {
+  useUi.setState({ notificationsEnabled: true });
+  expect(useUi.getState().notificationsEnabled).toBe(true);
+  useUi.getState().toggleNotifications();
+  expect(useUi.getState().notificationsEnabled).toBe(false);
+  expect(localStorage.getItem("cockpit.ui.notificationsEnabled")).toBe("0");
+  useUi.getState().toggleNotifications();
+  expect(useUi.getState().notificationsEnabled).toBe(true);
+  expect(localStorage.getItem("cockpit.ui.notificationsEnabled")).toBe("1");
+});
+
 function sess(pk: string, lastActive: number | null): Session {
   return {
     sessionPk: pk,
