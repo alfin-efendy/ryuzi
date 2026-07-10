@@ -310,6 +310,7 @@ export function HomeView() {
             {isGit && (
               <Combobox
                 aria-label="Branch"
+                popupClassName="w-64 max-w-[var(--available-width)]"
                 options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
                 value={nav.composerBranch}
                 onValueChange={(v) => nav.setComposerBranch(v)}
