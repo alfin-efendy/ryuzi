@@ -4,7 +4,9 @@
 
 use super::agents::{Agent, AgentRegistry};
 use super::commands::CommandRegistry;
-use super::ledger::Ledger;
+use super::context_manager::{
+    compaction::CompactionOutcome, is_context_overflow, ContextConfig, ContextManager,
+};
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::tools::{
@@ -26,8 +28,6 @@ use tokio_util::sync::CancellationToken;
 
 /// Upper bound on provider turns per drain, to bound runaway tool loops.
 const MAX_PROVIDER_TURNS: usize = 50;
-/// `max_tokens` requested per provider turn.
-const MAX_TOKENS: i64 = 8192;
 /// Flush the streaming-text buffer into a persisted row at this size or on a
 /// newline, whichever comes first (keeps rows delta-shaped without spamming).
 const TEXT_FLUSH_BYTES: usize = 120;
@@ -43,6 +43,10 @@ pub struct RunnerDeps {
     /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
     pub extra_skill_dirs: Vec<PathBuf>,
     pub model: Option<String>,
+    /// Reasoning effort for this session (from project settings; None = default).
+    pub effort: Option<String>,
+    /// Resolved per-model metadata (context window, max output, capabilities).
+    pub meta: crate::llm_router::model_meta::ModelMeta,
     /// Interior-mutable so a LIVE session can pick up a permission-mode change
     /// (from the composer / project settings) on the NEXT turn without being
     /// torn down — the control plane refreshes it in the continue path. The
@@ -92,6 +96,13 @@ pub async fn run_turn(
     prompt: TurnPrompt,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    // /compact is an ACTION, not a prompt template: intercept before command
+    // resolution so it never becomes model input.
+    let trimmed = prompt.display.trim();
+    if trimmed == "/compact" || trimmed.starts_with("/compact ") {
+        return run_manual_compact(deps, &prompt).await;
+    }
+
     // Slash-command resolution on the raw user text.
     let (agent_text, agent) = match deps.commands.resolve(&prompt.display) {
         Some((expanded, override_agent)) => {
@@ -115,10 +126,38 @@ pub async fn run_turn(
     )
     .await;
 
-    // 2. Load history and append the user turn to the ledger.
-    let mut ledger = Ledger::load(deps.store.clone(), &deps.session_pk).await?;
-    ledger
-        .append_user(user_content_blocks(&prompt.blocks, &agent_text))
+    // 2. Load history + context state and append the user turn.
+    let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+    let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
+    // Seed the indicator immediately on resume, before any model call —
+    // prefer the persisted last-known status (server truth) over the
+    // reload estimate (spec §6.1/§10).
+    match deps.store.get_session_context(&deps.session_pk).await {
+        Ok(Some(saved)) => {
+            // Seed BEFORE reading status: an overflowed prior turn persisted
+            // the full-window total via `mark_full`, but this fresh
+            // `ContextManager` only knows the (possibly much smaller) reload
+            // estimate, which would otherwise let `needs_compaction` miss the
+            // overflow and loop forever (spec §12).
+            if let Some(saved_active) = saved["active_tokens"].as_u64() {
+                cm.seed_active_tokens(saved_active);
+            }
+            let st = cm.status();
+            let _ = deps.events.send(CoreEvent::ContextUsage {
+                session_pk: deps.session_pk.clone(),
+                active_tokens: saved["active_tokens"].as_u64().unwrap_or(st.active_tokens),
+                context_window: st.context_window,
+                usable_window: saved["usable_window"].as_u64().unwrap_or(st.usable_window),
+                percent_left: saved["percent_left"]
+                    .as_u64()
+                    .unwrap_or(st.percent_left as u64) as u8,
+                cache_read_tokens: 0,
+                output_tokens: 0,
+            });
+        }
+        _ => emit_context_usage(deps, &cm, true).await,
+    }
+    cm.append_user(user_content_blocks(&prompt.blocks, &agent_text))
         .await?;
 
     // 3. Drive the loop with a spawner available for the `task` tool.
@@ -127,11 +166,70 @@ pub async fn run_turn(
         cancel: cancel.clone(),
         depth: 0,
     });
-    drive(deps, &agent, &mut ledger, &cancel, Some(spawn), true).await?;
+    drive(deps, &agent, &mut cm, &cancel, Some(spawn), true).await?;
 
     // 4. Best-effort: give a fresh session a generated title.
     maybe_generate_title(deps, &prompt.display).await;
     Ok(())
+}
+
+/// Manual /compact: persist the user's row, compact the session history, and
+/// record a notice row. No model turn runs.
+async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::Result<()> {
+    emit_row(
+        deps,
+        "user",
+        "text",
+        user_row_payload(prompt),
+        None,
+        None,
+        None,
+    )
+    .await;
+    let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+    let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
+    // Same resume-seed as `run_turn` (spec §12): honor a persisted
+    // post-overflow total so a manual /compact right after an overflow
+    // reports honest `before_tokens` instead of the reload's undercount.
+    if let Ok(Some(saved)) = deps.store.get_session_context(&deps.session_pk).await {
+        if let Some(saved_active) = saved["active_tokens"].as_u64() {
+            cm.seed_active_tokens(saved_active);
+        }
+    }
+    if cm.is_empty() {
+        emit_row(
+            deps,
+            "system",
+            "notice",
+            json!({ "text": "Nothing to compact yet." }),
+            None,
+            None,
+            None,
+        )
+        .await;
+        return Ok(());
+    }
+    let model = deps.model.clone().unwrap_or_default();
+    match cm.compact(&deps.llm, &model, "manual").await {
+        Ok(outcome) => {
+            emit_compaction(deps, "manual", &outcome, true).await;
+            emit_context_usage(deps, &cm, true).await;
+            Ok(())
+        }
+        Err(e) => {
+            emit_row(
+                deps,
+                "system",
+                "notice",
+                json!({ "text": format!("Compaction failed: {e}") }),
+                None,
+                None,
+                None,
+            )
+            .await;
+            Ok(())
+        }
+    }
 }
 
 /// The persisted user-row payload: `{text}` plus `attachments` display
@@ -187,19 +285,9 @@ async fn maybe_generate_title(deps: &RunnerDeps, first_prompt: &str) {
         "messages": [{"role": "user", "content": [{"type": "text", "text": first_prompt}]}],
         "stream": true,
     });
-    let Ok(mut rx) = deps.llm.stream(body).await else {
+    let Ok(title) = super::llm::collect_text(&deps.llm, body).await else {
         return;
     };
-    let mut title = String::new();
-    while let Some(item) = rx.recv().await {
-        if let Ok(ev) = item {
-            if let Some(MessageStreamEvent::TextDelta { text, .. }) =
-                MessageStreamEvent::from_event(&ev)
-            {
-                title.push_str(&text);
-            }
-        }
-    }
     let title: String = title.trim().trim_matches('"').chars().take(80).collect();
     if !title.is_empty() {
         let _ = deps.store.set_session_title(&deps.session_pk, &title).await;
@@ -213,7 +301,7 @@ async fn maybe_generate_title(deps: &RunnerDeps, first_prompt: &str) {
 async fn drive(
     deps: &RunnerDeps,
     agent: &Agent,
-    ledger: &mut Ledger,
+    cm: &mut ContextManager,
     cancel: &CancellationToken,
     spawn: Option<Arc<dyn SubagentSpawner>>,
     emit_display: bool,
@@ -240,29 +328,78 @@ async fn drive(
     let model = deps.model.clone().unwrap_or_default();
     let mut final_text = String::new();
 
-    for _ in 0..MAX_PROVIDER_TURNS {
+    cm.set_baseline(&system, &tool_defs);
+    let settings_cap =
+        crate::settings::usize_setting(&deps.store, "context.max_output_tokens", 1).await;
+    // usize_setting floors at 1; treat 1 (the "unset" default) as no cap.
+    let max_tokens = if settings_cap > 1 {
+        (deps.meta.max_output_tokens as usize).min(settings_cap) as i64
+    } else {
+        deps.meta.max_output_tokens as i64
+    };
+    let thinking_budget = thinking_budget(deps.effort.as_deref(), &deps.meta, max_tokens);
+
+    for provider_turn in 0..MAX_PROVIDER_TURNS {
         if cancel.is_cancelled() {
             return Ok(final_text);
         }
-        // Compact the in-memory history if it has grown past the token budget.
-        super::compaction::maybe_compact(
-            &deps.llm,
-            &model,
-            ledger,
-            super::compaction::MAX_CONTEXT_TOKENS,
-            super::compaction::KEEP_RECENT_USER_TURNS,
-        )
-        .await;
-        let body = json!({
+        // Pre-turn (iteration 0) / mid-turn compaction check (spec §7.1).
+        if cm.status().needs_compaction {
+            let trigger = if provider_turn == 0 {
+                "pre_turn"
+            } else {
+                "mid_turn"
+            };
+            match cm.compact(&deps.llm, &model, trigger).await {
+                Ok(outcome) => emit_compaction(deps, trigger, &outcome, emit_display).await,
+                Err(e) => {
+                    tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
+                    if emit_display {
+                        emit_row(
+                            deps,
+                            "system",
+                            "notice",
+                            json!({ "text": format!(
+                                "Compaction failed ({e}); continuing with full history."
+                            ) }),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        let system_value: Value = if deps.meta.supports_prompt_cache {
+            json!([{ "type": "text", "text": system, "cache_control": {"type": "ephemeral"} }])
+        } else {
+            json!(system)
+        };
+        let mut body = json!({
             "model": model,
-            "system": system,
-            "messages": ledger.messages(),
+            "system": system_value,
+            "messages": cm.messages_for_request(),
             "tools": tool_defs,
-            "max_tokens": MAX_TOKENS,
+            "max_tokens": max_tokens,
             "stream": true,
         });
+        if let Some(budget) = thinking_budget {
+            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+        }
 
-        let mut rx = deps.llm.stream(body).await?;
+        let mut rx = match deps.llm.stream(body).await {
+            Ok(rx) => rx,
+            Err(e) if is_context_overflow(&e.to_string()) => {
+                cm.mark_full();
+                emit_context_usage(deps, cm, emit_display).await;
+                anyhow::bail!(
+                    "context window exceeded — send another message and the session \
+                     will compact before retrying: {e}"
+                );
+            }
+            Err(e) => return Err(e),
+        };
         let mut turn = TurnAccum::default();
         let mut text_buf = String::new();
 
@@ -276,6 +413,14 @@ async fn drive(
                 Ok(ev) => ev,
                 Err(e) => {
                     flush_text(deps, &mut text_buf, emit_display).await;
+                    if is_context_overflow(&e.to_string()) {
+                        cm.mark_full();
+                        emit_context_usage(deps, cm, emit_display).await;
+                        anyhow::bail!(
+                            "context window exceeded — send another message and the session \
+                             will compact before retrying: {e}"
+                        );
+                    }
                     return Err(e);
                 }
             };
@@ -333,19 +478,43 @@ async fn drive(
                         t.input_json.push_str(&partial_json);
                     }
                 }
-                MessageStreamEvent::MessageDelta { stop_reason, .. } => {
+                MessageStreamEvent::MessageDelta {
+                    stop_reason,
+                    output_tokens,
+                    input_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                } => {
                     turn.stop_reason = stop_reason;
+                    cm.observe_message_delta(
+                        output_tokens,
+                        input_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                    );
                 }
                 MessageStreamEvent::Error(msg) => {
                     flush_text(deps, &mut text_buf, emit_display).await;
+                    if is_context_overflow(&msg) {
+                        cm.mark_full();
+                        emit_context_usage(deps, cm, emit_display).await;
+                        anyhow::bail!(
+                            "context window exceeded — send another message and the session \
+                             will compact before retrying: {msg}"
+                        );
+                    }
                     anyhow::bail!("{msg}");
                 }
                 MessageStreamEvent::MessageStop => break,
-                MessageStreamEvent::MessageStart(_)
-                | MessageStreamEvent::ContentBlockStop { .. } => {}
+                MessageStreamEvent::MessageStart(msg) => {
+                    cm.observe_message_start(&msg);
+                }
+                MessageStreamEvent::ContentBlockStop { .. } => {}
             }
         }
         flush_text(deps, &mut text_buf, emit_display).await;
+        cm.commit_response();
+        emit_context_usage(deps, cm, emit_display).await;
         if !turn.text.is_empty() {
             final_text = turn.text.clone();
         }
@@ -371,7 +540,7 @@ async fn drive(
             // poisons the whole session. Use a non-empty sentinel instead.
             content.push(json!({ "type": "text", "text": "(no output)" }));
         }
-        ledger.append_assistant(json!(content)).await?;
+        cm.append_assistant(json!(content)).await?;
 
         if tool_calls.is_empty() {
             return Ok(final_text); // end_turn
@@ -388,13 +557,53 @@ async fn drive(
             }
             results.push(run_tool_call(deps, agent, t, emit_display, &spawn).await);
         }
-        ledger.append_user(json!(results)).await?;
+        cm.append_tool_results(results).await?;
 
         if cancel.is_cancelled() {
             return Ok(final_text);
         }
     }
+    if emit_display {
+        emit_row(
+            deps,
+            "system",
+            "notice",
+            json!({ "text": format!(
+                "Turn limit reached ({MAX_PROVIDER_TURNS} provider turns) — send a message to continue."
+            ) }),
+            None,
+            None,
+            None,
+        )
+        .await;
+    }
     Ok(final_text)
+}
+
+/// Effort → extended-thinking budget (spec §8): low/None → off, medium → 8192,
+/// high → 16384, clamped to half of max_tokens; only for reasoning models.
+///
+/// This key currently only takes effect on OpenAI-format upstreams: the
+/// router (`llm_router::client::anthropic_messages_stream`) strips
+/// `thinking` before it reaches an Anthropic-native upstream (passthrough
+/// `/messages` and kiro), since the runner doesn't yet replay signed
+/// thinking blocks in tool-use continuations and newest Anthropic models
+/// reject `budget_tokens` outright. The OpenAI translator maps this key to
+/// `reasoning_effort` instead, so it's unaffected.
+fn thinking_budget(
+    effort: Option<&str>,
+    meta: &crate::llm_router::model_meta::ModelMeta,
+    max_tokens: i64,
+) -> Option<i64> {
+    if !meta.supports_reasoning {
+        return None;
+    }
+    let budget = match effort {
+        Some("medium") => 8_192,
+        Some("high") | Some("xhigh") | Some("max") => 16_384,
+        _ => return None,
+    };
+    Some(budget.min(max_tokens / 2))
 }
 
 /// Tools delegated children may never use regardless of filters. `task` is
@@ -535,23 +744,17 @@ impl RunnerSpawner {
         } else {
             None
         };
-        let mut ledger = Ledger::ephemeral(&self.deps.session_pk);
-        if let Err(e) = ledger
+        let mut cm = ContextManager::ephemeral(
+            &self.deps.session_pk,
+            ContextConfig::with_meta(self.deps.meta),
+        );
+        if let Err(e) = cm
             .append_user(json!([{ "type": "text", "text": spec.prompt }]))
             .await
         {
             return result(SubtaskStatus::Error, e.to_string());
         }
-        match drive(
-            &child_deps,
-            &child,
-            &mut ledger,
-            &cancel,
-            child_spawn,
-            false,
-        )
-        .await
-        {
+        match drive(&child_deps, &child, &mut cm, &cancel, child_spawn, false).await {
             Ok(text) if cancel.is_cancelled() => {
                 result(SubtaskStatus::Interrupted, cap_report(&text))
             }
@@ -832,6 +1035,73 @@ async fn emit_row(
     }
 }
 
+/// Broadcast ContextUsage and persist it for resume seeding. Sub-agent
+/// (ephemeral) loops skip both — their usage must not clobber the session's.
+async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) {
+    if !emit {
+        return;
+    }
+    let st = cm.status();
+    let _ = deps.events.send(CoreEvent::ContextUsage {
+        session_pk: deps.session_pk.clone(),
+        active_tokens: st.active_tokens,
+        context_window: st.context_window,
+        usable_window: st.usable_window,
+        percent_left: st.percent_left,
+        cache_read_tokens: cm.last_cache_read(),
+        output_tokens: cm.last_output(),
+    });
+    let payload = json!({
+        "active_tokens": st.active_tokens,
+        "usable_window": st.usable_window,
+        "percent_left": st.percent_left,
+    });
+    if let Err(e) = deps
+        .store
+        .upsert_session_context(&deps.session_pk, &payload)
+        .await
+    {
+        tracing::warn!("native: upsert_session_context failed: {e}");
+    }
+}
+
+/// Sub-agent (ephemeral) compactions must never surface to the parent
+/// session: they operate on the child's own throwaway ledger, so neither the
+/// `ContextCompacted` event nor the notice row is the session's business —
+/// gate the whole function on `emit_display`, matching `emit_context_usage`.
+async fn emit_compaction(
+    deps: &RunnerDeps,
+    trigger: &str,
+    outcome: &CompactionOutcome,
+    emit_display: bool,
+) {
+    if !emit_display {
+        return;
+    }
+    let _ = deps.events.send(CoreEvent::ContextCompacted {
+        session_pk: deps.session_pk.clone(),
+        trigger: trigger.to_string(),
+        before_tokens: outcome.before_tokens,
+        after_tokens: outcome.after_tokens,
+        window_number: outcome.window_number,
+    });
+    let text = format!(
+        "Context compacted: ~{}k → ~{}k tokens",
+        outcome.before_tokens / 1000,
+        outcome.after_tokens / 1000
+    );
+    emit_row(
+        deps,
+        "system",
+        "notice",
+        json!({ "text": text }),
+        None,
+        None,
+        None,
+    )
+    .await;
+}
+
 fn tool_result(tool_use_id: &str, content: &str, is_error: bool) -> Value {
     json!({
         "type": "tool_result",
@@ -985,10 +1255,29 @@ pub(crate) mod testutil {
             serde_json::json!({"type": "message_stop"}),
         )
     }
+    /// message_start carrying Anthropic-style usage.
+    pub fn message_start_with_usage(input: i64, cache_read: i64) -> AnthropicEvent {
+        (
+            "message_start".into(),
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"id": "m1", "role": "assistant", "content": [],
+                             "usage": {"input_tokens": input,
+                                       "cache_read_input_tokens": cache_read}}
+            }),
+        )
+    }
+    pub fn error_event(message: &str) -> AnthropicEvent {
+        (
+            "error".into(),
+            serde_json::json!({"type": "error", "error": {"message": message}}),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::ledger::Ledger;
     use super::testutil::*;
     use super::*;
     use crate::domain::CoreEvent;
@@ -1006,6 +1295,8 @@ mod tests {
             extra_skill_dirs: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
+            effort: None,
+            meta: crate::llm_router::model_meta::FALLBACK,
             perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
             project_policy: None,
             store,
@@ -1019,6 +1310,255 @@ mod tests {
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    fn tiny_meta() -> crate::llm_router::model_meta::ModelMeta {
+        crate::llm_router::model_meta::ModelMeta {
+            context_window: 400, // tiny: threshold 360, usable 380
+            max_output_tokens: 8_192,
+            supports_prompt_cache: false,
+            supports_reasoning: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_events_flow_into_context_usage_event_and_session_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![
+            message_start_with_usage(5_000, 1_000),
+            text_delta("hi"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm).await;
+        let mut rx = deps.events.subscribe();
+        run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap();
+        // A ContextUsage event was emitted with server-truth numbers.
+        let mut saw = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::ContextUsage {
+                active_tokens,
+                cache_read_tokens,
+                ..
+            } = ev
+            {
+                saw = Some((active_tokens, cache_read_tokens));
+            }
+        }
+        let (active, cache) = saw.expect("a ContextUsage event");
+        assert!(
+            active >= 6_000,
+            "input+cache+output committed, got {active}"
+        );
+        assert_eq!(cache, 1_000);
+        // Persisted for resume seeding.
+        let ctx = deps.store.get_session_context("s1").await.unwrap().unwrap();
+        assert!(ctx["percent_left"].is_number());
+    }
+
+    #[tokio::test]
+    async fn pre_turn_compaction_triggers_and_continues_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // ScriptedLlm turn 0 answers the summarize call; turn 1 is the real turn.
+        let summarize = vec![text_delta("compacted summary"), message_stop()];
+        let main = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![summarize, main]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.meta = tiny_meta();
+        // Preload enough history through the SAME store to exceed the tiny
+        // 400-token window (each turn estimates to ~115 tokens).
+        {
+            let mut ledger = Ledger::load(deps.store.clone(), "s1").await.unwrap();
+            for i in 0..4 {
+                ledger
+                    .append_user(
+                        json!([{"type":"text","text": format!("u{i} {}", "x".repeat(400))}]),
+                    )
+                    .await
+                    .unwrap();
+                ledger
+                    .append_assistant(json!([{"type":"text","text": format!("a{i}")}]))
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut rx = deps.events.subscribe();
+        run_turn(
+            &deps,
+            TurnPrompt::text("next", "next"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // Compaction happened: checkpoint row + event + turn still completed.
+        assert!(deps
+            .store
+            .latest_context_checkpoint("s1")
+            .await
+            .unwrap()
+            .is_some());
+        let mut compacted = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, CoreEvent::ContextCompacted { .. }) {
+                compacted = true;
+            }
+        }
+        assert!(compacted);
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        assert!(msgs
+            .iter()
+            .any(|m| m.block_type == "text" && m.payload["text"] == "done"));
+    }
+
+    #[tokio::test]
+    async fn overflow_error_marks_context_full_and_surfaces_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![error_event(
+            "prompt is too long: 500000 tokens > 400000 maximum",
+        )];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm).await;
+        let err = run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("context"));
+        let ctx = deps.store.get_session_context("s1").await.unwrap().unwrap();
+        assert_eq!(ctx["percent_left"], 0);
+    }
+
+    #[tokio::test]
+    async fn overflow_then_next_turn_compacts_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1 overflows: mark_full pins the in-memory indicator to 0%
+        // and persists the full-window total to session_context.
+        let overflow = vec![error_event(
+            "prompt is too long: 500000 tokens > 400000 maximum",
+        )];
+        // Turn 2: the pre-turn compaction check fires BEFORE the real model
+        // call, so the scripted order is summarize-then-main.
+        let summarize = vec![text_delta("compacted summary"), message_stop()];
+        let main = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![overflow, summarize, main]));
+        // deps_at defaults to FALLBACK meta (128k window) — deliberately NOT
+        // a tiny meta, so the turn-2 reload estimate (just the one tiny "x"
+        // user turn left over from turn 1) sits at well under 1% of the
+        // window and would NOT, by itself, cross the 90% auto-compact
+        // threshold. Only the seeded full-window total proves the fix.
+        let deps = deps_at(dir.path(), llm).await;
+
+        let err = run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("context"));
+        assert!(
+            deps.store
+                .latest_context_checkpoint("s1")
+                .await
+                .unwrap()
+                .is_none(),
+            "turn 1 errored before any compaction ran"
+        );
+
+        // Turn 2: the ContextManager rebuilt from the reloaded (tiny) ledger
+        // must be seeded with turn 1's persisted full-window total so the
+        // pre-turn check deterministically compacts instead of looping on
+        // the undercounted reload estimate.
+        run_turn(
+            &deps,
+            TurnPrompt::text("next", "next"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            deps.store
+                .latest_context_checkpoint("s1")
+                .await
+                .unwrap()
+                .is_some(),
+            "pre-turn compaction must fire off the seeded overflow state"
+        );
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        assert!(msgs
+            .iter()
+            .any(|m| m.block_type == "text" && m.payload["text"] == "done"));
+    }
+
+    #[tokio::test]
+    async fn manual_compact_command_compacts_without_a_model_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let summarize = vec![text_delta("manual summary"), message_stop()];
+        let llm = Arc::new(ScriptedLlm::new(vec![summarize]));
+        let deps = deps_at(dir.path(), llm).await;
+        {
+            let mut ledger = Ledger::load(deps.store.clone(), "s1").await.unwrap();
+            ledger
+                .append_user(json!([{"type":"text","text":"old question"}]))
+                .await
+                .unwrap();
+            ledger
+                .append_assistant(json!([{"type":"text","text":"old answer"}]))
+                .await
+                .unwrap();
+        }
+        run_turn(
+            &deps,
+            TurnPrompt::text("/compact", "/compact"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let ck = deps.store.latest_context_checkpoint("s1").await.unwrap();
+        assert!(ck.is_some(), "manual /compact wrote a checkpoint");
+        // A notice row records it in the transcript.
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        assert!(msgs.iter().any(|m| m.block_type == "notice"));
+    }
+
+    #[tokio::test]
+    async fn cache_control_and_max_tokens_follow_model_meta() {
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.meta = crate::llm_router::model_meta::ModelMeta {
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+            supports_prompt_cache: true,
+            supports_reasoning: true,
+        };
+        deps.effort = Some("high".into());
+        run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap();
+        let bodies = llm.bodies.lock().unwrap();
+        let body = &bodies[0];
+        assert_eq!(body["max_tokens"], 64_000);
+        // System is a cache-controlled block array.
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        // Moving breakpoint on the final message's last block.
+        let msgs = body["messages"].as_array().unwrap();
+        let last_blocks = msgs.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(
+            last_blocks.last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+        // Effort high → extended thinking budget.
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 16_384);
     }
 
     #[tokio::test]

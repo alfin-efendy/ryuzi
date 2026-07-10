@@ -12,8 +12,8 @@
 
 pub mod agents;
 pub mod commands;
-pub mod compaction;
 pub mod context;
+pub mod context_manager;
 pub mod format;
 pub mod hooks;
 pub mod ledger;
@@ -125,6 +125,10 @@ impl Harness for NativeHarness {
         // route/model when a stale project pins a target no connection
         // actually serves anymore.
         let model = resolve_native_model(&ctx.store, ctx.model).await;
+        let meta =
+            crate::llm_router::model_meta::resolve(&ctx.store, model.as_deref().unwrap_or(""))
+                .await;
+        crate::llm_router::model_meta::spawn_refresh();
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
@@ -148,6 +152,8 @@ impl Harness for NativeHarness {
                 work_dir: ctx.work_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 model,
+                effort: ctx.effort,
+                meta,
                 perm_mode: Arc::new(std::sync::Mutex::new(ctx.perm_mode)),
                 project_policy: None,
                 store: ctx.store,

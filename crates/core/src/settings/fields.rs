@@ -1,4 +1,4 @@
-//! ConfigField schema: the 22 global settings fields. Keys, labels, help
+//! ConfigField schema: the 27 global settings fields. Keys, labels, help
 //! text, and defaults are user-visible contracts — settings stored under
 //! these keys must keep resolving across releases.
 
@@ -38,7 +38,7 @@ pub const BASE: ConfigField = ConfigField {
     default: None,
 };
 
-/// The 22 global settings fields.
+/// The 27 global settings fields.
 pub static GLOBAL_FIELDS: &[ConfigField] = &[
     ConfigField {
         key: "workdir_root",
@@ -211,6 +211,36 @@ pub static GLOBAL_FIELDS: &[ConfigField] = &[
         help: "(managed by the Providers picker)",
         ..BASE
     },
+    ConfigField {
+        key: "context.auto_compact_percent",
+        label: "Auto-compact threshold (%)",
+        field_type: FieldType::Int,
+        default: Some("90"),
+        help: "Compact a native session when its context reaches this percent of the model window",
+        ..BASE
+    },
+    ConfigField {
+        key: "context.tool_output_max_bytes",
+        label: "Tool output budget (bytes)",
+        field_type: FieldType::Int,
+        default: Some("10000"),
+        help: "Per-tool-result byte budget kept in model context (middle-truncated beyond this)",
+        ..BASE
+    },
+    ConfigField {
+        key: "context.max_output_tokens",
+        label: "Max output tokens",
+        field_type: FieldType::Int,
+        default: Some("0"),
+        help: "Cap on max_tokens per request; 0 = use the model's own maximum",
+        ..BASE
+    },
+    ConfigField {
+        key: "context.compact_prompt",
+        label: "Compaction prompt",
+        help: "Custom summarization prompt for context compaction (blank = built-in)",
+        ..BASE
+    },
 ];
 
 #[cfg(test)]
@@ -218,15 +248,15 @@ mod tests {
     use crate::settings::{all_fields, find_field};
 
     #[test]
-    fn schema_has_26_keys_and_correct_flags() {
+    fn schema_has_30_keys_and_correct_flags() {
         let fields = all_fields();
-        assert_eq!(fields.len(), 26); // 23 global + 3 discord + 0 claude-code
+        assert_eq!(fields.len(), 30); // 27 global + 3 discord
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();
         // list order: globals first, then discord fields
         assert_eq!(keys[0], "workdir_root");
         assert!(keys.contains(&"max_spawn_depth"));
         assert_eq!(
-            &keys[23..],
+            &keys[27..],
             &["discord.token", "discord.app_id", "discord.guild_id"]
         );
         // the only required global is workdir_root; all 3 discord fields required; token is the only secret
@@ -253,6 +283,14 @@ mod tests {
         assert_eq!(
             find_field("default_perm_mode").unwrap().one_of,
             &["default", "acceptEdits", "bypassPermissions"]
+        );
+        assert_eq!(
+            find_field("context.auto_compact_percent").unwrap().default,
+            Some("90")
+        );
+        assert_eq!(
+            find_field("context.tool_output_max_bytes").unwrap().default,
+            Some("10000")
         );
     }
 }

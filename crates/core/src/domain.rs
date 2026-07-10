@@ -357,6 +357,26 @@ pub enum CoreEvent {
         ok: bool,
         message: Option<String>,
     },
+    /// Per-response context usage for a native session (drives the
+    /// "% context left" indicator).
+    ContextUsage {
+        session_pk: String,
+        active_tokens: u64,
+        context_window: u64,
+        usable_window: u64,
+        percent_left: u8,
+        cache_read_tokens: u64,
+        output_tokens: u64,
+    },
+    /// The native runtime compacted a session's history
+    /// (trigger: pre_turn|mid_turn|manual).
+    ContextCompacted {
+        session_pk: String,
+        trigger: String,
+        before_tokens: u64,
+        after_tokens: u64,
+        window_number: u32,
+    },
 }
 
 #[cfg(test)]
@@ -425,5 +445,32 @@ mod tests {
         assert!(d.create_branch);
         assert_eq!(d.branch_name, None);
         assert_eq!(d.base_branch, None);
+    }
+
+    #[test]
+    fn context_events_serialize_with_camel_kind() {
+        let e = CoreEvent::ContextUsage {
+            session_pk: "s1".into(),
+            active_tokens: 120_000,
+            context_window: 200_000,
+            usable_window: 190_000,
+            percent_left: 37,
+            cache_read_tokens: 90_000,
+            output_tokens: 512,
+        };
+        let j = serde_json::to_value(&e).unwrap();
+        assert_eq!(j["kind"], "contextUsage");
+        assert_eq!(j["percent_left"], 37);
+
+        let e = CoreEvent::ContextCompacted {
+            session_pk: "s1".into(),
+            trigger: "pre_turn".into(),
+            before_tokens: 180_000,
+            after_tokens: 31_000,
+            window_number: 2,
+        };
+        let j = serde_json::to_value(&e).unwrap();
+        assert_eq!(j["kind"], "contextCompacted");
+        assert_eq!(j["window_number"], 2);
     }
 }

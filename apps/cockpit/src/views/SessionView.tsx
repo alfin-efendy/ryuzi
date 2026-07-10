@@ -27,8 +27,18 @@ import { useComposerAttachments } from "@/components/composer/useComposerAttachm
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
 
 export function SessionView() {
-  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
-    useStore();
+  const {
+    sessions,
+    transcripts,
+    focusedSessionPk,
+    send,
+    stop,
+    pendingApprovals,
+    projects,
+    setProjectModel,
+    setProjectPermMode,
+    contextUsage,
+  } = useStore();
   const nav = useNav();
   const [draft, setDraft] = useState("");
   const composerFiles = useComposerAttachments();
@@ -109,6 +119,7 @@ export function SessionView() {
 
   const meta = statusMeta(session.status);
   const running = session.status === "running";
+  const usage = contextUsage[session.sessionPk];
   const hasApproval = pendingApprovals.some((a) => a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(project?.permMode ?? "default");
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
@@ -284,6 +295,14 @@ export function SessionView() {
                 }
               />
               <div className="flex-1" />
+              {usage && (
+                <span
+                  className="w-32 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground"
+                  title={`~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
+                >
+                  {usage.percentLeft}% context left
+                </span>
+              )}
               <ModelPicker
                 ariaLabel="Model"
                 variant="chip"

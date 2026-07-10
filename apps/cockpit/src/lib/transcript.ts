@@ -36,7 +36,8 @@ export type Group =
   | { type: "agent"; key: string; markdown: string; turnEnd?: boolean }
   | { type: "thought"; key: string; markdown: string }
   | { type: "activity"; key: string; items: ActivityItem[] }
-  | { type: "error"; key: string; text: string };
+  | { type: "error"; key: string; text: string }
+  | { type: "notice"; key: string; text: string };
 
 export type EditCard = { path: string; kind: string };
 
@@ -151,6 +152,10 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
     }
     if (row.blockType === "error") {
       groups.push({ type: "error", key, text: row.text });
+      return;
+    }
+    if (row.blockType === "notice") {
+      groups.push({ type: "notice", key, text: row.text });
       return;
     }
     if (row.blockType === "tool_call" || row.blockType === "status") {

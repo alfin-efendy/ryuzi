@@ -58,6 +58,15 @@ fn builtin_commands() -> Vec<Command> {
                 .into(),
             agent: Some("plan".into()),
         },
+        // /compact is intercepted as an ACTION in runner::run_turn before
+        // command resolution — this entry exists only so UIs list it in
+        // slash-command autocomplete. Its template is never sent to a model.
+        Command {
+            name: "compact".into(),
+            description: "Summarize older history to free context-window space.".into(),
+            template: String::new(),
+            agent: None,
+        },
     ]
 }
 
@@ -169,6 +178,7 @@ mod tests {
         assert!(reg.get("init").is_some());
         assert!(reg.get("review").is_some());
         assert_eq!(reg.get("review").unwrap().agent.as_deref(), Some("plan"));
+        assert!(reg.get("compact").is_some());
     }
 
     #[test]
