@@ -760,7 +760,9 @@ async fn run_tool_call(
         }
     }
 
-    // Execute.
+    // Execute. Timed from here — after the permission gate — so a long human
+    // approval wait never inflates the card's duration badge.
+    let started = std::time::Instant::now();
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
         work_dir: deps.work_dir.clone(),
@@ -775,12 +777,13 @@ async fn run_tool_call(
     match tool.execute(&ctx, input).await {
         Ok(out) => {
             if emit_display {
+                let display = merge_display_duration(out.display, elapsed_ms(started));
                 finish_tool_row_with_display(
                     deps,
                     &t.id,
                     &out.for_model,
                     out.is_error,
-                    out.display,
+                    Some(display),
                 )
                 .await;
             }
@@ -789,7 +792,8 @@ async fn run_tool_call(
         Err(e) => {
             let msg = format!("{}: {e}", t.name);
             if emit_display {
-                finish_tool_row(deps, &t.id, &msg, true).await;
+                let display = merge_display_duration(None, elapsed_ms(started));
+                finish_tool_row_with_display(deps, &t.id, &msg, true, Some(display)).await;
             }
             tool_result(&t.id, &msg, true)
         }
@@ -849,6 +853,25 @@ async fn finish_tool_row_with_display(
         }
         Err(e) => tracing::warn!("native: update_tool_call({tool_call_id}) failed: {e}"),
     }
+}
+
+/// Milliseconds elapsed since `started`, saturating into a JSON-safe u64.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Fold the measured duration into a tool's display extras (`{"summary": …}`,
+/// `{"exit_code": …}`, …). The result is json_patch-merged into the persisted
+/// tool_call payload by [`finish_tool_row_with_display`], so `duration_ms`
+/// and the other extras survive session hydration. Non-object extras are
+/// discarded — a scalar would corrupt the payload merge.
+fn merge_display_duration(display: Option<Value>, duration_ms: u64) -> Value {
+    let mut extras = match display {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    extras.insert("duration_ms".to_string(), Value::from(duration_ms));
+    Value::Object(extras)
 }
 
 /// Flush any buffered streaming text as one delta-shaped `text` row (only when
@@ -1434,6 +1457,67 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.block_type == "text" && m.payload["text"] == "all set"));
+    }
+
+    #[test]
+    fn merge_display_duration_folds_duration_into_existing_extras() {
+        let merged = merge_display_duration(Some(json!({ "summary": "todos: 1/2 done" })), 1234);
+        assert_eq!(
+            merged,
+            json!({ "summary": "todos: 1/2 done", "duration_ms": 1234 })
+        );
+    }
+
+    #[test]
+    fn merge_display_duration_handles_missing_or_non_object_extras() {
+        assert_eq!(merge_display_duration(None, 7), json!({ "duration_ms": 7 }));
+        // A non-object display value would corrupt the json_patch — drop it.
+        assert_eq!(
+            merge_display_duration(Some(json!("junk")), 7),
+            json!({ "duration_ms": 7 })
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_payload_carries_duration_and_display_extras() {
+        let dir = tempfile::tempdir().unwrap();
+        // todowrite exercises timing + summary extras WITHOUT spawning any
+        // process (bash-based turns fail on sh-less Windows dev boxes).
+        let turn1 = vec![
+            tool_use_start(0, "call-1", "todowrite"),
+            input_json_delta(
+                0,
+                "{\"todos\":[{\"content\":\"first\",\"status\":\"completed\"},{\"content\":\"second\",\"status\":\"pending\"}]}",
+            ),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm).await;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("plan it", "plan it"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        let row = msgs
+            .iter()
+            .find(|m| m.block_type == "tool_call")
+            .expect("a tool_call row");
+        assert_eq!(row.payload["name"], "todowrite");
+        // The tool's own display extras still land in the payload...
+        assert_eq!(row.payload["summary"], "todos: 1/2 done");
+        // ...and the runner's timing is merged in beside them.
+        assert!(
+            row.payload["duration_ms"].is_u64(),
+            "payload missing duration_ms: {}",
+            row.payload
+        );
     }
 
     #[test]
