@@ -108,6 +108,11 @@ const GATEWAY_ID: &str = "discord";
 pub struct InboundMessage {
     pub channel_id: String,
     pub is_thread: bool,
+    /// A direct message (no guild) — serenity's `Message.guild_id.is_none()`.
+    /// A DM channel is never also a thread, but this is a distinct flag
+    /// (not derived from `is_thread`) since the connector is the one place
+    /// that can see `guild_id`.
+    pub is_dm: bool,
     pub author_bot: bool,
     pub author_id: String,
     pub mentions_bot: bool,
@@ -232,17 +237,34 @@ impl InboundRouting {
         self.router.read().unwrap().clone()
     }
 
-    /// Routes an inbound message: bot authors are ignored; a thread message
-    /// with content or attachments becomes a reply into the session bound to
-    /// that thread; a channel message that mentions the bot starts a new
-    /// turn (mentions stripped first). Events arriving before `set_router`
-    /// are dropped with a warning (see the module doc).
+    /// Routes an inbound message: bot authors are ignored; a DM (no
+    /// `/connect`, no project binding) starts or continues a project-less
+    /// `chat` session; a thread message with content or attachments becomes
+    /// a reply into the session bound to that thread; a channel message
+    /// that mentions the bot starts a new turn (mentions stripped first).
+    /// Events arriving before `set_router` are dropped with a warning (see
+    /// the module doc).
     async fn handle_message(&self, e: InboundMessage) {
         let Some(router) = self.router() else {
             eprintln!("[discord] dropping inbound message: router not set yet");
             return;
         };
         if e.author_bot {
+            return;
+        }
+        if e.is_dm {
+            // `on_dm` has no attachments parameter today (A7 scope: text-only
+            // project-less chat) — an attachment-only DM with empty text is
+            // silently dropped rather than starting a session with a blank
+            // prompt.
+            if !e.content.is_empty() {
+                if let Err(err) = router
+                    .on_dm(GATEWAY_ID, &e.channel_id, &e.author_id, &e.content)
+                    .await
+                {
+                    eprintln!("[discord] on_dm failed: {err}");
+                }
+            }
             return;
         }
         if e.is_thread {
@@ -518,7 +540,7 @@ mod tests {
     use super::*;
     use crate::attachments::{AttachmentFetcher, FetchOutcome};
     use crate::control::ControlPlane;
-    use crate::domain::SessionStatus;
+    use crate::domain::{SessionKind, SessionStatus};
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::plugins::Registries;
     use crate::settings::SettingsStore;
@@ -690,6 +712,7 @@ mod tests {
         InboundMessage {
             channel_id: "c".to_string(),
             is_thread: false,
+            is_dm: false,
             author_bot: false,
             author_id: "u".to_string(),
             mentions_bot: false,
@@ -1220,6 +1243,86 @@ mod tests {
         })
         .await;
         assert_eq!(store.list_sessions(None).await.unwrap().len(), 1);
+    }
+
+    // ---------- Task A7: DM messages start/continue a project-less chat session ----------
+
+    /// A DM (`is_dm: true`) with no `/connect`/workspace binding starts a
+    /// project-less `chat` session bound to the DM channel, and a second DM
+    /// in the same channel continues it — proving the DM path bypasses
+    /// `resolve_project_by_workspace` entirely (unlike a guild mention,
+    /// which requires `/connect` first). It also never touches the
+    /// registered gateway (`create_workspace`/`create_conversation`),
+    /// unlike `on_start`.
+    #[tokio::test]
+    #[serial]
+    async fn dm_message_starts_a_project_less_chat_session() {
+        let _guard = StateDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let (router, fake_gw, store, _db_guard) = wired_router(root.path()).await;
+        let port = Arc::new(FakePort::new());
+        let gw = DiscordGateway::new(port);
+        gw.set_router(router.clone());
+
+        gw.handle_message(InboundMessage {
+            channel_id: "dm-1".to_string(),
+            author_id: "u9".to_string(),
+            is_dm: true,
+            content: "hello".to_string(),
+            ..base_msg()
+        })
+        .await;
+
+        let session = store
+            .resolve_by_conversation("discord", "dm-1")
+            .await
+            .unwrap()
+            .expect("expected a chat session bound to the DM");
+        assert_eq!(session.kind, SessionKind::Chat);
+        assert_eq!(session.project_id, None);
+        wait_for_status(&store, &session.session_pk, SessionStatus::Idle).await;
+
+        // A second DM in the same channel continues the same session.
+        gw.handle_message(InboundMessage {
+            channel_id: "dm-1".to_string(),
+            author_id: "u9".to_string(),
+            is_dm: true,
+            content: "again".to_string(),
+            ..base_msg()
+        })
+        .await;
+        assert_eq!(store.list_sessions(None).await.unwrap().len(), 1);
+        wait_for_status(&store, &session.session_pk, SessionStatus::Idle).await;
+
+        assert!(
+            fake_gw.calls().is_empty(),
+            "DM chat sessions must not touch the gateway: {:?}",
+            fake_gw.calls()
+        );
+    }
+
+    /// A DM with no content and no attachments is silently ignored — `on_dm`
+    /// has no attachments parameter, so there's nothing worth starting a
+    /// session over.
+    #[tokio::test]
+    #[serial]
+    async fn dm_with_empty_content_is_ignored() {
+        let _guard = StateDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let (router, _fake_gw, store, _db_guard) = wired_router(root.path()).await;
+        let port = Arc::new(FakePort::new());
+        let gw = DiscordGateway::new(port);
+        gw.set_router(router.clone());
+
+        gw.handle_message(InboundMessage {
+            channel_id: "dm-2".to_string(),
+            author_id: "u9".to_string(),
+            is_dm: true,
+            ..base_msg()
+        })
+        .await;
+
+        assert!(store.list_sessions(None).await.unwrap().is_empty());
     }
 
     // ---------- Test 7 (Task 6): set_router reconciliation ----------
