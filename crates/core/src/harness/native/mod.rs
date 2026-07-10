@@ -142,6 +142,19 @@ impl Harness for NativeHarness {
         // simply off, keeping runs hermetic.
         let session_row = ctx.store.get_session(&ctx.session_pk).await.ok().flatten();
         let project_id = session_row.as_ref().map(|s| s.project_id.clone());
+        let model_name = model.as_deref().unwrap_or("");
+        let mut effort_policy = if let Some(project_id) = project_id.as_deref() {
+            crate::llm_router::model_effort::build_turn_effort_policy(
+                &ctx.store, project_id, model_name,
+            )
+            .await?
+        } else {
+            crate::llm_router::model_effort::build_utility_effort_policy(&ctx.store, model_name)
+                .await?
+        };
+        if project_id.is_none() {
+            effort_policy.project_override = ctx.effort;
+        }
         let memory_store = project_id
             .as_deref()
             .map(|pid| Arc::new(memory::MemoryStore::at_default(Some(pid))));
@@ -152,7 +165,7 @@ impl Harness for NativeHarness {
                 work_dir: ctx.work_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 model,
-                effort: ctx.effort,
+                turn_effort_policy: Arc::new(effort_policy),
                 meta,
                 perm_mode: Arc::new(std::sync::Mutex::new(ctx.perm_mode)),
                 project_id,
@@ -414,6 +427,7 @@ mod tests {
             async fn stream(
                 &self,
                 _body: serde_json::Value,
+                _effort_policy: Arc<crate::llm_router::model_effort::TurnEffortPolicy>,
             ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<AnthropicEvent>>>
             {
                 let n = self.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -473,6 +487,138 @@ mod tests {
         let turns = store.list_provider_turns("sess").await.unwrap();
         let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_turn_keeps_first_snapshot_and_next_lock_holder_refreshes() {
+        use crate::domain::{Project, Session, SessionStatus};
+        use crate::llm_router::connections;
+        use crate::llm_router::model_effort::TurnEffortPolicy;
+        use runner::testutil::{message_delta, message_stop, text_delta};
+        use std::sync::Mutex as StdMutex;
+
+        struct SnapshotLlm {
+            policies: StdMutex<Vec<Arc<TurnEffortPolicy>>>,
+            first_started: tokio::sync::Notify,
+            release_first: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl llm::LlmStream for SnapshotLlm {
+            async fn stream(
+                &self,
+                _body: serde_json::Value,
+                effort_policy: Arc<TurnEffortPolicy>,
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<AnthropicEvent>>>
+            {
+                let index = {
+                    let mut policies = self.policies.lock().unwrap();
+                    let index = policies.len();
+                    policies.push(effort_policy);
+                    index
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                if index == 0 {
+                    self.first_started.notify_one();
+                    self.release_first.notified().await;
+                }
+                tokio::spawn(async move {
+                    let _ = tx.send(Ok(text_delta("ok"))).await;
+                    let _ = tx.send(Ok(message_delta("end_turn"))).await;
+                    let _ = tx.send(Ok(message_stop())).await;
+                });
+                Ok(rx)
+            }
+        }
+
+        struct SnapshotFactory(Arc<SnapshotLlm>);
+        impl llm::LlmStreamFactory for SnapshotFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        connections::add_connection(
+            &store,
+            conn_for_resolution_tests("claude", "anthropic", "model-a"),
+        )
+        .await
+        .unwrap();
+        let mut conn = connections::get_connection(&store, "claude")
+            .await
+            .unwrap()
+            .unwrap();
+        conn.data.models_override = Some(vec!["model-a".into(), "model-b".into()]);
+        connections::update_connection(&store, conn).await.unwrap();
+        store
+            .insert_project(Project {
+                project_id: "p".into(),
+                name: "p".into(),
+                workdir: dir.path().to_string_lossy().into_owned(),
+                source: None,
+                harness: "native".into(),
+                model: Some("anthropic/model-a".into()),
+                effort: Some("low".into()),
+                perm_mode: PermMode::BypassPermissions,
+                created_at: Some(0),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        store
+            .insert_session(Session {
+                session_pk: "sess".into(),
+                project_id: "p".into(),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("titled".into()),
+                status: SessionStatus::Running,
+                started_by: None,
+                created_at: Some(0),
+                last_active: Some(0),
+                resume_attempts: 0,
+                branch_owned: true,
+            })
+            .await
+            .unwrap();
+        let llm = Arc::new(SnapshotLlm {
+            policies: StdMutex::new(Vec::new()),
+            first_started: tokio::sync::Notify::new(),
+            release_first: tokio::sync::Notify::new(),
+        });
+        let plugin = native_plugin_with_llm_factory(Arc::new(SnapshotFactory(llm.clone())));
+        let harness = plugin.harness.unwrap().create().unwrap();
+        let mut ctx = ctx_for(store.clone(), dir.path().to_path_buf()).await;
+        ctx.model = Some("anthropic/model-a".into());
+        ctx.effort = Some("low".into());
+        let session = harness.start_session(ctx).await.unwrap();
+
+        let first = session.send_prompt(TurnPrompt::text("one", "one"));
+        tokio::pin!(first);
+        tokio::select! {
+            result = &mut first => panic!("first turn ended before release: {result:?}"),
+            _ = llm.first_started.notified() => {}
+        }
+        store
+            .update_project_runtime("p", Some("anthropic/model-b".into()), Some("high".into()))
+            .await
+            .unwrap();
+        let second = session.send_prompt(TurnPrompt::text("two", "two"));
+        llm.release_first.notify_one();
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let policies = llm.policies.lock().unwrap();
+        assert_eq!(policies.len(), 2);
+        assert_eq!(policies[0].requested_model, "anthropic/model-a");
+        assert_eq!(policies[0].project_override.as_deref(), Some("low"));
+        assert_eq!(policies[1].requested_model, "anthropic/model-b");
+        assert_eq!(policies[1].project_override.as_deref(), Some("high"));
     }
 
     fn conn_for_resolution_tests(

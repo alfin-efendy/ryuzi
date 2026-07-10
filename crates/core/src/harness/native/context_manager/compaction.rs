@@ -4,6 +4,7 @@
 
 use super::{estimate_tokens, is_context_overflow, ContextManager};
 use crate::harness::native::llm::{collect_text, LlmStream};
+use crate::llm_router::model_effort::TurnEffortPolicy;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ impl ContextManager {
         llm: &Arc<dyn LlmStream>,
         model: &str,
         _trigger: &str,
+        effort_policy: Arc<TurnEffortPolicy>,
     ) -> anyhow::Result<CompactionOutcome> {
         anyhow::ensure!(!model.is_empty(), "compaction: no model configured");
         anyhow::ensure!(!self.ledger.is_empty(), "compaction: empty history");
@@ -70,7 +72,7 @@ impl ContextManager {
                 "messages": messages,
                 "stream": true,
             });
-            match collect_text(llm, body).await {
+            match collect_text(llm, body, effort_policy.clone()).await {
                 Ok(s) if !s.trim().is_empty() => break s.trim().to_string(),
                 Ok(_) => anyhow::bail!("compaction: model returned an empty summary"),
                 Err(e) if is_context_overflow(&e.to_string()) && working.len() > 1 => {
@@ -218,6 +220,16 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    fn policy() -> Arc<TurnEffortPolicy> {
+        Arc::new(TurnEffortPolicy {
+            requested_model: "test/model".into(),
+            project_override: None,
+            route_compatibility: Default::default(),
+            configured: Default::default(),
+            surfaces: Default::default(),
+        })
+    }
+
     fn meta() -> ModelMeta {
         ModelMeta {
             context_window: 100_000,
@@ -253,7 +265,10 @@ mod tests {
             message_stop(),
         ]]));
         let before_len = cm.messages_for_request().len();
-        let outcome = cm.compact(&llm, "test/model", "manual").await.unwrap();
+        let outcome = cm
+            .compact(&llm, "test/model", "manual", policy())
+            .await
+            .unwrap();
         assert_eq!(outcome.window_number, 1);
         assert!(outcome.after_tokens < outcome.before_tokens);
         let msgs = cm.messages_for_request();
@@ -280,11 +295,15 @@ mod tests {
             vec![text_delta("summary one"), message_stop()],
             vec![text_delta("summary two"), message_stop()],
         ]));
-        cm.compact(&llm, "test/model", "manual").await.unwrap();
+        cm.compact(&llm, "test/model", "manual", policy())
+            .await
+            .unwrap();
         cm.append_user(json!([{"type":"text","text":"another question"}]))
             .await
             .unwrap();
-        cm.compact(&llm, "test/model", "manual").await.unwrap();
+        cm.compact(&llm, "test/model", "manual", policy())
+            .await
+            .unwrap();
         let text = serde_json::to_string(&cm.messages_for_request()).unwrap();
         assert!(
             !text.contains("summary one"),
@@ -305,7 +324,9 @@ mod tests {
         let ok = vec![text_delta("recovered summary"), message_stop()];
         let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![overflow, ok]));
         let len_before = cm.messages_for_request().len();
-        cm.compact(&llm, "test/model", "manual").await.unwrap();
+        cm.compact(&llm, "test/model", "manual", policy())
+            .await
+            .unwrap();
         assert!(cm.messages_for_request().len() < len_before);
         let text = serde_json::to_string(&cm.messages_for_request()).unwrap();
         assert!(text.contains("recovered summary"));
@@ -320,7 +341,10 @@ mod tests {
         )];
         let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![boom]));
         let before = cm.messages_for_request();
-        assert!(cm.compact(&llm, "test/model", "manual").await.is_err());
+        assert!(cm
+            .compact(&llm, "test/model", "manual", policy())
+            .await
+            .is_err());
         assert_eq!(cm.messages_for_request().len(), before.len());
     }
 
@@ -350,7 +374,9 @@ mod tests {
             text_delta("summary of the conversation"),
             message_stop(),
         ]]));
-        cm.compact(&llm, "test/model", "manual").await.unwrap();
+        cm.compact(&llm, "test/model", "manual", policy())
+            .await
+            .unwrap();
         let text = serde_json::to_string(&cm.messages_for_request()).unwrap();
         assert!(
             text.contains("look at this screenshot"),
@@ -407,7 +433,7 @@ mod tests {
 
         let before = cm.messages_for_request();
         let before_json = serde_json::to_string(&before).unwrap();
-        let result = cm.compact(&llm, "test/model", "manual").await;
+        let result = cm.compact(&llm, "test/model", "manual", policy()).await;
         match result {
             Err(e) => assert!(is_context_overflow(&e.to_string())),
             Ok(_) => panic!("expected compaction to fail on persistent overflow"),

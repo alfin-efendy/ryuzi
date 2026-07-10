@@ -785,6 +785,9 @@ pub async fn decompose_goal(
         .await
         .ok_or_else(|| anyhow::anyhow!("no default model configured for decomposition"))?;
     let ctx = client::UpstreamCtx::new(store.clone());
+    let effort_policy = Arc::new(
+        crate::llm_router::model_effort::build_utility_effort_policy(store, &model).await?,
+    );
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 2048,
@@ -794,7 +797,7 @@ pub async fn decompose_goal(
         }],
         "stream": true,
     });
-    let mut rx = client::anthropic_messages_stream(&ctx, body).await?;
+    let mut rx = client::anthropic_messages_stream(&ctx, body, effort_policy).await?;
     let mut text = String::new();
     while let Some(item) = rx.recv().await {
         let ev = item?;

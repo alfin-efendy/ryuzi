@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_probe_hits_responses_and_normalizes_suffixed_ids() {
+    async fn codex_probe_hits_responses_and_keeps_bare_effort_suffix_exact() {
         let ctx = test_ctx().await;
         let desc = registry::descriptor("openai-oauth").unwrap();
         let target = RouteTarget {
@@ -786,7 +786,7 @@ mod tests {
         assert_eq!(req.headers().get("accept").unwrap(), "text/event-stream");
         assert_eq!(req.headers().get("chatgpt-account-id").unwrap(), "acct-1");
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
-        assert_eq!(sent["model"], "gpt-5.2-codex");
+        assert_eq!(sent["model"], "gpt-5.2-codex-high");
         // The ChatGPT Codex backend rejects shorthand probes (verified live
         // 2026-07-10): a string `input` 400s with "Input must be a list",
         // `stream: false` 400s with "Stream must be set to true", and

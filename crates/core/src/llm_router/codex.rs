@@ -493,6 +493,16 @@ pub fn codex_base_model(model: &str) -> &str {
     model.strip_suffix("-review").unwrap_or(model)
 }
 
+/// Map the policy/UI effort identity to the Codex Responses wire value.
+/// This is deliberately a protocol adapter, not a capability list.
+pub fn reasoning_effort_for_request(effort: &str) -> &str {
+    if effort == "ultra" {
+        "max"
+    } else {
+        effort
+    }
+}
+
 pub fn normalize_codex_responses_body(
     body: &mut Value,
     upstream_model: &str,
@@ -523,18 +533,21 @@ pub fn normalize_codex_responses_body(
         }
     }
 
-    if body.get("reasoning").is_none() {
-        if let Some(effort) = body
-            .get("reasoning_effort")
-            .and_then(Value::as_str)
-            .or(explicit_effort)
-        {
-            body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+    if let Some(effort) = explicit_effort {
+        body["reasoning"]["effort"] = json!(reasoning_effort_for_request(effort));
+    } else if body.get("reasoning").is_none() {
+        if let Some(effort) = body.get("reasoning_effort").and_then(Value::as_str) {
+            body["reasoning"] = json!({
+                "effort": reasoning_effort_for_request(effort),
+                "summary": "auto"
+            });
         }
-    } else if body
-        .get("reasoning")
-        .and_then(|r| r.get("summary"))
-        .is_none()
+    }
+    if body.get("reasoning").is_some()
+        && body
+            .get("reasoning")
+            .and_then(|r| r.get("summary"))
+            .is_none()
     {
         body["reasoning"]["summary"] = json!("auto");
     }
@@ -841,6 +854,30 @@ mod tests {
 
         assert_eq!(body["model"], "gpt-known-high");
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn codex_wire_maps_ultra_to_max_but_preserves_open_custom_values() {
+        let mut ultra = json!({"input": []});
+        normalize_codex_responses_body(&mut ultra, "gpt-5.5", Some("ultra"), None);
+        assert_eq!(ultra["reasoning"]["effort"], "max");
+
+        let mut custom = json!({"input": []});
+        normalize_codex_responses_body(&mut custom, "gpt-5.5", Some("provider-experimental"), None);
+        assert_eq!(custom["reasoning"]["effort"], "provider-experimental");
+    }
+
+    #[test]
+    fn policy_effort_overwrites_existing_reasoning_without_losing_summary() {
+        let mut body = json!({
+            "input": [],
+            "reasoning": {"effort": "low", "summary": "detailed"}
+        });
+
+        normalize_codex_responses_body(&mut body, "gpt-5.5", Some("ultra"), None);
+
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
     }
 
     #[test]

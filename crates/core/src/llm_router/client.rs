@@ -895,6 +895,55 @@ fn strip_thinking(body: &mut Value) {
     }
 }
 
+fn target_effort(
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+) -> model_effort::EffectiveEffort {
+    let preference_key = model_effort::ModelPreferenceKey {
+        family: target.desc.family.to_string(),
+        model: target.upstream_model.clone(),
+    };
+    let surface = model_effort::ExecutionSurfaceKey {
+        provider_id: target.conn.provider.clone(),
+        connection_id: Some(target.conn.id.clone()),
+        model: target.upstream_model.clone(),
+    };
+    resolve_target_effort(
+        policy,
+        target.route_target_key.as_ref(),
+        target.request_compatibility_effort.as_deref(),
+        &preference_key,
+        &surface,
+    )
+}
+
+fn apply_anthropic_effort(
+    body: &mut Value,
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+) {
+    if let Some(effort) = target_effort(target, policy).value {
+        body["output_config"]["effort"] = json!(effort);
+    } else if let Some(output) = body.get_mut("output_config").and_then(Value::as_object_mut) {
+        output.remove("effort");
+    }
+}
+
+fn apply_openai_effort(
+    body: &mut Value,
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+    caller_supplied_thinking: bool,
+) {
+    if let Some(effort) = target_effort(target, policy).value {
+        body["reasoning_effort"] = json!(effort);
+    } else if !caller_supplied_thinking {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("reasoning_effort");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Upstream request construction (moved from server.rs — behavior unchanged,
 // `&AppState` retargeted to `&UpstreamCtx`)
@@ -1590,20 +1639,13 @@ fn deliver_probed(
 pub async fn anthropic_messages_stream(
     ctx: &UpstreamCtx,
     body: Value,
+    effort_policy: Arc<model_effort::TurnEffortPolicy>,
 ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
     let requested = body["model"].as_str().unwrap_or("").to_string();
     let targets = route_models_for_anthropic_messages(&ctx.store, &requested).await?;
     if targets.is_empty() {
         anyhow::bail!("no enabled connection serves model '{requested}'");
     }
-    let policy_model = targets
-        .iter()
-        .find(|target| target.request_compatibility_effort.is_some())
-        .map(|target| format!("{}/{}", target.desc.family, target.upstream_model))
-        .unwrap_or_else(|| requested.clone());
-    let effort_policy =
-        model_effort::build_utility_effort_policy(&ctx.store, &policy_model).await?;
-
     let mut failures = Vec::new();
     let mut attempted = std::collections::HashSet::<(String, String)>::new();
     let mut queue = std::collections::VecDeque::from(targets);
@@ -1699,6 +1741,7 @@ pub async fn anthropic_messages_stream(
         match target.desc.format {
             ApiFormat::Anthropic => {
                 strip_thinking(&mut attempt_body);
+                apply_anthropic_effort(&mut attempt_body, &target, &effort_policy);
                 let tool_map = claude_cloak_map_for(&target, &attempt_body);
                 let resp = match send_upstream(ctx, &mut target, &attempt_body).await {
                     Ok(resp) => resp,
@@ -1749,6 +1792,12 @@ pub async fn anthropic_messages_stream(
                 // Not stripped here: `anthropic_to_openai_request` translates
                 // `thinking` into `reasoning_effort` for this wire format.
                 let mut upstream_body = translate::anthropic_to_openai_request(&attempt_body)?;
+                apply_openai_effort(
+                    &mut upstream_body,
+                    &target,
+                    &effort_policy,
+                    body.get("thinking").is_some(),
+                );
                 apply_max_completion_tokens(target.desc, &mut upstream_body);
                 let resp = match send_upstream(ctx, &mut target, &upstream_body).await {
                     Ok(resp) => resp,
@@ -2419,10 +2468,91 @@ mod tests {
         }
     }
 
+    fn single_option_policy(target: &RouteTarget, value: &str) -> model_effort::TurnEffortPolicy {
+        let surface = model_effort::ExecutionSurfaceKey {
+            provider_id: target.conn.provider.clone(),
+            connection_id: Some(target.conn.id.clone()),
+            model: target.upstream_model.clone(),
+        };
+        model_effort::TurnEffortPolicy {
+            requested_model: format!("{}/{}", target.desc.family, target.upstream_model),
+            project_override: None,
+            route_compatibility: Default::default(),
+            configured: Default::default(),
+            surfaces: std::collections::HashMap::from([(
+                surface.clone(),
+                model_effort::ExecutionModelEffortCapabilities {
+                    surface,
+                    model_display_name: target.upstream_model.clone(),
+                    supported: vec![model_effort::ReasoningEffortOption {
+                        value: value.into(),
+                        label: value.into(),
+                        description: None,
+                    }],
+                    provider_default: None,
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn single_option_implicit_default_is_sent_to_wire() {
+        let anthropic = RouteTarget {
+            conn: mk_conn("a1", "anthropic", "api_key", ConnectionData::default()),
+            desc: registry::descriptor("anthropic").unwrap(),
+            upstream_model: "claude-one".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
+        };
+        let policy = single_option_policy(&anthropic, "focused");
+        let mut anthropic_body = json!({"messages": []});
+        apply_anthropic_effort(&mut anthropic_body, &anthropic, &policy);
+        assert_eq!(anthropic_body["output_config"]["effort"], "focused");
+
+        let openai = RouteTarget {
+            conn: mk_conn("o1", "openai", "api_key", ConnectionData::default()),
+            desc: registry::descriptor("openai").unwrap(),
+            upstream_model: "gpt-one".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
+        };
+        let policy = single_option_policy(&openai, "focused");
+        let mut chat_body = json!({"messages": []});
+        apply_openai_effort(&mut chat_body, &openai, &policy, false);
+        assert_eq!(chat_body["reasoning_effort"], "focused");
+
+        let codex = RouteTarget {
+            conn: mk_conn("c1", "openai-oauth", "oauth", ConnectionData::default()),
+            desc: registry::descriptor("openai-oauth").unwrap(),
+            upstream_model: "gpt-codex".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
+        };
+        let policy = single_option_policy(&codex, "ultra");
+        let selected = target_effort(&codex, &policy).value.unwrap();
+        assert_eq!(selected, "ultra", "policy identity stays provider-native");
+        let mut responses = json!({"input": []});
+        crate::llm_router::codex::normalize_codex_responses_body(
+            &mut responses,
+            "gpt-codex",
+            Some(&selected),
+            None,
+        );
+        assert_eq!(responses["reasoning"]["effort"], "max");
+    }
+
     async fn test_ctx() -> UpstreamCtx {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         UpstreamCtx::new(store)
+    }
+
+    async fn utility_policy(ctx: &UpstreamCtx, model: &str) -> Arc<model_effort::TurnEffortPolicy> {
+        Arc::new(
+            model_effort::build_utility_effort_policy(&ctx.store, model)
+                .await
+                .unwrap(),
+        )
     }
 
     /// Drain an `anthropic_messages_stream` receiver, panicking on transport
@@ -2609,6 +2739,7 @@ mod tests {
                 "model": "anthropic/claude-t",
                 "messages": [{"role": "user", "content": "hi"}],
             }),
+            utility_policy(&ctx, "anthropic/claude-t").await,
         )
         .await
         .unwrap();
@@ -2661,6 +2792,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_streams_route_accounts_dynamically_with_same_effort_policy() {
+        use axum::{routing::post, Router};
+
+        const FIRST: &str = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        const SECOND: &str = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"second\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async { ([("content-type", "text/event-stream")], FIRST) }),
+            )
+            .route(
+                "/second/messages",
+                post(|| async { ([("content-type", "text/event-stream")], SECOND) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+        routes::save_provider_account_route(
+            &ctx.store,
+            "anthropic",
+            routes::ModelRouteStrategy::RoundRobin,
+        )
+        .await
+        .unwrap();
+        let policy = utility_policy(&ctx, "anthropic/claude-t").await;
+        let body = || json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]});
+
+        let first = anthropic_messages_stream(&ctx, body(), policy.clone())
+            .await
+            .unwrap();
+        let second = anthropic_messages_stream(&ctx, body(), policy.clone())
+            .await
+            .unwrap();
+        assert_eq!(stream_text(&collect_stream(first).await), "first");
+        assert_eq!(stream_text(&collect_stream(second).await), "second");
+        assert_eq!(Arc::strong_count(&policy), 1);
+    }
+
+    #[tokio::test]
     async fn stream_rotates_on_error_event_before_first_content() {
         use axum::{routing::post, Router};
 
@@ -2690,6 +2863,7 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await,
         )
         .await
         .unwrap();
@@ -2741,6 +2915,7 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await,
         )
         .await
         .unwrap();
@@ -2799,6 +2974,7 @@ mod tests {
         let err = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await,
         )
         .await
         .unwrap_err();
@@ -2865,6 +3041,7 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await,
         )
         .await
         .unwrap();
@@ -2911,6 +3088,7 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await,
         )
         .await
         .unwrap();
@@ -5297,6 +5475,7 @@ mod tests {
                 "model": "anthropic/claude-a",
                 "messages": [{"role": "user", "content": "hi"}],
             }),
+            utility_policy(&ctx, "anthropic/claude-a").await,
         )
         .await
         .unwrap();

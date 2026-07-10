@@ -5,6 +5,7 @@
 //! driven without a network.
 
 use crate::llm_router::client::{self, AnthropicEvent, MessageStreamEvent, UpstreamCtx};
+use crate::llm_router::model_effort::TurnEffortPolicy;
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -17,6 +18,7 @@ pub trait LlmStream: Send + Sync {
     async fn stream(
         &self,
         body: Value,
+        effort_policy: Arc<TurnEffortPolicy>,
     ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>>;
 }
 
@@ -37,8 +39,9 @@ impl LlmStream for RouterLlmStream {
     async fn stream(
         &self,
         body: Value,
+        effort_policy: Arc<TurnEffortPolicy>,
     ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
-        client::anthropic_messages_stream(&self.ctx, body).await
+        client::anthropic_messages_stream(&self.ctx, body, effort_policy).await
     }
 }
 
@@ -56,8 +59,12 @@ impl LlmStreamFactory for RouterLlmStreamFactory {
 /// Stream a request and concatenate its text deltas. A stream `Error` event
 /// or transport error becomes `Err`. Shared by title generation and
 /// compaction summarization.
-pub async fn collect_text(llm: &Arc<dyn LlmStream>, body: Value) -> anyhow::Result<String> {
-    let mut rx = llm.stream(body).await?;
+pub async fn collect_text(
+    llm: &Arc<dyn LlmStream>,
+    body: Value,
+    effort_policy: Arc<TurnEffortPolicy>,
+) -> anyhow::Result<String> {
+    let mut rx = llm.stream(body, effort_policy).await?;
     let mut out = String::new();
     while let Some(item) = rx.recv().await {
         let ev = item?;
@@ -75,6 +82,16 @@ mod tests {
     use super::*;
     use crate::harness::native::runner::testutil::{message_stop, text_delta, ScriptedLlm};
 
+    fn policy() -> Arc<TurnEffortPolicy> {
+        Arc::new(TurnEffortPolicy {
+            requested_model: "test/model".into(),
+            project_override: None,
+            route_compatibility: Default::default(),
+            configured: Default::default(),
+            surfaces: Default::default(),
+        })
+    }
+
     #[tokio::test]
     async fn collect_text_concatenates_deltas_and_propagates_errors() {
         let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![
@@ -85,12 +102,12 @@ mod tests {
             )],
         ]));
         assert_eq!(
-            collect_text(&llm, serde_json::json!({"stream": true}))
+            collect_text(&llm, serde_json::json!({"stream": true}), policy(),)
                 .await
                 .unwrap(),
             "ab"
         );
-        let err = collect_text(&llm, serde_json::json!({"stream": true}))
+        let err = collect_text(&llm, serde_json::json!({"stream": true}), policy())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("boom"));

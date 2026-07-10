@@ -17,6 +17,7 @@ use crate::approval::ApprovalHub;
 use crate::domain::{CoreEvent, NewMessage, PermMode};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
+use crate::llm_router::model_effort::TurnEffortPolicy;
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -43,8 +44,8 @@ pub struct RunnerDeps {
     /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
     pub extra_skill_dirs: Vec<PathBuf>,
     pub model: Option<String>,
-    /// Reasoning effort for this session (from project settings; None = default).
-    pub effort: Option<String>,
+    /// Immutable effort/capability snapshot for the current turn.
+    pub turn_effort_policy: Arc<TurnEffortPolicy>,
     /// Resolved per-model metadata (context window, max output, capabilities).
     pub meta: crate::llm_router::model_meta::ModelMeta,
     /// Interior-mutable so a LIVE session can pick up a permission-mode change
@@ -100,22 +101,22 @@ pub async fn run_turn(
     prompt: TurnPrompt,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    // /compact is an ACTION, not a prompt template: intercept before command
-    // resolution so it never becomes model input.
     let trimmed = prompt.display.trim();
-    if trimmed == "/compact" || trimmed.starts_with("/compact ") {
-        return run_manual_compact(deps, &prompt).await;
-    }
+    let manual_compact = trimmed == "/compact" || trimmed.starts_with("/compact ");
 
     // Slash-command resolution on the raw user text.
-    let (agent_text, agent) = match deps.commands.resolve(&prompt.display) {
-        Some((expanded, override_agent)) => {
-            let agent = override_agent
-                .and_then(|n| deps.agents.get(&n))
-                .unwrap_or_else(|| deps.agent.clone());
-            (merge_agent_prompt_suffix(expanded, &prompt), agent)
+    let (agent_text, agent) = if manual_compact {
+        (prompt.agent.clone(), deps.agent.clone())
+    } else {
+        match deps.commands.resolve(&prompt.display) {
+            Some((expanded, override_agent)) => {
+                let agent = override_agent
+                    .and_then(|n| deps.agents.get(&n))
+                    .unwrap_or_else(|| deps.agent.clone());
+                (merge_agent_prompt_suffix(expanded, &prompt), agent)
+            }
+            None => (prompt.agent.clone(), deps.agent.clone()),
         }
-        None => (prompt.agent.clone(), deps.agent.clone()),
     };
 
     // 1. Persist + broadcast the user's message (raw display text).
@@ -138,8 +139,14 @@ pub async fn run_turn(
     // in-flight turns and running subagents keep the model they started with.
     // Only `model` is refreshed here; `meta` (context window / output caps /
     // prompt-cache support) stays at the session-start value.
-    let turn_deps = refresh_turn_model(deps).await;
+    let turn_deps = refresh_turn_configuration(deps).await;
     let deps = &turn_deps;
+
+    // /compact is an action, but it still snapshots the same complete turn
+    // configuration as every other turn before making its utility call.
+    if manual_compact {
+        return run_manual_compact(deps).await;
+    }
 
     // 2. Load history + context state and append the user turn.
     let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
@@ -190,17 +197,7 @@ pub async fn run_turn(
 
 /// Manual /compact: persist the user's row, compact the session history, and
 /// record a notice row. No model turn runs.
-async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::Result<()> {
-    emit_row(
-        deps,
-        "user",
-        "text",
-        user_row_payload(prompt),
-        None,
-        None,
-        None,
-    )
-    .await;
+async fn run_manual_compact(deps: &RunnerDeps) -> anyhow::Result<()> {
     let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
     let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
     // Same resume-seed as `run_turn` (spec §12): honor a persisted
@@ -225,7 +222,10 @@ async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::R
         return Ok(());
     }
     let model = deps.model.clone().unwrap_or_default();
-    match cm.compact(&deps.llm, &model, "manual").await {
+    match cm
+        .compact(&deps.llm, &model, "manual", deps.turn_effort_policy.clone())
+        .await
+    {
         Ok(outcome) => {
             emit_compaction(deps, "manual", &outcome, true).await;
             emit_context_usage(deps, &cm, true).await;
@@ -286,8 +286,9 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
 /// those contexts behave exactly as before. When the pinned model fails
 /// routing and a substitute is resolved, a status row announces the
 /// substitution — no silent swap.
-async fn refresh_turn_model(deps: &RunnerDeps) -> RunnerDeps {
-    let pinned = match project_pinned_model(deps).await {
+async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
+    let project_pin = project_pinned_model(deps).await;
+    let pinned = match project_pin.clone() {
         Some(pinned) => pinned,
         None => deps.model.clone(),
     };
@@ -312,6 +313,19 @@ async fn refresh_turn_model(deps: &RunnerDeps) -> RunnerDeps {
     let mut turn = deps.clone();
     if resolved.is_some() {
         turn.model = resolved;
+    }
+    let model = turn.model.as_deref().unwrap_or("");
+    if project_pin.is_some() {
+        turn.meta = crate::llm_router::model_meta::resolve(&turn.store, model).await;
+    }
+    let policy = if let Some(project_id) = turn.project_id.as_deref() {
+        crate::llm_router::model_effort::build_turn_effort_policy(&turn.store, project_id, model)
+            .await
+    } else {
+        crate::llm_router::model_effort::build_utility_effort_policy(&turn.store, model).await
+    };
+    if let Ok(policy) = policy {
+        turn.turn_effort_policy = Arc::new(policy);
     }
     turn
 }
@@ -356,7 +370,9 @@ async fn maybe_generate_title(deps: &RunnerDeps, first_prompt: &str) {
         "messages": [{"role": "user", "content": [{"type": "text", "text": first_prompt}]}],
         "stream": true,
     });
-    let Ok(title) = super::llm::collect_text(&deps.llm, body).await else {
+    let Ok(title) =
+        super::llm::collect_text(&deps.llm, body, deps.turn_effort_policy.clone()).await
+    else {
         return;
     };
     let title: String = title.trim().trim_matches('"').chars().take(80).collect();
@@ -408,8 +424,6 @@ async fn drive(
     } else {
         deps.meta.max_output_tokens as i64
     };
-    let thinking_budget = thinking_budget(deps.effort.as_deref(), &deps.meta, max_tokens);
-
     for provider_turn in 0..MAX_PROVIDER_TURNS {
         if cancel.is_cancelled() {
             return Ok(final_text);
@@ -421,7 +435,10 @@ async fn drive(
             } else {
                 "mid_turn"
             };
-            match cm.compact(&deps.llm, &model, trigger).await {
+            match cm
+                .compact(&deps.llm, &model, trigger, deps.turn_effort_policy.clone())
+                .await
+            {
                 Ok(outcome) => emit_compaction(deps, trigger, &outcome, emit_display).await,
                 Err(e) => {
                     tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
@@ -447,7 +464,7 @@ async fn drive(
         } else {
             json!(system)
         };
-        let mut body = json!({
+        let body = json!({
             "model": model,
             "system": system_value,
             // `cm.messages_for_request()` applies the sanitized projection:
@@ -459,11 +476,7 @@ async fn drive(
             "max_tokens": max_tokens,
             "stream": true,
         });
-        if let Some(budget) = thinking_budget {
-            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
-        }
-
-        let mut rx = match deps.llm.stream(body).await {
+        let mut rx = match deps.llm.stream(body, deps.turn_effort_policy.clone()).await {
             Ok(rx) => rx,
             Err(e) if is_context_overflow(&e.to_string()) => {
                 cm.mark_full();
@@ -653,32 +666,6 @@ async fn drive(
         .await;
     }
     Ok(final_text)
-}
-
-/// Effort → extended-thinking budget (spec §8): low/None → off, medium → 8192,
-/// high → 16384, clamped to half of max_tokens; only for reasoning models.
-///
-/// This key currently only takes effect on OpenAI-format upstreams: the
-/// router (`llm_router::client::anthropic_messages_stream`) strips
-/// `thinking` before it reaches an Anthropic-native upstream (passthrough
-/// `/messages` and kiro), since the runner doesn't yet replay signed
-/// thinking blocks in tool-use continuations and newest Anthropic models
-/// reject `budget_tokens` outright. The OpenAI translator maps this key to
-/// `reasoning_effort` instead, so it's unaffected.
-fn thinking_budget(
-    effort: Option<&str>,
-    meta: &crate::llm_router::model_meta::ModelMeta,
-    max_tokens: i64,
-) -> Option<i64> {
-    if !meta.supports_reasoning {
-        return None;
-    }
-    let budget = match effort {
-        Some("medium") => 8_192,
-        Some("high") | Some("xhigh") | Some("max") => 16_384,
-        _ => return None,
-    };
-    Some(budget.min(max_tokens / 2))
 }
 
 /// Tools delegated children may never use regardless of filters. `task` is
@@ -1256,9 +1243,10 @@ impl ToolAccum {
 pub(crate) mod testutil {
     use super::super::llm::LlmStream;
     use crate::llm_router::client::AnthropicEvent;
+    use crate::llm_router::model_effort::TurnEffortPolicy;
     use async_trait::async_trait;
     use serde_json::Value;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
     /// An `LlmStream` that replays scripted turns: the first `stream()` call
@@ -1280,6 +1268,7 @@ pub(crate) mod testutil {
         async fn stream(
             &self,
             _body: Value,
+            _effort_policy: Arc<TurnEffortPolicy>,
         ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
             let events = self
                 .turns
@@ -1303,6 +1292,7 @@ pub(crate) mod testutil {
     pub struct RecordingLlm {
         inner: ScriptedLlm,
         pub bodies: Mutex<Vec<Value>>,
+        pub policies: Mutex<Vec<Arc<TurnEffortPolicy>>>,
     }
 
     impl RecordingLlm {
@@ -1310,6 +1300,7 @@ pub(crate) mod testutil {
             RecordingLlm {
                 inner: ScriptedLlm::new(turns),
                 bodies: Mutex::new(Vec::new()),
+                policies: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1319,9 +1310,11 @@ pub(crate) mod testutil {
         async fn stream(
             &self,
             body: Value,
+            effort_policy: Arc<TurnEffortPolicy>,
         ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
             self.bodies.lock().unwrap().push(body.clone());
-            self.inner.stream(body).await
+            self.policies.lock().unwrap().push(effort_policy.clone());
+            self.inner.stream(body, effort_policy).await
         }
     }
 
@@ -1409,7 +1402,13 @@ mod tests {
             extra_skill_dirs: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
-            effort: None,
+            turn_effort_policy: Arc::new(TurnEffortPolicy {
+                requested_model: "test/model".into(),
+                project_override: None,
+                route_compatibility: Default::default(),
+                configured: Default::default(),
+                surfaces: Default::default(),
+            }),
             meta: crate::llm_router::model_meta::FALLBACK,
             perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
             project_id: None,
@@ -1552,6 +1551,154 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| s.contains("is not routable"))),
             "a routable pin must never emit a not-routable status row"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_turn_configuration_reloads_model_effort_preferences_defaults_and_meta() {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+        use crate::llm_router::model_effort::{
+            DiscoveredModelMeta, ModelPreferenceKey, ReasoningEffortOption,
+        };
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let turn = || vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn(), turn()]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.model = Some("anthropic/model-a".into());
+        deps.project_id = Some("p".into());
+        let option = |value: &str| ReasoningEffortOption {
+            value: value.into(),
+            label: value.into(),
+            description: None,
+        };
+        connections::add_connection(
+            &deps.store,
+            ConnectionRow {
+                id: "claude".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "claude".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    models_override: Some(vec!["model-a".into(), "model-b".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([
+                        (
+                            "model-a".into(),
+                            DiscoveredModelMeta {
+                                effort_options: Some(vec![option("low"), option("high")]),
+                                default_effort_advertised: true,
+                                default_effort: Some("low".into()),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "model-b".into(),
+                            DiscoveredModelMeta {
+                                effort_options: Some(vec![option("ultra")]),
+                                ..Default::default()
+                            },
+                        ),
+                    ])),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+        deps.store
+            .update_project_runtime("p", Some("anthropic/model-a".into()), Some("high".into()))
+            .await
+            .unwrap();
+        let key_a = ModelPreferenceKey {
+            family: "anthropic".into(),
+            model: "model-a".into(),
+        };
+        deps.store
+            .set_model_effort_preference(&key_a, "low")
+            .await
+            .unwrap();
+        deps.store
+            .set_setting_raw(
+                "models.meta.anthropic/model-a",
+                r#"{"context_window":111111}"#,
+            )
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("one", "one"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        deps.store
+            .update_project_runtime("p", Some("anthropic/model-b".into()), None)
+            .await
+            .unwrap();
+        deps.store
+            .clear_model_effort_preference(&key_a)
+            .await
+            .unwrap();
+        let key_b = ModelPreferenceKey {
+            family: "anthropic".into(),
+            model: "model-b".into(),
+        };
+        deps.store
+            .set_model_effort_preference(&key_b, "ultra")
+            .await
+            .unwrap();
+        deps.store
+            .set_setting_raw(
+                "models.meta.anthropic/model-b",
+                r#"{"context_window":222222}"#,
+            )
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("two", "two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        {
+            let bodies = llm.bodies.lock().unwrap();
+            assert_eq!(bodies[0]["model"], "anthropic/model-a");
+            assert_eq!(bodies[1]["model"], "anthropic/model-b");
+        }
+        {
+            let policies = llm.policies.lock().unwrap();
+            assert_eq!(policies[0].requested_model, "anthropic/model-a");
+            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+            assert_eq!(
+                policies[0].configured.get(&key_a).map(String::as_str),
+                Some("low")
+            );
+            assert_eq!(policies[1].requested_model, "anthropic/model-b");
+            assert_eq!(policies[1].project_override, None);
+            assert!(!policies[1].configured.contains_key(&key_a));
+            assert_eq!(
+                policies[1].configured.get(&key_b).map(String::as_str),
+                Some("ultra")
+            );
+            assert!(policies[1].surfaces.values().any(|surface| {
+                surface.supported.len() == 1 && surface.supported[0].value == "ultra"
+            }));
+        }
+        assert_eq!(
+            refresh_turn_configuration(&deps).await.meta.context_window,
+            222_222
         );
     }
 
@@ -1802,11 +1949,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_compact_command_compacts_without_a_model_turn() {
+    async fn manual_compact_refreshes_turn_configuration_before_utility_call() {
         let dir = tempfile::tempdir().unwrap();
         let summarize = vec![text_delta("manual summary"), message_stop()];
-        let llm = Arc::new(ScriptedLlm::new(vec![summarize]));
-        let deps = deps_at(dir.path(), llm).await;
+        let llm = Arc::new(RecordingLlm::new(vec![summarize]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.project_id = Some("p".into());
+        add_anthropic_conn(&deps.store, &["model-a"]).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+        deps.store
+            .update_project_runtime("p", Some("anthropic/model-a".into()), Some("high".into()))
+            .await
+            .unwrap();
         {
             let mut ledger = Ledger::load(deps.store.clone(), "s1").await.unwrap();
             ledger
@@ -1827,6 +1981,12 @@ mod tests {
         .unwrap();
         let ck = deps.store.latest_context_checkpoint("s1").await.unwrap();
         assert!(ck.is_some(), "manual /compact wrote a checkpoint");
+        {
+            let policies = llm.policies.lock().unwrap();
+            assert_eq!(policies.len(), 1, "manual compact makes one utility call");
+            assert_eq!(policies[0].requested_model, "anthropic/model-a");
+            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+        }
         // A notice row records it in the transcript.
         let msgs = deps.store.list_messages("s1").await.unwrap();
         assert!(msgs.iter().any(|m| m.block_type == "notice"));
@@ -1848,7 +2008,6 @@ mod tests {
             reasoning_efforts: vec![],
             default_reasoning_effort: None,
         };
-        deps.effort = Some("high".into());
         run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
             .await
             .unwrap();
@@ -1864,9 +2023,9 @@ mod tests {
             last_blocks.last().unwrap()["cache_control"]["type"],
             "ephemeral"
         );
-        // Effort high → extended thinking budget.
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["thinking"]["budget_tokens"], 16_384);
+        // Effort is now applied by the router against the immutable turn
+        // policy, never reduced to a synthetic thinking budget in the runner.
+        assert!(body.get("thinking").is_none());
     }
 
     #[tokio::test]
@@ -1886,8 +2045,8 @@ mod tests {
             message_delta("end_turn"),
             message_stop(),
         ];
-        let llm = Arc::new(ScriptedLlm::new(vec![turn1, turn2]));
-        let deps = deps_at(dir.path(), llm).await;
+        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
         let mut rx = deps.events.subscribe();
 
         run_turn(
@@ -1927,6 +2086,12 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.block_type == "text" && m.payload["text"] == "Done."));
+
+        {
+            let policies = llm.policies.lock().unwrap();
+            assert_eq!(policies.len(), 2);
+            assert!(Arc::ptr_eq(&policies[0], &policies[1]));
+        }
 
         // The provider-turn ledger is a valid alternating history:
         // user, assistant(text+tool_use), user(tool_result), assistant(text).
