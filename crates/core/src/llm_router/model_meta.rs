@@ -38,8 +38,9 @@ impl ModelMeta {
 
 static VENDORED: &str = include_str!("model_meta_snapshot.json");
 
-fn vendored() -> HashMap<String, ModelMeta> {
-    serde_json::from_str(VENDORED).unwrap_or_default()
+fn vendored() -> &'static HashMap<String, ModelMeta> {
+    static CACHE: std::sync::OnceLock<HashMap<String, ModelMeta>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| serde_json::from_str(VENDORED).unwrap_or_default())
 }
 
 /// Lowercase, strip a `provider/` prefix, a `-latest` suffix, and trailing
@@ -74,6 +75,9 @@ fn normalize(id: &str) -> String {
     s
 }
 
+/// Ties among normalized-key matches resolve to the lexicographically
+/// smallest key, so the result is deterministic regardless of `HashMap`
+/// iteration order.
 fn lookup(map: &HashMap<String, ModelMeta>, id: &str) -> Option<ModelMeta> {
     if let Some(m) = map.get(id) {
         return Some(*m);
@@ -84,7 +88,8 @@ fn lookup(map: &HashMap<String, ModelMeta>, id: &str) -> Option<ModelMeta> {
     }
     // Normalized key match on both sides (snapshot ids may carry dates too).
     map.iter()
-        .find(|(k, _)| normalize(k) == norm)
+        .filter(|(k, _)| normalize(k) == norm)
+        .min_by(|a, b| a.0.cmp(b.0))
         .map(|(_, m)| *m)
 }
 
@@ -192,13 +197,15 @@ pub async fn resolve(store: &Store, requested: &str) -> ModelMeta {
             candidates.push(target.upstream_model);
         }
     }
-    let maps: Vec<HashMap<String, ModelMeta>> = std::iter::once(refreshed())
-        .flatten()
-        .chain([vendored()])
-        .collect();
+    let refreshed_map = refreshed();
     let base = candidates
         .iter()
-        .find_map(|c| maps.iter().find_map(|m| lookup(m, c)))
+        .find_map(|c| {
+            refreshed_map
+                .as_ref()
+                .and_then(|m| lookup(m, c))
+                .or_else(|| lookup(vendored(), c))
+        })
         .unwrap_or(FALLBACK);
     // Settings override (raw key, JSON object value) — checked per candidate.
     for c in &candidates {
@@ -227,10 +234,32 @@ mod tests {
     fn vendored_snapshot_parses_and_lookup_hits_normalized_ids() {
         let map = vendored();
         assert!(!map.is_empty());
-        let meta = lookup(&map, "anthropic/claude-sonnet-4-5-20250929")
+        let meta = lookup(map, "anthropic/claude-sonnet-4-5-20250929")
             .expect("normalized lookup should hit claude-sonnet-4-5");
         assert!(meta.context_window >= 200_000);
         assert!(meta.supports_prompt_cache);
+    }
+
+    #[test]
+    fn lookup_fallback_tie_break_is_deterministic() {
+        let older = ModelMeta {
+            context_window: 100,
+            ..FALLBACK
+        };
+        let newer = ModelMeta {
+            context_window: 200,
+            ..FALLBACK
+        };
+        let mut map = HashMap::new();
+        map.insert("m-20240101".to_string(), older);
+        map.insert("m-20250101".to_string(), newer);
+        for _ in 0..20 {
+            let meta = lookup(&map, "m").expect("normalized fallback match");
+            assert_eq!(
+                meta.context_window, 100,
+                "must always resolve to the lexicographically smallest key (m-20240101)"
+            );
+        }
     }
 
     #[test]
