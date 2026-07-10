@@ -26,6 +26,7 @@ import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
+import { HISTORY_IDLE, historyEntries, shouldNavigateHistory, stepHistory, type HistoryState } from "@/components/composer/inputHistory";
 
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
@@ -88,6 +89,15 @@ export function SessionView() {
     prevSessionRunning.current = sessionRunning;
   }, [sessionRunning, session?.sessionPk, fetchDiff]);
 
+  // ArrowUp/Down history over this session's sent messages. A ref (not state)
+  // holds the navigation cursor — it never drives rendering.
+  const historyRef = useRef<HistoryState>(HISTORY_IDLE);
+  const history = useMemo(() => historyEntries(rows), [rows]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off the focused session
+  useEffect(() => {
+    historyRef.current = HISTORY_IDLE;
+  }, [focusedSessionPk]);
+
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
     if (!trimmed.startsWith("/") || trimmed.includes(" ")) return null;
@@ -139,6 +149,7 @@ export function SessionView() {
     // Clear optimistically; a rejected send puts the text back (unless the
     // user already started typing something new — restoreDraft is a no-op then).
     useNav.getState().clearDraft(key);
+    historyRef.current = HISTORY_IDLE;
     composerFiles.clear();
     setContextRefs([]);
     void send(key, t, {
@@ -240,11 +251,27 @@ export function SessionView() {
           >
             <Textarea
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => {
+                // Typing exits history mode: the edited text becomes the live draft.
+                historyRef.current = HISTORY_IDLE;
+                setDraft(e.target.value);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   submit();
+                  return;
+                }
+                if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+                  const dir = e.key === "ArrowUp" ? ("up" as const) : ("down" as const);
+                  const popupOpen = slashMatches.length > 0 || contextHits.length > 0;
+                  const el = e.currentTarget;
+                  if (!shouldNavigateHistory(dir, draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, popupOpen)) return;
+                  const step = stepHistory(dir, history, historyRef.current, draft);
+                  if (!step) return;
+                  e.preventDefault();
+                  historyRef.current = step.state;
+                  setDraft(step.text);
                 }
               }}
               onPaste={composerFiles.onPaste}
