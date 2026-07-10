@@ -138,6 +138,14 @@ const SPAWN_TIMEOUT_MS: u64 = 30_000;
 /// Attach to a live daemon, or spawn one (`current_exe --engine-daemon`) and
 /// poll daemon.json until Running(port). A live pid whose control API is
 /// unreachable/401 is treated as outdated: SIGTERM, wait dead (5s), spawn fresh.
+///
+/// The returned `EngineClient` is captured ONCE by the caller (typically into
+/// managed Tauri state) and never refreshed mid-session, so recovering across
+/// a later daemon restart (crash, canary self-update) relies on the token and
+/// port staying stable — `control_token::write_token` now reuses an existing
+/// valid token across same-port restarts specifically so this held client
+/// keeps working without a manual Cockpit restart. A `control_port` change,
+/// however, still requires restarting Cockpit.
 pub async fn connect_or_spawn() -> anyhow::Result<EngineClient> {
     let dir = ryuzi_core::paths::db_path()
         .parent()
