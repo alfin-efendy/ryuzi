@@ -467,12 +467,13 @@ pub enum CoreEvent {
     /// Per-session accumulated cost: total USD and a per-model token+dollar
     /// breakdown. Emitted alongside `ContextUsage`.
     ///
-    /// Unlike its sibling context-telemetry variants above, this variant's
-    /// own fields are camelCased (`sessionPk`, `totalUsd`) via a per-variant
-    /// `rename_all`: the enum-level `rename_all = "camelCase"` on
-    /// `CoreEvent` only renames the `kind` tag value, not each variant's
-    /// field names (see `ContextUsage`'s still-snake_case `session_pk`).
-    #[serde(rename_all = "camelCase")]
+    /// Like its sibling context-telemetry variants above, this variant's own
+    /// fields stay snake_case (`session_pk`, `total_usd`): the enum-level
+    /// `rename_all = "camelCase"` on `CoreEvent` only renames the `kind` tag
+    /// value, not each variant's field names (see `ContextUsage`'s
+    /// `session_pk`). The nested `ModelCost` struct carries its own
+    /// `rename_all = "camelCase"`, so its fields (e.g. `cache_read` →
+    /// `cacheRead`) are camelCased independently.
     SessionCost {
         session_pk: String,
         total_usd: f64,
@@ -576,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn session_cost_serializes_with_kind_tag_and_camel_case() {
+    fn session_cost_serializes_snake_variant_camel_nested() {
         let e = CoreEvent::SessionCost {
             session_pk: "s1".into(),
             total_usd: 0.1234,
@@ -591,8 +592,8 @@ mod tests {
         };
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["kind"], "sessionCost");
-        assert_eq!(v["sessionPk"], "s1");
-        assert_eq!(v["totalUsd"], 0.1234);
+        assert_eq!(v["session_pk"], "s1");
+        assert_eq!(v["total_usd"], 0.1234);
         assert_eq!(v["models"][0]["model"], "claude-sonnet-4");
         assert_eq!(v["models"][0]["cacheRead"], 20);
         assert_eq!(v["models"][0]["cacheCreation"], 5);
