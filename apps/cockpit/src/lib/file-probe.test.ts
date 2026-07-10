@@ -25,7 +25,13 @@ beforeEach(() => {
 afterEach(() => clearProbeCache());
 
 test("true when the parent listing contains the file entry", async () => {
-  listDirResult = { status: "ok", data: [{ name: "app.ts", dir: false }, { name: "sub", dir: true }] };
+  listDirResult = {
+    status: "ok",
+    data: [
+      { name: "app.ts", dir: false },
+      { name: "sub", dir: true },
+    ],
+  };
   expect(await workspaceFileExists("s1", "src/app.ts")).toBe(true);
   expect(listDirCalls).toEqual([["s1", "src"]]);
 });
@@ -42,7 +48,13 @@ test("bare basename probes the workdir root", async () => {
 });
 
 test("cache: sibling files share one listing; concurrent callers dedup in flight", async () => {
-  listDirResult = { status: "ok", data: [{ name: "a.ts", dir: false }, { name: "b.ts", dir: false }] };
+  listDirResult = {
+    status: "ok",
+    data: [
+      { name: "a.ts", dir: false },
+      { name: "b.ts", dir: false },
+    ],
+  };
   const [a, b] = await Promise.all([workspaceFileExists("s1", "src/a.ts"), workspaceFileExists("s1", "src/b.ts")]);
   expect(a).toBe(true);
   expect(b).toBe(true);

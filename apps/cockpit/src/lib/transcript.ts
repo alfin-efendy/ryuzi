@@ -68,9 +68,7 @@ export const STREAMING_TAIL = 3;
 
 /** One piece of a partitioned activity cluster: a folded run of steps, or a
  *  standalone item that must stay visible. */
-export type ActivityFragment =
-  | { kind: "fold"; items: ActivityItem[]; runLength: number }
-  | { kind: "item"; item: ActivityItem };
+export type ActivityFragment = { kind: "fold"; items: ActivityItem[]; runLength: number } | { kind: "item"; item: ActivityItem };
 
 /** True while the tool is still running — running items never fold. */
 function isInProgress(item: ActivityItem): boolean {
