@@ -569,3 +569,32 @@ test("a null detail (pluginDetail failed, begin still routed to done) shows neut
   expect(setPluginEnabled).not.toHaveBeenCalled();
   await waitFor(() => expect(listPlugins).toHaveBeenCalled());
 });
+
+test("closing during an oauth flow cancels the pending install with the state token", async () => {
+  beginData = beginResult({ authKind: "oauth", oauthAvailable: true, oauthBegin });
+  await renderWizard();
+
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith("notion", "state-123"));
+  expect(onClose).toHaveBeenCalled();
+});
+
+test("closing an oauth wizard while begin is still in flight cancels with a null token", async () => {
+  detailData = detailFixture({ auth: oauthAuthInfo });
+  beginPluginInstall.mockImplementationOnce(() => new Promise<never>(() => {}));
+  await renderWizard();
+
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith("notion", null));
+  expect(onClose).toHaveBeenCalled();
+});
+
+test("closing a non-oauth wizard never calls cancelPluginInstall", async () => {
+  detailData = detailFixture({ settings: [field("plugin.notion.user", "User")] });
+  beginData = beginResult({ authKind: "none" });
+  await renderWizard();
+
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(cancelPluginInstall).not.toHaveBeenCalled();
+  expect(onClose).toHaveBeenCalled();
+});

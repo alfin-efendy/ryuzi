@@ -45,7 +45,16 @@ export function InstallWizardModal({
 
   const Icon = iconFor(pluginIcon ?? null);
 
+  // Close/Cancel from any step. For oauth installs also tear down the
+  // pending flow (loopback listener + flow-map entry). Uses the manifest's
+  // auth kind while begin is still in flight — the backend flow may already
+  // have started. cancel_plugin_install is a safe no-op when nothing is
+  // pending (including after a completed flow).
   const close = () => {
+    const oauthFlow = begin ? begin.authKind === "oauth" : detail?.auth?.kind === "oauth";
+    if (oauthFlow) {
+      void commands.cancelPluginInstall(pluginId, begin?.oauthBegin?.stateToken ?? null);
+    }
     onClose();
   };
 
