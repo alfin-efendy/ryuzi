@@ -220,7 +220,7 @@ async fn share_session(state: &ApiState, session_pk: &str) -> Result<String, Api
         .store()
         .get_session(session_pk)
         .await?
-        .ok_or_else(|| ApiError::not_found(format!("unknown session: {session_pk}")))?;
+        .ok_or_else(|| ApiError::not_found(format!("unknown session {session_pk}")))?;
     let messages = cp.list_messages(session_pk).await?;
     let title = session.title.unwrap_or_else(|| "ryuzi session".to_string());
     Ok(build_html(&title, &messages))

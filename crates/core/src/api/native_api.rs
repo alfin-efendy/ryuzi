@@ -56,7 +56,7 @@ async fn project_workdir(cp: &ControlPlane, project_id: &str) -> Result<String, 
         .into_iter()
         .find(|p| p.project_id == project_id)
         .map(|p| p.workdir)
-        .ok_or_else(|| ApiError::not_found(format!("unknown project: {project_id}")))
+        .ok_or_else(|| ApiError::not_found(format!("unknown project {project_id}")))
 }
 
 /// The agents available for a project (built-ins plus discovered custom agents).
