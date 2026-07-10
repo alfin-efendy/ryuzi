@@ -96,10 +96,16 @@ fn binary_on_path(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| {
             std::env::split_paths(&paths).any(|dir| {
-                let p = dir.join(cmd);
-                p.is_file()
-                    || p.with_extension("exe").is_file()
-                    || p.with_extension("cmd").is_file()
+                if dir.join(cmd).is_file() {
+                    return true;
+                }
+                // Windows executable shims: APPEND (not replace) the
+                // extension, so a dotted bare name like `python3.11` becomes
+                // `python3.11.exe`, not the wrong `python3.exe` that
+                // `Path::with_extension` would produce.
+                ["exe", "cmd"]
+                    .iter()
+                    .any(|ext| dir.join(format!("{cmd}.{ext}")).is_file())
             })
         })
         .unwrap_or(false)
@@ -122,17 +128,95 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn doctor_flags_missing_stdio_binary_and_unconfigured() {
-        // Build a control plane with the embedded catalog (which has stdio
-        // uvx/npx entries) and assert doctor reports at least the unconfigured
-        // enabled-but-no-credential class without leaking secrets.
+    async fn doctor_is_empty_on_a_fresh_store_and_findings_are_secret_free() {
+        // A fresh control plane has no enabled connector plugins, no OAuth
+        // tokens, and no attach rows, so doctor reports nothing. This is the
+        // baseline; the seeded cases below prove the aggregation actually
+        // fires. Any finding that *is* produced must still be secret-free.
         let cp = test_cp_with_catalog().await;
         let findings = plugin_doctor(&cp).await.unwrap();
-        // Every finding is secret-free and carries a suggested action.
+        assert!(
+            findings.is_empty(),
+            "a fresh store should surface no findings, got: {findings:?}"
+        );
         for f in &findings {
             assert!(!f.message.is_empty());
             assert!(!f.suggested_action.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_a_seeded_attach_failure_without_leaking_raw_body() {
+        // Seed a failed attach row (with an already-sanitized reason) for a
+        // real catalog plugin id, then assert doctor surfaces an
+        // `attach-failed` finding for it — this forces at least one real
+        // finding so the secret-free/non-empty assertions actually run.
+        let cp = test_cp_with_catalog().await;
+        assert!(
+            cp.plugins()
+                .list()
+                .iter()
+                .any(|p| p.manifest.id == "github"),
+            "test relies on the embedded `github` catalog plugin"
+        );
+        cp.store()
+            .record_plugin_attach(&crate::store::PluginAttachStatus {
+                plugin_id: "github".to_string(),
+                last_attach_at: 1,
+                outcome: "failed".to_string(),
+                reason: Some("github: authentication failed".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let findings = plugin_doctor(&cp).await.unwrap();
+        let finding = findings
+            .iter()
+            .find(|f| f.plugin_id == "github" && f.kind == "attach-failed")
+            .expect("doctor should report an attach-failed finding for the seeded row");
+        assert_eq!(finding.severity, "warn");
+        assert_eq!(finding.message, "github: authentication failed");
+        assert!(!finding.suggested_action.is_empty());
+        // The recorded reason is already sanitized upstream — doctor must
+        // never surface anything token-like from an attach reason.
+        for f in &findings {
+            assert!(!f.message.is_empty());
+            assert!(!f.suggested_action.is_empty());
+            assert!(!f.message.contains("refresh_token"));
+            assert!(!f.message.contains("client_secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_a_reconnect_required_token() {
+        // Seed an OAuth token flagged reconnect_required for a real catalog
+        // plugin id and assert doctor surfaces the reconnect-required branch.
+        // The token is encrypted at rest, so point the cipher at a hermetic
+        // test key file (never the real keychain) before writing it.
+        crate::llm_router::secrets::use_test_key_file();
+        let cp = test_cp_with_catalog().await;
+        cp.store()
+            .upsert_plugin_oauth_token(&crate::plugins::oauth::PluginOauthToken {
+                plugin_id: "linear".to_string(),
+                access_token: "unused-in-this-test".to_string(),
+                refresh_token: None,
+                token_type: "Bearer".to_string(),
+                expires_at: None,
+                scopes: vec![],
+                reconnect_required: true,
+            })
+            .await
+            .unwrap();
+
+        let findings = plugin_doctor(&cp).await.unwrap();
+        let finding = findings
+            .iter()
+            .find(|f| f.plugin_id == "linear" && f.kind == "reconnect-required")
+            .expect("doctor should report a reconnect-required finding for the seeded token");
+        assert_eq!(finding.severity, "warn");
+        assert!(!finding.message.is_empty());
+        assert!(!finding.suggested_action.is_empty());
+        assert!(!finding.message.contains("unused-in-this-test"));
     }
 
     #[test]

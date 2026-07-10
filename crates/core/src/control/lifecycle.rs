@@ -676,7 +676,8 @@ impl ControlPlane {
                 Ok(false) => continue,
                 Err(e) => {
                     tracing::warn!(plugin = %id, "plugin connector failed: {e}");
-                    self.record_attach(id, "failed", Some(&e.to_string())).await;
+                    let reason = safe_attach_reason(id, AttachStage::Enable, &e);
+                    self.record_attach(id, "failed", Some(&reason)).await;
                     continue;
                 }
             }
@@ -687,7 +688,8 @@ impl ControlPlane {
             };
             if let Err(e) = connector.ensure_auth(&ctx).await {
                 tracing::warn!(plugin = %id, "plugin connector not ready: {e}");
-                self.record_attach(id, "failed", Some(&e.to_string())).await;
+                let reason = safe_attach_reason(id, AttachStage::Auth, &e);
+                self.record_attach(id, "failed", Some(&reason)).await;
                 continue;
             }
             match connector.mcp_servers(&ctx).await {
@@ -702,7 +704,8 @@ impl ControlPlane {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %id, "plugin connector failed: {e}");
-                    self.record_attach(id, "failed", Some(&e.to_string())).await;
+                    let reason = safe_attach_reason(id, AttachStage::McpServers, &e);
+                    self.record_attach(id, "failed", Some(&reason)).await;
                 }
             }
         }
@@ -713,6 +716,10 @@ impl ControlPlane {
     /// surfaces its own failure — a store write failing here must not turn
     /// into a session-start error, mirroring the warn-and-continue discipline
     /// of the loop that calls it.
+    ///
+    /// `reason` must already be secret-free (see [`safe_attach_reason`]): the
+    /// persisted value is doctor/UI-visible, so raw connector error text must
+    /// never reach it.
     async fn record_attach(&self, id: &str, outcome: &str, reason: Option<&str>) {
         let _ = self
             .store
@@ -907,5 +914,87 @@ impl ControlPlane {
         )
         .await;
         Ok(())
+    }
+}
+
+/// The stage of `attach_plugin_mcp_servers` at which a connector failed —
+/// used only to pick a generic fallback message for [`safe_attach_reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachStage {
+    /// `PluginHost::is_enabled` itself errored (internal, secret-free).
+    Enable,
+    /// `Connector::ensure_auth` errored — the one stage whose error text can
+    /// carry a raw token-endpoint response body (HTTP-OAuth refresh path).
+    Auth,
+    /// `Connector::mcp_servers` errored while resolving specs.
+    McpServers,
+}
+
+/// Map a connector-attach failure to a secret-free reason safe to PERSIST
+/// into `plugin_attach_status` (which `plugin_doctor` reads back and later
+/// surfaces in the UI). The full error still reaches `tracing::warn!` at the
+/// call site — only the persisted reason is sanitized here.
+///
+/// Only the friendly `"configure {id}: ..."` messages that `ensure_auth`
+/// (and the HTTP-OAuth `auth_required` path) raise for a missing/expired
+/// credential are known to be secret-free: they name a setting key or a help
+/// URL, never a value. Those pass through verbatim. Every other error — in
+/// particular `refresh_http_oauth_token`'s `"{id} OAuth token refresh failed
+/// with HTTP {status}: {detail}"`, where `detail` is the raw token-endpoint
+/// response body and the refresh POST carried the real
+/// `refresh_token`/`client_secret` — is collapsed to a generic per-stage
+/// message so no connector error body is ever written to the DB.
+fn safe_attach_reason(id: &str, stage: AttachStage, err: &anyhow::Error) -> String {
+    let msg = err.to_string();
+    if msg.starts_with(&format!("configure {id}:")) {
+        return msg;
+    }
+    match stage {
+        AttachStage::Enable => format!("{id}: could not determine whether the plugin is enabled"),
+        AttachStage::Auth => format!("{id}: authentication failed"),
+        AttachStage::McpServers => format!("{id}: could not resolve MCP servers"),
+    }
+}
+
+#[cfg(test)]
+mod safe_attach_reason_tests {
+    use super::{safe_attach_reason, AttachStage};
+
+    #[test]
+    fn friendly_configure_message_passes_through_verbatim() {
+        // The secret-free `ensure_auth` missing-credential message (names a
+        // setting key / help URL, never a value) is preserved as-is.
+        let err = anyhow::anyhow!("configure acme: see https://acme.test/help");
+        assert_eq!(
+            safe_attach_reason("acme", AttachStage::Auth, &err),
+            "configure acme: see https://acme.test/help"
+        );
+    }
+
+    #[test]
+    fn oauth_refresh_body_never_reaches_the_persisted_reason() {
+        // Simulate the raw HTTP-OAuth token-refresh error whose `detail` is
+        // an untruncated response body echoing the refresh POST's form
+        // fields — the exact leak the sanitizer must stop.
+        let err = anyhow::anyhow!(
+            "acme OAuth token refresh failed with HTTP 400: \
+             {{\"echo\":\"refresh_token=leaked-secret-token&client_secret=leaked-client-secret\"}}"
+        );
+        let reason = safe_attach_reason("acme", AttachStage::Auth, &err);
+        assert_eq!(reason, "acme: authentication failed");
+        assert!(!reason.contains("leaked-secret-token"));
+        assert!(!reason.contains("leaked-client-secret"));
+        assert!(!reason.contains("refresh_token"));
+    }
+
+    #[test]
+    fn enable_and_mcp_stage_errors_are_generic_and_drop_raw_text() {
+        let err = anyhow::anyhow!("some internal detail with a token=abc123 in it");
+        let enable = safe_attach_reason("acme", AttachStage::Enable, &err);
+        let mcp = safe_attach_reason("acme", AttachStage::McpServers, &err);
+        assert!(!enable.contains("abc123"));
+        assert!(!mcp.contains("abc123"));
+        assert!(enable.starts_with("acme:"));
+        assert!(mcp.starts_with("acme:"));
     }
 }
