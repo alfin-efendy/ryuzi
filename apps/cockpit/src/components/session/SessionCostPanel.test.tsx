@@ -42,3 +42,25 @@ test("no cost yet renders a dash but still shows the ring", () => {
   fireEvent.click(screen.getByRole("button", { name: /context/i }));
   expect(screen.getByText("—")).toBeTruthy();
 });
+
+test("multiple models render their own rows plus a separate Total row", () => {
+  useStore.setState({
+    sessionCost: {
+      s1: {
+        totalUsd: 0.18,
+        models: [
+          { model: "claude-sonnet-4", input: 100, output: 40, cacheRead: 20, cacheCreation: 5, usd: 0.12 },
+          { model: "gpt-4o-mini", input: 200, output: 10, cacheRead: 0, cacheCreation: 0, usd: 0.06 },
+        ],
+      },
+    },
+  });
+  render(<SessionCostPanel sessionPk="s1" />);
+  fireEvent.click(screen.getByRole("button", { name: /context/i }));
+  expect(screen.getByText("claude-sonnet-4")).toBeTruthy();
+  expect(screen.getByText("gpt-4o-mini")).toBeTruthy();
+  expect(screen.getByText("$0.12")).toBeTruthy();
+  expect(screen.getByText("$0.06")).toBeTruthy();
+  expect(screen.getByText("Total")).toBeTruthy();
+  expect(screen.getByText("$0.18")).toBeTruthy();
+});
