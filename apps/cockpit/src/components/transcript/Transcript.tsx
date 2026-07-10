@@ -3,7 +3,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { AudioLines, ChevronDown, Paperclip } from "lucide-react";
 import { buildTranscript, closeDanglingFence, type Row, type RowAttachment } from "@/lib/transcript";
 import { mediaKindForContentType } from "@/lib/attachments";
-import { distanceFromBottom, isStuck, showScrollFab } from "@/lib/scroll";
+import { distanceFromBottom, isStuck, pinningInterrupted, showScrollFab } from "@/lib/scroll";
 import { StatusDot } from "@/components/common/bits";
 import { Markdown } from "./Markdown";
 import { ThoughtBlock } from "./ThoughtBlock";
@@ -145,6 +145,10 @@ export function Transcript({
   // True while a FAB-initiated smooth scroll is in flight, so its own scroll
   // events don't read as "the user scrolled away" and cancel the stick.
   const pinningRef = useRef(false);
+  // Distance-from-bottom observed at the previous scroll event, used to
+  // detect the user interrupting a pinned flight (distance growing instead
+  // of shrinking) so control can be handed back to them mid-scroll.
+  const lastDistRef = useRef(0);
   const [fabVisible, setFabVisible] = useState(false);
   const [lightbox, setLightbox] = useState<string | null>(null);
 
@@ -155,10 +159,16 @@ export function Transcript({
     if (!el) return;
     const d = distanceFromBottom(el.scrollHeight, el.scrollTop, el.clientHeight);
     if (pinningRef.current) {
-      if (isStuck(d)) pinningRef.current = false;
+      if (isStuck(d)) {
+        pinningRef.current = false;
+      } else if (pinningInterrupted(lastDistRef.current, d)) {
+        pinningRef.current = false;
+        stickRef.current = false;
+      }
     } else {
       stickRef.current = isStuck(d);
     }
+    lastDistRef.current = d;
     setFabVisible(!pinningRef.current && showScrollFab(d));
   };
 
@@ -167,6 +177,7 @@ export function Transcript({
     if (!el) return;
     stickRef.current = true;
     pinningRef.current = true;
+    lastDistRef.current = distanceFromBottom(el.scrollHeight, el.scrollTop, el.clientHeight);
     setFabVisible(false);
     const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     el.scrollTo({ top: el.scrollHeight, behavior: reduced ? "auto" : "smooth" });
@@ -190,6 +201,7 @@ export function Transcript({
   // biome-ignore lint/correctness/useExhaustiveDependencies: re-runs on session identity change, not on the refs it touches
   useEffect(() => {
     stickRef.current = true;
+    lastDistRef.current = 0;
     setFabVisible(false);
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;

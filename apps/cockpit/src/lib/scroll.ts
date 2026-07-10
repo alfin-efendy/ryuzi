@@ -14,3 +14,10 @@ export function isStuck(distance: number): boolean {
 export function showScrollFab(distance: number): boolean {
   return distance > FAB_THRESHOLD_PX;
 }
+
+// A pinned (FAB-initiated) smooth scroll only ever shrinks the distance to
+// bottom; a growth beyond rounding tolerance means the user scrolled up
+// mid-flight and control returns to them.
+export function pinningInterrupted(prevDistance: number, distance: number): boolean {
+  return distance > prevDistance + 1;
+}
