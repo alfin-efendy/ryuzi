@@ -187,19 +187,9 @@ async fn maybe_generate_title(deps: &RunnerDeps, first_prompt: &str) {
         "messages": [{"role": "user", "content": [{"type": "text", "text": first_prompt}]}],
         "stream": true,
     });
-    let Ok(mut rx) = deps.llm.stream(body).await else {
+    let Ok(title) = super::llm::collect_text(&deps.llm, body).await else {
         return;
     };
-    let mut title = String::new();
-    while let Some(item) = rx.recv().await {
-        if let Ok(ev) = item {
-            if let Some(MessageStreamEvent::TextDelta { text, .. }) =
-                MessageStreamEvent::from_event(&ev)
-            {
-                title.push_str(&text);
-            }
-        }
-    }
     let title: String = title.trim().trim_matches('"').chars().take(80).collect();
     if !title.is_empty() {
         let _ = deps.store.set_session_title(&deps.session_pk, &title).await;
@@ -244,15 +234,7 @@ async fn drive(
         if cancel.is_cancelled() {
             return Ok(final_text);
         }
-        // Compact the in-memory history if it has grown past the token budget.
-        super::compaction::maybe_compact(
-            &deps.llm,
-            &model,
-            ledger,
-            super::compaction::MAX_CONTEXT_TOKENS,
-            super::compaction::KEEP_RECENT_USER_TURNS,
-        )
-        .await;
+        // Context/compaction checks land here in the ContextManager integration.
         let body = json!({
             "model": model,
             "system": system,

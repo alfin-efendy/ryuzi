@@ -3,7 +3,7 @@
 //! compaction checkpoints; the runner talks only to this type.
 
 pub mod accounting;
-pub mod compaction; // added in Task 9; create as an empty file for now
+pub mod compaction;
 pub mod truncation;
 
 pub use accounting::estimate_tokens;

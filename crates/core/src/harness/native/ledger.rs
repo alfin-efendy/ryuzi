@@ -166,6 +166,15 @@ impl Ledger {
             .collect();
         Ok(self.window_number)
     }
+
+    /// Replace the in-memory projection without touching persistence — used
+    /// by compaction's pre-trim, which is immediately followed by
+    /// `replace_all` (the durable step). Seqs are preserved positionally.
+    pub(super) fn overwrite_in_memory(&mut self, msgs: Vec<Value>) {
+        for (turn, msg) in self.turns.iter_mut().zip(msgs) {
+            turn.msg = msg;
+        }
+    }
 }
 
 #[cfg(test)]

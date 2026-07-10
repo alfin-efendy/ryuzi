@@ -12,7 +12,6 @@
 
 pub mod agents;
 pub mod commands;
-pub mod compaction;
 pub mod context;
 pub mod context_manager;
 pub mod format;
