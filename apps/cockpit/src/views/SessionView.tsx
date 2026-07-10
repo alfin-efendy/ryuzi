@@ -24,24 +24,15 @@ import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
 import { OpenInMenu } from "@/components/session/OpenInMenu";
+import { SessionCostPanel } from "@/components/session/SessionCostPanel";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
 import { HISTORY_IDLE, historyEntries, shouldNavigateHistory, stepHistory, type HistoryState } from "@/components/composer/inputHistory";
 
 export function SessionView() {
-  const {
-    sessions,
-    transcripts,
-    focusedSessionPk,
-    send,
-    stop,
-    pendingApprovals,
-    projects,
-    setProjectModel,
-    setProjectPermMode,
-    contextUsage,
-  } = useStore();
+  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
+    useStore();
   const nav = useNav();
   // Draft text lives in the persisted useNav drafts map keyed by session, so
   // switching sessions/views (SessionView renders un-keyed in App.tsx) swaps
@@ -178,7 +169,6 @@ export function SessionView() {
 
   const meta = statusMeta(session.status);
   const running = session.status === "running";
-  const usage = contextUsage[session.sessionPk];
   const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(project?.permMode ?? "default");
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
@@ -382,14 +372,7 @@ export function SessionView() {
                 }
               />
               <div className="flex-1" />
-              {usage && (
-                <span
-                  className="w-32 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground"
-                  title={`~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
-                >
-                  {usage.percentLeft}% context left
-                </span>
-              )}
+              <SessionCostPanel sessionPk={session.sessionPk} />
               <ModelPicker
                 ariaLabel="Model"
                 variant="chip"
