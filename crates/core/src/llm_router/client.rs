@@ -15,7 +15,7 @@
 //! native wire format.
 
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
-use crate::llm_router::{capabilities, claude_cloak, connections, oauth, routes, translate};
+use crate::llm_router::{capabilities, claude_cloak, connections, mimo, oauth, routes, translate};
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -32,15 +32,20 @@ pub struct UpstreamCtx {
     /// (post-401) refresh path. `None` in production, which uses each
     /// provider's static `registry::oauth_config` token_url.
     pub oauth_token_url_override: Option<String>,
+    /// Test-only override for the MiMo free-tier bootstrap endpoint that
+    /// mints the anti-abuse JWT. `None` in production
+    /// ([`mimo::BOOTSTRAP_URL`]).
+    pub mimo_bootstrap_url_override: Option<String>,
 }
 
 impl UpstreamCtx {
-    /// Construct a production context (no OAuth token-url override).
+    /// Construct a production context (no endpoint overrides).
     pub fn new(store: Arc<Store>) -> Self {
         Self {
             store,
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            mimo_bootstrap_url_override: None,
         }
     }
 }
@@ -745,6 +750,26 @@ fn free_upstream_request(
     let base = connections::effective_base_url(target.desc, &target.conn)
         .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
     let path = upstream_chat_path(target.desc);
+    // MiMo's free tier sits behind an anti-abuse gate: bootstrap-JWT bearer,
+    // Chrome-like UA + fingerprint headers, and the MiMoCode marker system
+    // message (see `mimo`). The bearer is attached from the process cache —
+    // async callers mint it via `mimo::ensure_jwt` before sending, and a
+    // missing token simply 403s into `send_upstream`'s re-bootstrap retry.
+    if target.conn.provider == "mimo-free" {
+        let mut gated = body.clone();
+        mimo::inject_system_marker(&mut gated);
+        let mut req = ctx
+            .http
+            .post(format!("{base}{path}"))
+            .json(&gated)
+            .header("user-agent", mimo::CHROME_UA)
+            .header("x-mimo-source", "mimocode-cli-free")
+            .header("x-session-affinity", mimo::session_affinity());
+        if let Some(jwt) = mimo::cached_jwt() {
+            req = req.header("authorization", format!("Bearer {jwt}"));
+        }
+        return Ok(req);
+    }
     let req = ctx.http.post(format!("{base}{path}")).json(body);
     Ok(apply_provider_request_headers(req, &target.conn.provider))
 }
@@ -761,7 +786,24 @@ pub(crate) async fn send_upstream(
     target: &mut RouteTarget,
     body: &Value,
 ) -> anyhow::Result<reqwest::Response> {
+    if target.conn.provider == "mimo-free" {
+        // Best-effort: a bootstrap outage falls through to an
+        // unauthenticated request whose 403 hits the retry below.
+        let _ = mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref()).await;
+    }
     let resp = upstream_request(ctx, target, body)?.send().await?;
+    if matches!(resp.status().as_u16(), 401 | 403) && target.conn.provider == "mimo-free" {
+        // The upstream rejected the cached bootstrap JWT — mint a fresh one
+        // and retry the same request once, mirroring the OAuth path below.
+        mimo::invalidate_jwt();
+        if mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref())
+            .await
+            .is_ok()
+        {
+            return Ok(upstream_request(ctx, target, body)?.send().await?);
+        }
+        return Ok(resp);
+    }
     if matches!(resp.status().as_u16(), 401 | 403) && connections::is_oauth(&target.conn) {
         let refreshed = match &ctx.oauth_token_url_override {
             Some(token_url) => oauth::refresh::force_refresh_with_token_url(
@@ -2896,6 +2938,67 @@ mod tests {
     }
 
     #[tokio::test]
+    // Test-only serialization of the process-wide JWT cache; the guard
+    // legitimately spans awaits on the current_thread test runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn mimo_free_chat_request_carries_gate_headers_marker_and_bearer() {
+        let _lock = crate::llm_router::mimo::test_cache_lock();
+        crate::llm_router::mimo::store_jwt("chat-test-jwt");
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("mimo-free").unwrap();
+        let target = RouteTarget {
+            conn: mk_conn("m1", "mimo-free", "free", ConnectionData::default()),
+            desc,
+            upstream_model: "mimo-auto".into(),
+        };
+        let body = json!({
+            "model": "mimo-auto",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "stream": false
+        });
+        let req = upstream_request(&ctx, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.xiaomimimo.com/api/free-ai/openai/chat"
+        );
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer chat-test-jwt"
+        );
+        assert!(req
+            .headers()
+            .get("user-agent")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Chrome"));
+        assert_eq!(
+            req.headers().get("x-mimo-source").unwrap(),
+            "mimocode-cli-free"
+        );
+        assert!(req
+            .headers()
+            .get("x-session-affinity")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("ses_"));
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(
+            sent["messages"][0]["content"],
+            crate::llm_router::mimo::SYSTEM_MARKER
+        );
+        assert_eq!(sent["messages"][1]["content"], "hi");
+        assert_eq!(sent["max_tokens"], 8);
+        crate::llm_router::mimo::invalidate_jwt();
+    }
+
+    #[tokio::test]
     async fn free_provider_uses_public_bearer_and_opencode_client_header() {
         let ctx = test_ctx().await;
         let desc = registry::descriptor("opencode-free").unwrap();
@@ -2919,7 +3022,14 @@ mod tests {
     }
 
     #[tokio::test]
+    // Test-only serialization of the process-wide JWT cache; the guard
+    // legitimately spans awaits on the current_thread test runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn mimo_free_hits_nonstandard_chat_path_without_opencode_headers() {
+        // With no cached bootstrap JWT, the request carries no bearer (it's
+        // cache-driven, not hardcoded) and never opencode-free's headers.
+        let _lock = crate::llm_router::mimo::test_cache_lock();
+        crate::llm_router::mimo::invalidate_jwt();
         let ctx = test_ctx().await;
         let desc = registry::descriptor("mimo-free").unwrap();
         let conn = mk_conn("c6", "mimo-free", "free", ConnectionData::default());

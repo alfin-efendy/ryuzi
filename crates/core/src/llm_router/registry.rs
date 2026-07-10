@@ -982,7 +982,7 @@ mod tests {
         // validates; lock the lowercase form so it can't regress.
         let models = descriptor("kiro").unwrap().models;
         assert!(models.contains(&"minimax-m2.5"));
-        assert!(!models.iter().any(|m| *m == "MiniMax-M2.5"));
+        assert!(!models.contains(&"MiniMax-M2.5"));
     }
 
     #[test]

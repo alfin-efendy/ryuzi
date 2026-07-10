@@ -8,6 +8,7 @@ pub mod codex;
 pub mod connections;
 pub mod keys;
 pub mod kiro;
+pub mod mimo;
 pub mod models;
 pub mod oauth;
 pub mod probe;

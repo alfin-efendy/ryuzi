@@ -63,6 +63,7 @@ impl AppState {
             store: self.store.clone(),
             http: self.http.clone(),
             oauth_token_url_override: self.oauth_token_url_override.clone(),
+            mimo_bootstrap_url_override: None,
         }
     }
 }
