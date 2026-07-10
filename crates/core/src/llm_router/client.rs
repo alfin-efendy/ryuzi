@@ -935,6 +935,12 @@ pub enum MessageStreamEvent {
     MessageDelta {
         stop_reason: Option<String>,
         output_tokens: i64,
+        /// Authoritative request input tokens when the upstream reports them in
+        /// the terminal delta (OpenAI-format translation, Task 1). `None` = not
+        /// reported here (Anthropic upstreams carry input on message_start).
+        input_tokens: Option<i64>,
+        cache_read_tokens: Option<i64>,
+        cache_creation_tokens: Option<i64>,
     },
     MessageStop,
     Error(String),
@@ -985,18 +991,26 @@ impl MessageStreamEvent {
                 }
             }
             "content_block_stop" => Some(MessageStreamEvent::ContentBlockStop { index }),
-            "message_delta" => Some(MessageStreamEvent::MessageDelta {
-                stop_reason: data
-                    .get("delta")
-                    .and_then(|d| d.get("stop_reason"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                output_tokens: data
-                    .get("usage")
-                    .and_then(|u| u.get("output_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
-            }),
+            "message_delta" => {
+                let usage = data.get("usage");
+                let opt = |key: &str| -> Option<i64> {
+                    usage
+                        .and_then(|u| u.get(key))
+                        .and_then(|v| v.as_i64())
+                        .filter(|v| *v > 0)
+                };
+                Some(MessageStreamEvent::MessageDelta {
+                    stop_reason: data
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    output_tokens: opt("output_tokens").unwrap_or(0),
+                    input_tokens: opt("input_tokens"),
+                    cache_read_tokens: opt("cache_read_input_tokens"),
+                    cache_creation_tokens: opt("cache_creation_input_tokens"),
+                })
+            }
             "message_stop" => Some(MessageStreamEvent::MessageStop),
             "error" => Some(MessageStreamEvent::Error(
                 data.get("error")
@@ -3070,13 +3084,36 @@ mod tests {
             MessageStreamEvent::from_event(&md),
             Some(MessageStreamEvent::MessageDelta {
                 stop_reason: Some("tool_use".into()),
-                output_tokens: 7
+                output_tokens: 7,
+                input_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
             })
         );
         let stop = ("message_stop".to_string(), json!({"type":"message_stop"}));
         assert_eq!(
             MessageStreamEvent::from_event(&stop),
             Some(MessageStreamEvent::MessageStop)
+        );
+    }
+
+    #[test]
+    fn message_delta_decodes_input_and_cache_usage() {
+        let ev = (
+            "message_delta".to_string(),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                   "usage":{"output_tokens":7,"input_tokens":1200,
+                            "cache_read_input_tokens":900,"cache_creation_input_tokens":0}}),
+        );
+        assert_eq!(
+            MessageStreamEvent::from_event(&ev),
+            Some(MessageStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".into()),
+                output_tokens: 7,
+                input_tokens: Some(1200),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: None, // 0 filters to None
+            })
         );
     }
 }
