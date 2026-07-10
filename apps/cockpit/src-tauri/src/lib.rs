@@ -363,6 +363,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             plugins_cmd::plugin_detail,
             plugins_cmd::set_plugin_enabled,
             plugins_cmd::set_plugin_setting,
+            plugins_cmd::uninstall_plugin,
             plugins_cmd::begin_plugin_oauth,
             plugins_cmd::complete_plugin_oauth,
             plugins_cmd::disconnect_plugin_oauth,

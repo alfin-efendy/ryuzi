@@ -1134,6 +1134,76 @@ pub async fn set_plugin_setting(
     Ok(())
 }
 
+/// Kind-symmetric uninstall: after this the entry's `installed` flips false
+/// and it reappears in Browse.
+async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
+    let settings = SettingsStore::new(cp.store().clone());
+    let Some(plugin) = cp.plugins().get(id) else {
+        // Synthesized curated pack or a pack installed without a manifest —
+        // resolve through the skills installer.
+        let installed = ryuzi_core::skills_install::list_installed_skills()?;
+        let Some(pack) = installed
+            .iter()
+            .find(|s| s.id == id || s.source == id || s.plugin_id.as_deref() == Some(id))
+        else {
+            anyhow::bail!("unknown plugin: {id}");
+        };
+        return ryuzi_core::skills_install::remove_installed_skill(&pack.id);
+    };
+    match derive_kind(&plugin) {
+        Some("provider") => {
+            let family = provider_family(id);
+            for row in ryuzi_core::llm_router::connections::list_connections(cp.store()).await? {
+                if provider_family(&row.provider) == family {
+                    ryuzi_core::llm_router::connections::remove_connection(cp.store(), &row.id)
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+        Some("gateway") => {
+            for field in &plugin.manifest.settings {
+                cp.store().delete_setting_raw(&field.key).await?;
+            }
+            ryuzi_core::plugins::toggle_enabled(cp.plugins(), &settings, id, false).await
+        }
+        Some("skill-pack") => {
+            let installed = ryuzi_core::skills_install::list_installed_skills()?;
+            let Some(pack) = installed
+                .iter()
+                .find(|s| s.plugin_id.as_deref() == Some(id) || s.id == id)
+            else {
+                anyhow::bail!("skill pack not installed: {id}");
+            };
+            ryuzi_core::skills_install::remove_installed_skill(&pack.id)
+        }
+        _ => {
+            if let Some(auth) = &plugin.manifest.auth {
+                if let Some(setting) = &auth.setting {
+                    cp.store().delete_setting_raw(setting).await?;
+                }
+                if auth.kind == AuthKind::Oauth {
+                    cp.store().delete_plugin_oauth_token(id).await?;
+                }
+            }
+            for field in &plugin.manifest.settings {
+                cp.store().delete_setting_raw(&field.key).await?;
+            }
+            if plugin.connector.is_some() && !plugin.manifest.experimental {
+                ryuzi_core::plugins::toggle_enabled(cp.plugins(), &settings, id, false).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn uninstall_plugin(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<Vec<PluginInfo>> {
+    uninstall(&cp, &id).await?;
+    Ok(assemble_list(&cp).await?)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn begin_plugin_oauth(
@@ -2170,6 +2240,118 @@ mod tests {
             settings.get("default_perm_mode").await.unwrap().as_deref(),
             Some("acceptEdits")
         );
+    }
+
+    // ---------- uninstall (kind-symmetric teardown) ----------
+
+    #[tokio::test]
+    async fn uninstall_gateway_clears_settings_and_disables() {
+        let cp = test_cp().await;
+        let settings = SettingsStore::new(cp.store().clone());
+        cp.store()
+            .set_setting_raw("discord.token", "t")
+            .await
+            .unwrap();
+        cp.store()
+            .set_setting_raw("discord.app_id", "a")
+            .await
+            .unwrap();
+        cp.store()
+            .set_setting_raw("discord.guild_id", "g")
+            .await
+            .unwrap();
+        ryuzi_core::plugins::toggle_enabled(cp.plugins(), &settings, "discord", true)
+            .await
+            .unwrap();
+
+        uninstall(&cp, "discord").await.unwrap();
+
+        assert_eq!(
+            cp.store().get_setting_raw("discord.token").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            cp.store().get_setting_raw("discord.app_id").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            cp.store()
+                .get_setting_raw("discord.guild_id")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!cp.plugins().is_enabled(&settings, "discord").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn uninstall_provider_removes_every_family_connection() {
+        let cp = test_cp().await;
+        let now = ryuzi_core::paths::now_ms();
+        for (id, provider) in [
+            ("c1", "anthropic"),
+            ("c2", "anthropic-oauth"),
+            ("c3", "openai"),
+        ] {
+            ryuzi_core::llm_router::connections::add_connection(
+                cp.store(),
+                ryuzi_core::llm_router::connections::ConnectionRow {
+                    id: id.into(),
+                    provider: provider.into(),
+                    auth_type: "api_key".into(),
+                    label: id.into(),
+                    priority: 0,
+                    enabled: true,
+                    data: Default::default(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        uninstall(&cp, "anthropic").await.unwrap();
+
+        let left = ryuzi_core::llm_router::connections::list_connections(cp.store())
+            .await
+            .unwrap();
+        let providers: Vec<_> = left.iter().map(|c| c.provider.as_str()).collect();
+        assert_eq!(
+            providers,
+            vec!["openai"],
+            "family (anthropic + anthropic-oauth) removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn uninstall_integration_clears_credential_and_disables() {
+        let cp = test_cp().await;
+        cp.store()
+            .set_setting_raw("plugin.github.token", "tok")
+            .await
+            .unwrap();
+        let settings = SettingsStore::new(cp.store().clone());
+        ryuzi_core::plugins::toggle_enabled(cp.plugins(), &settings, "github", true)
+            .await
+            .unwrap();
+
+        uninstall(&cp, "github").await.unwrap();
+
+        assert_eq!(
+            cp.store()
+                .get_setting_raw("plugin.github.token")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!cp.plugins().is_enabled(&settings, "github").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn uninstall_unknown_id_errors() {
+        let cp = test_cp().await;
+        assert!(uninstall(&cp, "definitely-not-a-plugin").await.is_err());
     }
 
     // ---------- begin_plugin_install resolution (steps 1-6) ----------
