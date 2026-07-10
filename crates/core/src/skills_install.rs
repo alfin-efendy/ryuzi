@@ -150,12 +150,14 @@ struct GitRepoCloner;
 #[async_trait::async_trait]
 impl RepoCloner for GitRepoCloner {
     async fn clone_repo(&self, source: &ParsedSkillSource, dest: &Path) -> Result<()> {
-        let output = tokio::process::Command::new("git")
-            .arg("clone")
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.arg("clone")
             .arg("--depth")
             .arg("1")
             .arg(&source.repo)
-            .arg(dest)
+            .arg(dest);
+        crate::process_util::no_window(&mut cmd);
+        let output = cmd
             .output()
             .await
             .with_context(|| format!("failed to spawn git clone for {}", source.repo))?;

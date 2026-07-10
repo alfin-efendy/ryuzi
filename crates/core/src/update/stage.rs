@@ -100,13 +100,10 @@ pub struct TarStageHost;
 
 impl StageHost for TarStageHost {
     fn extract_ryuzi(&self, tar_path: &Path, dest_dir: &Path) -> anyhow::Result<Vec<u8>> {
-        let out = std::process::Command::new("tar")
-            .args(["-xzf"])
-            .arg(tar_path)
-            .arg("-C")
-            .arg(dest_dir)
-            .output()
-            .context("tar command failed")?;
+        let mut cmd = std::process::Command::new("tar");
+        cmd.args(["-xzf"]).arg(tar_path).arg("-C").arg(dest_dir);
+        crate::process_util::no_window_std(&mut cmd);
+        let out = cmd.output().context("tar command failed")?;
 
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);

@@ -82,10 +82,10 @@ pub struct SidecarConfig {
 }
 
 pub fn default_bun_probe() -> Option<String> {
-    let output = std::process::Command::new("bun")
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("bun");
+    cmd.arg("--version");
+    crate::process_util::no_window_std(&mut cmd);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
