@@ -124,6 +124,11 @@ impl Tool for AskUserQuestion {
         let Some(resp) = resp else {
             return Ok(ToolOutput::error("Interrupted by user"));
         };
+        if resp.decision == crate::domain::ApprovalDecision::Cancel {
+            return Ok(ToolOutput::ok(
+                "No interactive surface answered this request.",
+            ));
+        }
         if !resp.allowed() {
             return Ok(ToolOutput::ok("The user declined to answer."));
         }
@@ -229,5 +234,29 @@ mod tests {
         let out = AskUserQuestion.execute(&ctx, valid_input()).await.unwrap();
         assert!(!out.is_error);
         assert!(out.for_model.contains("declined"));
+    }
+
+    #[tokio::test]
+    async fn cancel_decision_is_reported_as_no_interactive_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
+        tokio::spawn(async move {
+            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+                hub.resolve(
+                    &request_id,
+                    ApprovalResponse {
+                        decision: ApprovalDecision::Cancel,
+                        scope: None,
+                        payload: None,
+                    },
+                );
+            }
+        });
+        let out = AskUserQuestion.execute(&ctx, valid_input()).await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            out.for_model,
+            "No interactive surface answered this request."
+        );
     }
 }

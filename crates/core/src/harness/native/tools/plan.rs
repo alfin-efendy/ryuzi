@@ -64,6 +64,11 @@ impl Tool for ExitPlanMode {
         let Some(resp) = resp else {
             return Ok(ToolOutput::error("Interrupted by user"));
         };
+        if resp.decision == crate::domain::ApprovalDecision::Cancel {
+            return Ok(ToolOutput::ok(
+                "No interactive surface answered this request.",
+            ));
+        }
         if resp.allowed() {
             let mode = match resp
                 .payload
@@ -184,6 +189,36 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(out.for_model.contains("missing tests"));
+        assert_eq!(*perm.lock().unwrap(), PermMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn cancel_decision_is_reported_as_no_interactive_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, hub, mut rx, perm) = ctx_with_interaction(dir.path(), PermMode::Plan).await;
+        tokio::spawn(async move {
+            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+                hub.resolve(
+                    &request_id,
+                    ApprovalResponse {
+                        decision: ApprovalDecision::Cancel,
+                        scope: None,
+                        payload: None,
+                    },
+                );
+            }
+        });
+        let out = ExitPlanMode
+            .execute(&ctx, json!({"plan": "do X"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            out.for_model,
+            "No interactive surface answered this request."
+        );
+        // A timed-out headless prompt must leave the session in Plan mode —
+        // it's neither an approval nor a user rejection.
         assert_eq!(*perm.lock().unwrap(), PermMode::Plan);
     }
 

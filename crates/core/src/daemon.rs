@@ -9,7 +9,7 @@
 //! loop that spawns it.
 
 use crate::control::ControlPlane;
-use crate::domain::{ApprovalDecision, ApprovalRequest, CoreEvent, Surface};
+use crate::domain::{ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Surface};
 use crate::gateway::{Gateway, GatewayFactory};
 use crate::harness::acp::{claude_code_plugin, AcpAdapterDescriptor};
 use crate::harness::native::native_plugin;
@@ -329,8 +329,21 @@ fn spawn_approval_fanout(
                     input: _,
                 }) => {
                     // Gateways only render binary tool prompts. Plan/Question
-                    // prompts are Cockpit/CLI-only surfaces.
+                    // prompts are Cockpit/CLI-only surfaces — a headless
+                    // daemon/gateway session has nothing that will ever answer
+                    // them. Rather than `continue` and leave the turn parked
+                    // forever, spawn a timeout into the same `inflight` set
+                    // that resolves the request to `Cancel` once
+                    // `approval_timeout_ms` elapses, so the blocked tool call
+                    // reports "no interactive surface" instead of hanging.
+                    // `resolve_approval` is a harmless no-op if a real surface
+                    // (Cockpit, CLI) already answered it first.
                     if approval_kind != crate::domain::ApprovalKind::Tool {
+                        let cp = Arc::clone(&cp);
+                        let store = Arc::clone(&store);
+                        inflight.spawn(async move {
+                            schedule_non_tool_approval_cancel(&cp, &store, &request_id).await;
+                        });
                         continue;
                     }
                     let cp = Arc::clone(&cp);
@@ -355,6 +368,39 @@ fn spawn_approval_fanout(
             }
         }
     })
+}
+
+/// Headless fallback for Plan/Question approvals: gateways can't render
+/// them, so there's no surface to answer the request in a daemon/gateway
+/// session. Instead of leaving the turn parked forever, sleep for
+/// `approval_timeout_ms` (same setting, same default, as [`handle_approval`])
+/// then resolve the request as `Cancel` — distinct from an ordinary reject so
+/// `exitplanmode`/`askuserquestion` can report "no interactive surface"
+/// rather than "the user rejected this". `resolve_approval` returns `false`
+/// (and does nothing) if the request was already resolved by a real surface,
+/// so racing this against Cockpit/CLI is harmless.
+pub(crate) async fn schedule_non_tool_approval_cancel(
+    cp: &Arc<ControlPlane>,
+    store: &Arc<Store>,
+    request_id: &str,
+) {
+    let settings = SettingsStore::new(Arc::clone(store));
+    let timeout_ms: u64 = settings
+        .get("approval_timeout_ms")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300_000);
+    tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+    cp.resolve_approval(
+        request_id,
+        ApprovalResponse {
+            decision: ApprovalDecision::Cancel,
+            scope: None,
+            payload: None,
+        },
+    );
 }
 
 /// Core approval fan-out decision, callable directly (no broadcast loop
@@ -1118,6 +1164,142 @@ mod tests {
             msgs.iter()
                 .any(|m| m.role == "assistant" && m.payload["text"] == "done"),
             "expected the post-approval assistant row, got: {msgs:?}"
+        );
+    }
+
+    // ---------- Plan/Question approvals time out to Cancel, not a hang ----------
+
+    /// Like `PermFakeSession`, but raises a Plan-kind `ApprovalRequested`
+    /// (unscoped registration — nothing else in this test resolves it) and
+    /// records the decision it eventually got back as the assistant row, so
+    /// the test can assert the fan-out's own timeout resolved it — not any
+    /// gateway or manual `handle_approval` call.
+    struct PlanFakeSession {
+        store: Arc<Store>,
+        events: broadcast::Sender<CoreEvent>,
+        approvals: Arc<crate::approval::ApprovalHub>,
+        session_pk: String,
+    }
+
+    #[async_trait]
+    impl HarnessSession for PlanFakeSession {
+        async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
+            let request_id = "plan-req-1".to_string();
+            let rx = self
+                .approvals
+                .register_for_session(&self.session_pk, request_id.clone());
+            let _ = self.events.send(CoreEvent::ApprovalRequested {
+                session_pk: self.session_pk.clone(),
+                request_id: request_id.clone(),
+                tool: "exitplanmode".into(),
+                summary: "review the proposed plan".into(),
+                approval_kind: crate::domain::ApprovalKind::Plan,
+                input: serde_json::json!({ "plan": "do X" }),
+            });
+            let decision = rx
+                .await
+                .map(|r| format!("{:?}", r.decision))
+                .unwrap_or_else(|_| "channel-dropped".to_string());
+            let _ = self
+                .store
+                .insert_message(NewMessage::block(
+                    &self.session_pk,
+                    "assistant",
+                    "text",
+                    serde_json::json!({ "text": decision }),
+                ))
+                .await;
+            Ok(())
+        }
+        async fn cancel(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn end(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn agent_session_id(&self) -> Option<String> {
+            Some("agent-plan".into())
+        }
+    }
+
+    struct PlanFakeHarness;
+    #[async_trait]
+    impl Harness for PlanFakeHarness {
+        async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            Ok(Box::new(PlanFakeSession {
+                store: ctx.store.clone(),
+                events: ctx.events.clone(),
+                approvals: ctx.approvals.clone(),
+                session_pk: ctx.session_pk.clone(),
+            }))
+        }
+    }
+    struct PlanFakeHarnessFactory;
+    impl HarnessFactory for PlanFakeHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Ok(Arc::new(PlanFakeHarness))
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn approval_fanout_times_out_plan_kind_requests_to_cancel() {
+        let _guard = StateDirGuard::new();
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Store::open(&db_path).await.unwrap();
+        // Keep the test fast: the fan-out's own timeout — not any gateway or
+        // `handle_approval` call — must be what resolves this.
+        SettingsStore::new(Arc::new(store))
+            .set("approval_timeout_ms", "50")
+            .await
+            .unwrap();
+        let store = Store::open(&db_path).await.unwrap();
+
+        let mut regs = Registries::new();
+        regs.harness
+            .register("native", Arc::new(PlanFakeHarnessFactory));
+        let cp =
+            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
+        let store = cp.store().clone();
+
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+        // Spawn the REAL fan-out loop under test (no gateways — Plan-kind
+        // requests never touch them) instead of driving `handle_approval`
+        // manually, so this exercises the actual skip-branch fix.
+        let _fanout = spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), vec![]);
+
+        let mut rx = cp.subscribe();
+        let session = cp
+            .start_session(&project.project_id, "go", "test", &[])
+            .await
+            .unwrap();
+
+        let mut saw_result = false;
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(CoreEvent::Result { .. })) => {
+                    saw_result = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_result,
+            "the real spawn_approval_fanout must time out the parked Plan approval to Cancel \
+             so the blocked turn completes instead of hanging forever"
+        );
+
+        let msgs = store.list_messages(&session.session_pk).await.unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == "assistant" && m.payload["text"] == "Cancel"),
+            "expected the timed-out Plan approval to resolve with ApprovalDecision::Cancel, \
+             got: {msgs:?}"
         );
     }
 
