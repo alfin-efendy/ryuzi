@@ -19,6 +19,7 @@ import { useRuntimes } from "./store-runtimes";
 import { useNative } from "./store-native";
 import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
+import { notifier, notifyIntentForEvent, isWindowFocused } from "@/lib/notify";
 
 export type PendingApproval = {
   sessionPk: string;
@@ -234,6 +235,7 @@ export const useStore = create<State>((set, get) => ({
       if (prevSession) useUi.getState().markRead(prev, prevSession.lastActive ?? 0);
     }
     set({ focusedSessionPk: pk });
+    if (pk) notifier.cancelSettle(pk);
     if (pk && !get().loaded[pk]) void get().hydrateTranscript(pk);
   },
 
@@ -373,6 +375,15 @@ export const useStore = create<State>((set, get) => ({
       get().applyCoreEvent(event);
       // Keep the actively-viewed session marked read as its activity streams in.
       markFocusedSessionReadOnEvent(event, get().focusedSessionPk);
+      // OS notification for attention events (suppressed while focused).
+      const intent = notifyIntentForEvent(event, get().focusedSessionPk, isWindowFocused());
+      const evtPk = (event as { session_pk?: string }).session_pk;
+      if (evtPk) notifier.cancelSettle(evtPk); // any activity supersedes a pending settle
+      if (intent)
+        notifier.handle(
+          intent,
+          get().sessions.find((s) => s.sessionPk === intent.sessionPk),
+        );
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();

@@ -166,3 +166,11 @@ test("notificationText formats per kind", () => {
   });
   expect(notificationText({ sessionPk: "a", kind: "error", settle: false }, s)).toEqual({ title: "My session", body: "Turn errored" });
 });
+
+import { badgeCountFor } from "./notify";
+
+test("badgeCountFor composes attentionCount from store slices", () => {
+  const sessions = [sess("a", 500), sess("b", 50)];
+  // a unread (500>100), b read; +1 pending → 2
+  expect(badgeCountFor(sessions, { a: 100, b: 100 }, null, 1)).toBe(2);
+});

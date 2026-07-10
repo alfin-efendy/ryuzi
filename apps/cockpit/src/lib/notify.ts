@@ -105,3 +105,85 @@ export function createNotifier(deps: NotifierDeps): Notifier {
     },
   };
 }
+
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { useUi } from "@/store-ui";
+import { useStore } from "@/store";
+
+/** Convenience: the badge number for the current store slices. */
+export function badgeCountFor(
+  sessions: Session[],
+  readAt: Record<string, number>,
+  focusedSessionPk: string | null,
+  pendingApprovalCount: number,
+): number {
+  return attentionCount(sessions, readAt, focusedSessionPk, pendingApprovalCount);
+}
+
+let permissionChecked = false;
+let cachedGranted = false;
+async function ensurePermission(): Promise<boolean> {
+  if (permissionChecked) return cachedGranted;
+  permissionChecked = true;
+  try {
+    cachedGranted = (await isPermissionGranted()) || (await requestPermission()) === "granted";
+  } catch {
+    cachedGranted = false;
+  }
+  return cachedGranted;
+}
+
+/** The app-wide notifier, backed by the Tauri plugin + window. Badge writes are
+ *  wrapped so an unsupported platform (Windows) is a silent no-op. */
+export const notifier = createNotifier({
+  sendNotification: (o) => {
+    try {
+      sendNotification(o);
+    } catch {
+      /* notification unavailable — ignore */
+    }
+  },
+  setBadgeCount: (n) => {
+    try {
+      void getCurrentWindow().setBadgeCount(n);
+    } catch {
+      /* badge unsupported (e.g. Windows) — no-op */
+    }
+  },
+  ensurePermission,
+  isEnabled: () => useUi.getState().notificationsEnabled,
+  schedule: (fn, ms) => {
+    const id = setTimeout(fn, ms);
+    return () => clearTimeout(id);
+  },
+});
+
+/** Whether the OS window is focused right now (updated by onFocusChanged). */
+let windowFocused = true;
+export function isWindowFocused(): boolean {
+  return windowFocused;
+}
+
+let inited = false;
+/** Idempotent: track window focus and keep the dock badge in sync with
+ *  attention. Call once at startup. */
+export function initNotifications(): void {
+  if (inited) return;
+  inited = true;
+
+  void getCurrentWindow()
+    .onFocusChanged(({ payload: focused }) => {
+      windowFocused = focused;
+      if (focused) notifier.cancelAllSettles(); // back at the app → drop pending
+    })
+    .catch(() => {});
+
+  const recomputeBadge = () => {
+    const st = useStore.getState();
+    notifier.updateBadge(badgeCountFor(st.sessions, useUi.getState().readAt, st.focusedSessionPk, st.pendingApprovals.length));
+  };
+  useStore.subscribe(recomputeBadge);
+  useUi.subscribe(recomputeBadge);
+  recomputeBadge();
+}
