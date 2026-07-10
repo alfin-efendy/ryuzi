@@ -55,11 +55,14 @@ impl ControlPlane {
         // harness — otherwise a native session would inherit the Claude card's
         // model and every turn would hit the Claude subscription.
         //
-        // Permission mode is NOT inherited from the runtime card: the project's
-        // own `perm_mode` (set from the composer / project settings) is the
-        // single source of truth. `Default` means "Ask" (prompt before
-        // edits/commands) — inheriting the card's default (e.g. "Full") here is
-        // exactly what made a project set to Ask silently run without asking.
+        // Permission mode is NOT inherited from the runtime card: this new
+        // session's mode comes from `perm_mode` above (the picker) or falls
+        // back to the project's own `perm_mode` — never the runtime card's
+        // default. `Default` means "Ask" (prompt before edits/commands) —
+        // inheriting the card's default (e.g. "Full") here is exactly what
+        // made a project set to Ask silently run without asking. Once
+        // created, the SESSION's own row is the source of truth (per-session
+        // mode) — the project's `perm_mode` only seeds new sessions.
         if project.model.is_none() {
             let runtime_id = crate::runtimes::runtime_id_for_harness(&project.harness);
             if let Ok(defaults) =
