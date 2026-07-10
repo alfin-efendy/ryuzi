@@ -51,7 +51,6 @@ fn cli_agent_plugin(d: &RuntimeDescriptor) -> CorePlugin {
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: Some(RuntimeMeta {
                 binary: Some(d.binary.to_string()),

@@ -2451,7 +2451,6 @@ fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CoreP
             headers: std::collections::BTreeMap::new(),
         }],
         skills: vec![],
-        menu: None,
         provider: None,
         runtime: None,
     };

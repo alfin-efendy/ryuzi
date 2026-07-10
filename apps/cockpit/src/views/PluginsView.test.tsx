@@ -129,7 +129,6 @@ const wizardDetail: PluginDetail = {
   settings: [],
   mcp: [],
   models: [],
-  menuLabel: null,
   homepage: null,
   publisher: "Notion",
 };

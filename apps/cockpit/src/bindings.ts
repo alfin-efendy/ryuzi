@@ -1289,7 +1289,7 @@ kind: string; setting: string | null; env: string | null; helpUrl: string | null
  * the process environment. Never reveals the value itself.
  */
 configured: boolean; oauthConnectAvailable: boolean; oauthConnectError: string | null; oauthTokenStored: boolean; oauthReconnectRequired: boolean }
-export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; menuLabel: string | null; homepage: string | null; publisher: string }
+export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; homepage: string | null; publisher: string }
 export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean; 
 /**
  * A persisted (non-empty) row exists for `key`. Never the value itself.

@@ -54,7 +54,6 @@ function detailFixture(
     settings: overrides.settings ?? [],
     mcp: [],
     models: [],
-    menuLabel: null,
     homepage: null,
     publisher: "Notion",
   };

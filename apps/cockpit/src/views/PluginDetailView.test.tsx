@@ -35,7 +35,6 @@ const githubDetail: PluginDetail = {
   settings: [],
   mcp: [{ name: "github", transport: "http", commandOrUrl: "https://api.githubcopilot.com/mcp/" }],
   models: [],
-  menuLabel: "GitHub",
   homepage: "https://github.com/github/github-mcp-server",
   publisher: "GitHub (official)",
 };
@@ -67,7 +66,6 @@ const ollamaDetail: PluginDetail = {
   ],
   mcp: [],
   models: ["llama3", "mistral"],
-  menuLabel: null,
   homepage: null,
   publisher: "Ollama (local)",
 };
@@ -90,7 +88,6 @@ const sandboxDetail: PluginDetail = {
   settings: [],
   mcp: [],
   models: [],
-  menuLabel: null,
   homepage: "https://vercel.com/docs/vercel-sandbox",
   publisher: "Vercel (no MCP surface)",
 };
@@ -123,7 +120,6 @@ const oauthDetail: PluginDetail = {
   settings: [],
   mcp: [{ name: "acme", transport: "http", commandOrUrl: "https://api.acme.example.com/mcp" }],
   models: [],
-  menuLabel: "Acme",
   homepage: "https://acme.example.com",
   publisher: "Acme",
 };

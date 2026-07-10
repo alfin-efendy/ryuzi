@@ -1241,7 +1241,6 @@ name = "Meta Only"
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         };

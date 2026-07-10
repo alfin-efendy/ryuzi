@@ -215,7 +215,6 @@ mod tests {
             }],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         };

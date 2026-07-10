@@ -663,7 +663,6 @@ fn generated_plugin_manifest(
         settings: vec![],
         mcp: vec![],
         skills,
-        menu: None,
         provider: None,
         runtime: None,
     };

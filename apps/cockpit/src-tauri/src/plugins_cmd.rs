@@ -160,7 +160,6 @@ pub struct PluginDetail {
     pub settings: Vec<PluginFieldInfo>,
     pub mcp: Vec<PluginMcpInfo>,
     pub models: Vec<String>,
-    pub menu_label: Option<String>,
     pub homepage: Option<String>,
     pub publisher: String,
 }
@@ -932,7 +931,6 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
         settings: settings_info,
         mcp,
         models,
-        menu_label: m.menu.as_ref().and_then(|menu| menu.label.clone()),
         homepage: m.homepage.clone(),
         publisher: m.publisher.clone(),
     })
@@ -1400,7 +1398,6 @@ mod tests {
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         }

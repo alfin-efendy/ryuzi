@@ -341,7 +341,6 @@ mod toggle_enabled_tests {
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         }
