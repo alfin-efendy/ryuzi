@@ -12,7 +12,7 @@ export function ContextRing({ percentLeft }: { percentLeft: number }) {
   const color = quotaColor(pctUsed);
   return (
     <span className="flex items-center gap-1.5 text-[11px] tabular-nums text-muted-foreground">
-      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0" aria-hidden>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0" aria-hidden="true">
         <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="currentColor" strokeWidth={stroke} className="text-border" />
         <circle
           data-ring="progress"
