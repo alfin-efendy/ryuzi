@@ -1306,7 +1306,7 @@ export type PluginInfo = { id: string; name: string; description: string; icon: 
  */
 configured: boolean; 
 /**
- * `builtin` | `catalog` | `user`.
+ * `builtin` | `catalog` | `skill-pack`.
  */
 source: string; 
 /**

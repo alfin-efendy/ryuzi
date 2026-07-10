@@ -112,8 +112,10 @@ pub enum PluginSource {
     Builtin,
     /// Bundled in the embedded plugin catalog.
     Catalog,
-    /// Loaded from a user-authored manifest on disk.
-    User(std::path::PathBuf),
+    /// Installed as a skill pack by the skills installer
+    /// (`crate::skills_install`) — carries the manifest's own on-disk
+    /// directory.
+    SkillPack(std::path::PathBuf),
 }
 
 /// A manifest bound to the behavioral capabilities it advertises. Each
@@ -237,19 +239,19 @@ impl PluginHost {
     }
 
     /// Every `manifest.skills[].path` (resolved relative to the plugin's own
-    /// directory) contributed by an *enabled* [`PluginSource::User`] plugin,
-    /// filtered down to directories that actually exist on disk — handed to
-    /// the native runtime as `SessionCtx::extra_skill_dirs` so plugin-bundled
-    /// skills show up beside the worktree/global ones (see
+    /// directory) contributed by an *enabled* [`PluginSource::SkillPack`]
+    /// plugin, filtered down to directories that actually exist on disk —
+    /// handed to the native runtime as `SessionCtx::extra_skill_dirs` so
+    /// plugin-bundled skills show up beside the worktree/global ones (see
     /// `harness::native::skills::SkillRegistry::load_with`).
     ///
     /// Builtin/catalog plugins never contribute here: a `SkillDef.path` is
     /// only meaningful relative to a manifest's own directory on disk, which
-    /// only `PluginSource::User` carries.
+    /// only `PluginSource::SkillPack` carries.
     pub async fn enabled_skill_dirs(&self, settings: &SettingsStore) -> Vec<std::path::PathBuf> {
         let mut dirs = Vec::new();
         for plugin in &self.order {
-            let PluginSource::User(base) = &plugin.source else {
+            let PluginSource::SkillPack(base) = &plugin.source else {
                 continue;
             };
             if plugin.manifest.skills.is_empty() {
@@ -656,7 +658,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            source: PluginSource::User(base.path().to_path_buf()),
+            source: PluginSource::SkillPack(base.path().to_path_buf()),
         };
         let mut host = PluginHost::new();
         host.add(plugin);
@@ -692,7 +694,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            source: PluginSource::User(base.path().to_path_buf()),
+            source: PluginSource::SkillPack(base.path().to_path_buf()),
         });
         store
             .set_setting_raw("plugin.task7-skill-missing.enabled", "true")
@@ -700,7 +702,7 @@ mod tests {
             .unwrap();
 
         // A manifest-only builtin (always enabled) whose skill path DOES
-        // exist on disk must still be skipped: only `PluginSource::User`
+        // exist on disk must still be skipped: only `PluginSource::SkillPack`
         // carries the on-disk directory a relative `SkillDef.path` resolves
         // against.
         let builtin_dir = tempfile::tempdir().unwrap();
@@ -751,7 +753,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            source: PluginSource::User(plugin_base.path().to_path_buf()),
+            source: PluginSource::SkillPack(plugin_base.path().to_path_buf()),
         };
 
         let mut host = PluginHost::new();

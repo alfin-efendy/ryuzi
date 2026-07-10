@@ -128,7 +128,7 @@ pub(crate) fn load_user_plugins_from(regs: &mut Registries, base: &std::path::Pa
                 continue;
             }
         };
-        match declarative::declarative_plugin(manifest, PluginSource::User(dir.clone())) {
+        match declarative::declarative_plugin(manifest, PluginSource::SkillPack(dir.clone())) {
             Ok(plugin) => regs.add_plugin(plugin),
             Err(e) => {
                 tracing::warn!("skipping user plugin at {}: {e}", manifest_path.display());
@@ -543,7 +543,7 @@ command = "acme-mcp"
         );
         assert_eq!(
             plugin.source,
-            PluginSource::User(base.path().join("acme")),
+            PluginSource::SkillPack(base.path().join("acme")),
             "source should record the manifest's own directory"
         );
     }

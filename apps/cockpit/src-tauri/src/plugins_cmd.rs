@@ -56,7 +56,7 @@ pub struct PluginInfo {
     /// Install/Open split needs it — note this adds per-plugin store lookups
     /// to list assembly.
     pub configured: bool,
-    /// `builtin` | `catalog` | `user`.
+    /// `builtin` | `catalog` | `skill-pack`.
     pub source: String,
     /// Any of `provider` | `runtime` | `gateway` | `connector`.
     pub capabilities: Vec<String>,
@@ -247,7 +247,7 @@ fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
         PluginSource::Catalog => "catalog",
-        PluginSource::User(_) => "user",
+        PluginSource::SkillPack(_) => "skill-pack",
     }
 }
 
@@ -1432,7 +1432,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            source: PluginSource::User(std::path::PathBuf::from("/tmp/whatever")),
+            source: PluginSource::SkillPack(std::path::PathBuf::from("/tmp/whatever")),
         }
     }
 
@@ -1524,8 +1524,8 @@ mod tests {
         assert_eq!(source_label(&PluginSource::Builtin), "builtin");
         assert_eq!(source_label(&PluginSource::Catalog), "catalog");
         assert_eq!(
-            source_label(&PluginSource::User(std::path::PathBuf::from("/x"))),
-            "user"
+            source_label(&PluginSource::SkillPack(std::path::PathBuf::from("/x"))),
+            "skill-pack"
         );
     }
 

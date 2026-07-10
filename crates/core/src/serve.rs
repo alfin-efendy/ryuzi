@@ -169,7 +169,7 @@ fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
         PluginSource::Catalog => "catalog",
-        PluginSource::User(_) => "user",
+        PluginSource::SkillPack(_) => "skill-pack",
     }
 }
 
