@@ -81,8 +81,6 @@ function append(map: Record<string, Row[]>, pk: string, row: Row): Record<string
 function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions | null {
   if (!options) return null;
   return {
-    // Legacy field — the backend ignores it; removed with the Task-7 regen.
-    runtimeId: null,
     model: options.model ?? null,
     context: options.context
       ? {

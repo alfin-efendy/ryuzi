@@ -274,7 +274,7 @@ export function SessionView() {
           </Button>
         </div>
 
-        {/* Native runtime plan (todowrite) */}
+        {/* Agent plan (todowrite) */}
         <TodoPanel sessionPk={session.sessionPk} running={running} />
 
         {/* Transcript */}

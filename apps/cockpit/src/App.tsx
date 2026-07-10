@@ -13,8 +13,6 @@ import { SessionView } from "./views/SessionView";
 import { ModelsView } from "./views/ModelsView";
 import { ProviderDetailView } from "./views/ProviderDetailView";
 import { ConnectionDetailView } from "./views/ConnectionDetailView";
-import { RuntimeView } from "./views/RuntimeView";
-import { RuntimeDetailView } from "./views/RuntimeDetailView";
 import { SchedulerView } from "./views/SchedulerView";
 import { JobDetailView } from "./views/JobDetailView";
 import { JobNewView } from "./views/JobNewView";
@@ -41,10 +39,6 @@ function MainView() {
       return <ProviderDetailView provider={view.provider} />;
     case "connectionDetail":
       return <ConnectionDetailView id={view.id} />;
-    case "runtime":
-      return <RuntimeView />;
-    case "runtimeDetail":
-      return <RuntimeDetailView id={view.id} />;
     case "scheduler":
       return <SchedulerView />;
     case "jobDetail":

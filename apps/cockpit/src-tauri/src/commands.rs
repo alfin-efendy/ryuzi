@@ -136,7 +136,6 @@ impl From<GitOptions> for SessionGitOptions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatRequestOptions {
-    pub runtime_id: Option<String>,
     pub model: Option<String>,
     pub context: Option<ChatContextArg>,
     #[serde(default)]
@@ -145,50 +144,24 @@ pub struct ChatRequestOptions {
     pub git: Option<GitOptions>,
 }
 
-/// Ryuzi-only sessions: every runtime id resolves to the native harness.
-/// Legacy ids ("claude", "native") and anything else are accepted so old
-/// frontends or queued payloads can never error here; the Result shape is
-/// kept so call sites stay `?`-compatible.
-fn harness_for_runtime(_runtime_id: &str) -> Result<&'static str, CmdError> {
-    Ok("native")
-}
-
-async fn apply_runtime_choice(
-    cp: &ControlPlane,
-    project_id: &str,
-    runtime_id: Option<&str>,
-    model: Option<&str>,
-) -> R<()> {
-    let runtime_id = runtime_id.filter(|v| !v.trim().is_empty());
+/// Persist the composer's model choice on the project row, normalizing any
+/// legacy harness value ("claude-code", restored DBs) to "native" on the
+/// way. `model: None` keeps the project's pinned model instead of clearing
+/// it — the composer sends null when the user didn't touch the picker.
+async fn apply_model_choice(cp: &ControlPlane, project_id: &str, model: Option<&str>) -> R<()> {
     let model = model
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string);
-    if runtime_id.is_none() && model.is_none() {
-        return Ok(());
-    };
-    let harness = match runtime_id {
-        Some(runtime_id) => harness_for_runtime(runtime_id)?,
-        None => "",
-    };
     let Some(project) = cp.store().get_project(project_id).await? else {
         return Err(CmdError {
             message: format!("unknown project: {project_id}"),
         });
     };
-    let next_harness = if harness.is_empty() {
-        project.harness.as_str()
-    } else {
-        harness
-    };
-    let current_model = project.model.clone();
-    // Ryuzi-only: a runtime choice no longer implies a model reset — the
-    // composer always sends runtimeId "native", so `model: null` must keep
-    // the project's pinned model instead of clearing it.
-    let next_model = model.or_else(|| current_model.clone());
-    if project.harness != next_harness || current_model != next_model {
+    let next_model = model.or_else(|| project.model.clone());
+    if project.harness != "native" || project.model != next_model {
         cp.store()
-            .update_project(project_id, next_model, project.perm_mode, next_harness)
+            .update_project(project_id, next_model, project.perm_mode, "native")
             .await?;
     }
     Ok(())
@@ -293,13 +266,7 @@ pub async fn start_session(
     options: Option<ChatRequestOptions>,
 ) -> R<Session> {
     let options = options.unwrap_or_default();
-    apply_runtime_choice(
-        &cp,
-        &project_id,
-        options.runtime_id.as_deref(),
-        options.model.as_deref(),
-    )
-    .await?;
+    apply_model_choice(&cp, &project_id, options.model.as_deref()).await?;
     let git: Option<SessionGitOptions> = options.git.clone().map(Into::into);
     let attachments = attachment_refs_from_paths(&options.attachments).await?;
     let agent_prompt = chat_agent_prompt(&prompt, options.context.as_ref());
@@ -532,18 +499,8 @@ mod tests {
         assert_eq!(err.message, "file too large (2097153 bytes)");
     }
 
-    #[test]
-    fn harness_for_runtime_always_resolves_native() {
-        // Ryuzi-only sessions: any id — current, legacy, or unknown —
-        // resolves to the native harness instead of erroring.
-        assert_eq!(harness_for_runtime("native").unwrap(), "native");
-        assert_eq!(harness_for_runtime("claude").unwrap(), "native");
-        assert_eq!(harness_for_runtime("codex").unwrap(), "native");
-        assert_eq!(harness_for_runtime("anything-legacy").unwrap(), "native");
-    }
-
     #[tokio::test]
-    async fn apply_runtime_choice_keeps_the_pinned_model_when_none_is_sent() {
+    async fn apply_model_choice_keeps_the_pinned_model_when_none_is_sent() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
         let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
@@ -563,10 +520,8 @@ mod tests {
             .await
             .unwrap();
 
-        // The composer always sends runtimeId "native"; model may be null.
-        apply_runtime_choice(&cp, "p1", Some("native"), None)
-            .await
-            .unwrap();
+        // The composer may send model: null; the legacy harness still migrates.
+        apply_model_choice(&cp, "p1", None).await.unwrap();
 
         let got = cp.store().get_project("p1").await.unwrap().unwrap();
         assert_eq!(
@@ -581,11 +536,10 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_options_deserializes_model() {
+    fn chat_request_options_deserializes_model_and_ignores_legacy_runtime_id() {
         let opts: ChatRequestOptions =
             serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
                 .unwrap();
-        assert_eq!(opts.runtime_id.as_deref(), Some("native"));
         assert_eq!(opts.model.as_deref(), Some("fable"));
     }
 
@@ -621,8 +575,7 @@ mod tests {
     fn chat_request_options_git_defaults_to_none_and_deserializes() {
         // Old payloads (no `git` key) keep parsing.
         let opts: ChatRequestOptions =
-            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
-                .unwrap();
+            serde_json::from_value(serde_json::json!({"model": "fable"})).unwrap();
         assert!(opts.git.is_none());
 
         let opts: ChatRequestOptions = serde_json::from_value(serde_json::json!({

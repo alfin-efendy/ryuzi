@@ -12,7 +12,6 @@ mod gateways_cmd;
 mod native_cmd;
 mod open_cmd;
 mod plugins_cmd;
-mod runtimes_cmd;
 mod scheduler_cmd;
 mod session_io;
 mod skills_cmd;
@@ -283,15 +282,6 @@ fn make_builder() -> Builder<tauri::Wry> {
             agent_cmd::get_agent_settings,
             agent_cmd::set_agent_settings,
             agent_cmd::list_selectable_models,
-            runtimes_cmd::list_runtimes,
-            runtimes_cmd::refresh_runtimes,
-            runtimes_cmd::update_runtime_config,
-            runtimes_cmd::update_runtime,
-            runtimes_cmd::set_runtime_tier,
-            runtimes_cmd::set_default_runtime,
-            runtimes_cmd::runtime_config_status,
-            runtimes_cmd::apply_runtime_config,
-            runtimes_cmd::reset_runtime_config,
             gateways_cmd::list_gateways,
             gateways_cmd::probe_gateways,
             gateways_cmd::add_gateway,

@@ -445,7 +445,6 @@ test("start forwards chat options so composer model, context, and attachments re
   });
 
   expect(start).toHaveBeenCalledWith("p1", "/review", {
-    runtimeId: null,
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
@@ -485,7 +484,6 @@ test("start forwards composer git options to IPC", async () => {
   });
 
   expect(start).toHaveBeenCalledWith("p1", "go", {
-    runtimeId: null,
     model: null,
     context: null,
     attachments: [],

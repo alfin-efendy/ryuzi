@@ -199,91 +199,6 @@ async listSelectableModels() : Promise<Result<string[], CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async listRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("list_runtimes") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Re-probe every catalog agent (PATH + --version + npm latest + local model
- * list for ollama), persist the snapshot, and return the fresh assembly.
- */
-async refreshRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("refresh_runtimes") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async updateRuntimeConfig(id: string, enabled: boolean, model: string | null, permMode: string, flags: string) : Promise<Result<RuntimeInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("update_runtime_config", { id, enabled, model, permMode, flags }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Fire-and-forget npm update; progress streams via CoreEvent
- * RuntimeUpdateLog / RuntimeUpdateDone, then a refreshed snapshot matters —
- * the UI calls refreshRuntimes() on Done.
- */
-async updateRuntime(id: string) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("update_runtime", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setRuntimeTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<RuntimeInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_runtime_tier", { id, tierId, value, combo }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setDefaultRuntime(id: string) : Promise<Result<RuntimeInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_default_runtime", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async runtimeConfigStatus(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("runtime_config_status", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Guard (spec §5): refuse to write configs that point at a dead endpoint —
- * the server must be running and at least one endpoint key must exist.
- */
-async applyRuntimeConfig(id: string, mapping: RuntimeMappingArg) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("apply_runtime_config", { id, mapping }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async resetRuntimeConfig(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reset_runtime_config", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async listGateways() : Promise<Result<GatewayInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_gateways") };
@@ -1278,7 +1193,7 @@ export type CatalogEntry = { id: string; name: string;
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
-export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[]; 
+export type ChatRequestOptions = { model: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**
  * None => engine default (worktree ON, new engine-named branch from HEAD).
  */
@@ -1533,17 +1448,6 @@ export type ProviderQuotaInfo = { provider: string; plan: string | null; message
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
-export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
-/**
- * False for runtimes without an F1 handler (gemini, ollama).
- */
-supported: boolean }
-export type RuntimeInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
-/**
- * Whether Cockpit has a session harness for this agent today.
- */
-runnable: boolean }
-export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
 export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
 /**
  * True when the engine auto-generated the branch name (`harness/{short}`).
@@ -1568,7 +1472,6 @@ ok: boolean;
  * Tri-state probe verdict: "valid" | "invalid" | "unknown".
  */
 status: string; message: string }
-export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type TodoItem = { content: string; status: string }
 export type ToolInfo = { name: string; desc: string; perm: string }
 /**
