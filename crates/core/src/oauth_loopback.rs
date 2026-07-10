@@ -136,8 +136,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (server, result_rx, shutdown_tx) =
             spawn_callback_server(listener, "/plugin-oauth/acme/callback");
-        let url =
-            format!("http://127.0.0.1:{port}/plugin-oauth/acme/callback?code=c-1&state=s-1");
+        let url = format!("http://127.0.0.1:{port}/plugin-oauth/acme/callback?code=c-1&state=s-1");
         let body = reqwest::get(&url).await.unwrap().text().await.unwrap();
         assert!(body.contains("You can close this tab"), "{body}");
         let result = await_callback(server, result_rx, shutdown_tx, Duration::from_secs(5))
@@ -154,13 +153,11 @@ mod tests {
         let (server, result_rx, shutdown_tx) =
             spawn_callback_server(listener, "/plugin-oauth/acme/callback");
         // Another plugin's vendor redirecting onto this live server.
-        let other =
-            format!("http://127.0.0.1:{port}/plugin-oauth/other/callback?code=x&state=y");
+        let other = format!("http://127.0.0.1:{port}/plugin-oauth/other/callback?code=x&state=y");
         let body = reqwest::get(&other).await.unwrap().text().await.unwrap();
         assert!(body.contains("paste it in"), "{body}");
         // The real callback still works afterwards.
-        let url =
-            format!("http://127.0.0.1:{port}/plugin-oauth/acme/callback?code=c-2&state=s-2");
+        let url = format!("http://127.0.0.1:{port}/plugin-oauth/acme/callback?code=c-2&state=s-2");
         let _ = reqwest::get(&url).await.unwrap();
         let result = await_callback(server, result_rx, shutdown_tx, Duration::from_secs(5))
             .await

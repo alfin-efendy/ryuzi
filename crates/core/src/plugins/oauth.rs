@@ -392,7 +392,10 @@ mod tests {
         let base = serve(app).await;
         let http = reqwest::Client::new();
         let metadata = discover_oauth_server_metadata(&http, &base).await.unwrap();
-        assert_eq!(metadata.authorization_endpoint, "https://vendor.test/authorize");
+        assert_eq!(
+            metadata.authorization_endpoint,
+            "https://vendor.test/authorize"
+        );
         assert_eq!(metadata.token_endpoint, "https://vendor.test/token");
         assert_eq!(
             metadata.registration_endpoint.as_deref(),
@@ -419,7 +422,10 @@ mod tests {
         let metadata = discover_oauth_server_metadata(&http, &format!("{base}/v1/mcp/authv2"))
             .await
             .unwrap();
-        assert_eq!(metadata.authorization_endpoint, "https://vendor.test/path-authorize");
+        assert_eq!(
+            metadata.authorization_endpoint,
+            "https://vendor.test/path-authorize"
+        );
         assert!(metadata.registration_endpoint.is_none());
     }
 
@@ -476,7 +482,12 @@ mod tests {
         use axum::{http::StatusCode, routing::post, Router};
         let app = Router::new().route(
             "/register",
-            post(|| async { (StatusCode::FORBIDDEN, r#"{"error":"approved clients only"}"#) }),
+            post(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":"approved clients only"}"#,
+                )
+            }),
         );
         let base = serve(app).await;
         let http = reqwest::Client::new();

@@ -2488,7 +2488,11 @@ mod tests {
     async fn plugin_oauth_client_upsert_merges_columns_and_roundtrips() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
-        assert!(store.get_plugin_oauth_client("acme").await.unwrap().is_none());
+        assert!(store
+            .get_plugin_oauth_client("acme")
+            .await
+            .unwrap()
+            .is_none());
 
         // Discovery fills the endpoints; client_id stays NULL.
         store
@@ -2511,7 +2515,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let row = store.get_plugin_oauth_client("acme").await.unwrap().unwrap();
+        let row = store
+            .get_plugin_oauth_client("acme")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             row,
             PluginOauthClient {
@@ -2532,13 +2540,24 @@ mod tests {
             })
             .await
             .unwrap();
-        let row = store.get_plugin_oauth_client("acme").await.unwrap().unwrap();
-        assert_eq!(row.authorize_url.as_deref(), Some("https://vendor.test/authorize2"));
+        let row = store
+            .get_plugin_oauth_client("acme")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.authorize_url.as_deref(),
+            Some("https://vendor.test/authorize2")
+        );
         assert_eq!(row.token_url.as_deref(), Some("https://vendor.test/token"));
         assert_eq!(row.client_id.as_deref(), Some("client-1"));
 
         store.delete_plugin_oauth_client("acme").await.unwrap();
-        assert!(store.get_plugin_oauth_client("acme").await.unwrap().is_none());
+        assert!(store
+            .get_plugin_oauth_client("acme")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

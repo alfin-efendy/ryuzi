@@ -240,8 +240,8 @@ impl DeclarativeConnector {
             .as_ref()
             .and_then(|row| row.token_url.clone())
             .filter(|value| !value.is_empty());
-        let Some(token_url) = row_token_url
-            .or_else(|| auth.token_url.clone().filter(|value| !value.is_empty()))
+        let Some(token_url) =
+            row_token_url.or_else(|| auth.token_url.clone().filter(|value| !value.is_empty()))
         else {
             store.mark_plugin_oauth_reconnect_required(id).await?;
             return Err(self.http_oauth_auth_required_error(true));

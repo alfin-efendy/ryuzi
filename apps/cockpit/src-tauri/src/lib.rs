@@ -83,9 +83,7 @@ fn resolve_acp_adapter() -> anyhow::Result<(String, Vec<String>)> {
 /// exists to run it.
 #[cfg(debug_assertions)]
 fn dev_sidecar_bundle() -> Option<String> {
-    if ryuzi_core::sidecar::default_bun_probe().is_none() {
-        return None;
-    }
+    ryuzi_core::sidecar::default_bun_probe()?;
     let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dist/sidecar");
     let mut bundles: Vec<std::path::PathBuf> = std::fs::read_dir(dist)
         .ok()?

@@ -191,9 +191,8 @@ fn plugin_oauth_flows() -> &'static Mutex<HashMap<String, PluginOauthFlowState>>
 /// same `{plugin_id}:{state_token}` key as `PLUGIN_OAUTH_FLOWS`. Firing (or
 /// dropping) one makes the background task exit without emitting a
 /// completion event.
-static PLUGIN_INSTALL_CANCELS: OnceLock<
-    Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
-> = OnceLock::new();
+static PLUGIN_INSTALL_CANCELS: OnceLock<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>> =
+    OnceLock::new();
 
 fn plugin_install_cancels() -> &'static Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>> {
     PLUGIN_INSTALL_CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1818,8 +1817,10 @@ mod tests {
     fn use_cockpit_test_key_file() {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
-            let path = std::env::temp_dir()
-                .join(format!("ryuzi-cockpit-test-secret-{}.key", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "ryuzi-cockpit-test-secret-{}.key",
+                std::process::id()
+            ));
             std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
         });
     }
@@ -2056,7 +2057,10 @@ mod tests {
             .unwrap();
         assert!(result.oauth_external);
         assert!(!result.needs_client_id);
-        assert!(result.oauth_begin.is_none(), "external never opens a browser");
+        assert!(
+            result.oauth_begin.is_none(),
+            "external never opens a browser"
+        );
     }
 
     #[tokio::test]
@@ -2081,7 +2085,9 @@ mod tests {
         assert!(!result.needs_client_id);
         let begin = result.oauth_begin.expect("browser flow prepared");
         assert!(
-            begin.authorize_url.starts_with(&format!("{base}/authorize?")),
+            begin
+                .authorize_url
+                .starts_with(&format!("{base}/authorize?")),
             "{}",
             begin.authorize_url
         );
@@ -2095,9 +2101,19 @@ mod tests {
             .contains_key(&plugin_oauth_flow_key("wiz-dcr", &begin.state_token)));
 
         // Endpoints + client id persisted.
-        let row = store.get_plugin_oauth_client("wiz-dcr").await.unwrap().unwrap();
-        assert_eq!(row.authorize_url.as_deref(), Some(format!("{base}/authorize").as_str()));
-        assert_eq!(row.token_url.as_deref(), Some(format!("{base}/token").as_str()));
+        let row = store
+            .get_plugin_oauth_client("wiz-dcr")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.authorize_url.as_deref(),
+            Some(format!("{base}/authorize").as_str())
+        );
+        assert_eq!(
+            row.token_url.as_deref(),
+            Some(format!("{base}/token").as_str())
+        );
         assert_eq!(row.client_id.as_deref(), Some("dcr-client-123"));
 
         // Second begin: cached endpoints reused (no second discovery) and a
@@ -2107,8 +2123,16 @@ mod tests {
             .unwrap();
         assert!(result2.oauth_available);
         assert!(!result2.dcr_succeeded);
-        assert_eq!(discovery_hits.load(Ordering::SeqCst), 1, "no second discovery");
-        assert_eq!(register_hits.load(Ordering::SeqCst), 1, "no second registration");
+        assert_eq!(
+            discovery_hits.load(Ordering::SeqCst),
+            1,
+            "no second discovery"
+        );
+        assert_eq!(
+            register_hits.load(Ordering::SeqCst),
+            1,
+            "no second registration"
+        );
     }
 
     #[tokio::test]
@@ -2134,8 +2158,15 @@ mod tests {
         assert!(!result.dcr_succeeded);
         assert_eq!(register_hits.load(Ordering::SeqCst), 0);
         // Endpoints survive even though registration is impossible.
-        let row = store.get_plugin_oauth_client("wiz-slack").await.unwrap().unwrap();
-        assert_eq!(row.token_url.as_deref(), Some(format!("{base}/token").as_str()));
+        let row = store
+            .get_plugin_oauth_client("wiz-slack")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.token_url.as_deref(),
+            Some(format!("{base}/token").as_str())
+        );
         assert!(row.client_id.is_none());
 
         // Manual client id → re-begin goes straight to the browser flow.
@@ -2158,8 +2189,16 @@ mod tests {
             .unwrap()
             .authorize_url
             .contains("client_id=manual-client"));
-        assert_eq!(discovery_hits.load(Ordering::SeqCst), 1, "cached endpoints reused");
-        assert_eq!(register_hits.load(Ordering::SeqCst), 0, "DCR never attempted");
+        assert_eq!(
+            discovery_hits.load(Ordering::SeqCst),
+            1,
+            "cached endpoints reused"
+        );
+        assert_eq!(
+            register_hits.load(Ordering::SeqCst),
+            0,
+            "DCR never attempted"
+        );
     }
 
     #[tokio::test]
@@ -2180,7 +2219,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.oauth_available);
-        assert!(!result.needs_client_id, "nothing to enter without endpoints");
+        assert!(
+            !result.needs_client_id,
+            "nothing to enter without endpoints"
+        );
         assert!(result.dcr_error.is_some());
         assert!(result.oauth_begin.is_none());
     }

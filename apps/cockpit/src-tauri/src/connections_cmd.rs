@@ -686,12 +686,10 @@ pub async fn test_connection(cp: State<'_, Arc<ControlPlane>>, id: String) -> R<
         })?;
     let result = match models::fetch_connection_models(cp.store(), &client, desc, &mut row).await {
         Ok((status, discovered)) => {
-            if status.is_success() {
-                if !discovered.is_empty() {
-                    row.data.models_override = Some(discovered);
-                    row.updated_at = ryuzi_core::paths::now_ms();
-                    let _ = connections::update_connection(cp.store(), row).await;
-                }
+            if status.is_success() && !discovered.is_empty() {
+                row.data.models_override = Some(discovered);
+                row.updated_at = ryuzi_core::paths::now_ms();
+                let _ = connections::update_connection(cp.store(), row).await;
             }
             probe_outcome(Ok(status))
         }
