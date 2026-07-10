@@ -666,6 +666,7 @@ test("setFocused marks the previously-focused session read up to its lastActive"
         lastActive: 4200,
         resumeAttempts: 0,
         branchOwned: false,
+        permMode: "default",
       },
     ],
     loaded: { s1: true, s2: true },

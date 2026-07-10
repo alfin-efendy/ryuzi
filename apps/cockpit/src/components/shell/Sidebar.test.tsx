@@ -29,6 +29,7 @@ function sess(pk: string, lastActive: number) {
     lastActive,
     resumeAttempts: 0,
     branchOwned: false,
+    permMode: "default" as const,
   };
 }
 

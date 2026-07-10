@@ -79,6 +79,7 @@ function unreadSess(pk: string, lastActive: number | null): Session {
     lastActive,
     resumeAttempts: 0,
     branchOwned: false,
+    permMode: "default",
   };
 }
 
