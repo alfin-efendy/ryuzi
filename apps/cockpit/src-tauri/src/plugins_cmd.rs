@@ -261,8 +261,8 @@ fn source_label(source: &PluginSource) -> &'static str {
 }
 
 /// The catalog kind for a plugin, or `None` when it must not be listed
-/// (runtimes). Order matters: a provider manifest wins over runtime meta
-/// (ollama is both), and a skill-pack source wins over connector shape.
+/// (runtimes). Ollama is purely a provider now, and a skill-pack source
+/// wins over connector shape.
 fn derive_kind(plugin: &CorePlugin) -> Option<&'static str> {
     if plugin.manifest.provider.is_some() {
         return Some("provider");

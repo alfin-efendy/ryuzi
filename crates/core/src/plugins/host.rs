@@ -225,12 +225,12 @@ impl PluginHost {
             // so there is nothing to actually enable. Report disabled
             // unconditionally — this wins over the manifest-only fallback
             // below even if a stray `plugin.<id>.enabled = true` setting
-            // exists. Real capabilities (providers, cli-agents) always
-            // hardcode `experimental = false`, so this never affects them.
+            // exists. Real capabilities (providers) always hardcode
+            // `experimental = false`, so this never affects them.
             return Ok(false);
         }
         if plugin.connector.is_none() {
-            // Manifest-only plugin (e.g. a provider/cli-agent metadata entry
+            // Manifest-only plugin (e.g. a provider metadata entry
             // with no behavioral capability of its own) — always enabled.
             return Ok(true);
         }

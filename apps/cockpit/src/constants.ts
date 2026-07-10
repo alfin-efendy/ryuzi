@@ -15,8 +15,8 @@ export const PERM_MODES: { id: UiPermMode; label: string; desc: string }[] = [
 ];
 
 // The project row stores the engine's `PermMode`; the composer speaks the UI
-// four-mode vocabulary. These keep the two in sync (mirrors the Rust
-// `ui_perm_to_core` in crates/core/src/runtimes.rs).
+// four-mode vocabulary. These keep the two in sync (maps onto the engine's
+// PermMode at session start).
 export type CorePermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan";
 
 export function corePermToUi(mode: CorePermMode | string): UiPermMode {

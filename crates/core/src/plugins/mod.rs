@@ -178,7 +178,7 @@ pub(crate) fn load_skill_pack_plugins_from(
 ///   `plugin.<id>.enabled` write (see that method's doc) — toggling would
 ///   silently no-op
 /// - no harness/gateway/connector capability (manifest-only, e.g. a
-///   provider/cli-agent metadata entry) → an error, since `is_enabled`
+///   provider metadata entry) → an error, since `is_enabled`
 ///   always reports it enabled regardless of any `plugin.<id>.enabled`
 ///   write — toggling would silently no-op
 /// - connector-only → set `plugin.<id>.enabled` to `"true"`/`"false"`

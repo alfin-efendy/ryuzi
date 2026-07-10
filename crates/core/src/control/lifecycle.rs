@@ -46,22 +46,16 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
 
-        // A project without a pinned MODEL inherits THIS session's runtime
-        // config (Runtime screen → real effect), keyed off the project's own
-        // harness — otherwise a native session would inherit the Claude card's
-        // model and every turn would hit the Claude subscription.
+        // A project without a pinned MODEL inherits the agent's default model
+        // (Settings → Agent, stored under the `agent_model` settings key).
         //
-        // Permission mode is NOT inherited from the runtime card: the project's
-        // own `perm_mode` (set from the composer / project settings) is the
-        // single source of truth. `Default` means "Ask" (prompt before
-        // edits/commands) — inheriting the card's default (e.g. "Full") here is
-        // exactly what made a project set to Ask silently run without asking.
+        // Permission mode is NOT inherited: the project's own `perm_mode` (set
+        // from the composer / project settings) is the single source of truth.
+        // `Default` means "Ask" — inheriting a global default here is exactly
+        // what made a project set to Ask silently run without asking.
         if project.model.is_none() {
-            let runtime_id = crate::runtimes::runtime_id_for_harness(&project.harness);
-            if let Ok(defaults) =
-                crate::runtimes::session_defaults_for(&self.store, runtime_id).await
-            {
-                project.model = defaults.model;
+            if let Ok(agent) = crate::agent_settings::get(&self.store).await {
+                project.model = agent.model.filter(|m| !m.trim().is_empty());
             }
         }
 

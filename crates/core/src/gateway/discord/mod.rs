@@ -301,7 +301,6 @@ impl InboundRouting {
                         name: e.options.get("name").cloned(),
                         git_url: e.options.get("git").cloned(),
                         settings: crate::control::ProvisionSettings {
-                            harness: None,
                             model: e.options.get("model").cloned(),
                             effort: e.options.get("effort").cloned(),
                             perm_mode: e.options.get("mode").map(|m| PermMode::from_db(m)),

@@ -2451,12 +2451,11 @@ async fn provision_project_explicit_settings_override_defaults() {
 
     let mut req = provision_req("fake", "ws1", "u1");
     req.name = Some("overridden".to_string());
-    req.settings.harness = Some("other-harness".to_string());
     req.settings.model = Some("sonnet".to_string());
     req.settings.effort = Some("low".to_string());
     let project = cp.provision_project(req).await.unwrap();
 
-    assert_eq!(project.harness, "other-harness");
+    assert_eq!(project.harness, "native");
     assert_eq!(project.model.as_deref(), Some("sonnet"));
     assert_eq!(project.effort.as_deref(), Some("low"));
 }
