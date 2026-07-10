@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
@@ -11,12 +11,13 @@ import { useConnections } from "@/store-connections";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
-import { groupModelOptions } from "@/lib/model-groups";
+import { headerAgentLine } from "@/lib/session-header";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalPrompt } from "@/components/ApprovalPrompt";
 import { StatusDot } from "@/components/common/bits";
+import { ModelPicker } from "@/components/ModelPicker";
 import { Transcript } from "@/components/transcript/Transcript";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
@@ -25,12 +26,36 @@ import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
+import { HISTORY_IDLE, historyEntries, shouldNavigateHistory, stepHistory, type HistoryState } from "@/components/composer/inputHistory";
 
 export function SessionView() {
-  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
-    useStore();
+  const {
+    sessions,
+    transcripts,
+    focusedSessionPk,
+    send,
+    stop,
+    pendingApprovals,
+    projects,
+    setProjectModel,
+    setProjectPermMode,
+    contextUsage,
+  } = useStore();
   const nav = useNav();
-  const [draft, setDraft] = useState("");
+  // Draft text lives in the persisted useNav drafts map keyed by session, so
+  // switching sessions/views (SessionView renders un-keyed in App.tsx) swaps
+  // the visible text instead of leaking one session's draft into another.
+  const draftKey = focusedSessionPk ?? "";
+  const draft = nav.drafts[draftKey] ?? "";
+  // Same call shape as the old useState setter so pickContext/voice callbacks
+  // keep working; reads go through getState() to avoid stale closures.
+  const setDraft = useCallback(
+    (next: string | ((cur: string) => string)) => {
+      const { drafts, setDraft: write } = useNav.getState();
+      write(draftKey, typeof next === "function" ? next(drafts[draftKey] ?? "") : next);
+    },
+    [draftKey],
+  );
   const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
@@ -49,8 +74,6 @@ export function SessionView() {
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
-  const catalog = useConnections((s) => s.catalog);
-  const connections = useConnections((s) => s.connections);
   const connectionsLoaded = useConnections((s) => s.loaded);
   const hydrateConnections = useConnections((s) => s.hydrate);
 
@@ -73,6 +96,28 @@ export function SessionView() {
     }
     prevSessionRunning.current = sessionRunning;
   }, [sessionRunning, session?.sessionPk, fetchDiff]);
+
+  // ArrowUp/Down history over this session's sent messages. A ref (not state)
+  // holds the navigation cursor — it never drives rendering.
+  const historyRef = useRef<HistoryState>(HISTORY_IDLE);
+  const history = useMemo(() => historyEntries(rows), [rows]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the cleanup writes back to the *previous* session (closed over from this render); reset is edge-triggered off the focused session
+  useEffect(() => {
+    historyRef.current = HISTORY_IDLE;
+    return () => {
+      // Leaving this session while history navigation is active (switching
+      // sessions/views, or unmounting) would otherwise strand the
+      // pre-recall draft in this in-memory ref forever — write it back to
+      // the persisted drafts map so it survives. This cleanup runs on both
+      // dependency change and unmount, covering both loss paths with one
+      // code path. A completed send resets historyRef to HISTORY_IDLE
+      // synchronously in submit() — without a session change — so that
+      // path never reaches this cleanup with a stale pending value.
+      if (historyRef.current.index >= 0) {
+        useNav.getState().setDraft(draftKey, historyRef.current.pending);
+      }
+    };
+  }, [focusedSessionPk]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
@@ -111,6 +156,7 @@ export function SessionView() {
 
   const meta = statusMeta(session.status);
   const running = session.status === "running";
+  const usage = contextUsage[session.sessionPk];
   const hasApproval = pendingApprovals.some((a) => a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(project?.permMode ?? "default");
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
@@ -120,12 +166,19 @@ export function SessionView() {
   const submit = () => {
     const t = draft.trim();
     if (!t && composerFiles.attachments.length === 0) return;
-    setDraft("");
+    const key = session.sessionPk;
+    const typed = draft;
+    // Clear optimistically; a rejected send puts the text back (unless the
+    // user already started typing something new — restoreDraft is a no-op then).
+    useNav.getState().clearDraft(key);
+    historyRef.current = HISTORY_IDLE;
     composerFiles.clear();
     setContextRefs([]);
-    void send(session.sessionPk, t, {
+    void send(key, t, {
       context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
+    }).then((ok) => {
+      if (!ok) useNav.getState().restoreDraft(key, typed);
     });
   };
 
@@ -167,7 +220,7 @@ export function SessionView() {
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
             <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-              <span>{agent ? `${agent.name} · ${agent.model || agent.connection}` : "No agent detected"}</span>
+              <span>{headerAgentLine(agent, project)}</span>
               {session.branch && (
                 <span className="inline-flex items-center gap-1">
                   <GitBranch aria-hidden size={11} strokeWidth={2} />
@@ -220,20 +273,35 @@ export function SessionView() {
           >
             <Textarea
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => {
+                // Typing exits history mode: the edited text becomes the live draft.
+                historyRef.current = HISTORY_IDLE;
+                setDraft(e.target.value);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   submit();
+                  return;
+                }
+                if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                  const dir = e.key === "ArrowUp" ? ("up" as const) : ("down" as const);
+                  const popupOpen = slashMatches.length > 0 || contextHits.length > 0;
+                  const el = e.currentTarget;
+                  if (!shouldNavigateHistory(dir, draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, popupOpen)) return;
+                  const step = stepHistory(dir, history, historyRef.current, draft);
+                  if (!step) return;
+                  e.preventDefault();
+                  historyRef.current = step.state;
+                  setDraft(step.text);
                 }
               }}
               onPaste={composerFiles.onPaste}
               placeholder="Ask for follow-up changes"
-              rows={1}
-              className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
+              className="max-h-[40vh] min-h-0 resize-none overflow-y-auto border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
             />
             {slashMatches.length > 0 && (
-              <MenuPanel onClose={() => undefined} className="bottom-[82px] left-2.5 z-50 w-[320px]">
+              <MenuPanel onClose={() => undefined} className="bottom-full left-2.5 z-50 mb-1.5 w-[320px]">
                 <MenuSectionLabel>Commands</MenuSectionLabel>
                 {slashMatches.map((cmd) => (
                   <MenuItem key={cmd.name} onClick={() => setDraft(`/${cmd.name} `)} className="font-medium">
@@ -244,7 +312,7 @@ export function SessionView() {
               </MenuPanel>
             )}
             {contextHits.length > 0 && (
-              <MenuPanel onClose={() => setContextHits([])} className="bottom-[82px] left-2.5 z-50 w-[360px]">
+              <MenuPanel onClose={() => setContextHits([])} className="bottom-full left-2.5 z-50 mb-1.5 w-[360px]">
                 <MenuSectionLabel>Context</MenuSectionLabel>
                 {contextHits.map((path) => (
                   <MenuItem key={path} onClick={() => pickContext(path)} className="font-medium">
@@ -286,26 +354,24 @@ export function SessionView() {
                 }
               />
               <div className="flex-1" />
-              <Combobox
-                aria-label="Model"
-                options={groupModelOptions(modelOptions, catalog, connections)}
-                value={selectedModel || null}
+              {usage && (
+                <span
+                  className="w-32 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground"
+                  title={`~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
+                >
+                  {usage.percentLeft}% context left
+                </span>
+              )}
+              <ModelPicker
+                ariaLabel="Model"
+                variant="chip"
+                models={modelOptions}
+                value={selectedModel}
                 onValueChange={(m) => {
                   if (projectId) void setProjectModel(projectId, m);
                 }}
                 disabled={modelOptions.length === 0}
-                trigger={
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    title={modelOptions.length === 0 ? "No models available. Add a provider connection in Models." : "Model"}
-                    className="font-semibold"
-                  >
-                    <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
-                    {selectedModel || agent?.name || "No agent"}
-                    <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                  </Button>
-                }
+                placeholder="Default model"
               />
               <Button
                 variant="ghost"

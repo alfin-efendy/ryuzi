@@ -153,10 +153,18 @@ impl Tool for Bash {
         let text = truncate(&text, &ctx.caps);
         Ok(ToolOutput {
             for_model: text,
-            display: None,
+            display: exit_display(output.status.code()),
             is_error,
         })
     }
+}
+
+/// Structured display extras for a finished process: `{"exit_code": N}` when
+/// the OS reported a code (0 included — the UI renders it as a badge), `None`
+/// for signal deaths. The model-facing text keeps its `[exit code N]` suffix
+/// on failure; this field exists so the UI never parses that text.
+fn exit_display(code: Option<i32>) -> Option<Value> {
+    code.map(|c| json!({ "exit_code": c }))
 }
 
 /// Locate a POSIX `sh` for Windows. Pure — the caller passes the relevant
@@ -269,6 +277,7 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.for_model.contains("exit code 3"));
+        assert_eq!(out.display, Some(json!({ "exit_code": 3 })));
     }
 
     #[tokio::test]
@@ -294,6 +303,17 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.for_model.contains("interrupted"));
+    }
+
+    #[test]
+    fn exit_display_is_structured_and_keeps_zero() {
+        assert_eq!(exit_display(Some(0)), Some(json!({ "exit_code": 0 })));
+        assert_eq!(exit_display(Some(3)), Some(json!({ "exit_code": 3 })));
+    }
+
+    #[test]
+    fn exit_display_is_absent_for_signal_deaths() {
+        assert_eq!(exit_display(None), None);
     }
 
     /// End-to-end on Windows: the resolver finds a shell even when `sh` is

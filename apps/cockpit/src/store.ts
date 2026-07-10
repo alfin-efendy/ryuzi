@@ -13,6 +13,7 @@ import {
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
+import { useNative } from "./store-native";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
@@ -37,6 +38,8 @@ type State = {
   selectedProjectId: string | null;
   lastSeq: Record<string, number>;
   loaded: Record<string, boolean>;
+  /** Per-session context-window usage from the latest `contextUsage` event. */
+  contextUsage: Record<string, { activeTokens: number; usableWindow: number; percentLeft: number }>;
   applyCoreEvent: (e: CoreEvent) => void;
   clearApproval: (requestId: string) => void;
   setFocused: (pk: string | null) => void;
@@ -53,7 +56,9 @@ type State = {
   /** Resolves true as soon as the backend accepts — navigate immediately;
    *  the session list refresh completes in the background. */
   start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
-  send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
+  /** Resolves true when the backend accepted the prompt — false lets the
+   *  composer restore its optimistically-cleared draft. */
+  send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
   stop: (sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
   end: (sessionPk: string) => Promise<boolean>;
@@ -92,6 +97,7 @@ export const useStore = create<State>((set, get) => ({
   selectedProjectId: null,
   lastSeq: {},
   loaded: {},
+  contextUsage: {},
 
   applyCoreEvent: (e) =>
     set((st) => {
@@ -103,6 +109,15 @@ export const useStore = create<State>((set, get) => ({
           };
         case "message": {
           const pk = e.session_pk;
+          // A COMPLETED `todowrite` means this session's todo list just changed
+          // in the DB — refetch so the plan widget updates mid-run instead of
+          // waiting for the run to settle. (The initial in_progress emit fires
+          // BEFORE the tool executes, so fetching then would read stale data.)
+          // Fire-and-forget: loadTodos' fetch token drops out-of-order replies.
+          const payload = (e.payload ?? {}) as Record<string, unknown>;
+          if (e.block_type === "tool_call" && payload.name === "todowrite" && e.status === "completed") {
+            void useNative.getState().loadTodos(pk);
+          }
           // Tool updates re-use the original row's seq — upsert by identity
           // BEFORE the seq high-water guard would drop them as stale.
           if (e.tool_call_id) {
@@ -123,23 +138,15 @@ export const useStore = create<State>((set, get) => ({
           };
         }
         case "error":
-          // Transient infrastructure error (not a persisted transcript row; seq 0).
-          return {
-            transcripts: append(st.transcripts, e.session_pk, {
-              seq: 0,
-              role: "system",
-              blockType: "error",
-              text: e.message,
-              toolCallId: null,
-              toolStatus: null,
-              toolKind: null,
-              toolName: null,
-              toolOutput: null,
-              createdAt: Date.now(),
-              attachments: [],
-              toolPath: null,
-            }),
-          };
+          // Turn failed. The error text is persisted by the backend
+          // (emit_error) and arrives as a normal "message" event
+          // (role=system, block_type=error) BEFORE this terminal event, so
+          // appending a transient copy here would double-render it. Mirror
+          // the "result" arm: flip the session out of "running" (composer
+          // leaves Stop mode, the "Working…" pulse stops) and refresh so the
+          // DB-side Running→Idle demotion lands in the UI.
+          void get().refresh();
+          return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
         case "approvalRequested":
           return {
             pendingApprovals: [
@@ -157,6 +164,21 @@ export const useStore = create<State>((set, get) => ({
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
         case "sessionEnded":
           return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "ended" as const } : s)) };
+        case "contextUsage":
+          return {
+            contextUsage: {
+              ...st.contextUsage,
+              [e.session_pk]: {
+                activeTokens: e.active_tokens,
+                usableWindow: e.usable_window,
+                percentLeft: e.percent_left,
+              },
+            },
+          };
+        case "contextCompacted":
+          // The transcript notice arrives as a persisted message row; no
+          // extra state to keep here.
+          return {};
         default:
           return {};
       }
@@ -180,8 +202,9 @@ export const useStore = create<State>((set, get) => ({
     const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind, m.createdAt));
     const maxSeq = rows.reduce((mx, m) => Math.max(mx, m.seq), 0);
     set((st) => {
-      // Rows appended by applyCoreEvent while listMessages was in flight (fresher
-      // than the snapshot, or transient seq-0 error rows) must survive the replace.
+      // Rows appended by applyCoreEvent while listMessages was in flight
+      // (fresher than the snapshot) must survive the replace. seq-0 rows are
+      // kept defensively — no reducer currently produces them.
       const liveTail = (st.transcripts[pk] ?? []).filter((r) => r.seq > maxSeq || r.seq === 0);
       return {
         transcripts: { ...st.transcripts, [pk]: [...hydrated, ...liveTail] },
@@ -267,6 +290,7 @@ export const useStore = create<State>((set, get) => ({
       toast.error("Couldn't send message: " + res.error.message);
     }
     await get().refresh();
+    return res.status === "ok";
   },
   stop: async (sessionPk) => {
     const res = await commands.stopSession(sessionPk);

@@ -75,6 +75,13 @@ pub struct ProviderDescriptor {
     /// (their /models route 404s), so the refresh path must not treat the
     /// absence of a live catalog as an error.
     pub has_models_endpoint: bool,
+    /// OpenAI's current generation (gpt-5.x / o-series) rejects `max_tokens`
+    /// with HTTP 400 and requires `max_completion_tokens` instead. When set,
+    /// OpenAI-format request bodies get the field renamed post-translation
+    /// (both the model probe and the real chat path). True ONLY for the
+    /// first-party `openai` entry — every other OpenAI-compatible provider
+    /// still speaks `max_tokens`.
+    pub uses_max_completion_tokens: bool,
     /// RFC 8628 device-authorization grant config (Qwen, GitHub Copilot).
     /// Mutually exclusive with `oauth` and `device_flow`. Ported constants
     /// from 9router (MIT, (c) 2024-2026 decolua and contributors).
@@ -204,6 +211,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -225,6 +233,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: true,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -246,6 +255,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -267,6 +277,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -288,6 +299,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -309,6 +321,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -330,6 +343,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -351,6 +365,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -372,6 +387,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -393,6 +409,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -414,6 +431,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
@@ -453,6 +471,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -482,6 +501,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
         // NOTE: openai-oauth upstream is chatgpt.com/backend-api/codex/responses
         // (Responses wire) — applied in server.rs, not via base_url here.
@@ -503,7 +523,9 @@ pub const CATALOG: &[ProviderDescriptor] = &[
             "deepseek-3.2",
             "qwen3-coder-next",
             "glm-5",
-            "MiniMax-M2.5",
+            // CodeWhisperer model ids are lowercase; "MiniMax-M2.5" is
+            // rejected upstream with 400 INVALID_MODEL_ID.
+            "minimax-m2.5",
         ],
         requires_base_url: false,
         oauth: None,
@@ -512,7 +534,11 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: true,
         chat_path: None,
-        has_models_endpoint: true,
+        // No live /models route — CodeWhisperer isn't OpenAI-compatible for
+        // discovery; the seeded list above stands and "Refresh models"
+        // reports it instead of erroring.
+        has_models_endpoint: false,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -534,6 +560,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -557,6 +584,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: Some("/chat"),
         has_models_endpoint: false,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -578,6 +606,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -599,6 +628,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: true,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -627,6 +657,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: false,
+        uses_max_completion_tokens: false,
         device_grant: None,
     },
     ProviderDescriptor {
@@ -653,6 +684,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: false,
         chat_path: None,
         has_models_endpoint: false,
+        uses_max_completion_tokens: false,
         device_grant: Some(QWEN_DEVICE_GRANT),
     },
     ProviderDescriptor {
@@ -682,6 +714,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         risk_notice: true,
         chat_path: None,
         has_models_endpoint: false,
+        uses_max_completion_tokens: false,
         device_grant: Some(GITHUB_DEVICE_GRANT),
     },
 ];
@@ -914,7 +947,42 @@ mod tests {
     fn only_seed_only_providers_lack_a_models_endpoint() {
         assert!(!descriptor("mimo-free").unwrap().has_models_endpoint);
         assert!(!descriptor("cloudflare-ai").unwrap().has_models_endpoint);
+        assert!(!descriptor("kiro").unwrap().has_models_endpoint);
         assert!(descriptor("openai").unwrap().has_models_endpoint);
+    }
+
+    #[test]
+    fn only_openai_requires_max_completion_tokens() {
+        // OpenAI's gpt-5.x / o-series rejects `max_tokens` (HTTP 400) and
+        // requires `max_completion_tokens`; no other OpenAI-format provider
+        // does, so the flag must stay scoped to the first-party entry.
+        assert!(descriptor("openai").unwrap().uses_max_completion_tokens);
+        for d in CATALOG.iter().filter(|d| d.id != "openai") {
+            assert!(
+                !d.uses_max_completion_tokens,
+                "{} must NOT set uses_max_completion_tokens",
+                d.id
+            );
+        }
+    }
+
+    #[test]
+    fn kiro_uses_its_seeded_model_list() {
+        // Kiro has no OpenAI-compatible /models route — "Refresh models"
+        // must report the seeded-list message instead of erroring.
+        assert!(!descriptor("kiro").unwrap().has_models_endpoint);
+    }
+
+    #[test]
+    fn kiro_seeded_model_ids_use_codewhisperer_casing() {
+        // CodeWhisperer validates modelId case-sensitively: probing
+        // "MiniMax-M2.5" returns 400 INVALID_MODEL_ID while "minimax-m2.5"
+        // passes validation (verified live 2026-07-10 against
+        // runtime.us-east-1.kiro.dev). Every other seeded id already
+        // validates; lock the lowercase form so it can't regress.
+        let models = descriptor("kiro").unwrap().models;
+        assert!(models.contains(&"minimax-m2.5"));
+        assert!(!models.contains(&"MiniMax-M2.5"));
     }
 
     #[test]

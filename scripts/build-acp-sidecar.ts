@@ -101,6 +101,14 @@ const BUN_TO_TRIPLE: Record<string, string> = {
   "bun-windows-x64": "x86_64-pc-windows-msvc",
 };
 
+/**
+ * Asset filenames drop the `-unknown` vendor segment (platform tag), matching
+ * the ryuzi CLI tarball scheme. Manifest `standalone` KEYS stay full triples:
+ * hosts look artifacts up by their compile-time RYUZI_TARGET (crates/core
+ * build.rs), which is a real Rust triple.
+ */
+const platformTag = (triple: string): string => triple.replace("-unknown", "");
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -296,7 +304,7 @@ if (wantAllTargets) {
   console.log("\n--- Standalone binaries (all targets) ---");
   for (const [bunTargetKey, triple] of Object.entries(BUN_TO_TRIPLE)) {
     const ext = bunTargetKey.includes("windows") ? ".exe" : "";
-    const out = join(DIST, `${BIN_NAME}-${ACP_VERSION}-${triple}${ext}`);
+    const out = join(DIST, `${BIN_NAME}-${ACP_VERSION}-${platformTag(triple)}${ext}`);
     run("bun", ["build", "--compile", "--minify", `--target=${bunTargetKey}`, `--outfile=${out}`, entryPoint]);
     binaries[triple] = out;
   }

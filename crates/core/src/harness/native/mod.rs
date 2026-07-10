@@ -12,8 +12,8 @@
 
 pub mod agents;
 pub mod commands;
-pub mod compaction;
 pub mod context;
+pub mod context_manager;
 pub mod format;
 pub mod hooks;
 pub mod ledger;
@@ -125,6 +125,10 @@ impl Harness for NativeHarness {
         // route/model when a stale project pins a target no connection
         // actually serves anymore.
         let model = resolve_native_model(&ctx.store, ctx.model).await;
+        let meta =
+            crate::llm_router::model_meta::resolve(&ctx.store, model.as_deref().unwrap_or(""))
+                .await;
+        crate::llm_router::model_meta::spawn_refresh();
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
@@ -148,6 +152,8 @@ impl Harness for NativeHarness {
                 work_dir: ctx.work_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 model,
+                effort: ctx.effort,
+                meta,
                 perm_mode: Arc::new(std::sync::Mutex::new(ctx.perm_mode)),
                 project_policy: None,
                 store: ctx.store,
@@ -162,6 +168,7 @@ impl Harness for NativeHarness {
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             },
             live_cancel: Mutex::new(None),
+            turn_lock: tokio::sync::Mutex::new(()),
         }))
     }
 }
@@ -173,11 +180,20 @@ pub struct NativeSession {
     /// The in-flight turn's cancellation token, set for the duration of
     /// `send_prompt` so `cancel`/`end` can trip it.
     live_cancel: Mutex<Option<CancellationToken>>,
+    /// Serializes turns: two concurrent `send_prompt`s (double-send, gateway +
+    /// UI race) must never interleave their `provider_turns` appends, or the
+    /// ledger's user/assistant alternation — and its tool_use/tool_result
+    /// pairing — breaks durably.
+    turn_lock: tokio::sync::Mutex<()>,
 }
 
 #[async_trait]
 impl HarnessSession for NativeSession {
     async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+        // One turn at a time per session. A queued second prompt simply waits;
+        // `cancel()` trips only the CURRENT turn's token (the queued turn gets
+        // a fresh one when it starts).
+        let _turn = self.turn_lock.lock().await;
         let cancel = CancellationToken::new();
         *self.live_cancel.lock().unwrap() = Some(cancel.clone());
         let result = runner::run_turn(&self.deps, prompt, cancel).await;
@@ -377,6 +393,85 @@ mod tests {
         // cancel()/end() are safe no-ops when idle.
         session.cancel().await.unwrap();
         session.end().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_prompts_on_one_session_are_serialized() {
+        use runner::testutil::{message_delta, message_stop, text_delta};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Holds each provider stream open ~100ms and records how many
+        /// streams were ever active at once: >1 means two turns interleaved
+        /// their provider calls (and therefore their ledger appends).
+        struct OverlapLlm {
+            active: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl llm::LlmStream for OverlapLlm {
+            async fn stream(
+                &self,
+                _body: serde_json::Value,
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<AnthropicEvent>>>
+            {
+                let n = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_seen.fetch_max(n, Ordering::SeqCst);
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                let active = self.active.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let _ = tx.send(Ok(text_delta("ok"))).await;
+                    let _ = tx.send(Ok(message_delta("end_turn"))).await;
+                    // Mark the stream finished BEFORE the terminal event: a
+                    // serialized follow-up turn can only start after
+                    // message_stop is consumed, so it never counts as overlap.
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let _ = tx.send(Ok(message_stop())).await;
+                });
+                Ok(rx)
+            }
+        }
+
+        struct SharedFactory(Arc<OverlapLlm>);
+        impl llm::LlmStreamFactory for SharedFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let overlap = Arc::new(OverlapLlm {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+        });
+        let plugin = native_plugin_with_llm_factory(Arc::new(SharedFactory(overlap.clone())));
+        let harness = plugin.harness.unwrap().create().unwrap();
+        let session = harness
+            .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
+            .await
+            .unwrap();
+
+        // Two prompts land on the SAME session at the same time (double-send,
+        // UI + gateway race, boot-nudge racing a user prompt).
+        let (ra, rb) = tokio::join!(
+            session.send_prompt(TurnPrompt::text("one", "one")),
+            session.send_prompt(TurnPrompt::text("two", "two")),
+        );
+        ra.unwrap();
+        rb.unwrap();
+
+        assert_eq!(
+            overlap.max_seen.load(Ordering::SeqCst),
+            1,
+            "turns must not interleave provider calls"
+        );
+        // The durable ledger alternates cleanly: two complete turns in a row.
+        let turns = store.list_provider_turns("sess").await.unwrap();
+        let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
     }
 
     fn conn_for_resolution_tests(

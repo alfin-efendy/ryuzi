@@ -16,6 +16,11 @@ type NativeState = {
   shareSession: (sessionPk: string) => Promise<string | null>;
 };
 
+// Monotonic per-session fetch tokens for loadTodos: `todowrite` events and the
+// settle-time reload can race, and command responses may resolve out of order.
+// Only the newest in-flight fetch for a session may commit its result.
+const todoFetchToken: Record<string, number> = {};
+
 export const useNative = create<NativeState>((set) => ({
   agentsByProject: {},
   commandsByProject: {},
@@ -36,8 +41,10 @@ export const useNative = create<NativeState>((set) => ({
   },
 
   loadTodos: async (sessionPk) => {
+    const token = (todoFetchToken[sessionPk] ?? 0) + 1;
+    todoFetchToken[sessionPk] = token;
     const res = await commands.sessionTodos(sessionPk);
-    if (res.status === "ok") {
+    if (res.status === "ok" && todoFetchToken[sessionPk] === token) {
       set((s) => ({ todosBySession: { ...s.todosBySession, [sessionPk]: res.data } }));
     }
   },

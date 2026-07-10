@@ -661,7 +661,10 @@ command = "acme-mcp"
             "dir name mismatching the claimed plugin id must not be healed or loaded"
         );
         assert!(
-            !plugins_root.path().join("impostor/.ryuzi-skill.json").is_file(),
+            !plugins_root
+                .path()
+                .join("impostor/.ryuzi-skill.json")
+                .is_file(),
             "the impostor directory must not receive a provenance stamp"
         );
     }

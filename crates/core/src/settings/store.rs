@@ -29,6 +29,17 @@ pub fn validate_setting(key: &str, value: &str) -> Option<String> {
         }
         return None;
     }
+    // `models.meta.<model_id>` is a dynamic-suffix key (like `plugin.*`):
+    // per-model metadata overrides carrying a JSON object value.
+    if let Some(model_id) = key.strip_prefix("models.meta.") {
+        if model_id.is_empty() {
+            return Some(format!("unknown setting: {key}"));
+        }
+        return match serde_json::from_str::<serde_json::Value>(value) {
+            Ok(v) if v.is_object() => None,
+            _ => Some(format!("{key} must be a JSON object")),
+        };
+    }
     match crate::plugins::plugin_field(key) {
         Some(field) => validate_plugin_field(key, value, &field),
         None => Some(format!("unknown setting: {key}")),
@@ -276,6 +287,25 @@ mod tests {
         assert_eq!(csv(Some("a, b,,c ")), vec!["a", "b", "c"]);
         assert!(csv(None).is_empty());
         assert!(csv(Some("")).is_empty());
+    }
+
+    #[test]
+    fn models_meta_keys_validate_as_json_objects() {
+        assert_eq!(
+            validate_setting(
+                "models.meta.claude-sonnet-4-5",
+                r#"{"context_window":200000}"#
+            ),
+            None
+        );
+        assert_eq!(
+            validate_setting("models.meta.x", "not json"),
+            Some("models.meta.x must be a JSON object".to_string())
+        );
+        assert_eq!(
+            validate_setting("models.meta.", "{}"),
+            Some("unknown setting: models.meta.".to_string())
+        );
     }
 
     #[tokio::test]

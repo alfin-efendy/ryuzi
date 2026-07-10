@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
@@ -11,9 +11,8 @@ import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject } from "@/lib/composer-git";
-import { groupModelOptions } from "@/lib/model-groups";
 import { projectLabel } from "@/lib/sidebar";
-import { StatusDot } from "@/components/common/bits";
+import { ModelPicker } from "@/components/ModelPicker";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -23,7 +22,6 @@ import { BranchNameModal } from "@/components/modals/BranchNameModal";
 export function HomeView() {
   const { projects, selectedProjectId, selectProject, start, setProjectModel } = useStore();
   const nav = useNav();
-  const [draft, setDraft] = useState("");
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
@@ -33,6 +31,15 @@ export function HomeView() {
 
   const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
   const projectId = project?.projectId;
+  const draftKey = `home:${projectId ?? ""}`;
+  const draft = nav.drafts[draftKey] ?? "";
+  const setDraft = useCallback(
+    (next: string | ((cur: string) => string)) => {
+      const { drafts, setDraft: write } = useNav.getState();
+      write(draftKey, typeof next === "function" ? next(drafts[draftKey] ?? "") : next);
+    },
+    [draftKey],
+  );
   const isGit = project?.isGit ?? false;
   const runtimes = useRuntimes((s) => s.runtimes);
   // Ryuzi-only: every session runs the native runtime; the user picks a model.
@@ -42,8 +49,6 @@ export function HomeView() {
   const setComposerModel = useNav((s) => s.setComposerModel);
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
-  const catalog = useConnections((s) => s.catalog);
-  const connections = useConnections((s) => s.connections);
   const connectionsLoaded = useConnections((s) => s.loaded);
   const hydrateConnections = useConnections((s) => s.hydrate);
 
@@ -157,11 +162,13 @@ export function HomeView() {
       attachments: composerFiles.attachments,
       git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
     };
-    setDraft("");
+    const typed = draft;
+    useNav.getState().clearDraft(draftKey);
     composerFiles.clear();
     setContextRefs([]);
     const ok = await start(project.projectId, t, opts);
     if (ok) nav.navigate({ kind: "session" });
+    else useNav.getState().restoreDraft(draftKey, typed);
   };
 
   return (
@@ -184,11 +191,10 @@ export function HomeView() {
             }}
             onPaste={composerFiles.onPaste}
             placeholder="Do anything"
-            rows={2}
-            className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-[18px] pb-1 pt-4 text-[14.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[14.5px] dark:bg-transparent"
+            className="max-h-[40vh] resize-none overflow-y-auto border-none bg-transparent px-[18px] pb-1 pt-4 text-[14.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[14.5px] dark:bg-transparent"
           />
           {slashMatches.length > 0 && (
-            <MenuPanel onClose={() => undefined} className="bottom-[86px] left-3 z-50 w-[320px]">
+            <MenuPanel onClose={() => undefined} className="bottom-full left-3 z-50 mb-1.5 w-[320px]">
               <MenuSectionLabel>Commands</MenuSectionLabel>
               {slashMatches.map((cmd) => (
                 <MenuItem key={cmd.name} onClick={() => setDraft(`/${cmd.name} `)} className="font-medium">
@@ -199,7 +205,7 @@ export function HomeView() {
             </MenuPanel>
           )}
           {contextHits.length > 0 && (
-            <MenuPanel onClose={() => setContextHits([])} className="bottom-[86px] left-3 z-50 w-[360px]">
+            <MenuPanel onClose={() => setContextHits([])} className="bottom-full left-3 z-50 mb-1.5 w-[360px]">
               <MenuSectionLabel>Context</MenuSectionLabel>
               {contextHits.map((path) => (
                 <MenuItem key={path} onClick={() => pickContext(path)} className="font-medium">
@@ -229,28 +235,17 @@ export function HomeView() {
               {PERM_MODES.find((m) => m.id === native?.permMode)?.label ?? "Ask"}
             </Button>
             <div className="flex-1" />
-            <Combobox
-              aria-label="Model"
-              options={groupModelOptions(modelOptions, catalog, connections)}
-              value={selectedModel || null}
+            <ModelPicker
+              ariaLabel="Model"
+              variant="chip"
+              models={modelOptions}
+              value={selectedModel}
               onValueChange={(m) => {
                 setComposerModel(m);
                 if (projectId) void setProjectModel(projectId, m);
               }}
               disabled={modelOptions.length === 0}
               placeholder="Default model"
-              trigger={
-                <Button
-                  variant="ghost"
-                  title={modelOptions.length === 0 ? "No models available. Add a provider connection in Models." : "Model"}
-                  className="font-semibold"
-                >
-                  <StatusDot color={native?.color ?? "var(--muted-foreground)"} />
-                  {selectedModel || "Default model"}
-                  <span className="font-normal text-muted-foreground">Ryuzi</span>
-                  <ChevronDown aria-hidden size={12} strokeWidth={2} className="size-3" />
-                </Button>
-              }
             />
             <Button
               variant="ghost"
