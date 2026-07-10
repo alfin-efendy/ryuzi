@@ -52,7 +52,11 @@ pub struct RunnerDeps {
     /// torn down — the control plane refreshes it in the continue path. The
     /// tool gate reads it fresh per call via [`RunnerDeps::current_perm_mode`].
     pub perm_mode: Arc<std::sync::Mutex<PermMode>>,
-    pub project_policy: Option<String>,
+    /// The owning project (for tool_policies lookups/writes). `None` only in
+    /// bare test contexts without a session row.
+    pub project_id: Option<String>,
+    /// Per-session "don't ask again" sets, applied by the permission gate.
+    pub perm_overrides: Arc<std::sync::Mutex<super::permission::SessionPermOverrides>>,
     pub store: Arc<Store>,
     pub events: broadcast::Sender<CoreEvent>,
     pub approvals: Arc<ApprovalHub>,
@@ -927,18 +931,18 @@ async fn run_tool_call(
     // Permission gate. Read the mode fresh so a mid-session change applies.
     let perm_mode = deps.current_perm_mode();
     let spec = tool.permission(&input);
-    let decision = evaluate(
-        &spec,
-        &input,
+    let gate = super::permission::PermGate {
         perm_mode,
-        deps.project_policy.as_deref(),
-        &deps.session_pk,
-        &t.id,
-        &deps.approvals,
-        &deps.events,
+        project_id: deps.project_id.as_deref(),
+        store: &deps.store,
+        overrides: &deps.perm_overrides,
+        session_pk: &deps.session_pk,
+        tool_call_id: &t.id,
+        approvals: &deps.approvals,
+        events: &deps.events,
         cancel,
-    )
-    .await;
+    };
+    let decision = evaluate(&spec, &input, &gate).await;
     if decision == PermDecision::Deny {
         // Plan mode denies mutations outright (no prompt) — tell the model why
         // so it plans instead of retrying, rather than showing "Denied by user".
@@ -1401,7 +1405,8 @@ mod tests {
             effort: None,
             meta: crate::llm_router::model_meta::FALLBACK,
             perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
-            project_policy: None,
+            project_id: None,
+            perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
             store,
             events,
             approvals: Arc::new(ApprovalHub::new()),
