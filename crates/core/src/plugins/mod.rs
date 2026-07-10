@@ -620,7 +620,10 @@ command = "acme-mcp"
         let mut regs = Registries::new();
         load_skill_pack_plugins_from(&mut regs, plugins_root.path(), skills_root.path());
 
-        assert!(regs.plugins.get("acme-user").is_some(), "legacy pack must load");
+        assert!(
+            regs.plugins.get("acme-user").is_some(),
+            "legacy pack must load"
+        );
         assert!(
             plugins_root.path().join("acme/.ryuzi-skill.json").is_file(),
             "one-time heal must stamp the plugin directory"
