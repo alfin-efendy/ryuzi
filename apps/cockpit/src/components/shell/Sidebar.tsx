@@ -476,8 +476,9 @@ export function Sidebar() {
           <ModalBody>
             <p className="text-[13px] leading-[1.55] text-foreground">“{sessionTitle(confirmArchive.session)}”</p>
             <p className="mt-1 text-[12.5px] leading-[1.55] text-muted-foreground">
-              Archiving deletes the worktree and its <span className="font-mono text-xs">{confirmArchive.session.branch ?? "harness"}</span>{" "}
-              branch. The transcript stays available.
+              Archiving ends the session and deletes the worktree and its{" "}
+              <span className="font-mono text-xs">{confirmArchive.session.branch ?? "harness"}</span> branch — that work is discarded and
+              unrecoverable. The transcript stays available.
             </p>
           </ModalBody>
           <ModalFooter>

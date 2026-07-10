@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BranchNameModal } from "./BranchNameModal";
 
 afterEach(cleanup);
@@ -21,7 +21,7 @@ test("renders nothing while closed", () => {
 
 test("Create is disabled until a valid name is typed", () => {
   setup();
-  const dialog = screen.getByRole("dialog", { name: /Add MCP server|New Branch/ });
+  const dialog = screen.getByRole("dialog", { name: "New Branch" });
   expect(dialog.querySelector('[data-slot="modal-header"]')).not.toBeNull();
   expect(dialog.querySelector('[data-slot="modal-body"]')).not.toBeNull();
   expect(dialog.querySelector('[data-slot="modal-footer"]')).not.toBeNull();
@@ -29,6 +29,11 @@ test("Create is disabled until a valid name is typed", () => {
   expect(createButton().disabled).toBe(true);
   fireEvent.change(input(), { target: { value: "feat/x" } });
   expect(createButton().disabled).toBe(false);
+});
+
+test("focus starts on the branch name input", async () => {
+  setup();
+  await waitFor(() => expect(document.activeElement).toBe(input()));
 });
 
 test("whitespace and existing names show an error and keep Create disabled", () => {
