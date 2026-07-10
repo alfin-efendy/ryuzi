@@ -41,20 +41,17 @@ function CodeToken({ className, children, ...rest }: ComponentProps<"code">) {
       </code>
     );
   }
+  // A real <button> (not <code role="button">) so it is natively interactive
+  // and keyboard-accessible; `font-mono` keeps the inline-code look.
   return (
-    <code
-      role="button"
-      tabIndex={0}
+    <button
+      type="button"
       title={`Open ${parsed.path}`}
-      className={`${className ?? ""} cursor-pointer underline decoration-dotted underline-offset-2 hover:text-primary`}
+      className={`${className ?? ""} cursor-pointer font-mono underline decoration-dotted underline-offset-2 hover:text-primary`}
       onClick={() => openPath(parsed.path)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") openPath(parsed.path);
-      }}
-      {...rest}
     >
       {children}
-    </code>
+    </button>
   );
 }
 

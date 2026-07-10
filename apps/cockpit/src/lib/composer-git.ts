@@ -48,5 +48,8 @@ export function newBranchNameError(name: string, existing: string[]): string | n
  *  Pure dash runs typed intentionally (e.g. "feat-x") are left untouched.
  *  The whitespace check in newBranchNameError stays as a safety net. */
 export function normalizeBranchName(input: string): string {
-  return input.replace(/[\s-]*\s[\s-]*/g, "-");
+  // Match each maximal run of whitespace-and-dashes once (linear, no
+  // catastrophic backtracking), then collapse it to a single dash only when
+  // it contains whitespace; pure-dash runs are left as typed.
+  return input.replace(/[\s-]+/g, (run) => (/\s/.test(run) ? "-" : run));
 }
