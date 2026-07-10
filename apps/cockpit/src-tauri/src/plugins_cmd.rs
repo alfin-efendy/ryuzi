@@ -46,6 +46,13 @@ pub struct PluginInfo {
     pub verified: bool,
     pub experimental: bool,
     pub enabled: bool,
+    /// Same semantics as `PluginAuthInfo.configured` (oauth: token stored &&
+    /// !reconnect_required; else a persisted `auth.setting` row or `auth.env`
+    /// set). `false` when the manifest declares no `[auth]` block. On the
+    /// LIST payload (not just `plugin_detail`) because the Browse grid's
+    /// Install/Open split needs it — note this adds per-plugin store lookups
+    /// to list assembly.
+    pub configured: bool,
     /// `builtin` | `catalog` | `user`.
     pub source: String,
     /// Any of `provider` | `runtime` | `gateway` | `connector`.
@@ -143,7 +150,7 @@ fn source_label(source: &PluginSource) -> &'static str {
     }
 }
 
-fn plugin_info(plugin: &CorePlugin, enabled: bool) -> PluginInfo {
+fn plugin_info(plugin: &CorePlugin, enabled: bool, configured: bool) -> PluginInfo {
     let m = &plugin.manifest;
     PluginInfo {
         id: m.id.clone(),
@@ -154,6 +161,7 @@ fn plugin_info(plugin: &CorePlugin, enabled: bool) -> PluginInfo {
         verified: m.verified,
         experimental: m.experimental,
         enabled,
+        configured,
         source: source_label(&plugin.source).to_string(),
         capabilities: plugin
             .capabilities()
@@ -352,6 +360,32 @@ fn build_plugin_oauth_begin_result_with(
 /// (see `build_auth_info`).
 fn auth_configured(setting_value: Option<&str>, env_is_set: bool) -> bool {
     setting_value.is_some_and(|v| !v.is_empty()) || env_is_set
+}
+
+/// `PluginAuthInfo.configured` for the list payload without building the
+/// whole auth DTO: oauth → a token is stored and reconnect isn't required;
+/// otherwise the `auth.setting`-row / `auth.env` check. No `[auth]` → false.
+async fn plugin_auth_configured(
+    store: &Store,
+    plugin_id: &str,
+    auth: Option<&AuthSpec>,
+) -> anyhow::Result<bool> {
+    let Some(auth) = auth else {
+        return Ok(false);
+    };
+    if auth.kind == AuthKind::Oauth {
+        let token = store.get_plugin_oauth_token(plugin_id).await?;
+        return Ok(token.is_some_and(|token| !token.reconnect_required));
+    }
+    let setting_value = match &auth.setting {
+        Some(key) => store.get_setting_raw(key).await?,
+        None => None,
+    };
+    let env_is_set = auth
+        .env
+        .as_deref()
+        .is_some_and(|e| std::env::var_os(e).is_some());
+    Ok(auth_configured(setting_value.as_deref(), env_is_set))
 }
 
 async fn build_auth_info(
@@ -560,7 +594,13 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             .plugins()
             .is_enabled(&settings, &plugin.manifest.id)
             .await?;
-        out.push(plugin_info(&plugin, enabled));
+        let configured = plugin_auth_configured(
+            cp.store(),
+            &plugin.manifest.id,
+            plugin.manifest.auth.as_ref(),
+        )
+        .await?;
+        out.push(plugin_info(&plugin, enabled, configured));
     }
     Ok(out)
 }
@@ -580,9 +620,10 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
     let settings_info = build_settings_info(cp.store(), &m.settings).await?;
     let mcp = m.mcp.iter().map(mcp_info).collect();
     let models = providers::list_models(cp.store(), id).await?;
+    let configured = plugin_auth_configured(cp.store(), id, m.auth.as_ref()).await?;
 
     Ok(PluginDetail {
-        info: plugin_info(&plugin, enabled),
+        info: plugin_info(&plugin, enabled, configured),
         auth,
         settings: settings_info,
         mcp,
@@ -972,14 +1013,15 @@ mod tests {
     #[test]
     fn plugin_info_maps_identity_and_enabled_flag_through() {
         let plugin = harness_only("native");
-        let info = plugin_info(&plugin, true);
+        let info = plugin_info(&plugin, true, false);
         assert_eq!(info.id, "native");
         assert_eq!(info.name, "Plugin native");
         assert!(info.enabled);
         assert_eq!(info.source, "builtin");
         assert_eq!(info.capabilities, vec!["runtime".to_string()]);
+        assert!(!info.configured);
 
-        let info_disabled = plugin_info(&plugin, false);
+        let info_disabled = plugin_info(&plugin, false, false);
         assert!(!info_disabled.enabled);
     }
 
@@ -1271,6 +1313,66 @@ mod tests {
         assert!(
             !auth.configured,
             "no connection/env configured in a fresh store"
+        );
+    }
+
+    /// Same seam as core's `secrets::use_test_key_file` (pub(crate) there;
+    /// separate crates keep their own copy): point the process-global cipher
+    /// at a throwaway key file BEFORE the first encrypt/decrypt so tests
+    /// never touch the OS keychain or a real secret.key.
+    fn use_cockpit_test_key_file() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let path = std::env::temp_dir()
+                .join(format!("ryuzi-cockpit-test-secret-{}.key", std::process::id()));
+            std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
+        });
+    }
+
+    #[tokio::test]
+    async fn plugin_info_configured_matches_auth_info_semantics_for_non_oauth() {
+        let cp = test_cp().await;
+        let list = assemble_list(&cp).await.unwrap();
+        let anthropic = list.iter().find(|p| p.id == "anthropic").unwrap();
+        assert!(!anthropic.configured, "fresh store: nothing configured");
+        let detail = assemble_detail(&cp, "anthropic").await.unwrap();
+        assert_eq!(
+            detail.info.configured,
+            detail.auth.expect("anthropic declares auth").configured
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_info_configured_for_oauth_requires_stored_token_without_reconnect() {
+        use_cockpit_test_key_file();
+        let cp = test_cp().await;
+        // notion is a catalog kind=oauth plugin.
+        let before = assemble_detail(&cp, "notion").await.unwrap();
+        assert!(!before.info.configured);
+
+        cp.store()
+            .upsert_plugin_oauth_token(&PluginOauthToken {
+                plugin_id: "notion".into(),
+                access_token: "tok".into(),
+                refresh_token: None,
+                token_type: "Bearer".into(),
+                expires_at: None,
+                scopes: vec![],
+                reconnect_required: false,
+            })
+            .await
+            .unwrap();
+        let with_token = assemble_detail(&cp, "notion").await.unwrap();
+        assert!(with_token.info.configured);
+
+        cp.store()
+            .mark_plugin_oauth_reconnect_required("notion")
+            .await
+            .unwrap();
+        let reconnect = assemble_detail(&cp, "notion").await.unwrap();
+        assert!(
+            !reconnect.info.configured,
+            "reconnect_required must unset configured"
         );
     }
 
