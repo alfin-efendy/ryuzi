@@ -847,8 +847,27 @@ impl ControlPlane {
         self.attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
             .await;
         let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
+        // `kind`/`agent` come from the session row rather than a caller
+        // parameter — every caller of `start_harness_session` (fresh start,
+        // cold-resume, crash-resume) has already inserted the row before
+        // reaching here, so this is a reliable single source of truth. A
+        // missing row (shouldn't happen in practice) falls back to the kind
+        // implied by whether a project was resolved.
+        let session_row = self.store.get_session(session_pk).await.ok().flatten();
+        let kind = session_row
+            .as_ref()
+            .map(|s| s.kind)
+            .unwrap_or(if project.is_some() {
+                SessionKind::Project
+            } else {
+                SessionKind::Chat
+            });
+        let agent = session_row.and_then(|s| s.agent);
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
+            project_id: project.map(|p| p.project_id.clone()),
+            kind,
+            agent,
             work_dir: work_dir.to_path_buf(),
             perm_mode,
             model,

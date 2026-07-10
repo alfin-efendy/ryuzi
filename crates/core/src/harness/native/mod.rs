@@ -138,14 +138,19 @@ impl Harness for NativeHarness {
         // connections alive for the session's lifetime.
         let mcp_tools = connect_mcp_tools(&ctx.mcp_servers).await;
         let tools = Arc::new(tools::ToolRegistry::with_extra(mcp_tools));
-        // Persistent memory and tool-policy lookups key off the session's
-        // project; without a session row (bare tests) both features are
-        // simply off, keeping runs hermetic.
-        let session_row = ctx.store.get_session(&ctx.session_pk).await.ok().flatten();
-        let project_id = session_row.as_ref().and_then(|s| s.project_id.clone());
-        let memory_store = project_id
-            .as_deref()
-            .map(|pid| Arc::new(memory::MemoryStore::at_default(Some(pid))));
+        // Persistent memory is unconditional: a chat (project-less) session
+        // still gets GLOBAL memory, while a project session gets global +
+        // project scope. `at_default(None)` sets the global path and leaves
+        // the project path unset — global memory works, project-scope ops
+        // error cleanly — so previously skipping `MemoryStore` entirely for
+        // `project_id: None` needlessly denied chat sessions memory. Tool-
+        // policy lookups (below, via `RunnerDeps::project_id`) stay
+        // project-scoped and off without a project — chat sessions have no
+        // project to scope a `tool_policies` row to.
+        let project_id = ctx.project_id.clone();
+        let memory_store = Some(Arc::new(memory::MemoryStore::at_default(
+            project_id.as_deref(),
+        )));
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             deps: runner::RunnerDeps {
@@ -323,6 +328,9 @@ mod tests {
         let (events, _rx) = broadcast::channel(64);
         SessionCtx {
             session_pk: "sess".into(),
+            project_id: None,
+            kind: crate::domain::SessionKind::Chat,
+            agent: None,
             work_dir,
             perm_mode: PermMode::BypassPermissions,
             model: Some("test/model".into()),
@@ -395,6 +403,82 @@ mod tests {
         // cancel()/end() are safe no-ops when idle.
         session.cancel().await.unwrap();
         session.end().await.unwrap();
+    }
+
+    /// Redirect `dirs::home_dir()`/`dirs::data_dir()` into a tempdir for the
+    /// duration of a test — `MemoryStore::at_default` resolves under
+    /// `~/.config/ryuzi/memory`, so a test that exercises it for real must
+    /// not touch the developer's actual home directory. Process-global env,
+    /// so every test using this needs `#[serial]` (mirrors
+    /// `control::tests::StateDirGuard`).
+    struct StateDirGuard {
+        _dir: tempfile::TempDir,
+    }
+    impl StateDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            StateDirGuard { _dir: dir }
+        }
+    }
+
+    /// The actual wiring bug this task fixes: a chat (project-less) session
+    /// previously skipped `MemoryStore` construction entirely (`project_id:
+    /// None` short-circuited it in `NativeHarness::start_session`), so a
+    /// fact saved by one chat session was invisible to the next. Seed the
+    /// GLOBAL memory file `at_default(None)` resolves to, start a session
+    /// through the real `Harness` trait with `ctx.project_id: None` (as
+    /// `ctx_for` now sets), and confirm the seeded entry reaches the first
+    /// request's system prompt exactly like `memory_snapshot_reaches_
+    /// primary_system_but_not_subagents` proves it does for a project
+    /// session in `runner.rs`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_session_without_a_project_still_gets_global_memory() {
+        use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
+        let _guard = StateDirGuard::new();
+        memory::MemoryStore::at_default(None)
+            .add(
+                memory::MemoryScope::Global,
+                "the deploy key lives in 1Password",
+            )
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+
+        let llm = Arc::new(RecordingLlm::new(vec![vec![
+            text_delta("ok"),
+            message_delta("end_turn"),
+            message_stop(),
+        ]]));
+        struct OneShotFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for OneShotFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+        let plugin = native_plugin_with_llm_factory(Arc::new(OneShotFactory(llm.clone())));
+        let harness = plugin.harness.unwrap().create().unwrap();
+        // ctx_for's SessionCtx carries project_id: None — the chat-session shape.
+        let session = harness
+            .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
+            .await
+            .unwrap();
+        session
+            .send_prompt(TurnPrompt::text("hi", "hi"))
+            .await
+            .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        let system = bodies[0]["system"].as_str().unwrap_or_default();
+        assert!(
+            system.contains("the deploy key lives in 1Password"),
+            "{system}"
+        );
+        assert!(system.contains("# Persistent memory (global)"), "{system}");
     }
 
     #[tokio::test]

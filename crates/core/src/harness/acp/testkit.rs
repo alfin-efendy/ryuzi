@@ -596,7 +596,7 @@ pub async fn run_via_harness_trait_collecting_events(
     use tokio::sync::broadcast;
 
     use crate::approval::ApprovalHub;
-    use crate::domain::{CoreEvent, PermMode};
+    use crate::domain::{CoreEvent, PermMode, SessionKind};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
     use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
@@ -615,6 +615,9 @@ pub async fn run_via_harness_trait_collecting_events(
 
     let ctx = SessionCtx {
         session_pk: session_pk.clone(),
+        project_id: None,
+        kind: SessionKind::Project,
+        agent: None,
         work_dir: std::path::PathBuf::from("/tmp"),
         perm_mode: PermMode::Default,
         model: None,
@@ -1139,7 +1142,7 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
     use std::sync::Arc;
 
     use crate::approval::ApprovalHub;
-    use crate::domain::{CoreEvent, PermMode};
+    use crate::domain::{CoreEvent, PermMode, SessionKind};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
     use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
@@ -1203,6 +1206,9 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
     let session_pk = "fs-test-session-pk".to_string();
     let ctx = SessionCtx {
         session_pk: session_pk.clone(),
+        project_id: None,
+        kind: SessionKind::Project,
+        agent: None,
         work_dir,
         perm_mode: PermMode::Default,
         model: None,
@@ -1410,7 +1416,7 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
     use std::sync::Arc;
 
     use crate::approval::ApprovalHub;
-    use crate::domain::{CoreEvent, PermMode};
+    use crate::domain::{CoreEvent, PermMode, SessionKind};
     use crate::harness::acp::{AcpAdapterDescriptor, AcpHarness};
     use crate::harness::{Harness, SessionCtx, TurnPrompt};
     use crate::store::Store;
@@ -1472,6 +1478,9 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
     let session_pk = "terminal-test-session-pk".to_string();
     let ctx = SessionCtx {
         session_pk: session_pk.clone(),
+        project_id: None,
+        kind: SessionKind::Project,
+        agent: None,
         work_dir,
         perm_mode: PermMode::Default,
         model: None,
@@ -1705,6 +1714,9 @@ pub async fn run_perm_mock_via_harness(
 
     let ctx = SessionCtx {
         session_pk: session_pk.clone(),
+        project_id: Some(project_id.to_string()),
+        kind: SessionKind::Project,
+        agent: None,
         work_dir: std::path::PathBuf::from("/tmp"),
         perm_mode: PermMode::Default,
         model: None,

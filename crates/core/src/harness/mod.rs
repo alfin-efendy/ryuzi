@@ -1,5 +1,5 @@
 use crate::approval::ApprovalHub;
-use crate::domain::{CoreEvent, McpServerSpec, PermMode};
+use crate::domain::{CoreEvent, McpServerSpec, PermMode, SessionKind};
 use crate::registry::Registry;
 use crate::store::Store;
 use async_trait::async_trait;
@@ -14,6 +14,17 @@ use tokio::sync::broadcast;
 /// (Spec 3 wiring) and passed to `Harness::start_session`.
 pub struct SessionCtx {
     pub session_pk: String,
+    /// The owning project, if any — `None` for a chat-first (project-less)
+    /// session. Mirrors `Session.project_id`; harness backends key
+    /// project-scoped features (e.g. the native runtime's persistent memory
+    /// and tool-policy lookups) off this rather than re-querying the store.
+    pub project_id: Option<String>,
+    /// The session's kind (`Project`, `Chat`, `Worker`, `Review`), mirroring
+    /// `Session.kind`.
+    pub kind: SessionKind,
+    /// Which agent persona/config is driving this session, if any. Mirrors
+    /// `Session.agent`; unused for `Project` sessions today.
+    pub agent: Option<String>,
     pub work_dir: PathBuf,
     pub perm_mode: PermMode,
     pub model: Option<String>,
@@ -142,6 +153,9 @@ mod tests {
         let (events, _rx) = broadcast::channel(16);
         SessionCtx {
             session_pk: "s1".into(),
+            project_id: None,
+            kind: SessionKind::Chat,
+            agent: None,
             work_dir: PathBuf::from("/tmp"),
             perm_mode: PermMode::Default,
             model: None,
