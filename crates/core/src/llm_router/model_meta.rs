@@ -7,7 +7,7 @@ use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ModelMeta {
     pub context_window: u64,
     pub max_output_tokens: u64,
@@ -15,6 +15,15 @@ pub struct ModelMeta {
     pub supports_prompt_cache: bool,
     #[serde(default)]
     pub supports_reasoning: bool,
+    /// USD per 1M tokens; 0.0 when the upstream omits a rate.
+    #[serde(default)]
+    pub cost_input: f64,
+    #[serde(default)]
+    pub cost_output: f64,
+    #[serde(default)]
+    pub cost_cache_read: f64,
+    #[serde(default)]
+    pub cost_cache_write: f64,
 }
 
 /// Conservative metadata for unknown models (spec §5).
@@ -23,6 +32,10 @@ pub const FALLBACK: ModelMeta = ModelMeta {
     max_output_tokens: 8_192,
     supports_prompt_cache: false,
     supports_reasoning: false,
+    cost_input: 0.0,
+    cost_output: 0.0,
+    cost_cache_read: 0.0,
+    cost_cache_write: 0.0,
 };
 
 impl ModelMeta {
@@ -33,6 +46,16 @@ impl ModelMeta {
     /// The auto-compact threshold at `percent` (settings default 90).
     pub fn auto_compact_limit(&self, percent: u64) -> u64 {
         self.context_window * percent.min(95) / 100
+    }
+    /// USD for one request's four disjoint token buckets. Anthropic reports
+    /// non-cached input, cache-read, and cache-creation separately, each at
+    /// its own rate. Unknown rates (0.0) contribute 0.
+    pub fn cost_usd(&self, input: u64, output: u64, cache_read: u64, cache_creation: u64) -> f64 {
+        let per = |tokens: u64, rate: f64| (tokens as f64) / 1_000_000.0 * rate;
+        per(input, self.cost_input)
+            + per(output, self.cost_output)
+            + per(cache_read, self.cost_cache_read)
+            + per(cache_creation, self.cost_cache_write)
     }
 }
 
@@ -106,6 +129,14 @@ fn apply_override(base: ModelMeta, v: &serde_json::Value) -> ModelMeta {
         supports_reasoning: v["supports_reasoning"]
             .as_bool()
             .unwrap_or(base.supports_reasoning),
+        cost_input: v["cost_input"].as_f64().unwrap_or(base.cost_input),
+        cost_output: v["cost_output"].as_f64().unwrap_or(base.cost_output),
+        cost_cache_read: v["cost_cache_read"]
+            .as_f64()
+            .unwrap_or(base.cost_cache_read),
+        cost_cache_write: v["cost_cache_write"]
+            .as_f64()
+            .unwrap_or(base.cost_cache_write),
     }
 }
 
@@ -137,6 +168,10 @@ fn prune_models_dev(api: &serde_json::Value) -> HashMap<String, ModelMeta> {
                 max_output_tokens: m["limit"]["output"].as_u64().unwrap_or(8_192),
                 supports_prompt_cache: !m["cost"]["cache_read"].is_null(),
                 supports_reasoning: m["reasoning"].as_bool().unwrap_or(false),
+                cost_input: m["cost"]["input"].as_f64().unwrap_or(0.0),
+                cost_output: m["cost"]["output"].as_f64().unwrap_or(0.0),
+                cost_cache_read: m["cost"]["cache_read"].as_f64().unwrap_or(0.0),
+                cost_cache_write: m["cost"]["cache_write"].as_f64().unwrap_or(0.0),
             };
             match out.get(id) {
                 Some(prev) if prev.context_window >= meta.context_window => {}
@@ -219,6 +254,66 @@ pub async fn resolve(store: &Store, requested: &str) -> ModelMeta {
 }
 
 #[cfg(test)]
+mod cost_tests {
+    use super::*;
+
+    fn priced() -> ModelMeta {
+        ModelMeta {
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            supports_prompt_cache: true,
+            supports_reasoning: false,
+            cost_input: 3.0,        // $3 / 1M
+            cost_output: 15.0,      // $15 / 1M
+            cost_cache_read: 0.3,   // $0.30 / 1M
+            cost_cache_write: 3.75, // $3.75 / 1M
+        }
+    }
+
+    #[test]
+    fn each_bucket_priced_at_its_own_rate() {
+        let m = priced();
+        // 1M input @ $3 + 1M output @ $15 + 1M cache_read @ $0.30 + 1M cache_write @ $3.75
+        let got = m.cost_usd(1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((got - (3.0 + 15.0 + 0.3 + 3.75)).abs() < 1e-9, "got {got}");
+    }
+
+    #[test]
+    fn scales_linearly_and_units_are_per_million() {
+        let m = priced();
+        // 500k input only → half of $3.
+        let got = m.cost_usd(500_000, 0, 0, 0);
+        assert!((got - 1.5).abs() < 1e-9, "got {got}");
+    }
+
+    #[test]
+    fn zero_rates_contribute_zero() {
+        assert_eq!(
+            FALLBACK.cost_usd(1_000_000, 1_000_000, 1_000_000, 1_000_000),
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_known_vendored_model_has_nonzero_rates() {
+        // At least one claude-sonnet entry must be priced. Fold the rate check
+        // into the predicate: HashMap iteration order is randomized per process,
+        // so a bare `.find(name-only)` could surface a free/alias zero-priced
+        // variant and flake.
+        let priced = super::vendored().iter().any(|(k, m)| {
+            k.contains("claude")
+                && k.contains("sonnet")
+                && m.cost_input > 0.0
+                && m.cost_output > 0.0
+        });
+        assert!(
+            priced,
+            "expected at least one priced claude-sonnet entry in the vendored snapshot"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -281,6 +376,7 @@ mod tests {
             max_output_tokens: 64_000,
             supports_prompt_cache: true,
             supports_reasoning: true,
+            ..FALLBACK
         };
         let merged = apply_override(base, &serde_json::json!({"context_window": 150000}));
         assert_eq!(merged.context_window, 150_000);
