@@ -6,6 +6,7 @@
 
 use super::ApiError;
 use crate::domain::SessionGitOptions;
+use crate::llm_router::secrets::KeychainStatus;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::path::Path;
@@ -317,4 +318,98 @@ pub struct CommandInfo {
 pub struct TodoItem {
     pub content: String,
     pub status: String,
+}
+
+// --- runtimes_api (moved verbatim from apps/cockpit/src-tauri/src/runtimes_cmd.rs) ---
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TierInfo {
+    pub id: String,
+    pub label: String,
+    pub value: Option<String>,
+    pub combo: bool,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeInfo {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub initial: String,
+    pub connection: String,
+    pub binary_path: Option<String>,
+    pub installed_version: Option<String>,
+    pub latest_version: Option<String>,
+    pub npm_package: Option<String>,
+    pub models: Vec<String>,
+    pub enabled: bool,
+    pub model: String,
+    pub perm_mode: String,
+    pub flags: String,
+    pub tiers: Vec<TierInfo>,
+    pub is_default: bool,
+    /// Whether Cockpit has a session harness for this agent today.
+    pub runnable: bool,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeConfigStatusInfo {
+    pub config_path: String,
+    pub exists: bool,
+    pub configured: bool,
+    /// False for runtimes without an F1 handler (gemini, ollama).
+    pub supported: bool,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeMappingArg {
+    pub model: String,
+    pub opus: Option<String>,
+    pub sonnet: Option<String>,
+    pub haiku: Option<String>,
+    pub models: Vec<String>,
+}
+
+// --- endpoint_api (moved verbatim from apps/cockpit/src-tauri/src/endpoint_cmd.rs) ---
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointStatusInfo {
+    pub running: bool,
+    pub port: u16,
+    pub base_url: String,
+    pub autostart: bool,
+    pub keychain_status: KeychainStatus,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointKeyInfo {
+    pub id: String,
+    pub name: String,
+    pub key: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UsagePoint {
+    pub day: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSeries {
+    pub days: Vec<UsagePoint>,
+    pub today_requests: i64,
+    pub today_input_tokens: i64,
+    pub today_output_tokens: i64,
 }
