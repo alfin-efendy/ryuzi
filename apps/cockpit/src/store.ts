@@ -13,6 +13,7 @@ import {
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
+import { useNative } from "./store-native";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 
 export type PendingApproval = { sessionPk: string; requestId: string; tool: string; summary: string };
@@ -103,6 +104,15 @@ export const useStore = create<State>((set, get) => ({
           };
         case "message": {
           const pk = e.session_pk;
+          // A COMPLETED `todowrite` means this session's todo list just changed
+          // in the DB — refetch so the plan widget updates mid-run instead of
+          // waiting for the run to settle. (The initial in_progress emit fires
+          // BEFORE the tool executes, so fetching then would read stale data.)
+          // Fire-and-forget: loadTodos' fetch token drops out-of-order replies.
+          const payload = (e.payload ?? {}) as Record<string, unknown>;
+          if (e.block_type === "tool_call" && payload.name === "todowrite" && e.status === "completed") {
+            void useNative.getState().loadTodos(pk);
+          }
           // Tool updates re-use the original row's seq — upsert by identity
           // BEFORE the seq high-water guard would drop them as stale.
           if (e.tool_call_id) {

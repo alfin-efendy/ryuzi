@@ -1,6 +1,7 @@
-import { test, expect, spyOn } from "bun:test";
+import { test, expect, mock, spyOn } from "bun:test";
 import { useStore } from "./store";
 import { commands } from "./bindings";
+import { useNative } from "./store-native";
 
 function reset() {
   useStore.setState({
@@ -548,4 +549,53 @@ test("cloneProject clones via IPC and refreshes on success", async () => {
   clone.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+});
+
+test("a completed todowrite tool_call triggers a todo refetch for its session", () => {
+  reset();
+  const original = useNative.getState().loadTodos;
+  const loadTodos = mock((_pk: string) => Promise.resolve());
+  useNative.setState({ loadTodos });
+  const s = useStore.getState();
+  // Initial in_progress insert: the tool hasn't executed yet — no fetch.
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 4,
+    role: "assistant",
+    block_type: "tool_call",
+    payload: { name: "todowrite", input: { todos: [{ content: "a", status: "pending" }] } },
+    tool_call_id: "tc-todo",
+    status: "in_progress",
+    tool_kind: "other",
+  });
+  expect(loadTodos).not.toHaveBeenCalled();
+  // Completion re-emit (same seq, merged by toolCallId): the DB changed — refetch.
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 4,
+    role: "assistant",
+    block_type: "tool_call",
+    payload: { name: "todowrite", input: { todos: [{ content: "a", status: "pending" }] }, output: "Updated todo list (0/1 done)" },
+    tool_call_id: "tc-todo",
+    status: "completed",
+    tool_kind: "other",
+  });
+  expect(loadTodos).toHaveBeenCalledTimes(1);
+  expect(loadTodos).toHaveBeenCalledWith("s1");
+  // Other completed tools never trigger a todo fetch.
+  s.applyCoreEvent({
+    kind: "message",
+    session_pk: "s1",
+    seq: 5,
+    role: "assistant",
+    block_type: "tool_call",
+    payload: { name: "bash", input: { command: "ls" }, output: "ok" },
+    tool_call_id: "tc-bash",
+    status: "completed",
+    tool_kind: "execute",
+  });
+  expect(loadTodos).toHaveBeenCalledTimes(1);
+  useNative.setState({ loadTodos: original });
 });

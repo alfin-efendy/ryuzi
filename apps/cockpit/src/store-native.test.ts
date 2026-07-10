@@ -94,3 +94,40 @@ test("importSession reports success", async () => {
   expect(ok).toBe(true);
   spy.mockRestore();
 });
+
+test("loadTodos drops out-of-order responses (a stale fetch can't clobber newer data)", async () => {
+  reset();
+  type TodosResult = Awaited<ReturnType<typeof commands.sessionTodos>>;
+  const resolvers: Array<(v: TodosResult) => void> = [];
+  const spy = spyOn(commands, "sessionTodos").mockImplementation(
+    () => new Promise<TodosResult>((resolve) => resolvers.push(resolve)),
+  );
+  const first = useNative.getState().loadTodos("s1"); // older fetch…
+  const second = useNative.getState().loadTodos("s1"); // …superseded by this one
+  // The newer fetch resolves first with the fresh list.
+  resolvers[1]({ status: "ok", data: [{ content: "execute", status: "in_progress" }] });
+  await second;
+  // The older fetch resolves late with the stale list — it must be ignored.
+  resolvers[0]({ status: "ok", data: [{ content: "plan", status: "completed" }] });
+  await first;
+  expect(useNative.getState().todosBySession.s1).toEqual([{ content: "execute", status: "in_progress" }]);
+  spy.mockRestore();
+});
+
+test("loadTodos tokens are per-session — one session's fetch never invalidates another's", async () => {
+  reset();
+  type TodosResult = Awaited<ReturnType<typeof commands.sessionTodos>>;
+  const resolvers: Array<(v: TodosResult) => void> = [];
+  const spy = spyOn(commands, "sessionTodos").mockImplementation(
+    () => new Promise<TodosResult>((resolve) => resolvers.push(resolve)),
+  );
+  const a = useNative.getState().loadTodos("s1");
+  const b = useNative.getState().loadTodos("s2"); // different session, issued later
+  resolvers[1]({ status: "ok", data: [{ content: "other", status: "pending" }] });
+  await b;
+  resolvers[0]({ status: "ok", data: [{ content: "mine", status: "pending" }] });
+  await a;
+  expect(useNative.getState().todosBySession.s1).toEqual([{ content: "mine", status: "pending" }]);
+  expect(useNative.getState().todosBySession.s2).toEqual([{ content: "other", status: "pending" }]);
+  spy.mockRestore();
+});
