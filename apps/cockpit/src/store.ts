@@ -348,10 +348,7 @@ export const useStore = create<State>((set, get) => ({
       const event = e.payload.event;
       get().applyCoreEvent(event);
       // Keep the actively-viewed session marked read as its activity streams in.
-      const activePk = (event as { session_pk?: string }).session_pk;
-      if (activePk && activePk === get().focusedSessionPk) {
-        useUi.getState().markRead(activePk, Date.now());
-      }
+      markFocusedSessionReadOnEvent(event, get().focusedSessionPk);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
@@ -360,3 +357,17 @@ export const useStore = create<State>((set, get) => ({
     });
   },
 }));
+
+/**
+ * A core event for the session currently focused in the UI counts as the
+ * user having "seen" it as it streams in — mark that session read so its
+ * unread dot never lags behind what's already on screen. Extracted from the
+ * `init()` listener so the decision is testable without driving a real Tauri
+ * event subscription.
+ */
+export function markFocusedSessionReadOnEvent(event: CoreEvent, focusedSessionPk: string | null): void {
+  const activePk = (event as { session_pk?: string }).session_pk;
+  if (activePk && activePk === focusedSessionPk) {
+    useUi.getState().markRead(activePk, Date.now());
+  }
+}

@@ -1,5 +1,5 @@
 import { test, expect, mock, spyOn } from "bun:test";
-import { useStore } from "./store";
+import { useStore, markFocusedSessionReadOnEvent } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
 import { useUi } from "./store-ui";
@@ -667,4 +667,46 @@ test("setFocused marks the previously-focused session read up to its lastActive"
   useStore.getState().setFocused("s2");
   expect(useUi.getState().readAt.s1).toBe(4200);
   expect(useStore.getState().focusedSessionPk).toBe("s2");
+});
+
+// markFocusedSessionReadOnEvent is the extracted decision the init() coreEventMsg
+// listener runs on every live event; it's exercised directly here since driving the
+// real Tauri event subscription isn't practical in this harness.
+test("markFocusedSessionReadOnEvent marks the focused session read as live activity streams in", () => {
+  useUi.setState({ readAt: {} });
+  const before = Date.now();
+  markFocusedSessionReadOnEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 1,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "hi" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    "s1",
+  );
+  expect(useUi.getState().readAt.s1).toBeGreaterThanOrEqual(before);
+});
+
+test("markFocusedSessionReadOnEvent leaves read state untouched for events on a non-focused session", () => {
+  useUi.setState({ readAt: {} });
+  markFocusedSessionReadOnEvent(
+    {
+      kind: "message",
+      session_pk: "s2",
+      seq: 1,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "hi" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    "s1",
+  );
+  expect(useUi.getState().readAt.s2).toBeUndefined();
 });

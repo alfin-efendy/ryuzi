@@ -264,7 +264,7 @@ export function Sidebar() {
             <MenuSeparator />
             <MenuSectionLabel>Status</MenuSectionLabel>
             {(["idle", "running", "interrupted", "ended"] as const).map((st) => (
-              <MenuItem key={st} selected={!!sessionFilter.statuses[st]} onClick={() => toggleStatusFilter(st)} className="capitalize">
+              <MenuItem key={st} selected={!!sessionFilter.statuses[st]} onClick={() => toggleStatusFilter(st)}>
                 <span className="flex-1 capitalize">{st}</span>
               </MenuItem>
             ))}
@@ -374,6 +374,7 @@ export function Sidebar() {
                             <span aria-hidden className="flex w-2 shrink-0 items-center justify-center">
                               {unread && <span data-testid={`unread-dot-${s.sessionPk}`} className="size-1.5 rounded-full bg-primary" />}
                             </span>
+                            {unread && <span className="sr-only">unread</span>}
                           </Button>
                           <Button
                             type="button"
