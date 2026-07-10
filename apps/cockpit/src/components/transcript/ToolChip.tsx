@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useContext, useMemo, useState, type ReactNode } from "react";
 import { Button } from "@ryuzi/ui";
 import { toJsxRuntime } from "hast-util-to-jsx-runtime";
 import { common, createLowlight } from "lowlight";
@@ -21,13 +21,9 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import {
-  formatToolDuration,
-  partitionActivity,
-  toolCardHeader,
-  type ActivityFragment,
-  type ActivityItem,
-} from "@/lib/transcript";
+import { toWorkspaceRelativePath } from "@/lib/paths";
+import { formatToolDuration, partitionActivity, toolCardHeader, type ActivityFragment, type ActivityItem } from "@/lib/transcript";
+import { TranscriptFileContext, useOpenWorkspaceFile } from "./TranscriptFileContext";
 
 const kindIcon: Record<string, LucideIcon> = {
   read: FileText,
@@ -117,38 +113,67 @@ function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "tool" }
   const { title, detail } = toolCardHeader(item);
   const duration = formatToolDuration(item.durationMs);
   const expandable = !!item.output;
+  const openWorkspaceFile = useOpenWorkspaceFile();
+  const fileCtx = useContext(TranscriptFileContext);
+  // Trusted arg path (no probe): clickable when a provider is present and the
+  // path resolves inside the worktree.
+  const linkRel = openWorkspaceFile && fileCtx && item.path ? toWorkspaceRelativePath(item.path, fileCtx.workdir) : null;
 
-  const header = (
+  const detailNode =
+    detail !== null ? (
+      linkRel !== null && openWorkspaceFile !== null ? (
+        <a
+          href={linkRel}
+          className="min-w-0 flex-1 cursor-pointer truncate text-left font-normal text-muted-foreground underline decoration-dotted underline-offset-2"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openWorkspaceFile(linkRel);
+          }}
+        >
+          {detail}
+        </a>
+      ) : (
+        <span className="min-w-0 flex-1 truncate text-left font-normal text-muted-foreground">{detail}</span>
+      )
+    ) : (
+      <span className="min-w-0 flex-1" />
+    );
+
+  // Icon + title toggle the card when expandable. Kept as its own Button
+  // (rather than wrapping the whole row, as before) because `detailNode` can
+  // render a real <a> for the clickable path — an anchor nested inside a
+  // <button> is invalid content (and, unlike button-in-button, browsers won't
+  // auto-repair it), so the toggle target and the link must be siblings.
+  const iconTitle = (
     <>
       <Icon aria-hidden size={12} strokeWidth={2} className="shrink-0 text-muted-foreground" />
       <span className="shrink-0">{title}</span>
-      {detail !== null ? (
-        <span className="min-w-0 flex-1 truncate text-left font-normal text-muted-foreground">{detail}</span>
-      ) : (
-        <span className="min-w-0 flex-1" />
-      )}
-      {duration !== "" && <Badge>{duration}</Badge>}
-      {item.exitCode !== null && <Badge tone={item.exitCode === 0 ? "muted" : "error"}>exit {item.exitCode}</Badge>}
-      <StatusMark status={item.status} />
     </>
   );
   const headerClass = "flex w-full items-center gap-2 px-3 py-[7px] font-mono text-xs text-foreground";
 
   return (
     <div className="acrylic-panel flex w-full max-w-[640px] flex-col overflow-hidden rounded-md border border-border">
-      {expandable ? (
-        <Button
-          variant="ghost"
-          size="xs"
-          aria-expanded={open}
-          onClick={() => setOpen((v) => !v)}
-          className={`${headerClass} h-auto cursor-pointer justify-start rounded-none font-normal hover:bg-accent dark:hover:bg-accent`}
-        >
-          {header}
-        </Button>
-      ) : (
-        <div className={headerClass}>{header}</div>
-      )}
+      <div className={headerClass}>
+        {expandable ? (
+          <Button
+            variant="ghost"
+            size="xs"
+            aria-expanded={open}
+            onClick={() => setOpen((v) => !v)}
+            className="h-auto shrink-0 cursor-pointer gap-2 rounded p-0.5 font-normal hover:bg-accent dark:hover:bg-accent"
+          >
+            {iconTitle}
+          </Button>
+        ) : (
+          iconTitle
+        )}
+        {detailNode}
+        {duration !== "" && <Badge>{duration}</Badge>}
+        {item.exitCode !== null && <Badge tone={item.exitCode === 0 ? "muted" : "error"}>exit {item.exitCode}</Badge>}
+        <StatusMark status={item.status} />
+      </div>
       {open && item.output && <OutputBlock text={item.output} />}
     </div>
   );
@@ -179,12 +204,7 @@ function StepsFold({ items, runLength }: { items: ActivityItem[]; runLength: num
         onClick={() => setOpen((v) => !v)}
         className="h-auto max-w-fit cursor-pointer justify-start gap-1.5 px-1.5 py-[3px] font-mono text-xs font-normal text-muted-foreground"
       >
-        <ChevronRight
-          aria-hidden
-          size={12}
-          strokeWidth={2}
-          className={open ? "rotate-90 transition-transform" : "transition-transform"}
-        />
+        <ChevronRight aria-hidden size={12} strokeWidth={2} className={open ? "rotate-90 transition-transform" : "transition-transform"} />
         {label}
       </Button>
       {open &&
