@@ -169,7 +169,7 @@ fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
         PluginSource::Catalog => "catalog",
-        PluginSource::User(_) => "user",
+        PluginSource::SkillPack(_) => "skill-pack",
     }
 }
 
@@ -234,7 +234,6 @@ mod tests {
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         }

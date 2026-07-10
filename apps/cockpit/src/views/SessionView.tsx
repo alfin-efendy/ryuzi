@@ -15,7 +15,7 @@ import { headerAgentLine } from "@/lib/session-header";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
-import { ApprovalPrompt } from "@/components/ApprovalPrompt";
+import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
 import { ModelPicker } from "@/components/ModelPicker";
 import { Transcript } from "@/components/transcript/Transcript";
@@ -179,7 +179,7 @@ export function SessionView() {
   const meta = statusMeta(session.status);
   const running = session.status === "running";
   const usage = contextUsage[session.sessionPk];
-  const hasApproval = pendingApprovals.some((a) => a.sessionPk === session.sessionPk);
+  const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(project?.permMode ?? "default");
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
   const selectedModel = project?.model || agent?.model || "";
@@ -286,7 +286,11 @@ export function SessionView() {
             agentColor={agent?.color ?? "var(--muted-foreground)"}
             running={running}
           >
-            {hasApproval && <ApprovalPrompt sessionPk={session.sessionPk} />}
+            {pendingForSession.map((a, i) => (
+              <div key={a.requestId} className="px-4 pb-2">
+                <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
+              </div>
+            ))}
           </Transcript>
         </TranscriptFileContext.Provider>
 

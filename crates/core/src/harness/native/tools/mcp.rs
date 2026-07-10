@@ -51,8 +51,12 @@ impl Tool for McpTool {
         "other"
     }
     fn permission(&self, _input: &Value) -> PermissionSpec {
-        // MCP tools default to prompting (the key is not in the safe set).
-        PermissionSpec::new("mcp", format!("run {}", self.full_name))
+        // Key on the tool's own full name (`mcp__server__tool`) — not a
+        // shared "mcp" bucket — so "always allow"/"always deny" rules are
+        // per-tool, not a blanket rule covering every MCP tool from every
+        // server. `key_to_policy_tool` passes unknown keys through
+        // unchanged, so this needs no other plumbing changes.
+        PermissionSpec::new(self.full_name.clone(), format!("run {}", self.full_name))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
         match self.caller.call(&self.tool_name, input).await {
@@ -106,6 +110,30 @@ mod tests {
         let out = tool.execute(&ctx, json!({ "q": "x" })).await.unwrap();
         assert!(!out.is_error);
         assert_eq!(out.for_model, "42 results");
+    }
+
+    #[tokio::test]
+    async fn permission_key_is_the_tools_own_full_name_not_a_shared_bucket() {
+        let caller = Arc::new(FakeCaller { reply: json!({}) });
+        let search = McpTool::new(
+            "notion",
+            "search",
+            "Search Notion",
+            json!({}),
+            caller.clone(),
+        );
+        let fetch = McpTool::new("github", "fetch_issue", "Fetch issue", json!({}), caller);
+
+        let search_key = search.permission(&json!({})).key;
+        let fetch_key = fetch.permission(&json!({})).key;
+
+        assert_eq!(search_key, "mcp__notion__search");
+        assert_eq!(fetch_key, "mcp__github__fetch_issue");
+        assert_ne!(
+            search_key, fetch_key,
+            "two different MCP tools must get two different permission keys, \
+             so an 'always allow'/'always deny' rule for one never covers the other"
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ import {
   FolderOpen,
   FolderPlus,
   Grip,
+  Inbox,
   LayoutGrid,
   ListFilter,
   Pencil,
@@ -19,6 +20,7 @@ import {
   Settings,
 } from "lucide-react";
 import {
+  Badge,
   Button,
   MenuPanel,
   MenuPanelItem as MenuItem,
@@ -31,17 +33,16 @@ import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
-import { usePlugins, sidebarPlugins } from "@/store-plugins";
 import { useTerms } from "@/store-terms";
 import { commands, type Session } from "@/bindings";
 import { archivedCount, orderProjects, projectLabel, sessionTitle, sessionsForProject, type Ordering } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
-import { pluginIcon } from "@/lib/plugin-icons";
 import { StatusDot } from "@/components/common/bits";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
+  { label: "Inbox", icon: Inbox, view: { kind: "inbox" }, group: ["inbox"] },
   { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail", "connectionDetail"] },
   { label: "Runtime", icon: Bot, view: { kind: "runtime" }, group: ["runtime", "runtimeDetail"] },
   { label: "Scheduler", icon: CalendarClock, view: { kind: "scheduler" }, group: ["scheduler", "jobDetail", "jobNew"] },
@@ -81,6 +82,7 @@ function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
 
 export function Sidebar() {
   const { projects, sessions, setFocused, focusedSessionPk, selectProject, end } = useStore();
+  const pendingCount = useStore((s) => s.pendingApprovals.length);
   const { pinned, archived, togglePin, setArchived } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
   const [archivingPk, setArchivingPk] = useState<string | null>(null);
@@ -143,12 +145,6 @@ export function Sidebar() {
     if (!gatewaysLoaded) void hydrateGateways();
   }, [gatewaysLoaded, hydrateGateways]);
 
-  const { plugins, loaded: pluginsLoaded, load: loadPlugins } = usePlugins();
-  useEffect(() => {
-    if (!pluginsLoaded) void loadPlugins();
-  }, [pluginsLoaded, loadPlugins]);
-  const menuPlugins = sidebarPlugins(plugins);
-
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [showArchived, setShowArchived] = useState<Record<string, boolean>>({});
   const [archivedGlobal, setArchivedGlobal] = useState(false);
@@ -187,37 +183,15 @@ export function Sidebar() {
             >
               <Icon aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
               {item.label}
+              {item.view.kind === "inbox" && pendingCount > 0 && (
+                <Badge variant="secondary" className="ml-auto h-4 min-w-4 px-1 text-[10px]">
+                  {pendingCount}
+                </Badge>
+              )}
             </Button>
           );
         })}
       </div>
-
-      {/* Plugin-driven menu section — enabled catalog/user integrations only;
-          core builtins live in the fixed NAV list above. Hidden entirely
-          when no plugin qualifies so it never reserves empty space. */}
-      {menuPlugins.length > 0 && (
-        <div className="box-border flex w-[260px] flex-col gap-[2px] px-2.5 pb-1">
-          <div className="px-2.5 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">
-            Enabled plugins
-          </div>
-          {menuPlugins.map((plugin) => {
-            const active = view.kind === "pluginDetail" && view.id === plugin.id;
-            const Icon = pluginIcon(plugin.icon);
-            return (
-              <Button
-                key={plugin.id}
-                type="button"
-                variant="ghost"
-                onClick={() => nav.navigate({ kind: "pluginDetail", id: plugin.id })}
-                className={`h-auto w-full justify-start gap-2.5 rounded-md py-[7px] text-left text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground dark:hover:bg-sidebar-accent ${active ? "bg-sidebar-accent" : ""}`}
-              >
-                <Icon aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
-                <span className="min-w-0 flex-1 truncate">{plugin.name}</span>
-              </Button>
-            );
-          })}
-        </div>
-      )}
 
       {/* Projects header */}
       <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-5 pr-3">

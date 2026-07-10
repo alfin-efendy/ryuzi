@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { basename, fileBadge } from "./paths";
+import { basename, fileBadge, parsePathToken } from "./paths";
 import { joinPath } from "./paths";
 import { toRepoRelative } from "./paths";
 
@@ -100,4 +100,20 @@ test("unsafe segments rejected after stripping", () => {
 
 test("windows-style workdir separators are tolerated", () => {
   expect(toWorkspaceRelativePath("C:\\w\\proj\\src\\app.ts", "C:\\w\\proj")).toBe("src/app.ts");
+});
+
+test("parsePathToken accepts relative and absolute paths with optional :line[:col]", () => {
+  expect(parsePathToken("src/store.ts")).toEqual({ path: "src/store.ts", line: null });
+  expect(parsePathToken("src/store.ts:42")).toEqual({ path: "src/store.ts", line: 42 });
+  expect(parsePathToken(String.raw`crates\core\src\lib.rs:10:5`)).toEqual({ path: String.raw`crates\core\src\lib.rs`, line: 10 });
+  expect(parsePathToken(String.raw`C:\work\proj\src\a.ts:7`)).toEqual({ path: String.raw`C:\work\proj\src\a.ts`, line: 7 });
+  expect(parsePathToken("src/.env")).toEqual({ path: "src/.env", line: null });
+});
+
+test("parsePathToken rejects non-paths", () => {
+  expect(parsePathToken("and/or")).toBeNull();
+  expect(parsePathToken("store.ts")).toBeNull();
+  expect(parsePathToken("https://example.com/a.ts")).toBeNull();
+  expect(parsePathToken("run this/that.ts now")).toBeNull();
+  expect(parsePathToken("cargo test")).toBeNull();
 });

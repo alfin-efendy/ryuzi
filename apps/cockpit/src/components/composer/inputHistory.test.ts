@@ -20,6 +20,7 @@ function row(overrides: Partial<Row>): Row {
     toolDurationMs: null,
     toolExitCode: null,
     toolSummary: null,
+    toolSubagent: null,
     ...overrides,
   };
 }

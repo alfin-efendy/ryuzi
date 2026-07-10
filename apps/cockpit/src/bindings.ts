@@ -77,8 +77,24 @@ async endSession(sessionPk: string) : Promise<Result<null, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async resolveApproval(requestId: string, allow: boolean) : Promise<boolean> {
-    return await TAURI_INVOKE("resolve_approval", { requestId, allow });
+async listToolPolicies() : Promise<Result<ToolPolicyRow[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_tool_policies") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteToolPolicy(projectId: string, tool: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_tool_policy", { projectId, tool }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async resolveApproval(requestId: string, response: ApprovalResponse) : Promise<boolean> {
+    return await TAURI_INVOKE("resolve_approval", { requestId, response });
 },
 async readFile(path: string) : Promise<Result<string, CmdError>> {
     try {
@@ -400,14 +416,6 @@ async toggleAppAgent(id: string, agentId: string, allowed: boolean) : Promise<Re
     else return { status: "error", error: e  as any };
 }
 },
-async registrySearch(query: string | null, cursor: string | null) : Promise<Result<RegistryPage, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("registry_search", { query, cursor }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async listDir(sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_dir", { sessionPk, rel }) };
@@ -422,6 +430,20 @@ async listDir(sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], C
 async sessionWorkdir(sessionPk: string) : Promise<Result<string, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("session_workdir", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Whether `rel` names an existing regular file inside the session's
+ * working tree. Jailed like every fsview path: absolute paths and `..`
+ * escapes are simply "not found" (false), never an error — chat file-links
+ * must fail silent.
+ */
+async fileExists(sessionPk: string, rel: string) : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("file_exists", { sessionPk, rel }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -937,6 +959,14 @@ async setPluginSetting(key: string, value: string) : Promise<Result<null, CmdErr
     else return { status: "error", error: e  as any };
 }
 },
+async uninstallPlugin(id: string) : Promise<Result<PluginInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("uninstall_plugin", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async beginPluginOauth(pluginId: string) : Promise<Result<PluginOauthBeginResult, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("begin_plugin_oauth", { pluginId }) };
@@ -964,6 +994,44 @@ async disconnectPluginOauth(pluginId: string) : Promise<Result<PluginAuthInfo, C
 async pluginModels(id: string) : Promise<Result<string[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("plugin_models", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The install wizard's entry point (spec 8-step resolution order). Steps
+ * 1-6 live in `resolve_plugin_install`; this command adds step 7 (bind
+ * 8976 — retried briefly — + background callback/exchange task, degrading
+ * to `callback_mode: "manual"` only when the port is still taken after
+ * the retries) and step 8 (emit `PluginOauthAuthorizeUrlMsg` + open the
+ * browser), exactly like `begin_plugin_oauth` does for the detail view.
+ */
+async beginPluginInstall(pluginId: string) : Promise<Result<PluginInstallBeginResult, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("begin_plugin_install", { pluginId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setPluginOauthClientId(pluginId: string, clientId: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_oauth_client_id", { pluginId, clientId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel the pending OAuth flow for this plugin, if any: shuts down the
+ * callback listener and removes the flow-map entry. `state_token` narrows
+ * to a specific flow when known; `None` cancels whatever is pending for
+ * the id.
+ */
+async cancelPluginInstall(pluginId: string, stateToken: string | null) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_plugin_install", { pluginId, stateToken }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1087,6 +1155,7 @@ accentChangedMsg: AccentChangedMsg,
 coreEventMsg: CoreEventMsg,
 oauthAuthorizeUrlMsg: OauthAuthorizeUrlMsg,
 pluginOauthAuthorizeUrlMsg: PluginOauthAuthorizeUrlMsg,
+pluginOauthCompletedMsg: PluginOauthCompletedMsg,
 termExitMsg: TermExitMsg,
 termOutputMsg: TermOutputMsg
 }>({
@@ -1094,6 +1163,7 @@ accentChangedMsg: "accent-changed-msg",
 coreEventMsg: "core-event-msg",
 oauthAuthorizeUrlMsg: "oauth-authorize-url-msg",
 pluginOauthAuthorizeUrlMsg: "plugin-oauth-authorize-url-msg",
+pluginOauthCompletedMsg: "plugin-oauth-completed-msg",
 termExitMsg: "term-exit-msg",
 termOutputMsg: "term-output-msg"
 })
@@ -1117,6 +1187,45 @@ env: string[]; url: string | null; version: string | null; publisher: string | n
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
+/**
+ * The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+ */
+export type ApprovalDecision = "allowOnce" | "allowAlways" | "rejectOnce" | "rejectAlways" | "cancel"
+/**
+ * What a pending approval is asking the user for.
+ */
+export type ApprovalKind = 
+/**
+ * Permission to run one tool call.
+ */
+"tool" | 
+/**
+ * Review of an `exitplanmode` plan.
+ */
+"plan" | 
+/**
+ * An `askuserquestion` form.
+ */
+"question"
+/**
+ * The user's full reply to an approval request. `payload` carries
+ * kind-specific data: `{"mode": "acceptEdits"|"default"}` or
+ * `{"feedback": "…"}` for Plan, `{"answers": {question: [labels]}}`
+ * for Question.
+ */
+export type ApprovalResponse = { decision: ApprovalDecision; scope: ApprovalScope | null; payload: JsonValue | null }
+/**
+ * Where an `AllowAlways`/`RejectAlways` decision is remembered.
+ */
+export type ApprovalScope = 
+/**
+ * In-memory for the current session only.
+ */
+"session" | 
+/**
+ * Persisted to the project's `tool_policies` row.
+ */
+"project"
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type BranchList = { 
 /**
@@ -1162,7 +1271,7 @@ claudeCloaking: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -1285,7 +1394,7 @@ kind: string; setting: string | null; env: string | null; helpUrl: string | null
  * the process environment. Never reveals the value itself.
  */
 configured: boolean; oauthConnectAvailable: boolean; oauthConnectError: string | null; oauthTokenStored: boolean; oauthReconnectRequired: boolean }
-export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; menuLabel: string | null; homepage: string | null; publisher: string }
+export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; homepage: string | null; publisher: string }
 export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean; 
 /**
  * A persisted (non-empty) row exists for `key`. Never the value itself.
@@ -1293,13 +1402,73 @@ export type PluginFieldInfo = { key: string; label: string; help: string; secret
 valueSet: boolean }
 export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[]; verified: boolean; experimental: boolean; enabled: boolean; 
 /**
- * `builtin` | `catalog` | `user`.
+ * Same semantics as `PluginAuthInfo.configured` (oauth: token stored &&
+ * !reconnect_required; else a persisted `auth.setting` row or `auth.env`
+ * set). `false` when the manifest declares no `[auth]` block. On the
+ * LIST payload (not just `plugin_detail`) because the Browse grid's
+ * Install/Open split needs it — note this adds per-plugin store lookups
+ * to list assembly.
+ */
+configured: boolean; 
+/**
+ * `builtin` | `catalog` | `skill-pack`.
  */
 source: string; 
 /**
  * Any of `provider` | `runtime` | `gateway` | `connector`.
  */
-capabilities: string[] }
+capabilities: string[]; 
+/**
+ * `integration` | `provider` | `gateway` | `skill-pack`. Runtime-kind
+ * plugins are excluded from the list — the Runtime page owns them.
+ */
+kind: string; 
+/**
+ * Kind-specific "already set up" flag: integration = configured ||
+ * enabled; provider = ≥1 connection in the provider's family; gateway =
+ * all manifest settings present; skill-pack = installed on disk.
+ */
+installed: boolean; 
+/**
+ * Provider family head id (providers only) — the Models `providerDetail`
+ * navigation target. `None` for other kinds.
+ */
+family: string | null }
+export type PluginInstallBeginResult = { 
+/**
+ * `none` | `api-key` | `token` | `oauth`.
+ */
+authKind: string; 
+/**
+ * `auth.env` is declared AND set in the environment.
+ */
+envVarPresent: boolean; envVarName: string | null; 
+/**
+ * Endpoints + client id resolved; the browser flow started.
+ */
+oauthAvailable: boolean; 
+/**
+ * OAuth brokered outside Cockpit (kind=oauth, no `auth.resource`, no
+ * manifest `authorize_url` — google-workspace).
+ */
+oauthExternal: boolean; 
+/**
+ * oauth, endpoints may be known, but no client id and DCR not
+ * applicable / failed.
+ */
+needsClientId: boolean; 
+/**
+ * This call performed a successful registration.
+ */
+dcrSucceeded: boolean; 
+/**
+ * `auto` (callback server bound) | `manual` (bind failed → paste).
+ */
+callbackMode: string; oauthBegin: PluginOauthBeginResult | null; 
+/**
+ * Discovery/DCR failure detail (shown on the manual client id form).
+ */
+dcrError: string | null }
 export type PluginMcpInfo = { name: string; 
 /**
  * `stdio` | `http`.
@@ -1312,6 +1481,13 @@ transport: string;
 commandOrUrl: string }
 export type PluginOauthAuthorizeUrlMsg = { pluginId: string; authorizeUrl: string }
 export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string; redirectUri: string }
+/**
+ * Emitted by `begin_plugin_install`'s background callback task when the
+ * loopback OAuth flow finishes: `ok: true` after the token is stored;
+ * `ok: false` (with `error`) on timeout, state mismatch, or exchange
+ * failure — the flow entry survives failures so manual paste still works.
+ */
+export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —
@@ -1322,21 +1498,6 @@ export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteS
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
-export type RegistryEntry = { 
-/**
- * Registry name, e.g. `io.github.owner/server`.
- */
-id: string; name: string; desc: string; version: string; publisher: string | null; 
-/**
- * stdio (npm package) | http (remote)
- */
-kind: string; 
-/**
- * npm identifier for stdio entries; URL for remotes.
- */
-installTarget: string | null; website: string | null; versions: RegistryEntryVersion[] }
-export type RegistryEntryVersion = { version: string; installTarget: string | null; website: string | null; isLatest: boolean }
-export type RegistryPage = { entries: RegistryEntry[]; nextCursor: string | null }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
 /**
@@ -1376,6 +1537,10 @@ status: string; message: string }
 export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type TodoItem = { content: string; status: string }
 export type ToolInfo = { name: string; desc: string; perm: string }
+/**
+ * One persisted "don't ask again" rule (Settings → Permissions).
+ */
+export type ToolPolicyRow = { projectId: string; tool: string; decision: string }
 export type UsagePoint = { day: string; requests: number; inputTokens: number; outputTokens: number }
 export type UsageSeries = { days: UsagePoint[]; todayRequests: number; todayInputTokens: number; todayOutputTokens: number }
 export type WorktreeState = { 

@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AddAppInput, AppInfo, PluginInfo, RegistryEntry } from "@/bindings";
+import type { AddAppInput, AppInfo, PluginDetail, PluginInfo, PluginInstallBeginResult } from "@/bindings";
 
-function plugin(id: string, categories: string[]): PluginInfo {
+function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}): PluginInfo {
   return {
     id,
     name: id,
@@ -14,15 +14,18 @@ function plugin(id: string, categories: string[]): PluginInfo {
     enabled: false,
     source: "catalog",
     capabilities: ["connector"],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
+    ...over,
   };
 }
 
 const github = plugin("github", ["vcs", "issues"]);
-const notion = plugin("notion", ["docs", "wiki", "productivity"]);
-const builtin = {
-  ...plugin("ollama", ["model-provider"]),
-  source: "builtin" as const,
-};
+const notion = plugin("notion", ["docs"], { installed: true });
+const anthropic = plugin("anthropic", ["model-provider"], { kind: "provider", family: "anthropic", source: "builtin" });
+const superpowers = plugin("superpowers", ["skills"], { kind: "skill-pack", source: "skill-pack" });
 
 const githubApp: AppInfo = {
   id: "github",
@@ -47,50 +50,30 @@ const githubApp: AppInfo = {
   agentAccess: [],
 };
 
-// Mutable fixture read by the `listApps` mock at call time. PluginsView's
-// `hydrate` effect (unlike other views) is unconditional, so it always
-// re-fetches on mount — tests set this before rendering instead of seeding
-// `useApps` state directly (which hydrate would immediately overwrite).
+// Mutable fixtures read by the mocks at call time. PluginsView's `hydrate`
+// (apps) and `load` (plugins) effects re-fetch on mount, so tests set these
+// before rendering instead of seeding store state directly.
 let appsFixture: AppInfo[] = [];
+let pluginsFixture: PluginInfo[] = [github, notion];
 
 const listApps = mock(async () => ({ status: "ok" as const, data: appsFixture }));
 const addApp = mock(async (_input: AddAppInput) => ({ status: "ok" as const, data: appsFixture }));
-const listPlugins = mock(async () => ({ status: "ok" as const, data: [github, notion, builtin] as PluginInfo[] }));
-
-const registrySearch = mock(async (_query: string | null, _cursor: string | null) => ({
+const listPlugins = mock(async () => ({ status: "ok" as const, data: pluginsFixture }));
+const uninstallPlugin = mock(async (id: string) => ({
   status: "ok" as const,
-  data: {
-    entries: [
-      {
-        ...entry("io.github/org/alpha", "1.1.0", {
-          name: "Alpha Server",
-          desc: "Registry alpha",
-          installTarget: "@alpha/server@1.1.0",
-          website: "https://alpha.example",
-          isLatest: true,
-        }),
-        versions: [
-          { version: "1.1.0", installTarget: "@alpha/server@1.1.0", website: "https://alpha.example", isLatest: true },
-          { version: "1.0.0", installTarget: "@alpha/server@1.0.0", website: "https://alpha-old.example", isLatest: false },
-        ],
-      },
-    ],
-    nextCursor: null,
-  },
+  data: pluginsFixture.filter((p) => p.id !== id),
 }));
 
 const listSkills = mock(async () => ({
   status: "ok" as const,
-  data: [
-    {
-      id: "superpowers",
-      name: "Superpowers",
-      source: "superpowers",
-      pluginId: null,
-      installedAt: "2026-07-08T10:00:00Z",
-      skillCount: 12,
-    },
-  ],
+  data: [] as {
+    id: string;
+    name: string;
+    source: string;
+    pluginId: string | null;
+    installedAt: string;
+    skillCount: number;
+  }[],
 }));
 
 type InstallSkillResponse =
@@ -141,67 +124,86 @@ const refreshSkill = mock(async (_id: string) => ({
   },
 }));
 
+// The wizard mounts inside PluginsView, so its IPC surface needs benign
+// defaults here: begin resolves to authKind "none" with no settings, which
+// routes the wizard straight to done.
+const wizardDetail: PluginDetail = {
+  info: notion,
+  auth: null,
+  settings: [],
+  mcp: [],
+  models: [],
+  homepage: null,
+  publisher: "Notion",
+};
+const wizardBegin: PluginInstallBeginResult = {
+  authKind: "none",
+  envVarPresent: false,
+  envVarName: null,
+  oauthAvailable: false,
+  oauthExternal: false,
+  needsClientId: false,
+  dcrSucceeded: false,
+  callbackMode: "auto",
+  oauthBegin: null,
+  dcrError: null,
+};
+const pluginDetail = mock(async (_id: string) => ({ status: "ok" as const, data: wizardDetail }));
+const beginPluginInstall = mock(async (_pluginId: string) => ({ status: "ok" as const, data: wizardBegin }));
+const setPluginOauthClientId = mock(async (_pluginId: string, _clientId: string) => ({ status: "ok" as const, data: null }));
+const cancelPluginInstall = mock(async (_pluginId: string, _stateToken: string | null) => ({ status: "ok" as const, data: null }));
+const completePluginOauth = mock(async (_pluginId: string, _code: string, _stateToken: string) => ({
+  status: "ok" as const,
+  data: null,
+}));
+const setPluginSetting = mock(async (_key: string, _value: string) => ({ status: "ok" as const, data: null }));
+const setPluginEnabled = mock(async (_id: string, _enabled: boolean) => ({ status: "ok" as const, data: null }));
+const pluginOauthCompletedMsgListen = mock(
+  async (_cb: (event: { payload: { pluginId: string; ok: boolean; error: string | null } }) => void) => () => {},
+);
+// AddConnectionModal (mounted for provider installs) subscribes to the OAuth
+// authorize-url stream on open; a no-op listener keeps that effect happy.
+const oauthAuthorizeUrlMsgListen = mock(async (_cb: (event: unknown) => void) => () => {});
+
 // Mock the Tauri IPC boundary before the component (and the real stores it
 // pulls in) resolve "@/bindings"; the stores themselves are real zustand
 // singletons, seeded/reset around each test below.
 mock.module("@/bindings", () => ({
+  events: {
+    pluginOauthCompletedMsg: { listen: pluginOauthCompletedMsgListen },
+    oauthAuthorizeUrlMsg: { listen: oauthAuthorizeUrlMsgListen },
+  },
   commands: {
     listApps,
     addApp,
     listPlugins,
-    registrySearch,
+    uninstallPlugin,
     listSkills,
     installSkill,
     removeSkill,
     refreshSkill,
+    pluginDetail,
+    beginPluginInstall,
+    setPluginOauthClientId,
+    cancelPluginInstall,
+    completePluginOauth,
+    setPluginSetting,
+    setPluginEnabled,
   },
 }));
 
 const { useSkills } = await import("../store-skills");
 const { useApps } = await import("@/store-apps");
 const { usePlugins } = await import("@/store-plugins");
-const { useRuntimes } = await import("@/store-runtimes");
 const { useGateways } = await import("@/store-gateways");
 const { useNav } = await import("@/store-nav");
-const { filterByCategory, mergeRegistryEntries, PluginsView } = await import("./PluginsView");
+const { filterByCategory, PluginsView } = await import("./PluginsView");
 
-function entry(
-  id: string,
-  version: string,
-  options: {
-    name?: string;
-    desc?: string;
-    installTarget?: string | null;
-    website?: string | null;
-    publisher?: string | null;
-    kind?: string;
-    isLatest?: boolean;
-  } = {},
-): RegistryEntry {
-  return {
-    id,
-    name: options.name ?? "Server",
-    desc: options.desc ?? "A server.",
-    version,
-    publisher: options.publisher ?? "Acme",
-    kind: options.kind ?? "stdio",
-    installTarget: options.installTarget ?? `npx ${id}@${version}`,
-    website: options.website ?? null,
-    versions: [
-      {
-        version,
-        installTarget: options.installTarget ?? `npx ${id}@${version}`,
-        website: options.website ?? null,
-        isLatest: options.isLatest ?? false,
-      },
-    ],
-  };
-}
+const all = [plugin("github", ["vcs", "issues"]), plugin("notion", ["docs", "wiki", "productivity"]), plugin("ollama", ["model-provider"])];
 
-const all = [github, notion, builtin];
-
-// Render and flush the mount-effect hydrates (apps via `hydrate`, skills
-// store reset) inside act so their setState calls do not fire mid-assertion.
+// Render and flush the mount-effect fetches (apps via `hydrate`, plugins via
+// `load`, skills refresh) inside act so their setState calls do not fire
+// mid-assertion.
 async function renderView() {
   render(<PluginsView />);
   await act(async () => {});
@@ -209,17 +211,26 @@ async function renderView() {
 
 beforeEach(() => {
   appsFixture = [];
+  pluginsFixture = [github, notion];
   listApps.mockClear();
   addApp.mockClear();
   listPlugins.mockClear();
-  registrySearch.mockClear();
+  uninstallPlugin.mockClear();
   listSkills.mockClear();
   installSkill.mockClear();
   removeSkill.mockClear();
   refreshSkill.mockClear();
+  pluginDetail.mockClear();
+  beginPluginInstall.mockClear();
+  setPluginOauthClientId.mockClear();
+  cancelPluginInstall.mockClear();
+  completePluginOauth.mockClear();
+  setPluginSetting.mockClear();
+  setPluginEnabled.mockClear();
+  pluginOauthCompletedMsgListen.mockClear();
+  oauthAuthorizeUrlMsgListen.mockClear();
   useApps.setState({ apps: [], loaded: false, probing: null });
-  usePlugins.setState({ plugins: [github, notion, builtin], loaded: true });
-  useRuntimes.setState({ runtimes: [], loaded: false, refreshing: false, updating: {}, updateLog: {} });
+  usePlugins.setState({ plugins: [], loaded: false });
   useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
   useNav.setState({ history: { back: [], current: { kind: "plugins" }, forward: [] } });
   useSkills.setState({ skills: [], loading: false, error: null });
@@ -231,121 +242,164 @@ afterEach(() => {
   cleanup();
   useApps.setState({ apps: [], loaded: false, probing: null });
   usePlugins.setState({ plugins: [], loaded: false });
-  useRuntimes.setState({ runtimes: [], loaded: false, refreshing: false, updating: {}, updateLog: {} });
   useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
   useNav.setState({ history: { back: [], current: { kind: "home" }, forward: [] } });
+  useSkills.setState({ skills: [], loading: false, error: null });
 });
 
-test("renders the plugins heading and browse action", async () => {
+test("has exactly two tabs and no Access/Skills", async () => {
+  await renderView();
+
+  expect(screen.getByRole("button", { name: "Installed" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Browse" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Access" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Skills" })).toBeNull();
+});
+
+test("header shows Add MCP server and Add skill source, not Browse plugins", async () => {
   await renderView();
 
   expect(screen.getByRole("heading", { name: "Plugins" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Add MCP server" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Browse plugins" })).toBeTruthy();
-  expect(screen.getByText("No plugins installed yet. Add an MCP server by hand or browse plugins.")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Add skill source" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Browse plugins" })).toBeNull();
 });
 
-test("access tab uses plugin wording for installed MCP server controls", async () => {
-  appsFixture = [githubApp];
-  await renderView();
-
-  fireEvent.click(screen.getByRole("button", { name: "Access" }));
-
-  expect(screen.getByText("Plugin")).toBeTruthy();
-  expect(screen.getByText("Access here applies before per-tool permissions — a blocked agent never sees the plugin's tools.")).toBeTruthy();
-  expect(screen.queryByText("App")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Add app" })).toBeNull();
-});
-
-test("browse combines catalog cards with live registry results from the same view", async () => {
+test("browse lists only not-installed entries", async () => {
+  pluginsFixture = [github, notion];
   await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Browse" }));
 
-  await waitFor(() => expect(registrySearch).toHaveBeenCalledWith(null, null));
-  expect(await screen.findByText("notion")).toBeTruthy();
-  expect(await screen.findByText("Alpha Server")).toBeTruthy();
-  expect(screen.getAllByText("Catalog").length).toBeGreaterThan(0);
-  expect(screen.getAllByText("Registry").length).toBeGreaterThan(0);
+  expect(await screen.findByText("github")).toBeTruthy();
+  expect(screen.queryByText("notion")).toBeNull();
 });
 
-test("registry install uses the selected version install target from browse", async () => {
+test("browse install routes an integration to the install wizard", async () => {
+  pluginsFixture = [github, anthropic, superpowers];
   await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  await screen.findByText("Alpha Server");
+  await screen.findByText("github");
 
-  fireEvent.click(screen.getByRole("combobox", { name: "Version for Alpha Server" }));
-  fireEvent.click(await screen.findByRole("option", { name: "1.0.0" }));
-  fireEvent.click(screen.getByRole("button", { name: "Install Alpha Server" }));
+  fireEvent.click(screen.getByRole("button", { name: "Install github" }));
 
-  await waitFor(() =>
-    expect(addApp).toHaveBeenCalledWith(
-      expect.objectContaining({
-        name: "Alpha Server",
-        version: "1.0.0",
-        command: "npx",
-        args: ["-y", "@alpha/server@1.0.0"],
-      }),
-    ),
-  );
+  expect(await screen.findByText("Install github", { selector: "span" })).toBeTruthy();
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith("github"));
 });
 
-test("skills tab renders installed skills from listSkills", async () => {
+test("browse install routes a provider to the connection modal", async () => {
+  pluginsFixture = [github, anthropic, superpowers];
   await renderView();
 
-  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("anthropic");
 
-  await waitFor(() => expect(listSkills).toHaveBeenCalledTimes(1));
-  expect((await screen.findAllByText("Superpowers")).length).toBeGreaterThan(0);
-  expect(screen.getByText("superpowers")).toBeTruthy();
-  expect(screen.getByText("12 skills")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Refresh Superpowers" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Remove Superpowers" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Install anthropic" }));
+
+  expect((await screen.findAllByText("Add account")).length).toBeGreaterThan(0);
 });
 
-test("skills tab installs Superpowers from the curated action", async () => {
+test("browse install routes a skill pack to installSource", async () => {
+  pluginsFixture = [github, anthropic, superpowers];
   await renderView();
 
-  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-  await screen.findByText("Superpowers");
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("superpowers");
 
-  fireEvent.click(screen.getByRole("button", { name: "Install Superpowers" }));
+  fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
 
   await waitFor(() => expect(installSkill).toHaveBeenCalledWith("superpowers"));
 });
 
-test("manual skill install preserves the typed source after a failed attempt", async () => {
-  installSkill.mockImplementationOnce(async () => ({
-    status: "error" as const,
-    error: "network down",
-  }));
-
+test("browse skill-pack install is guarded while skills are loading", async () => {
+  pluginsFixture = [github, anthropic, superpowers];
   await renderView();
 
-  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-  await screen.findByText("Superpowers");
+  // A skills install is already in flight: installSource sets loading:true
+  // synchronously at the start, so a rapid second click must be a no-op.
+  act(() => {
+    useSkills.setState({ loading: true });
+  });
 
-  const input = screen.getByRole("textbox", { name: "Skill source" }) as HTMLInputElement;
-  fireEvent.change(input, { target: { value: "obra/superpowers" } });
-  fireEvent.click(screen.getByRole("button", { name: "Install source" }));
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("superpowers");
 
-  await waitFor(() => expect(installSkill).toHaveBeenCalledWith("obra/superpowers"));
-  expect(input.value).toBe("obra/superpowers");
+  fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
+
+  await act(async () => {});
+  expect(installSkill).not.toHaveBeenCalled();
 });
 
-test("manual skill install clears the typed source after a successful attempt", async () => {
+test("browse skill-pack install fires when skills are not loading", async () => {
+  pluginsFixture = [github, anthropic, superpowers];
   await renderView();
 
-  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-  await screen.findByText("Superpowers");
+  act(() => {
+    useSkills.setState({ loading: false });
+  });
 
-  const input = screen.getByRole("textbox", { name: "Skill source" }) as HTMLInputElement;
-  fireEvent.change(input, { target: { value: "obra/superpowers" } });
-  fireEvent.click(screen.getByRole("button", { name: "Install source" }));
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("superpowers");
 
-  await waitFor(() => expect(installSkill).toHaveBeenCalledWith("obra/superpowers"));
-  await waitFor(() => expect(input.value).toBe(""));
+  fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
+
+  await waitFor(() => expect(installSkill).toHaveBeenCalledWith("superpowers"));
+});
+
+test("installed aggregates apps and installed plugins with uninstall", async () => {
+  appsFixture = [githubApp];
+  pluginsFixture = [notion];
+  await renderView();
+
+  expect(await screen.findByText("GitHub")).toBeTruthy();
+  expect(screen.getByText("notion")).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Uninstall notion" }));
+
+  await waitFor(() => expect(uninstallPlugin).toHaveBeenCalledWith("notion"));
+});
+
+test("an installed curated pack renders as exactly one card, not a duplicate manual row", async () => {
+  // The skills store and the plugins list both know about superpowers once
+  // it's installed (same id). The Installed tab must show it once — as the
+  // plugin card with an Uninstall button — and NOT also as a manual "Skill
+  // sources" row (whose id/pluginId matches a listed plugin, so it's filtered
+  // out).
+  const installedPack = { ...superpowers, installed: true };
+  pluginsFixture = [installedPack];
+  useSkills.setState({
+    skills: [
+      {
+        id: "superpowers",
+        name: "superpowers",
+        source: "superpowers",
+        pluginId: null,
+        installedAt: "2026-07-08T10:00:00Z",
+        skillCount: 12,
+      },
+    ],
+    loading: false,
+    error: null,
+  });
+  await renderView();
+
+  expect(await screen.findByText("superpowers")).toBeTruthy();
+  // Exactly one node bears the pack name (the InstalledPluginCard), and it
+  // carries an Uninstall action — the manual "Skill sources" card would add a
+  // Remove button and a second name node.
+  expect(screen.getAllByText("superpowers")).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "Uninstall superpowers" })).toBeTruthy();
+  expect(screen.queryByText("Skill sources")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Remove superpowers" })).toBeNull();
+});
+
+test("empty installed state points at browse", async () => {
+  appsFixture = [];
+  pluginsFixture = [];
+  await renderView();
+
+  expect(await screen.findByText("Nothing installed yet. Browse plugins or add an MCP server by hand.")).toBeTruthy();
 });
 
 test("filterByCategory passes every plugin through for the default all category", () => {
@@ -363,78 +417,4 @@ test("filterByCategory matches a plugin tagged with several categories from any 
 
 test("filterByCategory returns an empty list when nothing matches", () => {
   expect(filterByCategory(all, "sandbox")).toEqual([]);
-});
-
-test("mergeRegistryEntries de-dupes by id, keeps first-seen order, and uses isLatest-aware winner", () => {
-  const pageOne: RegistryEntry[] = [
-    { ...entry("io.github/org/alpha", "1.0.0", { desc: "alpha old", installTarget: "@alpha/server@1.0.0", isLatest: false }) },
-    { ...entry("io.github/org/beta", "0.9.0", { installTarget: "@beta/server@0.9.0" }) },
-  ];
-  const pageTwo: RegistryEntry[] = [
-    {
-      ...entry("io.github/org/alpha", "1.1.0", {
-        desc: "alpha latest",
-        installTarget: "@alpha/server@1.1.0",
-        website: "https://alpha.example",
-        isLatest: true,
-      }),
-      versions: [{ version: "1.1.0", installTarget: "@alpha/server@1.1.0", website: "https://alpha.example", isLatest: true }],
-    },
-    { ...entry("io.github/org/gamma", "2.0.0", { installTarget: "@gamma/server@2.0.0" }) },
-  ];
-
-  const merged = mergeRegistryEntries(pageOne, pageTwo);
-
-  expect(merged).toHaveLength(3);
-  expect(merged.map((row) => row.id)).toEqual(["io.github/org/alpha", "io.github/org/beta", "io.github/org/gamma"]);
-
-  const alpha = merged[0];
-  expect(alpha.version).toBe("1.1.0");
-  expect(alpha.desc).toBe("alpha latest");
-  expect(alpha.installTarget).toBe("@alpha/server@1.1.0");
-  expect(alpha.website).toBe("https://alpha.example");
-  expect(alpha.versions.map((v) => v.version)).toEqual(["1.1.0", "1.0.0"]);
-  expect(new Set(alpha.versions.map((v) => v.version)).size).toBe(2);
-});
-
-test("mergeRegistryEntries selects top-level winner by isLatest when newer version is not top-level", () => {
-  const pageOne: RegistryEntry[] = [
-    {
-      ...entry("io.github/org/alpha", "2.0.0", {
-        name: "Alpha Core",
-        desc: "Original top-level name",
-        installTarget: "@alpha/server@2.0.0",
-        website: "https://old.example",
-        isLatest: false,
-      }),
-      versions: [{ version: "2.0.0", installTarget: "@alpha/server@2.0.0", website: "https://old.example", isLatest: false }],
-    },
-  ];
-
-  const pageTwo: RegistryEntry[] = [
-    {
-      ...entry("io.github/org/alpha", "2.0.0", {
-        name: "Incoming name",
-        desc: "Incoming top-level name",
-        installTarget: "@alpha/server@2.0.0-new",
-        website: "https://incoming.example",
-        isLatest: false,
-      }),
-      versions: [
-        { version: "2.0.0", installTarget: "@alpha/server@2.0.0-new", website: "https://incoming.example", isLatest: false },
-        { version: "1.9.0", installTarget: "@alpha/server@1.9.0", website: "https://latest-only.example", isLatest: true },
-      ],
-    },
-  ];
-
-  const merged = mergeRegistryEntries(pageOne, pageTwo);
-
-  expect(merged).toHaveLength(1);
-  expect(merged[0].version).toBe("1.9.0");
-  expect(merged[0].installTarget).toBe("@alpha/server@1.9.0");
-  expect(merged[0].website).toBe("https://latest-only.example");
-  expect(merged[0].name).toBe("Alpha Core");
-  expect(merged[0].desc).toBe("Original top-level name");
-  expect(merged[0].publisher).toBe("Acme");
-  expect(merged[0].versions.map((v) => v.version)).toEqual(["1.9.0", "2.0.0"]);
 });

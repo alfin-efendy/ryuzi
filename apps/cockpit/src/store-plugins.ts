@@ -4,13 +4,14 @@ import { commands, type PluginInfo } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
 // embedded catalog, or user-authored — and this store mirrors the flattened
-// `PluginInfo` list Cockpit needs for the catalog and sidebar screens.
+// `PluginInfo` list Cockpit needs for the Plugins hub screens.
 
 type PluginsState = {
   plugins: PluginInfo[];
   loaded: boolean;
   load: () => Promise<void>;
   setEnabled: (id: string, on: boolean) => Promise<void>;
+  uninstall: (id: string) => Promise<boolean>;
 };
 
 export const usePlugins = create<PluginsState>((set, get) => ({
@@ -32,30 +33,29 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     if (res.status === "error") toast.error(`Plugin update failed: ${res.error.message}`);
     await get().load();
   },
+
+  uninstall: async (id) => {
+    const res = await commands.uninstallPlugin(id);
+    if (res.status === "error") {
+      toast.error(`Uninstall failed: ${res.error.message}`);
+      return false;
+    }
+    set({ plugins: res.data, loaded: true });
+    return true;
+  },
 }));
 
 export function pluginById(plugins: PluginInfo[], id: string): PluginInfo | undefined {
   return plugins.find((p) => p.id === id);
 }
 
-/**
- * Plugins the sidebar shows as their own menu row: enabled integrations
- * (catalog or user-authored). Core builtins (native, claude-code, discord,
- * providers) never get a row here — they're wired into the fixed NAV items
- * above, and `PluginInfo` itself carries no menu-contribution field (that
- * lives on `PluginDetail.menuLabel`, only available per-plugin via
- * `pluginDetail`, not in the bulk `listPlugins` response the sidebar uses).
- */
-export function sidebarPlugins(plugins: PluginInfo[]): PluginInfo[] {
-  return plugins.filter((p) => p.enabled && (p.source === "catalog" || p.source === "user"));
+/** Browse tab: only entries not yet installed — installing removes the card. */
+export function browsePlugins(plugins: PluginInfo[]): PluginInfo[] {
+  return plugins.filter((p) => !p.installed);
 }
 
-/**
- * Plugins the Apps → Catalog tab lists: every catalog or user-authored entry,
- * enabled or not (unlike `sidebarPlugins`, which only surfaces the ones
- * already enabled). Core builtins (native, claude-code, discord, providers)
- * keep their own dedicated screens instead of a catalog row.
- */
-export function catalogPlugins(plugins: PluginInfo[]): PluginInfo[] {
-  return plugins.filter((p) => p.source === "catalog" || p.source === "user");
+/** Installed tab: providers, gateways, and skill packs that are set up.
+ *  MCP apps render from `useApps` separately. */
+export function installedPlugins(plugins: PluginInfo[]): PluginInfo[] {
+  return plugins.filter((p) => p.installed);
 }

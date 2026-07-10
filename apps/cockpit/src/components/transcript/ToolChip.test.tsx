@@ -18,6 +18,7 @@ function toolItem(key: string, status = "completed"): ActivityItem {
     name: "read",
     kind: "read",
     status,
+    subagent: null,
     output: null,
     path: null,
     input: { file_path: `src/${key}.ts` },

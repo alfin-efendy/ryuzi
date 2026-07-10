@@ -57,10 +57,10 @@ pub fn list_dir(root: &Path, rel: &str) -> anyhow::Result<Vec<DirEntry>> {
 /// Whether the working tree has uncommitted work (staged, unstaged, or
 /// untracked) — the guard before destructive worktree teardown.
 pub async fn is_dirty(workdir: &str) -> anyhow::Result<bool> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", workdir, "status", "--porcelain"])
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["-C", workdir, "status", "--porcelain"]);
+    crate::process_util::no_window(&mut cmd);
+    let out = cmd.output().await?;
     if !out.status.success() {
         anyhow::bail!(
             "git status failed: {}",
@@ -79,21 +79,21 @@ pub async fn unmerged_commit_count(workdir: &str, branch: &str) -> anyhow::Resul
     // applies to the next enumerator only, and patterns for --branches are
     // matched without the refs/heads/ prefix).
     let exclude = format!("--exclude={branch}");
-    let out = tokio::process::Command::new("git")
-        .args([
-            "-C",
-            workdir,
-            "rev-list",
-            "--count",
-            "HEAD",
-            "--not",
-            &exclude,
-            "--branches",
-            "--tags",
-            "--remotes",
-        ])
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args([
+        "-C",
+        workdir,
+        "rev-list",
+        "--count",
+        "HEAD",
+        "--not",
+        &exclude,
+        "--branches",
+        "--tags",
+        "--remotes",
+    ]);
+    crate::process_util::no_window(&mut cmd);
+    let out = cmd.output().await?;
     if !out.status.success() {
         anyhow::bail!(
             "git rev-list failed: {}",
@@ -108,10 +108,10 @@ pub async fn unmerged_commit_count(workdir: &str, branch: &str) -> anyhow::Resul
 
 /// The working tree's diff against HEAD (staged + unstaged), unified format.
 pub async fn git_diff(workdir: &str) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", workdir, "diff", "HEAD"])
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["-C", workdir, "diff", "HEAD"]);
+    crate::process_util::no_window(&mut cmd);
+    let out = cmd.output().await?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("git diff failed: {}", err.trim());
@@ -151,30 +151,30 @@ pub async fn revert_file(workdir: &str, rel_path: &str) -> anyhow::Result<()> {
     // `rel_path` containing `*`/`?`/`[...]` can only ever match its own
     // literal name, never widen the revert to other files.
     let literal_pathspec = format!(":(literal){rel_path}");
-    let tracked = tokio::process::Command::new("git")
-        .args([
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args([
+        "-C",
+        workdir,
+        "ls-files",
+        "--error-unmatch",
+        "--",
+        &literal_pathspec,
+    ]);
+    crate::process_util::no_window(&mut cmd);
+    let tracked = cmd.output().await?;
+    if tracked.status.success() {
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args([
             "-C",
             workdir,
-            "ls-files",
-            "--error-unmatch",
+            "restore",
+            "--staged",
+            "--worktree",
             "--",
             &literal_pathspec,
-        ])
-        .output()
-        .await?;
-    if tracked.status.success() {
-        let out = tokio::process::Command::new("git")
-            .args([
-                "-C",
-                workdir,
-                "restore",
-                "--staged",
-                "--worktree",
-                "--",
-                &literal_pathspec,
-            ])
-            .output()
-            .await?;
+        ]);
+        crate::process_util::no_window(&mut cmd);
+        let out = cmd.output().await?;
         anyhow::ensure!(
             out.status.success(),
             "git restore failed: {}",

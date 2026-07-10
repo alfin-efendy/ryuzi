@@ -110,15 +110,16 @@ pub async fn diagnostics(work_dir: &Path, file: &Path) -> anyhow::Result<Option<
     let uri = format!("file://{}", file.to_string_lossy());
     let root_uri = format!("file://{}", work_dir.to_string_lossy());
 
-    let mut child = match tokio::process::Command::new(cmd)
+    let mut command = tokio::process::Command::new(cmd);
+    command
         .args(&args)
         .current_dir(work_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    crate::process_util::no_window(&mut command);
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(_) => return Ok(None), // server not installed
     };

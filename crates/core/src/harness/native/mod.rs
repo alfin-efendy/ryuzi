@@ -137,14 +137,14 @@ impl Harness for NativeHarness {
         // connections alive for the session's lifetime.
         let mcp_tools = connect_mcp_tools(&ctx.mcp_servers).await;
         let tools = Arc::new(tools::ToolRegistry::with_extra(mcp_tools));
-        // Persistent memory keys off the session's project; without a session
-        // row (bare tests) the feature is simply off, keeping runs hermetic.
-        let memory_store = match ctx.store.get_session(&ctx.session_pk).await {
-            Ok(Some(session)) => Some(Arc::new(memory::MemoryStore::at_default(Some(
-                &session.project_id,
-            )))),
-            _ => None,
-        };
+        // Persistent memory and tool-policy lookups key off the session's
+        // project; without a session row (bare tests) both features are
+        // simply off, keeping runs hermetic.
+        let session_row = ctx.store.get_session(&ctx.session_pk).await.ok().flatten();
+        let project_id = session_row.as_ref().map(|s| s.project_id.clone());
+        let memory_store = project_id
+            .as_deref()
+            .map(|pid| Arc::new(memory::MemoryStore::at_default(Some(pid))));
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             deps: runner::RunnerDeps {
@@ -155,7 +155,8 @@ impl Harness for NativeHarness {
                 effort: ctx.effort,
                 meta,
                 perm_mode: Arc::new(std::sync::Mutex::new(ctx.perm_mode)),
-                project_policy: None,
+                project_id,
+                perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
                 store: ctx.store,
                 events: ctx.events,
                 approvals: ctx.approvals,
@@ -286,7 +287,6 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
             settings: vec![],
             mcp: vec![],
             skills: vec![],
-            menu: None,
             provider: None,
             runtime: None,
         },

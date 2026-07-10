@@ -147,6 +147,111 @@ fn parse_www_authenticate_params(header: &str) -> Vec<(String, String)> {
     pairs
 }
 
+/// RFC 8414 authorization-server metadata — only the fields we need.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OauthServerMetadata {
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    #[serde(default)]
+    pub registration_endpoint: Option<String>,
+}
+
+/// The RFC 8414 discovery URL candidates for `resource`, most specific
+/// first: the §3 path-inserted form (only when the resource URL has a
+/// path), then the origin-root form.
+fn discovery_urls(resource: &str) -> anyhow::Result<Vec<String>> {
+    let url = url::Url::parse(resource)?;
+    let origin = url.origin().ascii_serialization();
+    let path = url.path().trim_end_matches('/');
+    let mut candidates = Vec::new();
+    if !path.is_empty() && path != "/" {
+        candidates.push(format!(
+            "{origin}/.well-known/oauth-authorization-server{path}"
+        ));
+    }
+    candidates.push(format!("{origin}/.well-known/oauth-authorization-server"));
+    Ok(candidates)
+}
+
+/// Fetch the RFC 8414 document for `resource` (the manifest's full
+/// `auth.resource` URL). Discovery order: path-inserted form first when the
+/// resource has a path, then origin-root. First 2xx-with-valid-JSON wins;
+/// every candidate failing is a discovery error naming the last failure.
+pub async fn discover_oauth_server_metadata(
+    http: &reqwest::Client,
+    resource: &str,
+) -> anyhow::Result<OauthServerMetadata> {
+    let mut last_failure = String::new();
+    for candidate in discovery_urls(resource)? {
+        match http.get(&candidate).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<OauthServerMetadata>().await {
+                    Ok(metadata) => return Ok(metadata),
+                    Err(err) => last_failure = format!("{candidate}: invalid metadata: {err}"),
+                }
+            }
+            Ok(response) => last_failure = format!("{candidate}: HTTP {}", response.status()),
+            Err(err) => last_failure = format!("{candidate}: {err}"),
+        }
+    }
+    anyhow::bail!("OAuth discovery failed for {resource} — {last_failure}")
+}
+
+/// RFC 7591 dynamic-client-registration request. We always register as a
+/// PUBLIC PKCE client — never a confidential one.
+#[derive(Debug, Serialize)]
+struct DcrRegistrationRequest {
+    redirect_uris: Vec<String>,
+    token_endpoint_auth_method: &'static str, // "none" — public PKCE client
+    grant_types: Vec<&'static str>,           // ["authorization_code", "refresh_token"]
+    response_types: Vec<&'static str>,        // ["code"]
+    client_name: &'static str,                // "Ryuzi"
+}
+
+/// NOTE: if the server also returns `client_secret`, serde skips it (no
+/// deny_unknown_fields) and we deliberately IGNORE it — we registered as a
+/// public PKCE client, so `plugin_oauth_clients` never stores a secret and
+/// needs no encryption.
+#[derive(Debug, Deserialize)]
+struct DcrRegistrationResponse {
+    client_id: String,
+}
+
+/// RFC 7591 registration against `registration_endpoint`. Returns the new
+/// client_id.
+pub async fn register_oauth_client(
+    http: &reqwest::Client,
+    registration_endpoint: &str,
+    redirect_uri: &str,
+) -> anyhow::Result<String> {
+    let request = DcrRegistrationRequest {
+        redirect_uris: vec![redirect_uri.to_string()],
+        token_endpoint_auth_method: "none",
+        grant_types: vec!["authorization_code", "refresh_token"],
+        response_types: vec!["code"],
+        client_name: "Ryuzi",
+    };
+    let response = http
+        .post(registration_endpoint)
+        .json(&request)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let detail = body.trim();
+        if detail.is_empty() {
+            anyhow::bail!("dynamic client registration failed with HTTP {status}");
+        }
+        anyhow::bail!("dynamic client registration failed with HTTP {status}: {detail}");
+    }
+    let payload: DcrRegistrationResponse = response.json().await?;
+    if payload.client_id.is_empty() {
+        anyhow::bail!("dynamic client registration returned an empty client_id");
+    }
+    Ok(payload.client_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +347,192 @@ mod tests {
             parse_www_authenticate_resource(r#"Bearer realm="mcp", error="invalid_token""#),
             None
         );
+    }
+
+    // ---------- RFC 8414 discovery + RFC 7591 DCR ----------
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        base
+    }
+
+    #[test]
+    fn discovery_urls_orders_path_inserted_before_root() {
+        assert_eq!(
+            discovery_urls("https://mcp.atlassian.com/v1/mcp/authv2").unwrap(),
+            vec![
+                "https://mcp.atlassian.com/.well-known/oauth-authorization-server/v1/mcp/authv2"
+                    .to_string(),
+                "https://mcp.atlassian.com/.well-known/oauth-authorization-server".to_string(),
+            ]
+        );
+        assert_eq!(
+            discovery_urls("https://mcp.vercel.com").unwrap(),
+            vec!["https://mcp.vercel.com/.well-known/oauth-authorization-server".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_root_form_succeeds_for_a_pathless_resource() {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new().route(
+            "/.well-known/oauth-authorization-server",
+            get(|| async {
+                Json(serde_json::json!({
+                    "authorization_endpoint": "https://vendor.test/authorize",
+                    "token_endpoint": "https://vendor.test/token",
+                    "registration_endpoint": "https://vendor.test/register"
+                }))
+            }),
+        );
+        let base = serve(app).await;
+        let http = reqwest::Client::new();
+        let metadata = discover_oauth_server_metadata(&http, &base).await.unwrap();
+        assert_eq!(
+            metadata.authorization_endpoint,
+            "https://vendor.test/authorize"
+        );
+        assert_eq!(metadata.token_endpoint, "https://vendor.test/token");
+        assert_eq!(
+            metadata.registration_endpoint.as_deref(),
+            Some("https://vendor.test/register")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_path_inserted_only_vendor_is_found_first() {
+        use axum::{routing::get, Json, Router};
+        // Atlassian shape: ONLY the RFC 8414 §3 path-inserted document
+        // exists; the origin-root form 404s (axum default).
+        let app = Router::new().route(
+            "/.well-known/oauth-authorization-server/v1/mcp/authv2",
+            get(|| async {
+                Json(serde_json::json!({
+                    "authorization_endpoint": "https://vendor.test/path-authorize",
+                    "token_endpoint": "https://vendor.test/path-token"
+                }))
+            }),
+        );
+        let base = serve(app).await;
+        let http = reqwest::Client::new();
+        let metadata = discover_oauth_server_metadata(&http, &format!("{base}/v1/mcp/authv2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.authorization_endpoint,
+            "https://vendor.test/path-authorize"
+        );
+        assert!(metadata.registration_endpoint.is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_falls_back_past_a_2xx_invalid_json_path_inserted_document() {
+        use axum::{response::Html, routing::get, Json, Router};
+        // Path-inserted candidate responds 200 but with a body that isn't
+        // RFC 8414 JSON at all (e.g. a vendor's HTML error/landing page) —
+        // "first 2xx-with-VALID-JSON wins" must keep going to the root form
+        // rather than treating this 2xx as the winner and bailing.
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server/v1/mcp/authv2",
+                get(|| async { Html("<html><body>not json</body></html>") }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "authorization_endpoint": "https://vendor.test/authorize",
+                        "token_endpoint": "https://vendor.test/token"
+                    }))
+                }),
+            );
+        let base = serve(app).await;
+        let http = reqwest::Client::new();
+        let metadata = discover_oauth_server_metadata(&http, &format!("{base}/v1/mcp/authv2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.authorization_endpoint,
+            "https://vendor.test/authorize"
+        );
+        assert_eq!(metadata.token_endpoint, "https://vendor.test/token");
+    }
+
+    #[tokio::test]
+    async fn discovery_fails_when_both_forms_404() {
+        use axum::Router;
+        let base = serve(Router::new()).await;
+        let http = reqwest::Client::new();
+        let err = discover_oauth_server_metadata(&http, &format!("{base}/mcp"))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("OAuth discovery failed"), "{msg}");
+        assert!(msg.contains("404"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn dcr_registers_a_public_pkce_client_and_ignores_client_secret() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/register",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body["token_endpoint_auth_method"], "none");
+                assert_eq!(body["client_name"], "Ryuzi");
+                assert_eq!(
+                    body["grant_types"],
+                    serde_json::json!(["authorization_code", "refresh_token"])
+                );
+                assert_eq!(body["response_types"], serde_json::json!(["code"]));
+                assert_eq!(
+                    body["redirect_uris"],
+                    serde_json::json!(["http://127.0.0.1:8976/plugin-oauth/acme/callback"])
+                );
+                Json(serde_json::json!({
+                    "client_id": "dcr-client-1",
+                    "client_secret": "must-be-ignored"
+                }))
+            }),
+        );
+        let base = serve(app).await;
+        let http = reqwest::Client::new();
+        let client_id = register_oauth_client(
+            &http,
+            &format!("{base}/register"),
+            "http://127.0.0.1:8976/plugin-oauth/acme/callback",
+        )
+        .await
+        .unwrap();
+        assert_eq!(client_id, "dcr-client-1");
+    }
+
+    #[tokio::test]
+    async fn dcr_rejection_is_an_error_carrying_the_body_detail() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let app = Router::new().route(
+            "/register",
+            post(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":"approved clients only"}"#,
+                )
+            }),
+        );
+        let base = serve(app).await;
+        let http = reqwest::Client::new();
+        let err = register_oauth_client(
+            &http,
+            &format!("{base}/register"),
+            "http://127.0.0.1:8976/plugin-oauth/acme/callback",
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dynamic client registration failed"), "{msg}");
+        assert!(msg.contains("approved clients only"), "{msg}");
     }
 }

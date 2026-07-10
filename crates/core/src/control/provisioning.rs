@@ -58,10 +58,10 @@ fn strip_one_trailing_slash(s: &str) -> &str {
 /// Run `git` with `args`, failing with the captured stderr on a non-zero
 /// exit.
 async fn run_git(args: &[&str]) -> anyhow::Result<()> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args);
+    crate::process_util::no_window(&mut cmd);
+    let output = cmd.output().await?;
     if !output.status.success() {
         anyhow::bail!(
             "git {} failed: {}",

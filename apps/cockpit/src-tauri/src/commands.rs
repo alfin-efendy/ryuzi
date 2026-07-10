@@ -1,6 +1,6 @@
 use crate::error::CmdError;
 use ryuzi_core::branches::BranchList;
-use ryuzi_core::domain::AttachmentRef;
+use ryuzi_core::domain::{AttachmentRef, ToolPolicyRow};
 use ryuzi_core::{
     ControlPlane, Message, PermMode, Project, Session, SessionGitOptions, TurnPrompt,
 };
@@ -352,8 +352,28 @@ pub async fn end_session(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -
 
 #[tauri::command]
 #[specta::specta]
-pub fn resolve_approval(cp: State<'_, Arc<ControlPlane>>, request_id: String, allow: bool) -> bool {
-    cp.resolve_approval(&request_id, allow)
+pub async fn list_tool_policies(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<ToolPolicyRow>> {
+    Ok(cp.list_tool_policies().await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_tool_policy(
+    cp: State<'_, Arc<ControlPlane>>,
+    project_id: String,
+    tool: String,
+) -> R<()> {
+    Ok(cp.delete_tool_policy(&project_id, &tool).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn resolve_approval(
+    cp: State<'_, Arc<ControlPlane>>,
+    request_id: String,
+    response: ryuzi_core::domain::ApprovalResponse,
+) -> bool {
+    cp.resolve_approval(&request_id, response)
 }
 
 /// Largest file the viewer will load into memory.

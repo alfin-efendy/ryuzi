@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { Button, cn } from "@ryuzi/ui";
-import { joinPath, looksLikeWorkspaceFilePath, toWorkspaceRelativePath } from "@/lib/paths";
+import { joinPath, looksLikeWorkspaceFilePath, parsePathToken, toWorkspaceRelativePath } from "@/lib/paths";
 import { workspaceFileExists } from "@/lib/file-probe";
 import { useUi } from "@/store-ui";
 import { useNav } from "@/store-nav";
@@ -38,12 +38,20 @@ export function WorkspacePathCode({ text, className }: { text: string; className
   const open = useOpenWorkspaceFile();
   const [exists, setExists] = useState(false);
 
-  const rel = ctx ? toWorkspaceRelativePath(text, ctx.workdir) : null;
+  // `src/a.ts:42[:5]` opens the file: parsePathToken strips the line/col
+  // suffix when the token has one; everything else passes through raw. (Line
+  // jumping itself is not supported by the viewer yet — the path still opens.)
+  const pathText = parsePathToken(text)?.path ?? text;
+  const rel = ctx ? toWorkspaceRelativePath(pathText, ctx.workdir) : null;
   // Trusted = the span was an absolute path that resolved under the workdir;
   // only those may skip the shape heuristic (they still get probed).
-  const inputWasAbsolute = text.startsWith("/") || /^[A-Za-z]:[\\/]/.test(text);
+  const inputWasAbsolute = pathText.startsWith("/") || /^[A-Za-z]:[\\/]/.test(pathText);
   const trusted = rel !== null && inputWasAbsolute;
-  const candidate = ctx && rel !== null && (trusted || looksLikeWorkspaceFilePath(text)) ? rel : null;
+  // The shape heuristic sees a separator-normalized form so Windows-style
+  // relative paths (`crates\core\lib.rs`) qualify; the existence probe stays
+  // the gate that decides whether anything actually links.
+  const shapeText = pathText.replace(/\\/g, "/");
+  const candidate = ctx && rel !== null && (trusted || looksLikeWorkspaceFilePath(shapeText)) ? rel : null;
 
   useEffect(() => {
     setExists(false);

@@ -21,7 +21,3 @@ transport = "stdio"
 command = "uvx"
 args = ["better-telegram-mcp"]
 env = { TELEGRAM_BOT_TOKEN = "${auth}" }
-
-[menu]
-section = "plugins"
-label = "Telegram"
