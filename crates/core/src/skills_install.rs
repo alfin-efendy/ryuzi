@@ -217,6 +217,19 @@ pub async fn install_skill_source(source: &str) -> Result<InstalledSkillPack> {
     install_skill_source_with(source, &roots, &cloner).await
 }
 
+/// Like `install_skill_source`, but also writes a `plugin_installs` ledger
+/// row (resolved commit, content fingerprint, and trust tier) for the
+/// installed pack. Used by the daemon/Tauri paths, which always have a
+/// `Store` handle; `install_skill_source` remains for callers without one.
+pub async fn install_skill_source_recorded(
+    source: &str,
+    store: &crate::store::Store,
+) -> Result<InstalledSkillPack> {
+    let roots = InstallRoots::for_user()?;
+    let cloner = GitRepoCloner;
+    install_skill_source_with_recorded(source, &roots, &cloner, store).await
+}
+
 pub fn list_installed_skills() -> Result<Vec<InstalledSkillInfo>> {
     let roots = InstallRoots::for_user()?;
     list_installed_skills_in(&roots)
@@ -225,6 +238,28 @@ pub fn list_installed_skills() -> Result<Vec<InstalledSkillInfo>> {
 pub fn remove_installed_skill(id: &str) -> Result<()> {
     let roots = InstallRoots::for_user()?;
     remove_installed_skill_in(&roots, id)
+}
+
+/// Like `remove_installed_skill`, but also deletes the pack's `plugin_installs`
+/// ledger row and any `plugin_attach_status` row, so a reinstall starts from a
+/// clean ledger state instead of resurrecting stale trust/pin metadata.
+pub async fn remove_installed_skill_recorded(id: &str, store: &crate::store::Store) -> Result<()> {
+    let roots = InstallRoots::for_user()?;
+    remove_installed_skill_in(&roots, id)?;
+    store.delete_plugin_install(id).await?;
+    store
+        .with_conn({
+            let id = id.to_string();
+            move |c| {
+                c.execute(
+                    "DELETE FROM plugin_attach_status WHERE plugin_id=?1",
+                    rusqlite::params![id],
+                )
+                .map(|_| ())
+            }
+        })
+        .await?;
+    Ok(())
 }
 
 pub async fn refresh_installed_skill(id: &str) -> Result<InstalledSkillPack> {
@@ -238,17 +273,150 @@ async fn install_skill_source_with(
     roots: &InstallRoots,
     cloner: &impl RepoCloner,
 ) -> Result<InstalledSkillPack> {
+    let (pack, _commit) = install_skill_source_with_commit(source, roots, cloner).await?;
+    Ok(pack)
+}
+
+/// Shared install orchestration for both the plain and ledger-recording entry
+/// points: parses the source, clones it, discovers the install target, and
+/// installs it — returning the resolved commit (from `RepoCloner::clone_repo`)
+/// alongside the installed pack, so `install_skill_source_with_recorded` can
+/// write it into the ledger without cloning the repo a second time.
+async fn install_skill_source_with_commit(
+    source: &str,
+    roots: &InstallRoots,
+    cloner: &impl RepoCloner,
+) -> Result<(InstalledSkillPack, Option<String>)> {
     roots.ensure_exists()?;
     let source = parse_skill_source(source)?;
     let temp = tempfile::tempdir()?;
     let repo_dir = temp.path().join("repo");
-    // Bound but unused until a later task threads it into the install ledger.
-    let _commit = cloner.clone_repo(&source, &repo_dir).await?;
+    let commit = cloner.clone_repo(&source, &repo_dir).await?;
     let discovered = discover_install_target(&repo_dir, &source)?;
-    match discovered {
-        Discovery::Single(skill) => install_single_skill(roots, &source, skill),
-        Discovery::Pack(pack) => install_plugin_pack(roots, &source, *pack),
+    let pack = match discovered {
+        Discovery::Single(skill) => install_single_skill(roots, &source, skill)?,
+        Discovery::Pack(pack) => install_plugin_pack(roots, &source, *pack)?,
+    };
+    Ok((pack, commit))
+}
+
+/// Like `install_skill_source_with`, but also writes a `plugin_installs`
+/// ledger row: `resolved_commit` from the cloner, `fingerprint` from
+/// `fingerprint_dir` on the installed pack's on-disk directory, and
+/// `trust_tier` = `"curated"` for `CURATED_SKILL_SOURCES` repos, otherwise
+/// `"acknowledged"` (immediately acked, since an explicit install is itself
+/// the acknowledgement).
+async fn install_skill_source_with_recorded(
+    source: &str,
+    roots: &InstallRoots,
+    cloner: &impl RepoCloner,
+    store: &crate::store::Store,
+) -> Result<InstalledSkillPack> {
+    let (pack, commit) = install_skill_source_with_commit(source, roots, cloner).await?;
+    let fingerprint = fingerprint_dir(&installed_pack_dir(roots, &pack))?;
+    let now = crate::paths::now_ms();
+    let trust_tier = if is_curated_source(&pack.source) {
+        "curated"
+    } else {
+        "acknowledged"
+    };
+    store
+        .upsert_plugin_install(&crate::store::PluginInstallRecord {
+            plugin_id: pack.id.clone(),
+            kind: if pack.plugin_id.is_some() {
+                "plugin_pack".into()
+            } else {
+                "single_skill".into()
+            },
+            source_spec: source.to_string(),
+            resolved_commit: commit,
+            fingerprint,
+            installed_at: now,
+            updated_at: now,
+            pinned: false,
+            pin_reason: None,
+            trust_tier: trust_tier.into(),
+            trust_ack_at: if trust_tier == "acknowledged" {
+                Some(now)
+            } else {
+                None
+            },
+            trust_ack_summary: None,
+        })
+        .await?;
+    Ok(pack)
+}
+
+/// The on-disk directory whose fingerprint identifies a pack: the plugin dir
+/// for packs, the single-skill dir otherwise.
+fn installed_pack_dir(roots: &InstallRoots, pack: &InstalledSkillPack) -> PathBuf {
+    match &pack.plugin_id {
+        Some(pid) => roots.plugins_root.join(pid),
+        None => roots.skills_root.join(&pack.id),
     }
+}
+
+/// Whether `canonical_repo` (already resolved by `parse_skill_source`) names
+/// one of the curated skill sources — i.e. whether an install of it should
+/// land at the `"curated"` trust tier rather than `"acknowledged"`.
+pub(crate) fn is_curated_source(canonical_repo: &str) -> bool {
+    CURATED_SKILL_SOURCES
+        .iter()
+        .any(|(_, repo)| *repo == canonical_repo)
+}
+
+/// One-time backfill: create a `plugin_installs` ledger row for every
+/// on-disk installed pack that lacks one (installs made before the ledger
+/// existed). Idempotent — packs that already have a row are skipped, so
+/// repeated calls (e.g. every daemon startup) after the first are no-ops.
+/// Backfilled rows have no `resolved_commit` (the original clone is long
+/// gone) and default to a fresh `installed_at`/`updated_at` timestamp.
+pub async fn backfill_install_records(store: &crate::store::Store) -> Result<usize> {
+    let roots = InstallRoots::for_user()?;
+    backfill_install_records_in(&roots, store).await
+}
+
+async fn backfill_install_records_in(
+    roots: &InstallRoots,
+    store: &crate::store::Store,
+) -> Result<usize> {
+    let packs = collect_installed_packs(roots)?;
+    let mut backfilled = 0usize;
+    for pack in packs {
+        if store.get_plugin_install(&pack.id).await?.is_some() {
+            continue;
+        }
+        let fingerprint = fingerprint_dir(&installed_pack_dir(roots, &pack))
+            .unwrap_or_else(|_| "sha256:unknown".into());
+        let now = crate::paths::now_ms();
+        let trust_tier = if is_curated_source(&pack.source) {
+            "curated"
+        } else {
+            "acknowledged"
+        };
+        store
+            .upsert_plugin_install(&crate::store::PluginInstallRecord {
+                plugin_id: pack.id.clone(),
+                kind: if pack.plugin_id.is_some() {
+                    "plugin_pack".into()
+                } else {
+                    "single_skill".into()
+                },
+                source_spec: pack.source.clone(),
+                resolved_commit: None,
+                fingerprint,
+                installed_at: now,
+                updated_at: now,
+                pinned: false,
+                pin_reason: None,
+                trust_tier: trust_tier.into(),
+                trust_ack_at: None,
+                trust_ack_summary: None,
+            })
+            .await?;
+        backfilled += 1;
+    }
+    Ok(backfilled)
 }
 
 async fn refresh_installed_skill_with(
@@ -1140,11 +1308,9 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<()> {
 /// false mismatch). Symlinks/special files are ignored, matching
 /// `copy_dir_recursive`.
 ///
-/// Not yet called from production code — a later task wires it into the
-/// install ledger for local-edit detection. Allow dead-code on this pair
-/// until then so clippy stays clean; both are exercised directly by
-/// `fingerprint_is_stable_and_excludes_git_and_stamp` below.
-#[allow(dead_code)]
+/// Wired into the install ledger by `install_skill_source_with_recorded` and
+/// `backfill_install_records_in` for local-edit detection; also exercised
+/// directly by `fingerprint_is_stable_and_excludes_git_and_stamp` below.
 pub(crate) fn fingerprint_dir(dir: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut files: Vec<(String, PathBuf)> = Vec::new();
@@ -1163,7 +1329,6 @@ pub(crate) fn fingerprint_dir(dir: &Path) -> Result<String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
-#[allow(dead_code)]
 fn collect_files_rel(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
     for entry in std::fs::read_dir(dir)?.filter_map(std::result::Result::ok) {
         let path = entry.path();
@@ -2671,5 +2836,75 @@ path = "skills/focus"
             "new1"
         );
         assert!(!base.join("t1/v.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn recorded_install_writes_ledger_row_with_fingerprint_and_trust() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "My Skill", "d", "body");
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/acme/my-skill".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: Some("deadbeef".into()),
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+
+        let pack = install_skill_source_with_recorded(
+            "https://github.com/acme/my-skill",
+            &roots,
+            &cloner,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        let rec = store.get_plugin_install(&pack.id).await.unwrap().unwrap();
+        assert_eq!(rec.source_spec, "https://github.com/acme/my-skill");
+        assert_eq!(rec.resolved_commit.as_deref(), Some("deadbeef"));
+        assert!(rec.fingerprint.starts_with("sha256:"));
+        assert_eq!(rec.kind, "single_skill");
+        // Arbitrary (non-curated) source → acknowledged tier.
+        assert_eq!(rec.trust_tier, "acknowledged");
+    }
+
+    #[tokio::test]
+    async fn backfill_records_missing_installs_idempotently() {
+        let config = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "S", "d", "b");
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "https://github.com/acme/s".to_string(),
+            repo.path().to_path_buf(),
+        );
+        let roots = InstallRoots::new(config.path().to_path_buf());
+        let cloner = FakeRepoCloner {
+            repos,
+            commit: None,
+        };
+        // Install WITHOUT recording (legacy install).
+        install_skill_source_with("https://github.com/acme/s", &roots, &cloner)
+            .await
+            .unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let n = backfill_install_records_in(&roots, &store).await.unwrap();
+        assert_eq!(n, 1);
+        let rec = store.get_plugin_install("s").await.unwrap().unwrap();
+        assert!(rec.resolved_commit.is_none()); // backfilled rows have no commit
+                                                // Re-run is a no-op.
+        assert_eq!(
+            backfill_install_records_in(&roots, &store).await.unwrap(),
+            0
+        );
     }
 }

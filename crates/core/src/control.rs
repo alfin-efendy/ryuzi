@@ -103,6 +103,18 @@ impl ControlPlane {
         attachment_fetcher: Arc<dyn AttachmentFetcher>,
     ) -> Arc<ControlPlane> {
         let (events, _) = broadcast::channel(1024);
+
+        // One-time: create ledger rows for any skill packs installed before
+        // the ledger existed. Best-effort — a backfill failure must not
+        // block startup (mirrors the plugin path's warn-and-continue
+        // discipline). Runs here (rather than in `new`/`new_with_telemetry`)
+        // so every construction path — daemon, tests, and any future caller
+        // — gets it exactly once, while `store` is still an `Arc<Store>` we
+        // can borrow before it's moved into the struct below.
+        if let Err(e) = crate::skills_install::backfill_install_records(&store).await {
+            tracing::warn!("plugin install-ledger backfill failed: {e}");
+        }
+
         Arc::new(ControlPlane {
             store,
             registries,
