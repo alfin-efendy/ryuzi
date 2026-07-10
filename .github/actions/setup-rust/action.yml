@@ -4,12 +4,21 @@ inputs:
   components:
     description: Comma-separated rustup components (e.g. "clippy, rustfmt")
     default: ""
+  cache:
+    description: >-
+      Enable the shared cargo cache. Release builds set "false": rust-cache
+      keys share a prefix across workflows whose job is named `build`, and a
+      stale restore once shipped a fingerprint for a crate whose rlib was
+      pruned — cargo then skips compiling it and rustc dies with E0463
+      (keyring, run 28958324320). Release artifacts build clean instead.
+    default: "true"
 runs:
   using: composite
   steps:
     - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       with:
         components: ${{ inputs.components }}
-    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+    - if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         workspaces: ". -> target"

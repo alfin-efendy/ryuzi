@@ -71,10 +71,6 @@ id = "RUSTSEC-2024-0370"
 reason = "proc-macro-error is an unmaintained transitive proc-macro crate; no vulnerable runtime path; revisit on parent upgrades. Tracked in #40."
 
 [[IgnoredVulns]]
-id = "RUSTSEC-2017-0008"
-reason = "serial is an unmaintained transitive crate; no vulnerable runtime path; revisit on parent upgrades. Tracked in #40."
-
-[[IgnoredVulns]]
 id = "RUSTSEC-2025-0075"
 reason = "unic-* is an unmaintained transitive util crate; no vulnerable runtime path; revisit on parent upgrades. Tracked in #40."
 
@@ -93,14 +89,6 @@ reason = "unic-* is an unmaintained transitive util crate; no vulnerable runtime
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0100"
 reason = "unic-* is an unmaintained transitive util crate; no vulnerable runtime path; revisit on parent upgrades. Tracked in #40."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0194"
-reason = "quick-xml parent-pinned; upgrading to 0.41.0 requires the parent crate to unpin first. Tracked in #40."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0195"
-reason = "quick-xml parent-pinned; upgrading to 0.41.0 requires the parent crate to unpin first. Tracked in #40."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0049"
