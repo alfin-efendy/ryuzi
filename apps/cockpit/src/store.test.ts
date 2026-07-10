@@ -647,7 +647,20 @@ test("setFocused marks the previously-focused session read up to its lastActive"
   useStore.setState({
     focusedSessionPk: "s1",
     sessions: [
-      { sessionPk: "s1", projectId: "p", agentSessionId: null, worktreePath: null, branch: null, title: "s1", status: "idle", startedBy: null, createdAt: 0, lastActive: 4200, resumeAttempts: 0, branchOwned: false },
+      {
+        sessionPk: "s1",
+        projectId: "p",
+        agentSessionId: null,
+        worktreePath: null,
+        branch: null,
+        title: "s1",
+        status: "idle",
+        startedBy: null,
+        createdAt: 0,
+        lastActive: 4200,
+        resumeAttempts: 0,
+        branchOwned: false,
+      },
     ],
     loaded: { s1: true, s2: true },
   });
