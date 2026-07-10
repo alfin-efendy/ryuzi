@@ -43,7 +43,8 @@ tauri-plugin-autostart = "2"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
-reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
+futures.workspace = true
 portable-pty.workspace = true
 specta = { workspace = true, features = ["derive"] }
 tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }

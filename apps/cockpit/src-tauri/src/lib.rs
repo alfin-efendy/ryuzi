@@ -4,6 +4,7 @@ mod backdrop;
 mod commands;
 mod connections_cmd;
 mod endpoint_cmd;
+pub mod engine;
 pub mod engine_daemon;
 mod error;
 mod events;
