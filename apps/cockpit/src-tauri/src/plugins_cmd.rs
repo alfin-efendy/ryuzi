@@ -608,6 +608,10 @@ async fn resolve_plugin_install(
         );
     result.oauth_available = true;
     result.oauth_begin = Some(begin);
+    // Step 6 succeeded: any earlier dcr_error (e.g. discovery failed but the
+    // manifest's endpoints rescued the flow) is stale — never let the DTO
+    // carry oauthAvailable:true alongside a leftover dcrError.
+    result.dcr_error = None;
     Ok(result)
 }
 
@@ -1076,7 +1080,12 @@ pub async fn begin_plugin_install(
         message: format!("unknown plugin: {plugin_id}"),
     })?;
     let auth = plugin.manifest.auth.clone();
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| CmdError {
+            message: e.to_string(),
+        })?;
     let mut result = resolve_plugin_install(cp.store(), &http, &plugin_id, auth.as_ref()).await?;
     let Some(begin) = result.oauth_begin.clone() else {
         return Ok(result);
