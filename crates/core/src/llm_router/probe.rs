@@ -677,6 +677,13 @@ mod tests {
             "Bearer at-codex"
         );
         assert_eq!(req.headers().get("originator").unwrap(), "codex_cli_rs");
+        // The Codex CLI fingerprint headers the backend expects on every
+        // request (9router providers/registry/codex.js).
+        assert_eq!(
+            req.headers().get("user-agent").unwrap(),
+            "codex_cli_rs/0.136.0"
+        );
+        assert_eq!(req.headers().get("accept").unwrap(), "text/event-stream");
         assert_eq!(req.headers().get("chatgpt-account-id").unwrap(), "acct-1");
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(sent["model"], "gpt-5.2-codex");

@@ -706,6 +706,11 @@ fn oauth_upstream_request(
                 .json(body)
                 .header("authorization", format!("Bearer {access_token}"))
                 .header("originator", "codex_cli_rs")
+                // The Codex CLI identifies itself with these on every request
+                // (9router `providers/registry/codex.js`); the Responses wire
+                // always streams, so Accept is text/event-stream.
+                .header("user-agent", "codex_cli_rs/0.136.0")
+                .header("accept", "text/event-stream")
                 .header("session_id", uuid::Uuid::new_v4().to_string());
             if let Some(account_id) = crate::llm_router::models::chatgpt_account_id(&target.conn) {
                 req = req.header("chatgpt-account-id", account_id);
@@ -758,13 +763,25 @@ fn free_upstream_request(
     if target.conn.provider == "mimo-free" {
         let mut gated = body.clone();
         mimo::inject_system_marker(&mut gated);
+        // The MiMoCode CLI sends Accept matching the stream mode
+        // (9router `executors/mimo-free.js` buildHeaders).
+        let accept = if gated
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
         let mut req = ctx
             .http
             .post(format!("{base}{path}"))
             .json(&gated)
             .header("user-agent", mimo::CHROME_UA)
             .header("x-mimo-source", "mimocode-cli-free")
-            .header("x-session-affinity", mimo::session_affinity());
+            .header("x-session-affinity", mimo::session_affinity())
+            .header("accept", accept);
         if let Some(jwt) = mimo::cached_jwt() {
             req = req.header("authorization", format!("Bearer {jwt}"));
         }
@@ -2987,6 +3004,9 @@ mod tests {
             .to_str()
             .unwrap()
             .starts_with("ses_"));
+        // Non-streaming request → Accept: application/json (stream-aware,
+        // mirrors 9router executors/mimo-free.js).
+        assert_eq!(req.headers().get("accept").unwrap(), "application/json");
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(sent["messages"][0]["role"], "system");
         assert_eq!(

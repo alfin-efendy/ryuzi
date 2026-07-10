@@ -88,11 +88,19 @@ fn jwt_exp_ms(jwt: &str) -> i64 {
     }
 }
 
-/// Stable per-machine device fingerprint, mirroring the MiMoCode CLI's
+/// Stable per-install device fingerprint, mirroring the MiMoCode CLI's
 /// hostname|platform|arch|user seed. The server only needs an opaque stable
-/// id per install.
+/// hex id per install; the anti-abuse gate keys its rate limits on it, so
+/// uniqueness across installs matters (a shared seed means shared throttle
+/// buckets). `$HOSTNAME` is a non-exported shell var on most launches, so we
+/// prefer a genuinely per-install identifier — the Linux machine-id — and
+/// fall back to hostname/user env when it's absent.
 fn fingerprint() -> String {
     use sha2::{Digest, Sha256};
+    let machine_id = std::fs::read_to_string("/etc/machine-id")
+        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "ryuzi-host".to_string());
@@ -100,7 +108,7 @@ fn fingerprint() -> String {
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "ryuzi-user".to_string());
     let seed = format!(
-        "{host}|{}|{}|{user}",
+        "{machine_id}|{host}|{}|{}|{user}",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
