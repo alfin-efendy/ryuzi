@@ -274,25 +274,26 @@ export function SessionView() {
           </Button>
         </div>
 
-        {/* Native runtime plan (todowrite) */}
-        <TodoPanel sessionPk={session.sessionPk} running={running} />
-
-        {/* Transcript */}
-        <TranscriptFileContext.Provider value={transcriptFileCtx}>
-          <Transcript
-            sessionPk={session.sessionPk}
-            rows={rows}
-            agentName={agent?.name ?? "Agent"}
-            agentColor={agent?.color ?? "var(--muted-foreground)"}
-            running={running}
-          >
-            {pendingForSession.map((a, i) => (
-              <div key={a.requestId} className="px-4 pb-2">
-                <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
-              </div>
-            ))}
-          </Transcript>
-        </TranscriptFileContext.Provider>
+        {/* Transcript, with the floating plan panel overlaying it */}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <TranscriptFileContext.Provider value={transcriptFileCtx}>
+            <Transcript
+              sessionPk={session.sessionPk}
+              rows={rows}
+              agentName={agent?.name ?? "Agent"}
+              agentColor={agent?.color ?? "var(--muted-foreground)"}
+              running={running}
+            >
+              {pendingForSession.map((a, i) => (
+                <div key={a.requestId} className="px-4 pb-2">
+                  <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
+                </div>
+              ))}
+            </Transcript>
+          </TranscriptFileContext.Provider>
+          {/* Native runtime plan (todowrite) — floating rounded panel */}
+          <TodoPanel sessionPk={session.sessionPk} running={running} />
+        </div>
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
