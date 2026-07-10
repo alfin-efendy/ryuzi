@@ -34,11 +34,11 @@ const github: PluginInfo = {
   configured: false,
 };
 
-const userPlugin: PluginInfo = {
+const skillPack: PluginInfo = {
   ...github,
   id: "acme",
   name: "Acme",
-  source: "user",
+  source: "skill-pack",
 };
 
 const disabledCatalog: PluginInfo = { ...github, id: "linear", name: "Linear", enabled: false };
@@ -99,12 +99,12 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
   listSpy.mockRestore();
 });
 
-test("sidebarPlugins keeps only enabled catalog/user plugins, hiding builtins and disabled ones", () => {
-  const result = sidebarPlugins([builtin, github, userPlugin, disabledCatalog]);
-  expect(result.map((p) => p.id)).toEqual(["github", "acme"]);
+test("sidebarPlugins keeps only enabled catalog plugins, hiding builtins, skill packs, and disabled ones", () => {
+  const result = sidebarPlugins([builtin, github, skillPack, disabledCatalog]);
+  expect(result.map((p) => p.id)).toEqual(["github"]);
 });
 
-test("catalogPlugins keeps every catalog/user plugin regardless of enabled state, hiding builtins", () => {
-  const result = catalogPlugins([builtin, github, userPlugin, disabledCatalog]);
-  expect(result.map((p) => p.id)).toEqual(["github", "acme", "linear"]);
+test("catalogPlugins keeps every catalog plugin regardless of enabled state, hiding builtins and skill packs", () => {
+  const result = catalogPlugins([builtin, github, skillPack, disabledCatalog]);
+  expect(result.map((p) => p.id)).toEqual(["github", "linear"]);
 });
