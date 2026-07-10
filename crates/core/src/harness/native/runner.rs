@@ -131,14 +131,12 @@ pub async fn run_turn(
     )
     .await;
 
-    // Per-turn model snapshot: re-read the project's pinned model fresh from
-    // the store and resolve it for THIS turn, so a picker change mid-chat
-    // applies on the next turn without restarting the session. Everything
-    // below — request bodies, compaction, title generation, and the sub-agent
-    // spawner — reads the snapshot; the original `deps` is never mutated, so
-    // in-flight turns and running subagents keep the model they started with.
-    // Only `model` is refreshed here; `meta` (context window / output caps /
-    // prompt-cache support) stays at the session-start value.
+    // Complete per-turn configuration snapshot: re-read the project's pinned
+    // model/effort, configured and provider defaults, eligible surfaces, and
+    // ModelMeta. Everything below — request bodies, compaction, title
+    // generation, and the sub-agent spawner — shares this immutable snapshot;
+    // the original `deps` is never mutated, so in-flight turns and running
+    // subagents keep the configuration they started with.
     let turn_deps = refresh_turn_configuration(deps).await;
     let deps = &turn_deps;
 

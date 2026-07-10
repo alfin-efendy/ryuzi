@@ -1127,9 +1127,18 @@ fn oauth_upstream_request(
             // the `openai-oauth` catalog entry in registry.rs) — Codex CLI
             // never talks to anything else, so this isn't override-able.
             const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
+            #[cfg(test)]
+            let codex_base = target
+                .conn
+                .data
+                .base_url_override
+                .as_deref()
+                .unwrap_or(CODEX_BASE);
+            #[cfg(not(test))]
+            let codex_base = CODEX_BASE;
             let mut req = ctx
                 .http
-                .post(format!("{CODEX_BASE}/responses"))
+                .post(format!("{codex_base}/responses"))
                 .json(body)
                 .header("authorization", format!("Bearer {access_token}"))
                 .header("originator", "codex_cli_rs")
@@ -2340,10 +2349,13 @@ async fn codex_stream(
         &preference_key,
         &surface,
     );
+    if let Some(effort) = effort.value.as_deref() {
+        crate::llm_router::codex::apply_native_reasoning_effort(&mut responses, effort);
+    }
     crate::llm_router::codex::normalize_codex_responses_body(
         &mut responses,
         &target.upstream_model,
-        effort.value.as_deref(),
+        None,
         None,
     );
     let resp = send_upstream(ctx, target, &responses)
@@ -2539,6 +2551,105 @@ mod tests {
             None,
         );
         assert_eq!(responses["reasoning"]["effort"], "max");
+    }
+
+    #[tokio::test]
+    async fn codex_stream_sends_native_policy_effort_and_omits_unsupported_effort() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::Mutex as StdMutex;
+
+        async fn capture(
+            State(captured): State<Arc<StdMutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> ([(&'static str, &'static str); 1], &'static str) {
+            captured.lock().unwrap().push(body);
+            (
+                [("content-type", "text/event-stream")],
+                "event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            )
+        }
+
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/responses", post(capture))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "codex-wire",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("test-token".into()),
+                    expires_at: Some(crate::paths::now_ms() + 100 * 24 * 60 * 60 * 1_000),
+                    last_refresh_at: Some(crate::paths::now_ms()),
+                    needs_relogin: Some(false),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["gpt-wire".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let surface = model_effort::ExecutionSurfaceKey {
+            provider_id: "openai-oauth".into(),
+            connection_id: Some("codex-wire".into()),
+            model: "gpt-wire".into(),
+        };
+        let policy = Arc::new(model_effort::TurnEffortPolicy {
+            requested_model: "openai/gpt-wire".into(),
+            project_override: Some("ultra".into()),
+            route_compatibility: Default::default(),
+            configured: Default::default(),
+            surfaces: std::collections::HashMap::from([(
+                surface.clone(),
+                model_effort::ExecutionModelEffortCapabilities {
+                    surface,
+                    model_display_name: "GPT Wire".into(),
+                    supported: vec![model_effort::ReasoningEffortOption {
+                        value: "ultra".into(),
+                        label: "Ultra".into(),
+                        description: None,
+                    }],
+                    provider_default: None,
+                },
+            )]),
+        });
+        let body = || {
+            json!({
+                "model": "openai/gpt-wire",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+        };
+
+        let rx = anthropic_messages_stream(&ctx, body(), policy)
+            .await
+            .unwrap();
+        let _ = collect_stream(rx).await;
+
+        let unsupported = Arc::new(model_effort::TurnEffortPolicy {
+            requested_model: "openai/gpt-wire".into(),
+            project_override: Some("ultra".into()),
+            route_compatibility: Default::default(),
+            configured: Default::default(),
+            surfaces: Default::default(),
+        });
+        let rx = anthropic_messages_stream(&ctx, body(), unsupported)
+            .await
+            .unwrap();
+        let _ = collect_stream(rx).await;
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0]["reasoning"]["effort"], "max");
+        assert!(captured[1].get("reasoning").is_none());
     }
 
     async fn test_ctx() -> UpstreamCtx {

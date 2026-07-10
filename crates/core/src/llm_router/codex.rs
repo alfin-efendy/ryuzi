@@ -503,6 +503,18 @@ pub fn reasoning_effort_for_request(effort: &str) -> &str {
     }
 }
 
+/// Apply an already-resolved native turn policy. Unlike shared Responses
+/// normalization, this intentionally overwrites any translated effort.
+pub(crate) fn apply_native_reasoning_effort(body: &mut Value, effort: &str) {
+    let wire_effort = json!(reasoning_effort_for_request(effort));
+    match body.get_mut("reasoning") {
+        Some(Value::Object(reasoning)) => {
+            reasoning.insert("effort".into(), wire_effort);
+        }
+        _ => body["reasoning"] = json!({"effort": wire_effort}),
+    }
+}
+
 pub fn normalize_codex_responses_body(
     body: &mut Value,
     upstream_model: &str,
@@ -533,23 +545,20 @@ pub fn normalize_codex_responses_body(
         }
     }
 
-    if let Some(effort) = explicit_effort {
-        body["reasoning"]["effort"] = json!(reasoning_effort_for_request(effort));
-    } else if body.get("reasoning").is_none() {
-        if let Some(effort) = body.get("reasoning_effort").and_then(Value::as_str) {
+    if body.get("reasoning").is_none() {
+        if let Some(effort) = body
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .or(explicit_effort)
+        {
             body["reasoning"] = json!({
                 "effort": reasoning_effort_for_request(effort),
                 "summary": "auto"
             });
         }
     }
-    if body.get("reasoning").is_some()
-        && body
-            .get("reasoning")
-            .and_then(|r| r.get("summary"))
-            .is_none()
-    {
-        body["reasoning"]["summary"] = json!("auto");
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.entry("summary").or_insert_with(|| json!("auto"));
     }
     if body
         .get("reasoning")
@@ -868,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_effort_overwrites_existing_reasoning_without_losing_summary() {
+    fn external_caller_reasoning_effort_wins_over_route_compatibility() {
         let mut body = json!({
             "input": [],
             "reasoning": {"effort": "low", "summary": "detailed"}
@@ -876,8 +885,22 @@ mod tests {
 
         normalize_codex_responses_body(&mut body, "gpt-5.5", Some("ultra"), None);
 
-        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["effort"], "low");
         assert_eq!(body["reasoning"]["summary"], "detailed");
+
+        let mut flat = json!({"input": [], "reasoning_effort": "high"});
+        normalize_codex_responses_body(&mut flat, "gpt-5.5", Some("low"), None);
+        assert_eq!(flat["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn malformed_reasoning_shape_does_not_panic() {
+        let mut body = json!({"input": [], "reasoning": "malformed"});
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            normalize_codex_responses_body(&mut body, "gpt-5.5", Some("low"), None);
+        }));
+        assert!(result.is_ok());
+        assert_eq!(body["reasoning"], "malformed");
     }
 
     #[test]
