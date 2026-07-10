@@ -276,11 +276,10 @@ export function SessionView() {
               }}
               onPaste={composerFiles.onPaste}
               placeholder="Ask for follow-up changes"
-              rows={1}
-              className="field-sizing-fixed min-h-0 resize-none border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
+              className="max-h-[40vh] min-h-0 resize-none overflow-y-auto border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
             />
             {slashMatches.length > 0 && (
-              <MenuPanel onClose={() => undefined} className="bottom-[82px] left-2.5 z-50 w-[320px]">
+              <MenuPanel onClose={() => undefined} className="bottom-full left-2.5 z-50 mb-1.5 w-[320px]">
                 <MenuSectionLabel>Commands</MenuSectionLabel>
                 {slashMatches.map((cmd) => (
                   <MenuItem key={cmd.name} onClick={() => setDraft(`/${cmd.name} `)} className="font-medium">
@@ -291,7 +290,7 @@ export function SessionView() {
               </MenuPanel>
             )}
             {contextHits.length > 0 && (
-              <MenuPanel onClose={() => setContextHits([])} className="bottom-[82px] left-2.5 z-50 w-[360px]">
+              <MenuPanel onClose={() => setContextHits([])} className="bottom-full left-2.5 z-50 mb-1.5 w-[360px]">
                 <MenuSectionLabel>Context</MenuSectionLabel>
                 {contextHits.map((path) => (
                   <MenuItem key={path} onClick={() => pickContext(path)} className="font-medium">
