@@ -1,6 +1,6 @@
 use crate::domain::{
     Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionStatus,
-    Surface,
+    Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -490,6 +490,27 @@ fn migrations() -> Migrations<'static> {
                 client_id TEXT,\
                 updated_at INTEGER NOT NULL\
             );",
+        ),
+        // Rebuild plugin_oauth_clients to the nullable shape. Some dev DBs
+        // carry a pre-release v1 table (every column NOT NULL, created by an
+        // uncommitted experimental build); IF NOT EXISTS above never heals an
+        // existing table, so the discovery-first upsert (client_id = NULL)
+        // failed its NOT NULL constraint. Copy-drop-rename is idempotent —
+        // replay on an already-nullable table is a harmless rebuild — which
+        // the rewind-and-replay migration test relies on.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_oauth_clients_rebuild (\
+                plugin_id TEXT PRIMARY KEY NOT NULL,\
+                authorize_url TEXT,\
+                token_url TEXT,\
+                client_id TEXT,\
+                updated_at INTEGER NOT NULL\
+            );\
+            INSERT OR REPLACE INTO plugin_oauth_clients_rebuild \
+                SELECT plugin_id, authorize_url, token_url, client_id, updated_at \
+                FROM plugin_oauth_clients;\
+            DROP TABLE plugin_oauth_clients;\
+            ALTER TABLE plugin_oauth_clients_rebuild RENAME TO plugin_oauth_clients;",
         ),
     ])
 }
@@ -1405,6 +1426,41 @@ impl Store {
                  VALUES (?1, ?2, ?3) \
                  ON CONFLICT(project_id, tool) DO UPDATE SET decision=excluded.decision",
                 params![project_id, tool, decision],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Every persisted tool policy, ordered for stable display.
+    pub async fn list_tool_policies(&self) -> anyhow::Result<Vec<ToolPolicyRow>> {
+        self.with_conn(|c| -> rusqlite::Result<Vec<ToolPolicyRow>> {
+            let mut stmt = c.prepare(
+                "SELECT project_id, tool, decision FROM tool_policies \
+                 ORDER BY project_id, tool",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(ToolPolicyRow {
+                        project_id: r.get(0)?,
+                        tool: r.get(1)?,
+                        decision: r.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Remove one persisted tool policy (the Settings "revoke" action).
+    pub async fn delete_tool_policy(&self, project_id: &str, tool: &str) -> anyhow::Result<()> {
+        let project_id = project_id.to_string();
+        let tool = tool.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM tool_policies WHERE project_id=?1 AND tool=?2",
+                params![project_id, tool],
             )
         })
         .await?;
@@ -2432,6 +2488,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_and_delete_tool_policies() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .set_tool_policy("p1", "Bash", "allowAlways")
+            .await
+            .unwrap();
+        store
+            .set_tool_policy("p2", "Edit", "rejectAlways")
+            .await
+            .unwrap();
+        let rows = store.list_tool_policies().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        store.delete_tool_policy("p1", "Bash").await.unwrap();
+        let rows = store.list_tool_policies().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project_id, "p2");
+        assert_eq!(rows[0].decision, "rejectAlways");
+    }
+
+    #[tokio::test]
     async fn settings_kv_upserts_and_reads_back() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -2764,22 +2841,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_oauth_clients_v1_not_null_table_is_rebuilt_on_open() {
+        // Some dev DBs carry the pre-release v1 shape of plugin_oauth_clients
+        // (every column NOT NULL, from an uncommitted experimental build).
+        // CREATE TABLE IF NOT EXISTS never heals an existing table, so the
+        // discovery-first upsert (client_id = NULL) died with "NOT NULL
+        // constraint failed: plugin_oauth_clients.client_id". The rebuild
+        // migration must swap such a table to the nullable shape on the next
+        // open, preserving any rows it holds.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        "DROP TABLE plugin_oauth_clients;\
+                         CREATE TABLE plugin_oauth_clients (\
+                             plugin_id TEXT PRIMARY KEY NOT NULL,\
+                             authorize_url TEXT NOT NULL,\
+                             token_url TEXT NOT NULL,\
+                             client_id TEXT NOT NULL,\
+                             updated_at INTEGER NOT NULL\
+                         );\
+                         INSERT INTO plugin_oauth_clients \
+                             VALUES ('legacy', 'https://v.test/a', 'https://v.test/t', 'cid-1', 1);\
+                         -- Rewind past the rebuild slot so it re-runs on the
+                         -- next open, exactly like a dev DB that migrated up
+                         -- to the slot before it.
+                         PRAGMA user_version = 18;",
+                    )
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        // The v1-era row survives the rebuild...
+        let legacy = store
+            .get_plugin_oauth_client("legacy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.client_id.as_deref(), Some("cid-1"));
+        // ...and the discovery-first upsert (no client id yet) now works.
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "atlassian".into(),
+                authorize_url: Some("https://v.test/authorize".into()),
+                token_url: Some("https://v.test/token".into()),
+                client_id: None,
+            })
+            .await
+            .unwrap();
+        let row = store
+            .get_plugin_oauth_client("atlassian")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.client_id.is_none());
+    }
+
+    #[tokio::test]
     async fn migration_13_rewrites_claude_code_defaults_to_native() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back six so the
+        // DB, seed the old values, then wind user_version back seven so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
         // CREATE TABLE IF NOT EXISTS; 17 context_checkpoints + session_context —
         // CREATE TABLE IF NOT EXISTS; 18 plugin_oauth_clients — CREATE TABLE
-        // IF NOT EXISTS; all no-ops on replay) re-run on the next open.
+        // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
+        // copy-drop-rename; all no-ops on replay) re-run on the next open.
         // `Migrations` always fast-forwards to the latest defined version,
         // so there is no way to replay 13 alone once something is appended
         // after it.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 6)
+            c.pragma_update(None, "user_version", v - 7)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();

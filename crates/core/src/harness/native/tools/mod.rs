@@ -25,6 +25,8 @@ pub mod ls;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;
+pub mod plan;
+pub mod question;
 pub mod read;
 pub mod revert;
 pub mod skill;
@@ -116,6 +118,55 @@ pub trait SubagentSpawner: Send + Sync {
     }
 }
 
+/// Channel bundle for tools whose EXECUTION is a user interaction
+/// (`exitplanmode`, `askuserquestion`): they emit their own
+/// `ApprovalRequested` and block on the reply, reusing the approval pipeline.
+pub struct Interaction {
+    pub approvals: Arc<crate::approval::ApprovalHub>,
+    pub events: tokio::sync::broadcast::Sender<crate::domain::CoreEvent>,
+    /// The session's live permission mode (shared with `RunnerDeps`).
+    pub perm_mode: Arc<std::sync::Mutex<crate::domain::PermMode>>,
+    pub project_id: Option<String>,
+}
+
+impl Interaction {
+    /// Park an interaction request and await the user's reply. `None` when the
+    /// turn was cancelled or the session dropped the sender.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request(
+        &self,
+        session_pk: &str,
+        request_id: &str,
+        tool: &str,
+        summary: &str,
+        approval_kind: crate::domain::ApprovalKind,
+        input: serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> Option<crate::domain::ApprovalResponse> {
+        let rx = self
+            .approvals
+            .register_for_session(session_pk, request_id.to_string());
+        let _ = self
+            .events
+            .send(crate::domain::CoreEvent::ApprovalRequested {
+                session_pk: session_pk.to_string(),
+                request_id: request_id.to_string(),
+                tool: tool.to_string(),
+                summary: summary.to_string(),
+                approval_kind,
+                input,
+            });
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                self.approvals.resolve_bool(request_id, false);
+                None
+            }
+            res = rx => res.ok(),
+        }
+    }
+}
+
 /// Everything a tool needs to run one call.
 pub struct ToolCtx {
     pub session_pk: String,
@@ -134,6 +185,12 @@ pub struct ToolCtx {
     pub memory: Option<Arc<crate::harness::native::memory::MemoryStore>>,
     /// Stack of worktree snapshot SHAs for the `revert` tool (most recent last).
     pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// This call's tool_use id — doubles as the approval request_id for
+    /// interaction tools. Empty only in bare test contexts.
+    pub tool_call_id: String,
+    /// Present when the session has interactive surfaces; `None` disables
+    /// `exitplanmode`/`askuserquestion` (they return a tool error).
+    pub interaction: Option<Arc<Interaction>>,
 }
 
 /// The result of a tool call.
@@ -235,6 +292,8 @@ impl ToolRegistry {
             Arc::new(revert::Revert),
             Arc::new(lsp::Lsp),
             Arc::new(task::Task),
+            Arc::new(plan::ExitPlanMode),
+            Arc::new(question::AskUserQuestion),
         ];
         let mut tools = BTreeMap::new();
         for t in list {
@@ -332,7 +391,33 @@ pub(crate) mod testutil {
             spawn: None,
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            tool_call_id: "test-call".into(),
+            interaction: None,
         }
+    }
+
+    /// `ctx_at` + a live Interaction pinned to `mode`. Returns the hub/events
+    /// so tests can script the user's reply.
+    pub async fn ctx_with_interaction(
+        dir: &Path,
+        mode: crate::domain::PermMode,
+    ) -> (
+        ToolCtx,
+        Arc<crate::approval::ApprovalHub>,
+        tokio::sync::broadcast::Receiver<crate::domain::CoreEvent>,
+        Arc<std::sync::Mutex<crate::domain::PermMode>>,
+    ) {
+        let mut ctx = ctx_at(dir).await;
+        let hub = Arc::new(crate::approval::ApprovalHub::new());
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let perm = Arc::new(std::sync::Mutex::new(mode));
+        ctx.interaction = Some(Arc::new(Interaction {
+            approvals: hub.clone(),
+            events: tx,
+            perm_mode: perm.clone(),
+            project_id: None,
+        }));
+        (ctx, hub, rx, perm)
     }
 }
 
@@ -398,11 +483,13 @@ mod tests {
             "revert",
             "lsp",
             "task",
+            "exitplanmode",
+            "askuserquestion",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 16);
+        assert_eq!(defs.len(), 18);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

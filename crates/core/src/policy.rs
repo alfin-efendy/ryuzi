@@ -1,6 +1,17 @@
 use crate::domain::PermMode;
 
-const SAFE_TOOLS: &[&str] = &["Read", "Grep", "Glob", "LS", "NotebookRead", "TodoWrite"];
+const SAFE_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "LS",
+    "NotebookRead",
+    "TodoWrite",
+    // Interaction tools: their execution IS the prompt, so the gate itself
+    // never needs to ask — and they must work inside Plan mode.
+    "ExitPlanMode",
+    "AskUserQuestion",
+];
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
 /// `true` = auto-allow without asking the user.
@@ -28,26 +39,35 @@ pub enum PolicyOutcome {
     Deny,
 }
 
+/// Whether `tool` is in the read-only safe set (auto-allowed everywhere,
+/// including Plan mode).
+pub fn is_safe_tool(tool: &str) -> bool {
+    SAFE_TOOLS.contains(&tool)
+}
+
 /// Combined policy decision. Order matters:
 ///  1. **Plan** is a hard read-only mode — any non-safe (mutating) tool is
-///     DENIED outright, never prompted, and `allowAlways` does NOT override it.
-///     This is what makes the composer's "Plan" mode actually enforce
-///     "propose a plan first; no edits/commands" instead of silently behaving
-///     like "Ask".
-///  2. per-project `allowAlways` auto-allows,
-///  3. the mode-based auto-allow (safe tools always; edits under AcceptEdits;
+///     DENIED outright, never prompted, and no later rule overrides it. This
+///     is what makes the composer's "Plan" mode actually enforce "propose a
+///     plan first; no edits/commands" instead of silently behaving like "Ask".
+///  2. per-project `"rejectAlways"` is now a hard Deny — it beats the
+///     safe-tool auto-allow and every mode-based auto-allow below it.
+///  3. per-project `"allowAlways"` auto-allows,
+///  4. the mode-based auto-allow (safe tools always; edits under AcceptEdits;
 ///     everything under BypassPermissions),
-///  4. otherwise Prompt.
+///  5. otherwise Prompt.
 ///
 /// `project_policy` is the raw decision string returned by
-/// `Store::get_tool_policy` — currently only `"allowAlways"` triggers an
-/// `AutoAllow`.
+/// `Store::get_tool_policy`.
 pub fn decide_tool_permission(
     perm_mode: PermMode,
     project_policy: Option<&str>,
     tool: &str,
 ) -> PolicyOutcome {
     if perm_mode == PermMode::Plan && !SAFE_TOOLS.contains(&tool) {
+        return PolicyOutcome::Deny;
+    }
+    if project_policy == Some("rejectAlways") {
         return PolicyOutcome::Deny;
     }
     if project_policy == Some("allowAlways") {
@@ -204,16 +224,23 @@ mod tests {
             decide_tool_permission(PermMode::Default, None, "Bash"),
             PolicyOutcome::Prompt
         );
-        // Unknown policy value → Prompt
-        assert_eq!(
-            decide_tool_permission(PermMode::Default, Some("rejectAlways"), "Read"),
-            // Read is in SAFE_TOOLS → AutoAllow regardless of project_policy
-            PolicyOutcome::AutoAllow
-        );
-        // Unknown policy + unknown tool → Prompt
+    }
+
+    #[test]
+    fn reject_always_project_policy_denies() {
         assert_eq!(
             decide_tool_permission(PermMode::Default, Some("rejectAlways"), "Bash"),
-            PolicyOutcome::Prompt
+            PolicyOutcome::Deny
+        );
+        // Deny-wins: an explicit Never beats the safe-tool auto-allow.
+        assert_eq!(
+            decide_tool_permission(PermMode::Default, Some("rejectAlways"), "Read"),
+            PolicyOutcome::Deny
+        );
+        // …and beats AcceptEdits' mode auto-allow.
+        assert_eq!(
+            decide_tool_permission(PermMode::AcceptEdits, Some("rejectAlways"), "Edit"),
+            PolicyOutcome::Deny
         );
     }
 
