@@ -19,7 +19,10 @@
 use crate::error::CmdError;
 use crate::events::PluginOauthAuthorizeUrlMsg;
 use reqwest::Url;
-use ryuzi_core::plugins::oauth::{generate_pkce_verifier, pkce_challenge_s256, PluginOauthToken};
+use ryuzi_core::plugins::oauth::{
+    discover_oauth_server_metadata, generate_pkce_verifier, pkce_challenge_s256,
+    register_oauth_client, OauthServerMetadata, PluginOauthToken,
+};
 use ryuzi_core::plugins::providers;
 use ryuzi_core::settings::SettingsStore;
 use ryuzi_core::store::PluginOauthClient;
@@ -86,6 +89,48 @@ pub struct PluginOauthBeginResult {
 
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct PluginInstallBeginResult {
+    /// `none` | `api-key` | `token` | `oauth`.
+    pub auth_kind: String,
+    /// `auth.env` is declared AND set in the environment.
+    pub env_var_present: bool,
+    pub env_var_name: Option<String>,
+    /// Endpoints + client id resolved; the browser flow started.
+    pub oauth_available: bool,
+    /// OAuth brokered outside Cockpit (kind=oauth, no `auth.resource`, no
+    /// manifest `authorize_url` — google-workspace).
+    pub oauth_external: bool,
+    /// oauth, endpoints may be known, but no client id and DCR not
+    /// applicable / failed.
+    pub needs_client_id: bool,
+    /// This call performed a successful registration.
+    pub dcr_succeeded: bool,
+    /// `auto` (callback server bound) | `manual` (bind failed → paste).
+    pub callback_mode: String,
+    pub oauth_begin: Option<PluginOauthBeginResult>,
+    /// Discovery/DCR failure detail (shown on the manual client id form).
+    pub dcr_error: Option<String>,
+}
+
+impl PluginInstallBeginResult {
+    fn new(auth_kind: &str) -> Self {
+        Self {
+            auth_kind: auth_kind.to_string(),
+            env_var_present: false,
+            env_var_name: None,
+            oauth_available: false,
+            oauth_external: false,
+            needs_client_id: false,
+            dcr_succeeded: false,
+            callback_mode: "manual".to_string(),
+            oauth_begin: None,
+            dcr_error: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginFieldInfo {
     pub key: String,
     pub label: String,
@@ -142,6 +187,63 @@ fn plugin_oauth_flows() -> &'static Mutex<HashMap<String, PluginOauthFlowState>>
     PLUGIN_OAUTH_FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Cancellation handles for pending loopback callback servers, keyed by the
+/// same `{plugin_id}:{state_token}` key as `PLUGIN_OAUTH_FLOWS`. Firing (or
+/// dropping) one makes the background task exit without emitting a
+/// completion event.
+static PLUGIN_INSTALL_CANCELS: OnceLock<
+    Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+> = OnceLock::new();
+
+fn plugin_install_cancels() -> &'static Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>> {
+    PLUGIN_INSTALL_CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop pending flow state (and shut down any live callback server) for
+/// `plugin_id` — all of its flows when `state_token` is `None`, else just
+/// that one flow.
+fn cancel_pending_plugin_flows(plugin_id: &str, state_token: Option<&str>) {
+    let prefix = format!("{plugin_id}:");
+    let keys: Vec<String> = {
+        let mut flows = plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match state_token {
+            Some(token) => {
+                let key = plugin_oauth_flow_key(plugin_id, token);
+                flows.remove(&key);
+                vec![key]
+            }
+            None => {
+                let keys: Vec<String> = flows
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                for key in &keys {
+                    flows.remove(key);
+                }
+                keys
+            }
+        }
+    };
+    let mut cancels = plugin_install_cancels()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // A cancel sender can exist for a flow already removed (and vice versa)
+    // — sweep by prefix as well as by the exact keys.
+    let cancel_keys: Vec<String> = cancels
+        .keys()
+        .filter(|k| keys.contains(k) || (state_token.is_none() && k.starts_with(&prefix)))
+        .cloned()
+        .collect();
+    for key in cancel_keys {
+        if let Some(tx) = cancels.remove(&key) {
+            let _ = tx.send(());
+        }
+    }
+}
+
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
@@ -184,8 +286,19 @@ fn plugin_oauth_flow_key(plugin_id: &str, state_token: &str) -> String {
     format!("{plugin_id}:{state_token}")
 }
 
+/// The wizard's loopback callback server port. Registered redirect URIs use
+/// it, so it can never change without re-registering every DCR client.
+const PLUGIN_OAUTH_CALLBACK_PORT: u16 = 8976;
+
+fn plugin_oauth_callback_path(plugin_id: &str) -> String {
+    format!("/plugin-oauth/{plugin_id}/callback")
+}
+
 fn plugin_oauth_redirect_uri(plugin_id: &str) -> String {
-    format!("http://127.0.0.1:8976/plugin-oauth/{plugin_id}/callback")
+    format!(
+        "http://127.0.0.1:{PLUGIN_OAUTH_CALLBACK_PORT}{}",
+        plugin_oauth_callback_path(plugin_id)
+    )
 }
 
 fn plugin_oauth_requested_scopes(auth: &AuthSpec) -> Vec<String> {
@@ -351,6 +464,152 @@ fn build_plugin_oauth_begin_result_with(
         authorize_url: url.into(),
         redirect_uri,
     })
+}
+
+/// Steps 1-6 of the install resolution order: env var → non-oauth kinds →
+/// external OAuth → endpoint discovery (regardless of the
+/// dynamic-registration flag) → client id / DCR → authorize URL + flow
+/// state. Kept free of the Tauri runtime so tests can drive it against a
+/// mock vendor; `begin_plugin_install` wraps it with the callback server
+/// (step 7) and browser open (step 8).
+async fn resolve_plugin_install(
+    store: &Store,
+    http: &reqwest::Client,
+    plugin_id: &str,
+    auth: Option<&AuthSpec>,
+) -> anyhow::Result<PluginInstallBeginResult> {
+    // A manifest without [auth] behaves as kind "none".
+    let Some(auth) = auth else {
+        return Ok(PluginInstallBeginResult::new("none"));
+    };
+    let mut result = PluginInstallBeginResult::new(auth_kind_label(auth.kind));
+    result.env_var_name = auth.env.clone();
+
+    // 1. Env var short-circuit: install completes with zero auth input (the
+    // wizard still routes through the settings step before enabling).
+    if auth
+        .env
+        .as_deref()
+        .is_some_and(|e| std::env::var_os(e).is_some())
+    {
+        result.env_var_present = true;
+        return Ok(result);
+    }
+
+    // 2. Non-OAuth kinds: the wizard routes to token input or settings.
+    if auth.kind != AuthKind::Oauth {
+        return Ok(result);
+    }
+
+    // 3. External OAuth (google-workspace): no discovery, no browser, no
+    // callback — the child server brokers sign-in at first use. The wizard
+    // only collects the client id when none is saved yet.
+    if is_external_oauth(auth) {
+        let resolved = resolve_plugin_oauth(store, plugin_id, auth).await?;
+        result.oauth_external = true;
+        result.needs_client_id = resolved.client_id.is_none();
+        return Ok(result);
+    }
+
+    // 4. Endpoint resolution: discover when either endpoint COLUMN is
+    // missing — regardless of the dynamic-registration flag (Slack needs
+    // endpoints too). Manifest endpoints can still rescue a failure.
+    let row = store.get_plugin_oauth_client(plugin_id).await?;
+    let row_has_endpoints = row.as_ref().is_some_and(|row| {
+        row.authorize_url.as_deref().is_some_and(|v| !v.is_empty())
+            && row.token_url.as_deref().is_some_and(|v| !v.is_empty())
+    });
+    let mut discovered: Option<OauthServerMetadata> = None;
+    if !row_has_endpoints {
+        if let Some(resource) = auth.resource.as_deref().filter(|v| !v.is_empty()) {
+            match discover_oauth_server_metadata(http, resource).await {
+                Ok(metadata) => {
+                    // Persist endpoints even when registration is impossible
+                    // — the manual client-id path needs an authorize URL.
+                    // Network I/O above, store write here: never inside
+                    // with_conn.
+                    store
+                        .upsert_plugin_oauth_client(&PluginOauthClient {
+                            plugin_id: plugin_id.to_string(),
+                            authorize_url: Some(metadata.authorization_endpoint.clone()),
+                            token_url: Some(metadata.token_endpoint.clone()),
+                            client_id: None,
+                        })
+                        .await?;
+                    discovered = Some(metadata);
+                }
+                Err(err) => result.dcr_error = Some(err.to_string()),
+            }
+        }
+    }
+    let mut resolved = resolve_plugin_oauth(store, plugin_id, auth).await?;
+    if resolved.authorize_url.is_none() || resolved.token_url.is_none() {
+        // Discovery failed and neither cache nor manifest supplies
+        // endpoints — nothing else is possible; the wizard shows dcr_error
+        // with Retry.
+        return Ok(result);
+    }
+
+    // 5. Client id: any existing id (row → client_id_setting) permanently
+    // suppresses DCR. DCR runs only when the manifest opts in AND this
+    // call's discovery document exposed a registration_endpoint.
+    if resolved.client_id.is_none() {
+        let registration_endpoint = discovered
+            .as_ref()
+            .and_then(|m| m.registration_endpoint.clone())
+            .filter(|_| auth.dynamic_registration);
+        let Some(registration_endpoint) = registration_endpoint else {
+            result.needs_client_id = true;
+            return Ok(result);
+        };
+        match register_oauth_client(
+            http,
+            &registration_endpoint,
+            &plugin_oauth_redirect_uri(plugin_id),
+        )
+        .await
+        {
+            Ok(client_id) => {
+                store
+                    .upsert_plugin_oauth_client(&PluginOauthClient {
+                        plugin_id: plugin_id.to_string(),
+                        authorize_url: None,
+                        token_url: None,
+                        client_id: Some(client_id.clone()),
+                    })
+                    .await?;
+                result.dcr_succeeded = true;
+                resolved.client_id = Some(client_id);
+            }
+            Err(err) => {
+                result.dcr_error = Some(err.to_string());
+                result.needs_client_id = true;
+                return Ok(result);
+            }
+        }
+    }
+
+    // 6. Authorize URL + flow state; a new begin cancels whatever flow was
+    // pending for this plugin first.
+    cancel_pending_plugin_flows(plugin_id, None);
+    let verifier = generate_pkce_verifier();
+    let state_token = ryuzi_core::paths::new_id();
+    let begin =
+        build_plugin_oauth_begin_result_with(plugin_id, auth, &resolved, &verifier, &state_token)?;
+    plugin_oauth_flows()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(
+            plugin_oauth_flow_key(plugin_id, &state_token),
+            PluginOauthFlowState {
+                verifier,
+                redirect_uri: begin.redirect_uri.clone(),
+                requested_scopes: plugin_oauth_requested_scopes(auth),
+            },
+        );
+    result.oauth_available = true;
+    result.oauth_begin = Some(begin);
+    Ok(result)
 }
 
 /// Whether an auth block's credential is configured: a persisted, non-empty
@@ -769,6 +1028,7 @@ mod tests {
     use ryuzi_core::Registries;
     use ryuzi_plugin_sdk::{AuthSpec, ModelDef, PluginManifest, ProviderMeta, RuntimeMeta};
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- minimal fakes, self-contained to this test module ----
 
@@ -1398,5 +1658,295 @@ mod tests {
             settings.get("default_perm_mode").await.unwrap().as_deref(),
             Some("acceptEdits")
         );
+    }
+
+    // ---------- begin_plugin_install resolution (steps 1-6) ----------
+
+    /// Minimal hand-rolled HTTP mock on std::net (this crate has no axum —
+    /// core's axum-mock convention doesn't apply here; adding axum would be
+    /// a new dependency). Serves the RFC 8414 root + path-inserted documents
+    /// (both spellings share the well-known prefix) pointing endpoints (and,
+    /// when `with_registration`, the registration endpoint) at itself, plus
+    /// an RFC 7591 register endpoint; counts hits per route.
+    fn spawn_mock_vendor(
+        with_registration: bool,
+        discovery_hits: Arc<AtomicUsize>,
+        register_hits: Arc<AtomicUsize>,
+    ) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served_base = base.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let base = served_base.clone();
+                let discovery_hits = discovery_hits.clone();
+                let register_hits = register_hits.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    let header_end = loop {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                    // Drain any request body so the client never sees a
+                    // reset while still writing.
+                    if let Some(len) = head.lines().find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    }) {
+                        let mut have = buf.len() - header_end;
+                        while have < len {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => have += n,
+                            }
+                        }
+                    }
+                    let request_line = head.lines().next().unwrap_or_default().to_string();
+                    let (status, body) = if request_line
+                        .starts_with("GET /.well-known/oauth-authorization-server")
+                    {
+                        discovery_hits.fetch_add(1, Ordering::SeqCst);
+                        let registration = if with_registration {
+                            format!(r#","registration_endpoint":"{base}/register""#)
+                        } else {
+                            String::new()
+                        };
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/token"{registration}}}"#
+                            ),
+                        )
+                    } else if request_line.starts_with("POST /register") {
+                        register_hits.fetch_add(1, Ordering::SeqCst);
+                        ("200 OK", r#"{"client_id":"dcr-client-123"}"#.to_string())
+                    } else {
+                        ("404 Not Found", String::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        base
+    }
+
+    async fn test_store() -> (ryuzi_core::Store, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        (store, tmp)
+    }
+
+    #[tokio::test]
+    async fn begin_env_var_short_circuits_before_any_oauth_work() {
+        let (store, _tmp) = test_store().await;
+        let var = "RYUZI_TEST_WIZ_ENV_7a91";
+        std::env::set_var(var, "present");
+        let auth = AuthSpec {
+            kind: AuthKind::ApiKey,
+            env: Some(var.to_string()),
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+        let result = resolve_plugin_install(&store, &http, "wiz-env", Some(&auth))
+            .await
+            .unwrap();
+        assert_eq!(result.auth_kind, "api-key");
+        assert!(result.env_var_present);
+        assert_eq!(result.env_var_name.as_deref(), Some(var));
+        assert!(result.oauth_begin.is_none());
+        std::env::remove_var(var);
+    }
+
+    #[tokio::test]
+    async fn begin_non_oauth_kind_reports_kind_only() {
+        let (store, _tmp) = test_store().await;
+        let auth = AuthSpec {
+            kind: AuthKind::Token,
+            setting: Some("plugin.wiz-token.token".into()),
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+        let result = resolve_plugin_install(&store, &http, "wiz-token", Some(&auth))
+            .await
+            .unwrap();
+        assert_eq!(result.auth_kind, "token");
+        assert!(!result.env_var_present);
+        assert!(!result.oauth_available && !result.oauth_external && !result.needs_client_id);
+        // And no [auth] block at all behaves as "none".
+        let result = resolve_plugin_install(&store, &http, "wiz-none", None)
+            .await
+            .unwrap();
+        assert_eq!(result.auth_kind, "none");
+    }
+
+    #[tokio::test]
+    async fn begin_external_oauth_never_discovers_and_tracks_saved_client_id() {
+        let (store, _tmp) = test_store().await;
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            setting: Some("plugin.wiz-external.client_id".into()),
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+        let result = resolve_plugin_install(&store, &http, "wiz-external", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.oauth_external);
+        assert!(result.needs_client_id, "no saved auth.setting value yet");
+        assert!(!result.oauth_available);
+        assert!(result.oauth_begin.is_none());
+
+        store
+            .set_setting_raw("plugin.wiz-external.client_id", "google-client")
+            .await
+            .unwrap();
+        let result = resolve_plugin_install(&store, &http, "wiz-external", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.oauth_external);
+        assert!(!result.needs_client_id);
+        assert!(result.oauth_begin.is_none(), "external never opens a browser");
+    }
+
+    #[tokio::test]
+    async fn begin_runs_discovery_then_dcr_then_reuses_the_cache() {
+        let (store, _tmp) = test_store().await;
+        let discovery_hits = Arc::new(AtomicUsize::new(0));
+        let register_hits = Arc::new(AtomicUsize::new(0));
+        let base = spawn_mock_vendor(true, discovery_hits.clone(), register_hits.clone());
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            resource: Some(format!("{base}/mcp")),
+            dynamic_registration: true,
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+
+        let result = resolve_plugin_install(&store, &http, "wiz-dcr", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.dcr_succeeded);
+        assert!(result.oauth_available);
+        assert!(!result.needs_client_id);
+        let begin = result.oauth_begin.expect("browser flow prepared");
+        assert!(
+            begin.authorize_url.starts_with(&format!("{base}/authorize?")),
+            "{}",
+            begin.authorize_url
+        );
+        assert!(begin.authorize_url.contains("client_id=dcr-client-123"));
+        assert_eq!(discovery_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(register_hits.load(Ordering::SeqCst), 1);
+        // Flow state was stored for the callback/exchange.
+        assert!(plugin_oauth_flows()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_key(&plugin_oauth_flow_key("wiz-dcr", &begin.state_token)));
+
+        // Endpoints + client id persisted.
+        let row = store.get_plugin_oauth_client("wiz-dcr").await.unwrap().unwrap();
+        assert_eq!(row.authorize_url.as_deref(), Some(format!("{base}/authorize").as_str()));
+        assert_eq!(row.token_url.as_deref(), Some(format!("{base}/token").as_str()));
+        assert_eq!(row.client_id.as_deref(), Some("dcr-client-123"));
+
+        // Second begin: cached endpoints reused (no second discovery) and a
+        // client id on the row permanently suppresses DCR.
+        let result2 = resolve_plugin_install(&store, &http, "wiz-dcr", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result2.oauth_available);
+        assert!(!result2.dcr_succeeded);
+        assert_eq!(discovery_hits.load(Ordering::SeqCst), 1, "no second discovery");
+        assert_eq!(register_hits.load(Ordering::SeqCst), 1, "no second registration");
+    }
+
+    #[tokio::test]
+    async fn begin_without_registration_endpoint_persists_endpoints_then_manual_id_skips_dcr() {
+        let (store, _tmp) = test_store().await;
+        let discovery_hits = Arc::new(AtomicUsize::new(0));
+        let register_hits = Arc::new(AtomicUsize::new(0));
+        // Slack shape: endpoints discoverable, registration closed, manifest
+        // does not opt into dynamic-registration.
+        let base = spawn_mock_vendor(false, discovery_hits.clone(), register_hits.clone());
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            resource: Some(format!("{base}/mcp")),
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+
+        let result = resolve_plugin_install(&store, &http, "wiz-slack", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.needs_client_id);
+        assert!(!result.oauth_available);
+        assert!(!result.dcr_succeeded);
+        assert_eq!(register_hits.load(Ordering::SeqCst), 0);
+        // Endpoints survive even though registration is impossible.
+        let row = store.get_plugin_oauth_client("wiz-slack").await.unwrap().unwrap();
+        assert_eq!(row.token_url.as_deref(), Some(format!("{base}/token").as_str()));
+        assert!(row.client_id.is_none());
+
+        // Manual client id → re-begin goes straight to the browser flow.
+        store
+            .upsert_plugin_oauth_client(&PluginOauthClient {
+                plugin_id: "wiz-slack".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("manual-client".into()),
+            })
+            .await
+            .unwrap();
+        let result = resolve_plugin_install(&store, &http, "wiz-slack", Some(&auth))
+            .await
+            .unwrap();
+        assert!(result.oauth_available);
+        assert!(!result.needs_client_id);
+        assert!(result
+            .oauth_begin
+            .unwrap()
+            .authorize_url
+            .contains("client_id=manual-client"));
+        assert_eq!(discovery_hits.load(Ordering::SeqCst), 1, "cached endpoints reused");
+        assert_eq!(register_hits.load(Ordering::SeqCst), 0, "DCR never attempted");
+    }
+
+    #[tokio::test]
+    async fn begin_discovery_failure_with_no_endpoints_reports_only_the_error() {
+        let (store, _tmp) = test_store().await;
+        // Bind then drop: requests to this port are refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let auth = AuthSpec {
+            kind: AuthKind::Oauth,
+            resource: Some(format!("{base}/mcp")),
+            dynamic_registration: true,
+            ..Default::default()
+        };
+        let http = reqwest::Client::new();
+        let result = resolve_plugin_install(&store, &http, "wiz-down", Some(&auth))
+            .await
+            .unwrap();
+        assert!(!result.oauth_available);
+        assert!(!result.needs_client_id, "nothing to enter without endpoints");
+        assert!(result.dcr_error.is_some());
+        assert!(result.oauth_begin.is_none());
     }
 }
