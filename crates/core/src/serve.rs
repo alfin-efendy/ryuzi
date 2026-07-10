@@ -207,16 +207,16 @@ async fn get_plugin(
 }
 
 /// Merge a `plugin_installs` ledger row into a plugin's JSON summary/manifest
-/// object. Overwrites `source` with the record's actual `source_spec` (e.g.
-/// a git URL) — more specific than the generic [`source_label`] enum tag,
-/// and only ever applies to plugins that actually have an install record
-/// (git-sourced skill packs), so builtin/catalog plugins keep their
-/// `source_label` value untouched.
+/// object. The record's origin lands under the DISTINCT `sourceSpec` key (a
+/// git URL / source spec), deliberately NOT the existing `source` field —
+/// `source` stays the stable [`source_label`] enum tag (`"builtin" |
+/// "catalog" | "skill-pack"`) so consumers matching on those labels keep
+/// working even once a plugin has a ledger row.
 fn merge_install_record(
     map: &mut serde_json::Map<String, Value>,
     rec: &crate::store::PluginInstallRecord,
 ) {
-    map.insert("source".to_string(), json!(rec.source_spec));
+    map.insert("sourceSpec".to_string(), json!(rec.source_spec));
     map.insert("resolvedCommit".to_string(), json!(rec.resolved_commit));
     map.insert("pinned".to_string(), json!(rec.pinned));
     map.insert("installedAt".to_string(), json!(rec.installed_at));
@@ -302,7 +302,11 @@ async fn update_plugin_route(
     let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     match crate::skills_install::update_installed_pack(&id, force, cp.store()).await {
         Ok(outcome) => {
-            cp.mark_plugins_restart_required();
+            // Only an actual reinstall changes what's on disk / loaded;
+            // AlreadyCurrent/SkippedPinned/LocalEdits/NeedsReack are no-ops.
+            if matches!(outcome, crate::skills_install::UpdateOutcome::Updated) {
+                cp.mark_plugins_restart_required();
+            }
             Json(outcome).into_response()
         }
         Err(e) => err(&e),
@@ -315,7 +319,13 @@ async fn update_plugin_route(
 async fn update_all_plugins(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse {
     match crate::skills_install::update_all_packs(cp.store()).await {
         Ok(list) => {
-            cp.mark_plugins_restart_required();
+            // Only mark dirty if at least one pack actually reinstalled.
+            if list
+                .iter()
+                .any(|(_, o)| matches!(o, crate::skills_install::UpdateOutcome::Updated))
+            {
+                cp.mark_plugins_restart_required();
+            }
             Json(
                 list.into_iter()
                     .map(|(id, outcome)| json!({ "id": id, "outcome": outcome }))
@@ -362,7 +372,10 @@ async fn uninstall_plugin_route(
 }
 
 /// The `{id, name, description, categories, verified, experimental, enabled,
-/// capabilities}` shape `GET /plugins` returns for one plugin.
+/// source, capabilities}` shape `GET /plugins` returns for one plugin.
+/// `source` is the stable [`source_label`] enum tag (`"builtin" | "catalog" |
+/// "skill-pack"`); a plugin's git origin, when it has a ledger row, is added
+/// separately under `sourceSpec` (see [`merge_install_record`]).
 fn plugin_summary(plugin: &CorePlugin, enabled: bool) -> Value {
     let m = &plugin.manifest;
     json!({
@@ -373,6 +386,7 @@ fn plugin_summary(plugin: &CorePlugin, enabled: bool) -> Value {
         "verified": m.verified,
         "experimental": m.experimental,
         "enabled": enabled,
+        "source": source_label(&plugin.source),
         "capabilities": plugin.capabilities(),
     })
 }
@@ -559,6 +573,67 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let outcomes: Vec<serde_json::Value> = resp.json().await.unwrap();
         assert!(outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_plugin_enrichment_keeps_source_enum_and_adds_source_spec() {
+        // Seed a plugin_installs ledger row for a builtin id, then confirm the
+        // enrichment adds record fields under DISTINCT keys and leaves the
+        // stable `source` enum label untouched (regression guard for the
+        // `source`/`sourceSpec` collision).
+        let cp = test_cp_with_plugins().await;
+        let store = cp.store().clone();
+        store
+            .upsert_plugin_install(&crate::store::PluginInstallRecord {
+                plugin_id: "anthropic".to_string(),
+                kind: "plugin_pack".to_string(),
+                source_spec: "https://github.com/acme/anthropic-pack".to_string(),
+                resolved_commit: Some("abc123".to_string()),
+                fingerprint: "sha256:deadbeef".to_string(),
+                installed_at: 1_700_000_000,
+                updated_at: 1_700_000_500,
+                pinned: false,
+                pin_reason: None,
+                trust_tier: "acknowledged".to_string(),
+                trust_ack_at: Some(1_700_000_000),
+                trust_ack_summary: None,
+            })
+            .await
+            .unwrap();
+
+        let port = serve(cp, 0).await.unwrap();
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/anthropic"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+
+        // `source` stays the enum label — NOT overwritten by the git spec.
+        assert_eq!(body["source"], "builtin");
+        // The record's origin lands under the distinct `sourceSpec` key.
+        assert_eq!(body["sourceSpec"], "https://github.com/acme/anthropic-pack");
+        assert_eq!(body["trustTier"], "acknowledged");
+        assert_eq!(body["installedAt"], 1_700_000_000_i64);
+        assert_eq!(body["resolvedCommit"], "abc123");
+        assert_eq!(body["pinned"], false);
+
+        // The same enrichment is visible in the LIST payload's entry.
+        let list: Vec<Value> = reqwest::get(format!("http://127.0.0.1:{port}/plugins"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let entry = list
+            .iter()
+            .find(|p| p["id"] == "anthropic")
+            .expect("anthropic present in /plugins");
+        assert_eq!(entry["source"], "builtin");
+        assert_eq!(
+            entry["sourceSpec"],
+            "https://github.com/acme/anthropic-pack"
+        );
+        assert_eq!(entry["trustTier"], "acknowledged");
     }
 
     #[tokio::test]
