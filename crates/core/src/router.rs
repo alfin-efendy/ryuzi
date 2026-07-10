@@ -320,7 +320,8 @@ impl Router {
             // Context telemetry has no Discord rendering (yet) — the
             // compaction notice arrives as a persisted Message row instead.
             | CoreEvent::ContextUsage { .. }
-            | CoreEvent::ContextCompacted { .. } => {}
+            | CoreEvent::ContextCompacted { .. }
+            | CoreEvent::SessionCost { .. } => {}
         }
     }
 
