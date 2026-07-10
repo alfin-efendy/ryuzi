@@ -12,6 +12,7 @@
       "!assets/**",
       "!outputs/**",
       "!apps/cockpit/src/bindings.ts",
+      "!crates/core/src/llm_router/model_meta_snapshot.json",
       "!**/*.css"
     ]
   },
