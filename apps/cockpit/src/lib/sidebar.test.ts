@@ -11,6 +11,7 @@ function sess(pk: string, projectId: string, title: string | null, lastActive = 
     branch: null,
     title,
     status: "idle",
+    permMode: "default",
     startedBy: null,
     createdAt: null,
     lastActive,

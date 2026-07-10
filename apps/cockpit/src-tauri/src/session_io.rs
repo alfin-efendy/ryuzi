@@ -3,7 +3,7 @@
 //! session for viewing.
 
 use crate::error::CmdError;
-use ryuzi_core::domain::{Message, NewMessage, NewProviderTurn, Session, SessionStatus};
+use ryuzi_core::domain::{Message, NewMessage, NewProviderTurn, PermMode, Session, SessionStatus};
 use ryuzi_core::paths::{new_id, now_ms};
 use ryuzi_core::{ControlPlane, Store};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,10 @@ async fn apply_import(
         branch: None,
         title: export.title,
         status: SessionStatus::Ended,
+        // The session is created already-Ended (archived, view-only) — its
+        // permission mode is never read by the engine again, so Default is
+        // fine rather than looking up the project's mode.
+        perm_mode: PermMode::Default,
         started_by: Some("import".to_string()),
         created_at: Some(now_ms()),
         last_active: Some(now_ms()),
@@ -250,6 +254,7 @@ mod tests {
                 branch: None,
                 title: Some("My session".into()),
                 status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
                 started_by: None,
                 created_at: Some(0),
                 last_active: Some(0),

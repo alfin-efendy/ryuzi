@@ -94,6 +94,9 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
       : null,
     attachments: options.attachments ?? [],
     git: options.git ?? null,
+    // Wired up by the new-chat permission picker in a later task; until then
+    // every session inherits its project's default mode (backend `None`).
+    permMode: null,
   };
 }
 

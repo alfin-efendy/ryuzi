@@ -1,5 +1,6 @@
 //! `exitplanmode` — present a Plan-mode plan for user review. Approval flips
-//! the session's permission mode (and the project's persisted default);
+//! the session's permission mode and persists it to THIS session's row only
+//! (per-session mode — sibling sessions on the same project are unaffected);
 //! rejection returns the user's feedback so the model can revise the plan.
 
 use super::{PermissionSpec, Tool, ToolCtx, ToolOutput};
@@ -81,14 +82,13 @@ impl Tool for ExitPlanMode {
             };
             *interaction.perm_mode.lock().unwrap() = mode;
             // Persist so the control plane's per-turn refresh (which re-reads
-            // the project row) keeps the new mode instead of snapping back to
-            // Plan.
-            if let Some(pid) = interaction.project_id.as_deref() {
-                let _ = ctx
-                    .store
-                    .update_project_prefs(pid, None, None, Some(mode))
-                    .await;
-            }
+            // the SESSION row) keeps the new mode instead of snapping back to
+            // Plan. Per-session by design — approving a plan here must not
+            // change sibling sessions.
+            let _ = ctx
+                .store
+                .update_session_perm_mode(&ctx.session_pk, mode)
+                .await;
             Ok(ToolOutput::ok(format!(
                 "Plan approved. Permission mode is now {} — proceed with the implementation.",
                 mode.as_str()

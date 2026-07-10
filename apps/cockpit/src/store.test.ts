@@ -287,6 +287,7 @@ const runningSession = (pk: string) => ({
   branch: null,
   title: null,
   status: "running" as const,
+  permMode: "default" as const,
   createdAt: null,
   lastActive: null,
   startedBy: null,
@@ -428,6 +429,7 @@ test("start forwards chat options so composer runtime, context, and attachments 
       branch: "harness/s1",
       title: "/review",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
@@ -451,6 +453,7 @@ test("start forwards chat options so composer runtime, context, and attachments 
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
     git: null,
+    permMode: null,
   });
   expect(useStore.getState().focusedSessionPk).toBe("s1");
 
@@ -471,6 +474,7 @@ test("start forwards composer git options to IPC", async () => {
       branch: "feat/login",
       title: "go",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
@@ -491,6 +495,7 @@ test("start forwards composer git options to IPC", async () => {
     context: null,
     attachments: [],
     git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
+    permMode: null,
   });
 
   start.mockRestore();
@@ -510,6 +515,7 @@ test("start resolves and focuses the session without waiting for refresh", async
       branch: null,
       title: "go",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,

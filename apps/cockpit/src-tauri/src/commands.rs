@@ -42,6 +42,21 @@ pub async fn update_project(
         })
 }
 
+/// Set one session's own permission mode (composer/session settings) —
+/// per-session, not the project default `update_project` changes.
+#[tauri::command]
+#[specta::specta]
+pub async fn update_session_perm_mode(
+    cp: State<'_, Arc<ControlPlane>>,
+    session_pk: String,
+    perm_mode: PermMode,
+) -> R<()> {
+    Ok(cp
+        .store()
+        .update_session_perm_mode(&session_pk, perm_mode)
+        .await?)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn list_projects(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<Project>> {
@@ -143,6 +158,9 @@ pub struct ChatRequestOptions {
     pub attachments: Vec<String>,
     /// None => engine default (worktree ON, new engine-named branch from HEAD).
     pub git: Option<GitOptions>,
+    /// Initial permission mode for the session being started (new-chat
+    /// picker). `None` ⇒ inherit the project default.
+    pub perm_mode: Option<PermMode>,
 }
 
 /// Ryuzi-only sessions: every runtime id resolves to the native harness.
@@ -312,6 +330,7 @@ pub async fn start_session(
             "cockpit",
             &attachments,
             git,
+            options.perm_mode,
         )
         .await?)
 }

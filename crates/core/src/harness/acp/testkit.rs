@@ -1585,6 +1585,7 @@ pub async fn run_perm_mock_via_harness(
         branch: None,
         title: None,
         status: SessionStatus::Running,
+        perm_mode: PermMode::Default,
         started_by: None,
         created_at: None,
         last_active: None,
