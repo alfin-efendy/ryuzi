@@ -274,6 +274,10 @@ mod tests {
             max_output_tokens: 8_192,
             supports_prompt_cache: true,
             supports_reasoning: false,
+            cost_input: 0.0,
+            cost_output: 0.0,
+            cost_cache_read: 0.0,
+            cost_cache_write: 0.0,
         }
     }
 
