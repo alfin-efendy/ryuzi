@@ -66,3 +66,11 @@ test("non-git project: no branch pill, no worktree toggle, no list_branches call
   await waitFor(() => expect(nativeCommands).toHaveBeenCalledWith("p1"));
   expect(listBranches).not.toHaveBeenCalled();
 });
+
+test("composer text is read from the persisted draft map (key home:{projectId})", () => {
+  useNav.getState().setDraft("home:p1", "half-typed prompt");
+  render(<HomeView />);
+  const box = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  expect(box.value).toBe("half-typed prompt");
+  useNav.getState().clearDraft("home:p1");
+});

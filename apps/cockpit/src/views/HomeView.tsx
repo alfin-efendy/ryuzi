@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
@@ -23,7 +23,6 @@ import { BranchNameModal } from "@/components/modals/BranchNameModal";
 export function HomeView() {
   const { projects, selectedProjectId, selectProject, start, setProjectModel } = useStore();
   const nav = useNav();
-  const [draft, setDraft] = useState("");
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
@@ -33,6 +32,15 @@ export function HomeView() {
 
   const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
   const projectId = project?.projectId;
+  const draftKey = `home:${projectId ?? ""}`;
+  const draft = nav.drafts[draftKey] ?? "";
+  const setDraft = useCallback(
+    (next: string | ((cur: string) => string)) => {
+      const { drafts, setDraft: write } = useNav.getState();
+      write(draftKey, typeof next === "function" ? next(drafts[draftKey] ?? "") : next);
+    },
+    [draftKey],
+  );
   const isGit = project?.isGit ?? false;
   const runtimes = useRuntimes((s) => s.runtimes);
   // Ryuzi-only: every session runs the native runtime; the user picks a model.
@@ -157,11 +165,13 @@ export function HomeView() {
       attachments: composerFiles.attachments,
       git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
     };
-    setDraft("");
+    const typed = draft;
+    useNav.getState().clearDraft(draftKey);
     composerFiles.clear();
     setContextRefs([]);
     const ok = await start(project.projectId, t, opts);
     if (ok) nav.navigate({ kind: "session" });
+    else useNav.getState().restoreDraft(draftKey, typed);
   };
 
   return (

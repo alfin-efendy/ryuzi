@@ -599,3 +599,19 @@ test("a completed todowrite tool_call triggers a todo refetch for its session", 
   expect(loadTodos).toHaveBeenCalledTimes(1);
   useNative.setState({ loadTodos: original });
 });
+
+test("send resolves true on success and false on backend error (drives composer draft restore)", async () => {
+  reset();
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(true);
+
+  cont.mockResolvedValue({ status: "error", error: { message: "quota exhausted" } });
+  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(false);
+
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});

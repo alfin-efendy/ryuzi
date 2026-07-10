@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
@@ -31,7 +31,20 @@ export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
     useStore();
   const nav = useNav();
-  const [draft, setDraft] = useState("");
+  // Draft text lives in the persisted useNav drafts map keyed by session, so
+  // switching sessions/views (SessionView renders un-keyed in App.tsx) swaps
+  // the visible text instead of leaking one session's draft into another.
+  const draftKey = focusedSessionPk ?? "";
+  const draft = nav.drafts[draftKey] ?? "";
+  // Same call shape as the old useState setter so pickContext/voice callbacks
+  // keep working; reads go through getState() to avoid stale closures.
+  const setDraft = useCallback(
+    (next: string | ((cur: string) => string)) => {
+      const { drafts, setDraft: write } = useNav.getState();
+      write(draftKey, typeof next === "function" ? next(drafts[draftKey] ?? "") : next);
+    },
+    [draftKey],
+  );
   const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
@@ -121,12 +134,18 @@ export function SessionView() {
   const submit = () => {
     const t = draft.trim();
     if (!t && composerFiles.attachments.length === 0) return;
-    setDraft("");
+    const key = session.sessionPk;
+    const typed = draft;
+    // Clear optimistically; a rejected send puts the text back (unless the
+    // user already started typing something new — restoreDraft is a no-op then).
+    useNav.getState().clearDraft(key);
     composerFiles.clear();
     setContextRefs([]);
-    void send(session.sessionPk, t, {
+    void send(key, t, {
       context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
+    }).then((ok) => {
+      if (!ok) useNav.getState().restoreDraft(key, typed);
     });
   };
 

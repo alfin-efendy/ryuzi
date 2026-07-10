@@ -54,7 +54,9 @@ type State = {
   /** Resolves true as soon as the backend accepts — navigate immediately;
    *  the session list refresh completes in the background. */
   start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
-  send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<void>;
+  /** Resolves true when the backend accepted the prompt — false lets the
+   *  composer restore its optimistically-cleared draft. */
+  send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
   stop: (sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
   end: (sessionPk: string) => Promise<boolean>;
@@ -270,6 +272,7 @@ export const useStore = create<State>((set, get) => ({
       toast.error("Couldn't send message: " + res.error.message);
     }
     await get().refresh();
+    return res.status === "ok";
   },
   stop: async (sessionPk) => {
     const res = await commands.stopSession(sessionPk);
