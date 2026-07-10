@@ -157,9 +157,7 @@ test("error rows and unknown block types: error gets its own group, unknown rend
 });
 
 test("notice rows (e.g. compaction) get their own group, distinct from errors and agent text", () => {
-  const groups = groupRows([
-    row({ seq: 1, blockType: "notice", text: "Context compacted: ~100k → ~20k tokens", role: "system" }),
-  ]);
+  const groups = groupRows([row({ seq: 1, blockType: "notice", text: "Context compacted: ~100k → ~20k tokens", role: "system" })]);
   expect(groups).toEqual([{ type: "notice", key: "s1", text: "Context compacted: ~100k → ~20k tokens" }]);
 });
 
