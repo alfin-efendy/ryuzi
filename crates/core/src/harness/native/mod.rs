@@ -150,6 +150,7 @@ impl Harness for NativeHarness {
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 work_dir: ctx.work_dir,
+                attachments_dir: ctx.attachments_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 model,
                 effort: ctx.effort,
@@ -323,6 +324,7 @@ mod tests {
         SessionCtx {
             session_pk: "sess".into(),
             work_dir,
+            attachments_dir: None,
             perm_mode: PermMode::BypassPermissions,
             model: Some("test/model".into()),
             effort: None,

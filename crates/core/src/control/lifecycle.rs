@@ -633,6 +633,7 @@ impl ControlPlane {
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
             work_dir: work_dir.to_path_buf(),
+            attachments_dir: Some(self.attachment_dest_dir(session_pk).await),
             perm_mode,
             model: project.model.clone(),
             effort: project.effort.clone(),

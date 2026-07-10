@@ -616,6 +616,7 @@ pub async fn run_via_harness_trait_collecting_events(
     let ctx = SessionCtx {
         session_pk: session_pk.clone(),
         work_dir: std::path::PathBuf::from("/tmp"),
+        attachments_dir: None,
         perm_mode: PermMode::Default,
         model: None,
         effort: None,
@@ -1204,6 +1205,7 @@ pub async fn run_prompt_with_fs_calls() -> FsOutcome {
     let ctx = SessionCtx {
         session_pk: session_pk.clone(),
         work_dir,
+        attachments_dir: None,
         perm_mode: PermMode::Default,
         model: None,
         effort: None,
@@ -1473,6 +1475,7 @@ pub async fn run_prompt_with_terminal_calls() -> TerminalOutcome {
     let ctx = SessionCtx {
         session_pk: session_pk.clone(),
         work_dir,
+        attachments_dir: None,
         perm_mode: PermMode::Default,
         model: None,
         effort: None,
@@ -1703,6 +1706,7 @@ pub async fn run_perm_mock_via_harness(
     let ctx = SessionCtx {
         session_pk: session_pk.clone(),
         work_dir: std::path::PathBuf::from("/tmp"),
+        attachments_dir: None,
         perm_mode: PermMode::Default,
         model: None,
         effort: None,

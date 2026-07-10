@@ -41,6 +41,36 @@ fn tool_content_text(v: &Value) -> Value {
     }
 }
 
+/// Split a tool_result's content into (text-only content for the `tool`
+/// message, hoisted OpenAI image parts). OpenAI's `role:"tool"` messages
+/// cannot carry images, so vision content rides a synthetic user turn
+/// placed right after the tool results.
+fn split_tool_result_images(v: &Value) -> (Value, Vec<Value>) {
+    let Some(blocks) = v.as_array() else {
+        return (tool_content_text(v), Vec::new());
+    };
+    let mut images = Vec::new();
+    for b in blocks {
+        if b["type"] == "image" {
+            let mt = b["source"]["media_type"].as_str().unwrap_or("image/png");
+            let data = b["source"]["data"].as_str().unwrap_or("");
+            images.push(json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:{mt};base64,{data}")}
+            }));
+        }
+    }
+    if images.is_empty() {
+        return (tool_content_text(v), Vec::new());
+    }
+    let text: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    (json!(text.join("\n")), images)
+}
+
 /// Copy shared sampling params (both APIs use the same names).
 fn copy_common(src: &Value, dst: &mut serde_json::Map<String, Value>) {
     for k in ["temperature", "top_p", "stream", "metadata"] {
@@ -102,11 +132,17 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
                                 "arguments": serde_json::to_string(&b["input"])?,
                             }
                         })),
-                        "tool_result" => tool_results.push(json!({
-                            "role": "tool",
-                            "tool_call_id": b["tool_use_id"],
-                            "content": tool_content_text(&b["content"]),
-                        })),
+                        "tool_result" => {
+                            let (content, images) = split_tool_result_images(&b["content"]);
+                            tool_results.push(json!({
+                                "role": "tool",
+                                "tool_call_id": b["tool_use_id"],
+                                "content": content,
+                            }));
+                            if !images.is_empty() {
+                                tool_results.push(json!({"role": "user", "content": images}));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -945,6 +981,35 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "tu_1", "content": "sunny"})
         );
         assert_eq!(msgs[3], json!({"role": "user", "content": "also note X"}));
+    }
+
+    #[test]
+    fn tool_result_images_hoist_into_a_user_message() {
+        let body = json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "read", "input": {"path": "shot.png"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+                        {"type": "text", "text": "[image shot.png attached]"}
+                    ]}
+                ]}
+            ]
+        });
+        let out = anthropic_to_openai_request(&body).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        // tool message keeps the text, image hoists into a following user turn
+        let tool_msg = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(tool_msg["content"], "[image shot.png attached]");
+        let user_msg = msgs.iter().find(|m| m["role"] == "user").unwrap();
+        assert_eq!(user_msg["content"][0]["type"], "image_url");
+        assert!(user_msg["content"][0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
     }
 
     #[test]

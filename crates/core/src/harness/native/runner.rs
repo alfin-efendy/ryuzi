@@ -40,6 +40,8 @@ const TEXT_FLUSH_BYTES: usize = 120;
 pub struct RunnerDeps {
     pub session_pk: String,
     pub work_dir: PathBuf,
+    /// Session attachments folder (second read root for the `read` tool).
+    pub attachments_dir: Option<PathBuf>,
     /// Plugin-bundled skill directories folded in beside the worktree/global
     /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
     pub extra_skill_dirs: Vec<PathBuf>,
@@ -1050,6 +1052,7 @@ async fn run_tool_call(
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
         work_dir: deps.work_dir.clone(),
+        attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
         store: deps.store.clone(),
         cancel: cancel.clone(),
@@ -1066,11 +1069,22 @@ async fn run_tool_call(
         })),
     };
     match tool.execute(&ctx, input).await {
-        Ok(out) => {
-            let extras = merge_display_duration(out.display, elapsed_ms(started));
+        Ok(mut out) => {
+            let extras = merge_display_duration(out.display.take(), elapsed_ms(started));
             finish_tool_row_with_display(deps, &t.id, &out.for_model, out.is_error, Some(extras))
                 .await;
-            tool_result(&t.id, &out.for_model, out.is_error)
+            match out.model_blocks.take() {
+                Some(mut blocks) => {
+                    blocks.push(json!({ "type": "text", "text": out.for_model }));
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": t.id,
+                        "content": blocks,
+                        "is_error": out.is_error,
+                    })
+                }
+                None => tool_result(&t.id, &out.for_model, out.is_error),
+            }
         }
         Err(e) => {
             let msg = format!("{}: {e}", t.name);
@@ -1490,6 +1504,7 @@ mod tests {
         RunnerDeps {
             session_pk: "s1".into(),
             work_dir: dir.to_path_buf(),
+            attachments_dir: None,
             extra_skill_dirs: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),

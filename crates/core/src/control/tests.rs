@@ -1815,7 +1815,7 @@ async fn attachments_manifest_is_appended_to_the_prompt_the_harness_receives() {
         .join(&session.session_pk)
         .join("notes.txt");
     let expected_manifest = format!(
-        "[User attached 1 file — saved to disk, use the Read tool to open them:]\n- {} (text/plain, 5 B)",
+        "[User attached 1 file:]\n- notes.txt (text/plain, 5 B) — saved to disk; open it with the Read tool: {}",
         dest.display()
     );
     assert_eq!(

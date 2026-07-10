@@ -149,6 +149,7 @@ impl Tool for Bash {
         let text = truncate(&text, &ctx.caps);
         Ok(ToolOutput {
             for_model: text,
+            model_blocks: None,
             display: exit_display(output.status.code()),
             is_error,
         })

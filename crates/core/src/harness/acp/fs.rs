@@ -19,6 +19,16 @@ use agent_client_protocol::schema::v1::{
 /// Maximum file size allowed by `read_text_file` (2 MiB).
 pub const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Strip a Windows `\\?\` verbatim-path prefix, if present. A no-op on
+/// non-verbatim paths (including every Unix path), so it's safe to apply
+/// unconditionally.
+fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+    match p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) => PathBuf::from(rest),
+        None => p.to_path_buf(),
+    }
+}
+
 /// Resolve `path` relative to `work_dir` and verify it stays inside `work_dir`.
 ///
 /// Rules:
@@ -68,7 +78,15 @@ pub fn sandbox(work_dir: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     // Quick check on the lexically normalized path before canonicalization.
     // An absolute path that isn't a prefix of canonical_root after normalization
     // is definitely an escape.
-    if !normalized.starts_with(&canonical_root) {
+    //
+    // `canonical_root` came through `canonicalize()`, which on Windows prefixes
+    // the result with the `\\?\` verbatim marker. A caller-supplied ABSOLUTE
+    // `path` (e.g. an attachment path handed to a tool) was never canonicalized,
+    // so it never carries that marker — comparing it against `canonical_root`
+    // as-is would reject a perfectly in-tree path on a false prefix mismatch.
+    // Compare against both the marker-bearing and marker-stripped forms; the
+    // stripped form is a no-op on non-Windows / non-verbatim roots.
+    if !normalized.starts_with(&canonical_root) && !normalized.starts_with(strip_verbatim_prefix(&canonical_root)) {
         anyhow::bail!(
             "sandbox: path {} escapes the worktree {}",
             path.display(),
