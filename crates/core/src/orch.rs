@@ -1325,6 +1325,14 @@ mod tests {
     #[async_trait]
     impl Harness for EchoHarness {
         async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            // Mirrors a real harness refusing to start in a work_dir that
+            // doesn't exist on disk — the single-slot registry no longer
+            // lets a test force a start failure via an unresolvable harness
+            // id, so `worker_start_failure_fails_task_then_root` triggers
+            // this by pointing a project at a nonexistent directory instead.
+            if !ctx.work_dir.exists() {
+                anyhow::bail!("work_dir does not exist: {}", ctx.work_dir.display());
+            }
             Ok(Box::new(EchoSession {
                 store: ctx.store.clone(),
                 session_pk: ctx.session_pk.clone(),
@@ -1370,8 +1378,7 @@ mod tests {
             .await
             .unwrap();
         let mut regs = crate::plugins::Registries::new();
-        regs.harness
-            .register("claude-code", Arc::new(EchoHarnessFactory));
+        regs.harness = Arc::new(EchoHarnessFactory);
         let cp = ControlPlane::new(store, regs).await;
         (cp, repo)
     }
@@ -1464,14 +1471,15 @@ mod tests {
     #[tokio::test]
     async fn worker_start_failure_fails_task_then_root() {
         let (cp, _repo) = cp_with_project().await;
-        // A project whose harness is not registered: start_session errors.
+        // A project rooted at a nonexistent work_dir: EchoHarness::start_session
+        // refuses to start (see its doc), so start_session errors.
         cp.store()
             .insert_project(crate::domain::Project {
                 project_id: "p2".into(),
                 name: "p2".into(),
                 workdir: "C:/nonexistent-dir-for-orch-test".into(),
                 source: None,
-                harness: "no-such-harness".into(),
+                harness: "native".into(),
                 model: None,
                 effort: None,
                 perm_mode: crate::domain::PermMode::Default,

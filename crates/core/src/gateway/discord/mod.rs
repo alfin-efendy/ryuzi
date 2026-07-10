@@ -948,8 +948,7 @@ mod tests {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(db_guard.path()).await.unwrap();
         let mut regs = Registries::new();
-        regs.harness
-            .register("native", Arc::new(OneShotHarnessFactory));
+        regs.harness = Arc::new(OneShotHarnessFactory);
         let cp = ControlPlane::new_full(
             Arc::new(store),
             regs,

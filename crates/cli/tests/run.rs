@@ -116,7 +116,7 @@ fn deps_with_fake(
         build_registries: Box::new(|| {
             let mut r = Registries::new();
             // new projects are always created with the native harness
-            r.harness.register("native", Arc::new(FakeFactory));
+            r.harness = Arc::new(FakeFactory);
             Ok(r)
         }),
     }
@@ -299,7 +299,7 @@ fn run_exits_when_session_demoted_even_without_terminal_event() {
     let mut deps = deps_with_fake(&db, out.clone(), errs.clone());
     deps.build_registries = Box::new(|| {
         let mut r = Registries::new();
-        r.harness.register("native", Arc::new(BlockingFactory));
+        r.harness = Arc::new(BlockingFactory);
         Ok(r)
     });
 
@@ -479,12 +479,11 @@ fn deps_with_approval_fake(
         },
         build_registries: Box::new(move || {
             let mut r = Registries::new();
-            let factory = Arc::new(ApprovalFakeFactory {
+            r.harness = Arc::new(ApprovalFakeFactory {
                 approval_kind,
                 input: input.clone(),
                 resolved: resolved.clone(),
             });
-            r.harness.register("native", factory);
             Ok(r)
         }),
     }

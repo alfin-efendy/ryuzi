@@ -278,13 +278,10 @@ fn registries(block_until_cancel: bool) -> Registries {
 /// times the harness started a session / drove a prompt / ended.
 fn registries_with(block_until_cancel: bool, counters: Counters) -> Registries {
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(FakeHarnessFactory {
-            block_until_cancel,
-            counters,
-        }),
-    );
+    regs.harness = Arc::new(FakeHarnessFactory {
+        block_until_cancel,
+        counters,
+    });
     regs
 }
 
@@ -315,24 +312,19 @@ fn commit_file(repo_dir: &std::path::Path, name: &str, content: &str) {
         .unwrap();
 }
 
-/// A ControlPlane whose fake harness is registered under BOTH runnable
-/// harness ids, so these tests don't care which default `connect_project`
-/// assigns.
+/// A ControlPlane whose fake harness IS the only harness (the single
+/// `Registries.harness` slot), so these tests don't care which harness id
+/// `connect_project` assigns.
 async fn fake_control_plane_any_harness() -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile)
 {
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let counters = Counters::default();
     let mut regs = Registries::new();
-    for id in ["native", "claude-code"] {
-        regs.harness.register(
-            id,
-            Arc::new(FakeHarnessFactory {
-                block_until_cancel: false,
-                counters: counters.clone(),
-            }),
-        );
-    }
+    regs.harness = Arc::new(FakeHarnessFactory {
+        block_until_cancel: false,
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
@@ -573,8 +565,7 @@ async fn control_plane_with_failing_factory(
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
-    regs.harness
-        .register("native", Arc::new(FailingHarnessFactory));
+    regs.harness = Arc::new(FailingHarnessFactory);
     let cp = ControlPlane::new(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
@@ -699,28 +690,6 @@ async fn wait_for_session_ctx(counters: &Counters) -> Vec<crate::domain::McpServ
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("timed out waiting for the harness SessionCtx");
-}
-
-#[tokio::test]
-#[serial]
-async fn unknown_harness_errors_cleanly() {
-    let _guard = StateDirGuard::new();
-    let db = tempfile::NamedTempFile::new().unwrap();
-    let store = crate::store::Store::open(db.path()).await.unwrap();
-    // Empty registry → no harness registered under "native".
-    let cp = ControlPlane::new(store, Registries::new()).await;
-    let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
-    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
-
-    let err = cp
-        .start_session(&project.project_id, "go", "test", &[])
-        .await
-        .expect_err("start_session should fail without a registered harness");
-    assert!(
-        err.to_string().contains("unknown harness"),
-        "expected a clear unknown-harness error, got: {err}"
-    );
 }
 
 #[tokio::test]
@@ -993,12 +962,9 @@ async fn failed_cold_resume_rolls_back_the_running_status() {
     let store = crate::store::Store::open(db.path()).await.unwrap();
     let counters = Counters::default();
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(FailingResumeFactory {
-            counters: counters.clone(),
-        }),
-    );
+    regs.harness = Arc::new(FailingResumeFactory {
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -1275,13 +1241,10 @@ async fn stop_during_startup_cancels_cleanly() {
     let counters = Counters::default();
     let release = Arc::new(tokio::sync::Notify::new());
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(GatedHarnessFactory {
-            release: release.clone(),
-            counters: counters.clone(),
-        }),
-    );
+    regs.harness = Arc::new(GatedHarnessFactory {
+        release: release.clone(),
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let store = cp.store().clone();
     let repo = tempfile::tempdir().unwrap();
@@ -1415,13 +1378,10 @@ async fn end_during_startup_waits_for_the_startup_task_and_cleans_the_worktree()
     let counters = Counters::default();
     let release = Arc::new(tokio::sync::Notify::new());
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(GatedHarnessFactory {
-            release: release.clone(),
-            counters: counters.clone(),
-        }),
-    );
+    regs.harness = Arc::new(GatedHarnessFactory {
+        release: release.clone(),
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let store = cp.store().clone();
     let repo = tempfile::tempdir().unwrap();
@@ -1491,13 +1451,10 @@ async fn continue_during_startup_waits_and_reuses_the_startup_handle() {
     let counters = Counters::default();
     let open = Arc::new(AtomicBool::new(false));
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(LatchGatedHarnessFactory {
-            open: open.clone(),
-            counters: counters.clone(),
-        }),
-    );
+    regs.harness = Arc::new(LatchGatedHarnessFactory {
+        open: open.clone(),
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -1703,8 +1660,7 @@ async fn failed_turn_persists_a_durable_error_row_and_demotes_before_the_bus_err
     let (_db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
-    regs.harness
-        .register("native", Arc::new(ErrSendHarnessFactory));
+    regs.harness = Arc::new(ErrSendHarnessFactory);
     let cp = ControlPlane::new(store, regs).await;
     seed_project(&cp.store, "p1").await;
     seed_session(

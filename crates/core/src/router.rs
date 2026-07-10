@@ -879,9 +879,8 @@ mod tests {
         }
     }
 
-    /// A `ControlPlane` wired with `harness` under `"native"` (the default
-    /// runtime `connect_project`/`harness_for_runtime` resolve to since Plan
-    /// C) and `workdir_root` pointed at `root` (needed by `on_connect` ->
+    /// A `ControlPlane` wired with `harness` as the single native slot
+    /// and `workdir_root` pointed at `root` (needed by `on_connect` ->
     /// `provision_project`'s name-flow). Returns the sqlite temp-file guard
     /// the caller must keep alive.
     async fn wired_control_plane_with_harness(
@@ -891,7 +890,7 @@ mod tests {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(db_guard.path()).await.unwrap();
         let mut regs = crate::plugins::Registries::new();
-        regs.harness.register("native", harness);
+        regs.harness = harness;
         let cp = ControlPlane::new(store, regs).await;
         let store_ref = cp.store().clone();
         crate::settings::SettingsStore::new(store_ref.clone())

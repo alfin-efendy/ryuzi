@@ -65,16 +65,6 @@ impl ControlPlane {
             }
         }
 
-        // Cheap validation only — the session row must be returnable
-        // immediately. Anything disk- or process-heavy runs in the background
-        // startup task below and surfaces failures in the transcript.
-        if self.registries.harness.get(&project.harness).is_none() {
-            anyhow::bail!(
-                "unknown harness '{}' (registered: {:?})",
-                project.harness,
-                self.registries.harness.names()
-            );
-        }
         let git = git.unwrap_or_default();
         // Git options (branch name / worktree) only apply to git projects; a
         // plain folder runs in-place with no branch, so skip the branch-name
@@ -144,17 +134,10 @@ impl ControlPlane {
 
     /// Send a follow-up prompt on an existing session.
     ///
-    /// The ACP session built by `start_harness_session` is long-lived: its
-    /// handle holds an mpsc `ClientRequest` channel whose client loop stays
-    /// connected to serve many prompts on ONE session. So the fast (normal)
-    /// path here REUSES the live handle from the `running` map — no new adapter
-    /// process, no `session/load` replay, because the live adapter already holds
-    /// the full conversation context.
-    ///
-    /// Only when the handle is ABSENT — e.g. the in-memory `running` map was
-    /// wiped by an app restart — do we start a FRESH session that resumes via
-    /// `session/load` (passing `session.agent_session_id` as `resume`). That
-    /// cold-resume path is the single place `session/load` is needed.
+    /// The harness session built by `start_harness_session` is long-lived;
+    /// the fast path reuses the live handle from the `running` map; only
+    /// when the handle is absent (app restart) does a fresh session resume
+    /// from the persisted agent session id.
     pub async fn continue_session(
         self: &Arc<Self>,
         session_pk: &str,
@@ -576,9 +559,9 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Resolve `project.harness` in the registry, create the harness, build a
-    /// `SessionCtx`, and start the session. Records the returned handle in the
-    /// `running` map and returns a clone for driving the first prompt.
+    /// Create the native harness, build a `SessionCtx`, and start the
+    /// session. Records the returned handle in the `running` map and
+    /// returns a clone for driving the first prompt.
     async fn start_harness_session(
         self: &Arc<Self>,
         project: &Project,
@@ -586,31 +569,14 @@ impl ControlPlane {
         work_dir: &Path,
         resume: Option<String>,
     ) -> anyhow::Result<Arc<dyn HarnessSession>> {
-        let factory = self
-            .registries
-            .harness
-            .get(&project.harness)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown harness '{}' (registered: {:?})",
-                    project.harness,
-                    self.registries.harness.names()
-                )
-            })?;
-        let harness = factory.create()?;
+        let harness = self.registries.harness.create()?;
 
         // Attach the Apps screen's enabled MCP servers to the session. The MCP
-        // per-agent allowlist is keyed by runtime id, which differs from the
-        // harness id: the claude-code harness maps to the "claude" runtime;
-        // other harnesses (e.g. "native") use their own id.
-        let mcp_agent_id = if project.harness == "claude-code" {
-            "claude"
-        } else {
-            project.harness.as_str()
-        };
-        let mut mcp_servers = crate::mcp::servers_for_session(&self.store, mcp_agent_id)
-            .await
-            .unwrap_or_default();
+        // per-agent allowlist has a single agent id: "native".
+        let mut mcp_servers =
+            crate::mcp::servers_for_session(&self.store, crate::harness::native::NATIVE_ID)
+                .await
+                .unwrap_or_default();
         let settings = SettingsStore::new(self.store.clone());
         self.attach_plugin_mcp_servers(&project.project_id, work_dir, &settings, &mut mcp_servers)
             .await;
@@ -700,7 +666,7 @@ impl ControlPlane {
     }
 
     /// Drive a prompt on `handle` in the background. `send_prompt` blocks until
-    /// the turn completes (ACP `EndTurn`); on completion we atomically demote
+    /// the turn completes (turn end); on completion we atomically demote
     /// `Running → Idle` (unless the session was already Interrupted/Ended) and
     /// broadcast a `Result`. Errors are persisted as a durable error row
     /// (via `emit_error`), the row is demoted Running→Idle, and only then

@@ -11,7 +11,6 @@
 use crate::control::ControlPlane;
 use crate::domain::{ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Surface};
 use crate::gateway::{Gateway, GatewayFactory};
-use crate::harness::acp::{claude_code_plugin, AcpAdapterDescriptor};
 use crate::harness::native::native_plugin;
 use crate::harness::HarnessFactory;
 use crate::llm_router::secrets;
@@ -34,32 +33,15 @@ use tokio::task::{JoinHandle, JoinSet};
 pub struct BuildDaemonOpts {
     /// Path to the sqlite database (created/migrated by `Store::open`).
     pub db_path: PathBuf,
-    /// Lazily resolves the ACP adapter descriptor (e.g. locates/downloads the
-    /// bundled sidecar). This is called AT MOST ONCE, and only if
-    /// `enabled_runtimes` (a persisted setting) includes `"claude-code"` — a
-    /// gateway-only daemon with no runtime enabled never pays the cost of
-    /// resolving (or downloading) the sidecar. The caller (CLI: the sidecar
-    /// resolver) owns any I/O this closure performs.
-    pub adapter: Box<dyn FnOnce() -> anyhow::Result<AcpAdapterDescriptor> + Send>,
     /// Override the telemetry backend (used by tests). `None` selects
-    /// Console, or OTLP-behind-a-feature-flag once `otel_endpoint` is set and
-    /// Task 6 lands; see [`build_daemon`]'s doc for the current fallback.
+    /// Console, or OTLP behind the `otel` feature once `otel_endpoint` is set.
     pub telemetry: Option<Arc<dyn Telemetry>>,
     /// Gateway factories available to wire, keyed by the id an entry in the
-    /// `enabled_gateways` setting names (e.g. `"discord"`). 4D-b registers
-    /// its gateway(s) here (directly, or via a plugin's `add_plugin`).
+    /// `enabled_gateways` setting names (e.g. `"discord"`).
     pub extra_gateway_factories: Vec<(String, Arc<dyn GatewayFactory>)>,
-    /// Harness factories to register directly (keyed by `Project.harness`),
-    /// alongside whatever the `claude_code_plugin` installs under
-    /// `"claude-code"` when `enabled_runtimes` calls for it. Registered
-    /// unconditionally (registration is cheap — a `HarnessFactory` isn't
-    /// instantiated until a session actually starts), and installed AFTER
-    /// the `claude_code_plugin` step so an entry here can override it.
-    /// Empty in production today; exists so tests can wire a fake harness
-    /// through the real `build_daemon` composition (e.g. to exercise the
-    /// real spawned approval fan-out end-to-end) without spinning up an
-    /// actual ACP sidecar.
-    pub extra_harness_factories: Vec<(String, Arc<dyn HarnessFactory>)>,
+    /// Test seam: replace the single native harness factory with a fake.
+    /// `None` (production) uses the real native runtime.
+    pub harness_factory: Option<Arc<dyn HarnessFactory>>,
 }
 
 /// A fully wired daemon: control plane, shared store handle, and the
@@ -190,9 +172,9 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 }
 
 /// Build order (each stage depends on the previous one):
-/// `Store::open` → settings → telemetry select → `Registries` (installs
-/// `claude_code_plugin` iff `enabled_runtimes` contains `"claude-code"`,
-/// then `opts.extra_harness_factories`) → `ControlPlane::new_with_telemetry`
+/// `Store::open` → settings → telemetry select → `Registries` (always
+/// installs the native plugin, then `install_builtins`, then applies
+/// `opts.harness_factory` if set) → `ControlPlane::new_with_telemetry`
 /// → gateways (from `enabled_gateways` + `extra_gateway_factories` + the
 /// provider catalog) → the outbound `Router` spawned on one `cp.subscribe()`
 /// → a second, inbound-only `Router` handed to every gateway via
@@ -229,21 +211,11 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     };
 
     let mut registries = Registries::new();
-    {
-        let settings = SettingsStore::new(Arc::clone(&store));
-        let enabled_runtimes = csv(settings.get("enabled_runtimes").await?.as_deref());
-        if enabled_runtimes.iter().any(|r| r == "claude-code") {
-            let descriptor = (opts.adapter)()?;
-            registries.add_plugin(claude_code_plugin(descriptor));
-        }
-        if enabled_runtimes.iter().any(|r| r == "native") {
-            registries.add_plugin(native_plugin());
-        }
-    }
+    registries.add_plugin(native_plugin());
     crate::plugins::install_builtins(&mut registries);
     crate::plugins::load_skill_pack_plugins(&mut registries);
-    for (id, factory) in opts.extra_harness_factories {
-        registries.harness.register(id, factory);
+    if let Some(factory) = opts.harness_factory {
+        registries.harness = factory;
     }
 
     let cp =
@@ -769,10 +741,9 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
-            extra_harness_factories: vec![],
+            harness_factory: None,
         })
         .await
         .unwrap();
@@ -1099,8 +1070,7 @@ mod tests {
         let (_db_guard, db_path) = temp_db_path();
         let store = Store::open(&db_path).await.unwrap();
         let mut regs = Registries::new();
-        regs.harness
-            .register("native", Arc::new(PermFakeHarnessFactory));
+        regs.harness = Arc::new(PermFakeHarnessFactory);
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store().clone();
@@ -1256,8 +1226,7 @@ mod tests {
         let store = Store::open(&db_path).await.unwrap();
 
         let mut regs = Registries::new();
-        regs.harness
-            .register("native", Arc::new(PlanFakeHarnessFactory));
+        regs.harness = Arc::new(PlanFakeHarnessFactory);
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store().clone();
@@ -1365,12 +1334,9 @@ mod tests {
         let store = Store::open(&db_path).await.unwrap();
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let mut regs = Registries::new();
-        regs.harness.register(
-            "claude-code",
-            Arc::new(ResumeFakeHarnessFactory {
-                prompts: prompts.clone(),
-            }),
-        );
+        regs.harness = Arc::new(ResumeFakeHarnessFactory {
+            prompts: prompts.clone(),
+        });
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store().clone();
@@ -1554,10 +1520,9 @@ mod tests {
         // Console silently and still build successfully end-to-end.
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: None,
             extra_gateway_factories: vec![],
-            extra_harness_factories: vec![],
+            harness_factory: None,
         })
         .await
         .unwrap();
@@ -1589,10 +1554,9 @@ mod tests {
         // here would be awkward/flaky.
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: None,
             extra_gateway_factories: vec![],
-            extra_harness_factories: vec![],
+            harness_factory: None,
         })
         .await
         .unwrap();
@@ -1621,13 +1585,9 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
-            extra_harness_factories: vec![(
-                "claude-code".to_string(),
-                Arc::new(PermFakeHarnessFactory) as Arc<dyn HarnessFactory>,
-            )],
+            harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
         })
         .await
         .unwrap();
@@ -1692,13 +1652,9 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
-            extra_harness_factories: vec![(
-                "claude-code".to_string(),
-                Arc::new(PermFakeHarnessFactory) as Arc<dyn HarnessFactory>,
-            )],
+            harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
         })
         .await
         .unwrap();

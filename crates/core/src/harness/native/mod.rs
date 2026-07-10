@@ -339,8 +339,8 @@ mod tests {
     fn native_plugin_registers_under_native_id() {
         let mut regs = crate::plugins::Registries::new();
         regs.add_plugin(native_plugin());
-        assert!(regs.harness.get("native").is_some());
-        assert!(regs.gateway.get("native").is_none());
+        assert!(regs.plugins.get(NATIVE_ID).is_some());
+        assert!(regs.gateway.get(NATIVE_ID).is_none());
     }
 
     #[test]

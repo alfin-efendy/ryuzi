@@ -16,14 +16,10 @@ fn main() -> ExitCode {
         detect_git: ryuzi_cli::detect::detect_git,
         build_registries: Box::new(|| {
             let mut registries = ryuzi_core::Registries::new();
-            // Ryuzi's native runtime is in-process — no external binary.
+            // The native runtime is the only harness — no external binary.
             registries.add_plugin(ryuzi_core::harness::native::native_plugin());
-            // Discord is a built-in gateway (its factory is a no-op unless the
-            // `discord` feature is on, which this crate's Cargo.toml enables);
-            // register it like `native`/`claude-code` so `ryuzi plugins
-            // enable/disable discord` recognizes it — the store seeds
-            // `enabled_gateways = "discord"` by default, so leaving this
-            // unregistered made that setting refer to an "unknown plugin".
+            // Discord is a built-in gateway; register it so `ryuzi plugins
+            // enable/disable discord` recognizes it.
             registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
             ryuzi_core::plugins::install_builtins(&mut registries);
             ryuzi_core::plugins::load_skill_pack_plugins(&mut registries);

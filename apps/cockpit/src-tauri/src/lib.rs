@@ -17,238 +17,17 @@ mod session_io;
 mod skills_cmd;
 mod term;
 
-use ryuzi_core::harness::acp::claude_code_plugin_with_resolver;
 use ryuzi_core::harness::native::native_plugin;
-use ryuzi_core::{AcpAdapterDescriptor, ControlPlane, Registries, Store};
+use ryuzi_core::{ControlPlane, Registries, Store};
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
-/// The base name of the ACP adapter sidecar binary (no target-triple suffix,
-/// no `.exe`). Used only as the dev/PATH fallback name when the shared
-/// resolver (`ryuzi_core::sidecar::host_manager`) fails to resolve a cached
-/// or downloaded artifact — see `resolve_acp_adapter` below.
-///
-/// Package: @agentclientprotocol/claude-agent-acp
-/// NOTE: the adapter refuses to start inside a nested Claude Code session, so
-/// we unconditionally remove the `CLAUDECODE` env-var before spawning it.
-/// Authentication (claude login) is out-of-band — the host machine's `claude`
-/// session is reused; no credentials are managed here.
-const ADAPTER_BIN: &str = "claude-agent-acp";
-
-/// Resolve the ACP adapter via the shared tiered resolver (Spec 4 §4):
-/// RYUZI_ACP_PATH override → cached artifact → download (bun bundle if a
-/// host bun exists, else the standalone binary). First resolve needs network
-/// or Bun — the same contract as the CLI. Runs lazily on the first
-/// `claude-code` session start (never at app launch — see
-/// [`build_registries`]).
-///
-/// On resolver failure (dev builds embed `release_tag: v0.0.0`, so the
-/// download tier always 404s) we try, in order:
-///   1. the repo-local bundle produced by `bun scripts/build-acp-sidecar.ts
-///      --bundle` (dev builds only), run via the host `bun`;
-///   2. an explicit PATH scan for a globally installed `claude-agent-acp`;
-///   3. an actionable error — surfaced verbatim at session start, which
-///      beats the old bare-name fallback whose only symptom was
-///      "failed to spawn ACP adapter: program not found".
-fn resolve_acp_adapter() -> anyhow::Result<(String, Vec<String>)> {
-    let resolve_err = match ryuzi_core::sidecar::host_manager().resolve() {
-        Ok(r) => return Ok((r.command, r.args)),
-        Err(e) => e,
-    };
-    eprintln!("[ryuzi] sidecar resolve failed: {resolve_err:#}");
-
-    #[cfg(debug_assertions)]
-    if let Some(bundle) = dev_sidecar_bundle() {
-        eprintln!("[ryuzi] using repo-local ACP bundle: {bundle}");
-        return Ok(("bun".to_string(), vec![bundle]));
-    }
-
-    if let Some(found) = find_on_path(ADAPTER_BIN) {
-        eprintln!("[ryuzi] using PATH-installed ACP adapter: {found}");
-        return Ok((found, vec![]));
-    }
-
-    Err(anyhow::anyhow!(
-        "ACP adapter unavailable: {resolve_err:#}. Fix: install bun >= {} so the adapter \
-         can be fetched automatically, set RYUZI_ACP_PATH to an adapter binary, or (dev) \
-         run `bun scripts/build-acp-sidecar.ts --bundle --install-cache` from the repo root.",
-        ryuzi_core::sidecar::embedded_manifest().min_bun
-    ))
-}
-
-/// Dev builds only: the universal JS bundle emitted by
-/// `bun scripts/build-acp-sidecar.ts --bundle` into `<repo>/dist/sidecar/`.
-/// Returns the newest `claude-agent-acp-*.js` there, provided a host `bun`
-/// exists to run it.
-#[cfg(debug_assertions)]
-fn dev_sidecar_bundle() -> Option<String> {
-    ryuzi_core::sidecar::default_bun_probe()?;
-    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dist/sidecar");
-    let mut bundles: Vec<std::path::PathBuf> = std::fs::read_dir(dist)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(ADAPTER_BIN) && n.ends_with(".js"))
-        })
-        .collect();
-    bundles.sort();
-    bundles.pop().map(|p| p.to_string_lossy().into_owned())
-}
-
-/// Explicit PATH scan for a globally installed adapter (npm/bun global
-/// installs). Windows also probes `.exe`; `.cmd` shims are skipped because
-/// `CreateProcess` cannot spawn them without a shell.
-fn find_on_path(bin: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let plain = dir.join(bin);
-        if plain.is_file() {
-            return Some(plain.to_string_lossy().into_owned());
-        }
-        if cfg!(windows) {
-            let exe = dir.join(format!("{bin}.exe"));
-            if exe.is_file() {
-                return Some(exe.to_string_lossy().into_owned());
-            }
-        }
-    }
-    None
-}
-
-/// Map Rust's `std::env::consts::{OS, ARCH}` to the npm platform-package
-/// naming used by `@anthropic-ai/claude-agent-sdk`'s optional-dependency
-/// binaries (e.g. `claude-agent-sdk-win32-x64`). Pure and testable in
-/// isolation from the filesystem lookups in
-/// [`resolve_claude_code_executable`].
-fn sdk_platform_package(os: &str, arch: &str) -> String {
-    let os = match os {
-        "windows" => "win32",
-        "macos" => "darwin",
-        other => other,
-    };
-    let arch = match arch {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        other => other,
-    };
-    format!("claude-agent-sdk-{os}-{arch}")
-}
-
-/// Resolve a Claude Code CLI for the ACP adapter's `CLAUDE_CODE_EXECUTABLE`
-/// override. The bun-compiled adapter cannot resolve
-/// `@anthropic-ai/claude-agent-sdk` from its virtual filesystem (bunfs), so
-/// the engine locates the CLI on its behalf:
-///   1. Respect an operator-provided CLAUDE_CODE_EXECUTABLE (inherited env).
-///   2. A bundled `claude-code[.exe]` next to the app executable (reserved
-///      for future packaged builds; nothing bundles it yet).
-///   3. Dev builds only: the SDK platform package inside the sidecar
-///      isolated build dir produced by scripts/build-acp-sidecar.ts.
-///
-/// Returns None when nothing is found — the adapter then falls back to its
-/// own resolution, which works when it runs un-compiled under bun/node.
-fn resolve_claude_code_executable() -> Option<String> {
-    // 1. Operator-provided override — the child inherits it either way, so
-    // don't shadow it with our own resolution.
-    if std::env::var_os("CLAUDE_CODE_EXECUTABLE").is_some() {
-        return None;
-    }
-
-    // 2. Bundled `claude-code[.exe]` next to the app executable.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            #[cfg(windows)]
-            let candidate = dir.join("claude-code.exe");
-            #[cfg(not(windows))]
-            let candidate = dir.join("claude-code");
-
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-
-    // 3. Dev builds only: the SDK platform package inside the isolated
-    // sidecar build dir (see scripts/build-acp-sidecar.ts).
-    #[cfg(debug_assertions)]
-    {
-        let bin_name = if cfg!(windows) {
-            "claude.exe"
-        } else {
-            "claude"
-        };
-        let scope_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".sidecar-build")
-            .join("node_modules")
-            .join("@anthropic-ai");
-
-        let os = std::env::consts::OS;
-        let arch = std::env::consts::ARCH;
-        // On Linux, both glibc and musl platform packages may be installed;
-        // prefer glibc, mirroring the adapter's own resolution order.
-        let candidates = if os == "linux" {
-            vec![
-                sdk_platform_package(os, arch),
-                format!("{}-musl", sdk_platform_package(os, arch)),
-            ]
-        } else {
-            vec![sdk_platform_package(os, arch)]
-        };
-
-        for pkg in candidates {
-            let candidate = scope_dir.join(&pkg).join(bin_name);
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-
-    None
-}
-
-/// Build the extension registries: the in-process `native` harness (needs no
-/// external binary) plus the `claude-agent-acp` harness with a LAZY adapter
-/// resolver.
-///
-/// Registration performs no sidecar I/O: the resolver (which may download the
-/// adapter on first run) only executes when a `claude-code` session actually
-/// starts. App launch therefore never blocks on the resolve, and a setup that
-/// only runs the `native` harness never touches the resolver at all.
-///
-/// `env_remove: ["CLAUDECODE"]` is required: the adapter checks for this
-/// variable to detect a nested Claude Code session and refuses to start.
+/// Build the extension registries: the in-process `native` harness (the
+/// only runtime) plus the built-in discord gateway plugin.
 fn build_registries() -> Registries {
     let mut registries = Registries::new();
-    // The native runtime needs no external binary — register it unconditionally
-    // so projects with `harness = "native"` work in the desktop app.
     registries.add_plugin(native_plugin());
-
-    registries.add_plugin(claude_code_plugin_with_resolver(|| {
-        let mut env = Vec::new();
-        if let Some(cli) = resolve_claude_code_executable() {
-            env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
-        }
-        let (command, args) = resolve_acp_adapter()?;
-        Ok(AcpAdapterDescriptor {
-            command,
-            args,
-            env,
-            // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's
-            // running inside a Claude Code session and refuses to start.
-            env_remove: vec!["CLAUDECODE".to_string()],
-        })
-    }));
-
-    // Discord is a built-in gateway (its factory is a no-op unless the
-    // `discord` feature is on); register it like `native`/`claude-code` so
-    // Cockpit's `list_plugins`/`set_plugin_enabled` recognize it — the store
-    // seeds `enabled_gateways = "discord"` by default, so leaving this
-    // unregistered made Cockpit diverge from the CLI/`serve`, which both
-    // already register it (see `crates/cli/src/main.rs`'s `build_registries`).
     registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
-
     ryuzi_core::plugins::install_builtins(&mut registries);
     ryuzi_core::plugins::load_skill_pack_plugins(&mut registries);
     registries
@@ -535,15 +314,11 @@ mod tests {
         export_bindings(&out);
     }
 
-    /// Registration must be hermetic: both harnesses appear in the registry
-    /// without any sidecar resolve (this test would touch the network under
-    /// the old eager resolution — laziness is what makes it runnable at all).
+    /// The native plugin (the only harness) must be present without any I/O.
     #[test]
-    fn build_registries_registers_both_harnesses_without_sidecar_io() {
+    fn build_registries_registers_the_native_plugin() {
         let registries = build_registries();
-        let names = registries.harness.names();
-        assert!(names.iter().any(|n| n == "native"), "got: {names:?}");
-        assert!(names.iter().any(|n| n == "claude-code"), "got: {names:?}");
+        assert!(registries.plugins.get("native").is_some());
     }
 
     /// Regression test: Cockpit's composition root historically omitted
@@ -557,30 +332,6 @@ mod tests {
         assert!(
             registries.plugins.get("discord").is_some(),
             "discord plugin missing from Cockpit's composition root"
-        );
-    }
-
-    #[test]
-    fn sdk_platform_package_maps_windows_x86_64() {
-        assert_eq!(
-            sdk_platform_package("windows", "x86_64"),
-            "claude-agent-sdk-win32-x64"
-        );
-    }
-
-    #[test]
-    fn sdk_platform_package_maps_macos_aarch64() {
-        assert_eq!(
-            sdk_platform_package("macos", "aarch64"),
-            "claude-agent-sdk-darwin-arm64"
-        );
-    }
-
-    #[test]
-    fn sdk_platform_package_maps_linux_x86_64() {
-        assert_eq!(
-            sdk_platform_package("linux", "x86_64"),
-            "claude-agent-sdk-linux-x64"
         );
     }
 }

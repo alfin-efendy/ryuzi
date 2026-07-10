@@ -32,9 +32,9 @@ struct PluginOauthRefreshResponse {
 
 /// Build a `CorePlugin` from a manifest. Harness and gateway capability can
 /// never come from a manifest alone (those require Rust code — see
-/// `harness::native`, `harness::acp`, `plugins::builtin::discord_plugin`);
-/// the only capability a declarative plugin can carry is a connector, and
-/// only when `manifest.mcp` is non-empty.
+/// `harness::native`, `plugins::builtin::discord_plugin`); the only
+/// capability a declarative plugin can carry is a connector, and only when
+/// `manifest.mcp` is non-empty.
 pub fn declarative_plugin(
     manifest: PluginManifest,
     source: PluginSource,

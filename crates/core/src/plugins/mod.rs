@@ -10,9 +10,9 @@
 //! supersedes the old `Integration` trait).
 //!
 //! [`builtin`] holds first-party plugins that don't have a more natural home
-//! beside their own implementation module — `native`/`claude-code` live
-//! beside their harness code in `harness::native`/`harness::acp`; `discord`
-//! lives here since `gateway::discord` is data/protocol-only.
+//! beside their own implementation module — `native` lives beside its
+//! harness code in `harness::native`; `discord` lives here since
+//! `gateway::discord` is data/protocol-only.
 //!
 //! [`providers`] and [`runtimes_meta`] generate manifest-only plugins from
 //! two existing static catalogs (`llm_router::registry::CATALOG` and
@@ -36,18 +36,18 @@ pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
 /// ([`runtimes_meta::cli_agent_plugins`]) — plus the embedded integration
 /// catalog ([`catalog::catalog_plugins`]) to `regs`.
 ///
-/// This deliberately does NOT add `native`, `claude-code`, or `discord`:
-/// those carry host-injected config (an ACP adapter descriptor, a gateway
-/// factory) that only the composition root can supply, so hosts add them
-/// first and call `install_builtins` afterward (see `runtimes_meta`'s module
-/// doc for why `native` is skipped from the CLI-agent catalog for exactly
-/// this reason — it would otherwise collide with the harness plugin).
+/// This deliberately does NOT add `native` or `discord`: those carry
+/// host-injected config (a gateway factory) that only the composition root
+/// can supply, so hosts add them first and call `install_builtins`
+/// afterward (see `runtimes_meta`'s module doc for why `native` is skipped
+/// from the CLI-agent catalog for exactly this reason — it would otherwise
+/// collide with the harness plugin).
 ///
 /// The catalog is added last: `Registries::add_plugin` keeps the first
 /// registration for a colliding id, so providers and CLI agents (added
 /// above) always win over a same-id catalog entry, and both of those always
-/// lose to `native`/`claude-code`/`discord` (added by the composition root
-/// before calling this function).
+/// lose to `native`/`discord` (added by the composition root before calling
+/// this function).
 pub fn install_builtins(regs: &mut Registries) {
     for plugin in providers::provider_plugins() {
         regs.add_plugin(plugin);
@@ -737,16 +737,6 @@ name = "Fake Anthropic"
 #[cfg(test)]
 mod install_builtins_tests {
     use super::*;
-    use crate::harness::acp::AcpAdapterDescriptor;
-
-    fn stub_descriptor() -> AcpAdapterDescriptor {
-        AcpAdapterDescriptor {
-            command: "true".to_string(),
-            args: vec![],
-            env: vec![],
-            env_remove: vec![],
-        }
-    }
 
     #[test]
     fn install_builtins_adds_every_provider_and_cli_agent_id() {
@@ -784,12 +774,11 @@ mod install_builtins_tests {
     fn install_builtins_ids_never_collide_with_native_claude_code_or_discord() {
         let mut regs = Registries::new();
         regs.add_plugin(crate::harness::native::native_plugin());
-        regs.add_plugin(crate::harness::acp::claude_code_plugin(stub_descriptor()));
         regs.add_plugin(builtin::discord_plugin());
         assert_eq!(
             regs.plugins.list().len(),
-            3,
-            "sanity: three builtins registered before install_builtins"
+            2,
+            "sanity: two builtins registered before install_builtins"
         );
 
         install_builtins(&mut regs);
@@ -807,14 +796,14 @@ mod install_builtins_tests {
             "duplicate plugin ids after install_builtins: {ids:?}"
         );
 
-        // 3 pre-registered (native, claude-code, discord) + every provider +
-        // every runtimes-catalog entry EXCEPT `native` (already registered
-        // above, under the same id, by the harness plugin) and `ollama`
-        // (already covered by the `ollama` model-provider plugin — see
+        // 2 pre-registered (native, discord) + every provider + every
+        // runtimes-catalog entry EXCEPT `native` (already registered above,
+        // under the same id, by the harness plugin) and `ollama` (already
+        // covered by the `ollama` model-provider plugin — see
         // `runtimes_meta`'s module doc) + every embedded integration-catalog
         // entry (`catalog::CATALOG_MANIFESTS`, disjoint from all of the
         // above by construction — see `catalog`'s own collision test).
-        let expected = 3
+        let expected = 2
             + crate::llm_router::registry::CATALOG.len()
             + (crate::runtimes::CATALOG.len() - 2)
             + catalog::CATALOG_MANIFESTS.len();
@@ -822,7 +811,7 @@ mod install_builtins_tests {
             ids.len(),
             expected,
             "install_builtins silently dropped a colliding id instead of staying disjoint \
-             from the native/claude-code/discord builtins"
+             from the native/discord builtins"
         );
     }
 }

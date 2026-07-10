@@ -85,20 +85,11 @@ where
 }
 
 /// Factored out of `run_daemon` so `run_canary` can build an identical
-/// `BuildDaemonOpts` (same adapter/telemetry/gateway wiring) for its own
+/// `BuildDaemonOpts` (same telemetry/gateway wiring) for its own
 /// `build_daemon` call.
 fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
     BuildDaemonOpts {
         db_path: deps.db_path.clone(),
-        // The external claude-code harness is gone from the CLI. Core still
-        // requires `BuildDaemonOpts.adapter` until the engine deletion commit
-        // (group 3) removes the field — this stub only runs if a legacy DB
-        // still lists "claude-code" in `enabled_runtimes`, and fails with a
-        // clear message instead of resolving a sidecar. Delete this stub
-        // together with the core field.
-        adapter: Box::new(|| {
-            anyhow::bail!("the claude-code harness has been removed; Ryuzi is native-only")
-        }),
         telemetry: None,
         // `factory_entries()` is gated INSIDE `ryuzi-core` on ITS OWN
         // `discord` feature (see `gateway::discord::mod`'s doc on why the
@@ -109,7 +100,7 @@ fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
         // `not(feature = "discord")`; populated for every real `ryuzi-cli`
         // build (its `Cargo.toml` always requests `ryuzi-core/discord`).
         extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
-        extra_harness_factories: vec![],
+        harness_factory: None,
     }
 }
 
