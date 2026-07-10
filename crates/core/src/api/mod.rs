@@ -93,7 +93,9 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
 /// build an `ApiState` without duplicating the boilerplate.
 #[cfg(test)]
 pub(crate) mod tests_support {
+    use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::serve::ApiState;
+    use async_trait::async_trait;
     use std::sync::Arc;
 
     /// A fresh in-memory-backed `ApiState` with a real bearer token ("t").
@@ -103,6 +105,73 @@ pub(crate) mod tests_support {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(tmp.path()).await.unwrap();
         let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
+        std::mem::forget(tmp);
+        ApiState {
+            router_server: Arc::new(crate::llm_router::server::RouterServer::new(
+                cp.store().clone(),
+            )),
+            cp,
+            token: Some("t".into()),
+        }
+    }
+
+    /// A no-op `HarnessSession` — the RPC tests that use
+    /// `state_with_fake_native` only assert on the session row a start call
+    /// returns synchronously, before the background startup ever drives a
+    /// prompt through this.
+    struct FakeSession;
+    #[async_trait]
+    impl HarnessSession for FakeSession {
+        async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn cancel(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn end(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn agent_session_id(&self) -> Option<String> {
+            None
+        }
+    }
+
+    struct FakeHarness;
+    #[async_trait]
+    impl Harness for FakeHarness {
+        async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            Ok(Box::new(FakeSession))
+        }
+    }
+
+    struct FakeHarnessFactory;
+    impl HarnessFactory for FakeHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Ok(Arc::new(FakeHarness))
+        }
+    }
+
+    /// Like `state()`, but with a fake `"native"` harness registered and
+    /// `HOME`/`XDG_DATA_HOME` redirected into a leaked tempdir. Chat sessions
+    /// have no project to carry a harness id, so `start_chat_session` falls
+    /// back to the `"native"` runtime — and its background startup touches
+    /// `paths::state_dir()` (via `paths::chat_scratch_dir`), which resolves
+    /// through `dirs::data_dir()`. Mirrors `control::tests::StateDirGuard`;
+    /// since the env override is process-global, every test that uses this
+    /// MUST be `#[serial]`.
+    pub(crate) async fn state_with_fake_native() -> ApiState {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+        std::env::set_var("HOME", dir.path());
+        std::mem::forget(dir);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let mut registries = crate::plugins::Registries::new();
+        registries
+            .harness
+            .register("native", Arc::new(FakeHarnessFactory));
+        let cp = crate::control::ControlPlane::new(store, registries).await;
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(

@@ -129,6 +129,21 @@ pub async fn start_session(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn start_chat_session(
+    engine: Engine<'_>,
+    prompt: String,
+    options: Option<ChatRequestOptions>,
+) -> R<Session> {
+    engine
+        .rpc(
+            "start_chat_session",
+            serde_json::json!({ "prompt": prompt, "options": options }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn continue_session(
     engine: Engine<'_>,
     session_pk: String,

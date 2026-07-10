@@ -24,6 +24,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "clone_project",
     "list_branches",
     "start_session",
+    "start_chat_session",
     "continue_session",
     "stop_session",
     "end_session",
@@ -74,6 +75,11 @@ struct ProjectIdP {
 #[derive(Deserialize)]
 struct StartP {
     project_id: String,
+    prompt: String,
+    options: Option<ChatRequestOptions>,
+}
+#[derive(Deserialize)]
+struct StartChatP {
     prompt: String,
     options: Option<ChatRequestOptions>,
 }
@@ -141,6 +147,28 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "start_session" => {
             let a: StartP = params(p)?;
             ok(start_session(state, &a.project_id, &a.prompt, a.options).await?)
+        }
+        "start_chat_session" => {
+            let a: StartChatP = params(p)?;
+            let attachments = attachment_refs_from_paths(
+                &a.options
+                    .as_ref()
+                    .map(|o| o.attachments.clone())
+                    .unwrap_or_default(),
+            )
+            .await?;
+            let agent_prompt = chat_agent_prompt(
+                &a.prompt,
+                a.options.as_ref().and_then(|o| o.context.as_ref()),
+            );
+            ok(state
+                .cp
+                .start_chat_session(
+                    TurnPrompt::text(agent_prompt, a.prompt),
+                    "cockpit",
+                    &attachments,
+                )
+                .await?)
         }
         "continue_session" => {
             let a: ContinueP = params(p)?;
@@ -356,6 +384,22 @@ async fn stage_attachment(
 mod tests {
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn start_chat_session_dispatches() {
+        let s = crate::api::tests_support::state_with_fake_native().await;
+        let out = dispatch(
+            &s,
+            "start_chat_session",
+            json!({"prompt": "hi", "options": null}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["projectId"], serde_json::Value::Null);
+        assert_eq!(out["kind"], "chat");
+    }
 
     #[tokio::test]
     async fn settings_round_trip_via_rpc() {

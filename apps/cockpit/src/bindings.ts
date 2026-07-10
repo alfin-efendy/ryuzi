@@ -53,6 +53,14 @@ async startSession(projectId: string, prompt: string, options: ChatRequestOption
     else return { status: "error", error: e  as any };
 }
 },
+async startChatSession(prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_chat_session", { prompt, options }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async continueSession(sessionPk: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("continue_session", { sessionPk, prompt, options }) };

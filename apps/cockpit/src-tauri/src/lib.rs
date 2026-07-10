@@ -217,6 +217,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::connect_project,
             commands::clone_project,
             commands::start_session,
+            commands::start_chat_session,
             commands::continue_session,
             commands::stop_session,
             commands::end_session,
