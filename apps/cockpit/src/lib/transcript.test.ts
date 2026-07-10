@@ -14,6 +14,7 @@ import {
   toolInputSummary,
   turnDurationMs,
   type ActivityFragment,
+  type ActivityItem,
   type Row,
   type TurnBlock,
 } from "./transcript";

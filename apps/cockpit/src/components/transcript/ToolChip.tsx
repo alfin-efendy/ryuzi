@@ -6,6 +6,7 @@ import { Fragment, jsx, jsxs } from "react/jsx-runtime";
 import {
   Brain,
   Check,
+  ChevronRight,
   Copy,
   FileText,
   FolderInput,
@@ -20,7 +21,13 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { formatToolDuration, toolCardHeader, type ActivityItem } from "@/lib/transcript";
+import {
+  formatToolDuration,
+  partitionActivity,
+  toolCardHeader,
+  type ActivityFragment,
+  type ActivityItem,
+} from "@/lib/transcript";
 
 const kindIcon: Record<string, LucideIcon> = {
   read: FileText,
@@ -158,13 +165,72 @@ function StatusChip({ text }: { text: string }) {
   );
 }
 
-/** A run of consecutive tool calls / status rows, stacked compactly. `live`
- *  is true only for the streaming turn — its cards mount expanded. */
-export function ActivityCluster({ items, live = false }: { items: ActivityItem[]; live?: boolean }) {
+/** A folded run of steps: one muted "See N steps" row, expanding to the
+ *  individual chips (which mount collapsed, like a completed turn's). */
+function StepsFold({ items, runLength }: { items: ActivityItem[]; runLength: number }) {
+  const [open, setOpen] = useState(false);
+  const label = `See ${runLength} step${runLength === 1 ? "" : "s"}`;
   return (
     <div className="flex flex-col gap-1.5">
-      {items.map((item) =>
-        item.type === "tool" ? <ToolChip key={item.key} item={item} live={live} /> : <StatusChip key={item.key} text={item.text} />,
+      <Button
+        variant="ghost"
+        size="xs"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className="h-auto max-w-fit cursor-pointer justify-start gap-1.5 px-1.5 py-[3px] font-mono text-xs font-normal text-muted-foreground"
+      >
+        <ChevronRight
+          aria-hidden
+          size={12}
+          strokeWidth={2}
+          className={open ? "rotate-90 transition-transform" : "transition-transform"}
+        />
+        {label}
+      </Button>
+      {open &&
+        items.map((item) =>
+          item.type === "tool" ? <ToolChip key={item.key} item={item} live={false} /> : <StatusChip key={item.key} text={item.text} />,
+        )}
+    </div>
+  );
+}
+
+/** A run of consecutive tool calls / status rows, stacked compactly. `live`
+ *  is true only for the streaming turn — its cards mount expanded. `fold`
+ *  partitions the run behind "See N steps" rows (live turns only today);
+ *  `liveTail` keeps the newest STREAMING_TAIL items visible while folding
+ *  older ones. */
+export function ActivityCluster({
+  items,
+  live = false,
+  fold = false,
+  liveTail = false,
+}: {
+  items: ActivityItem[];
+  live?: boolean;
+  fold?: boolean;
+  liveTail?: boolean;
+}) {
+  if (!fold) {
+    return (
+      <div className="flex flex-col gap-1.5">
+        {items.map((item) =>
+          item.type === "tool" ? <ToolChip key={item.key} item={item} live={live} /> : <StatusChip key={item.key} text={item.text} />,
+        )}
+      </div>
+    );
+  }
+  const fragments: ActivityFragment[] = partitionActivity(items, liveTail);
+  return (
+    <div className="flex flex-col gap-1.5">
+      {fragments.map((f) =>
+        f.kind === "fold" ? (
+          <StepsFold key={f.items[0].key} items={f.items} runLength={f.runLength} />
+        ) : f.item.type === "tool" ? (
+          <ToolChip key={f.item.key} item={f.item} live={live} />
+        ) : (
+          <StatusChip key={f.item.key} text={f.item.text} />
+        ),
       )}
     </div>
   );
