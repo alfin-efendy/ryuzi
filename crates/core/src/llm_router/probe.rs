@@ -124,6 +124,66 @@ async fn probe_once(
     Ok(probe_request(ctx, target, model)?.send().await?.status())
 }
 
+/// Like [`probe_once`] but also returns the response body on a NON-2xx
+/// status (a small JSON error), so the MiMo path can distinguish a transient
+/// risk-control/rate-limit block from a real failure. Success bodies (which
+/// may be a streaming SSE response) are dropped unread, as everywhere else.
+async fn probe_once_with_error_body(
+    ctx: &UpstreamCtx,
+    target: &RouteTarget,
+    model: &str,
+) -> anyhow::Result<(reqwest::StatusCode, String)> {
+    let resp = probe_request(ctx, target, model)?.send().await?;
+    let status = resp.status();
+    let body = if status.is_success() {
+        String::new()
+    } else {
+        resp.text().await.unwrap_or_default()
+    };
+    Ok((status, body))
+}
+
+/// MiMo free-tier probe. Mints/uses the bootstrap JWT, re-bootstraps once on
+/// a 401/403, and — unlike the generic status-only path — reads the error
+/// body so a transient risk-control / rate-limit block (which MiMo returns as
+/// HTTP 400) becomes an `unknown` verdict (never persisted, never hidden)
+/// instead of a false `invalid`. `mimo-auto` is the only, always-valid MiMo
+/// model, so a persisted `invalid` there is never correct.
+async fn probe_mimo(ctx: &UpstreamCtx, target: &RouteTarget, model: &str) -> ProbeOutcome {
+    // Without the bootstrap JWT every request 403s — surface a bootstrap
+    // outage as a network error (verdict `unknown`, never persisted).
+    if let Err(e) = mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref()).await {
+        return probe_outcome_for(model, Err(e.to_string()));
+    }
+    let (mut status, mut body) = match probe_once_with_error_body(ctx, target, model).await {
+        Ok(sb) => sb,
+        Err(e) => return probe_outcome_for(model, Err(e.to_string())),
+    };
+    if matches!(status.as_u16(), 401 | 403) {
+        // The upstream rejected the cached JWT — re-bootstrap once and resend.
+        mimo::invalidate_jwt();
+        if let Err(e) =
+            mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref()).await
+        {
+            return probe_outcome_for(model, Err(e.to_string()));
+        }
+        match probe_once_with_error_body(ctx, target, model).await {
+            Ok(sb) => (status, body) = sb,
+            Err(e) => return probe_outcome_for(model, Err(e.to_string())),
+        }
+    }
+    if !status.is_success() {
+        if let Some(message) = mimo::transient_block_message(model, &body) {
+            return ProbeOutcome {
+                ok: false,
+                status: ProbeStatus::Unknown,
+                message,
+            };
+        }
+    }
+    probe_outcome_for(model, Ok(status))
+}
+
 /// Probe `model` on `conn`: send the real one-token chat request, read only
 /// the HTTP status, and map it to a tri-state verdict. Refresh behavior
 /// mirrors the Cockpit test path exactly: proactive `ensure_fresh` first
@@ -170,33 +230,12 @@ pub(crate) async fn probe_model_with_ctx(
         }
     }
     if target.conn.provider == "mimo-free" {
-        // Without the bootstrap JWT every request 403s, which would persist
-        // a false `invalid` verdict — surface a bootstrap outage as a
-        // network error instead (verdict `unknown`, never persisted).
-        if let Err(e) =
-            mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref()).await
-        {
-            return probe_outcome_for(model, Err(e.to_string()));
-        }
+        return probe_mimo(ctx, &target, model).await;
     }
     let status = match probe_once(ctx, &target, model).await {
         Ok(s) => s,
         Err(e) => return probe_outcome_for(model, Err(e.to_string())),
     };
-    if target.conn.provider == "mimo-free" && matches!(status.as_u16(), 401 | 403) {
-        // The upstream rejected the cached JWT — re-bootstrap once and
-        // resend, mirroring the reactive OAuth refresh below.
-        mimo::invalidate_jwt();
-        if let Err(e) =
-            mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref()).await
-        {
-            return probe_outcome_for(model, Err(e.to_string()));
-        }
-        return match probe_once(ctx, &target, model).await {
-            Ok(s) => probe_outcome_for(model, Ok(s)),
-            Err(e) => probe_outcome_for(model, Err(e.to_string())),
-        };
-    }
     if connections::is_oauth(&target.conn)
         && matches!(status.as_u16(), 401 | 403)
         && target.conn.data.refresh_token.is_some()
@@ -513,6 +552,55 @@ mod tests {
         assert!(out.ok, "{}", out.message);
         assert_eq!(out.status, ProbeStatus::Valid);
         assert_eq!(BOOTSTRAPS.load(Ordering::SeqCst), 1);
+        crate::llm_router::mimo::invalidate_jwt();
+    }
+
+    // Test-only serialization of the process-wide JWT cache; the guard
+    // legitimately spans awaits on the current_thread test runtime.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn mimo_probe_maps_risk_control_400_to_unknown_not_invalid() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+
+        let _lock = crate::llm_router::mimo::test_cache_lock();
+        crate::llm_router::mimo::store_jwt("live-jwt");
+
+        // MiMo signals its transient abuse throttle as HTTP 400 with a
+        // risk_control body — must NOT persist a false `invalid` for the
+        // always-valid mimo-auto model.
+        async fn chat() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"code": "441", "type": "risk_control",
+                    "message": "Detected high-frequency non-compliant requests"}})),
+            )
+        }
+        let app = Router::new().route("/openai/chat", post(chat));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let ctx = UpstreamCtx {
+            store: Arc::new(crate::store::Store::open(tmp.path()).await.unwrap()),
+            http: reqwest::Client::new(),
+            oauth_token_url_override: None,
+            mimo_bootstrap_url_override: Some("http://127.0.0.1:1/never".into()),
+        };
+        let conn = mk_conn(
+            "m11",
+            "mimo-free",
+            "free",
+            ConnectionData {
+                base_url_override: Some(format!("http://127.0.0.1:{port}/openai")),
+                ..Default::default()
+            },
+        );
+        let desc = registry::descriptor("mimo-free").unwrap();
+        let out = probe_model_with_ctx(&ctx, desc, &conn, "mimo-auto").await;
+        assert!(!out.ok);
+        assert_eq!(out.status, ProbeStatus::Unknown);
+        assert!(out.message.contains("rate-limited"), "{}", out.message);
         crate::llm_router::mimo::invalidate_jwt();
     }
 
