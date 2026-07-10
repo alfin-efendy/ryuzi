@@ -629,3 +629,104 @@ pub struct PluginDetail {
     pub homepage: Option<String>,
     pub publisher: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_for_runtime_always_resolves_native() {
+        // Ryuzi-only sessions: any id — current, legacy, or unknown —
+        // resolves to the native harness instead of erroring.
+        assert_eq!(harness_for_runtime("native").unwrap(), "native");
+        assert_eq!(harness_for_runtime("claude").unwrap(), "native");
+        assert_eq!(harness_for_runtime("codex").unwrap(), "native");
+        assert_eq!(harness_for_runtime("anything-legacy").unwrap(), "native");
+    }
+
+    #[test]
+    fn chat_agent_prompt_appends_context_without_changing_display_text() {
+        let out = chat_agent_prompt(
+            "/review auth",
+            Some(&ChatContextArg {
+                branch: Some("feature/auth".into()),
+                voice_transcript: Some("review the auth changes".into()),
+                references: vec![],
+            }),
+        );
+        assert!(out.starts_with("/review auth\n\n[Chat context]"));
+        assert!(out.contains("- Branch: feature/auth"));
+        assert!(out.contains("- Voice transcript: review the auth changes"));
+    }
+
+    #[test]
+    fn chat_agent_prompt_appends_referenced_files_from_context_mentions() {
+        let out = chat_agent_prompt(
+            "explain this",
+            Some(&ChatContextArg {
+                references: vec!["src/main.rs".into(), "crates/core/src/lib.rs".into()],
+                ..Default::default()
+            }),
+        );
+        assert!(out.contains("- Referenced file: src/main.rs"));
+        assert!(out.contains("- Referenced file: crates/core/src/lib.rs"));
+    }
+
+    #[test]
+    fn chat_request_options_deserializes_model() {
+        let opts: ChatRequestOptions =
+            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
+                .unwrap();
+        assert_eq!(opts.runtime_id.as_deref(), Some("native"));
+        assert_eq!(opts.model.as_deref(), Some("fable"));
+    }
+
+    #[test]
+    fn chat_request_options_git_defaults_to_none_and_deserializes() {
+        // Old payloads (no `git` key) keep parsing.
+        let opts: ChatRequestOptions =
+            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
+                .unwrap();
+        assert!(opts.git.is_none());
+
+        let opts: ChatRequestOptions = serde_json::from_value(serde_json::json!({
+            "git": {
+                "useWorktree": false,
+                "createBranch": true,
+                "branchName": "feat/x",
+                "baseBranch": null
+            }
+        }))
+        .unwrap();
+        let git = opts.git.unwrap();
+        assert!(!git.use_worktree);
+        assert!(git.create_branch);
+        assert_eq!(git.branch_name.as_deref(), Some("feat/x"));
+        assert_eq!(git.base_branch, None);
+    }
+
+    #[test]
+    fn git_options_convert_to_session_git_options_trimming_blanks() {
+        let core: SessionGitOptions = GitOptions {
+            use_worktree: true,
+            create_branch: false,
+            branch_name: Some("   ".into()),
+            base_branch: Some(" develop ".into()),
+        }
+        .into();
+        assert!(core.use_worktree);
+        assert!(!core.create_branch);
+        assert_eq!(core.branch_name, None, "blank names collapse to None");
+        assert_eq!(core.base_branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn sanitize_file_name_strips_directories_and_unsafe_chars() {
+        assert_eq!(sanitize_file_name("shot.png"), "shot.png");
+        // rsplit keeps only the last path segment — traversal collapses away.
+        assert_eq!(sanitize_file_name("..\\..\\evil.exe"), "evil.exe");
+        assert_eq!(sanitize_file_name("a/b/c.png"), "c.png");
+        assert_eq!(sanitize_file_name("we|ird?.png"), "weird.png");
+        assert_eq!(sanitize_file_name("   "), "file");
+    }
+}

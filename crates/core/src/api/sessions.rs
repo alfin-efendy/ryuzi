@@ -382,4 +382,42 @@ mod tests {
         assert_eq!(opts.runtime_id.as_deref(), Some("native"));
         assert!(!opts.git.unwrap().use_worktree);
     }
+
+    #[tokio::test]
+    async fn apply_runtime_choice_keeps_the_pinned_model_when_none_is_sent() {
+        use crate::domain::{PermMode, Project};
+
+        let s = state().await;
+        s.cp.store()
+            .insert_project(Project {
+                project_id: "p1".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                harness: "claude-code".into(),
+                model: Some("openrouter/qwen3:free".into()),
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+
+        // The composer always sends runtimeId "native"; model may be null.
+        super::apply_runtime_choice(&s.cp, "p1", Some("native"), None)
+            .await
+            .unwrap();
+
+        let got = s.cp.store().get_project("p1").await.unwrap().unwrap();
+        assert_eq!(
+            got.harness, "native",
+            "legacy harness migrates on next start"
+        );
+        assert_eq!(
+            got.model.as_deref(),
+            Some("openrouter/qwen3:free"),
+            "model:null must not clear the pinned model"
+        );
+    }
 }
