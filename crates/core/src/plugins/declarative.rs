@@ -2,7 +2,7 @@
 //! working `Connector` via placeholder substitution — no bespoke Rust code
 //! required per plugin. Used both for manifest-authored builtins/catalog
 //! entries and for user plugins discovered from disk
-//! (`plugins::load_user_plugins`).
+//! (`plugins::load_skill_pack_plugins`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

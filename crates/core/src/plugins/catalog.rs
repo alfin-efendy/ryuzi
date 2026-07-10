@@ -10,7 +10,7 @@
 //! and is registered in [`CATALOG_MANIFESTS`] below. [`catalog_plugins`]
 //! parses and validates every one of them eagerly; a broken embedded
 //! manifest is a build-time bug (it shipped inside the binary, so there is
-//! no "skip and log" recovery the way `plugins::load_user_plugins_from`
+//! no "skip and log" recovery the way `plugins::load_skill_pack_plugins_from`
 //! recovers from a bad on-disk user manifest) — hence the `expect()` naming
 //! the offending id.
 //!
