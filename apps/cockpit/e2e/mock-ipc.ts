@@ -9,7 +9,6 @@ export const PROJECT = {
   name: "demo",
   workdir: "/tmp/demo",
   source: null,
-  harness: "claude",
   model: null,
   effort: null,
   permMode: "default",

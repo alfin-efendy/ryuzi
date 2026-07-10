@@ -32,7 +32,7 @@ use ryuzi_plugin_sdk::PluginManifest;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-/// The native runtime harness id, stored in `projects.harness`.
+/// The native runtime harness id — the sole in-process agent runtime.
 pub const NATIVE_ID: &str = "native";
 
 /// The native agent runtime as a [`Harness`]. Each session runs the agentic

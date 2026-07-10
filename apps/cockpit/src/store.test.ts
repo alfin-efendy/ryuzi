@@ -551,7 +551,6 @@ test("cloneProject clones via IPC and refreshes on success", async () => {
       name: "repo",
       workdir: "C:\\proj\\repo",
       source: "https://github.com/user/repo.git",
-      harness: "native",
       model: null,
       effort: null,
       permMode: "default",

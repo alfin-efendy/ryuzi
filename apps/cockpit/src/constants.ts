@@ -104,6 +104,6 @@ export const PROVIDER_DEVICE_SUBTITLE: Record<string, string> = {
 };
 
 // The one (native, in-process) agent. Identity only — model/perm-mode state
-// lives in store-agent. Values mirror the native RuntimeDescriptor in
-// crates/core/src/runtimes.rs.
+// lives in store-agent. These values are the native agent's identity, defined
+// only here now that the runtime concept is gone.
 export const NATIVE_AGENT = { id: "native", name: "Ryuzi", color: "#7C5CFF", initial: "R" } as const;

@@ -191,7 +191,6 @@ mod tests {
                 name: "p1".into(),
                 workdir: "/tmp/p1".into(),
                 source: None,
-                harness: "native".into(),
                 model: None,
                 effort: None,
                 perm_mode: ryuzi_core::PermMode::Default,

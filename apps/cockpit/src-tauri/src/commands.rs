@@ -32,10 +32,9 @@ pub async fn update_project(
     project_id: String,
     model: Option<String>,
     perm_mode: PermMode,
-    harness: String,
 ) -> R<Project> {
     cp.store()
-        .update_project(&project_id, model, perm_mode, &harness)
+        .update_project(&project_id, model, perm_mode)
         .await?
         .ok_or_else(|| CmdError {
             message: format!("unknown project: {project_id}"),
@@ -144,10 +143,9 @@ pub struct ChatRequestOptions {
     pub git: Option<GitOptions>,
 }
 
-/// Persist the composer's model choice on the project row, normalizing any
-/// legacy harness value ("claude-code", restored DBs) to "native" on the
-/// way. `model: None` keeps the project's pinned model instead of clearing
-/// it — the composer sends null when the user didn't touch the picker.
+/// Persist the composer's model choice on the project row. `model: None`
+/// keeps the project's pinned model instead of clearing it — the composer
+/// sends null when the user didn't touch the picker.
 async fn apply_model_choice(cp: &ControlPlane, project_id: &str, model: Option<&str>) -> R<()> {
     let model = model
         .map(str::trim)
@@ -159,9 +157,9 @@ async fn apply_model_choice(cp: &ControlPlane, project_id: &str, model: Option<&
         });
     };
     let next_model = model.or_else(|| project.model.clone());
-    if project.harness != "native" || project.model != next_model {
+    if project.model != next_model {
         cp.store()
-            .update_project(project_id, next_model, project.perm_mode, "native")
+            .update_project(project_id, next_model, project.perm_mode)
             .await?;
     }
     Ok(())
@@ -510,7 +508,6 @@ mod tests {
                 name: "demo".into(),
                 workdir: "/tmp/demo".into(),
                 source: None,
-                harness: "claude-code".into(),
                 model: Some("openrouter/qwen3:free".into()),
                 effort: None,
                 perm_mode: PermMode::Default,
@@ -520,14 +517,10 @@ mod tests {
             .await
             .unwrap();
 
-        // The composer may send model: null; the legacy harness still migrates.
+        // The composer may send model: null; the pinned model must survive.
         apply_model_choice(&cp, "p1", None).await.unwrap();
 
         let got = cp.store().get_project("p1").await.unwrap().unwrap();
-        assert_eq!(
-            got.harness, "native",
-            "legacy harness migrates on next start"
-        );
         assert_eq!(
             got.model.as_deref(),
             Some("openrouter/qwen3:free"),

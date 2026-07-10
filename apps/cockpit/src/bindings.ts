@@ -154,9 +154,9 @@ async setSetting(key: string, value: string) : Promise<Result<null, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async updateProject(projectId: string, model: string | null, permMode: PermMode, harness: string) : Promise<Result<Project, CmdError>> {
+async updateProject(projectId: string, model: string | null, permMode: PermMode) : Promise<Result<Project, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_project", { projectId, model, permMode, harness }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_project", { projectId, model, permMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1236,14 +1236,6 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  */
 { kind: "orchTaskChanged"; task_id: string; root_id: string | null; status: string } | 
 /**
- * A runtime npm install/update produced an output line.
- */
-{ kind: "runtimeUpdateLog"; runtime_id: string; line: string } | 
-/**
- * A runtime npm install/update finished (ok=false → message has detail).
- */
-{ kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null } | 
-/**
  * Per-response context usage for a native session (drives the
  * "% context left" indicator).
  */
@@ -1281,8 +1273,8 @@ export type GitOptions = { useWorktree: boolean; createBranch: boolean; branchNa
 export type InstalledSkillEntry = { id: string; name: string }
 export type InstalledSkillInfo = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skillCount: number }
 export type InstalledSkillPack = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skills: InstalledSkillEntry[] }
-export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
-export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
+export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
+export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Where the process's master key actually came from. Surfaced to the UI
@@ -1437,7 +1429,7 @@ export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string;
  * failure — the flow entry survives failures so manual paste still works.
  */
 export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
-export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
+export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —
  * NOT a DB column. Self-corrects if the user later runs `git init`.

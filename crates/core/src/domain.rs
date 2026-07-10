@@ -64,7 +64,6 @@ pub struct Project {
     pub name: String,
     pub workdir: String,
     pub source: Option<String>,
-    pub harness: String,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub perm_mode: PermMode,

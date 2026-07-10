@@ -8,7 +8,6 @@ function project(model: string | null): Project {
     name: "p1",
     workdir: "/w",
     source: null,
-    harness: "native",
     model,
     effort: null,
     permMode: "default",

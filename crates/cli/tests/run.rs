@@ -179,37 +179,6 @@ fn run_rejects_removed_harness_flag_as_unknown_argument() {
 
 #[test]
 #[serial]
-fn new_project_is_created_with_the_native_harness() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    git_repo_fixture(&repo);
-    std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
-    std::env::set_var("HOME", tmp.path());
-    let db = tmp.path().join("ryuzi.sqlite");
-
-    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut deps = deps_with_fake(&db, out.clone(), errs.clone());
-    let args: Vec<String> = ["run", "--dir", repo.to_str().unwrap(), "--prompt", "hi"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    assert_eq!(ryuzi_cli::dispatch::run_cli(args, &mut deps), 0);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let harness = rt.block_on(async {
-        let store = ryuzi_core::Store::open(&db).await.unwrap();
-        store.list_projects().await.unwrap()[0].harness.clone()
-    });
-    assert_eq!(harness, "native");
-}
-
-#[test]
-#[serial]
 fn run_usage_and_mode_validation() {
     let tmp = tempfile::tempdir().unwrap();
     let out = Arc::new(std::sync::Mutex::new(Vec::new()));

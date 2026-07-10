@@ -107,10 +107,7 @@ impl ControlPlane {
             &self.store,
             "local",
             "info",
-            &format!(
-                "session {short} started ({} · {})",
-                project.harness, project.name
-            ),
+            &format!("session {short} started ({})", project.name),
         )
         .await;
 

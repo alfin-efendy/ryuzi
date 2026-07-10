@@ -580,7 +580,6 @@ async fn seed_project(store: &Store, project_id: &str) {
             name: "demo".into(),
             workdir: "/tmp/demo".into(),
             source: None,
-            harness: "native".into(),
             model: None,
             effort: None,
             perm_mode: PermMode::Default,
@@ -690,15 +689,6 @@ async fn wait_for_session_ctx(counters: &Counters) -> Vec<crate::domain::McpServ
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("timed out waiting for the harness SessionCtx");
-}
-
-#[tokio::test]
-async fn connect_project_defaults_to_the_native_harness() {
-    let (cp, _store, _log, _db_guard) = fake_control_plane().await;
-    let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
-    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
-    assert_eq!(project.harness, "native");
 }
 
 #[tokio::test]
@@ -2176,7 +2166,6 @@ async fn provision_project_name_flow_creates_a_real_repo_with_head_and_binds_it(
 
     assert_eq!(project.name, "demo");
     assert_eq!(project.workdir, root.path().join("demo").to_string_lossy());
-    assert_eq!(project.harness, "native");
     assert_eq!(project.perm_mode, crate::domain::PermMode::Default);
 
     // A real repo with a HEAD commit (worktrees need one).
@@ -2319,7 +2308,6 @@ async fn clone_project_derives_name_records_source_and_needs_no_settings() {
 
     assert_eq!(project.name, "upstream-repo");
     assert_eq!(project.source.as_deref(), Some(git_url.as_str()));
-    assert_eq!(project.harness, "native");
     assert!(project.is_git);
     assert_eq!(
         project.workdir,
@@ -2432,7 +2420,6 @@ async fn provision_project_uses_settings_defaults_when_none_given() {
     req.name = Some("defaulted".to_string());
     let project = cp.provision_project(req).await.unwrap();
 
-    assert_eq!(project.harness, "native");
     assert_eq!(project.model.as_deref(), Some("opus"));
     assert_eq!(project.effort.as_deref(), Some("high"));
 }
@@ -2455,7 +2442,6 @@ async fn provision_project_explicit_settings_override_defaults() {
     req.settings.effort = Some("low".to_string());
     let project = cp.provision_project(req).await.unwrap();
 
-    assert_eq!(project.harness, "native");
     assert_eq!(project.model.as_deref(), Some("sonnet"));
     assert_eq!(project.effort.as_deref(), Some("low"));
 }

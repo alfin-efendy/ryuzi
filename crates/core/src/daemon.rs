@@ -548,7 +548,6 @@ mod tests {
                 name: "demo".into(),
                 workdir: "/tmp/demo".into(),
                 source: None,
-                harness: "claude-code".into(),
                 model: None,
                 effort: None,
                 perm_mode: PermMode::Default,

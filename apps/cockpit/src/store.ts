@@ -267,7 +267,7 @@ export const useStore = create<State>((set, get) => ({
     if ((project.model ?? null) === next) return;
     // Optimistic paint so the composer label updates immediately.
     set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, model: next } : p)) });
-    const res = await commands.updateProject(projectId, next, project.permMode, project.harness);
+    const res = await commands.updateProject(projectId, next, project.permMode);
     if (res.status === "error") {
       toast.error("Couldn't set model: " + res.error.message);
       await get().refresh();
@@ -277,7 +277,7 @@ export const useStore = create<State>((set, get) => ({
     const project = get().projects.find((p) => p.projectId === projectId);
     if (!project || project.permMode === permMode) return;
     set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode } : p)) });
-    const res = await commands.updateProject(projectId, project.model, permMode, project.harness);
+    const res = await commands.updateProject(projectId, project.model, permMode);
     if (res.status === "error") {
       toast.error("Couldn't set permission mode: " + res.error.message);
       await get().refresh();

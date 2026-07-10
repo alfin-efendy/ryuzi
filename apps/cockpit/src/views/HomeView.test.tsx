@@ -30,7 +30,6 @@ function project(overrides: Partial<Project> = {}): Project {
     name: "demo",
     workdir: "C:\\code\\demo",
     source: null,
-    harness: "native",
     model: null,
     effort: null,
     permMode: "default",

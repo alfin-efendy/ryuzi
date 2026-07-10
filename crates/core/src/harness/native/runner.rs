@@ -1476,7 +1476,6 @@ mod tests {
                 name: "p".into(),
                 workdir: "/w".into(),
                 source: None,
-                harness: "native".into(),
                 model: model.map(str::to_string),
                 effort: None,
                 perm_mode: PermMode::BypassPermissions,
@@ -1558,7 +1557,6 @@ mod tests {
                 "p",
                 Some("anthropic/model-b".into()),
                 PermMode::BypassPermissions,
-                "native",
             )
             .await
             .unwrap();
@@ -2542,7 +2540,6 @@ mod tests {
                 name: "p".into(),
                 workdir: dir.path().to_string_lossy().into(),
                 source: None,
-                harness: "native".into(),
                 model: None,
                 effort: None,
                 perm_mode: PermMode::Default,

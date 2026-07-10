@@ -232,7 +232,6 @@ mod tests {
                 name: "p".into(),
                 workdir: "/tmp".into(),
                 source: None,
-                harness: "native".into(),
                 model: None,
                 effort: None,
                 perm_mode: PermMode::Default,
