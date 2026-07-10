@@ -11,6 +11,7 @@ import { catalogPlugins, usePlugins } from "@/store-plugins";
 import { useSkills } from "@/store-skills";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { AddAppModal } from "@/components/modals/AddAppModal";
+import { InstallWizardModal } from "@/components/modals/InstallWizardModal";
 import { useNav } from "@/store-nav";
 
 type PluginsTab = "installed" | "access" | "browse" | "skills";
@@ -169,8 +170,21 @@ export function filterByCategory(plugins: PluginInfo[], category: string): Plugi
   return plugins.filter((p) => p.categories.includes(category));
 }
 
-function CatalogCard({ plugin, onOpen, onToggle }: { plugin: PluginInfo; onOpen: () => void; onToggle: () => void }) {
+function CatalogCard({
+  plugin,
+  onOpen,
+  onInstall,
+  onToggle,
+}: {
+  plugin: PluginInfo;
+  onOpen: () => void;
+  onInstall: () => void;
+  onToggle: () => void;
+}) {
   const Icon = pluginIcon(plugin.icon);
+  // Installed = the wizard (or manual config) already ran: configured or
+  // enabled. Everything else gets the primary Install entry point.
+  const installed = plugin.configured || plugin.enabled;
   return (
     <Card className="flex flex-col gap-3 px-[18px] py-4">
       <div className="flex items-start gap-3">
@@ -195,12 +209,20 @@ function CatalogCard({ plugin, onOpen, onToggle }: { plugin: PluginInfo; onOpen:
       </div>
       <div className="flex items-center gap-2 pt-0.5">
         <span className="flex-1" />
-        <Button variant="outline" size="sm" onClick={onOpen}>
-          Configure
-        </Button>
-        <span className={plugin.experimental ? "pointer-events-none opacity-40" : ""}>
-          <Switch on={plugin.enabled} onToggle={onToggle} label={`${plugin.name} enabled`} />
-        </span>
+        {installed ? (
+          <>
+            <Button variant="outline" size="sm" onClick={onOpen} aria-label={`Open ${plugin.name}`}>
+              Open
+            </Button>
+            <span className={plugin.experimental ? "pointer-events-none opacity-40" : ""}>
+              <Switch on={plugin.enabled} onToggle={onToggle} label={`${plugin.name} enabled`} />
+            </span>
+          </>
+        ) : (
+          <Button size="sm" onClick={onInstall} aria-label={`Install ${plugin.name}`}>
+            Install
+          </Button>
+        )}
       </div>
     </Card>
   );
@@ -317,6 +339,7 @@ export function PluginsView() {
   const [selectedVersions, setSelectedVersions] = useState<Record<string, string>>({});
   const [registryActivated, setRegistryActivated] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [installingPlugin, setInstallingPlugin] = useState<PluginInfo | null>(null);
   const [skillInstallSource, setSkillInstallSource] = useState("");
   const [skillsActivated, setSkillsActivated] = useState(false);
 
@@ -638,6 +661,7 @@ export function PluginsView() {
                     key={plugin.id}
                     plugin={plugin}
                     onOpen={() => nav.navigate({ kind: "pluginDetail", id: plugin.id })}
+                    onInstall={() => setInstallingPlugin(plugin)}
                     onToggle={() => {
                       if (!plugin.experimental) void setPluginEnabled(plugin.id, !plugin.enabled);
                     }}
@@ -773,6 +797,14 @@ export function PluginsView() {
         )}
       </div>
       {addOpen && <AddAppModal onClose={() => setAddOpen(false)} />}
+      {installingPlugin && (
+        <InstallWizardModal
+          pluginId={installingPlugin.id}
+          pluginName={installingPlugin.name}
+          pluginIcon={installingPlugin.icon}
+          onClose={() => setInstallingPlugin(null)}
+        />
+      )}
     </div>
   );
 }

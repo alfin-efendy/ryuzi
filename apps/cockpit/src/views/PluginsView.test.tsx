@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AddAppInput, AppInfo, PluginInfo, RegistryEntry } from "@/bindings";
+import type { AddAppInput, AppInfo, PluginDetail, PluginInfo, PluginInstallBeginResult, RegistryEntry } from "@/bindings";
 
 function plugin(id: string, categories: string[]): PluginInfo {
   return {
@@ -142,10 +142,52 @@ const refreshSkill = mock(async (_id: string) => ({
   },
 }));
 
+// The wizard mounts inside PluginsView, so its IPC surface needs benign
+// defaults here: begin resolves to authKind "none" with no settings, which
+// routes the wizard straight to done.
+const wizardDetail: PluginDetail = {
+  info: notion,
+  auth: null,
+  settings: [],
+  mcp: [],
+  models: [],
+  menuLabel: null,
+  homepage: null,
+  publisher: "Notion",
+};
+const wizardBegin: PluginInstallBeginResult = {
+  authKind: "none",
+  envVarPresent: false,
+  envVarName: null,
+  oauthAvailable: false,
+  oauthExternal: false,
+  needsClientId: false,
+  dcrSucceeded: false,
+  callbackMode: "auto",
+  oauthBegin: null,
+  dcrError: null,
+};
+const pluginDetail = mock(async (_id: string) => ({ status: "ok" as const, data: wizardDetail }));
+const beginPluginInstall = mock(async (_pluginId: string) => ({ status: "ok" as const, data: wizardBegin }));
+const setPluginOauthClientId = mock(async (_pluginId: string, _clientId: string) => ({ status: "ok" as const, data: null }));
+const cancelPluginInstall = mock(async (_pluginId: string, _stateToken: string | null) => ({ status: "ok" as const, data: null }));
+const completePluginOauth = mock(async (_pluginId: string, _code: string, _stateToken: string) => ({
+  status: "ok" as const,
+  data: null,
+}));
+const setPluginSetting = mock(async (_key: string, _value: string) => ({ status: "ok" as const, data: null }));
+const setPluginEnabled = mock(async (_id: string, _enabled: boolean) => ({ status: "ok" as const, data: null }));
+const pluginOauthCompletedMsgListen = mock(
+  async (_cb: (event: { payload: { pluginId: string; ok: boolean; error: string | null } }) => void) => () => {},
+);
+
 // Mock the Tauri IPC boundary before the component (and the real stores it
 // pulls in) resolve "@/bindings"; the stores themselves are real zustand
 // singletons, seeded/reset around each test below.
 mock.module("@/bindings", () => ({
+  events: {
+    pluginOauthCompletedMsg: { listen: pluginOauthCompletedMsgListen },
+  },
   commands: {
     listApps,
     addApp,
@@ -155,6 +197,13 @@ mock.module("@/bindings", () => ({
     installSkill,
     removeSkill,
     refreshSkill,
+    pluginDetail,
+    beginPluginInstall,
+    setPluginOauthClientId,
+    cancelPluginInstall,
+    completePluginOauth,
+    setPluginSetting,
+    setPluginEnabled,
   },
 }));
 
@@ -218,6 +267,14 @@ beforeEach(() => {
   installSkill.mockClear();
   removeSkill.mockClear();
   refreshSkill.mockClear();
+  pluginDetail.mockClear();
+  beginPluginInstall.mockClear();
+  setPluginOauthClientId.mockClear();
+  cancelPluginInstall.mockClear();
+  completePluginOauth.mockClear();
+  setPluginSetting.mockClear();
+  setPluginEnabled.mockClear();
+  pluginOauthCompletedMsgListen.mockClear();
   useApps.setState({ apps: [], loaded: false, probing: null });
   usePlugins.setState({ plugins: [github, notion, builtin], loaded: true });
   useRuntimes.setState({ runtimes: [], loaded: false, refreshing: false, updating: {}, updateLog: {} });
@@ -268,6 +325,34 @@ test("browse combines catalog cards with live registry results from the same vie
   expect(await screen.findByText("Alpha Server")).toBeTruthy();
   expect(screen.getAllByText("Catalog").length).toBeGreaterThan(0);
   expect(screen.getAllByText("Registry").length).toBeGreaterThan(0);
+});
+
+test("browse shows Install for unconfigured disabled catalog plugins and opens the wizard", async () => {
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("notion");
+
+  expect(screen.queryByRole("button", { name: "Open notion" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Install notion" }));
+
+  expect(await screen.findByText("Install notion", { selector: "span" })).toBeTruthy();
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith("notion"));
+});
+
+test("browse shows Open plus the enable switch for configured plugins", async () => {
+  usePlugins.setState({ plugins: [{ ...github, configured: true }, notion, builtin], loaded: true });
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+
+  // "github" is ambiguous here: the Browse tab's own quick-search chips
+  // (QUICK_SEARCHES) include a literal "github" entry alongside the
+  // catalog card, so wait on the unique aria-labeled button instead of
+  // screen.findByText("github").
+  expect(await screen.findByRole("button", { name: "Open github" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Install github" })).toBeNull();
+  expect(screen.getByRole("switch", { name: "github enabled" })).toBeTruthy();
 });
 
 test("registry install uses the selected version install target from browse", async () => {
