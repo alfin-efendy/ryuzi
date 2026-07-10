@@ -1,4 +1,3 @@
-use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::BorderType;
 

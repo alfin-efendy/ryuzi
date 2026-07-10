@@ -699,6 +699,19 @@ async listModelStatuses(family: string) : Promise<Result<ModelStatusInfo[], CmdE
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Every persisted probe verdict, unfiltered — the family-scoped
+ * `list_model_statuses` above stays for the provider Models card; this
+ * variant feeds the app-wide picker filter.
+ */
+async listAllModelStatuses() : Promise<Result<ModelStatusEntry[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_all_model_statuses") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async connectionProviderQuota(id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { id }) };
@@ -1250,6 +1263,11 @@ export type ModelRouteTarget = {
  * the family serving `model`, at request time.
  */
 provider: string; model: string }
+/**
+ * One persisted probe verdict row across ALL families — hydrates the
+ * app-wide model-status store consumed by every model picker.
+ */
+export type ModelStatusEntry = { family: string; model: string; status: string; message: string; testedAt: number }
 /**
  * One persisted probe verdict row for the provider Models card.
  */

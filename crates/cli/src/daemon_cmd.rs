@@ -208,7 +208,10 @@ async fn build_and_start(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
 /// Builds the production `UpdateManager`: real HTTP, real settings, and —
 /// only on platforms `detect_platform` recognizes — a real self-apply hook
 /// (`ProdApplyHook`). Unsupported platforms get `apply_update: None`, so
-/// `UpdateManager::tick` falls back to its notify-only path.
+/// `UpdateManager::tick` falls back to its notify-only path. Since 0.7.0,
+/// update assets use the platform-tag naming scheme (target triple minus
+/// `-unknown`); the updaters in <= 0.6.0 binaries match nothing and
+/// silently no-op — see `ryuzi_core::update::asset`.
 fn build_updater(daemon: Arc<Daemon>, dir: PathBuf) -> Arc<UpdateManager> {
     let exec_path = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())

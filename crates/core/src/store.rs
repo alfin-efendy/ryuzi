@@ -812,6 +812,30 @@ impl Store {
         .await
     }
 
+    /// Every persisted probe verdict across all families — hydrates the
+    /// Cockpit-wide model-status store so pickers can hide invalid models.
+    pub async fn list_all_model_statuses(&self) -> anyhow::Result<Vec<ModelStatusRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT family, model, status, message, tested_at FROM model_status \
+                 ORDER BY family, model",
+            )?;
+            let items = stmt
+                .query_map([], |r| {
+                    Ok(ModelStatusRow {
+                        family: r.get(0)?,
+                        model: r.get(1)?,
+                        status: r.get(2)?,
+                        message: r.get(3)?,
+                        tested_at: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    }
+
     /// Update the user-editable project settings and return the fresh row.
     pub async fn update_project(
         &self,
@@ -2052,6 +2076,44 @@ mod tests {
         assert_eq!(rows[0].model, "claude-x");
         assert_eq!(rows[0].status, "valid");
         assert_eq!(rows[0].tested_at, 100);
+    }
+
+    #[tokio::test]
+    async fn list_all_model_statuses_returns_every_family() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store.list_all_model_statuses().await.unwrap().is_empty());
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "openai".into(),
+                model: "gpt-x".into(),
+                status: "invalid".into(),
+                message: "Model gpt-x returned HTTP 404".into(),
+                tested_at: 101,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "anthropic".into(),
+                model: "claude-x".into(),
+                status: "valid".into(),
+                message: "Model claude-x OK".into(),
+                tested_at: 100,
+            })
+            .await
+            .unwrap();
+
+        let rows = store.list_all_model_statuses().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Deterministic ORDER BY family, model: anthropic sorts before openai.
+        assert_eq!(rows[0].family, "anthropic");
+        assert_eq!(rows[0].model, "claude-x");
+        assert_eq!(rows[0].status, "valid");
+        assert_eq!(rows[0].tested_at, 100);
+        assert_eq!(rows[1].family, "openai");
+        assert_eq!(rows[1].model, "gpt-x");
+        assert_eq!(rows[1].status, "invalid");
     }
 
     #[tokio::test]

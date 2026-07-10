@@ -81,7 +81,10 @@ type UiState = {
   activeTabId: string | null;
   pinned: Record<string, true>;
   archived: Record<string, true>;
-  /** Provider Models card: hide rows with a persisted "invalid" verdict. */
+  /** Hide models with a persisted "invalid" verdict app-wide: the Provider
+   *  Models card rows AND every model picker (composers, route targets,
+   *  runtime config). A picker's current selection always stays visible,
+   *  flagged as invalid. */
   hideInvalidModels: boolean;
   toggleLeft: () => void;
   toggleRight: () => void;
