@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Combobox as ComboboxPrimitive } from "@base-ui/react/combobox";
-import { Check, ChevronsUpDown, Plus } from "lucide-react";
+import { Check, ChevronsUpDown, Plus, TriangleAlert } from "lucide-react";
 
 import { cn } from "../../lib/utils";
 import { buttonVariants } from "./button";
@@ -10,6 +10,9 @@ type ComboboxOption = {
   label: string;
   description?: string;
   mono?: boolean;
+  /** Render the label in the warning tone with a TriangleAlert icon — used for
+   *  entries with a persisted invalid verdict that must stay selectable. */
+  invalid?: boolean;
 };
 
 type ComboboxGroup = {
@@ -47,6 +50,10 @@ type ComboboxProps = {
    */
   trigger?: React.ReactNode;
   className?: string;
+  /** Extra classes merged into the popup panel via `cn` (tailwind-merge):
+   *  non-conflicting classes merge alongside the anchor-width default; a
+   *  conflicting w-* class replaces it (tailwind-merge semantics). */
+  popupClassName?: string;
   /** Pinned "+ <label>" row below the list that clears + focuses the search
    *  input — an affordance for allowCreate (typing a new name creates it). */
   createHintLabel?: string;
@@ -69,6 +76,7 @@ function ComboboxItemView({ item }: { item: ComboboxItemData }) {
   return (
     <ComboboxPrimitive.Item
       value={item}
+      title={item.label}
       data-slot="combobox-item"
       className={cn(
         "grid cursor-default grid-cols-[minmax(0,1fr)_1rem] items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none",
@@ -80,6 +88,12 @@ function ComboboxItemView({ item }: { item: ComboboxItemData }) {
           <span className="flex items-center gap-1.5">
             <Plus aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="truncate">{item.label}</span>
+          </span>
+        ) : item.invalid ? (
+          <span className="flex items-center gap-1.5 text-amber-500">
+            <TriangleAlert aria-hidden className="size-3.5 shrink-0" />
+            <span className={cn("truncate", item.mono && "font-mono text-[12.5px]")}>{item.label}</span>
+            <span className="sr-only">(invalid)</span>
           </span>
         ) : (
           <span className={cn("block truncate", item.mono && "font-mono text-[12.5px]")}>{item.label}</span>
@@ -106,6 +120,7 @@ function Combobox({
   footer,
   trigger,
   className,
+  popupClassName,
   createHintLabel,
   onCreateHint,
 }: ComboboxProps) {
@@ -194,6 +209,7 @@ function Combobox({
             className={cn(
               "w-[max(var(--anchor-width),11rem)] max-w-[var(--available-width)] origin-(--transform-origin) rounded-xl border border-border surface-acrylic text-popover-foreground shadow-lg outline-none",
               "data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+              popupClassName,
             )}
           >
             {showSearch && (

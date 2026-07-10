@@ -530,6 +530,22 @@ fn upstream_chat_path(desc: &ProviderDescriptor) -> &'static str {
     }
 }
 
+/// OpenAI's current generation (gpt-5.x / o-series) rejects `max_tokens` with
+/// HTTP 400 and requires `max_completion_tokens`. Applied post-translation at
+/// call sites that know the descriptor, so `translate` stays
+/// provider-agnostic. A no-op for every other provider (mimo, qwen, copilot,
+/// custom-openai, … all still speak `max_tokens`).
+pub(crate) fn apply_max_completion_tokens(desc: &ProviderDescriptor, body: &mut Value) {
+    if !desc.uses_max_completion_tokens {
+        return;
+    }
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(v) = obj.remove("max_tokens") {
+            obj.insert("max_completion_tokens".to_string(), v);
+        }
+    }
+}
+
 pub(crate) fn upstream_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
@@ -686,14 +702,7 @@ fn oauth_upstream_request(
                 .header("authorization", format!("Bearer {access_token}"))
                 .header("originator", "codex_cli_rs")
                 .header("session_id", uuid::Uuid::new_v4().to_string());
-            if let Some(account_id) = target
-                .conn
-                .data
-                .provider_specific
-                .as_ref()
-                .and_then(|v| v.get("chatgpt_account_id"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(account_id) = crate::llm_router::models::chatgpt_account_id(&target.conn) {
                 req = req.header("chatgpt-account-id", account_id);
             }
             Ok(req)
@@ -1117,7 +1126,8 @@ pub async fn anthropic_messages_stream(
                 return Ok(rx);
             }
             ApiFormat::OpenAi => {
-                let upstream_body = translate::anthropic_to_openai_request(&attempt_body)?;
+                let mut upstream_body = translate::anthropic_to_openai_request(&attempt_body)?;
+                apply_max_completion_tokens(target.desc, &mut upstream_body);
                 let resp = send_upstream(ctx, &mut target, &upstream_body).await?;
                 if !resp.status().is_success() {
                     let failure = upstream_status_failure(provider, resp).await;
@@ -1191,8 +1201,9 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
                 return Ok(v);
             }
             ApiFormat::OpenAi => {
-                let upstream_body = translate::openai_to_anthropic_request(&attempt_body)
+                let mut upstream_body = translate::openai_to_anthropic_request(&attempt_body)
                     .or_else(|_| translate::anthropic_to_openai_request(&attempt_body))?;
+                apply_max_completion_tokens(target.desc, &mut upstream_body);
                 let provider = target.conn.provider.clone();
                 let resp = send_upstream(ctx, &mut target, &upstream_body).await?;
                 if !resp.status().is_success() {
@@ -1373,7 +1384,7 @@ fn kiro_endpoints(auth_method: &str, region: &str) -> Vec<String> {
 }
 
 /// Build the verbatim kiro upstream request (wire contract only — no cloaking).
-fn kiro_upstream_request(
+pub(crate) fn kiro_upstream_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
     kiro_body: &Value,
@@ -1697,6 +1708,78 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         UpstreamCtx::new(store)
+    }
+
+    #[test]
+    fn apply_max_completion_tokens_renames_only_for_openai() {
+        let mut body = json!({"model": "gpt-5.2", "max_tokens": 64, "messages": []});
+        apply_max_completion_tokens(registry::descriptor("openai").unwrap(), &mut body);
+        assert_eq!(body["max_completion_tokens"], 64);
+        assert!(body.get("max_tokens").is_none());
+
+        for id in ["mimo-free", "qwen", "github-copilot", "custom-openai"] {
+            let mut body = json!({"model": "m", "max_tokens": 64, "messages": []});
+            apply_max_completion_tokens(registry::descriptor(id).unwrap(), &mut body);
+            assert_eq!(body["max_tokens"], 64, "{id} must keep max_tokens");
+            assert!(
+                body.get("max_completion_tokens").is_none(),
+                "{id} must not gain max_completion_tokens"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_renames_max_tokens_for_openai_descriptor() {
+        use axum::{routing::post, Json, Router};
+
+        async fn ok(Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(body["max_completion_tokens"], 32);
+            assert!(body.get("max_tokens").is_none());
+            Json(json!({
+                "id": "chatcmpl-1", "object": "chat.completion", "model": body["model"].clone(),
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "pong"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let app = Router::new().route("/v1/chat/completions", post(ok));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "oai",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-oai".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/v1")),
+                    models_override: Some(vec!["gpt-5.2".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let response = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "openai/gpt-5.2",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["content"][0]["text"], "pong");
     }
 
     #[test]

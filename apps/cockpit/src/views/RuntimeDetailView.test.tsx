@@ -284,3 +284,10 @@ test("native default-model picker groups models with the Router default sentinel
   expect(screen.getByRole("option", { name: "claude-opus-4" })).toBeTruthy();
   expect(screen.getByText("Anthropic")).toBeTruthy();
 });
+
+test("tier model picker always shows the search input", async () => {
+  await renderView();
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Smart model" }));
+  expect(await screen.findByPlaceholderText("Search…")).toBeTruthy();
+});

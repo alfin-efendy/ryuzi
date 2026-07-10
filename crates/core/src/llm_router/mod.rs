@@ -10,6 +10,7 @@ pub mod keys;
 pub mod kiro;
 pub mod models;
 pub mod oauth;
+pub mod probe;
 pub mod quota;
 pub mod registry;
 pub mod responses;
