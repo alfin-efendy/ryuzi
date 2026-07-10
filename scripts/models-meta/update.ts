@@ -7,10 +7,7 @@ type Meta = {
   supports_reasoning: boolean;
 };
 
-const api = (await (await fetch("https://models.dev/api.json")).json()) as Record<
-  string,
-  { models?: Record<string, any> }
->;
+const api = (await (await fetch("https://models.dev/api.json")).json()) as Record<string, { models?: Record<string, any> }>;
 const out: Record<string, Meta> = {};
 for (const provider of Object.values(api)) {
   for (const [id, m] of Object.entries(provider.models ?? {})) {
@@ -27,8 +24,5 @@ for (const provider of Object.values(api)) {
   }
 }
 const sorted = Object.fromEntries(Object.entries(out).sort(([a], [b]) => a.localeCompare(b)));
-await Bun.write(
-  "crates/core/src/llm_router/model_meta_snapshot.json",
-  JSON.stringify(sorted, null, 1) + "\n",
-);
+await Bun.write("crates/core/src/llm_router/model_meta_snapshot.json", JSON.stringify(sorted, null, 1) + "\n");
 console.log(`wrote ${Object.keys(sorted).length} models`);
