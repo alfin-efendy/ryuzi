@@ -51,7 +51,14 @@ type State = {
   /** Per-session context-window usage from the latest `contextUsage` event. */
   contextUsage: Record<
     string,
-    { activeTokens: number; usableWindow: number; percentLeft: number; contextWindow: number; cacheReadTokens: number; outputTokens: number }
+    {
+      activeTokens: number;
+      usableWindow: number;
+      percentLeft: number;
+      contextWindow: number;
+      cacheReadTokens: number;
+      outputTokens: number;
+    }
   >;
   /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
