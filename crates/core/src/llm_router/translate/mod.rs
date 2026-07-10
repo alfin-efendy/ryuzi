@@ -176,6 +176,19 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
         };
         out.insert("tool_choice".into(), mapped);
     }
+    // Anthropic extended-thinking → OpenAI reasoning_effort buckets. The
+    // cache_control fields never survive translation: content blocks are
+    // reconstructed field-by-field above.
+    if let Some(budget) = body["thinking"]["budget_tokens"].as_i64() {
+        let effort = if budget >= 16_384 {
+            "high"
+        } else if budget >= 8_192 {
+            "medium"
+        } else {
+            "low"
+        };
+        out.insert("reasoning_effort".into(), json!(effort));
+    }
     Ok(Value::Object(out))
 }
 
@@ -769,6 +782,24 @@ mod tests {
         });
         let out = anthropic_to_openai_request(&req).unwrap();
         assert_eq!(out["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn request_translation_maps_thinking_to_reasoning_effort_and_drops_cache_control() {
+        let body = json!({
+            "model": "gpt-x",
+            "system": [{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}],
+            "thinking": {"type":"enabled","budget_tokens": 16384},
+            "messages": [{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}],
+            "max_tokens": 1000,
+        });
+        let out = anthropic_to_openai_request(&body).unwrap();
+        assert_eq!(out["reasoning_effort"], "high");
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(
+            !s.contains("cache_control"),
+            "cache_control must not reach OpenAI upstreams: {s}"
+        );
     }
 
     #[test]

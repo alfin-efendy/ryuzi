@@ -65,7 +65,7 @@ pub struct ContextStatus {
 pub struct ContextManager {
     pub(super) ledger: Ledger,
     cfg: ContextConfig,
-    pub(super) tokens: TokenState,
+    tokens: TokenState,
 }
 
 impl ContextManager {
@@ -177,6 +177,17 @@ impl ContextManager {
 
     pub fn commit_response(&mut self) {
         self.tokens.commit();
+    }
+
+    /// The last committed response's cache-read token count (server truth) —
+    /// for the `ContextUsage` event; not tracked between commits.
+    pub fn last_cache_read(&self) -> u64 {
+        self.tokens.cache_read
+    }
+
+    /// The last committed response's output token count (server truth).
+    pub fn last_output(&self) -> u64 {
+        self.tokens.last_output
     }
 
     /// On a context-overflow error: pin the indicator to 0% so the next
