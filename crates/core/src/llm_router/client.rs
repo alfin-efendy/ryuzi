@@ -191,7 +191,7 @@ async fn route_models_for_body_matching(
         };
         if target_allowed(&conn, desc)
             && connection_has_required_credentials(desc, &conn)
-            && resolved_requested_model(&conn, desc, requested, requested, false).is_some()
+            && connection_serves_model(desc, &conn, requested, false)
         {
             let family = desc.family.to_string();
             if !grouped.contains_key(&family) {
@@ -205,17 +205,12 @@ async fn route_models_for_body_matching(
         let candidates = grouped.remove(&provider).unwrap_or_default();
         for conn in ordered_provider_connections(store, &provider, requested, candidates).await? {
             if let Some(desc) = registry::descriptor(&conn.provider) {
-                let Some((upstream_model, request_compatibility_effort)) =
-                    resolved_requested_model(&conn, desc, requested, requested, false)
-                else {
-                    continue;
-                };
                 out.push(RouteTarget {
                     conn,
                     desc,
-                    upstream_model,
+                    upstream_model: requested.to_string(),
                     route_target_key: None,
-                    request_compatibility_effort,
+                    request_compatibility_effort: None,
                 });
             }
         }
@@ -560,9 +555,8 @@ fn native_client_can_drive(conn: &connections::ConnectionRow) -> bool {
 /// users could never pin a native model (hence it "always went to the Claude
 /// subscription" default). Only models that will actually run are listed, so
 /// the picker never offers an entry that would error on send. Codex
-/// (`openai-oauth`) connections additionally get `-low/-medium/-high/-xhigh`
-/// effort-suffixed variants of each model, since Codex routes those through
-/// [`crate::llm_router::codex::codex_base_model`].
+/// (`openai-oauth`) effort capabilities are returned as structured metadata
+/// on the canonical model entry rather than as synthetic model IDs.
 pub async fn selectable_native_models(
     store: &Store,
 ) -> anyhow::Result<Vec<model_effort::SelectableModelInfo>> {
@@ -668,6 +662,7 @@ pub async fn selectable_native_models(
         .filter(|route| route.enabled && !route.targets.is_empty())
     {
         let mut route_capabilities = Vec::new();
+        let mut route_effective = Vec::new();
         for target in routes::peek_ordered_targets(store, &route).await? {
             for connection in &enabled {
                 let Some(descriptor) = registry::descriptor(&connection.provider) else {
@@ -678,15 +673,56 @@ pub async fn selectable_native_models(
                     && connection_has_required_credentials(descriptor, connection)
                     && connection_serves_model(descriptor, connection, &target.model, false)
                 {
-                    route_capabilities.push(
-                        capability(
-                            connection,
-                            descriptor.family.to_string(),
-                            target.model.clone(),
-                        )
-                        .await
-                        .1,
-                    );
+                    let (key, capability) = capability(
+                        connection,
+                        descriptor.family.to_string(),
+                        target.model.clone(),
+                    )
+                    .await;
+                    let supports = |value: &str| {
+                        capability
+                            .supported
+                            .iter()
+                            .any(|option| option.value == value)
+                    };
+                    let selected = target
+                        .effort
+                        .as_deref()
+                        .filter(|value| supports(value))
+                        .map(|value| {
+                            (
+                                Some(value.to_string()),
+                                model_effort::EffectiveEffortSource::RouteCompatibility,
+                            )
+                        })
+                        .or_else(|| {
+                            configured
+                                .get(&key)
+                                .filter(|value| supports(value))
+                                .map(|value| {
+                                    (
+                                        Some(value.clone()),
+                                        model_effort::EffectiveEffortSource::Configured,
+                                    )
+                                })
+                        })
+                        .or_else(|| {
+                            capability
+                                .provider_default
+                                .as_ref()
+                                .filter(|value| supports(value))
+                                .cloned()
+                                .or_else(|| {
+                                    (capability.supported.len() == 1)
+                                        .then(|| capability.supported[0].value.clone())
+                                })
+                                .map(|value| {
+                                    (Some(value), model_effort::EffectiveEffortSource::Provider)
+                                })
+                        })
+                        .unwrap_or((None, model_effort::EffectiveEffortSource::None));
+                    route_effective.push(selected);
+                    route_capabilities.push(capability);
                 }
             }
         }
@@ -713,14 +749,47 @@ pub async fn selectable_native_models(
                         .iter()
                         .all(|value| value.as_ref() == Some(first))
                 });
-            out.push(make_info(
+            let mut info = make_info(
                 model_effort::SelectableModelKind::NamedRoute,
                 route.name.clone(),
                 route.name,
                 None,
                 route_configured,
                 route_capabilities,
-            ));
+            );
+            let first_value = route_effective.first().map(|(value, _)| value.clone());
+            let uniform_value = first_value.is_some()
+                && route_effective
+                    .iter()
+                    .all(|(value, _)| Some(value.clone()) == first_value);
+            if uniform_value {
+                info.resolved_default = first_value.flatten();
+                let first_source = route_effective.first().map(|(_, source)| source);
+                let uniform_source = first_source.is_some()
+                    && route_effective
+                        .iter()
+                        .all(|(_, source)| Some(source) == first_source);
+                info.default_source = if uniform_source {
+                    match first_source {
+                        Some(model_effort::EffectiveEffortSource::Configured) => {
+                            model_effort::ModelDefaultSource::Configured
+                        }
+                        Some(model_effort::EffectiveEffortSource::Provider) => {
+                            model_effort::ModelDefaultSource::Provider
+                        }
+                        Some(model_effort::EffectiveEffortSource::None) => {
+                            model_effort::ModelDefaultSource::None
+                        }
+                        _ => model_effort::ModelDefaultSource::VariesByTarget,
+                    }
+                } else {
+                    model_effort::ModelDefaultSource::VariesByTarget
+                };
+            } else {
+                info.resolved_default = None;
+                info.default_source = model_effort::ModelDefaultSource::VariesByTarget;
+            }
+            out.push(info);
         }
     }
     for key in concrete_order {
@@ -763,6 +832,41 @@ pub async fn selectable_native_models(
         ));
     }
     Ok(out)
+}
+
+pub async fn named_route_compatibility_default(
+    store: &Store,
+    requested: &str,
+    supported: &[model_effort::ReasoningEffortOption],
+) -> anyhow::Result<Option<String>> {
+    let route_list = routes::list_model_routes(store).await?;
+    let Some(route) = routes::route_by_name(&route_list, requested) else {
+        return Ok(None);
+    };
+    let enabled = connections::list_connections(store)
+        .await?
+        .into_iter()
+        .filter(|connection| connection.enabled)
+        .collect::<Vec<_>>();
+    let efforts = route
+        .targets
+        .iter()
+        .filter(|target| {
+            route_target_has_candidate(&enabled, target, anthropic_messages_target_allowed)
+        })
+        .map(|target| target.effort.clone())
+        .collect::<Vec<_>>();
+    let Some(first) = efforts.first().cloned().flatten() else {
+        return Ok(None);
+    };
+    if !efforts
+        .iter()
+        .all(|effort| effort.as_deref() == Some(first.as_str()))
+        || !supported.iter().any(|option| option.value == first)
+    {
+        return Ok(None);
+    }
+    Ok(Some(first))
 }
 
 /// Anthropic's Claude-Code-branded system prefix, required by the
@@ -3685,6 +3789,21 @@ mod tests {
         connections::add_connection(
             &ctx.store,
             mk_conn(
+                "generic-bare",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk".into()),
+                    models_override: Some(vec!["gpt-known-high".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
                 "generic-openai",
                 "openai",
                 "api_key",
@@ -3713,13 +3832,13 @@ mod tests {
         .await
         .unwrap();
 
-        let bare = route_model(&ctx.store, "gpt-known-high")
+        let bare = route_models_for_anthropic_messages(&ctx.store, "gpt-known-high")
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(bare.conn.provider, "openai-oauth");
-        assert_eq!(bare.upstream_model, "gpt-known");
-        assert_eq!(bare.request_compatibility_effort.as_deref(), Some("high"));
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].conn.id, "generic-bare");
+        assert_eq!(bare[0].upstream_model, "gpt-known-high");
+        assert_eq!(bare[0].request_compatibility_effort, None);
 
         let unknown = route_model(&ctx.store, "openai/gpt-unknown-high")
             .await
@@ -3800,52 +3919,33 @@ mod tests {
         )
         .await
         .unwrap();
-        routes::save_model_route(
-            &ctx.store,
-            routes::ModelRouteInfo {
-                id: "r1".into(),
-                name: "safe".into(),
-                enabled: true,
-                strategy: routes::ModelRouteStrategy::Fallback,
-                targets: vec![
-                    routes::ModelRouteTarget {
-                        provider: "openai".into(),
-                        model: "gpt-x".into(),
-                        effort: None,
-                    },
-                    routes::ModelRouteTarget {
-                        provider: "anthropic".into(),
-                        model: "claude-x".into(),
-                        effort: None,
-                    },
-                ],
-                created_at: 1,
-                updated_at: 1,
-            },
-        )
-        .await
-        .unwrap();
-        ctx.store
-            .set_model_effort_preference(
-                &model_effort::ModelPreferenceKey {
-                    family: "openai".into(),
+        let route_info = routes::ModelRouteInfo {
+            id: "r1".into(),
+            name: "safe".into(),
+            enabled: true,
+            strategy: routes::ModelRouteStrategy::Fallback,
+            targets: vec![
+                routes::ModelRouteTarget {
+                    provider: "openai".into(),
                     model: "gpt-x".into(),
+                    effort: Some("high".into()),
                 },
-                "high",
-            )
-            .await
-            .unwrap();
-        ctx.store
-            .set_model_effort_preference(
-                &model_effort::ModelPreferenceKey {
-                    family: "anthropic".into(),
+                routes::ModelRouteTarget {
+                    provider: "anthropic".into(),
                     model: "claude-x".into(),
+                    effort: None,
                 },
-                "high",
+            ],
+            created_at: 1,
+            updated_at: 1,
+        };
+        ctx.store
+            .set_setting(
+                "llm_model_routes",
+                &serde_json::to_string(&vec![route_info]).unwrap(),
             )
             .await
             .unwrap();
-
         let models = selectable_native_models(&ctx.store).await.unwrap();
         let route = models
             .iter()
@@ -3859,21 +3959,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["high"]
         );
-        assert_eq!(route.configured_default.as_deref(), Some("high"));
+        assert_eq!(route.configured_default, None);
         assert_eq!(route.resolved_default.as_deref(), Some("high"));
         assert_eq!(
             route.default_source,
-            model_effort::ModelDefaultSource::Configured
+            model_effort::ModelDefaultSource::VariesByTarget
         );
+        let policy = model_effort::build_utility_effort_policy(&ctx.store, "safe")
+            .await
+            .unwrap();
+        let routed = route_models_for_anthropic_messages(&ctx.store, "safe")
+            .await
+            .unwrap();
+        let target = routed
+            .iter()
+            .find(|target| target.conn.provider == "openai-oauth")
+            .unwrap();
+        let surface = model_effort::ExecutionSurfaceKey {
+            provider_id: target.conn.provider.clone(),
+            connection_id: Some(target.conn.id.clone()),
+            model: target.upstream_model.clone(),
+        };
+        let preference = model_effort::ModelPreferenceKey {
+            family: target.desc.family.into(),
+            model: target.upstream_model.clone(),
+        };
+        let resolved = resolve_target_effort(
+            &policy,
+            target.route_target_key.as_ref(),
+            None,
+            &preference,
+            &surface,
+        );
+        assert_eq!(resolved.value.as_deref(), Some("high"));
+        assert_eq!(
+            resolved.source,
+            model_effort::EffectiveEffortSource::RouteCompatibility
+        );
+        let mut project_policy = policy.clone();
+        project_policy.project_override = Some("medium".into());
+        let project = resolve_target_effort(
+            &project_policy,
+            target.route_target_key.as_ref(),
+            None,
+            &preference,
+            &surface,
+        );
+        assert_eq!(project.value.as_deref(), Some("medium"));
+        assert_eq!(project.source, model_effort::EffectiveEffortSource::Project);
         let concrete = models
             .iter()
             .find(|model| model.request_value == "openai/gpt-x")
             .unwrap();
-        assert_eq!(concrete.configured_default.as_deref(), Some("high"));
-        assert_eq!(concrete.resolved_default.as_deref(), Some("high"));
+        assert_eq!(concrete.configured_default, None);
+        assert_eq!(concrete.resolved_default.as_deref(), Some("medium"));
         assert_eq!(
             concrete.default_source,
-            model_effort::ModelDefaultSource::Configured
+            model_effort::ModelDefaultSource::Provider
         );
         let review = models
             .iter()

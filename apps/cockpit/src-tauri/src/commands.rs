@@ -87,8 +87,21 @@ async fn project_runtime_info_inner(
             .as_ref()
             .is_some_and(|info| info.supported.iter().any(|option| &option.value == *effort))
     });
+    let route_compatibility = match (project.model.as_deref(), model_info.as_ref()) {
+        (Some(model), Some(info)) => {
+            ryuzi_core::llm_router::client::named_route_compatibility_default(
+                cp.store(),
+                model,
+                &info.supported,
+            )
+            .await?
+        }
+        _ => None,
+    };
     let (effective_effort, effective_source) = if let Some(effort) = project_effort {
         (Some(effort.clone()), EffectiveEffortSource::Project)
+    } else if let Some(effort) = route_compatibility {
+        (Some(effort), EffectiveEffortSource::RouteCompatibility)
     } else if let Some(info) = &model_info {
         let source = match info.default_source {
             ModelDefaultSource::Configured => EffectiveEffortSource::Configured,
@@ -786,6 +799,93 @@ mod tests {
             info.stored_effort_status,
             ryuzi_core::llm_router::model_effort::StoredEffortStatus::Valid
         );
+    }
+
+    #[tokio::test]
+    async fn project_runtime_info_reports_named_route_compatibility_and_project_precedence() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
+        let metadata = ryuzi_core::llm_router::model_effort::DiscoveredModelMeta {
+            display_name: Some("GPT X".into()),
+            effort_options: Some(vec![
+                ryuzi_core::llm_router::model_effort::ReasoningEffortOption {
+                    value: "medium".into(),
+                    label: "Medium".into(),
+                    description: None,
+                },
+                ryuzi_core::llm_router::model_effort::ReasoningEffortOption {
+                    value: "high".into(),
+                    label: "High".into(),
+                    description: None,
+                },
+            ]),
+            default_effort_advertised: true,
+            default_effort: Some("medium".into()),
+        };
+        ryuzi_core::llm_router::connections::add_connection(
+            cp.store(),
+            ryuzi_core::llm_router::connections::ConnectionRow {
+                id: "codex".into(),
+                provider: "openai-oauth".into(),
+                auth_type: "oauth".into(),
+                label: "Codex".into(),
+                priority: 0,
+                enabled: true,
+                data: ryuzi_core::llm_router::connections::ConnectionData {
+                    access_token: Some("at".into()),
+                    models_override: Some(vec!["gpt-x".into()]),
+                    model_meta_overrides: Some([("gpt-x".into(), metadata)].into()),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        cp.store()
+            .insert_project(Project {
+                project_id: "p1".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                harness: "native".into(),
+                model: Some("safe".into()),
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        cp.store()
+            .set_setting(
+                "llm_model_routes",
+                r#"[{"id":"r1","name":"safe","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"gpt-x","effort":"high"}],"createdAt":1,"updatedAt":1}]"#,
+            )
+            .await
+            .unwrap();
+
+        let compatibility = project_runtime_info_inner(&cp, "p1".into()).await.unwrap();
+        assert_eq!(compatibility.effective_effort.as_deref(), Some("high"));
+        assert_eq!(
+            compatibility.effective_source,
+            EffectiveEffortSource::RouteCompatibility
+        );
+        assert_eq!(
+            compatibility.stored_effort_status,
+            StoredEffortStatus::Valid
+        );
+
+        cp.store()
+            .update_project_runtime("p1", Some("safe".into()), Some("medium".into()))
+            .await
+            .unwrap();
+        let project = project_runtime_info_inner(&cp, "p1".into()).await.unwrap();
+        assert_eq!(project.effective_effort.as_deref(), Some("medium"));
+        assert_eq!(project.effective_source, EffectiveEffortSource::Project);
+        assert_eq!(project.stored_effort_status, StoredEffortStatus::Valid);
     }
 
     #[test]
