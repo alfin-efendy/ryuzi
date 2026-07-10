@@ -383,6 +383,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             events::CoreEventMsg,
             events::OauthAuthorizeUrlMsg,
             events::PluginOauthAuthorizeUrlMsg,
+            events::PluginOauthCompletedMsg,
             accent::AccentChangedMsg,
             term::TermOutputMsg,
             term::TermExitMsg
