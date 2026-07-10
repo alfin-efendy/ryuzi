@@ -17,6 +17,7 @@ pub mod context_manager;
 pub mod cost;
 pub mod format;
 pub mod hooks;
+pub mod iteration_budget;
 pub mod ledger;
 pub mod llm;
 pub mod lsp;

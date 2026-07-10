@@ -7,6 +7,7 @@ use super::commands::CommandRegistry;
 use super::context_manager::{
     compaction::CompactionOutcome, is_context_overflow, ContextConfig, ContextManager,
 };
+use super::iteration_budget::{IterationBudget, PARENT_MAX_ITERS, SUBAGENT_MAX_ITERS};
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::tools::{
@@ -26,8 +27,6 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-/// Upper bound on provider turns per drain, to bound runaway tool loops.
-const MAX_PROVIDER_TURNS: usize = 50;
 /// Flush the streaming-text buffer into a persisted row at this size or on a
 /// newline, whichever comes first (keeps rows delta-shaped without spamming).
 const TEXT_FLUSH_BYTES: usize = 120;
@@ -194,6 +193,7 @@ pub async fn run_turn(
         cancel: cancel.clone(),
         depth: 0,
     });
+    let budget = IterationBudget::new(PARENT_MAX_ITERS);
     drive(
         deps,
         &agent,
@@ -201,6 +201,7 @@ pub async fn run_turn(
         &cancel,
         Some(spawn),
         DisplayMode::Full,
+        &budget,
     )
     .await?;
 
@@ -427,6 +428,7 @@ async fn drive(
     cancel: &CancellationToken,
     spawn: Option<Arc<dyn SubagentSpawner>>,
     display: DisplayMode,
+    budget: &IterationBudget,
 ) -> anyhow::Result<String> {
     let system = match &agent.prompt {
         Some(p) => p.clone(),
@@ -461,7 +463,8 @@ async fn drive(
     };
     let thinking_budget = thinking_budget(deps.effort.as_deref(), &deps.meta, max_tokens);
 
-    for provider_turn in 0..MAX_PROVIDER_TURNS {
+    let mut provider_turn = 0usize;
+    while budget.try_consume() {
         if cancel.is_cancelled() {
             return Ok(final_text);
         }
@@ -693,14 +696,16 @@ async fn drive(
         if cancel.is_cancelled() {
             return Ok(final_text);
         }
+        provider_turn += 1;
     }
+    // Budget exhausted (Task B2 replaces this notice with a terminal summary call).
     if display.text() {
         emit_row(
             deps,
             "system",
             "notice",
             json!({ "text": format!(
-                "Turn limit reached ({MAX_PROVIDER_TURNS} provider turns) — send a message to continue."
+                "Turn limit reached ({provider_turn} provider turns) — send a message to continue."
             ) }),
             None,
             None,
@@ -891,7 +896,18 @@ impl RunnerSpawner {
         let display = DisplayMode::ToolsOnly {
             label: spec.agent_type.clone(),
         };
-        match drive(&child_deps, &child, &mut cm, &cancel, child_spawn, display).await {
+        let child_budget = IterationBudget::new(SUBAGENT_MAX_ITERS);
+        match drive(
+            &child_deps,
+            &child,
+            &mut cm,
+            &cancel,
+            child_spawn,
+            display,
+            &child_budget,
+        )
+        .await
+        {
             Ok(text) if cancel.is_cancelled() => {
                 result(SubtaskStatus::Interrupted, cap_report(&text))
             }
