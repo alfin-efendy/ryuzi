@@ -3,11 +3,12 @@
 //! Resolution order: settings override (`models.meta.<id>`, JSON object) →
 //! refreshed models.dev snapshot on disk → vendored snapshot → FALLBACK.
 
+use crate::llm_router::model_effort::{ExecutionSurfaceKey, ReasoningEffortOption};
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMeta {
     pub context_window: u64,
     pub max_output_tokens: u64,
@@ -15,6 +16,12 @@ pub struct ModelMeta {
     pub supports_prompt_cache: bool,
     #[serde(default)]
     pub supports_reasoning: bool,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<ReasoningEffortOption>,
+    #[serde(default)]
+    pub default_reasoning_effort: Option<String>,
 }
 
 /// Conservative metadata for unknown models (spec §5).
@@ -23,6 +30,9 @@ pub const FALLBACK: ModelMeta = ModelMeta {
     max_output_tokens: 8_192,
     supports_prompt_cache: false,
     supports_reasoning: false,
+    display_name: None,
+    reasoning_efforts: Vec::new(),
+    default_reasoning_effort: None,
 };
 
 impl ModelMeta {
@@ -80,17 +90,17 @@ fn normalize(id: &str) -> String {
 /// iteration order.
 fn lookup(map: &HashMap<String, ModelMeta>, id: &str) -> Option<ModelMeta> {
     if let Some(m) = map.get(id) {
-        return Some(*m);
+        return Some(m.clone());
     }
     let norm = normalize(id);
     if let Some(m) = map.get(&norm) {
-        return Some(*m);
+        return Some(m.clone());
     }
     // Normalized key match on both sides (snapshot ids may carry dates too).
     map.iter()
         .filter(|(k, _)| normalize(k) == norm)
         .min_by(|a, b| a.0.cmp(b.0))
-        .map(|(_, m)| *m)
+        .map(|(_, m)| m.clone())
 }
 
 /// Merge a partial JSON override (any subset of ModelMeta's fields) over base.
@@ -106,7 +116,32 @@ fn apply_override(base: ModelMeta, v: &serde_json::Value) -> ModelMeta {
         supports_reasoning: v["supports_reasoning"]
             .as_bool()
             .unwrap_or(base.supports_reasoning),
+        display_name: v
+            .get("display_name")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or(base.display_name),
+        reasoning_efforts: v
+            .get("reasoning_efforts")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or(base.reasoning_efforts),
+        default_reasoning_effort: v
+            .get("default_reasoning_effort")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or(base.default_reasoning_effort),
     }
+}
+
+fn apply_surface_settings_override(base: ModelMeta, v: &serde_json::Value) -> ModelMeta {
+    let display_name = base.display_name.clone();
+    let reasoning_efforts = base.reasoning_efforts.clone();
+    let default_reasoning_effort = base.default_reasoning_effort.clone();
+    let mut merged = apply_override(base, v);
+    merged.display_name = display_name;
+    merged.reasoning_efforts = reasoning_efforts;
+    merged.default_reasoning_effort = default_reasoning_effort;
+    merged
 }
 
 /// `~/.config/ryuzi/models-meta.json` — the refreshed snapshot location
@@ -127,7 +162,7 @@ fn prune_models_dev(api: &serde_json::Value) -> HashMap<String, ModelMeta> {
     let Some(providers) = api.as_object() else {
         return out;
     };
-    for provider in providers.values() {
+    for (provider_id, provider) in providers {
         let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
             continue;
         };
@@ -137,7 +172,11 @@ fn prune_models_dev(api: &serde_json::Value) -> HashMap<String, ModelMeta> {
                 max_output_tokens: m["limit"]["output"].as_u64().unwrap_or(8_192),
                 supports_prompt_cache: !m["cost"]["cache_read"].is_null(),
                 supports_reasoning: m["reasoning"].as_bool().unwrap_or(false),
+                display_name: m["name"].as_str().map(str::to_string),
+                reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
             };
+            out.insert(format!("{provider_id}/{id}"), meta.clone());
             match out.get(id) {
                 Some(prev) if prev.context_window >= meta.context_window => {}
                 _ => {
@@ -206,7 +245,7 @@ pub async fn resolve(store: &Store, requested: &str) -> ModelMeta {
                 .and_then(|m| lookup(m, c))
                 .or_else(|| lookup(vendored(), c))
         })
-        .unwrap_or(FALLBACK);
+        .unwrap_or_else(|| FALLBACK.clone());
     // Settings override (raw key, JSON object value) — checked per candidate.
     for c in &candidates {
         if let Ok(Some(raw)) = store.get_setting_raw(&format!("models.meta.{c}")).await {
@@ -216,6 +255,45 @@ pub async fn resolve(store: &Store, requested: &str) -> ModelMeta {
         }
     }
     base
+}
+
+/// Resolve metadata for one exact provider/connection/model execution surface.
+pub async fn resolve_for_surface(store: &Store, surface: &ExecutionSurfaceKey) -> ModelMeta {
+    let exact_key = format!("{}/{}", surface.provider_id, surface.model);
+    let refreshed_map = refreshed();
+    let base = refreshed_map
+        .as_ref()
+        .and_then(|map| map.get(&exact_key).cloned())
+        .or_else(|| vendored().get(&exact_key).cloned())
+        .or_else(|| lookup(vendored(), &surface.model))
+        .unwrap_or_else(|| FALLBACK.clone());
+
+    let mut resolved = base;
+    if let Some(connection_id) = &surface.connection_id {
+        if let Ok(Some(connection)) =
+            crate::llm_router::connections::get_connection(store, connection_id).await
+        {
+            if connection.provider == surface.provider_id {
+                if let Some(discovered) = connection
+                    .data
+                    .model_meta_overrides
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&surface.model))
+                {
+                    resolved = discovered.merge_over(resolved);
+                }
+            }
+        }
+    }
+    if let Ok(Some(raw)) = store
+        .get_setting_raw(&format!("models.meta.{}", surface.model))
+        .await
+    {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            resolved = apply_surface_settings_override(resolved, &value);
+        }
+    }
+    resolved
 }
 
 #[cfg(test)]
@@ -281,6 +359,9 @@ mod tests {
             max_output_tokens: 64_000,
             supports_prompt_cache: true,
             supports_reasoning: true,
+            display_name: None,
+            reasoning_efforts: vec![],
+            default_reasoning_effort: None,
         };
         let merged = apply_override(base, &serde_json::json!({"context_window": 150000}));
         assert_eq!(merged.context_window, 150_000);

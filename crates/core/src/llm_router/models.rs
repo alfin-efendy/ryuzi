@@ -1,5 +1,5 @@
 //! Provider model discovery.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -7,6 +7,7 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::llm_router::connections::{self, ConnectionRow};
+use crate::llm_router::model_effort::{DiscoveredModelMeta, ReasoningEffortOption};
 use crate::llm_router::registry::{AuthScheme, ProviderDescriptor};
 use crate::store::Store;
 
@@ -99,8 +100,16 @@ fn is_codex_chat_model(item: &Value, id: &str) -> bool {
 }
 
 pub fn parse_model_ids(provider: &str, data: &Value) -> Vec<String> {
+    parse_models(provider, data).0
+}
+
+pub(crate) fn parse_models(
+    provider: &str,
+    data: &Value,
+) -> (Vec<String>, HashMap<String, DiscoveredModelMeta>) {
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
+    let mut metadata = HashMap::new();
 
     for item in raw_models(data) {
         let Some(id) = model_id(item).map(str::trim).filter(|id| !id.is_empty()) else {
@@ -109,15 +118,61 @@ pub fn parse_model_ids(provider: &str, data: &Value) -> Vec<String> {
         if seen.insert(id.to_string()) {
             ids.push(id.to_string());
         }
+        let effort_field = ["supported_reasoning_levels", "supported_reasoning_efforts"]
+            .iter()
+            .find_map(|key| item.get(*key));
+        let effort_options = effort_field.map(|value| {
+            value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let value = entry.as_str().map(str::to_string).or_else(|| {
+                        ["effort", "value", "id"]
+                            .iter()
+                            .find_map(|key| entry.get(*key).and_then(Value::as_str))
+                            .map(str::to_string)
+                    })?;
+                    let label = ["label", "display_name", "name"]
+                        .iter()
+                        .find_map(|key| entry.get(*key).and_then(Value::as_str))
+                        .unwrap_or(&value)
+                        .to_string();
+                    let description = entry
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    Some(ReasoningEffortOption {
+                        value,
+                        label,
+                        description,
+                    })
+                })
+                .collect()
+        });
+        let default_field = ["default_reasoning_level", "default_reasoning_effort"]
+            .iter()
+            .find_map(|key| item.get(*key));
+        let discovered = DiscoveredModelMeta {
+            display_name: ["display_name", "displayName"]
+                .iter()
+                .find_map(|key| item.get(*key).and_then(Value::as_str))
+                .map(str::to_string),
+            effort_options,
+            default_effort_advertised: default_field.is_some(),
+            default_effort: default_field.and_then(Value::as_str).map(str::to_string),
+        };
+        metadata.insert(id.to_string(), discovered.clone());
         if provider == "openai-oauth" && is_codex_chat_model(item, id) && !id.ends_with("-review") {
             let review = format!("{id}-review");
             if seen.insert(review.clone()) {
-                ids.push(review);
+                ids.push(review.clone());
             }
+            metadata.insert(review, discovered);
         }
     }
 
-    ids
+    (ids, metadata)
 }
 
 fn strip_generation_path(base: &str) -> String {
@@ -210,7 +265,7 @@ pub async fn fetch_models(
     desc: &ProviderDescriptor,
     row: &ConnectionRow,
 ) -> Result<Vec<String>> {
-    let (status, models) = fetch_models_once(http, desc, row).await?;
+    let (status, models, _) = fetch_models_once(http, desc, row).await?;
     if !status.is_success() {
         return Err(anyhow!(
             "model list request for {} failed with status {status}",
@@ -224,14 +279,19 @@ async fn fetch_models_once(
     http: &reqwest::Client,
     desc: &ProviderDescriptor,
     row: &ConnectionRow,
-) -> Result<(StatusCode, Vec<String>)> {
+) -> Result<(
+    StatusCode,
+    Vec<String>,
+    HashMap<String, DiscoveredModelMeta>,
+)> {
     let resp = build_model_list_request(http, desc, row)?.send().await?;
     let status = resp.status();
     if !status.is_success() {
-        return Ok((status, Vec::new()));
+        return Ok((status, Vec::new(), HashMap::new()));
     }
     let value: Value = resp.json().await?;
-    Ok((status, parse_model_ids(&row.provider, &value)))
+    let (models, metadata) = parse_models(&row.provider, &value);
+    Ok((status, models, metadata))
 }
 
 pub async fn fetch_connection_models(
@@ -239,7 +299,11 @@ pub async fn fetch_connection_models(
     http: &reqwest::Client,
     desc: &ProviderDescriptor,
     row: &mut ConnectionRow,
-) -> Result<(StatusCode, Vec<String>)> {
+) -> Result<(
+    StatusCode,
+    Vec<String>,
+    HashMap<String, DiscoveredModelMeta>,
+)> {
     if connections::is_oauth(row) {
         if let Err(err) = crate::llm_router::oauth::refresh::ensure_fresh(store, http, row).await {
             if row.data.needs_relogin == Some(true) {
@@ -248,7 +312,7 @@ pub async fn fetch_connection_models(
         }
     }
 
-    let (status, models) = fetch_models_once(http, desc, row).await?;
+    let (status, models, metadata) = fetch_models_once(http, desc, row).await?;
     if connections::is_oauth(row)
         && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
         && row.data.refresh_token.is_some()
@@ -257,7 +321,7 @@ pub async fn fetch_connection_models(
         return fetch_models_once(http, desc, row).await;
     }
 
-    Ok((status, models))
+    Ok((status, models, metadata))
 }
 
 pub async fn refresh_connection_models(
@@ -267,7 +331,7 @@ pub async fn refresh_connection_models(
 ) -> Result<Vec<String>> {
     let desc = crate::llm_router::registry::descriptor(&row.provider)
         .ok_or_else(|| anyhow!("unknown provider: {}", row.provider))?;
-    let (status, models) = fetch_connection_models(store, http, desc, row).await?;
+    let (status, models, metadata) = fetch_connection_models(store, http, desc, row).await?;
     if !status.is_success() {
         return Err(anyhow!(
             "model list request for {} failed with status {status}",
@@ -276,6 +340,7 @@ pub async fn refresh_connection_models(
     }
     if !models.is_empty() {
         row.data.models_override = Some(models.clone());
+        row.data.model_meta_overrides = Some(metadata);
         row.updated_at = crate::paths::now_ms();
         connections::update_connection(store, row.clone()).await?;
     }

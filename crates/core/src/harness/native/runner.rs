@@ -142,7 +142,7 @@ pub async fn run_turn(
     let deps = &turn_deps;
 
     // 2. Load history + context state and append the user turn.
-    let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+    let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
     let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
     // Seed the indicator immediately on resume, before any model call —
     // prefer the persisted last-known status (server truth) over the
@@ -201,7 +201,7 @@ async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::R
         None,
     )
     .await;
-    let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+    let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
     let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
     // Same resume-seed as `run_turn` (spec §12): honor a persisted
     // post-overflow total so a manual /compact right after an overflow
@@ -823,7 +823,7 @@ impl RunnerSpawner {
         };
         let mut cm = ContextManager::ephemeral(
             &self.deps.session_pk,
-            ContextConfig::with_meta(self.deps.meta),
+            ContextConfig::with_meta(self.deps.meta.clone()),
         );
         if let Err(e) = cm
             .append_user(json!([{ "type": "text", "text": spec.prompt }]))
@@ -1619,6 +1619,9 @@ mod tests {
             max_output_tokens: 8_192,
             supports_prompt_cache: false,
             supports_reasoning: false,
+            display_name: None,
+            reasoning_efforts: vec![],
+            default_reasoning_effort: None,
         }
     }
 
@@ -1840,6 +1843,9 @@ mod tests {
             max_output_tokens: 64_000,
             supports_prompt_cache: true,
             supports_reasoning: true,
+            display_name: None,
+            reasoning_efforts: vec![],
+            default_reasoning_effort: None,
         };
         deps.effort = Some("high".into());
         run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())

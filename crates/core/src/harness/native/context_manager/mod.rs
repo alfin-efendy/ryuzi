@@ -264,6 +264,9 @@ mod tests {
             max_output_tokens: 8_192,
             supports_prompt_cache: true,
             supports_reasoning: false,
+            display_name: None,
+            reasoning_efforts: vec![],
+            default_reasoning_effort: None,
         }
     }
 

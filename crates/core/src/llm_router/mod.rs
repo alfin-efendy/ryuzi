@@ -9,6 +9,7 @@ pub mod connections;
 pub mod keys;
 pub mod kiro;
 pub mod mimo;
+pub mod model_effort;
 pub mod model_meta;
 pub mod models;
 pub mod oauth;

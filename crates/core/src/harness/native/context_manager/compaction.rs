@@ -224,6 +224,9 @@ mod tests {
             max_output_tokens: 8_192,
             supports_prompt_cache: false,
             supports_reasoning: false,
+            display_name: None,
+            reasoning_efforts: vec![],
+            default_reasoning_effort: None,
         }
     }
 
@@ -368,6 +371,9 @@ mod tests {
             max_output_tokens: 8_192,
             supports_prompt_cache: false,
             supports_reasoning: false,
+            display_name: None,
+            reasoning_efforts: vec![],
+            default_reasoning_effort: None,
         };
         let mut cm = ContextManager::ephemeral("s", ContextConfig::with_meta(tiny_meta));
         cm.append_user(json!([{"type":"text","text":"start task"}]))

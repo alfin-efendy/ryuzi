@@ -7,6 +7,7 @@ use crate::llm_router::secrets;
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -14,6 +15,8 @@ pub struct ConnectionData {
     pub api_key: Option<String>,
     pub base_url_override: Option<String>,
     pub models_override: Option<Vec<String>>,
+    pub model_meta_overrides:
+        Option<HashMap<String, crate::llm_router::model_effort::DiscoveredModelMeta>>,
     // OAuth (auth_type == "oauth"): tokens are encrypted at rest via
     // secrets::SecretCipher (keychain-derived master key, file fallback when
     // the keychain is unavailable) and decrypted transparently on read.
