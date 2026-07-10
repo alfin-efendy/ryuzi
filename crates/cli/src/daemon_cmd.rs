@@ -124,6 +124,28 @@ fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
     }
 }
 
+/// Bring up the control API for a started daemon: write a fresh bearer
+/// token, read `control_port` (default [`DEFAULT_CONTROL_PORT`]), and serve.
+/// Returns the BOUND port. Shared by `run_daemon` and the canary's
+/// `promote()` so the two entry points cannot drift.
+async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<u16> {
+    let token = ryuzi_core::control_token::write_token(dir)?;
+    let settings = SettingsStore::new(daemon.store.clone());
+    let control_port: u16 = settings
+        .get("control_port")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_CONTROL_PORT);
+    let state = ryuzi_core::serve::ApiState {
+        cp: daemon.cp.clone(),
+        router_server: daemon.router_server.clone(),
+        token: Some(token),
+    };
+    ryuzi_core::serve::serve(state, control_port).await
+}
+
 async fn run_daemon(deps: &mut Deps) -> u8 {
     let dir: PathBuf = deps
         .db_path
@@ -182,29 +204,25 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
     // Control API: bearer token, then the bound port, written into daemon.json
     // BEFORE the daemon is reported running so clients that poll the status
     // file never observe a "running" daemon with no reachable control API.
-    let token = match ryuzi_core::control_token::write_token(&dir) {
-        Ok(t) => t,
-        Err(e) => {
-            (deps.err)(&format!("daemon: could not write control token: {e}"));
-            return 1;
-        }
-    };
-    let settings = SettingsStore::new(daemon.store.clone());
-    let control_port: u16 = settings
-        .get("control_port")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_CONTROL_PORT);
-    let state = ryuzi_core::serve::ApiState {
-        cp: daemon.cp.clone(),
-        router_server: daemon.router_server.clone(),
-        token: Some(token),
-    };
-    let bound = match ryuzi_core::serve::serve(state, control_port).await {
+    let bound = match start_control_api(&dir, &daemon).await {
         Ok(p) => p,
         Err(e) => {
+            // The daemon already started (gateways claimed, reconcile() may
+            // have fired) — stop it before reporting Error so a failed
+            // control API doesn't leave an orphaned daemon process with no
+            // status reflecting the failure.
+            daemon.stop().await;
+            let _ = write_status(
+                &dir,
+                &DaemonStatusFile {
+                    pid,
+                    state: DaemonFileState::Error,
+                    started_at,
+                    last_error: Some(e.to_string()),
+                    version,
+                    port: None,
+                },
+            );
             (deps.err)(&format!("daemon: control api failed to bind: {e}"));
             return 1;
         }
@@ -649,21 +667,10 @@ impl CanaryHost for ProdCanaryHost {
         let daemon = guard.as_ref().expect("open_db succeeded before promote");
         daemon.start().await?; // claims gateways + fires reconcile() for interrupted sessions
 
-        let token = ryuzi_core::control_token::write_token(&self.dir)?;
-        let settings = SettingsStore::new(daemon.store.clone());
-        let control_port: u16 = settings
-            .get("control_port")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_CONTROL_PORT);
-        let state = ryuzi_core::serve::ApiState {
-            cp: daemon.cp.clone(),
-            router_server: daemon.router_server.clone(),
-            token: Some(token),
-        };
-        let bound = ryuzi_core::serve::serve(state, control_port).await?;
+        // On failure here, just propagate `Err`: the canary flow's applier
+        // (see `apply_update`/`ApplierHost`) handles rollback of a failed
+        // promote, so no status write is needed on this path.
+        let bound = start_control_api(&self.dir, daemon).await?;
 
         let _ = write_status(
             &self.dir,
