@@ -1,14 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Copy, Loader2 } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
 import { events, type CatalogEntry, type DeviceFlowInfo } from "@/bindings";
-import { CategoryBadge, Chip } from "@/components/common/bits";
-import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
+import { Chip } from "@/components/common/bits";
+import { Button, ChoiceCard, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, RadioGroup } from "@ryuzi/ui";
 import {
   DEVICE_SIGNIN_ACTION,
   KIRO_DEVICE_CODE_HINT,
-  KIRO_IMPORT_ACTION,
   KIRO_IMPORT_HINT,
   KIRO_IMPORT_SUCCESS,
   KIRO_SIGNIN_ACTION,
@@ -20,6 +19,7 @@ import {
 import { usesDeviceSignin } from "./deviceSignin";
 
 type DeviceStep = "form" | "waiting";
+type SignInFlow = "device" | "oauth" | "apiKey" | "free";
 
 const SUBSCRIPTION_LABELS: Record<string, string> = {
   "anthropic-oauth": "Claude subscription",
@@ -30,11 +30,24 @@ const BASE_URL_PLACEHOLDERS: Record<string, string> = {
   "cloudflare-ai": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
 };
 
+function signInFlow(entry: CatalogEntry): SignInFlow {
+  if (usesDeviceSignin(entry)) return "device";
+  if (entry.category === "oauth") return "oauth";
+  if (entry.category === "free") return "free";
+  return "apiKey";
+}
+
 function authMethodLabel(entry: CatalogEntry): string {
-  if (entry.category === "oauth") return SUBSCRIPTION_LABELS[entry.id] ?? "Subscription";
-  if (entry.category === "device") return "Device sign-in";
-  if (entry.category === "free") return "Free tier";
-  return "API key";
+  switch (signInFlow(entry)) {
+    case "device":
+      return "Device sign-in";
+    case "oauth":
+      return SUBSCRIPTION_LABELS[entry.id] ?? "Subscription";
+    case "free":
+      return "Free tier";
+    case "apiKey":
+      return "API key";
+  }
 }
 
 export function AddConnectionModal({ open, onClose, family }: { open: boolean; onClose: () => void; family: string }) {
@@ -52,8 +65,8 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
   const [deviceInfo, setDeviceInfo] = useState<DeviceFlowInfo | null>(null);
   const selected =
     members.find((entry) => entry.id === selectedId) ?? members.find((entry) => entry.category === "api_key") ?? members[0] ?? null;
-  const title = "Add account";
   const selectedRef = useRef<CatalogEntry | null>(selected);
+  const operationRef = useRef(0);
 
   useEffect(() => {
     selectedRef.current = selected;
@@ -95,7 +108,14 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
 
   if (!open) return null;
 
+  const beginOperation = () => {
+    operationRef.current += 1;
+    return operationRef.current;
+  };
+  const operationIsCurrent = (operation: number) => operationRef.current === operation;
+
   const close = () => {
+    operationRef.current += 1;
     setLabel("");
     setApiKey("");
     setBaseUrl("");
@@ -107,21 +127,40 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     onClose();
   };
 
-  const baseUrlMissing = selected?.category === "api_key" && !!selected.requiresBaseUrl && baseUrl.trim().length === 0;
+  const flow = selected ? signInFlow(selected) : null;
+  const baseUrlMissing = flow === "apiKey" && !!selected?.requiresBaseUrl && baseUrl.trim().length === 0;
   const canSubmit = !!selected && !saving && !baseUrlMissing;
+  const shortCommitBusy = saving && (flow === "apiKey" || flow === "free");
+
+  const selectMethod = (id: string) => {
+    if (shortCommitBusy || id === selected?.id) return;
+    operationRef.current += 1;
+    setSelectedId(id);
+    setSaving(false);
+    setOauthWaiting(false);
+    setOauthAuthorizeUrl("");
+    setDeviceStep("form");
+    setDeviceInfo(null);
+  };
 
   const submitApiKey = async () => {
     if (!selected || !canSubmit) return;
+    const target = selected;
+    const operation = beginOperation();
     setSaving(true);
-    const ok = await add(selected.id, label.trim() || selected.name, apiKey, baseUrl.trim() || null);
+    const ok = await add(target.id, label.trim() || target.name, apiKey, baseUrl.trim() || null);
+    if (!operationIsCurrent(operation)) return;
     setSaving(false);
     if (ok) close();
   };
 
   const submitFree = async () => {
     if (!selected || !canSubmit) return;
+    const target = selected;
+    const operation = beginOperation();
     setSaving(true);
-    const ok = await addFree(selected.id, label.trim() || selected.name);
+    const ok = await addFree(target.id, label.trim() || target.name);
+    if (!operationIsCurrent(operation)) return;
     setSaving(false);
     if (ok) close();
   };
@@ -129,11 +168,12 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
   const connectBrowser = async () => {
     if (!selected || saving) return;
     const target = selected;
+    const operation = beginOperation();
     setSaving(true);
     setOauthWaiting(true);
     setOauthAuthorizeUrl("");
     const ok = await connectOauth(target.id, label.trim() || target.name);
-    if (selectedRef.current?.id !== target.id) return;
+    if (!operationIsCurrent(operation)) return;
     setSaving(false);
     if (ok) close();
     else setOauthWaiting(false);
@@ -143,18 +183,13 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     if (oauthAuthorizeUrl) void navigator.clipboard.writeText(oauthAuthorizeUrl);
   };
 
-  // Kiro (the "device" category) signs in via AWS SSO-OIDC device-code flow;
-  // RFC 8628 device-grant providers (qwen, github-copilot) use the generic
-  // device flow commands instead. Kiro also supports starting a fresh sign-in
-  // or importing an existing sign-in from a Kiro IDE on this machine. The
-  // `selectedRef` guard drops results that resolve after the user has
-  // navigated to a different provider.
   const startDevice = async () => {
     if (!selected || saving) return;
     const target = selected;
+    const operation = beginOperation();
     setSaving(true);
     const info = target.usesDeviceGrant ? await startDeviceFlow(target.id) : await startKiroDevice();
-    if (selectedRef.current?.id !== target.id) return;
+    if (!operationIsCurrent(operation)) return;
     if (!info) {
       setSaving(false);
       return;
@@ -165,18 +200,22 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     const ok = target.usesDeviceGrant
       ? await awaitDeviceFlow(target.id, signinLabel, info.flowId)
       : await awaitKiroDevice(signinLabel, info.flowId);
-    if (selectedRef.current?.id !== target.id) return;
+    if (!operationIsCurrent(operation)) return;
     setSaving(false);
     if (ok) close();
-    else setDeviceStep("form");
+    else {
+      setDeviceInfo(null);
+      setDeviceStep("form");
+    }
   };
 
   const importFromIde = async () => {
     if (!selected || saving) return;
     const target = selected;
+    const operation = beginOperation();
     setSaving(true);
     const ok = await importKiro(label.trim() || target.name);
-    if (selectedRef.current?.id !== target.id) return;
+    if (!operationIsCurrent(operation)) return;
     setSaving(false);
     if (ok) {
       toast.success(KIRO_IMPORT_SUCCESS);
@@ -191,155 +230,99 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
   };
 
   return (
-    <Modal onClose={close} width={480}>
-      <div className="flex items-center gap-3">
-        <Chip initial={selected?.initial ?? "C"} color={selected?.color ?? "#8B8B8B"} size={36} />
-        <div className="min-w-0 flex-1">
-          <div className="text-[15px] font-semibold tracking-[-0.01em]">{title}</div>
-          <div className="text-xs text-muted-foreground">{selected ? selected.name : "Provider unavailable"}</div>
-        </div>
-      </div>
-
-      {members.length > 1 && (
-        <div role="radiogroup" aria-label="Sign-in method" className="mt-4 grid grid-cols-2 gap-2">
-          {members.map((entry) => {
-            const checked = entry.id === selected?.id;
-            return (
-              <Button
+    <Modal onClose={close} width={480} busy={shortCommitBusy}>
+      <ModalHeader
+        leading={<Chip initial={selected?.initial ?? "C"} color={selected?.color ?? "#8B8B8B"} size={36} />}
+        title="Add account"
+        description={selected?.name ?? "Provider unavailable"}
+      />
+      <ModalBody>
+        {members.length > 1 && (
+          <RadioGroup
+            aria-label="Sign-in method"
+            value={selected?.id ?? ""}
+            onValueChange={selectMethod}
+            disabled={shortCommitBusy}
+            className="grid-cols-2"
+          >
+            {members.map((entry) => (
+              <ChoiceCard
                 key={entry.id}
-                role="radio"
-                aria-checked={checked}
-                aria-label={authMethodLabel(entry)}
-                variant={checked ? "secondary" : "outline"}
-                onClick={() => {
-                  // Switching sign-in method mid-flight (e.g. while an OAuth
-                  // connect is still waiting) must clear the in-flight state,
-                  // otherwise `saving`/`oauthWaiting` stay latched and the newly
-                  // chosen form is dead until the modal is reopened.
-                  if (entry.id === selected?.id) return;
-                  setSelectedId(entry.id);
-                  setSaving(false);
-                  setOauthWaiting(false);
-                  setOauthAuthorizeUrl("");
-                  setDeviceStep("form");
-                  setDeviceInfo(null);
-                }}
-                className="h-auto w-full justify-start gap-[11px] px-3 py-[11px] text-left"
-              >
-                <Chip initial={entry.initial} color={entry.color} size={32} />
-                <span className="min-w-0">
-                  <span className="flex items-center gap-1.5 font-semibold">
-                    {authMethodLabel(entry)}
-                    <CategoryBadge category={entry.freeTier ? "free_tier" : entry.category} />
-                  </span>
-                  <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11px] font-normal text-muted-foreground">
-                    {entry.name}
-                  </span>
-                </span>
-              </Button>
-            );
-          })}
-        </div>
-      )}
+                value={entry.id}
+                title={authMethodLabel(entry)}
+                description={entry.name}
+                leading={<Chip initial={entry.initial} color={entry.color} size={32} />}
+              />
+            ))}
+          </RadioGroup>
+        )}
 
-      {selected?.riskNotice && (
-        <p className="mt-3 rounded-md border border-border px-3 py-2 text-[11.5px]" style={{ color: "#F59E0B" }}>
-          {PROVIDER_RISK_NOTICE}
-        </p>
-      )}
+        {selected?.riskNotice && (
+          <p className="mt-3 rounded-md border border-border px-3 py-2 text-[11.5px] text-amber-500">{PROVIDER_RISK_NOTICE}</p>
+        )}
 
-      {selected?.category === "oauth" ? (
-        <>
+        {flow === "oauth" && selected && (
           <div className="mt-3.5 flex flex-col gap-3">
             <FormField label="Label">
               <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected.name} />
             </FormField>
-          </div>
-          {!oauthWaiting ? (
-            <Button size="lg" onClick={() => void connectBrowser()} disabled={saving} className="mt-3.5 w-full">
-              {saving ? "Opening..." : "Connect with browser"}
-            </Button>
-          ) : (
-            <div className="mt-3.5 flex flex-col gap-3">
-              <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2.5 text-[12.5px] text-muted-foreground">
-                <Loader2 aria-hidden size={13} strokeWidth={2} className="shrink-0 animate-spin" />
-                Waiting for your browser... complete the login, then return here.
-              </div>
-              {oauthAuthorizeUrl && (
-                <FormField label="Login URL">
-                  <div className="flex min-w-0 gap-2">
+            {oauthWaiting && (
+              <>
+                <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2.5 text-[12.5px] text-muted-foreground">
+                  <Loader2 aria-hidden className="shrink-0 animate-spin" />
+                  Waiting for your browser... complete the login, then return here.
+                </div>
+                {oauthAuthorizeUrl && (
+                  <FormField label="Login URL">
                     <Input
                       readOnly
                       value={oauthAuthorizeUrl}
                       onFocus={(event) => event.currentTarget.select()}
-                      className="min-w-0 font-mono text-[11.5px]"
+                      className="font-mono text-[11.5px]"
                     />
-                    <Button type="button" variant="outline" onClick={copyAuthorizeUrl} className="shrink-0" aria-label="Copy login URL">
-                      <Copy aria-hidden size={13} strokeWidth={2} className="size-3.5" />
-                      Copy
-                    </Button>
-                  </div>
-                </FormField>
-              )}
-            </div>
-          )}
-        </>
-      ) : selected && usesDeviceSignin(selected) ? (
-        <>
-          {deviceStep === "form" && (
-            <>
-              <div className="mt-3.5 flex flex-col gap-3">
-                <FormField label="Label">
-                  <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected.name} />
-                </FormField>
-              </div>
-              <p className="mt-2 text-[11.5px] text-muted-foreground">
-                {selected.id === "kiro"
-                  ? KIRO_SIGNIN_SUBTITLE
-                  : (PROVIDER_DEVICE_SUBTITLE[selected.id] ?? "Sign in with your provider account.")}
-              </p>
-              <Button size="lg" onClick={() => void startDevice()} disabled={saving} className="mt-2 w-full">
-                {saving ? "Opening..." : selected.id === "kiro" ? KIRO_SIGNIN_ACTION : DEVICE_SIGNIN_ACTION}
-              </Button>
-              {selected.id === "kiro" && (
-                <>
-                  <Button size="lg" variant="outline" onClick={() => void importFromIde()} disabled={saving} className="mt-2 w-full">
-                    {saving ? "Importing..." : KIRO_IMPORT_ACTION}
-                  </Button>
-                  <p className="mt-2 text-[11.5px] text-muted-foreground">{KIRO_IMPORT_HINT}</p>
-                </>
-              )}
-            </>
-          )}
+                  </FormField>
+                )}
+              </>
+            )}
+          </div>
+        )}
 
-          {deviceStep === "waiting" && deviceInfo && (
-            <div className="mt-3.5 flex flex-col items-center gap-3 rounded-md border border-border px-4 py-4 text-center">
-              <p className="text-[12.5px] text-muted-foreground">{KIRO_DEVICE_CODE_HINT}</p>
-              <div className="flex items-center gap-1.5">
-                <span className="font-mono text-lg font-semibold tracking-[0.08em]">{deviceInfo.userCode}</span>
-                <Button variant="ghost" size="icon-sm" title="Copy code" onClick={copyDeviceCode} className="text-muted-foreground">
-                  <Copy aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-                </Button>
-              </div>
-              <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
-                <Loader2 aria-hidden size={13} strokeWidth={2} className="shrink-0 animate-spin" />
-                {KIRO_WAITING_HINT}
-              </div>
-              {deviceInfo.verificationUri && (
-                <p className="text-[11px] text-muted-foreground break-all">
-                  or visit <span className="font-mono">{deviceInfo.verificationUri}</span>
-                </p>
-              )}
-            </div>
-          )}
-        </>
-      ) : (
-        <>
+        {flow === "device" && selected && deviceStep === "form" && (
           <div className="mt-3.5 flex flex-col gap-3">
             <FormField label="Label">
-              <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected?.name ?? "Connection"} />
+              <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected.name} />
             </FormField>
-            {selected?.category === "api_key" && (
+            <p className="text-[11.5px] text-muted-foreground">
+              {selected.id === "kiro"
+                ? KIRO_SIGNIN_SUBTITLE
+                : (PROVIDER_DEVICE_SUBTITLE[selected.id] ?? "Sign in with your provider account.")}
+            </p>
+            {selected.id === "kiro" && <p className="text-[11.5px] text-muted-foreground">{KIRO_IMPORT_HINT}</p>}
+          </div>
+        )}
+
+        {flow === "device" && deviceStep === "waiting" && deviceInfo && (
+          <div className="mt-3.5 flex flex-col items-center gap-3 rounded-md border border-border px-4 py-4 text-center">
+            <p className="text-[12.5px] text-muted-foreground">{KIRO_DEVICE_CODE_HINT}</p>
+            <span className="font-mono text-lg font-semibold tracking-[0.08em]">{deviceInfo.userCode}</span>
+            <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+              <Loader2 aria-hidden className="shrink-0 animate-spin" />
+              {KIRO_WAITING_HINT}
+            </div>
+            {deviceInfo.verificationUri && (
+              <p className="break-all text-[11px] text-muted-foreground">
+                or visit <span className="font-mono">{deviceInfo.verificationUri}</span>
+              </p>
+            )}
+          </div>
+        )}
+
+        {(flow === "apiKey" || flow === "free") && selected && (
+          <div className="mt-3.5 flex flex-col gap-3">
+            <FormField label="Label">
+              <Input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={selected.name} />
+            </FormField>
+            {flow === "apiKey" && (
               <>
                 <FormField label="API key">
                   <Input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="sk-..." />
@@ -358,28 +341,50 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
                   <Input
                     value={baseUrl}
                     onChange={(event) => setBaseUrl(event.target.value)}
-                    placeholder={BASE_URL_PLACEHOLDERS[selected?.id ?? ""] ?? "https://host/v1"}
+                    placeholder={BASE_URL_PLACEHOLDERS[selected.id] ?? "https://host/v1"}
                   />
                 </FormField>
               </>
             )}
           </div>
+        )}
+      </ModalBody>
 
-          <Button
-            size="lg"
-            onClick={() => void (selected?.category === "free" ? submitFree() : submitApiKey())}
-            disabled={!canSubmit}
-            className="mt-3.5 w-full"
-          >
-            {saving ? "Adding..." : title}
+      <ModalFooter>
+        {oauthWaiting && oauthAuthorizeUrl && (
+          <Button variant="outline" onClick={copyAuthorizeUrl}>
+            Copy login URL
           </Button>
-        </>
-      )}
-
-      <ModalFooter className="mt-4">
-        <Button variant="outline" onClick={close}>
+        )}
+        {deviceStep === "waiting" && deviceInfo && (
+          <Button variant="outline" onClick={copyDeviceCode}>
+            Copy code
+          </Button>
+        )}
+        {flow === "device" && deviceStep === "form" && selected?.id === "kiro" && (
+          <Button variant="outline" disabled={saving} onClick={() => void importFromIde()}>
+            Import from Kiro IDE
+          </Button>
+        )}
+        <div className="flex-1" />
+        <Button variant="outline" disabled={shortCommitBusy} onClick={close}>
           Cancel
         </Button>
+        {flow === "oauth" && !oauthWaiting && (
+          <Button disabled={saving} onClick={() => void connectBrowser()}>
+            {saving ? "Opening..." : "Connect with browser"}
+          </Button>
+        )}
+        {flow === "device" && deviceStep === "form" && (
+          <Button disabled={saving} onClick={() => void startDevice()}>
+            {saving ? "Opening..." : selected?.id === "kiro" ? KIRO_SIGNIN_ACTION : DEVICE_SIGNIN_ACTION}
+          </Button>
+        )}
+        {(flow === "apiKey" || flow === "free") && (
+          <Button disabled={!canSubmit} onClick={() => void (flow === "free" ? submitFree() : submitApiKey())}>
+            {saving ? "Adding..." : "Add account"}
+          </Button>
+        )}
       </ModalFooter>
     </Modal>
   );
