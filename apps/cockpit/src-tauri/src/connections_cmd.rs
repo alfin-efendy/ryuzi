@@ -5,15 +5,15 @@ use ryuzi_core::llm_router::claude_cloak;
 use ryuzi_core::llm_router::connections::{self, ConnectionData, ConnectionRow};
 use ryuzi_core::llm_router::models;
 use ryuzi_core::llm_router::oauth;
+use ryuzi_core::llm_router::probe;
 use ryuzi_core::llm_router::quota::{self, CodexResetCreditResult, ProviderQuotaInfo};
-use ryuzi_core::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderCategory};
+use ryuzi_core::llm_router::registry::{self, ApiFormat, ProviderCategory};
 use ryuzi_core::llm_router::routes::{
     self, ModelRouteInfo, ModelRouteStrategy, ProviderAccountRouteInfo,
 };
 use ryuzi_core::store::ModelStatusRow;
 use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use specta::Type;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -90,6 +90,18 @@ pub struct RefreshModelsResult {
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelStatusInfo {
+    pub model: String,
+    pub status: String,
+    pub message: String,
+    pub tested_at: i64,
+}
+
+/// One persisted probe verdict row across ALL families — hydrates the
+/// app-wide model-status store consumed by every model picker.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatusEntry {
+    pub family: String,
     pub model: String,
     pub status: String,
     pub message: String,
@@ -495,174 +507,16 @@ fn probe_outcome(resp: Result<reqwest::StatusCode, String>) -> TestResult {
     }
 }
 
-fn model_probe_body(format: ApiFormat, model: &str) -> Value {
-    match format {
-        ApiFormat::OpenAi => json!({
-            "model": model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1,
-            "stream": false
-        }),
-        ApiFormat::Anthropic => json!({
-            "model": model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1,
-            "stream": false
-        }),
-    }
-}
-
-fn model_probe_outcome(model: &str, resp: Result<reqwest::StatusCode, String>) -> TestResult {
-    let status = models::probe_status(resp.as_ref().ok().map(|s| s.as_u16()));
-    let message = match &resp {
-        Ok(s) if s.is_success() => format!("Model {model} OK"),
-        Ok(s) if s.as_u16() == 401 || s.as_u16() == 403 => {
-            format!("Model {model} was rejected by provider credentials.")
-        }
-        Ok(s) => format!("Model {model} returned HTTP {s}"),
-        Err(e) => format!("Model {model} network error: {e}"),
-    };
+/// Map the engine's probe outcome onto the Tauri wire type — verbatim, so
+/// the UI strings and the persisted verdict stay identical to the
+/// pre-unification behavior. The probe itself (request building, kiro/codex
+/// branches, refresh retry) lives in `ryuzi_core::llm_router::probe`.
+fn to_test_result(outcome: &probe::ProbeOutcome) -> TestResult {
     TestResult {
-        ok: status == models::ProbeStatus::Valid,
-        status: status.as_str().to_string(),
-        message,
+        ok: outcome.ok,
+        status: outcome.status.as_str().to_string(),
+        message: outcome.message.clone(),
     }
-}
-
-fn chatgpt_account_id(row: &ConnectionRow) -> Option<&str> {
-    let data = row.data.provider_specific.as_ref()?;
-    data.get("chatgpt_account_id")
-        .or_else(|| data.get("chatgptAccountId"))
-        .or_else(|| data.get("accountId"))
-        .or_else(|| data.get("workspaceId"))
-        .and_then(Value::as_str)
-}
-
-fn codex_probe_model(model: &str) -> String {
-    let mut upstream = model.strip_suffix("-review").unwrap_or(model).to_string();
-    for effort in ["xhigh", "high", "medium", "low", "none"] {
-        let suffix = format!("-{effort}");
-        if upstream.ends_with(&suffix) {
-            upstream.truncate(upstream.len() - suffix.len());
-            break;
-        }
-    }
-    upstream
-}
-
-fn build_model_probe_request(
-    http: &reqwest::Client,
-    desc: &registry::ProviderDescriptor,
-    row: &ConnectionRow,
-    model: &str,
-) -> anyhow::Result<reqwest::RequestBuilder> {
-    if row.provider == "openai-oauth" {
-        let token = row.data.access_token.clone().unwrap_or_default();
-        let mut req = http
-            .post("https://chatgpt.com/backend-api/codex/responses")
-            .json(&json!({
-                "model": codex_probe_model(model),
-                "input": "ping",
-                "stream": false,
-                "store": false
-            }))
-            .header("authorization", format!("Bearer {token}"))
-            .header("originator", "codex_cli_rs")
-            .header("session_id", ryuzi_core::paths::new_id());
-        if let Some(account_id) = chatgpt_account_id(row) {
-            req = req.header("chatgpt-account-id", account_id);
-        }
-        return Ok(req);
-    }
-
-    let base = connections::effective_base_url(desc, row)
-        .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", row.id))?;
-    let mut body = model_probe_body(desc.format, model);
-
-    if row.provider == "anthropic-oauth" {
-        models::inject_claude_code_system_prompt(&mut body);
-        let token = row.data.access_token.clone().unwrap_or_default();
-        let session_id = ryuzi_core::paths::new_id();
-        let cloaked = claude_cloak::enabled(&row.data);
-        if cloaked {
-            claude_cloak::apply_request_cloak(&mut body, &token, &session_id);
-        }
-        let req = http
-            .post(format!("{base}/messages?beta=true"))
-            .json(&body)
-            .header("authorization", format!("Bearer {token}"))
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", models::ANTHROPIC_OAUTH_BETA)
-            .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("user-agent", "claude-cli/2.1.92 (external, sdk-cli)")
-            .header("x-app", "cli");
-        return Ok(if cloaked {
-            claude_cloak::spoof_headers(req, &session_id)
-        } else {
-            req
-        });
-    }
-
-    let path = match desc.format {
-        ApiFormat::OpenAi => "/chat/completions",
-        ApiFormat::Anthropic => "/messages",
-    };
-    let mut req = http.post(format!("{base}{path}")).json(&body);
-    if desc.no_auth {
-        if row.provider == "opencode-free" {
-            req = req
-                .header("authorization", "Bearer public")
-                .header("x-opencode-client", "desktop");
-        }
-        return Ok(req);
-    }
-
-    let key = row.data.api_key.clone().unwrap_or_default();
-    match desc.auth {
-        AuthScheme::XApiKey => Ok(req
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")),
-        AuthScheme::Bearer => Ok(req.header("authorization", format!("Bearer {key}"))),
-        AuthScheme::None => Ok(req),
-    }
-}
-
-async fn test_model_once(
-    http: &reqwest::Client,
-    desc: &registry::ProviderDescriptor,
-    row: &ConnectionRow,
-    model: &str,
-) -> anyhow::Result<reqwest::StatusCode> {
-    Ok(build_model_probe_request(http, desc, row, model)?
-        .send()
-        .await?
-        .status())
-}
-
-async fn test_model_status(
-    store: &Arc<ryuzi_core::Store>,
-    http: &reqwest::Client,
-    desc: &registry::ProviderDescriptor,
-    row: &mut ConnectionRow,
-    model: &str,
-) -> anyhow::Result<reqwest::StatusCode> {
-    if connections::is_oauth(row) {
-        if let Err(err) = oauth::refresh::ensure_fresh(store, http, row).await {
-            if row.data.needs_relogin == Some(true) {
-                return Err(err);
-            }
-        }
-    }
-
-    let status = test_model_once(http, desc, row, model).await?;
-    if connections::is_oauth(row)
-        && matches!(status.as_u16(), 401 | 403)
-        && row.data.refresh_token.is_some()
-    {
-        oauth::refresh::force_refresh(store, http, row).await?;
-        return test_model_once(http, desc, row, model).await;
-    }
-    Ok(status)
 }
 
 /// Hit the upstream's model-list endpoint to distinguish bad credentials
@@ -715,7 +569,7 @@ pub async fn test_connection_model(
             message: "Model id is empty".into(),
         });
     }
-    let mut row = connections::get_connection(cp.store(), &id)
+    let row = connections::get_connection(cp.store(), &id)
         .await?
         .ok_or_else(|| CmdError {
             message: format!("unknown connection: {id}"),
@@ -724,12 +578,7 @@ pub async fn test_connection_model(
         message: format!("unknown provider: {}", row.provider),
     })?;
     let client = provider_http_client()?;
-    let result = test_model_status(cp.store(), &client, desc, &mut row, &model)
-        .await
-        .map_or_else(
-            |e| model_probe_outcome(&model, Err(e.to_string())),
-            |status| model_probe_outcome(&model, Ok(status)),
-        );
+    let result = to_test_result(&probe::probe_model(&client, cp.store(), desc, &row, &model).await);
     // Best-effort persistence of definitive verdicts; upsert_model_status
     // ignores "unknown" so rate limits / outages never clobber a stored
     // valid/invalid record, and a store hiccup must not fail the probe.
@@ -758,6 +607,25 @@ pub async fn list_model_statuses(
     Ok(rows
         .into_iter()
         .map(|row| ModelStatusInfo {
+            model: row.model,
+            status: row.status,
+            message: row.message,
+            tested_at: row.tested_at,
+        })
+        .collect())
+}
+
+/// Every persisted probe verdict, unfiltered — the family-scoped
+/// `list_model_statuses` above stays for the provider Models card; this
+/// variant feeds the app-wide picker filter.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_all_model_statuses(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<ModelStatusEntry>> {
+    let rows = cp.store().list_all_model_statuses().await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ModelStatusEntry {
+            family: row.family,
             model: row.model,
             status: row.status,
             message: row.message,
@@ -929,49 +797,6 @@ mod tests {
     }
 
     #[test]
-    fn model_probe_body_matches_provider_format() {
-        let openai = model_probe_body(ApiFormat::OpenAi, "gpt-test");
-        assert_eq!(openai["model"], "gpt-test");
-        assert_eq!(openai["messages"][0]["content"], "ping");
-        assert_eq!(openai["max_tokens"], 1);
-
-        let anthropic = model_probe_body(ApiFormat::Anthropic, "claude-test");
-        assert_eq!(anthropic["model"], "claude-test");
-        assert_eq!(anthropic["messages"][0]["content"], "ping");
-        assert_eq!(anthropic["max_tokens"], 1);
-    }
-
-    #[test]
-    fn anthropic_oauth_model_probe_injects_claude_code_system_prompt() {
-        let http = reqwest::Client::new();
-        let desc = registry::descriptor("anthropic-oauth").unwrap();
-        let row = ConnectionRow {
-            id: "c1".into(),
-            provider: "anthropic-oauth".into(),
-            auth_type: "oauth".into(),
-            label: "Claude Code".into(),
-            priority: 0,
-            enabled: true,
-            data: ConnectionData {
-                access_token: Some("at-claude".into()),
-                ..Default::default()
-            },
-            created_at: 0,
-            updated_at: 0,
-        };
-        let req = build_model_probe_request(&http, desc, &row, "claude-opus-4-8")
-            .unwrap()
-            .build()
-            .unwrap();
-        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
-
-        assert_eq!(
-            sent["system"][0]["text"],
-            "You are Claude Code, Anthropic's official CLI for Claude."
-        );
-    }
-
-    #[test]
     fn connection_info_exposes_claude_cloaking_for_anthropic_oauth_only() {
         let mut row = ConnectionRow {
             id: "c1".into(),
@@ -981,7 +806,7 @@ mod tests {
             priority: 0,
             enabled: true,
             data: ConnectionData {
-                provider_specific: Some(json!({"claudeCloaking": true})),
+                provider_specific: Some(serde_json::json!({"claudeCloaking": true})),
                 ..Default::default()
             },
             created_at: 0,
@@ -994,14 +819,26 @@ mod tests {
     }
 
     #[test]
-    fn model_probe_outcome_mentions_model_id() {
-        let r = model_probe_outcome("gpt-test", Ok(status(200)));
-        assert!(r.ok);
-        assert_eq!(r.message, "Model gpt-test OK");
-
-        let r = model_probe_outcome("gpt-test", Ok(status(404)));
+    fn to_test_result_maps_probe_outcome_verbatim() {
+        let outcome = probe::ProbeOutcome {
+            ok: false,
+            status: models::ProbeStatus::Invalid,
+            message: "Model m returned HTTP 404 Not Found".into(),
+        };
+        let r = to_test_result(&outcome);
         assert!(!r.ok);
-        assert_eq!(r.message, "Model gpt-test returned HTTP 404 Not Found");
+        assert_eq!(r.status, "invalid");
+        assert_eq!(r.message, "Model m returned HTTP 404 Not Found");
+
+        let ok = probe::ProbeOutcome {
+            ok: true,
+            status: models::ProbeStatus::Valid,
+            message: "Model m OK".into(),
+        };
+        let r = to_test_result(&ok);
+        assert!(r.ok);
+        assert_eq!(r.status, "valid");
+        assert_eq!(r.message, "Model m OK");
     }
 
     /// A kiro device-flow connection must persist the registered AWS SSO-OIDC

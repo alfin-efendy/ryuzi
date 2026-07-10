@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useStore } from "./store";
 import { useRuntimes } from "./store-runtimes";
+import { useModelStatuses } from "./store-model-statuses";
 import { useNav } from "./store-nav";
 import { useDisableContextMenu } from "./lib/contextMenu";
 import { TitleBar } from "./components/shell/TitleBar";
@@ -65,12 +66,14 @@ function MainView() {
 export default function App() {
   const init = useStore((s) => s.init);
   const hydrateAgents = useRuntimes((s) => s.hydrate);
+  const hydrateModelStatuses = useModelStatuses((s) => s.hydrate);
   const pending = useStore((s) => s.pendingApprovals.length);
   useDisableContextMenu();
   useEffect(() => {
     init();
     void hydrateAgents();
-  }, [init, hydrateAgents]);
+    void hydrateModelStatuses();
+  }, [init, hydrateAgents, hydrateModelStatuses]);
   return (
     <div className="relative flex h-screen flex-col overflow-hidden text-sm text-foreground antialiased">
       {/* Wallpaper behind the glass chrome; collapses to transparent when an OS backdrop is active. */}

@@ -1,6 +1,5 @@
 import {
   Button,
-  Combobox,
   Input,
   Segmented,
   SettingsCard as Card,
@@ -14,8 +13,7 @@ import { AlertTriangle, Copy, Layers, Loader2, MonitorUp, X } from "lucide-react
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { commands, type RuntimeConfigStatusInfo } from "@/bindings";
-import type { ComboboxGroup, ComboboxOption } from "@ryuzi/ui";
-import { groupModelOptions, withLeadingOption } from "@/lib/model-groups";
+import { ModelPicker } from "@/components/ModelPicker";
 import { Chip, Pill } from "@/components/common/bits";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { PERM_MODES } from "@/constants";
@@ -28,30 +26,30 @@ import { useNav } from "@/store-nav";
 
 const WARN = "#F59E0B";
 
-// A single label + Combobox row for the endpoint-config card's model
+// A single label + ModelPicker row for the endpoint-config card's model
 // pickers — options come from the enabled connections' models, grouped by
 // provider family (values stay the raw `provider/model` ids).
 function ModelSelectRow({
   label,
   value,
-  options,
+  models,
   onChange,
 }: {
   label: string;
   value: string;
-  options: ComboboxOption[] | ComboboxGroup[];
+  models: string[];
   onChange: (v: string) => void;
 }) {
   return (
     <div className="flex items-center gap-2.5 px-[18px] py-[7px]">
       <span className="w-[100px] shrink-0 text-[12.5px] font-medium text-muted-foreground">{label}</span>
-      <Combobox
-        aria-label={label}
-        options={options}
-        value={value || null}
+      <ModelPicker
+        ariaLabel={label}
+        variant="field"
+        models={models}
+        value={value}
         onValueChange={onChange}
         placeholder="— pick a model —"
-        className="min-w-0 flex-1"
       />
     </div>
   );
@@ -68,14 +66,13 @@ export function RuntimeDetailView({ id }: { id: string }) {
   // Ryuzi's local router, guarded on the server being up + a key existing.
   const [cfg, setCfg] = useState<RuntimeConfigStatusInfo | null>(null);
   const { status: epStatus, keys: epKeys } = useEndpoint();
-  const { catalog, connections } = useConnections();
+  const { connections } = useConnections();
   const { routes } = useModelRoutes();
   const modelOptions = useMemo(() => {
     const routeModels = routes.filter((r) => r.enabled && r.targets.length > 0).map((r) => r.name);
     const providerModels = connections.filter((c) => c.enabled).flatMap((c) => c.models.map((m) => `${c.provider}/${m}`));
     return Array.from(new Set([...routeModels, ...providerModels]));
   }, [connections, routes]);
-  const groupedModelOptions = useMemo(() => groupModelOptions(modelOptions, catalog, connections), [modelOptions, catalog, connections]);
   const [model, setModel] = useState("");
   const [opus, setOpus] = useState("");
   const [sonnet, setSonnet] = useState("");
@@ -240,29 +237,17 @@ export function RuntimeDetailView({ id }: { id: string }) {
                     <span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">Not set</span>
                   )}
                 </div>
-                <Combobox
-                  aria-label={`${tier.label} model`}
-                  options={withLeadingOption(
-                    { value: "__combo__", label: "Route by task (combo)" },
-                    groupModelOptions(agent.models, catalog, connections),
-                  )}
-                  value={tier.combo ? "__combo__" : tier.value}
+                <ModelPicker
+                  ariaLabel={`${tier.label} model`}
+                  variant="field"
+                  models={agent.models}
+                  leading={[{ value: "__combo__", label: "Route by task (combo)" }]}
+                  value={tier.combo ? "__combo__" : (tier.value ?? "")}
                   onValueChange={(v) => {
                     if (v === "__combo__") void setTier(agent.id, tier.id, "route by task", true);
                     else void setTier(agent.id, tier.id, v);
                   }}
-                  trigger={
-                    <Button
-                      variant="outline"
-                      title={
-                        agent.models.length === 0
-                          ? `No models detected${agent.id === "ollama" ? " — pull one with `ollama pull`" : ""}.`
-                          : undefined
-                      }
-                    >
-                      Select model
-                    </Button>
-                  }
+                  placeholder="Select model"
                 />
               </div>
             ))}
@@ -282,15 +267,13 @@ export function RuntimeDetailView({ id }: { id: string }) {
             <span className="w-[110px] shrink-0 text-[13px] font-medium">Default model</span>
             {isNative ? (
               agent.models.length > 0 ? (
-                <Combobox
-                  aria-label="Default model"
-                  options={withLeadingOption(
-                    { value: "", label: "Router default (first usable provider)" },
-                    groupModelOptions(agent.models, catalog, connections),
-                  )}
+                <ModelPicker
+                  ariaLabel="Default model"
+                  variant="field"
+                  models={agent.models}
+                  leading={[{ value: "", label: "Router default (first usable provider)" }]}
                   value={agent.model || ""}
                   onValueChange={(v) => void update(agent.id, { model: v })}
-                  className="min-w-0 flex-1"
                 />
               ) : (
                 <span className="flex-1 truncate text-xs text-muted-foreground">
@@ -356,12 +339,12 @@ export function RuntimeDetailView({ id }: { id: string }) {
                 <div className="flex flex-col gap-1 py-2">
                   {agent.id === "claude" && (
                     <>
-                      <ModelSelectRow label="Opus" value={opus} options={groupedModelOptions} onChange={setOpus} />
-                      <ModelSelectRow label="Sonnet" value={sonnet} options={groupedModelOptions} onChange={setSonnet} />
-                      <ModelSelectRow label="Haiku" value={haiku} options={groupedModelOptions} onChange={setHaiku} />
+                      <ModelSelectRow label="Opus" value={opus} models={modelOptions} onChange={setOpus} />
+                      <ModelSelectRow label="Sonnet" value={sonnet} models={modelOptions} onChange={setSonnet} />
+                      <ModelSelectRow label="Haiku" value={haiku} models={modelOptions} onChange={setHaiku} />
                     </>
                   )}
-                  <ModelSelectRow label="Default model" value={model} options={groupedModelOptions} onChange={setModel} />
+                  <ModelSelectRow label="Default model" value={model} models={modelOptions} onChange={setModel} />
                 </div>
                 <div className="flex items-center justify-end gap-2 border-t border-border px-[18px] py-3">
                   {cfg?.configured && (

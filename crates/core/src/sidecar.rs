@@ -317,7 +317,7 @@ mod tests {
             standalone: HashMap::from([(
                 "x86_64-unknown-linux-gnu".into(),
                 ArtifactSpec {
-                    asset: "claude-agent-acp-0.55.0-x86_64-unknown-linux-gnu".into(),
+                    asset: "claude-agent-acp-0.55.0-x86_64-linux-gnu".into(),
                     sha256: bin_sha.into(),
                 },
             )]),

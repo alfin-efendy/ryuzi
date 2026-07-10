@@ -55,6 +55,26 @@ const claudeConnection: ConnectionInfo = {
   claudeCloaking: true,
 };
 
+// Cloudflare Workers AI ids carry slashes ("@cf/meta/llama-3.1-8b-instruct")
+// — the route target adapter must split at the FIRST slash only, keeping
+// the model portion (which itself contains slashes) intact.
+const cloudflareConnection: ConnectionInfo = {
+  id: "c5",
+  provider: "cloudflare-ai",
+  providerName: "Cloudflare Workers AI",
+  color: "#F38020",
+  initial: "C",
+  authType: "api_key",
+  label: "Cloudflare",
+  priority: 0,
+  enabled: true,
+  baseUrl: null,
+  models: ["@cf/meta/llama-3.1-8b-instruct"],
+  keyMasked: "sk-…abcd",
+  needsRelogin: false,
+  claudeCloaking: false,
+};
+
 const anthropicApiConnection: ConnectionInfo = {
   id: "c4",
   provider: "anthropic",
@@ -551,4 +571,52 @@ test("shows empty states for API keys, providers, and routes", async () => {
   expect(screen.getByText("No routes yet. Create a route alias to expose a combo-style model.")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Endpoint" }));
   expect(await screen.findByText("No API keys yet — create one for external tools.")).toBeTruthy();
+});
+
+test("route target picker always shows the search input", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
+  expect(await screen.findByPlaceholderText("Search…")).toBeTruthy();
+});
+
+test("route target adapter round-trips a slash-containing model id (cloudflare-ai)", async () => {
+  saveModelRoute.mockClear();
+  useConnections.setState({
+    catalog: [
+      ...catalog,
+      {
+        id: "cloudflare-ai",
+        name: "Cloudflare Workers AI",
+        family: "cloudflare-ai",
+        color: "#F38020",
+        initial: "C",
+        category: "api_key",
+        format: "openai",
+        requiresBaseUrl: false,
+        models: ["@cf/meta/llama-3.1-8b-instruct"],
+        freeTier: false,
+        riskNotice: false,
+        usesDeviceGrant: false,
+      },
+    ],
+    connections: [connection, cloudflareConnection],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+  fireEvent.change(screen.getByPlaceholderText("smart"), { target: { value: "cf-route" } });
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
+  fireEvent.click(await screen.findByRole("option", { name: "@cf/meta/llama-3.1-8b-instruct" }));
+
+  fireEvent.click(screen.getByRole("button", { name: "Save route" }));
+
+  await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
+  const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
+  expect(savedRoute.targets).toEqual([{ provider: "cloudflare-ai", model: "@cf/meta/llama-3.1-8b-instruct" }]);
 });

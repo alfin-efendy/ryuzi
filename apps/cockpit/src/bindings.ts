@@ -699,6 +699,19 @@ async listModelStatuses(family: string) : Promise<Result<ModelStatusInfo[], CmdE
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Every persisted probe verdict, unfiltered — the family-scoped
+ * `list_model_statuses` above stays for the provider Models card; this
+ * variant feeds the app-wide picker filter.
+ */
+async listAllModelStatuses() : Promise<Result<ModelStatusEntry[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_all_model_statuses") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async connectionProviderQuota(id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { id }) };
@@ -1171,7 +1184,17 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 /**
  * A runtime npm install/update finished (ok=false → message has detail).
  */
-{ kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null }
+{ kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null } | 
+/**
+ * Per-response context usage for a native session (drives the
+ * "% context left" indicator).
+ */
+{ kind: "contextUsage"; session_pk: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; output_tokens: number } | 
+/**
+ * The native runtime compacted a session's history
+ * (trigger: pre_turn|mid_turn|manual).
+ */
+{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number }
 export type CoreEventMsg = { event: CoreEvent }
 /**
  * Device-code flow info shown to the user while they complete the browser
@@ -1240,6 +1263,11 @@ export type ModelRouteTarget = {
  * the family serving `model`, at request time.
  */
 provider: string; model: string }
+/**
+ * One persisted probe verdict row across ALL families — hydrates the
+ * app-wide model-status store consumed by every model picker.
+ */
+export type ModelStatusEntry = { family: string; model: string; status: string; message: string; testedAt: number }
 /**
  * One persisted probe verdict row for the provider Models card.
  */

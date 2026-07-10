@@ -144,7 +144,7 @@ mod tests {
         arch: "x86_64",
         musl: false,
     };
-    const NAME: &str = "ryuzi-0.3.0-x86_64-unknown-linux-gnu.tar.gz";
+    const NAME: &str = "ryuzi-0.3.0-x86_64-linux-gnu.tar.gz";
 
     struct FakeHttp {
         asset: Vec<u8>,

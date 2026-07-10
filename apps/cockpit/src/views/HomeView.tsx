@@ -11,9 +11,8 @@ import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject } from "@/lib/composer-git";
-import { groupModelOptions } from "@/lib/model-groups";
 import { projectLabel } from "@/lib/sidebar";
-import { StatusDot } from "@/components/common/bits";
+import { ModelPicker } from "@/components/ModelPicker";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -50,8 +49,6 @@ export function HomeView() {
   const setComposerModel = useNav((s) => s.setComposerModel);
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
-  const catalog = useConnections((s) => s.catalog);
-  const connections = useConnections((s) => s.connections);
   const connectionsLoaded = useConnections((s) => s.loaded);
   const hydrateConnections = useConnections((s) => s.hydrate);
 
@@ -238,28 +235,17 @@ export function HomeView() {
               {PERM_MODES.find((m) => m.id === native?.permMode)?.label ?? "Ask"}
             </Button>
             <div className="flex-1" />
-            <Combobox
-              aria-label="Model"
-              options={groupModelOptions(modelOptions, catalog, connections)}
-              value={selectedModel || null}
+            <ModelPicker
+              ariaLabel="Model"
+              variant="chip"
+              models={modelOptions}
+              value={selectedModel}
               onValueChange={(m) => {
                 setComposerModel(m);
                 if (projectId) void setProjectModel(projectId, m);
               }}
               disabled={modelOptions.length === 0}
               placeholder="Default model"
-              trigger={
-                <Button
-                  variant="ghost"
-                  title={modelOptions.length === 0 ? "No models available. Add a provider connection in Models." : "Model"}
-                  className="font-semibold"
-                >
-                  <StatusDot color={native?.color ?? "var(--muted-foreground)"} />
-                  {selectedModel || "Default model"}
-                  <span className="font-normal text-muted-foreground">Ryuzi</span>
-                  <ChevronDown aria-hidden size={12} strokeWidth={2} className="size-3" />
-                </Button>
-              }
             />
             <Button
               variant="ghost"

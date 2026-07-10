@@ -4,7 +4,7 @@
 //! a scripted implementation via [`LlmStreamFactory`] so the runner can be
 //! driven without a network.
 
-use crate::llm_router::client::{self, AnthropicEvent, UpstreamCtx};
+use crate::llm_router::client::{self, AnthropicEvent, MessageStreamEvent, UpstreamCtx};
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -50,5 +50,49 @@ impl LlmStreamFactory for RouterLlmStreamFactory {
         Arc::new(RouterLlmStream {
             ctx: UpstreamCtx::new(store),
         })
+    }
+}
+
+/// Stream a request and concatenate its text deltas. A stream `Error` event
+/// or transport error becomes `Err`. Shared by title generation and
+/// compaction summarization.
+pub async fn collect_text(llm: &Arc<dyn LlmStream>, body: Value) -> anyhow::Result<String> {
+    let mut rx = llm.stream(body).await?;
+    let mut out = String::new();
+    while let Some(item) = rx.recv().await {
+        let ev = item?;
+        match MessageStreamEvent::from_event(&ev) {
+            Some(MessageStreamEvent::TextDelta { text, .. }) => out.push_str(&text),
+            Some(MessageStreamEvent::Error(msg)) => anyhow::bail!("{msg}"),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::native::runner::testutil::{message_stop, text_delta, ScriptedLlm};
+
+    #[tokio::test]
+    async fn collect_text_concatenates_deltas_and_propagates_errors() {
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![
+            vec![text_delta("a"), text_delta("b"), message_stop()],
+            vec![(
+                "error".to_string(),
+                serde_json::json!({"type":"error","error":{"message":"boom"}}),
+            )],
+        ]));
+        assert_eq!(
+            collect_text(&llm, serde_json::json!({"stream": true}))
+                .await
+                .unwrap(),
+            "ab"
+        );
+        let err = collect_text(&llm, serde_json::json!({"stream": true}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("boom"));
     }
 }

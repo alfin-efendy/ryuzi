@@ -88,7 +88,7 @@ fn list_shows_redaction_defaults_and_unset() {
     assert!(text.contains("default_perm_mode = default (default)"));
     assert!(text.contains("workdir_root = (unset)"));
     assert!(text.contains("enabled_gateways = discord")); // seeded, persisted (no "(default)")
-    assert_eq!(out.len(), 26); // one line per schema key, catalog order
+    assert_eq!(out.len(), 30); // one line per schema key, catalog order (27 global + 3 discord)
     assert_eq!(out[0].split(" = ").next(), Some("workdir_root"));
 }
 

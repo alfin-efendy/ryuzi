@@ -15,7 +15,7 @@
 //! native wire format.
 
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
-use crate::llm_router::{capabilities, claude_cloak, connections, oauth, routes, translate};
+use crate::llm_router::{capabilities, claude_cloak, connections, mimo, oauth, routes, translate};
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -32,15 +32,20 @@ pub struct UpstreamCtx {
     /// (post-401) refresh path. `None` in production, which uses each
     /// provider's static `registry::oauth_config` token_url.
     pub oauth_token_url_override: Option<String>,
+    /// Test-only override for the MiMo free-tier bootstrap endpoint that
+    /// mints the anti-abuse JWT. `None` in production
+    /// ([`mimo::BOOTSTRAP_URL`]).
+    pub mimo_bootstrap_url_override: Option<String>,
 }
 
 impl UpstreamCtx {
-    /// Construct a production context (no OAuth token-url override).
+    /// Construct a production context (no endpoint overrides).
     pub fn new(store: Arc<Store>) -> Self {
         Self {
             store,
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            mimo_bootstrap_url_override: None,
         }
     }
 }
@@ -566,6 +571,22 @@ fn claude_cloak_map_for(target: &RouteTarget, body: &Value) -> claude_cloak::Too
     claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body)
 }
 
+/// Remove the `thinking` key before a request reaches an Anthropic-native
+/// upstream (the `/messages` passthrough and kiro's translated-but-still-
+/// Claude-shaped payload). Extended thinking is not yet supported on these
+/// upstreams: the native runner does not replay signed thinking blocks in
+/// tool-use continuations, and the newest Anthropic models reject
+/// `budget_tokens` outright. The OpenAI-translation path
+/// (`translate::anthropic_to_openai_request`, used directly by the OpenAI
+/// format and by Codex's Responses-API bridge) maps this key to
+/// `reasoning_effort` instead and is unaffected — remove this gate once
+/// thinking-block replay lands in the runner.
+fn strip_thinking(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("thinking");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Upstream request construction (moved from server.rs — behavior unchanged,
 // `&AppState` retargeted to `&UpstreamCtx`)
@@ -581,6 +602,22 @@ fn upstream_chat_path(desc: &ProviderDescriptor) -> &'static str {
     match desc.format {
         ApiFormat::OpenAi => "/chat/completions",
         ApiFormat::Anthropic => "/messages",
+    }
+}
+
+/// OpenAI's current generation (gpt-5.x / o-series) rejects `max_tokens` with
+/// HTTP 400 and requires `max_completion_tokens`. Applied post-translation at
+/// call sites that know the descriptor, so `translate` stays
+/// provider-agnostic. A no-op for every other provider (mimo, qwen, copilot,
+/// custom-openai, … all still speak `max_tokens`).
+pub(crate) fn apply_max_completion_tokens(desc: &ProviderDescriptor, body: &mut Value) {
+    if !desc.uses_max_completion_tokens {
+        return;
+    }
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(v) = obj.remove("max_tokens") {
+            obj.insert("max_completion_tokens".to_string(), v);
+        }
     }
 }
 
@@ -739,15 +776,13 @@ fn oauth_upstream_request(
                 .json(body)
                 .header("authorization", format!("Bearer {access_token}"))
                 .header("originator", "codex_cli_rs")
+                // The Codex CLI identifies itself with these on every request
+                // (9router `providers/registry/codex.js`); the Responses wire
+                // always streams, so Accept is text/event-stream.
+                .header("user-agent", "codex_cli_rs/0.136.0")
+                .header("accept", "text/event-stream")
                 .header("session_id", uuid::Uuid::new_v4().to_string());
-            if let Some(account_id) = target
-                .conn
-                .data
-                .provider_specific
-                .as_ref()
-                .and_then(|v| v.get("chatgpt_account_id"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(account_id) = crate::llm_router::models::chatgpt_account_id(&target.conn) {
                 req = req.header("chatgpt-account-id", account_id);
             }
             Ok(req)
@@ -790,6 +825,38 @@ fn free_upstream_request(
     let base = connections::effective_base_url(target.desc, &target.conn)
         .ok_or_else(|| anyhow::anyhow!("connection {} has no base URL", target.conn.id))?;
     let path = upstream_chat_path(target.desc);
+    // MiMo's free tier sits behind an anti-abuse gate: bootstrap-JWT bearer,
+    // Chrome-like UA + fingerprint headers, and the MiMoCode marker system
+    // message (see `mimo`). The bearer is attached from the process cache —
+    // async callers mint it via `mimo::ensure_jwt` before sending, and a
+    // missing token simply 403s into `send_upstream`'s re-bootstrap retry.
+    if target.conn.provider == "mimo-free" {
+        let mut gated = body.clone();
+        mimo::inject_system_marker(&mut gated);
+        // The MiMoCode CLI sends Accept matching the stream mode
+        // (9router `executors/mimo-free.js` buildHeaders).
+        let accept = if gated
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        let mut req = ctx
+            .http
+            .post(format!("{base}{path}"))
+            .json(&gated)
+            .header("user-agent", mimo::CHROME_UA)
+            .header("x-mimo-source", "mimocode-cli-free")
+            .header("x-session-affinity", mimo::session_affinity())
+            .header("accept", accept);
+        if let Some(jwt) = mimo::cached_jwt() {
+            req = req.header("authorization", format!("Bearer {jwt}"));
+        }
+        return Ok(req);
+    }
     let req = ctx.http.post(format!("{base}{path}")).json(body);
     Ok(apply_provider_request_headers(req, &target.conn.provider))
 }
@@ -806,7 +873,24 @@ pub(crate) async fn send_upstream(
     target: &mut RouteTarget,
     body: &Value,
 ) -> anyhow::Result<reqwest::Response> {
+    if target.conn.provider == "mimo-free" {
+        // Best-effort: a bootstrap outage falls through to an
+        // unauthenticated request whose 403 hits the retry below.
+        let _ = mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref()).await;
+    }
     let resp = upstream_request(ctx, target, body)?.send().await?;
+    if matches!(resp.status().as_u16(), 401 | 403) && target.conn.provider == "mimo-free" {
+        // The upstream rejected the cached bootstrap JWT — mint a fresh one
+        // and retry the same request once, mirroring the OAuth path below.
+        mimo::invalidate_jwt();
+        if mimo::ensure_jwt(&ctx.http, ctx.mimo_bootstrap_url_override.as_deref())
+            .await
+            .is_ok()
+        {
+            return Ok(upstream_request(ctx, target, body)?.send().await?);
+        }
+        return Ok(resp);
+    }
     if matches!(resp.status().as_u16(), 401 | 403) && connections::is_oauth(&target.conn) {
         let refreshed = match &ctx.oauth_token_url_override {
             Some(token_url) => oauth::refresh::force_refresh_with_token_url(
@@ -1008,6 +1092,12 @@ pub enum MessageStreamEvent {
     MessageDelta {
         stop_reason: Option<String>,
         output_tokens: i64,
+        /// Authoritative request input tokens when the upstream reports them in
+        /// the terminal delta (OpenAI-format translation, Task 1). `None` = not
+        /// reported here (Anthropic upstreams carry input on message_start).
+        input_tokens: Option<i64>,
+        cache_read_tokens: Option<i64>,
+        cache_creation_tokens: Option<i64>,
     },
     MessageStop,
     Error(String),
@@ -1058,18 +1148,26 @@ impl MessageStreamEvent {
                 }
             }
             "content_block_stop" => Some(MessageStreamEvent::ContentBlockStop { index }),
-            "message_delta" => Some(MessageStreamEvent::MessageDelta {
-                stop_reason: data
-                    .get("delta")
-                    .and_then(|d| d.get("stop_reason"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                output_tokens: data
-                    .get("usage")
-                    .and_then(|u| u.get("output_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
-            }),
+            "message_delta" => {
+                let usage = data.get("usage");
+                let opt = |key: &str| -> Option<i64> {
+                    usage
+                        .and_then(|u| u.get(key))
+                        .and_then(|v| v.as_i64())
+                        .filter(|v| *v > 0)
+                };
+                Some(MessageStreamEvent::MessageDelta {
+                    stop_reason: data
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    output_tokens: opt("output_tokens").unwrap_or(0),
+                    input_tokens: opt("input_tokens"),
+                    cache_read_tokens: opt("cache_read_input_tokens"),
+                    cache_creation_tokens: opt("cache_creation_input_tokens"),
+                })
+            }
             "message_stop" => Some(MessageStreamEvent::MessageStop),
             "error" => Some(MessageStreamEvent::Error(
                 data.get("error")
@@ -1231,6 +1329,7 @@ pub async fn anthropic_messages_stream(
         // format match. On a non-2xx it records a failure and tries the next
         // fallback target, matching the other providers' behavior.
         if target.conn.provider == "kiro" {
+            strip_thinking(&mut attempt_body);
             match kiro_stream(ctx, &mut target, &attempt_body, started).await {
                 Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
                     StreamProbe::Deliver { buffered, rest } => {
@@ -1284,6 +1383,7 @@ pub async fn anthropic_messages_stream(
 
         match target.desc.format {
             ApiFormat::Anthropic => {
+                strip_thinking(&mut attempt_body);
                 let tool_map = claude_cloak_map_for(&target, &attempt_body);
                 let resp = match send_upstream(ctx, &mut target, &attempt_body).await {
                     Ok(resp) => resp,
@@ -1331,7 +1431,10 @@ pub async fn anthropic_messages_stream(
                 }
             }
             ApiFormat::OpenAi => {
-                let upstream_body = translate::anthropic_to_openai_request(&attempt_body)?;
+                // Not stripped here: `anthropic_to_openai_request` translates
+                // `thinking` into `reasoning_effort` for this wire format.
+                let mut upstream_body = translate::anthropic_to_openai_request(&attempt_body)?;
+                apply_max_completion_tokens(target.desc, &mut upstream_body);
                 let resp = match send_upstream(ctx, &mut target, &upstream_body).await {
                     Ok(resp) => resp,
                     Err(e) => {
@@ -1453,8 +1556,9 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
                 return Ok(v);
             }
             ApiFormat::OpenAi => {
-                let upstream_body = translate::openai_to_anthropic_request(&attempt_body)
+                let mut upstream_body = translate::openai_to_anthropic_request(&attempt_body)
                     .or_else(|_| translate::anthropic_to_openai_request(&attempt_body))?;
+                apply_max_completion_tokens(target.desc, &mut upstream_body);
                 let provider = target.conn.provider.clone();
                 let resp = match send_upstream(ctx, &mut target, &upstream_body).await {
                     Ok(resp) => resp,
@@ -1667,7 +1771,7 @@ fn kiro_endpoints(auth_method: &str, region: &str) -> Vec<String> {
 }
 
 /// Build the verbatim kiro upstream request (wire contract only — no cloaking).
-fn kiro_upstream_request(
+pub(crate) fn kiro_upstream_request(
     ctx: &UpstreamCtx,
     target: &RouteTarget,
     kiro_body: &Value,
@@ -2487,6 +2591,106 @@ mod tests {
             !events.iter().any(|(name, _)| name.as_str() == "error"),
             "empty truncated stream must rotate, not surface: {events:?}"
         );
+    }
+
+    #[test]
+    fn strip_thinking_removes_the_key_for_anthropic_native_upstreams() {
+        // Shape the runner sends when `thinking_budget` fires (spec §8):
+        // `thinking: {type: "enabled", budget_tokens: N}` alongside the rest
+        // of the Anthropic Messages body.
+        let mut body = json!({
+            "model": "claude-sonnet-5",
+            "messages": [],
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+        });
+        strip_thinking(&mut body);
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking key must be removed before an Anthropic-native send"
+        );
+        // Other keys are untouched.
+        assert_eq!(body["model"], "claude-sonnet-5");
+        assert_eq!(body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn strip_thinking_is_a_no_op_when_absent() {
+        let mut body = json!({"model": "m", "messages": []});
+        strip_thinking(&mut body);
+        assert_eq!(body["model"], "m");
+    }
+
+    #[test]
+    fn apply_max_completion_tokens_renames_only_for_openai() {
+        let mut body = json!({"model": "gpt-5.2", "max_tokens": 64, "messages": []});
+        apply_max_completion_tokens(registry::descriptor("openai").unwrap(), &mut body);
+        assert_eq!(body["max_completion_tokens"], 64);
+        assert!(body.get("max_tokens").is_none());
+
+        for id in ["mimo-free", "qwen", "github-copilot", "custom-openai"] {
+            let mut body = json!({"model": "m", "max_tokens": 64, "messages": []});
+            apply_max_completion_tokens(registry::descriptor(id).unwrap(), &mut body);
+            assert_eq!(body["max_tokens"], 64, "{id} must keep max_tokens");
+            assert!(
+                body.get("max_completion_tokens").is_none(),
+                "{id} must not gain max_completion_tokens"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_renames_max_tokens_for_openai_descriptor() {
+        use axum::{routing::post, Json, Router};
+
+        async fn ok(Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(body["max_completion_tokens"], 32);
+            assert!(body.get("max_tokens").is_none());
+            Json(json!({
+                "id": "chatcmpl-1", "object": "chat.completion", "model": body["model"].clone(),
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "pong"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let app = Router::new().route("/v1/chat/completions", post(ok));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "oai",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-oai".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}/v1")),
+                    models_override: Some(vec!["gpt-5.2".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let response = anthropic_messages(
+            &ctx,
+            json!({
+                "model": "openai/gpt-5.2",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["content"][0]["text"], "pong");
     }
 
     #[test]
@@ -3603,6 +3807,70 @@ mod tests {
     }
 
     #[tokio::test]
+    // Test-only serialization of the process-wide JWT cache; the guard
+    // legitimately spans awaits on the current_thread test runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn mimo_free_chat_request_carries_gate_headers_marker_and_bearer() {
+        let _lock = crate::llm_router::mimo::test_cache_lock();
+        crate::llm_router::mimo::store_jwt("chat-test-jwt");
+        let ctx = test_ctx().await;
+        let desc = registry::descriptor("mimo-free").unwrap();
+        let target = RouteTarget {
+            conn: mk_conn("m1", "mimo-free", "free", ConnectionData::default()),
+            desc,
+            upstream_model: "mimo-auto".into(),
+        };
+        let body = json!({
+            "model": "mimo-auto",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "stream": false
+        });
+        let req = upstream_request(&ctx, &target, &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.xiaomimimo.com/api/free-ai/openai/chat"
+        );
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer chat-test-jwt"
+        );
+        assert!(req
+            .headers()
+            .get("user-agent")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Chrome"));
+        assert_eq!(
+            req.headers().get("x-mimo-source").unwrap(),
+            "mimocode-cli-free"
+        );
+        assert!(req
+            .headers()
+            .get("x-session-affinity")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("ses_"));
+        // Non-streaming request → Accept: application/json (stream-aware,
+        // mirrors 9router executors/mimo-free.js).
+        assert_eq!(req.headers().get("accept").unwrap(), "application/json");
+        let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(
+            sent["messages"][0]["content"],
+            crate::llm_router::mimo::SYSTEM_MARKER
+        );
+        assert_eq!(sent["messages"][1]["content"], "hi");
+        assert_eq!(sent["max_tokens"], 8);
+        crate::llm_router::mimo::invalidate_jwt();
+    }
+
+    #[tokio::test]
     async fn free_provider_uses_public_bearer_and_opencode_client_header() {
         let ctx = test_ctx().await;
         let desc = registry::descriptor("opencode-free").unwrap();
@@ -3626,7 +3894,14 @@ mod tests {
     }
 
     #[tokio::test]
+    // Test-only serialization of the process-wide JWT cache; the guard
+    // legitimately spans awaits on the current_thread test runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn mimo_free_hits_nonstandard_chat_path_without_opencode_headers() {
+        // With no cached bootstrap JWT, the request carries no bearer (it's
+        // cache-driven, not hardcoded) and never opencode-free's headers.
+        let _lock = crate::llm_router::mimo::test_cache_lock();
+        crate::llm_router::mimo::invalidate_jwt();
         let ctx = test_ctx().await;
         let desc = registry::descriptor("mimo-free").unwrap();
         let conn = mk_conn("c6", "mimo-free", "free", ConnectionData::default());
@@ -3860,7 +4135,10 @@ mod tests {
             MessageStreamEvent::from_event(&md),
             Some(MessageStreamEvent::MessageDelta {
                 stop_reason: Some("tool_use".into()),
-                output_tokens: 7
+                output_tokens: 7,
+                input_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
             })
         );
         let stop = ("message_stop".to_string(), json!({"type":"message_stop"}));
@@ -4129,5 +4407,25 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("out of extra usage"), "got: {err}");
+    }
+
+    #[test]
+    fn message_delta_decodes_input_and_cache_usage() {
+        let ev = (
+            "message_delta".to_string(),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                   "usage":{"output_tokens":7,"input_tokens":1200,
+                            "cache_read_input_tokens":900,"cache_creation_input_tokens":0}}),
+        );
+        assert_eq!(
+            MessageStreamEvent::from_event(&ev),
+            Some(MessageStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".into()),
+                output_tokens: 7,
+                input_tokens: Some(1200),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: None, // 0 filters to None
+            })
+        );
     }
 }

@@ -33,7 +33,7 @@ else
   if ldd --version 2>&1 | grep -qi musl; then
     libc="musl"
   fi
-  triple="${cpu}-unknown-linux-${libc}"
+  triple="${cpu}-linux-${libc}"
 fi
 
 if [ "$VERSION" = "latest" ]; then

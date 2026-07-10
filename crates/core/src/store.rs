@@ -454,11 +454,41 @@ fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (family, model)\
             );",
         ),
+        // Context-window management (design: docs/superpowers/specs/
+        // 2026-07-10-context-window-management-design.md): durable compaction
+        // checkpoints + last-known context usage per session. IF NOT EXISTS
+        // for the rewind-and-replay migration test, like model_status above.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS context_checkpoints (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                session_pk TEXT NOT NULL,\
+                boundary_seq INTEGER NOT NULL,\
+                window_number INTEGER NOT NULL,\
+                payload TEXT NOT NULL,\
+                created_at INTEGER NOT NULL\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_context_checkpoints_session \
+                ON context_checkpoints(session_pk, boundary_seq);\
+            CREATE TABLE IF NOT EXISTS session_context (\
+                session_pk TEXT PRIMARY KEY NOT NULL,\
+                payload TEXT NOT NULL,\
+                updated_at INTEGER NOT NULL\
+            );",
+        ),
     ])
 }
 
 pub struct Store {
     pool: Pool,
+}
+
+/// One durable compaction checkpoint: the replacement history that stands in
+/// for every provider turn with `seq <= boundary_seq`.
+#[derive(Debug, Clone)]
+pub struct ContextCheckpoint {
+    pub boundary_seq: i64,
+    pub window_number: i64,
+    pub payload: serde_json::Value,
 }
 
 fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
@@ -768,6 +798,30 @@ impl Store {
             )?;
             let items = stmt
                 .query_map(params![family], |r| {
+                    Ok(ModelStatusRow {
+                        family: r.get(0)?,
+                        model: r.get(1)?,
+                        status: r.get(2)?,
+                        message: r.get(3)?,
+                        tested_at: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    }
+
+    /// Every persisted probe verdict across all families — hydrates the
+    /// Cockpit-wide model-status store so pickers can hide invalid models.
+    pub async fn list_all_model_statuses(&self) -> anyhow::Result<Vec<ModelStatusRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT family, model, status, message, tested_at FROM model_status \
+                 ORDER BY family, model",
+            )?;
+            let items = stmt
+                .query_map([], |r| {
                     Ok(ModelStatusRow {
                         family: r.get(0)?,
                         model: r.get(1)?,
@@ -1172,6 +1226,117 @@ impl Store {
             Ok(items)
         })
         .await
+    }
+
+    pub async fn insert_context_checkpoint(
+        &self,
+        session_pk: &str,
+        boundary_seq: i64,
+        window_number: i64,
+        payload: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let session_pk = session_pk.to_string();
+        let payload = serde_json::to_string(payload)?;
+        let now = crate::paths::now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO context_checkpoints(session_pk,boundary_seq,window_number,payload,created_at) \
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![session_pk, boundary_seq, window_number, payload, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn latest_context_checkpoint(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<ContextCheckpoint>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Option<ContextCheckpoint>> {
+            let mut stmt = c.prepare(
+                "SELECT boundary_seq,window_number,payload FROM context_checkpoints \
+                 WHERE session_pk=?1 ORDER BY boundary_seq DESC, id DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![session_pk], |r| {
+                let payload: String = r.get(2)?;
+                Ok(ContextCheckpoint {
+                    boundary_seq: r.get(0)?,
+                    window_number: r.get(1)?,
+                    payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                })
+            })?;
+            rows.next().transpose()
+        })
+        .await
+    }
+
+    pub async fn list_provider_turns_after(
+        &self,
+        session_pk: &str,
+        after_seq: i64,
+    ) -> anyhow::Result<Vec<ProviderTurn>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Vec<ProviderTurn>> {
+            let mut stmt = c.prepare(
+                "SELECT session_pk,seq,role,payload,created_at \
+                 FROM provider_turns WHERE session_pk=?1 AND seq>?2 ORDER BY seq",
+            )?;
+            let items = stmt
+                .query_map(params![session_pk, after_seq], |r| {
+                    let payload: String = r.get(3)?;
+                    Ok(ProviderTurn {
+                        session_pk: r.get(0)?,
+                        seq: r.get(1)?,
+                        role: r.get(2)?,
+                        payload: serde_json::from_str(&payload).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
+                        created_at: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    }
+
+    pub async fn upsert_session_context(
+        &self,
+        session_pk: &str,
+        payload: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let session_pk = session_pk.to_string();
+        let payload = serde_json::to_string(payload)?;
+        let now = crate::paths::now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO session_context(session_pk,payload,updated_at) VALUES(?1,?2,?3) \
+                 ON CONFLICT(session_pk) DO UPDATE SET payload=?2, updated_at=?3",
+                params![session_pk, payload, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn get_session_context(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Option<String>> {
+            let mut stmt = c.prepare("SELECT payload FROM session_context WHERE session_pk=?1")?;
+            let mut rows = stmt.query_map(params![session_pk], |r| r.get(0))?;
+            rows.next().transpose()
+        })
+        .await
+        .map(|opt| opt.and_then(|s: String| serde_json::from_str(&s).ok()))
     }
 
     /// Return the persisted decision for `(project_id, tool)`, or `None` if no
@@ -1914,6 +2079,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_all_model_statuses_returns_every_family() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store.list_all_model_statuses().await.unwrap().is_empty());
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "openai".into(),
+                model: "gpt-x".into(),
+                status: "invalid".into(),
+                message: "Model gpt-x returned HTTP 404".into(),
+                tested_at: 101,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_model_status(ModelStatusRow {
+                family: "anthropic".into(),
+                model: "claude-x".into(),
+                status: "valid".into(),
+                message: "Model claude-x OK".into(),
+                tested_at: 100,
+            })
+            .await
+            .unwrap();
+
+        let rows = store.list_all_model_statuses().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Deterministic ORDER BY family, model: anthropic sorts before openai.
+        assert_eq!(rows[0].family, "anthropic");
+        assert_eq!(rows[0].model, "claude-x");
+        assert_eq!(rows[0].status, "valid");
+        assert_eq!(rows[0].tested_at, 100);
+        assert_eq!(rows[1].family, "openai");
+        assert_eq!(rows[1].model, "gpt-x");
+        assert_eq!(rows[1].status, "invalid");
+    }
+
+    #[tokio::test]
     async fn insert_session_roundtrips_branch_owned_false() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -2389,10 +2592,11 @@ mod tests {
     #[tokio::test]
     async fn migration_13_rewrites_claude_code_defaults_to_native() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back four so the
+        // DB, seed the old values, then wind user_version back five so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
+        // CREATE TABLE IF NOT EXISTS; 17 context_checkpoints + session_context —
         // CREATE TABLE IF NOT EXISTS; all no-ops on replay) re-run on the
         // next open. `Migrations` always fast-forwards to the latest defined
         // version, so there is no way to replay 13 alone once something is
@@ -2400,7 +2604,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 4)
+            c.pragma_update(None, "user_version", v - 5)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -2781,5 +2985,63 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn context_checkpoints_and_session_context_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        assert!(store
+            .latest_context_checkpoint("s1")
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .insert_context_checkpoint("s1", 4, 1, &serde_json::json!([{"role":"user"}]))
+            .await
+            .unwrap();
+        store
+            .insert_context_checkpoint("s1", 9, 2, &serde_json::json!([{"role":"user","w":2}]))
+            .await
+            .unwrap();
+        let ck = store
+            .latest_context_checkpoint("s1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((ck.boundary_seq, ck.window_number), (9, 2));
+        assert_eq!(ck.payload[0]["w"], 2);
+        // Other sessions are isolated.
+        assert!(store
+            .latest_context_checkpoint("s2")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Tail listing.
+        use crate::domain::NewProviderTurn;
+        for i in 0..3 {
+            store
+                .insert_provider_turn(NewProviderTurn::new("s1", "user", serde_json::json!([i])))
+                .await
+                .unwrap();
+        }
+        let tail = store.list_provider_turns_after("s1", 2).await.unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].seq, 3);
+
+        // session_context upsert overwrites.
+        assert!(store.get_session_context("s1").await.unwrap().is_none());
+        store
+            .upsert_session_context("s1", &serde_json::json!({"percent_left": 42}))
+            .await
+            .unwrap();
+        store
+            .upsert_session_context("s1", &serde_json::json!({"percent_left": 17}))
+            .await
+            .unwrap();
+        let ctx = store.get_session_context("s1").await.unwrap().unwrap();
+        assert_eq!(ctx["percent_left"], 17);
     }
 }

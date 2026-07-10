@@ -81,6 +81,16 @@ function ErrorRow({ text }: { text: string }) {
   );
 }
 
+// System notices (e.g. compaction) render as a muted centered chip — distinct
+// from error rows and outside the user/agent bubble flow.
+function NoticeRow({ text }: { text: string }) {
+  return (
+    <div className="my-2 flex justify-center">
+      <span className="rounded-full bg-muted px-3 py-0.5 text-[11px] text-muted-foreground">{text}</span>
+    </div>
+  );
+}
+
 // memo: completed turns never re-render while the streaming tail grows.
 const AgentTurn = memo(function AgentTurn({
   markdown,
@@ -183,6 +193,8 @@ export function Transcript({
                 return <ActivityCluster key={g.key} items={g.items} live={running} />;
               case "error":
                 return <ErrorRow key={g.key} text={g.text} />;
+              case "notice":
+                return <NoticeRow key={g.key} text={g.text} />;
               case "summary":
                 return (
                   <div key={g.key} className="flex flex-col gap-1.5">

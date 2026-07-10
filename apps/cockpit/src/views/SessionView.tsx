@@ -12,12 +12,12 @@ import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { headerAgentLine } from "@/lib/session-header";
-import { groupModelOptions } from "@/lib/model-groups";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalPrompt } from "@/components/ApprovalPrompt";
 import { StatusDot } from "@/components/common/bits";
+import { ModelPicker } from "@/components/ModelPicker";
 import { Transcript } from "@/components/transcript/Transcript";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
@@ -29,8 +29,18 @@ import { AttachmentChips } from "@/components/composer/AttachmentChips";
 import { HISTORY_IDLE, historyEntries, shouldNavigateHistory, stepHistory, type HistoryState } from "@/components/composer/inputHistory";
 
 export function SessionView() {
-  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
-    useStore();
+  const {
+    sessions,
+    transcripts,
+    focusedSessionPk,
+    send,
+    stop,
+    pendingApprovals,
+    projects,
+    setProjectModel,
+    setProjectPermMode,
+    contextUsage,
+  } = useStore();
   const nav = useNav();
   // Draft text lives in the persisted useNav drafts map keyed by session, so
   // switching sessions/views (SessionView renders un-keyed in App.tsx) swaps
@@ -64,8 +74,6 @@ export function SessionView() {
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
-  const catalog = useConnections((s) => s.catalog);
-  const connections = useConnections((s) => s.connections);
   const connectionsLoaded = useConnections((s) => s.loaded);
   const hydrateConnections = useConnections((s) => s.hydrate);
 
@@ -148,6 +156,7 @@ export function SessionView() {
 
   const meta = statusMeta(session.status);
   const running = session.status === "running";
+  const usage = contextUsage[session.sessionPk];
   const hasApproval = pendingApprovals.some((a) => a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(project?.permMode ?? "default");
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
@@ -345,26 +354,24 @@ export function SessionView() {
                 }
               />
               <div className="flex-1" />
-              <Combobox
-                aria-label="Model"
-                options={groupModelOptions(modelOptions, catalog, connections)}
-                value={selectedModel || null}
+              {usage && (
+                <span
+                  className="w-32 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground"
+                  title={`~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
+                >
+                  {usage.percentLeft}% context left
+                </span>
+              )}
+              <ModelPicker
+                ariaLabel="Model"
+                variant="chip"
+                models={modelOptions}
+                value={selectedModel}
                 onValueChange={(m) => {
                   if (projectId) void setProjectModel(projectId, m);
                 }}
                 disabled={modelOptions.length === 0}
-                trigger={
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    title={modelOptions.length === 0 ? "No models available. Add a provider connection in Models." : "Model"}
-                    className="font-semibold"
-                  >
-                    <StatusDot color={agent?.color ?? "var(--muted-foreground)"} />
-                    {selectedModel || agent?.name || "No agent"}
-                    <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                  </Button>
-                }
+                placeholder="Default model"
               />
               <Button
                 variant="ghost"

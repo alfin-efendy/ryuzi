@@ -176,6 +176,19 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
         };
         out.insert("tool_choice".into(), mapped);
     }
+    // Anthropic extended-thinking → OpenAI reasoning_effort buckets. The
+    // cache_control fields never survive translation: content blocks are
+    // reconstructed field-by-field above.
+    if let Some(budget) = body["thinking"]["budget_tokens"].as_i64() {
+        let effort = if budget >= 16_384 {
+            "high"
+        } else if budget >= 8_192 {
+            "medium"
+        } else {
+            "low"
+        };
+        out.insert("reasoning_effort".into(), json!(effort));
+    }
     Ok(Value::Object(out))
 }
 
@@ -397,6 +410,7 @@ pub struct OpenAiToAnthropicStream {
     finish_reason: Option<String>,
     output_tokens: i64,
     input_tokens: i64,
+    cache_read_tokens: i64,
     stopped: bool,
 }
 
@@ -410,6 +424,7 @@ impl OpenAiToAnthropicStream {
             finish_reason: None,
             output_tokens: 0,
             input_tokens: 0,
+            cache_read_tokens: 0,
             stopped: false,
         }
     }
@@ -449,6 +464,9 @@ impl OpenAiToAnthropicStream {
             self.output_tokens = u["completion_tokens"]
                 .as_i64()
                 .unwrap_or(self.output_tokens);
+            self.cache_read_tokens = u["prompt_tokens_details"]["cached_tokens"]
+                .as_i64()
+                .unwrap_or(self.cache_read_tokens);
         }
         let choice = &chunk["choices"][0];
         let delta = &choice["delta"];
@@ -541,7 +559,9 @@ impl OpenAiToAnthropicStream {
             "message_delta".into(),
             json!({"type": "message_delta",
                    "delta": {"stop_reason": stop, "stop_sequence": null},
-                   "usage": {"output_tokens": self.output_tokens}}),
+                   "usage": {"output_tokens": self.output_tokens,
+                             "input_tokens": self.input_tokens,
+                             "cache_read_input_tokens": self.cache_read_tokens}}),
         ));
         out.push(("message_stop".into(), json!({"type": "message_stop"})));
         out
@@ -762,6 +782,24 @@ mod tests {
         });
         let out = anthropic_to_openai_request(&req).unwrap();
         assert_eq!(out["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn request_translation_maps_thinking_to_reasoning_effort_and_drops_cache_control() {
+        let body = json!({
+            "model": "gpt-x",
+            "system": [{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}],
+            "thinking": {"type":"enabled","budget_tokens": 16384},
+            "messages": [{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}],
+            "max_tokens": 1000,
+        });
+        let out = anthropic_to_openai_request(&body).unwrap();
+        assert_eq!(out["reasoning_effort"], "high");
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(
+            !s.contains("cache_control"),
+            "cache_control must not reach OpenAI upstreams: {s}"
+        );
     }
 
     #[test]
@@ -1156,5 +1194,27 @@ mod tests {
             "upstream stream interrupted: boom"
         );
         assert_eq!(chunk["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn finish_emits_input_and_cache_tokens_in_terminal_message_delta() {
+        let mut tr = OpenAiToAnthropicStream::new("gpt-x");
+        tr.feed(&json!({
+            "id": "c1",
+            "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 900}
+            }
+        }));
+        let out = tr.finish();
+        let delta = out
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("a message_delta event");
+        assert_eq!(delta.1["usage"]["output_tokens"], 7);
+        assert_eq!(delta.1["usage"]["input_tokens"], 1200);
+        assert_eq!(delta.1["usage"]["cache_read_input_tokens"], 900);
     }
 }
