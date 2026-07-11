@@ -177,6 +177,70 @@ test("permission_mode_uses_column_only_command", async () => {
   legacy.mockRestore();
 });
 
+test("runtime_success_merges_model_effort_after_concurrent_permission_success", async () => {
+  reset();
+  useStore.setState({ projects: [projectSnapshot()], projectRuntimeById: { p1: runtimeSnapshot } });
+  const runtime = deferredResult();
+  const persisted = { model: "old", effort: "low", permMode: "default" };
+  const updateRuntime = spyOn(commands, "updateProjectRuntime").mockImplementation(async () => {
+    const result = (await runtime.promise) as { status: "ok"; data: typeof runtimeSnapshot };
+    persisted.model = result.data.model ?? "";
+    persisted.effort = result.data.storedEffort ?? "";
+    return result;
+  });
+  const updatePerm = spyOn(commands, "updateProjectPermMode").mockImplementation(async (_id, mode) => {
+    persisted.permMode = mode;
+    return { status: "ok", data: null };
+  });
+  const runtimeSave = useStore.getState().setProjectRuntime("p1", "new-model", "high");
+  await useStore.getState().setProjectPermMode("p1", "bypassPermissions");
+  runtime.resolve({ status: "ok", data: { ...runtimeSnapshot, model: "new-model", storedEffort: "high" } });
+  await runtimeSave;
+  expect(useStore.getState().projects[0]).toMatchObject({ model: "new-model", effort: "high", permMode: "bypassPermissions" });
+  expect(useStore.getState().projectRuntimeById.p1).toMatchObject({ model: "new-model", storedEffort: "high" });
+  expect(persisted).toEqual({ model: "new-model", effort: "high", permMode: "bypassPermissions" });
+  updateRuntime.mockRestore();
+  updatePerm.mockRestore();
+});
+
+test("permission_failure_restores_only_perm_mode_after_concurrent_runtime_success", async () => {
+  reset();
+  useStore.setState({ projects: [projectSnapshot()], projectRuntimeById: { p1: runtimeSnapshot } });
+  const permission = deferredResult();
+  const persisted = { model: "old", effort: "low", permMode: "default" };
+  const updatePerm = spyOn(commands, "updateProjectPermMode").mockImplementation(() => permission.promise as never);
+  const updateRuntime = spyOn(commands, "updateProjectRuntime").mockImplementation(async () => {
+    persisted.model = "new-model";
+    persisted.effort = "high";
+    return { status: "ok", data: { ...runtimeSnapshot, model: "new-model", storedEffort: "high" } };
+  });
+  const permissionSave = useStore.getState().setProjectPermMode("p1", "bypassPermissions");
+  await useStore.getState().setProjectRuntime("p1", "new-model", "high");
+  permission.resolve({ status: "error", error: { message: "denied" } });
+  await permissionSave;
+  expect(useStore.getState().projects[0]).toMatchObject({ model: "new-model", effort: "high", permMode: "default" });
+  expect(useStore.getState().projectRuntimeById.p1).toMatchObject({ model: "new-model", storedEffort: "high" });
+  expect(persisted).toEqual({ model: "new-model", effort: "high", permMode: "default" });
+  updateRuntime.mockRestore();
+  updatePerm.mockRestore();
+});
+
+test("runtime_failure_rolls_back_only_model_effort_after_permission_success", async () => {
+  reset();
+  useStore.setState({ projects: [projectSnapshot()], projectRuntimeById: { p1: runtimeSnapshot } });
+  const runtime = deferredResult();
+  const updateRuntime = spyOn(commands, "updateProjectRuntime").mockImplementation(() => runtime.promise as never);
+  const updatePerm = spyOn(commands, "updateProjectPermMode").mockResolvedValue({ status: "ok", data: null });
+  const runtimeSave = useStore.getState().setProjectRuntime("p1", "new-model", "high");
+  await useStore.getState().setProjectPermMode("p1", "bypassPermissions");
+  runtime.resolve({ status: "error", error: { message: "runtime denied" } });
+  await runtimeSave;
+  expect(useStore.getState().projects[0]).toMatchObject({ model: "old", effort: "low", permMode: "bypassPermissions" });
+  expect(useStore.getState().projectRuntimeById.p1).toEqual(runtimeSnapshot);
+  updateRuntime.mockRestore();
+  updatePerm.mockRestore();
+});
+
 test("failed_runtime_save_rolls_back_both_snapshots", async () => {
   reset();
   const project = {

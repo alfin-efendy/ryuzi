@@ -109,7 +109,8 @@ type ProjectRuntimeQueue = {
   tail: Promise<void>;
   pending: number;
   latestIntent: number;
-  confirmedProject: Project;
+  confirmedModel: string | null;
+  confirmedEffort: string | null;
   confirmedRuntime: ProjectRuntimeInfo | undefined;
 };
 
@@ -313,7 +314,8 @@ export const useStore = create<State>((set, get) => ({
         tail: Promise.resolve(),
         pending: 0,
         latestIntent: 0,
-        confirmedProject: project,
+        confirmedModel: project.model,
+        confirmedEffort: project.effort,
         confirmedRuntime: previousRuntime,
       };
       projectRuntimeQueues.set(projectId, queue);
@@ -345,11 +347,8 @@ export const useStore = create<State>((set, get) => ({
         succeeded = res.status === "ok";
         if (res.status === "ok") {
           queue.confirmedRuntime = res.data;
-          queue.confirmedProject = {
-            ...queue.confirmedProject,
-            model: res.data.model,
-            effort: res.data.storedEffort,
-          };
+          queue.confirmedModel = res.data.model;
+          queue.confirmedEffort = res.data.storedEffort;
         } else {
           toast.error("Couldn't set model and effort: " + res.error.message);
         }
@@ -364,7 +363,9 @@ export const useStore = create<State>((set, get) => ({
           if (queue.confirmedRuntime) projectRuntimeById[projectId] = queue.confirmedRuntime;
           else delete projectRuntimeById[projectId];
           return {
-            projects: st.projects.map((candidate) => (candidate.projectId === projectId ? queue.confirmedProject : candidate)),
+            projects: st.projects.map((candidate) =>
+              candidate.projectId === projectId ? { ...candidate, model: queue.confirmedModel, effort: queue.confirmedEffort } : candidate,
+            ),
             projectRuntimeById,
           };
         });
@@ -421,11 +422,12 @@ export const useStore = create<State>((set, get) => ({
   setProjectPermMode: async (projectId, permMode) => {
     const project = get().projects.find((p) => p.projectId === projectId);
     if (!project || project.permMode === permMode) return;
+    const previousPermMode = project.permMode;
     set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode } : p)) });
     const res = await commands.updateProjectPermMode(projectId, permMode);
     if (res.status === "error") {
       toast.error("Couldn't set permission mode: " + res.error.message);
-      set({ projects: get().projects.map((p) => (p.projectId === projectId ? project : p)) });
+      set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode: previousPermMode } : p)) });
     }
   },
 
