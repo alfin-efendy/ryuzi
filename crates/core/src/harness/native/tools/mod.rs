@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub mod app_jobs;
+pub mod app_orchestrate;
 pub mod bash;
 pub mod edit;
 pub mod glob;
@@ -420,11 +421,12 @@ impl ToolRegistry {
             // `runner::visible_tool_defs` (schema) and its own
             // `Store::task_by_session` guard (runtime).
             Arc::new(orch_block::OrchBlock),
-            // App-control tool over the curated `AppControl` facade (spec
+            // App-control tools over the curated `AppControl` facade (spec
             // §9.1); `None` on `ctx.app` (sub-agents/workers/tests) errors
             // "not available". Blocked from delegated children — see
             // `runner::SUBAGENT_BLOCKLIST`.
             Arc::new(app_jobs::AppJobs),
+            Arc::new(app_orchestrate::AppOrchestrate),
         ];
         let mut tools = BTreeMap::new();
         for t in list {
@@ -888,11 +890,12 @@ mod tests {
             "askuserquestion",
             "orch_block",
             "app_jobs",
+            "app_orchestrate",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 22);
+        assert_eq!(defs.len(), 23);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));
