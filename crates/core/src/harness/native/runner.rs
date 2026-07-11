@@ -2628,7 +2628,11 @@ mod tests {
         let llm = Arc::new(ScriptedLlm::new(vec![final_turn("one"), final_turn("two")]));
         let deps = deps_at(dir.path(), llm).await;
         deps.store
-            .set_setting("memory.nudge_interval", "2")
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "memory.nudge_interval",
+                "2",
+            )
             .await
             .unwrap();
         deps.store
@@ -2734,7 +2738,11 @@ mod tests {
         let llm = Arc::new(ScriptedLlm::new(vec![final_turn("subagent reply")]));
         let deps = deps_at(dir.path(), llm).await;
         deps.store
-            .set_setting("memory.nudge_interval", "1")
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "memory.nudge_interval",
+                "1",
+            )
             .await
             .unwrap();
         deps.store
@@ -4390,7 +4398,7 @@ mod tests {
         let deps = deps_at(dir.path(), llm).await;
         // Serialize children so the scripted turns map deterministically.
         deps.store
-            .set_setting("max_concurrent_runs", "1")
+            .set_setting(crate::domain::WriteOrigin::User, "max_concurrent_runs", "1")
             .await
             .unwrap();
         let spawner = RunnerSpawner {
@@ -4638,7 +4646,7 @@ mod tests {
         let deps = deps_at(dir.path(), llm.clone()).await;
         // Explicit flat delegation: the orchestrator child may not re-spawn.
         deps.store
-            .set_setting("max_spawn_depth", "1")
+            .set_setting(crate::domain::WriteOrigin::User, "max_spawn_depth", "1")
             .await
             .unwrap();
 
@@ -5027,7 +5035,11 @@ mod tests {
         // exhaustion would now trigger auto-continue; disable it so the run
         // still reaches the summary tail this test asserts on.
         deps.store
-            .set_setting("agent.auto_continue_budget", "0")
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.auto_continue_budget",
+                "0",
+            )
             .await
             .unwrap();
         let agent = deps.agent.clone();
@@ -5101,11 +5113,19 @@ mod tests {
         seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
         add_anthropic_conn(&deps.store, &["model-a"]).await;
         deps.store
-            .set_setting("agent.max_provider_turns", "1")
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.max_provider_turns",
+                "1",
+            )
             .await
             .unwrap();
         deps.store
-            .set_setting("agent.auto_continue_budget", "1")
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.auto_continue_budget",
+                "1",
+            )
             .await
             .unwrap();
 
@@ -5161,11 +5181,19 @@ mod tests {
         seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
         add_anthropic_conn(&deps.store, &["model-a"]).await;
         deps.store
-            .set_setting("agent.max_provider_turns", "1")
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.max_provider_turns",
+                "1",
+            )
             .await
             .unwrap();
         deps.store
-            .set_setting("agent.auto_continue_budget", "0")
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.auto_continue_budget",
+                "0",
+            )
             .await
             .unwrap();
 
@@ -5268,7 +5296,7 @@ mod tests {
         let llm = Arc::new(ScriptedLlm::new(vec![]));
         let deps = deps_at(dir.path(), llm).await;
         deps.store
-            .set_setting("max_concurrent_runs", "1")
+            .set_setting(crate::domain::WriteOrigin::User, "max_concurrent_runs", "1")
             .await
             .unwrap();
         let spawner = RunnerSpawner {

@@ -173,14 +173,19 @@ async fn apply_response(gate: &PermGate<'_>, tool: &str, resp: ApprovalResponse)
 async fn persist_rule(gate: &PermGate<'_>, tool: &str, decision: &str) {
     if let Some(pid) = gate.project_id {
         // Best-effort: a failed write must not flip the user's verdict.
-        let _ = gate.store.set_tool_policy(pid, tool, decision).await;
+        // Triggered by a human answering an approval prompt, so this is
+        // always a `WriteOrigin::User` write.
+        let _ = gate
+            .store
+            .set_tool_policy(crate::domain::WriteOrigin::User, pid, tool, decision)
+            .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ApprovalDecision, ApprovalResponse, ApprovalScope};
+    use crate::domain::{ApprovalDecision, ApprovalResponse, ApprovalScope, WriteOrigin};
     use crate::store::Store;
     use std::sync::Arc;
 
@@ -286,7 +291,7 @@ mod tests {
     async fn project_reject_always_row_denies_without_prompt() {
         let f = Fixture::new().await;
         f.store
-            .set_tool_policy("p1", "Bash", "rejectAlways")
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "rejectAlways")
             .await
             .unwrap();
         let d = evaluate(

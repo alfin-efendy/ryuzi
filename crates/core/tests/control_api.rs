@@ -1,6 +1,7 @@
 //! End-to-end: a built daemon serving the control API — auth, rpc, SSE.
 
 use ryuzi_core::daemon::{build_daemon, BuildDaemonOpts};
+use ryuzi_core::domain::WriteOrigin;
 use ryuzi_core::serve::{serve, ApiState};
 use ryuzi_core::store::Store;
 use ryuzi_core::telemetry::NoopTelemetry;
@@ -135,8 +136,14 @@ async fn daemon_start_autostarts_the_endpoint_server_when_configured() {
     // via `Store::set_setting` directly, not `SettingsStore::set`).
     {
         let store = Store::open(&db_path).await.unwrap();
-        store.set_setting("endpoint_autostart", "1").await.unwrap();
-        store.set_setting("endpoint_port", "0").await.unwrap();
+        store
+            .set_setting(WriteOrigin::User, "endpoint_autostart", "1")
+            .await
+            .unwrap();
+        store
+            .set_setting(WriteOrigin::User, "endpoint_port", "0")
+            .await
+            .unwrap();
     }
 
     let daemon = build_daemon(BuildDaemonOpts {

@@ -343,14 +343,18 @@ impl ControlPlane {
         self.store.get_tool_policy(project_id, tool).await
     }
 
-    /// Persist (or update) a tool policy for `(project_id, tool)`.
+    /// Persist (or update) a tool policy for `(project_id, tool)`. Only
+    /// reached from the Cockpit/gateway resolve path (a human clicked
+    /// "Always allow"), so this always writes as `WriteOrigin::User`.
     pub async fn set_tool_policy(
         &self,
         project_id: &str,
         tool: &str,
         decision: &str,
     ) -> anyhow::Result<()> {
-        self.store.set_tool_policy(project_id, tool, decision).await
+        self.store
+            .set_tool_policy(crate::domain::WriteOrigin::User, project_id, tool, decision)
+            .await
     }
 
     /// All persisted tool policies (Settings → Permissions).
@@ -358,9 +362,13 @@ impl ControlPlane {
         self.store.list_tool_policies().await
     }
 
-    /// Remove a persisted tool policy.
+    /// Remove a persisted tool policy. Only reached from the Cockpit
+    /// Settings → Permissions "revoke" action (a human), so this always
+    /// writes as `WriteOrigin::User`.
     pub async fn delete_tool_policy(&self, project_id: &str, tool: &str) -> anyhow::Result<()> {
-        self.store.delete_tool_policy(project_id, tool).await
+        self.store
+            .delete_tool_policy(crate::domain::WriteOrigin::User, project_id, tool)
+            .await
     }
 }
 

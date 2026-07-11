@@ -3363,7 +3363,11 @@ async fn worktree_dir_setting_overrides_the_default_worktree_root() {
 
     let custom_root = tempfile::tempdir().unwrap();
     store
-        .set_setting("worktree_dir", custom_root.path().to_str().unwrap())
+        .set_setting(
+            crate::domain::WriteOrigin::User,
+            "worktree_dir",
+            custom_root.path().to_str().unwrap(),
+        )
         .await
         .unwrap();
 

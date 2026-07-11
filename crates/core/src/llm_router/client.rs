@@ -4873,6 +4873,7 @@ mod tests {
         };
         ctx.store
             .set_setting(
+                crate::domain::WriteOrigin::User,
                 "llm_model_routes",
                 &serde_json::to_string(&vec![route_info]).unwrap(),
             )

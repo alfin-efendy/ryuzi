@@ -1389,6 +1389,26 @@ where
     Ok(out)
 }
 
+/// Refuse a protected write from a non-user origin. This is the storage-layer
+/// half of Phase 6's negative space (spec §9.3): the curated app-control
+/// surface never exposes these writes, and this guard stops any tool that
+/// reaches `Store` directly from performing them.
+///
+/// `rusqlite::Error::UserFunctionError`/`ModuleError` need the `functions`/
+/// `vtab` features this workspace doesn't enable, so — like
+/// `to_sql_json_error` above — this reuses `ToSqlConversionFailure` (always
+/// available, and `String` already satisfies its boxed-error bound) purely
+/// as a carrier for an app-level message.
+fn ensure_user_origin(origin: crate::domain::WriteOrigin, what: &str) -> rusqlite::Result<()> {
+    if !origin.is_user() {
+        return Err(to_sql_json_error(format!(
+            "write to {what} is not permitted for {} origin (app-control negative space)",
+            origin.as_str()
+        )));
+    }
+    Ok(())
+}
+
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Store> {
         if let Some(parent) = path.parent() {
@@ -1441,10 +1461,16 @@ impl Store {
         .await
     }
 
-    pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+    pub async fn set_setting(
+        &self,
+        origin: crate::domain::WriteOrigin,
+        key: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
         let key = key.to_string();
         let value = value.to_string();
         self.with_conn(move |c| {
+            ensure_user_origin(origin, "settings")?;
             c.execute(
                 "INSERT INTO settings(key, value) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2476,6 +2502,7 @@ impl Store {
     /// On conflict (same project+tool already has a policy), update the decision.
     pub async fn set_tool_policy(
         &self,
+        origin: crate::domain::WriteOrigin,
         project_id: &str,
         tool: &str,
         decision: &str,
@@ -2484,6 +2511,7 @@ impl Store {
         let tool = tool.to_string();
         let decision = decision.to_string();
         self.with_conn(move |c| {
+            ensure_user_origin(origin, "tool_policies")?;
             c.execute(
                 "INSERT INTO tool_policies(project_id, tool, decision) \
                  VALUES (?1, ?2, ?3) \
@@ -2517,10 +2545,16 @@ impl Store {
     }
 
     /// Remove one persisted tool policy (the Settings "revoke" action).
-    pub async fn delete_tool_policy(&self, project_id: &str, tool: &str) -> anyhow::Result<()> {
+    pub async fn delete_tool_policy(
+        &self,
+        origin: crate::domain::WriteOrigin,
+        project_id: &str,
+        tool: &str,
+    ) -> anyhow::Result<()> {
         let project_id = project_id.to_string();
         let tool = tool.to_string();
         self.with_conn(move |c| {
+            ensure_user_origin(origin, "tool_policies")?;
             c.execute(
                 "DELETE FROM tool_policies WHERE project_id=?1 AND tool=?2",
                 params![project_id, tool],
@@ -3731,7 +3765,7 @@ pub fn quarantine_legacy_db(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{NewMessage, PermMode, Project};
+    use crate::domain::{NewMessage, PermMode, Project, WriteOrigin};
     use crate::domain::{Session, SessionStatus};
     use crate::llm_router::provenance::{
         RouteFailureCategory, RouteSelection, RouteSelectionReason,
@@ -4787,6 +4821,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_origin_settings_and_policy_writes_are_rejected() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        // A USER-origin write succeeds (the normal path).
+        store
+            .set_setting(WriteOrigin::User, "theme", "dark")
+            .await
+            .expect("user setting write");
+        store
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "allowAlways")
+            .await
+            .expect("user policy write");
+
+        // An AGENT-origin write to the SAME protected APIs is refused AT THE
+        // STORE — even though the caller invoked the method directly.
+        let e = store
+            .set_setting(WriteOrigin::Agent, "theme", "light")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not permitted"), "got: {e}");
+        let e = store
+            .set_tool_policy(WriteOrigin::Agent, "p1", "Bash", "rejectAlways")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not permitted"), "got: {e}");
+        let e = store
+            .delete_tool_policy(WriteOrigin::BackgroundReview, "p1", "Bash")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not permitted"), "got: {e}");
+
+        // The rejected writes had no effect: the user's values still stand.
+        assert_eq!(
+            store.get_setting("theme").await.unwrap().as_deref(),
+            Some("dark")
+        );
+        assert_eq!(
+            store
+                .get_tool_policy("p1", "Bash")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("allowAlways")
+        );
+    }
+
+    #[tokio::test]
     async fn tool_policy_is_per_project_and_upserts() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -4794,7 +4876,7 @@ mod tests {
         assert!(store.get_tool_policy("p1", "Bash").await.unwrap().is_none());
         // set a policy
         store
-            .set_tool_policy("p1", "Bash", "allowAlways")
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "allowAlways")
             .await
             .unwrap();
         assert_eq!(
@@ -4809,7 +4891,7 @@ mod tests {
         assert!(store.get_tool_policy("p2", "Bash").await.unwrap().is_none());
         // upsert (update) the existing policy
         store
-            .set_tool_policy("p1", "Bash", "rejectAlways")
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "rejectAlways")
             .await
             .unwrap();
         assert_eq!(
@@ -4827,16 +4909,19 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         store
-            .set_tool_policy("p1", "Bash", "allowAlways")
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "allowAlways")
             .await
             .unwrap();
         store
-            .set_tool_policy("p2", "Edit", "rejectAlways")
+            .set_tool_policy(WriteOrigin::User, "p2", "Edit", "rejectAlways")
             .await
             .unwrap();
         let rows = store.list_tool_policies().await.unwrap();
         assert_eq!(rows.len(), 2);
-        store.delete_tool_policy("p1", "Bash").await.unwrap();
+        store
+            .delete_tool_policy(WriteOrigin::User, "p1", "Bash")
+            .await
+            .unwrap();
         let rows = store.list_tool_policies().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].project_id, "p2");
@@ -4848,12 +4933,18 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         assert!(store.get_setting("default_agent").await.unwrap().is_none());
-        store.set_setting("default_agent", "claude").await.unwrap();
+        store
+            .set_setting(WriteOrigin::User, "default_agent", "claude")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_setting("default_agent").await.unwrap().as_deref(),
             Some("claude")
         );
-        store.set_setting("default_agent", "codex").await.unwrap();
+        store
+            .set_setting(WriteOrigin::User, "default_agent", "codex")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_setting("default_agent").await.unwrap().as_deref(),
             Some("codex")
@@ -5800,7 +5891,7 @@ mod tests {
 
         // KV-absent rule: a pre-existing agent_model must NOT be clobbered on replay.
         store
-            .set_setting("agent_model", "user-chose-this")
+            .set_setting(WriteOrigin::User, "agent_model", "user-chose-this")
             .await
             .unwrap();
         store.with_conn(rewind).await.unwrap();

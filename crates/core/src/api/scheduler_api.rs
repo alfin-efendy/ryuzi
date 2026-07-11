@@ -214,6 +214,7 @@ async fn toggle_job(state: &ApiState, id: String, enabled: bool) -> Result<Vec<J
     // Re-anchor so enabling doesn't immediately fire a long-past occurrence.
     cp.store()
         .set_setting(
+            crate::domain::WriteOrigin::User,
             &format!("job_last_fired.{id}"),
             &crate::paths::now_ms().to_string(),
         )

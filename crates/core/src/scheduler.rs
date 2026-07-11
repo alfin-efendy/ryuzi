@@ -740,7 +740,11 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
     let now = crate::paths::now_ms();
     // Cheap staleness probe for health surfaces.
     let _ = store
-        .set_setting("scheduler_last_tick", &now.to_string())
+        .set_setting(
+            crate::domain::WriteOrigin::User,
+            "scheduler_last_tick",
+            &now.to_string(),
+        )
         .await;
     let jobs = match list_jobs(&store).await {
         Ok(j) => j,
@@ -757,7 +761,9 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
             // First sighting: anchor at now so we fire on the NEXT occurrence.
             .unwrap_or(now);
         if last_fired == now {
-            let _ = store.set_setting(&key, &now.to_string()).await;
+            let _ = store
+                .set_setting(crate::domain::WriteOrigin::User, &key, &now.to_string())
+                .await;
             continue;
         }
         let Some(next) = next_run_after(&job.cron, last_fired) else {
@@ -769,7 +775,9 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
         if has_running_run(&store, &job.id).await.unwrap_or(true) {
             continue;
         }
-        let _ = store.set_setting(&key, &now.to_string()).await;
+        let _ = store
+            .set_setting(crate::domain::WriteOrigin::User, &key, &now.to_string())
+            .await;
         // Fire on a detached task: a slow/hung pre-check (up to 60s) must not
         // stall the other due jobs or the next liveness stamp. The anchor is
         // already advanced, so this fire cannot double-run.
