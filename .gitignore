@@ -67,3 +67,8 @@ apps/cockpit/test-results/
 
 # insta pending-snapshot artifacts (accepted .snap files are committed)
 *.snap.new
+
+# built + signed remote plugin catalog feed (scripts/catalog/build-feed.ts) —
+# a release artifact, not tracked; see docs/development/plugins.md#remote-catalog
+/catalog.json
+/catalog.json.sig
