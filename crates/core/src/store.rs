@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_27_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_28_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -911,6 +911,83 @@ fn migrations() -> Migrations<'static> {
             if !has_override {
                 tx.execute("ALTER TABLE jobs ADD COLUMN model_override TEXT", [])?;
             }
+            Ok(())
+        }),
+        // Migration 28 — Phase 4 self-learning (spec §4/§7): cross-session
+        // recall (messages_fts + sync triggers), skill telemetry, and curator
+        // lifecycle state. All statements existence-guarded so the
+        // rewind-and-replay migration tests re-run this as a no-op.
+        // messages_fts is a standalone (not external-content) FTS5 table:
+        // `messages` has a COMPOSITE PK (session_pk, seq) and no stable integer
+        // rowid, so triggers key on that pair and store it UNINDEXED.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            // NOTE: this string uses Rust backslash line-continuation, which
+            // deletes both the newline AND the following indentation — the
+            // whole statement list becomes ONE line with no embedded `\n`.
+            // Every continued line therefore ends with an explicit trailing
+            // space (so keywords/identifiers never fuse, e.g. `messages` +
+            // `WHEN` would otherwise merge into `messagesWHEN`), and any
+            // explanatory text uses `/* */` block comments rather than `--`
+            // line comments — a `--` comment has no real newline to stop at
+            // here, so it would silently swallow every statement after it.
+            tx.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5( \
+                    text, \
+                    session_pk UNINDEXED, \
+                    seq UNINDEXED, \
+                    tokenize = 'porter unicode61' \
+                 ); \
+                 /* Only user/assistant TEXT blocks are searchable; tool calls, \
+                    results, notices, and thinking are excluded. payload is a \
+                    JSON string, so pull the body with json_extract (JSON1 is \
+                    in the bundled amalgamation). */ \
+                 CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages \
+                 WHEN new.role IN ('user','assistant') AND new.block_type='text' \
+                      AND json_extract(new.payload,'$.text') IS NOT NULL \
+                 BEGIN \
+                     INSERT INTO messages_fts(text, session_pk, seq) \
+                     VALUES (json_extract(new.payload,'$.text'), new.session_pk, new.seq); \
+                 END; \
+                 /* messages text is immutable once written (append-only \
+                    ledger; only status/tool_kind mutate, never text), so no \
+                    AFTER UPDATE trigger is needed. DELETE keeps the index \
+                    consistent when a session is purged. */ \
+                 CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages \
+                 BEGIN \
+                     DELETE FROM messages_fts \
+                     WHERE session_pk = old.session_pk AND seq = old.seq; \
+                 END; \
+                 CREATE TABLE IF NOT EXISTS skill_usage ( \
+                     name TEXT PRIMARY KEY NOT NULL, \
+                     created_by TEXT, \
+                     use_count INTEGER NOT NULL DEFAULT 0, \
+                     view_count INTEGER NOT NULL DEFAULT 0, \
+                     patch_count INTEGER NOT NULL DEFAULT 0, \
+                     last_used_at INTEGER, \
+                     last_viewed_at INTEGER, \
+                     last_patched_at INTEGER, \
+                     state TEXT NOT NULL DEFAULT 'active', \
+                     pinned INTEGER NOT NULL DEFAULT 0, \
+                     archived_at INTEGER, \
+                     created_at INTEGER NOT NULL \
+                 ); \
+                 CREATE TABLE IF NOT EXISTS curator_state ( \
+                     id INTEGER PRIMARY KEY CHECK (id = 1), \
+                     last_run_at INTEGER, \
+                     last_run_id TEXT \
+                 ); \
+                 CREATE TABLE IF NOT EXISTS curator_runs ( \
+                     id TEXT PRIMARY KEY NOT NULL, \
+                     started_at INTEGER NOT NULL, \
+                     finished_at INTEGER, \
+                     status TEXT NOT NULL, \
+                     transitioned INTEGER NOT NULL DEFAULT 0, \
+                     consolidated INTEGER NOT NULL DEFAULT 0, \
+                     snapshot_path TEXT, \
+                     error TEXT, \
+                     log TEXT \
+                 );",
+            )?;
             Ok(())
         }),
     ])
@@ -4703,7 +4780,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 27, "forward migration must land at v27");
+        assert_eq!(user_version, 28, "forward migration must land at v28");
     }
 
     #[tokio::test]
@@ -4844,7 +4921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_27_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_28_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -4860,25 +4937,26 @@ mod tests {
         // parent_session_pk, copies every existing column forward including
         // perm_mode; 23 plugin_installs + plugin_attach_status; 24 typed model
         // effort preferences + legacy normalization; 25 session_route_state;
-        // 26 session_runtime_settings; 27 background_events + jobs.model_override
+        // 26 session_runtime_settings; 27 background_events + jobs.model_override;
+        // 28 messages_fts + sync triggers, skill_usage, curator_state, curator_runs
         // — all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 27
-        // defined, wind back fifteen.
+        // this test starts failing its assertions). With migrations through 28
+        // defined, wind back sixteen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 15)
+            c.pragma_update(None, "user_version", v - 16)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v27 here, so `harness` was
+                    // The DB is fully migrated to v28 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -4929,14 +5007,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back seven, and reopen so 21 (and the tail
-        // migrations 22–27) replay against it. Back SEVEN: the fully migrated
-        // tail is now v27, so rewinding to v20 is what makes migration 21
+        // wind user_version back eight, and reopen so 21 (and the tail
+        // migrations 22–28) replay against it. Back EIGHT: the fully migrated
+        // tail is now v28, so rewinding to v20 is what makes migration 21
         // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 7)
+            c.pragma_update(None, "user_version", v - 8)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -5074,9 +5152,74 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 27, "forward migration must land at v27");
+        assert_eq!(uv, 28, "forward migration must land at v28");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
+    }
+
+    #[tokio::test]
+    async fn migration_28_adds_fts_skill_usage_and_curator_tables() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let (uv, has_fts, has_usage, has_cstate, has_cruns) = store
+            .with_conn(|c| {
+                let uv: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                let t = |name: &str| -> rusqlite::Result<bool> {
+                    c.prepare("SELECT 1 FROM sqlite_master WHERE name=?1")?
+                        .exists([name])
+                };
+                Ok((
+                    uv,
+                    t("messages_fts")?,
+                    t("skill_usage")?,
+                    t("curator_state")?,
+                    t("curator_runs")?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(uv, 28, "forward migration must land at v28");
+        assert!(has_fts && has_usage && has_cstate && has_cruns);
+    }
+
+    #[tokio::test]
+    async fn messages_fts_trigger_indexes_text_rows_and_matches() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // A session row is not required for the trigger; insert a user text message.
+        store
+            .insert_message(crate::domain::NewMessage::block(
+                "s1",
+                "user",
+                "text",
+                serde_json::json!({ "text": "deploy the widget service to staging" }),
+            ))
+            .await
+            .unwrap();
+        // A non-text tool row must NOT be indexed.
+        store
+            .insert_message(crate::domain::NewMessage {
+                session_pk: "s1".into(),
+                role: "assistant".into(),
+                block_type: "tool_call".into(),
+                payload: serde_json::json!({ "name": "bash" }),
+                tool_call_id: Some("t1".into()),
+                status: None,
+                tool_kind: Some("execute".into()),
+            })
+            .await
+            .unwrap();
+        let hits: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'widget'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits, 1, "only the user text row is indexed and matches");
     }
 
     #[tokio::test]
