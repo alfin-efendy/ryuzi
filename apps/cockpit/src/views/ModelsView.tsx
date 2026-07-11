@@ -299,7 +299,6 @@ function EndpointTab() {
 function ProviderRow({ row }: { row: ProviderRowInfo }) {
   const nav = useNav();
   const open = () => nav.navigate({ kind: "providerDetail", provider: row.id });
-  const activeCount = row.accounts.filter((account) => account.enabled).length;
   const modelText = modelLabel(row.modelCount, row.accounts.length === 0);
 
   return (
@@ -316,7 +315,6 @@ function ProviderRow({ row }: { row: ProviderRowInfo }) {
           {row.badges.map((badge) => (
             <CategoryBadge key={badge} category={badge} />
           ))}
-          {activeCount > 0 && <Pill variant="primary">{activeCount} active</Pill>}
         </span>
         <span className="block text-xs font-normal text-muted-foreground">
           {accountLabel(row.accounts.length)} · {modelText}

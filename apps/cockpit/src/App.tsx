@@ -12,7 +12,6 @@ import { InboxView } from "./views/InboxView";
 import { SessionView } from "./views/SessionView";
 import { ModelsView } from "./views/ModelsView";
 import { ProviderDetailView } from "./views/ProviderDetailView";
-import { ConnectionDetailView } from "./views/ConnectionDetailView";
 import { RuntimeView } from "./views/RuntimeView";
 import { RuntimeDetailView } from "./views/RuntimeDetailView";
 import { SchedulerView } from "./views/SchedulerView";
@@ -39,8 +38,6 @@ function MainView() {
       return <ModelsView />;
     case "providerDetail":
       return <ProviderDetailView provider={view.provider} />;
-    case "connectionDetail":
-      return <ConnectionDetailView id={view.id} />;
     case "runtime":
       return <RuntimeView />;
     case "runtimeDetail":

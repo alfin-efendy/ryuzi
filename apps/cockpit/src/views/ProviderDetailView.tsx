@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronRight, Plus, RefreshCw, TestTube2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, ArrowUp, Pencil, Plus, RefreshCw, TestTube2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { commands, type ConnectionInfo, type ModelRouteStrategy, type SelectableModelInfo, type UsageSeries } from "@/bindings";
 import { useConnections } from "@/store-connections";
@@ -18,12 +18,16 @@ import {
   Switch,
 } from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { Chip, Pill } from "@/components/common/bits";
+import { Chip } from "@/components/common/bits";
 import { UsageChart } from "@/components/common/UsageChart";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { runtimeById, useRuntimes } from "@/store-runtimes";
 import { useStore } from "@/store";
+import { AccountQuotaSummary } from "@/components/AccountQuotaSummary";
+import { usesDeviceSignin } from "@/components/modals/deviceSignin";
+import { RenameAccountModal } from "@/components/modals/RenameAccountModal";
+import { ConfirmAccountActionModal, type ConfirmAccountAction } from "@/components/modals/ConfirmAccountActionModal";
 
 function accountLabel(count: number): string {
   return `${count} account${count === 1 ? "" : "s"}`;
@@ -35,6 +39,11 @@ function modelLabel(count: number, prefix = ""): string {
 
 function strategyText(strategy: ModelRouteStrategy): string {
   return strategy === "round-robin" ? "Round robin" : "By order";
+}
+
+export function accountReconnectKind(conn: ConnectionInfo, entry: Parameters<typeof usesDeviceSignin>[0] | undefined) {
+  if (conn.authType !== "oauth") return null;
+  return entry && usesDeviceSignin(entry) ? "device" : "redirect";
 }
 
 export function modelEffortDefaultOptions(metadata: SelectableModelInfo) {
@@ -94,14 +103,32 @@ function aggregateUsage(series: Array<UsageSeries | undefined>): UsageSeries | n
   };
 }
 
-function AccountRow({ conn, index, count }: { conn: ConnectionInfo; index: number; count: number }) {
-  const nav = useNav();
-  const update = useConnections((s) => s.update);
+function AccountRow({
+  conn,
+  index,
+  count,
+  deviceSignin,
+  onRename,
+  onDelete,
+  onResetCredit,
+  onDeviceReconnect,
+}: {
+  conn: ConnectionInfo;
+  index: number;
+  count: number;
+  deviceSignin: boolean;
+  onRename: () => void;
+  onDelete: (trigger: HTMLButtonElement) => void;
+  onResetCredit: (request: { accountName: string; onConfirm: () => Promise<boolean> }) => void;
+  onDeviceReconnect: () => void;
+}) {
+  const setEnabled = useConnections((s) => s.setEnabled);
   const move = useConnections((s) => s.move);
   const test = useConnections((s) => s.test);
+  const reconnectOauth = useConnections((s) => s.reconnectOauth);
   const [testing, setTesting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
-  const open = () => nav.navigate({ kind: "connectionDetail", id: conn.id });
   const name = conn.label || conn.providerName;
 
   const runTest = async () => {
@@ -114,65 +141,69 @@ function AccountRow({ conn, index, count }: { conn: ConnectionInfo; index: numbe
     }
   };
 
+  const reconnect = async () => {
+    if (deviceSignin) {
+      onDeviceReconnect();
+      return;
+    }
+    setReconnecting(true);
+    const ok = await reconnectOauth(conn.id);
+    setReconnecting(false);
+    if (ok) toast.success(`Reconnected ${name}`);
+  };
+
   return (
-    <div className="flex items-center gap-2 border-b border-border px-[18px] py-3.5 last:border-b-0">
-      <Chip initial={conn.initial} color={conn.color} size={34} onClick={open} />
-      <div className="flex shrink-0 items-center gap-1">
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={`Move ${name} up`}
-          title={`Move ${name} up`}
-          onClick={() => void move(conn.id, -1)}
-          disabled={index === 0}
-          className="text-muted-foreground"
-        >
-          <ArrowUp aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+    <div className="border-b border-border last:border-b-0">
+      <div className="flex items-center gap-2 px-[18px] py-3.5">
+        <Chip initial={conn.initial} color={conn.color} size={34} />
+        <div className="flex shrink-0 items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Move ${name} up`}
+            title={`Move ${name} up`}
+            onClick={() => void move(conn.id, -1)}
+            disabled={index === 0}
+            className="text-muted-foreground"
+          >
+            <ArrowUp aria-hidden />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Move ${name} down`}
+            title={`Move ${name} down`}
+            onClick={() => void move(conn.id, 1)}
+            disabled={index === count - 1}
+            className="text-muted-foreground"
+          >
+            <ArrowDown aria-hidden />
+          </Button>
+        </div>
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="truncate text-sm font-semibold text-foreground">{name}</span>
+          <Button variant="ghost" size="icon-sm" aria-label={`Rename ${name}`} onClick={onRename} className="text-muted-foreground">
+            <Pencil aria-hidden />
+          </Button>
+          {conn.needsRelogin && <span className="text-xs text-destructive">Needs re-login</span>}
+        </div>
+        <Switch on={conn.enabled} onToggle={() => void setEnabled(conn.id, !conn.enabled)} label="Enabled" />
+        <Button variant="outline" size="sm" onClick={() => void runTest()} disabled={testing}>
+          {testing ? "Testing..." : "Test"}
         </Button>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={`Move ${name} down`}
-          title={`Move ${name} down`}
-          onClick={() => void move(conn.id, 1)}
-          disabled={index === count - 1}
-          className="text-muted-foreground"
-        >
-          <ArrowDown aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+        {conn.authType === "oauth" && (
+          <Button variant="outline" size="sm" onClick={() => void reconnect()} disabled={reconnecting}>
+            {reconnecting ? "Reconnecting…" : "Reconnect"}
+          </Button>
+        )}
+        <Button variant="destructive" size="sm" onClick={(event) => onDelete(event.currentTarget)}>
+          <Trash2 aria-hidden data-icon="inline-start" />
+          Delete
         </Button>
       </div>
-      <Button
-        variant="ghost"
-        onClick={open}
-        className="h-auto min-w-0 flex-1 flex-col items-start gap-0 whitespace-normal p-0 text-left font-normal"
-      >
-        <span className="block text-sm font-semibold text-foreground">{name}</span>
-        <span className="block text-xs text-muted-foreground">
-          {conn.authType === "oauth" ? "Subscription" : conn.authType === "free" ? "Free" : "API key"} · {conn.keyMasked ?? "no key"} ·{" "}
-          {modelLabel(conn.models.length)}
-          {conn.needsRelogin ? " · needs re-login" : ""}
-        </span>
-      </Button>
-      <Switch
-        on={conn.enabled}
-        onToggle={() =>
-          void update(conn.id, {
-            label: conn.label,
-            enabled: !conn.enabled,
-            apiKey: null,
-            baseUrl: conn.baseUrl,
-            models: conn.models,
-            claudeCloaking: conn.provider === "anthropic-oauth" ? conn.claudeCloaking : null,
-          })
-        }
-        label="Enabled"
-      />
-      <Button variant="outline" size="sm" onClick={() => void runTest()} disabled={testing}>
-        {testing ? "Testing..." : "Test"}
-      </Button>
-      <Button variant="ghost" size="icon-sm" title="Details" onClick={open} className="text-muted-foreground">
-        <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5" />
-      </Button>
+      {conn.quotaCapability && (
+        <AccountQuotaSummary connectionId={conn.id} accountName={name} capability={conn.quotaCapability} onRequestReset={onResetCredit} />
+      )}
     </div>
   );
 }
@@ -378,12 +409,15 @@ function ProviderModelsCard({
 
 export function ProviderDetailView({ provider }: { provider: string }) {
   const nav = useNav();
-  const { catalog, connections, loaded, hydrate } = useConnections();
+  const { catalog, connections, loaded, hydrate, rename, remove } = useConnections();
   const usageByConnection = useUsage((s) => s.byConnection);
   const loadUsage = useUsage((s) => s.loadConnection);
   const [addOpen, setAddOpen] = useState(false);
   const [accountStrategy, setAccountStrategy] = useState<ModelRouteStrategy>("fallback");
   const [savingStrategy, setSavingStrategy] = useState(false);
+  const [renameConnection, setRenameConnection] = useState<ConnectionInfo | null>(null);
+  const [confirmAction, setConfirmAction] = useState<ConfirmAccountAction | null>(null);
+  const confirmTriggerRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -466,14 +500,15 @@ export function ProviderDetailView({ provider }: { provider: string }) {
           chip={<Chip initial={initial} color={color} size={44} />}
           title={name}
           sub={`${accountLabel(providerConnections.length)} · ${modelLabel(catalogModels.length, "catalog ")}`}
-          titleExtra={activeCount > 0 ? <Pill variant="primary">{activeCount} active</Pill> : undefined}
         />
 
         <Card>
           <CardHeader className="flex-wrap">
             <CardTitle>Accounts</CardTitle>
             <CardHint>
-              {providerConnections.length > 0 ? `${activeCount} active · ${strategyText(accountStrategy)}` : "No accounts connected"}
+              {providerConnections.length > 0
+                ? `${accountLabel(providerConnections.length)} · ${activeCount} active · ${strategyText(accountStrategy)}`
+                : "No accounts connected"}
             </CardHint>
             <div className="ml-auto flex items-center gap-2">
               <span className="text-xs font-medium text-muted-foreground">Account routing</span>
@@ -489,13 +524,36 @@ export function ProviderDetailView({ provider }: { provider: string }) {
                 className="w-[140px]"
               />
               <Button onClick={() => setAddOpen(true)}>
-                <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+                <Plus aria-hidden data-icon="inline-start" />
                 Add account
               </Button>
             </div>
           </CardHeader>
           {providerConnections.map((conn, index) => (
-            <AccountRow key={conn.id} conn={conn} index={index} count={providerConnections.length} />
+            <AccountRow
+              key={conn.id}
+              conn={conn}
+              index={index}
+              count={providerConnections.length}
+              deviceSignin={(() => {
+                const entry = catalog.find((candidate) => candidate.id === conn.provider);
+                return accountReconnectKind(conn, entry) === "device";
+              })()}
+              onRename={() => setRenameConnection(conn)}
+              onDelete={(trigger) => {
+                confirmTriggerRef.current = trigger;
+                setConfirmAction({
+                  kind: "delete",
+                  accountName: conn.label || conn.providerName,
+                  onConfirm: () => remove(conn.id),
+                });
+              }}
+              onResetCredit={(request) => {
+                confirmTriggerRef.current = document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
+                setConfirmAction({ kind: "resetCredit", ...request });
+              }}
+              onDeviceReconnect={() => setAddOpen(true)}
+            />
           ))}
           {loaded && providerConnections.length === 0 && (
             <div className="px-[18px] py-8 text-center text-[13px] text-muted-foreground">
@@ -522,6 +580,20 @@ export function ProviderDetailView({ provider }: { provider: string }) {
         <ProviderModelsCard family={provider} connections={providerConnections} catalogModels={catalogModels} />
       </div>
       <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} family={provider} />
+      <RenameAccountModal
+        open={renameConnection !== null}
+        connection={renameConnection}
+        onClose={() => setRenameConnection(null)}
+        onRename={(label) => (renameConnection ? rename(renameConnection.id, label) : Promise.resolve(false))}
+      />
+      <ConfirmAccountActionModal
+        open={confirmAction !== null}
+        action={confirmAction}
+        onClose={() => {
+          setConfirmAction(null);
+          confirmTriggerRef.current?.focus();
+        }}
+      />
     </div>
   );
 }

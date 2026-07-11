@@ -1,7 +1,47 @@
 import { expect, mock, test } from "bun:test";
 import { fireEvent, render, screen } from "@testing-library/react";
-import type { SelectableModelInfo } from "@/bindings";
-import { ModelEffortDefaultCombobox, modelEffortDefaultOptions } from "./ProviderDetailView";
+import type { CatalogEntry, ConnectionInfo, SelectableModelInfo } from "@/bindings";
+import { accountReconnectKind, ModelEffortDefaultCombobox, modelEffortDefaultOptions } from "./ProviderDetailView";
+
+const account = {
+  id: "account-1",
+  provider: "openai-oauth",
+  providerName: "ChatGPT",
+  color: "#111",
+  initial: "C",
+  authType: "oauth",
+  label: "Personal",
+  priority: 0,
+  enabled: true,
+  quotaCapability: null,
+  baseUrl: null,
+  models: [],
+  keyMasked: null,
+  needsRelogin: false,
+  claudeCloaking: false,
+} satisfies ConnectionInfo;
+
+const catalogEntry = {
+  id: "openai-oauth",
+  name: "ChatGPT",
+  family: "openai",
+  color: "#111",
+  initial: "C",
+  category: "oauth",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: [],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+} satisfies CatalogEntry;
+
+test("account reconnect is redirect for browser OAuth, device for device sign-in, and absent for API/free accounts", () => {
+  expect(accountReconnectKind(account, catalogEntry)).toBe("redirect");
+  expect(accountReconnectKind(account, { ...catalogEntry, category: "device" })).toBe("device");
+  expect(accountReconnectKind({ ...account, authType: "api_key" }, catalogEntry)).toBeNull();
+  expect(accountReconnectKind({ ...account, authType: "free" }, catalogEntry)).toBeNull();
+});
 
 test("provider_model_default_selector_clears_and_reports_varied_defaults", () => {
   const metadata: SelectableModelInfo = {

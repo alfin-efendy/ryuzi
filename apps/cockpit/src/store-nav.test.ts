@@ -3,7 +3,7 @@ import { goBackHistory, goForwardHistory, navigateHistory, useNav, type NavHisto
 
 const home: View = { kind: "home" };
 const models: View = { kind: "models" };
-const detail: View = { kind: "connectionDetail", id: "c1" };
+const detail: View = { kind: "providerDetail", provider: "openai" };
 
 const start: NavHistory = { back: [], current: home, forward: [] };
 

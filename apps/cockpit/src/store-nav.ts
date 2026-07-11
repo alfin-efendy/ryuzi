@@ -11,7 +11,6 @@ export type View =
   | { kind: "session" }
   | { kind: "models" }
   | { kind: "providerDetail"; provider: string }
-  | { kind: "connectionDetail"; id: string }
   | { kind: "runtime" }
   | { kind: "runtimeDetail"; id: AgentId }
   | { kind: "scheduler" }
