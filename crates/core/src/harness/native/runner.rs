@@ -1246,7 +1246,21 @@ pub(crate) async fn drive_review(
 /// `skill_manage` (Phase 4 Task 6) writes filesystem skills gated by an
 /// origin × provenance guard — a primary/review-fork capability, never a
 /// sub-agent's; `skill` (read-only recall) stays available to children.
-const SUBAGENT_BLOCKLIST: &[&str] = &["task", "memory", "todowrite", "todoread", "skill_manage"];
+/// App-control tools (`crate::harness::native::tools::APP_TOOLS`, Phase 6
+/// §9.1) never reach delegated children either — `ctx.app` is `None` in a
+/// sub-agent's own `ToolCtx` regardless, so this is belt-and-suspenders: it
+/// also keeps them out of the tool definitions advertised to the model.
+const SUBAGENT_BLOCKLIST: &[&str] = &[
+    "task",
+    "memory",
+    "todowrite",
+    "todoread",
+    "skill_manage",
+    "app_jobs",
+    "app_orchestrate",
+    "app_projects",
+    "clarify",
+];
 /// Cap on one delegated child's model-visible report (protects the parent's
 /// context from runaway child output).
 const MAX_SUBTASK_REPORT_CHARS: usize = 16_000;
@@ -4390,6 +4404,24 @@ mod tests {
         // capability only, never a sub-agent's.
         assert!(eff.allows("skill"));
         assert!(!eff.allows("skill_manage"));
+    }
+
+    #[test]
+    fn subagent_blocklist_blocks_app_tools() {
+        use super::super::agents::ToolFilter;
+        let names: Vec<String> = crate::harness::native::tools::APP_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let eff = effective_child_filter(
+            &ToolFilter::All,
+            &ToolFilter::All,
+            &names,
+            SUBAGENT_BLOCKLIST,
+        );
+        for t in crate::harness::native::tools::APP_TOOLS {
+            assert!(!eff.allows(t), "sub-agents must not get {t}");
+        }
     }
 
     #[tokio::test]
