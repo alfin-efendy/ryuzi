@@ -681,6 +681,7 @@ fn stage_for_trust_prompt(
         "resolvedCommit": commit,
         "skills": skills,
         "hookScripts": hook_scripts,
+        "totalBytes": total_bytes,
     })
     .to_string();
     let token = crate::paths::new_id();
@@ -3925,7 +3926,12 @@ path = "skills/focus"
         let pack = confirm_install(&prompt.token, &store).await.unwrap();
         let rec = store.get_plugin_install(&pack.id).await.unwrap().unwrap();
         assert_eq!(rec.trust_tier, "acknowledged");
-        assert!(rec.trust_ack_summary.is_some());
+        let summary = rec.trust_ack_summary.expect("ack summary persisted");
+        // The persisted snapshot must be a complete record of what was shown
+        // in the trust prompt, including the size the user saw — not just
+        // the identity/skills/hooks fields.
+        let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(summary["totalBytes"], serde_json::json!(prompt.total_bytes));
     }
 
     #[tokio::test]
@@ -3935,6 +3941,51 @@ path = "skills/focus"
         let err = confirm_install("no-such-token", &store)
             .await
             .expect_err("unknown token must be rejected");
+        assert!(err.to_string().contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn confirm_install_rejects_a_staged_token_past_the_ttl() {
+        // `confirm_install_rejects_unknown_or_expired_token` only covers the
+        // unknown-token branch; this exercises the actual TTL-expiry branch
+        // (`now_ms() - staged.created_ms > STAGED_INSTALL_TTL_MS`). No public
+        // seam exists to backdate a staged install, so this reaches into
+        // `staging_map()`/`StagedInstall` directly — both are private, but
+        // this `tests` module is a descendant of `skills_install` and so has
+        // the same visibility a same-module caller would.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
+        let temp = tempfile::tempdir().unwrap();
+        let repo_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let token = crate::paths::new_id();
+        staging_map().lock().unwrap().insert(
+            token.clone(),
+            StagedInstall {
+                parsed: parse_skill_source("acme/p").unwrap(),
+                source_spec: "acme/p".to_string(),
+                roots,
+                _temp: temp,
+                repo_dir,
+                commit: None,
+                ack_summary: "{}".to_string(),
+                created_ms: crate::paths::now_ms() - STAGED_INSTALL_TTL_MS - 1,
+                prior_id: None,
+            },
+        );
+
+        let err = confirm_install(&token, &store)
+            .await
+            .expect_err("a staged install past the TTL must be rejected");
+        assert!(err.to_string().contains("expired"));
+
+        // The token is removed up front regardless of outcome (single-use),
+        // so a replay hits the same "expired" message via the unknown-token
+        // branch instead of silently completing the install.
+        let err = confirm_install(&token, &store)
+            .await
+            .expect_err("an expired token must not be replayable");
         assert!(err.to_string().contains("expired"));
     }
 
@@ -4022,6 +4073,41 @@ path = "skills/focus"
         assert!(store.get_plugin_install("p").await.unwrap().is_none());
         let rec = store.get_plugin_install("q").await.unwrap().unwrap();
         assert_eq!(rec.trust_tier, "acknowledged");
+    }
+
+    #[tokio::test]
+    async fn update_direct_id_change_drops_old_ledger_row_and_records_the_new_id() {
+        // Covers `update_installed_pack_with`'s OWN id-change cleanup (`if
+        // refreshed.id != rec.plugin_id { store.delete_plugin_install(...) }`)
+        // — distinct from the reack-triggered id-change path already covered
+        // by `confirm_install_reack_identity_change_cleans_up_old_artifacts_and_ledger_row`.
+        // An update with no new hook scripts reinstalls directly (never
+        // routes through `NeedsReack`/`confirm_install`), so this exercises
+        // the ledger swap that happens inline in `update_installed_pack_with`.
+        let (roots, cloner_c1, store) = recorded_setup("https://github.com/acme/p", "c1").await;
+        install_skill_source_with_recorded("https://github.com/acme/p", &roots, &cloner_c1, &store)
+            .await
+            .unwrap();
+        assert!(store.get_plugin_install("p").await.unwrap().is_some());
+
+        // Upstream renames the skill (id "p" -> "q") without introducing any
+        // hook scripts, so the update reinstalls directly instead of routing
+        // through the re-ack trust gate.
+        let repo_dir = roots_repo(&roots);
+        write_skill(&repo_dir, "Q", "d", "body-v2");
+        let cloner_c2 = fake_cloner("https://github.com/acme/p", &repo_dir, "c2");
+
+        let outcome = update_installed_pack_with("p", false, &roots, &cloner_c2, &store)
+            .await
+            .unwrap();
+        assert_eq!(outcome, UpdateOutcome::Updated);
+
+        assert!(
+            store.get_plugin_install("p").await.unwrap().is_none(),
+            "the old id's ledger row must be gone after a direct (non-reack) id change"
+        );
+        let rec = store.get_plugin_install("q").await.unwrap().unwrap();
+        assert_eq!(rec.resolved_commit.as_deref(), Some("c2"));
     }
 
     #[tokio::test]
