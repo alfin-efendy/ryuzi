@@ -22,6 +22,7 @@ function row(overrides: Partial<Row>): Row {
     toolSummary: null,
     toolSubagent: null,
     speaker: null,
+    taskId: null,
     ...overrides,
   };
 }

@@ -95,3 +95,80 @@ test("refetchTranscript bypasses the loaded short-circuit that hydrateTranscript
   });
   expect(called).toBe(true);
 });
+
+test("answering a block calls orchAnswerBlock with the task id", async () => {
+  const spy = spyOn(commands, "orchAnswerBlock").mockResolvedValue({ status: "ok", data: true });
+  await useStore.getState().orchAnswerBlock("ot-7", "use 8080");
+  expect(spy).toHaveBeenCalledWith("ot-7", "use 8080");
+  spy.mockRestore();
+});
+
+test("startOrchestration submits when both a project and a focused home session are present", async () => {
+  useStore.setState({ selectedProjectId: "p1", focusedSessionPk: "home-1" });
+  const submit = spyOn(commands, "orchSubmit").mockResolvedValue({ status: "ok", data: "root-1" });
+  await expect(useStore.getState().startOrchestration("fix the bug")).resolves.toBe(true);
+  expect(submit).toHaveBeenCalledWith("p1", "fix the bug", true, "home-1");
+  submit.mockRestore();
+});
+
+test("startOrchestration is a no-op without both an attached project and a focused home session", async () => {
+  const submit = spyOn(commands, "orchSubmit");
+
+  useStore.setState({ selectedProjectId: null, focusedSessionPk: "home-1" });
+  await expect(useStore.getState().startOrchestration("fix the bug")).resolves.toBe(false);
+
+  useStore.setState({ selectedProjectId: "p1", focusedSessionPk: null });
+  await expect(useStore.getState().startOrchestration("fix the bug")).resolves.toBe(false);
+
+  expect(submit).not.toHaveBeenCalled();
+  submit.mockRestore();
+});
+
+test("send steers a live orchestration and does not also send a normal chat turn", async () => {
+  useStore.setState({ sessions: [] });
+  const steer = spyOn(commands, "orchSteer").mockResolvedValue({ status: "ok", data: "noted" });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const steerSession = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
+
+  await expect(useStore.getState().send("home-1", "cancel the build task", null)).resolves.toBe(true);
+  expect(steer).toHaveBeenCalledWith("home-1", "cancel the build task");
+  expect(cont).not.toHaveBeenCalled();
+  expect(steerSession).not.toHaveBeenCalled();
+
+  steer.mockRestore();
+  cont.mockRestore();
+  steerSession.mockRestore();
+});
+
+test("send falls through to the normal path when orchSteer reports no live orchestration", async () => {
+  useStore.setState({ sessions: [] });
+  const steer = spyOn(commands, "orchSteer").mockResolvedValue({ status: "ok", data: "noOrchestration" });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(true);
+  expect(steer).toHaveBeenCalledWith("s1", "hi");
+  expect(cont).toHaveBeenCalledWith("s1", "hi", null);
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("send falls through to the normal path when orchSteer itself errors", async () => {
+  useStore.setState({ sessions: [] });
+  const steer = spyOn(commands, "orchSteer").mockResolvedValue({ status: "error", error: { message: "unreachable" } });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(true);
+  expect(cont).toHaveBeenCalledWith("s1", "hi", null);
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});

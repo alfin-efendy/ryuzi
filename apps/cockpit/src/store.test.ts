@@ -1267,6 +1267,7 @@ test("enqueueMessage appends per session; removeQueued removes by id", () => {
 });
 
 test("sendNextQueued sends the head and removes it on success", async () => {
+  const originalSend = useStore.getState().send;
   const calls: Array<[string, string]> = [];
   useStore.setState({
     queued: { s1: [qmsg("a", "hello"), qmsg("b", "world")] },
@@ -1278,18 +1279,22 @@ test("sendNextQueued sends the head and removes it on success", async () => {
   await useStore.getState().sendNextQueued("s1");
   expect(calls).toEqual([["s1", "hello"]]);
   expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["b"]);
+  useStore.setState({ send: originalSend });
 });
 
 test("sendNextQueued unshifts the head back when send fails", async () => {
+  const originalSend = useStore.getState().send;
   useStore.setState({
     queued: { s1: [qmsg("a", "hello")] },
     send: async () => false,
   });
   await useStore.getState().sendNextQueued("s1");
   expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["a"]); // still queued
+  useStore.setState({ send: originalSend });
 });
 
 test("sendNextQueued on an empty queue does not call send", async () => {
+  const originalSend = useStore.getState().send;
   let called = false;
   useStore.setState({
     queued: {},
@@ -1300,6 +1305,7 @@ test("sendNextQueued on an empty queue does not call send", async () => {
   });
   await useStore.getState().sendNextQueued("s1");
   expect(called).toBe(false);
+  useStore.setState({ send: originalSend });
 });
 
 test("drainQueueOnEvent drains on result but not on error", () => {

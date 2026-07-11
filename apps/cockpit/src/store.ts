@@ -119,6 +119,14 @@ type State = {
   refetchTranscript: (pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
   /** Fetches the full task graph under `rootId` (a fresh strip on mount). */
   loadOrchTasks: (rootId: string) => Promise<void>;
+  /** Submit a fresh goal for orchestrated execution (the composer's
+   *  "Orchestrate" toggle / `/orchestrate` entry) — bound to the currently
+   *  attached project and the currently focused home chat, so worker
+   *  bubbles, block-for-human cards, and the aggregate report have somewhere
+   *  to post into. Resolves false (a no-op) without both. */
+  startOrchestration: (prompt: string, decompose?: boolean) => Promise<boolean>;
+  /** Answer a worker's blocking question (BlockCard's inline composer). */
+  orchAnswerBlock: (taskId: string, answer: string) => Promise<void>;
   init: () => Promise<void>;
 };
 
@@ -351,6 +359,19 @@ export const useStore = create<State>((set, get) => ({
   loadOrchTasks: async (rootId) => {
     const res = await commands.orchTasks(rootId);
     if (res.status === "ok") set((st) => ({ orchTasks: { ...st.orchTasks, [rootId]: res.data } }));
+  },
+
+  startOrchestration: async (prompt, decompose = true) => {
+    const projectId = get().selectedProjectId;
+    const home = get().focusedSessionPk;
+    if (!projectId || !home) return false;
+    const res = await commands.orchSubmit(projectId, prompt, decompose, home);
+    if (res.status === "error") toast.error("Couldn't start orchestration: " + res.error.message);
+    return res.status === "ok";
+  },
+  orchAnswerBlock: async (taskId, answer) => {
+    const res = await commands.orchAnswerBlock(taskId, answer);
+    if (res.status === "error") toast.error("Couldn't send the answer: " + res.error.message);
   },
 
   // Selecting a project clears the focused session so the center shows the "start a new session" composer.
@@ -629,6 +650,21 @@ export const useStore = create<State>((set, get) => ({
     return true;
   },
   send: async (sessionPk, prompt, options) => {
+    // A typed message while THIS chat drives a live orchestration steers it
+    // instead of running as a normal chat turn — e.g. "cancel" cancels the
+    // tree, anything else is noted as guidance for the judge. `orch_steer`
+    // cheaply returns "noOrchestration" when there's no live root bound to
+    // this session (the store keeps no client-side cache of that binding —
+    // the backend check is authoritative), so this is a no-op for ordinary
+    // chats. Any failure here (backend error or a thrown IPC error) falls
+    // through to the normal send path below — a steer-check failure must
+    // never swallow the user's message.
+    try {
+      const steer = await commands.orchSteer(sessionPk, prompt);
+      if (steer.status === "ok" && steer.data !== "noOrchestration") return true;
+    } catch {
+      // fall through to the normal send path
+    }
     // A session already RUNNING a turn gets steered — the message is
     // injected into that turn's next tool-result batch instead of racing a
     // whole new turn onto the session. Any other status (idle, interrupted,

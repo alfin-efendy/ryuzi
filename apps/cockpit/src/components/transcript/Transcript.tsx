@@ -12,6 +12,7 @@ import { TurnSummary } from "./TurnSummary";
 import { FileChangeCards } from "./FileChangeCards";
 import { TurnActions } from "./TurnActions";
 import { SpeakerBubble } from "./SpeakerBubble";
+import { BlockCard } from "./BlockCard";
 import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 
 function MediaItem({ a, onOpenImage }: { a: RowAttachment; onOpenImage: (src: string) => void }) {
@@ -239,7 +240,11 @@ export function Transcript({
                 case "notice":
                   return <NoticeRow key={g.key} text={g.text} />;
                 case "speaker":
-                  return <SpeakerBubble key={g.key} speaker={g.speaker} markdown={g.markdown} />;
+                  return g.blockType === "orch_block" && g.taskId ? (
+                    <BlockCard key={g.key} taskId={g.taskId} question={g.markdown} speaker={g.speaker} />
+                  ) : (
+                    <SpeakerBubble key={g.key} speaker={g.speaker} markdown={g.markdown} />
+                  );
                 case "summary":
                   return (
                     <div key={g.key} className="flex flex-col gap-1.5">

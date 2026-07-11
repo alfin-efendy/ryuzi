@@ -35,6 +35,8 @@ export type Row = {
   toolSubagent: string | null;
   /** Worker/orchestrator agent name for group-chat rows (Message.speaker); null for ordinary assistant turns. */
   speaker: string | null;
+  /** Blocking task id for an `orch_block` speaker row (payload.task_id); null for every other row. */
+  taskId: string | null;
 };
 
 export type RowAttachment = { name: string; path: string; contentType: string | null; size: number };
@@ -63,7 +65,7 @@ export type Group =
   | { type: "activity"; key: string; items: ActivityItem[] }
   | { type: "error"; key: string; text: string }
   | { type: "notice"; key: string; text: string }
-  | { type: "speaker"; key: string; speaker: string; markdown: string; blockType: string };
+  | { type: "speaker"; key: string; speaker: string; markdown: string; blockType: string; taskId: string | null };
 
 export type EditCard = { path: string; kind: string };
 
@@ -189,6 +191,7 @@ export function messageToRow(
     toolSummary: blockType === "tool_call" && typeof p.summary === "string" && p.summary ? p.summary : null,
     toolSubagent: blockType === "tool_call" && typeof p.subagent === "string" && p.subagent ? p.subagent : null,
     speaker,
+    taskId: blockType === "orch_block" && typeof p.task_id === "string" && p.task_id ? p.task_id : null,
   };
 }
 
@@ -243,7 +246,7 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
     // Tool calls dispatched by a sub-agent keep flowing through the normal
     // activity cluster below (their subagent label already renders there).
     if (row.speaker && row.blockType !== "tool_call") {
-      groups.push({ type: "speaker", key, speaker: row.speaker, markdown: row.text, blockType: row.blockType });
+      groups.push({ type: "speaker", key, speaker: row.speaker, markdown: row.text, blockType: row.blockType, taskId: row.taskId });
       return;
     }
     if (row.blockType === "tool_call" || row.blockType === "status") {

@@ -50,6 +50,7 @@ test("image preview uses the shared shell with visible X and footer action", () 
     toolSummary: null,
     toolSubagent: null,
     speaker: null,
+    taskId: null,
   };
   render(<Transcript sessionPk="s1" rows={[row]} agentName="Ryuzi" agentColor="#fff" running={false} />);
   fireEvent.click(screen.getByTitle("shot.png"));
