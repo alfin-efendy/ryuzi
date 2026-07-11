@@ -2069,7 +2069,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
-            source: PluginSource::SkillPack(std::path::PathBuf::from("/tmp/whatever")),
+            source: PluginSource::Catalog,
         }
     }
 
@@ -2650,6 +2650,16 @@ mod tests {
         let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
         let mut regs = Registries::new();
         ryuzi_core::plugins::install_builtins(&mut regs);
+        // `install_builtins` doesn't add discord (it lives beside
+        // `register_builtin_plugin_fields`'s composition, not the shared
+        // builtins list) — register it explicitly so list/detail/uninstall
+        // tests can exercise the one built-in gateway. Its manifest always
+        // declares the `chat-gateway` category, so `derive_kind` classifies
+        // it as `"gateway"` regardless of whether the `discord` Cargo
+        // feature is on; only the *live* `GatewayFactory` (used by
+        // `toggle_enabled`'s enable/disable path) is feature-gated — see
+        // `#[cfg(feature = "discord")]` tests below for that behavior.
+        regs.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
         ControlPlane::new(store, regs).await
     }
 
@@ -2786,6 +2796,13 @@ mod tests {
 
     // ---------- uninstall (kind-symmetric teardown) ----------
 
+    // Requires the live discord `GatewayFactory` — `toggle_enabled` branches
+    // on `plugin.gateway.is_some()` (not `derive_kind`'s manifest-category
+    // fallback), and that factory only exists when the `discord` Cargo
+    // feature is on (see `gateway::discord::factory_entries`). Without the
+    // feature, `toggle_enabled("discord", true)` falls through to the
+    // "always available" bail path since discord has no connector either.
+    #[cfg(feature = "discord")]
     #[tokio::test]
     async fn uninstall_gateway_clears_settings_and_disables() {
         let cp = test_cp().await;
@@ -3669,9 +3686,12 @@ mod tests {
         // An uninstall does (using the hermetic integration-kind path
         // already exercised by
         // `uninstall_integration_clears_credential_and_disables` — "github",
-        // not "discord": the `discord` gateway only registers under the
-        // `discord` Cargo feature, which this crate's default test build
-        // doesn't enable).
+        // not "discord": discord IS registered in `test_cp` regardless of
+        // the `discord` Cargo feature, but uninstalling it routes through
+        // `toggle_enabled`, which needs the *live* `GatewayFactory` that
+        // only exists when the feature is on — see
+        // `uninstall_gateway_clears_settings_and_disables`, this crate's
+        // default test build doesn't enable it).
         uninstall_and_mark(&cp, "github").await.unwrap();
         assert!(cp.plugins_restart_required());
     }
