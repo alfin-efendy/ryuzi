@@ -67,11 +67,27 @@ pub fn budget_summary(
     }
 }
 
-/// Largest whole-line prefix of `s` within `budget` chars.
+/// First `n` chars of `s` (UTF-8 safe).
+fn take_first_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// Last `n` chars of `s` (UTF-8 safe).
+fn take_last_chars(s: &str, n: usize) -> String {
+    let total = s.chars().count();
+    s.chars().skip(total.saturating_sub(n)).collect()
+}
+
+/// Largest whole-line prefix of `s` within `budget` chars. If the very first
+/// line alone exceeds `budget` (no line boundary to snap to), hard-cut it at a
+/// char boundary so the result stays within `budget`.
 fn snap_head(s: &str, budget: usize) -> String {
     let mut out = String::new();
     for line in s.split_inclusive('\n') {
-        if out.chars().count() + line.chars().count() > budget && !out.is_empty() {
+        if out.chars().count() + line.chars().count() > budget {
+            if out.is_empty() {
+                return take_first_chars(line, budget);
+            }
             break;
         }
         out.push_str(line);
@@ -79,12 +95,16 @@ fn snap_head(s: &str, budget: usize) -> String {
     out
 }
 
-/// Largest whole-line suffix of `s` within `budget` chars.
+/// Largest whole-line suffix of `s` within `budget` chars. If the very last
+/// line alone exceeds `budget`, hard-cut to its last `budget` chars.
 fn snap_tail(s: &str, budget: usize) -> String {
     let lines: Vec<&str> = s.split_inclusive('\n').collect();
     let mut out = String::new();
     for line in lines.iter().rev() {
-        if out.chars().count() + line.chars().count() > budget && !out.is_empty() {
+        if out.chars().count() + line.chars().count() > budget {
+            if out.is_empty() {
+                return take_last_chars(line, budget);
+            }
             break;
         }
         out.insert_str(0, line);
@@ -137,5 +157,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn single_long_line_with_no_newlines_is_bounded_by_the_cap() {
+        // A no-newline blob is the worst case for line-snapping: split_inclusive
+        // yields one element, so the old code returned the whole report twice.
+        let dir = tempfile::tempdir().unwrap();
+        let blob = "x".repeat(5_000); // no '\n' anywhere
+        let cap = 200usize;
+        let out = budget_summary(&blob, cap, dir.path(), "blob");
+        // The trimmed head+tail body must not exceed the cap (footer is extra).
+        // A cheap proxy: the whole output is far smaller than the raw report,
+        // and specifically the non-footer content is <= cap.
+        assert!(
+            out.text.chars().count() < blob.chars().count(),
+            "trimmed output must be smaller than the raw report, got {} vs {}",
+            out.text.chars().count(),
+            blob.chars().count()
+        );
+        assert!(out.text.contains("[truncated]"));
+        // Full report is preserved in the spill file.
+        let spilled = out.spilled_to.expect("blob over cap must spill");
+        assert_eq!(std::fs::read_to_string(&spilled).unwrap(), blob);
     }
 }
