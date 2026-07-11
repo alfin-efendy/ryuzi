@@ -30,6 +30,7 @@ pub mod settings;
 pub mod skills_install;
 pub mod store;
 pub mod telemetry;
+pub mod tls;
 pub mod update;
 pub mod workspace;
 pub mod worktree;
