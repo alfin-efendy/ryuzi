@@ -201,6 +201,22 @@ mod tests {
         assert_eq!(HookEvent::SessionEnd.as_str(), "session.end");
     }
 
+    // Guards the cross-crate contract: the SDK validates `[[extension]]`
+    // `events` against `ryuzi_plugin_sdk::KNOWN_HOOK_EVENTS`, but the events
+    // are actually fired here by `HookEvent`. If the two drift (a renamed
+    // variant, a new event on one side only), a manifest's subscription is
+    // accepted at parse time but never delivered at runtime — a silent break.
+    // This test fails to compile-or-assert the moment they diverge.
+    #[test]
+    fn hook_event_vocabulary_matches_the_sdk_known_events() {
+        let core: Vec<&str> = HookEvent::ALL.iter().map(|e| e.as_str()).collect();
+        assert_eq!(
+            core,
+            ryuzi_plugin_sdk::KNOWN_HOOK_EVENTS,
+            "core HookEvent vocabulary must stay in sync with the SDK's KNOWN_HOOK_EVENTS"
+        );
+    }
+
     #[test]
     fn only_tool_before_is_gating() {
         assert!(!HookEvent::SessionStart.is_gating());
