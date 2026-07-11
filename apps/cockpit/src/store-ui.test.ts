@@ -95,6 +95,10 @@ function sess(pk: string, lastActive: number | null): Session {
     resumeAttempts: 0,
     branchOwned: false,
     permMode: "default",
+    kind: "project",
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   };
 }
 

@@ -5,7 +5,9 @@
 //! until the proxy rewrite in Tasks 15-16.
 
 use super::{ok, params, ApiError};
-use crate::domain::{Message, NewMessage, NewProviderTurn, PermMode, Session, SessionStatus};
+use crate::domain::{
+    Message, NewMessage, NewProviderTurn, PermMode, Session, SessionKind, SessionStatus,
+};
 use crate::paths::{new_id, now_ms};
 use crate::serve::ApiState;
 use crate::store::Store;
@@ -104,7 +106,7 @@ async fn apply_import(
 ) -> anyhow::Result<Session> {
     let session = Session {
         session_pk: new_id(),
-        project_id: project_id.to_string(),
+        project_id: Some(project_id.to_string()),
         agent_session_id: None,
         worktree_path: None,
         branch: None,
@@ -118,6 +120,10 @@ async fn apply_import(
         branch_owned: false,
         // Archived/view-only: the mode is never re-read by a live turn.
         perm_mode: PermMode::Default,
+        kind: SessionKind::Project,
+        speaker: None,
+        agent: None,
+        parent_session_pk: None,
     };
     store.insert_session(session.clone()).await?;
     for m in export.messages {
@@ -271,7 +277,7 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
-                project_id: "p".into(),
+                project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -283,6 +289,10 @@ mod tests {
                 resume_attempts: 0,
                 branch_owned: false,
                 perm_mode: PermMode::Default,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();

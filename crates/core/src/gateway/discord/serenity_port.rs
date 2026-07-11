@@ -225,6 +225,11 @@ impl EventHandler for Handler {
             .on_message(InboundMessage {
                 channel_id: new_message.channel_id.to_string(),
                 is_thread,
+                // Serenity leaves `guild_id` unset on messages sent in a DM
+                // channel (there's no guild) — the connector is the only
+                // place that can see it, so it's normalized into the
+                // gateway-agnostic `InboundMessage` here.
+                is_dm: new_message.guild_id.is_none(),
                 author_bot: new_message.author.bot,
                 author_id: new_message.author.id.to_string(),
                 mentions_bot,

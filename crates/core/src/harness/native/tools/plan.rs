@@ -176,7 +176,7 @@ mod tests {
         // real project + session (shape mirrors runner.rs's
         // seed_pinned_project) whose pk matches ctx.session_pk so the write
         // lands, then read the row back.
-        use crate::domain::{Project, Session, SessionStatus};
+        use crate::domain::{Project, Session, SessionKind, SessionStatus};
 
         let dir = tempfile::tempdir().unwrap();
         let (ctx, hub, mut rx, perm) = ctx_with_interaction(dir.path(), PermMode::Plan).await;
@@ -197,7 +197,7 @@ mod tests {
         ctx.store
             .insert_session(Session {
                 session_pk: ctx.session_pk.clone(),
-                project_id: "p".into(),
+                project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -209,6 +209,10 @@ mod tests {
                 last_active: Some(0),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();

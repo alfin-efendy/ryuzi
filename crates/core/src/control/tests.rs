@@ -1,6 +1,7 @@
 use super::*;
 use crate::domain::{
-    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionStatus,
+    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionKind,
+    SessionStatus,
 };
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::now_ms;
@@ -56,6 +57,9 @@ struct FakeSession {
     /// Every prompt text driven on this (or a sibling) fake session, in
     /// order — lets resume tests assert the exact nudge text sent.
     prompts: Arc<Mutex<Vec<String>>>,
+    /// Every `steer()` call observed on this (or a sibling) fake session, in
+    /// order — lets steer tests assert the live handle actually received it.
+    steered: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -127,6 +131,10 @@ impl HarnessSession for FakeSession {
     fn agent_session_id(&self) -> Option<String> {
         Some("agent-1".to_string())
     }
+
+    fn steer(&self, text: String) {
+        self.steered.lock().unwrap().push(text);
+    }
 }
 
 /// Shared counters so tests can observe the harness/session lifecycle across
@@ -141,6 +149,8 @@ struct Counters {
     ended: Arc<AtomicBool>,
     /// Prompts observed by `send_prompt` across every produced session, in order.
     prompts: Arc<Mutex<Vec<String>>>,
+    /// `steer()` calls observed across every produced session, in order.
+    steered: Arc<Mutex<Vec<String>>>,
     /// The `SessionCtx.mcp_servers` the most recent `start_session` call was
     /// built with — lets plugin-connector tests assert on exactly what
     /// `start_harness_session` attached, without a bespoke fake per test.
@@ -166,6 +176,7 @@ impl Harness for FakeHarness {
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
+            steered: self.counters.steered.clone(),
         }))
     }
 }
@@ -206,6 +217,7 @@ impl Harness for GatedHarness {
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
+            steered: self.counters.steered.clone(),
         }))
     }
 }
@@ -251,6 +263,7 @@ impl Harness for LatchGatedHarness {
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
+            steered: self.counters.steered.clone(),
         }))
     }
 }
@@ -603,7 +616,7 @@ async fn seed_session(
     store
         .insert_session(Session {
             session_pk: session_pk.to_string(),
-            project_id: project_id.to_string(),
+            project_id: Some(project_id.to_string()),
             agent_session_id: agent_session_id.map(|s| s.to_string()),
             worktree_path: None,
             branch: None,
@@ -615,6 +628,10 @@ async fn seed_session(
             last_active: Some(now),
             resume_attempts: 0,
             branch_owned: true,
+            kind: SessionKind::Project,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         })
         .await
         .unwrap();
@@ -929,6 +946,107 @@ async fn continue_cold_resumes_when_handle_absent() {
     assert_eq!(counters.sends.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+#[serial]
+async fn steer_session_reaches_the_live_handle_without_starting_a_new_turn() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let counters = Counters::default();
+    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "first", "test", &[])
+        .await
+        .unwrap();
+    let handle_before = wait_for_running_handle(&cp, &session.session_pk).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let received = cp
+        .steer_session(&session.session_pk, "stop and check the tests first")
+        .await
+        .unwrap();
+    assert!(received, "a live handle must report it received the steer");
+
+    // The SAME live handle observed the steer — no new turn/session started.
+    assert_eq!(
+        counters.steered.lock().unwrap().as_slice(),
+        ["stop and check the tests first"]
+    );
+    assert_eq!(
+        counters.starts.load(Ordering::SeqCst),
+        1,
+        "steer must not start a new harness session"
+    );
+    assert_eq!(
+        counters.sends.load(Ordering::SeqCst),
+        1,
+        "steer must not itself drive a new turn — only the original send_prompt ran"
+    );
+    let handle_after = cp
+        .running
+        .lock()
+        .unwrap()
+        .get(&session.session_pk)
+        .cloned()
+        .unwrap();
+    assert!(Arc::ptr_eq(&handle_before, &handle_after));
+}
+
+#[tokio::test]
+#[serial]
+async fn steer_session_falls_back_to_a_new_turn_when_no_live_handle() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let counters = Counters::default();
+    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "first", "test", &[])
+        .await
+        .unwrap();
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Simulate the handle being gone (app restart) — no in-flight turn exists
+    // to steer into.
+    cp.running.lock().unwrap().remove(&session.session_pk);
+
+    let received = cp
+        .steer_session(&session.session_pk, "second, but as a fresh turn")
+        .await
+        .unwrap();
+    assert!(
+        !received,
+        "no live handle: the text must fall back to a normal continue, not report as steered"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // No steer() call was ever recorded — it went through continue_session's
+    // ordinary cold-resume + send_prompt path instead.
+    assert!(counters.steered.lock().unwrap().is_empty());
+    assert_eq!(
+        counters.sends.load(Ordering::SeqCst),
+        2,
+        "the fallback must have driven a real turn with the steer text"
+    );
+    assert_eq!(
+        counters.prompts.lock().unwrap().last().map(String::as_str),
+        Some("second, but as a fresh turn")
+    );
+    assert!(
+        cp.running.lock().unwrap().contains_key(&session.session_pk),
+        "the fallback's cold resume must re-register a live handle"
+    );
+}
+
 /// Factory that works for the first session but fails every later create —
 /// models "the adapter can't come back up" for cold-resume paths.
 struct FailingResumeFactory {
@@ -1102,6 +1220,114 @@ async fn start_session_streams_events_and_records_agent_id() {
         && m.payload["text"] == "working"));
     // seq is monotonic and matches insertion order.
     assert!(msgs.windows(2).all(|w| w[0].seq < w[1].seq));
+}
+
+#[tokio::test]
+#[serial]
+async fn start_chat_session_runs_without_a_project() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    assert_eq!(session.project_id, None);
+    assert_eq!(session.kind, SessionKind::Chat);
+    // startup ran in the scratch dir (no worktree)
+    assert!(session.worktree_path.is_none());
+
+    // Background startup creates the scratch dir and starts the harness in
+    // it (no git prep, no project).
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let scratch = crate::paths::chat_scratch_dir(&session.session_pk);
+    assert!(scratch.exists(), "expected the scratch dir to be created");
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.project_id, None);
+    assert_eq!(stored.worktree_path, None);
+    assert_eq!(stored.branch, None);
+}
+
+#[tokio::test]
+#[serial]
+async fn end_chat_session_removes_the_scratch_dir() {
+    let _guard = StateDirGuard::new();
+    let (cp, _store, _prompts, _db_guard) = fake_control_plane().await;
+
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let scratch = crate::paths::chat_scratch_dir(&session.session_pk);
+    assert!(scratch.exists());
+
+    cp.end_session(&session.session_pk).await.unwrap();
+
+    assert!(
+        !scratch.exists(),
+        "end_session must remove a chat session's scratch dir"
+    );
+    let stored = cp.list_sessions(None).await.unwrap();
+    let stored = stored
+        .iter()
+        .find(|s| s.session_pk == session.session_pk)
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Ended);
+}
+
+#[tokio::test]
+#[serial]
+async fn resume_session_resumes_a_chat_session() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
+
+    let now = now_ms();
+    store
+        .insert_session(Session {
+            session_pk: "chat-1".to_string(),
+            project_id: None,
+            agent_session_id: Some("agent-1".to_string()),
+            worktree_path: None,
+            branch: None,
+            title: Some("chat".into()),
+            status: SessionStatus::Running,
+            started_by: Some("test".into()),
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            perm_mode: PermMode::Default,
+            kind: SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        })
+        .await
+        .unwrap();
+
+    cp.resume_session("chat-1", "restart").await.unwrap();
+    wait_for_prompts(&prompt_log, 1).await;
+
+    assert_eq!(prompt_log.lock().unwrap()[0], RESUME_NUDGE);
+    let scratch = crate::paths::chat_scratch_dir("chat-1");
+    assert!(
+        scratch.exists(),
+        "resume must (re)create the chat session's scratch dir"
+    );
+    let mut s = store.get_session("chat-1").await.unwrap().unwrap();
+    for _ in 0..400 {
+        if s.status == SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        s = store.get_session("chat-1").await.unwrap().unwrap();
+    }
+    assert_eq!(s.status, SessionStatus::Idle);
 }
 
 #[tokio::test]
@@ -1322,7 +1548,7 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
     let session_pk = crate::paths::new_id();
     let session = Session {
         session_pk: session_pk.clone(),
-        project_id: project.project_id.clone(),
+        project_id: Some(project.project_id.clone()),
         agent_session_id: None,
         worktree_path: None,
         branch: None,
@@ -1334,6 +1560,10 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         last_active: Some(now_ms()),
         resume_attempts: 0,
         branch_owned: false,
+        kind: SessionKind::Project,
+        speaker: None,
+        agent: None,
+        parent_session_pk: None,
     };
     store.insert_session(session).await.unwrap();
 

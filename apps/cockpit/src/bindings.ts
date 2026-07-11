@@ -53,9 +53,25 @@ async startSession(projectId: string, prompt: string, options: ChatRequestOption
     else return { status: "error", error: e  as any };
 }
 },
+async startChatSession(prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_chat_session", { prompt, options }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async continueSession(sessionPk: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("continue_session", { sessionPk, prompt, options }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async steerSession(sessionPk: string, text: string) : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("steer_session", { sessionPk, text }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1240,7 +1256,7 @@ claudeCloaking: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -1489,7 +1505,12 @@ export type ProviderQuotaInfo = { provider: string; plan: string | null; message
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
-export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; 
+export type Session = { sessionPk: string; 
+/**
+ * `None` for chat-first sessions (`kind != Project`); a project-bound
+ * session always has this set.
+ */
+projectId: string | null; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; 
 /**
  * Per-session permission mode. Copied from the project (or the new-chat
  * picker) at creation; changing it affects THIS session only.
@@ -1500,7 +1521,29 @@ permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActi
  * `end_session` deletes the branch ONLY when this is set; user-named and
  * pre-existing branches survive teardown.
  */
-branchOwned: boolean }
+branchOwned: boolean; kind: SessionKind; 
+/**
+ * Who is speaking in this session (chat-first; e.g. a Discord user id
+ * or `"cockpit"`). Unused for `Project` sessions.
+ */
+speaker: string | null; 
+/**
+ * Which agent persona/config is driving this session. Unused for
+ * `Project` sessions.
+ */
+agent: string | null; 
+/**
+ * The session this one was spawned from (`Worker`/`Review` lineage).
+ */
+parentSessionPk: string | null }
+/**
+ * What a session represents. `Project` is the pre-Phase-2 default (bound to
+ * a project workdir); `Chat`, `Worker`, and `Review` are chat-first kinds
+ * added in Phase 2 — `project_id` is `None` for all three, and `Worker`/
+ * `Review` additionally carry `parent_session_pk` lineage back to the chat
+ * or project session that spawned them.
+ */
+export type SessionKind = "project" | "chat" | "worker" | "review"
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 

@@ -19,8 +19,13 @@ import { AttachmentChips } from "@/components/composer/AttachmentChips";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
 import { BranchNameModal } from "@/components/modals/BranchNameModal";
 
+// Sentinel Combobox value for "no project attached" — Base UI's Combobox
+// value type is a plain string, so a real project id can't share the slot
+// with null. Detaching (picking this) clears selectProject back to null.
+const NO_PROJECT = "__none__";
+
 export function HomeView() {
-  const { projects, selectedProjectId, selectProject, start, setProjectModel } = useStore();
+  const { projects, selectedProjectId, selectProject, start, startChat, setProjectModel } = useStore();
   const nav = useNav();
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
@@ -31,7 +36,10 @@ export function HomeView() {
   // Permission mode for the session about to be created. null = project default.
   const [composerPerm, setComposerPerm] = useState<UiPermMode | null>(null);
 
-  const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
+  // Chat is the default: no project is auto-selected. A project is attached
+  // only when the user explicitly picks one (sidebar "+" or the composer's
+  // project Combobox) — see selectedProjectId in the store.
+  const project = projects.find((p) => p.projectId === selectedProjectId);
   const projectId = project?.projectId;
   const draftKey = `home:${projectId ?? ""}`;
   const draft = nav.drafts[draftKey] ?? "";
@@ -161,7 +169,7 @@ export function HomeView() {
 
   const send = async () => {
     const t = draft.trim();
-    if ((!t && composerFiles.attachments.length === 0) || !project) return;
+    if (!t && composerFiles.attachments.length === 0) return;
     const opts = {
       model: nav.composerModel ?? null,
       context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
@@ -173,7 +181,9 @@ export function HomeView() {
     useNav.getState().clearDraft(draftKey);
     composerFiles.clear();
     setContextRefs([]);
-    const ok = await start(project.projectId, t, opts);
+    // No project attached → a chat-first session (the Home default);
+    // a picked project starts a normal project session, unchanged.
+    const ok = project ? await start(project.projectId, t, opts) : await startChat(t, opts);
     if (ok) nav.navigate({ kind: "session" });
     else useNav.getState().restoreDraft(draftKey, typed);
   };
@@ -303,9 +313,12 @@ export function HomeView() {
           <div className="relative flex items-center gap-1.5 border-t border-border px-3 py-2">
             <Combobox
               aria-label="Project"
-              options={projects.map((p) => ({ value: p.projectId, label: projectLabel(p) }))}
-              value={project?.projectId ?? null}
-              onValueChange={(id) => selectProject(id)}
+              options={[
+                { value: NO_PROJECT, label: "No project" },
+                ...projects.map((p) => ({ value: p.projectId, label: projectLabel(p) })),
+              ]}
+              value={project?.projectId ?? NO_PROJECT}
+              onValueChange={(id) => selectProject(id === NO_PROJECT ? null : id)}
               placeholder="No project"
               trigger={
                 <Button variant="ghost" size="sm" className="gap-[7px] font-semibold">

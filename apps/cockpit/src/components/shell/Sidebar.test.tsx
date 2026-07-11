@@ -30,6 +30,10 @@ function sess(pk: string, lastActive: number) {
     resumeAttempts: 0,
     branchOwned: false,
     permMode: "default" as const,
+    kind: "project" as const,
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   };
 }
 

@@ -1,5 +1,5 @@
 use crate::approval::ApprovalHub;
-use crate::domain::{CoreEvent, McpServerSpec, PermMode};
+use crate::domain::{CoreEvent, McpServerSpec, PermMode, SessionKind};
 use crate::store::Store;
 use async_trait::async_trait;
 
@@ -12,6 +12,17 @@ use tokio::sync::broadcast;
 /// (Spec 3 wiring) and passed to `Harness::start_session`.
 pub struct SessionCtx {
     pub session_pk: String,
+    /// The owning project, if any — `None` for a chat-first (project-less)
+    /// session. Mirrors `Session.project_id`; harness backends key
+    /// project-scoped features (e.g. the native runtime's persistent memory
+    /// and tool-policy lookups) off this rather than re-querying the store.
+    pub project_id: Option<String>,
+    /// The session's kind (`Project`, `Chat`, `Worker`, `Review`), mirroring
+    /// `Session.kind`.
+    pub kind: SessionKind,
+    /// Which agent persona/config is driving this session, if any. Mirrors
+    /// `Session.agent`; unused for `Project` sessions today.
+    pub agent: Option<String>,
     pub work_dir: PathBuf,
     /// The session's attachment folder (`…/.harness-attachments/{session_pk}`)
     /// — a second read root the native runtime's `read` tool tries when the
@@ -93,6 +104,13 @@ pub trait HarnessSession: Send + Sync {
     /// Update the live permission mode for subsequent turns. Default no-op;
     /// the native session overrides this (see its `RunnerDeps`).
     fn set_perm_mode(&self, _mode: PermMode) {}
+
+    /// Buffer a message sent while a turn is already running, for injection
+    /// into that turn's next tool-result batch (Task B3). Default no-op: only
+    /// the in-process native runtime has an in-flight loop to steer — the ACP
+    /// harness delegates the whole turn to an external agent process with no
+    /// such mid-turn channel, so a steer call on it is silently dropped.
+    fn steer(&self, _text: String) {}
 }
 
 /// Builds a `Harness`. The factory instance carries host-injected config,
@@ -143,6 +161,9 @@ mod tests {
         let (events, _rx) = broadcast::channel(16);
         SessionCtx {
             session_pk: "s1".into(),
+            project_id: None,
+            kind: SessionKind::Chat,
+            agent: None,
             work_dir: PathBuf::from("/tmp"),
             attachments_dir: None,
             perm_mode: PermMode::Default,

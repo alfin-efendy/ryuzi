@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { Project, Session, SessionStatus } from "../bindings";
-import { archivedCount, isUnreadVisible, orderProjects, sessionTitle, sessionsForProject, type SessionFilterCtx } from "./sidebar";
+import {
+  archivedCount,
+  chatSessions,
+  isUnreadVisible,
+  orderProjects,
+  sessionTitle,
+  sessionsForProject,
+  type SessionFilterCtx,
+} from "./sidebar";
 
 function sess(pk: string, projectId: string, title: string | null, lastActive = 0): Session {
   return {
@@ -17,6 +25,10 @@ function sess(pk: string, projectId: string, title: string | null, lastActive = 
     lastActive,
     resumeAttempts: 0,
     branchOwned: true,
+    kind: "project",
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   };
 }
 
@@ -61,6 +73,15 @@ describe("sidebar sessions", () => {
     expect(orderProjects(projects, "updated").map((p) => p.projectId)).toEqual(["z", "a"]);
     expect(orderProjects(projects, "name").map((p) => p.projectId)).toEqual(["a", "z"]);
   });
+
+  test("chat sessions bucket separately from project sessions", () => {
+    const sessions = [
+      { sessionPk: "c1", projectId: null, kind: "chat" },
+      { sessionPk: "p1", projectId: "proj", kind: "project" },
+    ] as any;
+    expect(chatSessions(sessions).map((s) => s.sessionPk)).toEqual(["c1"]);
+    expect(sessionsForProject(sessions, "proj", "", false, {}, {}, noFilter).map((s) => s.sessionPk)).toEqual(["p1"]);
+  });
 });
 
 // Distinct from the `sess` helper above (different field defaults); named to
@@ -79,7 +100,11 @@ function unreadSess(pk: string, lastActive: number | null): Session {
     lastActive,
     resumeAttempts: 0,
     branchOwned: false,
+    kind: "project",
     permMode: "default",
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   };
 }
 

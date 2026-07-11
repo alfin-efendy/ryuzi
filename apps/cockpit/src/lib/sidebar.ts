@@ -26,7 +26,9 @@ export type SessionFilterCtx = {
 };
 
 // Sessions shown under one project row: query-filtered, archived hidden unless
-// revealed, status/unread filtered, pinned first, newest first within each group.
+// revealed, status/unread filtered, pinned first, newest first within each
+// group. `kind === "project"` is required too — chat/worker/review sessions
+// carry `projectId: null` and must never leak into a project's bucket.
 export function sessionsForProject(
   sessions: Session[],
   projectId: string,
@@ -39,7 +41,7 @@ export function sessionsForProject(
   const q = query.trim().toLowerCase();
   const statusActive = Object.keys(filter.statuses).length > 0;
   return sessions
-    .filter((s) => s.projectId === projectId)
+    .filter((s) => s.projectId === projectId && s.kind === "project")
     .filter((s) => !q || sessionTitle(s).toLowerCase().includes(q))
     .filter((s) => showArchived || !archived[s.sessionPk])
     .filter((s) => !statusActive || filter.statuses[s.status])
@@ -49,6 +51,11 @@ export function sessionsForProject(
       if (pin !== 0) return pin;
       return (b.lastActive ?? 0) - (a.lastActive ?? 0);
     });
+}
+
+// Chat-first sessions (no project attached) — the sidebar's own "Chat" bucket.
+export function chatSessions(sessions: Session[]): Session[] {
+  return sessions.filter((s) => s.kind === "chat");
 }
 
 export function archivedCount(sessions: Session[], projectId: string, archived: Record<string, true>): number {

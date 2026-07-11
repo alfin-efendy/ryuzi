@@ -48,5 +48,5 @@ test("contextCompacted is a safe no-op for store state", () => {
     after_tokens: 20000,
     window_number: 1,
   } as never);
-  expect(useStore.getState().contextUsage["s1"]).toBeUndefined();
+  expect(useStore.getState().contextUsage.s1).toBeUndefined();
 });

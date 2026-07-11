@@ -498,7 +498,7 @@ mod tests {
             .store
             .insert_session(ryuzi_core::Session {
                 session_pk: "s1".into(),
-                project_id: "p1".into(),
+                project_id: Some("p1".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -510,6 +510,10 @@ mod tests {
                 created_at: Some(1),
                 last_active: Some(1),
                 resume_attempts: 0,
+                kind: ryuzi_core::SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
@@ -517,7 +521,7 @@ mod tests {
             .store
             .insert_session(ryuzi_core::Session {
                 session_pk: "s2".into(),
-                project_id: "p1".into(),
+                project_id: Some("p1".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -529,6 +533,10 @@ mod tests {
                 created_at: Some(2),
                 last_active: Some(2),
                 resume_attempts: 0,
+                kind: ryuzi_core::SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
@@ -553,7 +561,7 @@ mod tests {
             .store
             .insert_session(ryuzi_core::Session {
                 session_pk: "s1".into(),
-                project_id: "p1".into(),
+                project_id: Some("p1".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -565,6 +573,10 @@ mod tests {
                 created_at: Some(1),
                 last_active: Some(1),
                 resume_attempts: 0,
+                kind: ryuzi_core::SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
@@ -572,7 +584,7 @@ mod tests {
             .store
             .insert_session(ryuzi_core::Session {
                 session_pk: "s2".into(),
-                project_id: "p1".into(),
+                project_id: Some("p1".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
@@ -584,6 +596,10 @@ mod tests {
                 created_at: Some(2),
                 last_active: Some(2),
                 resume_attempts: 0,
+                kind: ryuzi_core::SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
