@@ -248,6 +248,46 @@ phase's async delegation).
 
 ---
 
+## Background rail & async delegation
+
+The daemon owns a durable **background rail** (`background_events` table,
+migration #23) so work that finishes outside a chat's current turn can still
+find its way back into that chat, even across a daemon restart.
+
+- **Rail delivery is idle-only.** A producer (async delegation, a scheduled
+  job, etc.) enqueues a row targeting a `session_pk`. The drainer only
+  delivers a row when that session is actually idle — it injects the payload
+  as a **new user turn** via `continue_session_with_prompt`. It never
+  interrupts a turn in progress. Delivered rows are kept as history; rows are
+  never lost to a daemon restart because the queue lives in SQLite, not
+  memory.
+- **`task` with `background: true`.** The native `task` tool accepts a
+  `background: true` flag: the child subtask runs as a detached in-process
+  worker instead of blocking the parent turn, and the parent gets an
+  immediate "dispatched" acknowledgement. Capacity is the same shared
+  `max_concurrent_runs` setting (`n`, default 3) that already caps
+  orchestrator fan-out and sync task batches — at capacity a background
+  dispatch is **rejected with a fallback-to-sync note**, not queued, so
+  callers never get a delegation stuck waiting behind someone else's slot.
+- **Completion re-entry.** When a background child finishes, its report is
+  summary-budgeted (head/tail-trimmed to a token-derived character cap; an
+  over-cap report spills the full text to a file under
+  `state_dir()/chat/<session_pk>/delegations/` and the summary's footer
+  points at it, so a `read`-paging call recovers the full result), wrapped in
+  Hermes' verbatim `[ASYNC DELEGATION COMPLETE — {id}]` block, and enqueued
+  to the rail (`kind: "delegation"`) targeting the parent session.
+- **Session-end cleanup.** Ending a session cancels any of its still-running
+  background workers and deletes its pending (undelivered) rail rows, so a
+  chat that ends mid-delegation never has an orphaned turn reappear in a
+  later, unrelated session.
+- **Cron via the rail.** Scheduled-job output no longer notifies out of band
+  — it delivers through the same rail (`kind: "job"`) to the job's home
+  session. Jobs also gained an optional per-job `model_override`, letting a
+  job start its session on a specific model instead of the project/agent
+  default.
+
+---
+
 ## Auxiliary model settings
 
 Three secondary (non-primary-turn) LLM calls each read their own optional
