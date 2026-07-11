@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Copy, Plus, Search, SquareTerminal, X } from "lucide-react";
 import { useNav, clampPanelSize, BOTTOM_HEIGHT } from "@/store-nav";
 import { useTerms } from "@/store-terms";
-import { sessKey } from "@/lib/session-key";
+import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 import { attach, detach, getTerm, refit, type TermInstance } from "@/lib/term-cache";
 import { Button, Input } from "@ryuzi/ui";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
@@ -37,7 +37,11 @@ export function BottomTerminalDrawer({ runnerId, sessionPk, projectName }: { run
   // empties. ensureOne self-guards on existing tabs + an in-flight open, so this
   // is StrictMode-safe. Closing the last tab therefore leaves the drawer empty
   // (see the empty state below) instead of instantly respawning a terminal.
+  // Belt-and-suspenders: SessionView's render guard is what actually keeps this
+  // component from mounting for a remote session, but a local ConPTY/bash has
+  // no meaning on a remote host either way, so refuse to spawn one here too.
   useEffect(() => {
+    if (runnerId !== LOCAL_RUNNER) return;
     void ensureOne(runnerId, sessionPk);
   }, [runnerId, sessionPk, ensureOne]);
 

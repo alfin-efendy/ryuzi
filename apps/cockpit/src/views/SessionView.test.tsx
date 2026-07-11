@@ -1,0 +1,174 @@
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { cleanup, render, screen } from "@testing-library/react";
+import type { CmdError, OpenTarget, Project, Result, Session } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
+
+// --- @/bindings: only the commands actually reachable from the mount paths
+// exercised below need a real implementation; everything else stays absent
+// so an accidental new call fails loudly instead of silently no-op'ing.
+const openInTargets: OpenTarget[] = [{ id: "vscode", name: "VS Code" }];
+const listOpenTargets = mock(() => Promise.resolve(openInTargets));
+const openIn = mock((): Promise<Result<null, CmdError>> => Promise.resolve({ status: "ok", data: null }));
+const sessionWorkdir = mock(
+  (_runnerId: string, _sessionPk: string): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "C:\\code\\demo" }),
+);
+const nativeCommands = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+// TodoPanel (always mounted by SessionView) fires this on mount — stubbed ok:[]
+// so its effect resolves cleanly; TodoPanel itself renders null for an empty list.
+const sessionTodos = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+
+mock.module("@/bindings", () => ({
+  commands: { listOpenTargets, openIn, sessionWorkdir, nativeCommands, sessionTodos },
+  events: { coreEventMsg: { listen: async () => () => {} } },
+}));
+// useComposerAttachments registers a Tauri drag-drop listener on mount (see HomeView.test.tsx).
+mock.module("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({ onDragDropEvent: () => Promise.resolve(() => {}) }),
+}));
+
+// Transcript is unrelated to the remote-runner gate under test and pulls in
+// markdown rendering — stub it so this test stays focused and fast. Deliberately
+// NOT stubbing RightPanel/TodoPanel here: bun's mock.module() replaces a module
+// for the whole test run (all files share one process), and both of those
+// already have their own dedicated *.test.tsx that import the real component —
+// stubbing them here would silently break those other files. RightPanel is
+// safe to leave real because nav.rightOpen defaults false, so it never mounts
+// in these tests anyway; TodoPanel is handled via the sessionTodos stub above.
+mock.module("@/components/transcript/Transcript", () => ({ Transcript: () => null }));
+
+// Stand-in for the real drawer (which pulls in xterm + store-terms) — a spy so
+// the test can assert whether the PTY drawer mounts at all, which is the
+// load-bearing behavior for this task (P4-4). No other test file imports the
+// real BottomTerminalDrawer, so mocking it here is safe.
+const drawerMounts: Array<{ runnerId: string; sessionPk: string }> = [];
+mock.module("@/components/session/BottomTerminalDrawer", () => ({
+  BottomTerminalDrawer: (props: { runnerId: string; sessionPk: string }) => {
+    drawerMounts.push({ runnerId: props.runnerId, sessionPk: props.sessionPk });
+    return <div data-testid="bottom-terminal-drawer" />;
+  },
+}));
+
+const { SessionView } = await import("./SessionView");
+const { useStore } = await import("@/store");
+const { useNav } = await import("@/store-nav");
+const { useConnections } = await import("@/store-connections");
+
+function project(overrides: Partial<Project> = {}): Project {
+  return {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:\\code\\demo",
+    source: null,
+    model: null,
+    effort: null,
+    permMode: "default",
+    createdAt: 1,
+    isGit: true,
+    ...overrides,
+  };
+}
+
+function session(runnerId: string, overrides: Partial<Session> = {}): Session & { runnerId: string } {
+  return {
+    runnerId,
+    sessionPk: "s1",
+    projectId: "p1",
+    agentSessionId: null,
+    worktreePath: null,
+    branch: null,
+    title: "demo session",
+    status: "idle",
+    permMode: "default",
+    startedBy: "cockpit",
+    createdAt: 1,
+    lastActive: 1,
+    resumeAttempts: 0,
+    branchOwned: false,
+    kind: "project",
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
+    ...overrides,
+  };
+}
+
+function seed(runnerId: string) {
+  useStore.setState({
+    sessions: [session(runnerId)],
+    projects: [project()],
+    focusedSession: { runnerId, pk: "s1" },
+    transcripts: {},
+    pendingApprovals: [],
+  });
+  // loaded: true keeps the mount effect from hydrating connections over IPC.
+  useConnections.setState({ loaded: true });
+}
+
+beforeEach(() => {
+  drawerMounts.length = 0;
+  listOpenTargets.mockClear();
+});
+
+afterEach(() => {
+  cleanup();
+  useNav.setState({ bottomOpen: false });
+  useConnections.setState({ loaded: false, catalog: [], connections: [] });
+});
+
+test("local session with the bottom panel open: terminal drawer mounts and both controls are enabled", async () => {
+  useNav.setState({ bottomOpen: true });
+  seed(LOCAL_RUNNER);
+  render(<SessionView />);
+
+  expect(await screen.findByTestId("bottom-terminal-drawer")).toBeTruthy();
+  // SessionView re-renders a few times as its mount effects settle (workdir,
+  // native commands, ...) — each re-render re-invokes the spy, so assert on
+  // the props it was given rather than an exact call count.
+  expect(drawerMounts.length).toBeGreaterThan(0);
+  expect(drawerMounts.every((m) => m.runnerId === LOCAL_RUNNER && m.sessionPk === "s1")).toBe(true);
+
+  const toggleBtn = screen.getByRole("button", { name: "Toggle bottom panel" }) as HTMLButtonElement;
+  expect(toggleBtn.hasAttribute("disabled")).toBe(false);
+
+  const openInBtn = await screen.findByRole("button", { name: "Open in…" });
+  expect(openInBtn.hasAttribute("disabled")).toBe(false);
+  expect(listOpenTargets).toHaveBeenCalledTimes(1);
+});
+
+// This is the load-bearing case (see SessionView.tsx's render-guard comment):
+// nav.bottomOpen is a single global/persisted flag also toggled from
+// TitleBar, so it can very well already be true when the user switches INTO
+// a remote session — the render guard (not just disabling the toggle button)
+// is what stops a remote PTY from auto-spawning in that situation.
+test("remote session, even with the bottom panel already globally open: terminal drawer never mounts and both controls are disabled", async () => {
+  useNav.setState({ bottomOpen: true });
+  seed("gw-1");
+  render(<SessionView />);
+
+  // findByRole (not getByRole) so pending mount-effect state updates (workdir,
+  // native commands, ...) settle under act() before we assert, avoiding
+  // "not wrapped in act" console noise from updates landing after this test.
+  const toggleBtn = (await screen.findByRole("button", { name: "Toggle bottom panel" })) as HTMLButtonElement;
+  expect(screen.queryByTestId("bottom-terminal-drawer")).toBeNull();
+  expect(drawerMounts).toEqual([]);
+
+  expect(toggleBtn.hasAttribute("disabled")).toBe(true);
+  expect(toggleBtn.closest("span")?.getAttribute("title")).toBe("Not available for sessions on a remote runner");
+
+  const openInBtn = screen.getByRole("button", { name: "Open in…" }) as HTMLButtonElement;
+  expect(openInBtn.hasAttribute("disabled")).toBe(true);
+  expect(openInBtn.closest("span")?.getAttribute("title")).toBe("Not available for sessions on a remote runner");
+  expect(listOpenTargets).not.toHaveBeenCalled();
+});
+
+test("remote session with the bottom panel closed: toggling it stays a no-op (disabled) instead of opening the drawer", async () => {
+  useNav.setState({ bottomOpen: false });
+  seed("gw-1");
+  render(<SessionView />);
+
+  const toggleBtn = await screen.findByRole("button", { name: "Toggle bottom panel" });
+  toggleBtn.click();
+
+  expect(useNav.getState().bottomOpen).toBe(false);
+  expect(screen.queryByTestId("bottom-terminal-drawer")).toBeNull();
+});

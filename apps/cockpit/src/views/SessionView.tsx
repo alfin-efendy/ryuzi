@@ -52,6 +52,10 @@ export function SessionView() {
   );
   const session = sessions.find((s) => isSession(s, focusedSession));
   const runnerId = session?.runnerId ?? LOCAL_RUNNER;
+  // A local ConPTY/bash and locally-installed apps can't operate on a remote
+  // host's workdir — the bottom terminal drawer and Open-in menu are gated
+  // off entirely for sessions running on a non-local runner.
+  const isRemote = runnerId !== LOCAL_RUNNER;
   const composerFiles = useComposerAttachments(runnerId);
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
@@ -252,15 +256,22 @@ export function SessionView() {
           <div className="flex-1" />
           <OpenInMenu runnerId={runnerId} sessionPk={session.sessionPk} />
           <div className="mx-0.5 h-[18px] w-px bg-border" />
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            title="Toggle bottom panel"
-            onClick={nav.toggleBottom}
-            className={nav.bottomOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
-          >
-            <PanelBottom aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
-          </Button>
+          {/* The disabled Button gets pointer-events-none, so its own `title`
+              never fires a hover tooltip — a wrapping span (still hoverable)
+              carries the "why disabled" tooltip. The Button keeps its normal
+              title in both states so it still has a stable accessible name. */}
+          <span title={isRemote ? "Not available for sessions on a remote runner" : undefined}>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              title="Toggle bottom panel"
+              onClick={nav.toggleBottom}
+              disabled={isRemote}
+              className={nav.bottomOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
+            >
+              <PanelBottom aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+            </Button>
+          </span>
           <Button
             variant="ghost"
             size="icon-sm"
@@ -436,8 +447,15 @@ export function SessionView() {
           </div>
         </div>
 
-        {/* Bottom terminal drawer — a real shell in the session worktree */}
-        {nav.bottomOpen && <BottomTerminalDrawer runnerId={runnerId} sessionPk={session.sessionPk} projectName={projectName} />}
+        {/* Bottom terminal drawer — a real shell in the session worktree. Gating
+            on !isRemote here (not just disabling the toggle button) matters
+            because nav.bottomOpen is a global, localStorage-persisted flag also
+            toggled from TitleBar — without this render guard, switching into a
+            remote session while the panel is already open would auto-spawn a
+            PTY against a host that has none. */}
+        {nav.bottomOpen && !isRemote && (
+          <BottomTerminalDrawer runnerId={runnerId} sessionPk={session.sessionPk} projectName={projectName} />
+        )}
       </div>
 
       {/* Right panel — keyed by session so switching sessions remounts it: per-session
