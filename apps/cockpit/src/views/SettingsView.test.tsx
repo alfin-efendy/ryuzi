@@ -5,13 +5,17 @@ import type { CmdError, Result } from "@/bindings";
 const ok = <T,>(data: T): Result<T, CmdError> => ({ status: "ok", data });
 
 // Settings → Agent renders three cards from one heading:
-//   • AgentSection  — perm-mode segmented + default-model picker (store-agent).
+//   • AgentSection  — default-model picker, gated on store-agent's `loaded`.
 //   • AgentLoopCard — two numeric settings via commands.getSetting/setSetting.
 //   • PermissionsCard — pulls in @/store (core-event subscription on load).
 // A single @/bindings mock therefore has to satisfy all three.
 const MAX_TURNS_KEY = "agent.max_provider_turns";
 
-const getAgentSettings = mock(async () => ok({ model: "anthropic/claude-opus-4", permMode: "ask" as string | null }));
+type AgentSettings = { model: string | null; permMode: string | null };
+let getAgentSettingsImpl: () => Promise<Result<AgentSettings, CmdError>> = () =>
+  Promise.resolve(ok({ model: "anthropic/claude-opus-4", permMode: "ask" }));
+
+const getAgentSettings = mock(() => getAgentSettingsImpl());
 const setAgentSettings = mock(async (_model: string | null, _permMode: string | null) => ok(null));
 const listSelectableModels = mock(async () => ok(["smart", "anthropic/claude-opus-4"]));
 
@@ -59,33 +63,57 @@ beforeEach(() => {
   getSetting.mockClear();
   setSetting.mockClear();
   setSettingImpl = () => Promise.resolve({ status: "error", error: { message: "boom" } });
+  // Default: settings resolve immediately with a persisted default model, so
+  // existing tests that don't care about the loading window keep working.
+  getAgentSettingsImpl = () => Promise.resolve(ok({ model: "anthropic/claude-opus-4", permMode: "ask" }));
 });
 
 afterEach(() => {
   cleanup();
-  useAgent.setState({ models: [], model: null, permMode: null });
+  useAgent.setState({ models: [], model: null, permMode: null, loaded: false });
   getAgentSettings.mockClear();
   setAgentSettings.mockClear();
   listSelectableModels.mockClear();
 });
 
-test("Agent section renders with perm-mode segmented + model picker from the store", async () => {
+test("Agent section renders the default model picker, enabled once agent settings load", async () => {
   render(<SettingsView />);
   expect(screen.getByText("Agent")).toBeTruthy();
-  // Segmented renders one button per mode (idiom from RuntimeDetailView.test).
-  for (const label of ["Plan", "Ask", "Edit", "Full"]) {
-    expect(screen.getByRole("button", { name: label })).toBeTruthy();
-  }
   // load() populated the picker with the persisted default model.
   await waitFor(() => expect(screen.getByRole("combobox", { name: "Default model" }).textContent).toContain("claude-opus-4"));
+  expect(useAgent.getState().loaded).toBe(true);
+  expect((screen.getByRole("combobox", { name: "Default model" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
-test("picking a permission mode persists model + mode via set_agent_settings", async () => {
+test("the permission-mode row was dropped from the Agent card", async () => {
   render(<SettingsView />);
   await waitFor(() => expect(getAgentSettings).toHaveBeenCalled());
+  expect(screen.queryByText("Permission mode")).toBeNull();
+  for (const label of ["Plan", "Ask", "Edit", "Full"]) {
+    expect(screen.queryByRole("button", { name: label })).toBeNull();
+  }
+});
+
+test("changing the default model persists it with the hydrated permMode via set_agent_settings", async () => {
+  render(<SettingsView />);
   await waitFor(() => expect(useAgent.getState().model).toBe("anthropic/claude-opus-4"));
-  fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-  await waitFor(() => expect(setAgentSettings).toHaveBeenCalledWith("anthropic/claude-opus-4", "edit"));
+  await useAgent.getState().setModel("smart");
+  expect(setAgentSettings).toHaveBeenCalledWith("smart", "ask");
+});
+
+test("the default model picker stays disabled when the agent-settings load fails, even though the model list is available", async () => {
+  // Promise.all in store-agent's load() settles both calls together; a
+  // real-world timeout/error on getAgentSettings can still land alongside a
+  // successful listSelectableModels response, so models.length > 0 while
+  // loaded stays false. The picker must render inert in that state, not
+  // silently accept a click that would round-trip null model/permMode.
+  getAgentSettingsImpl = () => Promise.resolve({ status: "error", error: { message: "boom" } });
+  render(<SettingsView />);
+
+  const picker = (await screen.findByRole("combobox", { name: "Default model" })) as HTMLButtonElement;
+  await waitFor(() => expect(listSelectableModels).toHaveBeenCalled());
+  expect(useAgent.getState().loaded).toBe(false);
+  expect(picker.disabled).toBe(true);
 });
 
 test("About tagline tells the native story, not Claude Code", async () => {

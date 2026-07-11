@@ -1,14 +1,4 @@
-import {
-  ACCENTS,
-  Button,
-  Input,
-  type Mode,
-  Segmented,
-  SettingsCard as Card,
-  SettingsCardRow as CardRow,
-  Switch,
-  useTheme,
-} from "@ryuzi/ui";
+import { ACCENTS, Button, Input, type Mode, SettingsCard as Card, SettingsCardRow as CardRow, Switch, useTheme } from "@ryuzi/ui";
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
@@ -16,7 +6,7 @@ import { toast } from "sonner";
 import { commands } from "@/bindings";
 import { ModelPicker } from "@/components/ModelPicker";
 import { PermissionsCard } from "@/components/PermissionsCard";
-import { PERM_MODES, PROJECTS_ROOT_KEY, type UiPermMode } from "@/constants";
+import { PROJECTS_ROOT_KEY } from "@/constants";
 import { useAgent } from "@/store-agent";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
 import { normalizeLoopSetting } from "@/lib/loop-settings";
@@ -184,38 +174,28 @@ function AccentRow() {
 }
 
 // ——— Agent (native) settings ———
-// The two knobs that survived the Runtime menu: default model + permission
-// mode, persisted in the engine settings KV via store-agent.
+// The default model, persisted in the engine settings KV via store-agent.
+// The permission-mode knob that used to live in this card was dropped per
+// review (dead at runtime — the composer's per-project permission control at
+// @/constants' PERM_MODES / uiPermToCore is the one that actually gates
+// tool calls). The picker stays inert until store-agent finishes hydrating,
+// so an early interaction can't round-trip null model/permMode and wipe the
+// persisted settings.
 
 function AgentSection() {
   const models = useAgent((s) => s.models);
   const model = useAgent((s) => s.model);
-  const permMode = useAgent((s) => s.permMode);
+  const loaded = useAgent((s) => s.loaded);
   const setModel = useAgent((s) => s.setModel);
-  const setPermMode = useAgent((s) => s.setPermMode);
 
   useEffect(() => {
     void useAgent.getState().load();
   }, []);
 
-  const permUi: UiPermMode = permMode ?? "ask";
-  const permDesc = PERM_MODES.find((m) => m.id === permUi)?.desc ?? "";
-
   return (
     <>
       <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">Agent</div>
       <Card>
-        <div className="flex flex-col gap-2 border-b border-border px-[18px] py-3">
-          <div className="flex items-center gap-3">
-            <span className="flex-1 text-[13px] font-medium">Permission mode</span>
-            <Segmented
-              options={PERM_MODES.map((m) => ({ id: m.id, label: m.label }))}
-              value={permUi}
-              onChange={(mode) => void setPermMode(mode)}
-            />
-          </div>
-          <div className="text-right text-[11.5px] text-muted-foreground">{permDesc}</div>
-        </div>
         <CardRow>
           <span className="w-[110px] shrink-0 text-[13px] font-medium">Default model</span>
           {models.length > 0 ? (
@@ -226,6 +206,7 @@ function AgentSection() {
               leading={[{ value: "", label: "Router default (first usable provider)" }]}
               value={model ?? ""}
               onValueChange={(v) => void setModel(v === "" ? null : v)}
+              disabled={!loaded}
             />
           ) : (
             <span className="flex-1 truncate text-xs text-muted-foreground">
