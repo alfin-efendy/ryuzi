@@ -5,7 +5,8 @@
 use super::agents::{Agent, AgentRegistry};
 use super::commands::CommandRegistry;
 use super::context_manager::{
-    compaction::CompactionOutcome, is_context_overflow, ContextConfig, ContextManager,
+    compaction::CompactionOutcome, is_context_overflow, truncate_for_context, ContextConfig,
+    ContextManager,
 };
 use super::iteration_budget::{IterationBudget, PARENT_MAX_ITERS, SUBAGENT_MAX_ITERS};
 use super::llm::LlmStream;
@@ -42,6 +43,11 @@ const DEFAULT_MAX_PROVIDER_TURNS: usize = 50;
 /// Flush the streaming-text buffer into a persisted row at this size or on a
 /// newline, whichever comes first (keeps rows delta-shaped without spamming).
 const TEXT_FLUSH_BYTES: usize = 120;
+/// Cap on the `tool.after` hook payload's result/output text — the tool's
+/// own `for_model` text is already model-facing (not raw secret material),
+/// but an external hook script is a different trust boundary than the LLM,
+/// so the observational payload still gets a hard size ceiling.
+const TOOL_AFTER_OUTPUT_BYTES: usize = 2_000;
 
 /// Everything one native session needs to run turns. Built by
 /// [`super::NativeHarness::start_session`]. Cloneable so a sub-agent spawner
@@ -1302,7 +1308,7 @@ async fn run_tool_call(
     // Plugin hooks: a `tool.before` hook may deny the call.
     let hook = super::hooks::run(
         &deps.work_dir,
-        "tool.before",
+        super::hooks::HookEvent::ToolBefore,
         &json!({ "tool": t.name, "input": input }),
     )
     .await;
@@ -1377,31 +1383,53 @@ async fn run_tool_call(
             project_id: deps.project_id.clone(),
         })),
     };
-    match tool.execute(&ctx, input).await {
+    // Keep a copy for the `tool.after` payload below — `execute` consumes
+    // `input` by value.
+    let hook_input = input.clone();
+    let (tool_use_result, after_summary) = match tool.execute(&ctx, input).await {
         Ok(mut out) => {
             let extras = merge_display_duration(out.display.take(), elapsed_ms(started));
             finish_tool_row_with_display(deps, &t.id, &out.for_model, out.is_error, Some(extras))
                 .await;
-            match out.model_blocks.take() {
+            let is_error = out.is_error;
+            let summary = json!({
+                "ok": !is_error,
+                "output": truncate_for_context(&out.for_model, TOOL_AFTER_OUTPUT_BYTES),
+            });
+            let result = match out.model_blocks.take() {
                 Some(mut blocks) => {
                     blocks.push(json!({ "type": "text", "text": out.for_model }));
                     json!({
                         "type": "tool_result",
                         "tool_use_id": t.id,
                         "content": blocks,
-                        "is_error": out.is_error,
+                        "is_error": is_error,
                     })
                 }
-                None => tool_result(&t.id, &out.for_model, out.is_error),
-            }
+                None => tool_result(&t.id, &out.for_model, is_error),
+            };
+            (result, summary)
         }
         Err(e) => {
             let msg = format!("{}: {e}", t.name);
             let extras = merge_display_duration(None, elapsed_ms(started));
             finish_tool_row_with_display(deps, &t.id, &msg, true, Some(extras)).await;
-            tool_result(&t.id, &msg, true)
+            let summary = json!({
+                "ok": false,
+                "error": truncate_for_context(&msg, TOOL_AFTER_OUTPUT_BYTES),
+            });
+            (tool_result(&t.id, &msg, true), summary)
         }
-    }
+    };
+    // Observational: never gates, result ignored. Fires for both Ok and Err
+    // outcomes now that the `ToolOutput` (or its error) has resolved.
+    let _ = super::hooks::run(
+        &deps.work_dir,
+        super::hooks::HookEvent::ToolAfter,
+        &json!({ "tool": t.name, "input": hook_input, "result": after_summary }),
+    )
+    .await;
+    tool_use_result
 }
 
 /// Insert the initial `tool_call` row (`{name, input}`, in_progress).
@@ -2166,6 +2194,53 @@ mod tests {
             steer: SteerBuffer::new(),
             background: super::super::background::BackgroundRegistry::new(),
         }
+    }
+
+    /// Feature C1a: a real tool call (the bash tool, actually executed —
+    /// `deps_at` sets `BypassPermissions`) must fire the `tool.after` hook
+    /// once it resolves, carrying the tool name, its input, and a compact
+    /// ok/output summary. This is distinct from the `hooks::run` unit tests
+    /// in `hooks.rs`: it proves the real `run_tool_call` call site actually
+    /// dispatches the event, not just that the dispatcher's contract is
+    /// correct in isolation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_after_hook_fires_once_the_tool_call_resolves() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook_dir = dir.path().join(".ryuzi/hooks/tool.after");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let capture = dir.path().join("captured.json");
+        let script = hook_dir.join("capture.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > {}\n", capture.display())).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let selection = route_selection("a", "Primary");
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (selection.clone(), tool_turn()),
+            (selection, final_turn("done")),
+        ]));
+        let deps = deps_at(dir.path(), llm).await;
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let captured: Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).unwrap()).unwrap();
+        assert_eq!(captured["tool"], "bash");
+        assert_eq!(captured["input"]["command"], "echo route");
+        assert_eq!(captured["result"]["ok"], true);
+        assert!(captured["result"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("route"));
     }
 
     #[tokio::test]

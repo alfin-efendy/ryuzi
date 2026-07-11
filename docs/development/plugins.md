@@ -822,17 +822,26 @@ MCP server) use hook scripts, not the manifest — see
 ```
 
 one executable per file, run in filename-sorted order, receiving the event
-payload as JSON on stdin. Only one event actually fires today: `tool.before`,
-a gating event dispatched from the native runner (`harness::native::runner`)
-before every tool call — a non-zero exit denies the action and the script's
-stdout becomes the shown reason. The `hooks::run` helper is event-name-generic
-(it would run any `.ryuzi/hooks/<event>/` directory's scripts), and
-`session.start`/`tool.after` event names exist in earlier design notes, but
-nothing in the native runner currently calls `hooks::run` for them — do not
-document them as observational hooks that fire; treat this as a future
-gap, not shipped behavior, until a call site exists. A missing hooks
-directory, or a script that isn't executable, is treated as "allow" — never
-a hard failure.
+payload as JSON on stdin. The typed event vocabulary (`hooks::HookEvent`) has
+four members, all dispatched from the native runtime (`harness::native`):
+
+| Event | Fires | Gating? | Payload |
+| --- | --- | --- | --- |
+| `session.start` | `NativeHarness::start_session`, after model/agent resolution | No (observational) | `{ session, project, model, work_dir }` |
+| `tool.before` | `harness::native::runner`, before every tool call | **Yes** | `{ tool, input }` |
+| `tool.after` | `harness::native::runner`, after the tool call resolves (Ok or Err) | No (observational) | `{ tool, input, result: { ok, output } }` or `{ tool, input, result: { ok: false, error } }` |
+| `session.end` | `NativeSession::end` — the sole teardown path reached from `ControlPlane::end_session` (never from a `stop_session` interrupt) | No (observational) | `{ session, reason }` |
+
+Only `tool.before` is gating: a non-zero exit denies the action and the
+script's stdout becomes the shown reason. Every other event is
+fire-and-forget — a non-zero exit from an observational hook is ignored
+(the remaining scripts still run, and the tool/session outcome is
+unaffected). `tool.after`'s `result.output`/`result.error` is truncated
+(2,000 bytes) before being written to the hook's stdin; it is not a
+secrets-scrubbed channel beyond that — it carries the same model-facing text
+the tool already returned to the LLM, not raw untouched process output. A
+missing hooks directory, or a script that isn't executable, is treated as
+"allow" — never a hard failure.
 
 ---
 

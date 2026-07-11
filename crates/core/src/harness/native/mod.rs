@@ -35,6 +35,7 @@ use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPr
 use crate::plugins::{CorePlugin, PluginSource};
 use async_trait::async_trait;
 use ryuzi_plugin_sdk::PluginManifest;
+use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -137,6 +138,19 @@ impl Harness for NativeHarness {
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
         let agent = agents.default_agent();
+        // Plugin hooks: observational — a `session.start` hook is notified but
+        // cannot block startup (only `tool.before` gates).
+        let _ = hooks::run(
+            &ctx.work_dir,
+            hooks::HookEvent::SessionStart,
+            &json!({
+                "session": ctx.session_pk.clone(),
+                "project": ctx.project_id.clone(),
+                "model": model.clone(),
+                "work_dir": ctx.work_dir.display().to_string(),
+            }),
+        )
+        .await;
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
         let mcp_tools = connect_mcp_tools(&ctx.mcp_servers).await;
@@ -249,6 +263,17 @@ impl HarnessSession for NativeSession {
         if let Some(tok) = self.live_cancel.lock().unwrap().as_ref() {
             tok.cancel();
         }
+        // Plugin hooks: observational `session.end`. `end()` is called from
+        // exactly one place — `ControlPlane::end_session`'s teardown, the
+        // sole path that removes the live handle from `running` — so this
+        // fires once per real session end, never on a `stop_session`
+        // interrupt (which cancels but does not `end()`).
+        let _ = hooks::run(
+            &self.deps.work_dir,
+            hooks::HookEvent::SessionEnd,
+            &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
+        )
+        .await;
         Ok(())
     }
 
@@ -401,6 +426,91 @@ mod tests {
         assert!(plugin.harness.is_some());
         assert!(plugin.gateway.is_none());
         assert!(plugin.connector.is_none());
+    }
+
+    /// Feature C1b: `start_session` must fire the `session.start` hook
+    /// (observational) once the model/agent are resolved, carrying the
+    /// session id, project id, model, and work_dir. This exercises the real
+    /// `NativeHarness::start_session` call site, not just `hooks::run`'s
+    /// dispatcher contract (covered separately in `hooks.rs`).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn start_session_fires_the_session_start_hook() {
+        use serde_json::Value;
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let hook_dir = dir.path().join(".ryuzi/hooks/session.start");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let capture = dir.path().join("captured.json");
+        let script = hook_dir.join("capture.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > {}\n", capture.display())).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let factory = Arc::new(ScriptedFactory { turns: vec![] });
+        let plugin = native_plugin_with_llm_factory(factory);
+        let harness = plugin.harness.unwrap().create().unwrap();
+        let _session = harness
+            .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
+            .await
+            .unwrap();
+
+        let captured: Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).unwrap()).unwrap();
+        assert_eq!(captured["session"], "sess");
+        assert_eq!(captured["work_dir"], dir.path().display().to_string());
+        // `project`/`model` are present regardless of what they resolve to —
+        // the shape of the payload is what this test asserts, not the native
+        // model-routing outcome for a fresh store with no connections.
+        assert!(captured.get("project").is_some());
+        assert!(captured.get("model").is_some());
+    }
+
+    /// Feature C1c: the session-teardown seam is `NativeSession::end()` —
+    /// the only place `HarnessSession::end` is invoked is
+    /// `ControlPlane::end_session`'s real teardown (never the
+    /// interrupt-only `stop_session` path), so firing `session.end` there
+    /// fires exactly once per real session end. Also proves the hook is NOT
+    /// fired merely by starting a session.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn end_fires_the_session_end_hook() {
+        use serde_json::Value;
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let hook_dir = dir.path().join(".ryuzi/hooks/session.end");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let capture = dir.path().join("captured.json");
+        let script = hook_dir.join("capture.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > {}\n", capture.display())).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let factory = Arc::new(ScriptedFactory { turns: vec![] });
+        let plugin = native_plugin_with_llm_factory(factory);
+        let harness = plugin.harness.unwrap().create().unwrap();
+        let session = harness
+            .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
+            .await
+            .unwrap();
+
+        assert!(!capture.exists(), "session.end must not fire before end()");
+        session.end().await.unwrap();
+
+        let captured: Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).unwrap()).unwrap();
+        assert_eq!(captured["session"], "sess");
+        assert_eq!(captured["reason"], "ended");
     }
 
     #[tokio::test]
