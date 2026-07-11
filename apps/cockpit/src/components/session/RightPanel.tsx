@@ -14,10 +14,57 @@ import { SubagentList } from "@/components/session/SubagentList";
 import { DiffStat } from "@/components/common/bits";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
 
-type TargetFetch = { target: PendingReview; status: "pending" | "fulfilled" | "rejected" };
+type TargetFetch = {
+  target: PendingReview;
+  revision: number;
+  status: "pending" | "fulfilled" | "rejected";
+  promise: Promise<void>;
+};
 
 function samePendingReview(a: PendingReview | null, b: PendingReview | null): boolean {
   return a?.sessionPk === b?.sessionPk && a?.path === b?.path;
+}
+
+let observedPendingReview = useDiff.getState().pendingReview;
+let pendingReviewRevision = observedPendingReview === null ? 0 : 1;
+let currentTargetFetch: TargetFetch | null = null;
+
+// `pendingReview` has no request ID, so observe its value at the store boundary
+// and assign every target occurrence a generation that survives panel remounts.
+useDiff.subscribe((state) => {
+  if (samePendingReview(observedPendingReview, state.pendingReview)) return;
+  observedPendingReview = state.pendingReview;
+  pendingReviewRevision += 1;
+  currentTargetFetch = null;
+});
+
+function startTargetFetch(target: PendingReview, fetchDiff: (sessionPk: string) => Promise<void>): TargetFetch {
+  let resolveCompletion!: () => void;
+  const attempt: TargetFetch = {
+    target,
+    revision: pendingReviewRevision,
+    status: "pending",
+    promise: new Promise((resolve) => {
+      resolveCompletion = resolve;
+    }),
+  };
+  currentTargetFetch = attempt;
+
+  const settle = (status: TargetFetch["status"]) => {
+    if (currentTargetFetch === attempt) attempt.status = status;
+    resolveCompletion();
+  };
+
+  try {
+    void fetchDiff(target.sessionPk).then(
+      () => settle("fulfilled"),
+      () => settle("rejected"),
+    );
+  } catch {
+    settle("rejected");
+  }
+
+  return attempt;
 }
 
 export function RightPanel({
@@ -49,8 +96,7 @@ export function RightPanel({
   // Auto-refresh the file tree when a running turn ends — the agent may have
   // created or removed files while it was running.
   const prevRunning = useRef(running);
-  const targetFetch = useRef<TargetFetch | null>(null);
-  const [targetFetchSettled, setTargetFetchSettled] = useState<PendingReview | null>(null);
+  const [targetFetchSettled, setTargetFetchSettled] = useState<TargetFetch | null>(null);
   useEffect(() => {
     if (prevRunning.current && !running) setTreeRefresh((n) => n + 1);
     prevRunning.current = running;
@@ -64,49 +110,44 @@ export function RightPanel({
     void fetchDiff(sessionPk);
   }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit]);
 
-  // Each same-session transcript target owns exactly one fresh fetch. Record
-  // its settlement independently of the shared diff loading flag: a rejected
-  // fetch may leave the store loading, while a Result error preserves files.
+  // Each same-session transcript target owns one global attempt. Its revision
+  // distinguishes repeated equal targets (A -> B -> A) and keeps an unresolved
+  // attempt available to a remounted panel.
   useEffect(() => {
     const target = pendingReview?.sessionPk === sessionPk ? pendingReview : null;
     if (target === null) {
-      if (targetFetch.current !== null) targetFetch.current = null;
       if (targetFetchSettled !== null) setTargetFetchSettled(null);
       return;
     }
-    if (samePendingReview(targetFetch.current?.target ?? null, target)) return;
 
-    targetFetch.current = { target, status: "pending" };
+    const attempt =
+      currentTargetFetch !== null &&
+      currentTargetFetch.revision === pendingReviewRevision &&
+      samePendingReview(currentTargetFetch.target, target)
+        ? currentTargetFetch
+        : startTargetFetch(target, fetchDiff);
+
     setTargetFetchSettled(null);
-    void fetchDiff(sessionPk).then(
-      () => {
-        if (samePendingReview(targetFetch.current?.target ?? null, target)) {
-          targetFetch.current = { target, status: "fulfilled" };
-          setTargetFetchSettled(target);
-        }
-      },
-      () => {
-        if (samePendingReview(targetFetch.current?.target ?? null, target)) {
-          targetFetch.current = { target, status: "rejected" };
-          setTargetFetchSettled(target);
-        }
-      },
-    );
+    void attempt.promise.then(() => {
+      if (currentTargetFetch === attempt && attempt.revision === pendingReviewRevision) {
+        setTargetFetchSettled(attempt);
+      }
+    });
   }, [pendingReview, fetchDiff, sessionPk]);
 
-  // Consume a pending jump only after its exact target-scoped fetch has
+  // Consume a pending jump only after its exact target-scoped attempt has
   // settled. Result errors deliberately retain old files in the store, so do
   // not select from them; rejected fetches clear without waiting for loading.
   useEffect(() => {
     if (pendingReview === null || pendingReview.sessionPk !== sessionPk) return;
-    if (!samePendingReview(targetFetchSettled, pendingReview)) return;
-    const status = targetFetch.current?.status;
-    if (status === "pending" || status === undefined) return;
-    if (status === "fulfilled" && !diff.loading && diff.error === null) {
+    const attempt = currentTargetFetch;
+    if (attempt === null || targetFetchSettled !== attempt || attempt.status === "pending") return;
+    if (attempt.revision !== pendingReviewRevision || !samePendingReview(attempt.target, pendingReview)) return;
+    if (attempt.status === "fulfilled" && !diff.loading && diff.error === null) {
       const idx = reviewFileIndex(diff.files, pendingReview.path);
       if (idx >= 0) setReviewFile(idx);
     }
-    targetFetch.current = null;
+    currentTargetFetch = null;
     setTargetFetchSettled(null);
     setPendingReview(null);
   }, [pendingReview, diff.files, diff.loading, diff.error, targetFetchSettled, setPendingReview, sessionPk]);

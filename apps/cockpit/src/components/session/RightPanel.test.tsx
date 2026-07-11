@@ -176,6 +176,76 @@ test("pending review target stays pending while its fresh diff fetch is still lo
   expect(screen.getByText("app.ts")).toBeTruthy();
 });
 
+test("A -> B -> A target fetches do not let stale completions settle the latest A", async () => {
+  const deferred: Array<{ resolve: (result: Result<string, CmdError>) => void }> = [];
+  gitDiff.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        deferred.push({ resolve });
+      }),
+  );
+  const targetA = { sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" };
+  const targetB = { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" };
+  useDiff.setState({ pendingReview: targetA });
+
+  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledTimes(1));
+
+  await act(async () => {
+    useDiff.setState({ pendingReview: targetB });
+  });
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledTimes(2));
+
+  await act(async () => {
+    useDiff.setState({ pendingReview: targetA });
+  });
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledTimes(3));
+
+  await act(async () => {
+    deferred[0]?.resolve({ status: "ok", data: APP_DIFF });
+    deferred[1]?.resolve({ status: "ok", data: APP_DIFF });
+  });
+  expect(useDiff.getState().pendingReview).toEqual(targetA);
+
+  await act(async () => {
+    deferred[2]?.resolve({ status: "ok", data: FRESH_DIFF });
+  });
+  await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
+  expect(gitDiff).toHaveBeenCalledTimes(3);
+  expect(screen.getByTitle("src/fresh.ts").className).toContain("bg-accent");
+  expect(screen.getByText("const fresh = true;")).toBeTruthy();
+});
+
+test("remount attaches to an unresolved target fetch instead of fetching again", async () => {
+  let resolveDiff!: (result: Result<string, CmdError>) => void;
+  gitDiff.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveDiff = resolve;
+      }),
+  );
+  const target = { sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" };
+  useDiff.setState({ pendingReview: target });
+
+  const firstPanel = render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledTimes(1));
+
+  await act(async () => {
+    firstPanel.unmount();
+  });
+  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+
+  expect(gitDiff).toHaveBeenCalledTimes(1);
+  expect(useDiff.getState().pendingReview).toEqual(target);
+
+  await act(async () => {
+    resolveDiff({ status: "ok", data: FRESH_DIFF });
+  });
+  await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
+  expect(screen.getByTitle("src/fresh.ts").className).toContain("bg-accent");
+  expect(screen.getByText("const fresh = true;")).toBeTruthy();
+});
+
 test("refreshing to fewer files clamps the selected review file", async () => {
   useDiff.setState({
     bySession: {
