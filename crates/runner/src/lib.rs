@@ -7,3 +7,4 @@ pub mod doctor;
 pub mod meta;
 pub mod paint;
 pub mod setup_cmd;
+pub mod status_cmd;

@@ -16,6 +16,7 @@ pub fn help_text() -> String {
         "COMMANDS",
         "  setup              first-run wizard: prompt for required settings",
         "  start              run the engine daemon in the foreground (Ctrl-C / SIGTERM to stop)",
+        "  status             show daemon state (pid, port, version)",
         "  doctor             check your environment (git, settings)",
         "  config             read/write settings: ryuzi config <get|set|list> ...",
     ]
