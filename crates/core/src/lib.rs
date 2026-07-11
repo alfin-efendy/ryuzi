@@ -18,6 +18,7 @@ pub mod llm_router;
 pub mod mcp;
 pub mod oauth_loopback;
 pub mod orch;
+pub mod pairing;
 pub mod paths;
 pub mod plugins;
 pub mod policy;

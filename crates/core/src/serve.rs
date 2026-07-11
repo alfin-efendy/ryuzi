@@ -15,10 +15,11 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Wire protocol version reported by `/health` for remote-runner clients to
 /// negotiate compatibility against.
@@ -35,6 +36,14 @@ pub struct ApiState {
 }
 
 /// Build the HTTP router over a control plane.
+///
+/// `POST /pair` is public alongside `/health` — deliberately outside the
+/// `authed` sub-router's `require_token` layer, since a device presenting a
+/// pairing code has no bearer token yet (it IS the bootstrap; see
+/// `crate::pairing`). Its rate limiter (see [`PairLimiter`]) is created
+/// fresh here, once per `router()` call, and captured by the route's
+/// closure rather than added to `ApiState` — see [`PairLimiter`]'s doc
+/// comment for why.
 pub fn router(state: ApiState) -> Router {
     let authed = Router::new()
         .route("/sessions", get(list_sessions))
@@ -47,8 +56,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/rpc/{method}", post(rpc))
         .route("/approvals/{request_id}", post(resolve_approval_route))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
+    let pair_limiter = PairLimiter::new();
+    let pair_route = post(
+        move |State(state): State<ApiState>, Json(body): Json<PairRequest>| async move {
+            pair(state, pair_limiter, body).await
+        },
+    );
     Router::new()
         .route("/health", get(health))
+        .route("/pair", pair_route)
         .merge(authed)
         .with_state(state)
 }
@@ -189,6 +205,117 @@ async fn health() -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": PROTOCOL_VERSION,
     }))
+}
+
+/// `POST /pair` request body: a plaintext pairing code (see
+/// `crate::pairing::mint_code`) and a human-readable label for the device
+/// being enrolled (stored verbatim in `devices.name`, shown back in device
+/// listings — not validated/sanitized here beyond what SQLite's bound
+/// parameter already guarantees).
+#[derive(Deserialize)]
+struct PairRequest {
+    code: String,
+    device_name: String,
+}
+
+/// Fixed-window rate limiter for `POST /pair`, capping it at
+/// `PAIR_RATE_LIMIT` requests per rolling `PAIR_RATE_WINDOW_MS`-millisecond
+/// window. `/pair` is the one route reachable with no bearer at all (see
+/// [`router`]), so it needs its own defense against a code-guessing flood
+/// that the `require_token` layer can't provide.
+///
+/// This is deliberately NOT a field on [`ApiState`]: `ApiState` is
+/// constructed at 7+ call sites across `ryuzi-core` (this file's tests,
+/// `api/mod.rs`'s test support, `tests/control_api.rs`), `ryuzi-runner`
+/// (`daemon_cmd.rs`), and `ryuzi-cockpit` (`engine.rs`, `engine_daemon.rs`).
+/// Adding a field there would mean touching every one of those for a
+/// concern that only the `/pair` route cares about. Instead, one
+/// `PairLimiter` is created per [`router`] call and captured by the
+/// `/pair` route's closure (see `router`'s `pair_route`) — scoped to that
+/// router/server instance, shared by every request it serves via the
+/// `Arc<Mutex<..>>` clones, and touching nothing outside this file.
+#[derive(Clone)]
+struct PairLimiter(Arc<Mutex<(i64, u32)>>);
+
+/// Requests allowed per window. ~10/min comfortably covers a human retrying
+/// a mistyped code a few times, while keeping a brute-force sweep of the
+/// 64-hex-char code space computationally irrelevant (the single-use +
+/// short-TTL code itself is the real defense; this just caps request
+/// throughput).
+const PAIR_RATE_LIMIT: u32 = 10;
+/// Window length: one minute.
+const PAIR_RATE_WINDOW_MS: i64 = 60_000;
+
+impl PairLimiter {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new((0, 0))))
+    }
+
+    /// `true` iff this request is within budget (and is recorded against
+    /// it); `false` once `PAIR_RATE_LIMIT` requests have already landed in
+    /// the current window. Fixed-window (not sliding/token-bucket): a new
+    /// window starts as soon as `now_ms` has advanced `PAIR_RATE_WINDOW_MS`
+    /// or more past the current window's start, at which point the counter
+    /// resets to 1. A burst can in principle straddle two adjacent windows
+    /// (up to ~2x the nominal rate right at the boundary) — an accepted
+    /// simplification for a bootstrap endpoint already guarded by a
+    /// short-TTL single-use code.
+    fn allow(&self, now_ms: i64) -> bool {
+        let mut window = self.0.lock().unwrap();
+        if now_ms - window.0 >= PAIR_RATE_WINDOW_MS {
+            *window = (now_ms, 1);
+            true
+        } else if window.1 < PAIR_RATE_LIMIT {
+            window.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// `POST /pair` handler body. Factored out of the router-registered closure
+/// (see `router`'s `pair_route`) so the actual logic is a plain, directly
+/// callable async fn rather than living inline in a closure literal;
+/// `limiter` is the per-router-instance [`PairLimiter`] that closure
+/// captured, NOT part of `ApiState`.
+///
+/// Rate-limited first (a flood never even reaches `pairing::redeem`, so it
+/// can't be used to burn through a target's pairing-code TTL window via
+/// sheer request volume); then delegates to `crate::pairing::redeem`, which
+/// does the actual single-use/expiry-checked code consumption. `Some(token)`
+/// is the device's new bearer token; `None` covers wrong code, already-used
+/// code, and expired code alike (see `redeem`'s doc comment for why those
+/// are deliberately indistinguishable) — all map to a flat 401.
+async fn pair(
+    state: ApiState,
+    limiter: PairLimiter,
+    body: PairRequest,
+) -> axum::response::Response {
+    if !limiter.allow(crate::paths::now_ms()) {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "too many pairing attempts, try again shortly" })),
+        )
+            .into_response();
+    }
+
+    match crate::pairing::redeem(
+        state.cp.store(),
+        &body.code,
+        &body.device_name,
+        crate::paths::now_ms(),
+    )
+    .await
+    {
+        Ok(Some(device_token)) => Json(json!({ "device_token": device_token })).into_response(),
+        Ok(None) => (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid or expired pairing code" })),
+        )
+            .into_response(),
+        Err(e) => err(&e),
+    }
 }
 
 async fn list_sessions(State(state): State<ApiState>) -> impl IntoResponse {
@@ -807,5 +934,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    // ---- P2-6: POST /pair (public bootstrap route + rate limit) ----
+
+    /// A pre-seeded, valid pairing code redeems a `device_token` with no
+    /// bearer at all (proving the route really is public, not just
+    /// reachable with a control-token-less request that happens to also
+    /// work), and the SAME code is rejected the second time — single-use,
+    /// enforced end-to-end through the real HTTP route, not just
+    /// `pairing::redeem`'s own unit tests.
+    #[tokio::test]
+    async fn pair_redeems_a_seeded_code_and_rejects_reuse() {
+        let cp = test_cp().await;
+        let store = cp.store().clone();
+        let now = crate::paths::now_ms();
+        let code = crate::pairing::mint_code(&store, 60_000, now)
+            .await
+            .unwrap();
+
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let r = client
+            .post(format!("http://127.0.0.1:{port}/pair"))
+            .json(&json!({ "code": code, "device_name": "alfin-laptop" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+        let body: Value = r.json().await.unwrap();
+        let token = body["device_token"]
+            .as_str()
+            .expect("device_token present on success");
+        assert_eq!(token.len(), 64);
+
+        // The device the pairing just created authenticates on the authed
+        // API, using the token /pair just handed back.
+        let r = client
+            .get(format!("http://127.0.0.1:{port}/sessions"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+
+        // Same code again: already consumed.
+        let r = client
+            .post(format!("http://127.0.0.1:{port}/pair"))
+            .json(&json!({ "code": code, "device_name": "alfin-laptop" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// An unknown/wrong code is a flat 401, with no bearer token presented
+    /// at all — confirms `/pair` sits outside `require_token`'s layer.
+    #[tokio::test]
+    async fn pair_rejects_an_unknown_code_with_no_bearer_needed() {
+        let cp = test_cp().await;
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
+
+        let r = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/pair"))
+            .json(&json!({ "code": "not-a-real-code", "device_name": "some-device" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// The fixed-window limiter allows exactly `PAIR_RATE_LIMIT` requests
+    /// and rejects the next one with 429 — exercised through the real route
+    /// (each request uses a bad code, so every allowed request is itself a
+    /// 401; the 11th is a 429 from the limiter before `pairing::redeem` is
+    /// even called).
+    #[tokio::test]
+    async fn pair_rate_limits_after_ten_requests_in_the_window() {
+        let cp = test_cp().await;
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let client = reqwest::Client::new();
+        let body = json!({ "code": "nope", "device_name": "flooder" });
+
+        for i in 0..PAIR_RATE_LIMIT {
+            let r = client
+                .post(format!("http://127.0.0.1:{port}/pair"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "request {i} should still be within the rate-limit budget"
+            );
+        }
+
+        let r = client
+            .post(format!("http://127.0.0.1:{port}/pair"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn pair_limiter_resets_after_the_window_elapses() {
+        let limiter = PairLimiter::new();
+        let start = 1_700_000_000_000_i64;
+        for _ in 0..PAIR_RATE_LIMIT {
+            assert!(limiter.allow(start));
+        }
+        assert!(!limiter.allow(start), "budget exhausted within the window");
+
+        // A new window: the budget is back.
+        assert!(limiter.allow(start + PAIR_RATE_WINDOW_MS));
     }
 }
