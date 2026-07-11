@@ -142,3 +142,11 @@ test("setDraft persists the map to localStorage", () => {
   expect(JSON.parse(localStorage.getItem("cockpit.composer.drafts") ?? "{}")).toEqual({});
   useNav.setState({ drafts: {} });
 });
+
+test("sanitizeRightTab accepts agents, keeps file/review, falls back on unknown", () => {
+  expect(sanitizeRightTab("agents")).toBe("agents");
+  expect(sanitizeRightTab("file")).toBe("file");
+  expect(sanitizeRightTab("review")).toBe("review");
+  expect(sanitizeRightTab("bogus")).toBe("review");
+  expect(sanitizeRightTab(null)).toBe("review");
+});

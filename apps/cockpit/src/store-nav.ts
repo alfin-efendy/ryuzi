@@ -24,7 +24,7 @@ export type View =
   | { kind: "pluginDetail"; id: string }
   | { kind: "settings" };
 
-export type RightTab = "review" | "file";
+export type RightTab = "review" | "file" | "agents";
 
 export type NavHistory = { back: View[]; current: View; forward: View[] };
 
@@ -70,7 +70,7 @@ export function clampPanelSize(px: number, viewport: number, b: { min: number; m
 
 /** Legacy persisted values ("term") and garbage collapse to "review". */
 export function sanitizeRightTab(raw: string | null): RightTab {
-  return raw === "file" ? "file" : "review";
+  return raw === "file" ? "file" : raw === "agents" ? "agents" : "review";
 }
 
 /** Parse a persisted panel size and clamp it to the current viewport. A size
