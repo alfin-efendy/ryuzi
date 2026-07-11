@@ -56,16 +56,22 @@ export function RightPanel({
   }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit]);
 
   // Consume a pending jump from a transcript edit card: select the file once
-  // it appears in this session's diff, then clear the intent. A pending jump
-  // for another session is left alone — its own panel consumes it.
+  // the diff fetch that should contain it has finished, then clear the
+  // intent either way. A pending jump for another session is left alone —
+  // its own panel consumes it. Waiting for `diff.loading` to settle avoids
+  // clearing the target against a stale (pre-fetch) file list.
   useEffect(() => {
-    if (pendingReview === null || pendingReview.sessionPk !== sessionPk) return;
+    if (pendingReview === null || pendingReview.sessionPk !== sessionPk || diff.loading) return;
     const idx = reviewFileIndex(diff.files, pendingReview.path);
-    if (idx >= 0) {
-      setReviewFile(idx);
-      setPendingReview(null);
-    }
-  }, [pendingReview, diff.files, setPendingReview, sessionPk]);
+    if (idx >= 0) setReviewFile(idx);
+    setPendingReview(null);
+  }, [pendingReview, diff.files, diff.loading, setPendingReview, sessionPk]);
+
+  // A refresh may shrink the file list out from under a stale selected
+  // index (e.g. commits amended away) — clamp it back into range.
+  useEffect(() => {
+    setReviewFile((index) => Math.min(index, Math.max(diff.files.length - 1, 0)));
+  }, [diff.files.length]);
 
   useEffect(() => {
     if (!nav.rightMaximized) return;
@@ -82,7 +88,8 @@ export function RightPanel({
     { id: "agents", label: "Agents", icon: Bot },
   ];
 
-  const review = diff.files.length > 0 ? diff.files[Math.min(reviewFile, diff.files.length - 1)] : null;
+  const selectedReviewFile = Math.min(reviewFile, Math.max(diff.files.length - 1, 0));
+  const review = diff.files.length > 0 ? diff.files[selectedReviewFile] : null;
   const reviewAdd = diff.files.reduce((n, f) => n + f.add, 0);
   const reviewDel = diff.files.reduce((n, f) => n + f.del, 0);
 
@@ -106,36 +113,39 @@ export function RightPanel({
         />
       )}
       {/* Tab bar */}
-      <div className="box-border flex h-[55px] shrink-0 items-center gap-1 border-b border-border px-2.5">
-        {rightTabs.map((t) => {
-          const sel = nav.rightTab === t.id;
-          const Icon = t.icon;
-          return (
-            <Button
-              key={t.id}
-              variant="ghost"
-              onClick={() => nav.setRightTab(t.id)}
-              className={sel ? "border-border bg-background text-foreground" : "text-muted-foreground"}
-            >
-              <Icon aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-              {t.label}
-            </Button>
-          );
-        })}
-        <div className="flex-1" />
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          title={nav.rightMaximized ? "Restore panel" : "Expand panel"}
-          onClick={() => nav.setRightMaximized(!nav.rightMaximized)}
-          className="text-muted-foreground"
-        >
-          {nav.rightMaximized ? (
-            <Minimize2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-          ) : (
-            <Maximize2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-          )}
-        </Button>
+      <div data-testid="right-panel-header" className="box-border flex h-[55px] shrink-0 items-center border-b border-border px-2.5">
+        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+          {rightTabs.map((t) => {
+            const sel = nav.rightTab === t.id;
+            const Icon = t.icon;
+            return (
+              <Button
+                key={t.id}
+                variant="ghost"
+                onClick={() => nav.setRightTab(t.id)}
+                className={`shrink-0 ${sel ? "border-border bg-background text-foreground" : "text-muted-foreground"}`}
+              >
+                <Icon aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                {t.label}
+              </Button>
+            );
+          })}
+        </div>
+        <div className="ml-1 flex shrink-0 items-center">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            title={nav.rightMaximized ? "Restore panel" : "Expand panel"}
+            onClick={() => nav.setRightMaximized(!nav.rightMaximized)}
+            className="text-muted-foreground"
+          >
+            {nav.rightMaximized ? (
+              <Minimize2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+            ) : (
+              <Maximize2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+            )}
+          </Button>
+        </div>
       </div>
 
       {/* Review tab — non-git projects get an explicit empty state */}
@@ -169,7 +179,7 @@ export function RightPanel({
                   variant="ghost"
                   title={`${f.dir}${f.name}`}
                   onClick={() => setReviewFile(i)}
-                  className={`h-auto w-full justify-start gap-2 rounded-none px-3 py-[5px] text-left font-mono ${i === reviewFile ? "bg-accent" : ""}`}
+                  className={`h-auto w-full justify-start gap-2 rounded-none px-3 py-[5px] text-left font-mono ${i === selectedReviewFile ? "bg-accent" : ""}`}
                 >
                   <span className="min-w-0 flex-1 truncate">{f.name}</span>
                   <DiffStat add={f.add} del={f.del} className="shrink-0 text-[11px]" />
