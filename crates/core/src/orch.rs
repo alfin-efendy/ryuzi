@@ -478,7 +478,7 @@ pub async fn cancel_tree(store: &Store, id: &str) -> anyhow::Result<u32> {
             let n = c.execute(
                 "UPDATE orch_tasks SET status='cancelled', finished_at=?2 \
                  WHERE (id=?1 OR root_id=?1) \
-                 AND status IN ('todo','ready','running','waiting','judging','decomposing')",
+                 AND status IN ('todo','ready','running','waiting','judging','decomposing','blocked')",
                 params![id, now],
             )?;
             Ok(n as u32)
@@ -650,22 +650,27 @@ pub async fn set_status(
         .await
 }
 
-/// `blocked` tasks whose worker session is `running` again — the rail just
-/// delivered the human's `unblock` answer as a fresh turn. `tick` flips these
-/// back to `running` so `finish_task`/`record_child_failure` treat the
-/// eventual outcome normally (spec §8).
-pub async fn list_blocked_resumed(store: &Store) -> anyhow::Result<Vec<OrchTask>> {
-    store
-        .with_conn(|c| {
-            let mut stmt = c.prepare(&format!(
-                "SELECT {ORCH_COLS} FROM orch_tasks t \
-                 JOIN sessions s ON s.session_pk = t.session_pk \
-                 WHERE t.status='blocked' AND s.status='running'"
-            ))?;
-            let rows = stmt.query_map([], task_from)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await
+/// Resume a blocked worker at the moment its answer is delivered over the rail
+/// (spec §8). Called by the background-rail drainer for a `kind='unblock'`
+/// event BEFORE it re-enters the worker's turn, so the flip is causal with the
+/// answer's delivery (never a session-status guess). This is what makes
+/// `watch_session`'s bare-status read of the post-resume `Result` correct:
+/// the drainer can only claim (and thus flip) once the block turn's session is
+/// idle, and `spawn_prompt` broadcasts that turn's `Result` BEFORE demoting the
+/// session to idle — so a parked `watch_session` has already observed the task
+/// as `blocked` before any flip is possible. No-op if the target session has no
+/// `blocked` orch task (defensive).
+pub async fn on_unblock_delivered(cp: &Arc<ControlPlane>, worker_session_pk: &str) {
+    let store = cp.store();
+    if let Ok(Some(task)) = store.task_by_session(worker_session_pk).await {
+        if task.status == "blocked"
+            && set_status(store, &task.id, "blocked", "running")
+                .await
+                .unwrap_or(false)
+        {
+            emit_changed(cp, &task.id, task.root_id.clone(), "running");
+        }
+    }
 }
 
 /// Every currently `blocked` task, for `tick`'s live status announcement —
@@ -941,24 +946,19 @@ pub async fn run_loop(cp: Arc<ControlPlane>) {
     }
 }
 
-/// One dispatcher pass: resume answered blocks, promote unblocked tasks,
-/// start workers up to the concurrency cap, then settle roots (failure
-/// digests / judge sessions). Factored out of [`run_loop`] so tests can drive
-/// it without sleeping.
+/// One dispatcher pass: announce live blocks, promote ready tasks, start
+/// workers up to the concurrency cap, then settle roots (failure digests /
+/// judge sessions). Blocked workers resume event-driven at unblock delivery
+/// (`on_unblock_delivered`), not here. Factored out of [`run_loop`] so tests
+/// can drive it without sleeping.
 pub async fn tick(cp: &Arc<ControlPlane>) {
     let store = cp.store();
-    // Resume workers whose block was just answered (their session went
-    // `running` again after the rail delivered the unblock turn) — before
-    // claiming, so `watch_session` (still waiting on the earlier `blocked`
-    // status) sees `running` on the eventual terminal event.
-    for t in list_blocked_resumed(store).await.unwrap_or_default() {
-        if set_status(store, &t.id, "blocked", "running")
-            .await
-            .unwrap_or(false)
-        {
-            emit_changed(cp, &t.id, t.root_id.clone(), "running");
-        }
-    }
+    // Blocked workers resume event-driven, at unblock DELIVERY on the rail
+    // (`on_unblock_delivered`, called by the background-rail drainer) — NOT by
+    // polling session status here. A `blocked` task whose session is `running`
+    // is the block-turn tail (the turn ends after `orch_block`), not an
+    // answered block, so a status poll would false-resume it. See the doc on
+    // `on_unblock_delivered`.
     // Announce every still-blocked task live so Cockpit's task strip renders
     // the block card even across a daemon restart. Idempotent by design —
     // the strip arm is a pure status upsert, so repeats each pass are
@@ -2121,5 +2121,223 @@ mod tests {
         assert!(a.error.is_none());
         // Non-failed tasks refuse.
         assert!(!retry_task(&s, &ids[1]).await.unwrap());
+    }
+
+    // -- block-for-human resume (Task E6 Fix 1) -----------------------------
+
+    /// Insert a worker session row directly in the given status/kind, bound to
+    /// a project, so a test can hand-craft the block-turn tail (task `blocked`
+    /// while the session row is still `running`).
+    async fn insert_worker_session(
+        cp: &Arc<ControlPlane>,
+        pk: &str,
+        project_id: &str,
+        status: crate::domain::SessionStatus,
+    ) {
+        let now = crate::paths::now_ms();
+        cp.store()
+            .insert_session(crate::domain::Session {
+                session_pk: pk.into(),
+                project_id: Some(project_id.into()),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status,
+                perm_mode: crate::domain::PermMode::Default,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: crate::domain::SessionKind::Worker,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The CRITICAL regression: a dispatcher `tick` landing in the block-turn
+    /// tail (task `blocked`, session still `running`, no answer delivered) must
+    /// NOT resume the task. The old heuristic (session `running` ⇒ resume)
+    /// would flip it to `running`; the event-driven design leaves it `blocked`.
+    #[tokio::test]
+    async fn tick_does_not_false_resume_an_unanswered_block() {
+        let (cp, _repo) = cp_with_project().await;
+        let root = submit_with_plan(
+            &cp,
+            "p1",
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+        // Promote + claim the child to `running` by hand (no real worker turn,
+        // so nothing races the state we build).
+        promote_ready(cp.store()).await.unwrap();
+        let claimed = claim_ready(cp.store(), 10).await.unwrap();
+        let child_id = claimed[0].id.clone();
+
+        // A worker session that is STILL `Running` — the block-turn tail after
+        // `orch_block` set the task `blocked` mid-turn but before `send_prompt`
+        // returned. This is exactly the shape the old poll false-resumed.
+        let worker_pk = "worker-blocktail";
+        insert_worker_session(&cp, worker_pk, "p1", crate::domain::SessionStatus::Running).await;
+        set_task_session(cp.store(), &child_id, worker_pk)
+            .await
+            .unwrap();
+        assert!(set_status(cp.store(), &child_id, "running", "blocked")
+            .await
+            .unwrap());
+
+        // The dispatcher runs while the block sits unanswered.
+        tick(&cp).await;
+
+        let after = get_task(cp.store(), &child_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status, "blocked",
+            "an unanswered block must stay blocked (not resumed, not done) — \
+             session-status is NOT an answer signal"
+        );
+        let root_row = get_task(cp.store(), &root).await.unwrap().unwrap();
+        assert_eq!(root_row.status, "waiting", "the root is untouched too");
+    }
+
+    /// The IMPORTANT half: a REAL answer, delivered over the rail, resumes the
+    /// worker — driven by `on_unblock_delivered` in the drainer, with no
+    /// reliance on `tick` timing. The resumed worker then reaches `done`.
+    #[tokio::test]
+    async fn delivered_unblock_resumes_the_worker() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        let home = cp
+            .start_chat_session(crate::harness::TurnPrompt::text("hi", "hi"), "test", &[])
+            .await
+            .unwrap();
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            Some(&home.session_pk),
+        )
+        .await
+        .unwrap();
+        tick(&cp).await; // start the worker
+        let child = list_tasks(cp.store(), Some(&root))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.root_id.is_some())
+            .unwrap();
+        let worker_pk = child.session_pk.clone().unwrap();
+        // Worker calls `orch_block`: task → blocked (wins the race against the
+        // near-instant EchoHarness turn, as in the round-trip test).
+        assert!(set_status(cp.store(), &child.id, "running", "blocked")
+            .await
+            .unwrap());
+        // The human answers — enqueues the `unblock` rail row for the worker.
+        assert!(cp
+            .answer_orch_block(&child.id, "use port 8080")
+            .await
+            .unwrap());
+        // Let the block turn's tail settle the worker session back to idle so
+        // the unblock row is deliverable.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(5_000);
+        loop {
+            let s = cp.store().get_session(&worker_pk).await.unwrap().unwrap();
+            if s.status == crate::domain::SessionStatus::Idle {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker never went idle (stuck at {:?})",
+                s.status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            get_task(cp.store(), &child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "blocked",
+            "still blocked until the answer is DELIVERED"
+        );
+
+        // Drive the background-rail drainer (the same entry the rail tests
+        // use). It claims the idle worker's `unblock` row, calls
+        // `on_unblock_delivered` to flip `blocked → running`, then re-enters
+        // the worker's turn — which EchoHarness completes, so the worker
+        // reaches `done` with no strand.
+        let done = drive_child_until(&cp, &child.id, "done", 10_000).await;
+        assert_eq!(
+            done.status, "done",
+            "the delivered answer resumed the worker to done"
+        );
+    }
+
+    /// Poll `background_rail::tick` + the child row until it reaches `target`.
+    async fn drive_child_until(
+        cp: &Arc<ControlPlane>,
+        child_id: &str,
+        target: &str,
+        max_ms: u64,
+    ) -> OrchTask {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(max_ms);
+        loop {
+            crate::background_rail::tick(cp).await;
+            let t = get_task(cp.store(), child_id).await.unwrap().unwrap();
+            if t.status == target {
+                return t;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "child stuck in `{}` waiting for `{target}`",
+                t.status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A cancel must clean a `blocked` child, not orphan it (the `blocked`
+    /// state was previously omitted from `cancel_tree`'s IN-list).
+    #[tokio::test]
+    async fn cancel_tree_cancels_a_blocked_child() {
+        let s = store().await;
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
+        let ids = insert_children(&s, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap();
+        promote_ready(&s).await.unwrap();
+        claim_ready(&s, 10).await.unwrap();
+        // A child blocks on a human question.
+        assert!(set_status(&s, &ids[0], "running", "blocked").await.unwrap());
+
+        let n = cancel_tree(&s, &root).await.unwrap();
+        assert!(n >= 2, "root + the blocked child (at least) were cancelled");
+        let child = get_task(&s, &ids[0]).await.unwrap().unwrap();
+        assert_eq!(
+            child.status, "cancelled",
+            "a cancel must clean the blocked child, not strand it at `blocked`"
+        );
     }
 }

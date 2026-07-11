@@ -1142,10 +1142,24 @@ impl ControlPlane {
                     if let Some(sid) = handle.agent_session_id() {
                         let _ = me.store.update_agent_session_id(&session_pk, &sid).await;
                     }
-                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
+                    // Broadcast `Result` BEFORE the idle demote (the Err arm
+                    // below deliberately demotes first, for UI-refresh
+                    // reasons; this arm must not). The ordering is load-bearing
+                    // for orch's block-for-human resume (Task E6): the
+                    // background-rail drainer flips a `blocked` worker task to
+                    // `running` (`orch::on_unblock_delivered`) only AFTER it
+                    // claims the unblock event, and a claim requires the worker
+                    // session to be idle (`claim_deliverable_background_event`
+                    // joins on `sessions.status`). Emitting `Result` before the
+                    // demote guarantees a parked `watch_session` has the block
+                    // turn's `Result` queued before the session is ever
+                    // claimable — so it reads the task as still `blocked` and
+                    // keeps waiting, instead of racing the flip and finishing
+                    // the unanswered block turn as `done`.
                     let _ = me.events.send(CoreEvent::Result {
                         session_pk: session_pk.clone(),
                     });
+                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                 }
                 Err(e) => {
                     let message = e.to_string();

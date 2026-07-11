@@ -53,6 +53,16 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
                 break;
             }
         };
+        // An `unblock` answer must resume the blocked worker's orch task
+        // causally with delivery — flip it `blocked → running` here, not by a
+        // tick-time session-status poll (which false-resumes the block-turn
+        // tail and strands a fast resume). Safe for non-orch kinds: this is
+        // gated on `kind == "unblock"`, which only ever targets a worker
+        // session. Runs BEFORE the turn re-enters so the flip is settled by the
+        // time the resumed turn's terminal event reaches `watch_session`.
+        if event.kind == "unblock" {
+            crate::orch::on_unblock_delivered(cp, &event.target_session_pk).await;
+        }
         // `continue_session_with_prompt` is the ONLY delivery path: a clean
         // new user turn onto a session `claim_deliverable_background_event`
         // already proved is idle. Never a mid-turn splice.
