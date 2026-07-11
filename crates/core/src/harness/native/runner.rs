@@ -970,7 +970,10 @@ async fn drive(
 /// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`. The todo
 /// tools are blocked because the list is keyed by the parent's session_pk: a
 /// child's `todowrite` would silently clobber the user-visible plan.
-const SUBAGENT_BLOCKLIST: &[&str] = &["task", "memory", "todowrite", "todoread"];
+/// `skill_manage` (Phase 4 Task 6) writes filesystem skills gated by an
+/// origin × provenance guard — a primary/review-fork capability, never a
+/// sub-agent's; `skill` (read-only recall) stays available to children.
+const SUBAGENT_BLOCKLIST: &[&str] = &["task", "memory", "todowrite", "todoread", "skill_manage"];
 /// Cap on one delegated child's model-visible report (protects the parent's
 /// context from runaway child output).
 const MAX_SUBTASK_REPORT_CHARS: usize = 16_000;
@@ -3609,6 +3612,27 @@ mod tests {
             "a sub-agent todowrite would clobber the parent session's plan"
         );
         assert!(!eff.allows("todoread"));
+    }
+
+    #[test]
+    fn subagent_blocklist_blocks_skill_manage() {
+        use super::super::agents::ToolFilter;
+        let names: Vec<String> = ["read", "bash", "skill", "skill_manage"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let eff = effective_child_filter(
+            &ToolFilter::All,
+            &ToolFilter::All,
+            &names,
+            SUBAGENT_BLOCKLIST,
+        );
+        assert!(eff.allows("read") && eff.allows("bash"));
+        // `skill` (read-only recall) stays available; `skill_manage` (a
+        // filesystem write, Phase 4 Task 6) is a primary/review-fork
+        // capability only, never a sub-agent's.
+        assert!(eff.allows("skill"));
+        assert!(!eff.allows("skill_manage"));
     }
 
     #[tokio::test]

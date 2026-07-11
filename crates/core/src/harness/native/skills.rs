@@ -73,7 +73,10 @@ impl SkillRegistry {
         self.skills.keys().cloned().collect()
     }
 
-    /// A `- name: description` list for the system prompt, or `None` if empty.
+    /// A `- name: description` list for the system prompt, or `None` if
+    /// empty. Descriptions are truncated to 60 chars — the index is a
+    /// scan-and-decide surface, not the skill's full documentation (that's
+    /// what the `skill` tool loads on demand).
     pub fn guidance(&self) -> Option<String> {
         if self.skills.is_empty() {
             return None;
@@ -81,11 +84,17 @@ impl SkillRegistry {
         let list = self
             .skills
             .values()
-            .map(|s| format!("- {}: {}", s.name, s.description))
+            .map(|s| {
+                let d: String = s.description.chars().take(60).collect();
+                format!("- {}: {d}", s.name)
+            })
             .collect::<Vec<_>>()
             .join("\n");
         Some(format!(
-            "Available skills (load a skill's full instructions with the `skill` tool before using it):\n{list}"
+            "Available skills. You MUST scan this list at the start of every \
+             task and load a skill's full instructions with the `skill` tool \
+             BEFORE doing work it covers. Author new skills with \
+             `skill_manage` (keep descriptions ≤60 chars).\n{list}"
         ))
     }
 }
@@ -207,6 +216,28 @@ mod tests {
         // read_skills over a non-existent / empty dir returns no skills.
         let dir = tempfile::tempdir().unwrap();
         assert!(read_skills(&dir.path().join(".ryuzi/skills")).is_empty());
+    }
+
+    #[test]
+    fn guidance_truncates_descriptions_to_60_chars_and_demands_a_scan() {
+        let mut skills = std::collections::BTreeMap::new();
+        skills.insert(
+            "x".into(),
+            Skill {
+                name: "x".into(),
+                description: "a".repeat(200),
+                body: String::new(),
+            },
+        );
+        let g = SkillRegistry { skills }.guidance().unwrap();
+        assert!(
+            g.contains("You MUST scan"),
+            "mandatory-scan wording missing: {g}"
+        );
+        assert!(
+            !g.contains(&"a".repeat(61)),
+            "description not truncated to 60 chars"
+        );
     }
 
     #[test]
