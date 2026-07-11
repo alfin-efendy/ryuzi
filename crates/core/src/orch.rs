@@ -17,13 +17,16 @@ use crate::control::ControlPlane;
 use crate::domain::CoreEvent;
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
+use specta::Type;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
 /// One row of the orchestrated task graph.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
 pub struct OrchTask {
     pub id: String,
     /// `None` for a root (goal) task.

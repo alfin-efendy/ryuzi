@@ -10,6 +10,7 @@ pub mod endpoint_api;
 pub mod fsview_api;
 pub mod gateways_api;
 pub mod native_api;
+pub mod orch_api;
 pub mod plugins_api;
 pub mod scheduler_api;
 pub mod session_io_api;
@@ -84,6 +85,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if endpoint_api::HANDLES.contains(&m) => endpoint_api::dispatch(state, m, p).await,
         m if connections_api::HANDLES.contains(&m) => connections_api::dispatch(state, m, p).await,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
+        m if orch_api::HANDLES.contains(&m) => orch_api::dispatch(state, m, p).await,
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }
