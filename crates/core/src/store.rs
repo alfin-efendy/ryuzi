@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_29_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_30_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -996,7 +996,7 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_29_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_30_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1040,6 +1040,32 @@ fn migrations() -> Migrations<'static> {
                 .exists([])?;
             if !has_steer_note {
                 tx.execute("ALTER TABLE orch_tasks ADD COLUMN steer_note TEXT", [])?;
+            }
+            Ok(())
+        }),
+        // 30: app-control audit needs to record the initiating session and
+        // the WriteOrigin. The `audit` table has existed (writerless) since
+        // an early migration; these two nullable columns let Phase 6 write
+        // app-control rows without overloading the gateway-oriented
+        // `gateway`/`conversation_id` columns. Additive columns — plain
+        // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
+        // replaying this migration on a DB that already has the columns
+        // (e.g. the rewind-and-replay in
+        // `migrations_13_to_30_replay_is_idempotent_and_converges_native_only`,
+        // which re-runs every migration appended after 13) is a no-op
+        // instead of a "duplicate column" error.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let has_session_pk = tx
+                .prepare("SELECT 1 FROM pragma_table_info('audit') WHERE name='session_pk'")?
+                .exists([])?;
+            if !has_session_pk {
+                tx.execute("ALTER TABLE audit ADD COLUMN session_pk TEXT", [])?;
+            }
+            let has_origin = tx
+                .prepare("SELECT 1 FROM pragma_table_info('audit') WHERE name='origin'")?
+                .exists([])?;
+            if !has_origin {
+                tx.execute("ALTER TABLE audit ADD COLUMN origin TEXT", [])?;
             }
             Ok(())
         }),
@@ -5533,7 +5559,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 29, "forward migration must land at v29");
+        assert_eq!(user_version, 30, "forward migration must land at v30");
     }
 
     #[tokio::test]
@@ -5561,6 +5587,24 @@ mod tests {
         assert_eq!(t.consecutive_failures, 0);
         assert!(!t.gave_up);
         assert_eq!(t.steer_note, None);
+    }
+
+    #[tokio::test]
+    async fn migration_30_adds_audit_session_and_origin_columns() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let cols: Vec<String> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare("PRAGMA table_info(audit)")?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "session_pk"), "cols: {cols:?}");
+        assert!(cols.iter().any(|c| c == "origin"), "cols: {cols:?}");
     }
 
     #[tokio::test]
@@ -5701,7 +5745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_29_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_30_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -5719,19 +5763,20 @@ mod tests {
         // effort preferences + legacy normalization; 25 session_route_state;
         // 26 session_runtime_settings; 27 background_events + jobs.model_override;
         // 28 messages_fts + sync triggers, skill_usage, curator_state, curator_runs;
-        // 29 messages.speaker + orch_tasks home/breaker/steer columns —
+        // 29 messages.speaker + orch_tasks home/breaker/steer columns;
+        // 30 audit.session_pk + audit.origin —
         // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 29
-        // defined, wind back seventeen.
+        // this test starts failing its assertions). With migrations through 30
+        // defined, wind back eighteen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 17)
+            c.pragma_update(None, "user_version", v - 18)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -5788,14 +5833,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back nine, and reopen so 21 (and the tail
-        // migrations 22–29) replay against it. Back NINE: the fully migrated
-        // tail is now v29, so rewinding to v20 is what makes migration 21
+        // wind user_version back ten, and reopen so 21 (and the tail
+        // migrations 22–30) replay against it. Back TEN: the fully migrated
+        // tail is now v30, so rewinding to v20 is what makes migration 21
         // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 9)
+            c.pragma_update(None, "user_version", v - 10)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -5933,7 +5978,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 29, "forward migration must land at v29");
+        assert_eq!(uv, 30, "forward migration must land at v30");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -5959,7 +6004,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 29, "forward migration must land at v29");
+        assert_eq!(uv, 30, "forward migration must land at v30");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 
