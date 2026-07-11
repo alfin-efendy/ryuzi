@@ -1,5 +1,6 @@
 //! `exitplanmode` — present a Plan-mode plan for user review. Approval flips
-//! the session's permission mode (and the project's persisted default);
+//! the session's permission mode and persists it to THIS session's row only
+//! (per-session mode — sibling sessions on the same project are unaffected);
 //! rejection returns the user's feedback so the model can revise the plan.
 
 use super::{PermissionSpec, Tool, ToolCtx, ToolOutput};
@@ -81,14 +82,13 @@ impl Tool for ExitPlanMode {
             };
             *interaction.perm_mode.lock().unwrap() = mode;
             // Persist so the control plane's per-turn refresh (which re-reads
-            // the project row) keeps the new mode instead of snapping back to
-            // Plan.
-            if let Some(pid) = interaction.project_id.as_deref() {
-                let _ = ctx
-                    .store
-                    .update_project_prefs(pid, None, None, Some(mode))
-                    .await;
-            }
+            // the SESSION row) keeps the new mode instead of snapping back to
+            // Plan. Per-session by design — approving a plan here must not
+            // change sibling sessions.
+            let _ = ctx
+                .store
+                .update_session_perm_mode(&ctx.session_pk, mode)
+                .await;
             Ok(ToolOutput::ok(format!(
                 "Plan approved. Permission mode is now {} — proceed with the implementation.",
                 mode.as_str()
@@ -165,6 +165,93 @@ mod tests {
         assert!(!out.is_error);
         assert!(out.for_model.contains("acceptEdits"));
         assert_eq!(*perm.lock().unwrap(), PermMode::AcceptEdits);
+    }
+
+    #[tokio::test]
+    async fn approve_persists_perm_mode_to_the_session_row() {
+        // ctx_with_interaction's in-memory store never seeds a session row,
+        // so update_session_perm_mode's UPDATE previously matched zero rows
+        // and silently no-opped — the plan-approval tests passed vacuously
+        // without ever proving the persistence actually took effect. Seed a
+        // real project + session (shape mirrors runner.rs's
+        // seed_pinned_project) whose pk matches ctx.session_pk so the write
+        // lands, then read the row back.
+        use crate::domain::{Project, Session, SessionKind, SessionStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, hub, mut rx, perm) = ctx_with_interaction(dir.path(), PermMode::Plan).await;
+        ctx.store
+            .insert_project(Project {
+                project_id: "p".into(),
+                name: "p".into(),
+                workdir: "/w".into(),
+                source: None,
+                harness: "native".into(),
+                model: None,
+                effort: None,
+                perm_mode: PermMode::Plan,
+                created_at: Some(0),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        ctx.store
+            .insert_session(Session {
+                session_pk: ctx.session_pk.clone(),
+                project_id: Some("p".into()),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("titled".into()),
+                status: SessionStatus::Running,
+                perm_mode: PermMode::Plan,
+                started_by: None,
+                created_at: Some(0),
+                last_active: Some(0),
+                resume_attempts: 0,
+                branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        let waiter = tokio::spawn(async move {
+            match rx.recv().await.unwrap() {
+                CoreEvent::ApprovalRequested { request_id, .. } => {
+                    hub.resolve(
+                        &request_id,
+                        ApprovalResponse {
+                            decision: ApprovalDecision::AllowOnce,
+                            scope: None,
+                            payload: Some(json!({"mode": "acceptEdits"})),
+                        },
+                    );
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        });
+        let out = ExitPlanMode
+            .execute(&ctx, json!({"plan": "do X"}))
+            .await
+            .unwrap();
+        waiter.await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(*perm.lock().unwrap(), PermMode::AcceptEdits);
+
+        let session = ctx
+            .store
+            .get_session(&ctx.session_pk)
+            .await
+            .unwrap()
+            .expect("seeded session row must still exist");
+        assert_eq!(
+            session.perm_mode,
+            PermMode::AcceptEdits,
+            "approval must persist to the session row, not just the in-memory mutex"
+        );
     }
 
     #[tokio::test]

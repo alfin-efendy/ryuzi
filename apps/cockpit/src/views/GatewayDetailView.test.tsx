@@ -34,6 +34,7 @@ const runningSession: Session = {
   branch: "main",
   title: "Fix flaky tests",
   status: "running",
+  permMode: "default",
   startedBy: null,
   createdAt: 1_720_000_000_000,
   lastActive: 1_720_000_000_000,

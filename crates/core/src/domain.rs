@@ -119,6 +119,9 @@ pub struct Session {
     pub branch: Option<String>,
     pub title: Option<String>,
     pub status: SessionStatus,
+    /// Per-session permission mode. Copied from the project (or the new-chat
+    /// picker) at creation; changing it affects THIS session only.
+    pub perm_mode: PermMode,
     pub started_by: Option<String>,
     pub created_at: Option<i64>,
     pub last_active: Option<i64>,

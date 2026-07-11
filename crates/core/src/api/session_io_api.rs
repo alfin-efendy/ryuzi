@@ -5,7 +5,9 @@
 //! until the proxy rewrite in Tasks 15-16.
 
 use super::{ok, params, ApiError};
-use crate::domain::{Message, NewMessage, NewProviderTurn, Session, SessionKind, SessionStatus};
+use crate::domain::{
+    Message, NewMessage, NewProviderTurn, PermMode, Session, SessionKind, SessionStatus,
+};
 use crate::paths::{new_id, now_ms};
 use crate::serve::ApiState;
 use crate::store::Store;
@@ -116,6 +118,8 @@ async fn apply_import(
         resume_attempts: 0,
         // Imported sessions never own a branch to clean up on end.
         branch_owned: false,
+        // Archived/view-only: the mode is never re-read by a live turn.
+        perm_mode: PermMode::Default,
         kind: SessionKind::Project,
         speaker: None,
         agent: None,
@@ -285,6 +289,7 @@ mod tests {
                 last_active: Some(0),
                 resume_attempts: 0,
                 branch_owned: false,
+                perm_mode: PermMode::Default,
                 kind: SessionKind::Project,
                 speaker: None,
                 agent: None,

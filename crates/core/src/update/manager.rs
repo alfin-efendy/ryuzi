@@ -239,6 +239,7 @@ pub fn upgrade_hint(install: &InstallInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::PermMode;
     use crate::domain::{CoreEvent, Session, SessionKind, SessionStatus};
     use crate::settings::SettingsStore;
     use crate::store::Store;
@@ -296,6 +297,7 @@ mod tests {
             branch: None,
             title: None,
             status,
+            perm_mode: PermMode::Default,
             started_by: None,
             created_at: None,
             last_active: None,

@@ -512,6 +512,30 @@ fn migrations() -> Migrations<'static> {
             DROP TABLE plugin_oauth_clients;\
             ALTER TABLE plugin_oauth_clients_rebuild RENAME TO plugin_oauth_clients;",
         ),
+        // Per-session permission mode (batch-3 design): sessions previously
+        // shared the project's mode; now each session carries its own,
+        // seeded from the owning project. Hook-guarded (SQLite has no ADD
+        // COLUMN IF NOT EXISTS) like branch_owned above: the rewind-and-replay
+        // test re-runs every migration appended after 13 on a DB that already
+        // has this column, so a plain ALTER would fail with "duplicate column".
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let exists = tx
+                .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='perm_mode'")?
+                .exists([])?;
+            if !exists {
+                tx.execute(
+                    "ALTER TABLE sessions ADD COLUMN perm_mode TEXT NOT NULL DEFAULT 'default'",
+                    [],
+                )?;
+                tx.execute(
+                    "UPDATE sessions SET perm_mode = COALESCE(\
+                         (SELECT p.perm_mode FROM projects p WHERE p.project_id = sessions.project_id),\
+                         'default')",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
         // Chat-first sessions (design: docs/superpowers/specs/
         // 2026-07-11-chat-first-sessions-design.md, Phase 2 Task A1):
         // sessions.project_id becomes nullable (chat/worker/review sessions
@@ -520,7 +544,10 @@ fn migrations() -> Migrations<'static> {
         // constraint in place, so rebuild the table: create the new shape,
         // copy every existing column, drop, rename. Existing rows all get
         // kind='project' with null lineage columns — correct, they were all
-        // project sessions before this migration.
+        // project sessions before this migration. This rebuild is appended
+        // AFTER the perm_mode migration above, so `sessions` already carries
+        // `perm_mode` here: sessions_new must include it and copy it forward,
+        // or the rebuild would silently drop the column perm_mode just added.
         M::up(
             r#"
             CREATE TABLE sessions_new (
@@ -536,6 +563,7 @@ fn migrations() -> Migrations<'static> {
                 started_by TEXT,
                 resume_attempts INTEGER NOT NULL DEFAULT 0,
                 branch_owned INTEGER NOT NULL DEFAULT 1,
+                perm_mode TEXT NOT NULL DEFAULT 'default',
                 kind TEXT NOT NULL DEFAULT 'project',
                 speaker TEXT,
                 agent TEXT,
@@ -543,9 +571,9 @@ fn migrations() -> Migrations<'static> {
             );
             INSERT INTO sessions_new
                 (session_pk, project_id, agent_session_id, worktree_path, branch, title,
-                 status, created_at, last_active, started_by, resume_attempts, branch_owned)
+                 status, created_at, last_active, started_by, resume_attempts, branch_owned, perm_mode)
             SELECT session_pk, project_id, agent_session_id, worktree_path, branch, title,
-                   status, created_at, last_active, started_by, resume_attempts, branch_owned
+                   status, created_at, last_active, started_by, resume_attempts, branch_owned, perm_mode
             FROM sessions;
             DROP TABLE sessions;
             ALTER TABLE sessions_new RENAME TO sessions;
@@ -990,12 +1018,12 @@ impl Store {
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,kind,speaker,agent,parent_session_pk) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
                     s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
-                    s.started_by, s.resume_attempts, s.branch_owned,
+                    s.started_by, s.resume_attempts, s.branch_owned, s.perm_mode.as_str(),
                     s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk
                 ],
             )
@@ -1028,6 +1056,25 @@ impl Store {
             )
         })
         .await?;
+        Ok(())
+    }
+
+    /// Set one session's permission mode (per-session override; the project
+    /// row is only the default seed for NEW sessions).
+    pub async fn update_session_perm_mode(&self, pk: &str, mode: PermMode) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let pk_for_err = pk.clone();
+        let rows = self
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE sessions SET perm_mode=?2 WHERE session_pk=?1",
+                    params![pk, mode.as_str()],
+                )
+            })
+            .await?;
+        if rows == 0 {
+            anyhow::bail!("update_session_perm_mode: unknown session {pk_for_err}");
+        }
         Ok(())
     }
 
@@ -1987,11 +2034,11 @@ impl Store {
 }
 
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,kind,speaker,agent,parent_session_pk";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     let status: String = r.get(6)?;
-    let kind: String = r.get(12)?;
+    let kind: String = r.get(13)?;
     Ok(Session {
         session_pk: r.get(0)?,
         project_id: r.get(1)?,
@@ -2005,10 +2052,14 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
         started_by: r.get(9)?,
         resume_attempts: r.get(10)?,
         branch_owned: r.get(11)?,
+        perm_mode: {
+            let pm: String = r.get(12)?;
+            PermMode::from_db(&pm)
+        },
         kind: SessionKind::from_db(&kind),
-        speaker: r.get(13)?,
-        agent: r.get(14)?,
-        parent_session_pk: r.get(15)?,
+        speaker: r.get(14)?,
+        agent: r.get(15)?,
+        parent_session_pk: r.get(16)?,
     })
 }
 
@@ -2141,6 +2192,7 @@ mod tests {
             last_active: Some(1),
             resume_attempts: 0,
             branch_owned: true,
+            perm_mode: PermMode::Default,
             kind: SessionKind::Project,
             speaker: None,
             agent: None,
@@ -2389,6 +2441,7 @@ mod tests {
                 last_active: Some(now),
                 resume_attempts: 0,
                 branch_owned: false,
+                perm_mode: crate::domain::PermMode::Default,
                 kind: crate::domain::SessionKind::Chat,
                 speaker: None,
                 agent: None,
@@ -2412,6 +2465,39 @@ mod tests {
             .unwrap()
             .iter()
             .any(|s| s.session_pk == "chat-1"));
+    }
+
+    #[tokio::test]
+    async fn session_perm_mode_roundtrips_and_updates() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_project(sample_project()).await.unwrap();
+        let mut s = sample_session();
+        s.perm_mode = PermMode::Plan;
+        store.insert_session(s).await.unwrap();
+
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.perm_mode, PermMode::Plan);
+
+        store
+            .update_session_perm_mode("s1", PermMode::AcceptEdits)
+            .await
+            .unwrap();
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.perm_mode, PermMode::AcceptEdits);
+    }
+
+    #[tokio::test]
+    async fn update_session_perm_mode_on_unknown_session_is_an_error() {
+        // The UPDATE previously matched zero rows and silently no-opped —
+        // a caller could believe the mode persisted when it never did.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let err = store
+            .update_session_perm_mode("does-not-exist", PermMode::AcceptEdits)
+            .await
+            .expect_err("updating a missing session must surface an error");
+        assert!(err.to_string().contains("does-not-exist"), "{err}");
     }
 
     #[tokio::test]
@@ -2869,12 +2955,16 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let conn = rusqlite::Connection::open(tmp.path()).unwrap();
-            // Minimal v4 shape: the 4 old tables + user_version 4.
+            // Minimal v4 shape: the 4 old tables + user_version 4. The project
+            // row carries a non-default perm_mode so the later
+            // sessions.perm_mode migration's backfill (Task 3) has something
+            // real to copy from 'old1'.
             conn.execute_batch(
                 "CREATE TABLE projects (project_id TEXT PRIMARY KEY, name TEXT, workdir TEXT NOT NULL, source TEXT, harness TEXT NOT NULL DEFAULT 'claude-code', model TEXT, effort TEXT, perm_mode TEXT NOT NULL DEFAULT 'default', created_at INTEGER);
                  CREATE TABLE sessions (session_pk TEXT PRIMARY KEY, project_id TEXT NOT NULL, agent_session_id TEXT, worktree_path TEXT, branch TEXT, title TEXT, status TEXT NOT NULL DEFAULT 'idle', created_at INTEGER, last_active INTEGER);
                  CREATE TABLE messages (session_pk TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL, block_type TEXT NOT NULL, payload TEXT NOT NULL, tool_call_id TEXT, status TEXT, tool_kind TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (session_pk, seq));
                  CREATE TABLE tool_policies (project_id TEXT NOT NULL, tool TEXT NOT NULL, decision TEXT NOT NULL, PRIMARY KEY (project_id, tool));
+                 INSERT INTO projects(project_id, name, workdir, perm_mode) VALUES ('p1', 'old', '/w', 'acceptEdits');
                  INSERT INTO sessions(session_pk, project_id) VALUES ('old1', 'p1');
                  PRAGMA user_version = 4;",
             )
@@ -2884,6 +2974,11 @@ mod tests {
         let s = store.get_session("old1").await.unwrap().unwrap();
         assert_eq!(s.resume_attempts, 0); // ALTER default applied
         assert_eq!(s.started_by, None);
+        assert_eq!(
+            s.perm_mode,
+            PermMode::AcceptEdits,
+            "sessions.perm_mode backfills from the owning project"
+        );
         assert_eq!(
             store
                 .get_setting_raw("enabled_gateways")
@@ -2906,7 +3001,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 20, "forward migration must land at v20");
+        assert_eq!(user_version, 21, "forward migration must land at v21");
     }
 
     #[tokio::test]
@@ -3056,19 +3151,20 @@ mod tests {
         // CREATE TABLE IF NOT EXISTS; 17 context_checkpoints + session_context —
         // CREATE TABLE IF NOT EXISTS; 18 plugin_oauth_clients — CREATE TABLE
         // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
-        // copy-drop-rename; 20 sessions rebuild (nullable project_id + kind/
-        // speaker/agent/parent_session_pk) — copies every existing column
-        // forward, so it's also a no-op on replay) re-run on the next open.
-        // `Migrations` always fast-forwards to the latest defined version,
-        // so there is no way to replay 13 alone once something is appended
-        // after it. Bump this offset by one for every migration appended
-        // after 13 — a stale offset silently skips migration 13 (the DB
-        // opens fine, but this test starts failing its assertions, as
-        // migration 20 did until this comment/offset were updated with it).
+        // copy-drop-rename; 20 sessions.perm_mode — hook-guarded, like
+        // branch_owned; 21 sessions rebuild — nullable project_id + kind/
+        // speaker/agent/parent_session_pk, copies every existing column
+        // forward including perm_mode, so it's also a no-op on replay) re-run
+        // on the next open. `Migrations` always fast-forwards to the latest
+        // defined version, so there is no way to replay 13 alone once
+        // something is appended after it. Bump this offset by one for every
+        // migration appended after 13 — a stale offset silently skips
+        // migration 13 (the DB opens fine, but this test starts failing its
+        // assertions). With migrations through 21 defined, wind back nine.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 8)
+            c.pragma_update(None, "user_version", v - 9)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();

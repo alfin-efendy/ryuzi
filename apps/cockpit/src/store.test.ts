@@ -1,7 +1,8 @@
 import { test, expect, mock, spyOn } from "bun:test";
-import { useStore } from "./store";
+import { useStore, markFocusedSessionReadOnEvent } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
+import { useUi } from "./store-ui";
 
 function reset() {
   useStore.setState({
@@ -287,6 +288,7 @@ const runningSession = (pk: string) => ({
   branch: null,
   title: null,
   status: "running" as const,
+  permMode: "default" as const,
   createdAt: null,
   lastActive: null,
   startedBy: null,
@@ -432,6 +434,7 @@ test("start forwards chat options so composer runtime, context, and attachments 
       branch: "harness/s1",
       title: "/review",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
@@ -459,6 +462,7 @@ test("start forwards chat options so composer runtime, context, and attachments 
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
     git: null,
+    permMode: null,
   });
   expect(useStore.getState().focusedSessionPk).toBe("s1");
 
@@ -479,6 +483,7 @@ test("start forwards composer git options to IPC", async () => {
       branch: "feat/login",
       title: "go",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
@@ -503,6 +508,7 @@ test("start forwards composer git options to IPC", async () => {
     context: null,
     attachments: [],
     git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
+    permMode: null,
   });
 
   start.mockRestore();
@@ -522,6 +528,7 @@ test("start resolves and focuses the session without waiting for refresh", async
       branch: null,
       title: "go",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
@@ -578,6 +585,7 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: false,
+      permMode: "default",
       kind: "chat",
       speaker: null,
       agent: null,
@@ -593,6 +601,7 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
   expect(startChat).toHaveBeenCalledWith("hey", {
     runtimeId: "native",
     model: "fable",
+    permMode: null,
     context: null,
     attachments: [],
     git: null,
@@ -748,4 +757,78 @@ test("send falls back to continue for a session that is not running", async () =
   cont.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+});
+
+test("setFocused marks the previously-focused session read up to its lastActive", () => {
+  useUi.setState({ readAt: {} });
+  useStore.setState({
+    focusedSessionPk: "s1",
+    sessions: [
+      {
+        sessionPk: "s1",
+        projectId: "p",
+        agentSessionId: null,
+        worktreePath: null,
+        branch: null,
+        title: "s1",
+        status: "idle",
+        startedBy: null,
+        createdAt: 0,
+        lastActive: 4200,
+        resumeAttempts: 0,
+        branchOwned: false,
+        permMode: "default",
+        kind: "project",
+        speaker: null,
+        agent: null,
+        parentSessionPk: null,
+      },
+    ],
+    loaded: { s1: true, s2: true },
+  });
+  useStore.getState().setFocused("s2");
+  expect(useUi.getState().readAt.s1).toBe(4200);
+  expect(useStore.getState().focusedSessionPk).toBe("s2");
+});
+
+// markFocusedSessionReadOnEvent is the extracted decision the init() coreEventMsg
+// listener runs on every live event; it's exercised directly here since driving the
+// real Tauri event subscription isn't practical in this harness.
+test("markFocusedSessionReadOnEvent marks the focused session read as live activity streams in", () => {
+  useUi.setState({ readAt: {} });
+  const before = Date.now();
+  markFocusedSessionReadOnEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 1,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "hi" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    "s1",
+  );
+  expect(useUi.getState().readAt.s1).toBeGreaterThanOrEqual(before);
+});
+
+test("markFocusedSessionReadOnEvent leaves read state untouched for events on a non-focused session", () => {
+  useUi.setState({ readAt: {} });
+  markFocusedSessionReadOnEvent(
+    {
+      kind: "message",
+      session_pk: "s2",
+      seq: 1,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "hi" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    "s1",
+  );
+  expect(useUi.getState().readAt.s2).toBeUndefined();
 });

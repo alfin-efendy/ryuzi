@@ -17,6 +17,7 @@ import {
 import { basename } from "./lib/paths";
 import { useRuntimes } from "./store-runtimes";
 import { useNative } from "./store-native";
+import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 
 export type PendingApproval = {
@@ -37,6 +38,7 @@ export type ChatOptions = {
   } | null;
   attachments?: string[];
   git?: GitOptions | null;
+  permMode?: PermMode | null;
 };
 
 type State = {
@@ -73,8 +75,8 @@ type State = {
   cloneProject: (url: string, destParent: string) => Promise<boolean>;
   /** Pin (or clear, with null) the model future turns of this project use. */
   setProjectModel: (projectId: string, model: string | null) => Promise<void>;
-  /** Change the permission mode future turns of this project run under. */
-  setProjectPermMode: (projectId: string, permMode: PermMode) => Promise<void>;
+  /** Change the permission mode this session (only this session) runs under. */
+  setSessionPermMode: (sessionPk: string, permMode: PermMode) => Promise<void>;
   /** Resolves true as soon as the backend accepts — navigate immediately;
    *  the session list refresh completes in the background. */
   start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
@@ -110,6 +112,7 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
       : null,
     attachments: options.attachments ?? [],
     git: options.git ?? null,
+    permMode: options.permMode ?? null,
   };
 }
 
@@ -230,6 +233,11 @@ export const useStore = create<State>((set, get) => ({
   clearApproval: (requestId) => set((st) => ({ pendingApprovals: st.pendingApprovals.filter((a) => a.requestId !== requestId) })),
 
   setFocused: (pk) => {
+    const prev = get().focusedSessionPk;
+    if (prev && prev !== pk) {
+      const prevSession = get().sessions.find((s) => s.sessionPk === prev);
+      if (prevSession) useUi.getState().markRead(prev, prevSession.lastActive ?? 0);
+    }
     set({ focusedSessionPk: pk });
     if (pk && !get().loaded[pk]) void get().hydrateTranscript(pk);
   },
@@ -264,7 +272,10 @@ export const useStore = create<State>((set, get) => ({
     const projects = await commands.listProjects();
     const sessions = await commands.listSessions(null);
     if (projects.status === "ok") set({ projects: projects.data });
-    if (sessions.status === "ok") set({ sessions: sessions.data });
+    if (sessions.status === "ok") {
+      set({ sessions: sessions.data });
+      useUi.getState().seedReadState(sessions.data);
+    }
   },
 
   addProject: async () => {
@@ -303,11 +314,11 @@ export const useStore = create<State>((set, get) => ({
       await get().refresh();
     }
   },
-  setProjectPermMode: async (projectId, permMode) => {
-    const project = get().projects.find((p) => p.projectId === projectId);
-    if (!project || project.permMode === permMode) return;
-    set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode } : p)) });
-    const res = await commands.updateProject(projectId, project.model, permMode, project.harness);
+  setSessionPermMode: async (sessionPk, permMode) => {
+    const session = get().sessions.find((s) => s.sessionPk === sessionPk);
+    if (!session || session.permMode === permMode) return;
+    set({ sessions: get().sessions.map((s) => (s.sessionPk === sessionPk ? { ...s, permMode } : s)) });
+    const res = await commands.updateSessionPermMode(sessionPk, permMode);
     if (res.status === "error") {
       toast.error("Couldn't set permission mode: " + res.error.message);
       await get().refresh();
@@ -384,6 +395,8 @@ export const useStore = create<State>((set, get) => ({
     await events.coreEventMsg.listen((e) => {
       const event = e.payload.event;
       get().applyCoreEvent(event);
+      // Keep the actively-viewed session marked read as its activity streams in.
+      markFocusedSessionReadOnEvent(event, get().focusedSessionPk);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
@@ -392,3 +405,17 @@ export const useStore = create<State>((set, get) => ({
     });
   },
 }));
+
+/**
+ * A core event for the session currently focused in the UI counts as the
+ * user having "seen" it as it streams in — mark that session read so its
+ * unread dot never lags behind what's already on screen. Extracted from the
+ * `init()` listener so the decision is testable without driving a real Tauri
+ * event subscription.
+ */
+export function markFocusedSessionReadOnEvent(event: CoreEvent, focusedSessionPk: string | null): void {
+  const activePk = (event as { session_pk?: string }).session_pk;
+  if (activePk && activePk === focusedSessionPk) {
+    useUi.getState().markRead(activePk, Date.now());
+  }
+}

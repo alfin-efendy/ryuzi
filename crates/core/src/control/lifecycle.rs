@@ -28,6 +28,7 @@ impl ControlPlane {
             started_by,
             attachments,
             None,
+            None,
         )
         .await
     }
@@ -39,6 +40,7 @@ impl ControlPlane {
         started_by: &str,
         attachments: &[AttachmentRef],
         git: Option<SessionGitOptions>,
+        perm_mode: Option<PermMode>,
     ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
@@ -54,11 +56,14 @@ impl ControlPlane {
         // harness — otherwise a native session would inherit the Claude card's
         // model and every turn would hit the Claude subscription.
         //
-        // Permission mode is NOT inherited from the runtime card: the project's
-        // own `perm_mode` (set from the composer / project settings) is the
-        // single source of truth. `Default` means "Ask" (prompt before
-        // edits/commands) — inheriting the card's default (e.g. "Full") here is
-        // exactly what made a project set to Ask silently run without asking.
+        // Permission mode is NOT inherited from the runtime card: this new
+        // session's mode comes from `perm_mode` above (the picker) or falls
+        // back to the project's own `perm_mode` — never the runtime card's
+        // default. `Default` means "Ask" (prompt before edits/commands) —
+        // inheriting the card's default (e.g. "Full") here is exactly what
+        // made a project set to Ask silently run without asking. Once
+        // created, the SESSION's own row is the source of truth (per-session
+        // mode) — the project's `perm_mode` only seeds new sessions.
         if project.model.is_none() {
             let runtime_id = crate::runtimes::runtime_id_for_harness(&project.harness);
             if let Ok(defaults) =
@@ -109,6 +114,7 @@ impl ControlPlane {
             },
             title: Some(title),
             status: SessionStatus::Running,
+            perm_mode: perm_mode.unwrap_or(project.perm_mode),
             started_by: Some(started_by.to_string()),
             created_at: Some(now),
             last_active: Some(now),
@@ -179,6 +185,7 @@ impl ControlPlane {
             last_active: Some(now),
             resume_attempts: 0,
             branch_owned: false,
+            perm_mode: PermMode::Default,
             kind: SessionKind::Chat,
             speaker: None,
             agent: None,
@@ -395,16 +402,12 @@ impl ControlPlane {
                 }
             }
         };
-        // Refresh the live session's permission mode from the project row so a
-        // change made in the composer/project settings between turns takes
-        // effect NOW — without this the warm handle keeps whatever mode it
-        // started with (ACP delegates permission externally, so its default
-        // no-op set_perm_mode simply does nothing).
-        if let Some(project_id) = session.project_id.as_deref() {
-            if let Ok(Some(project)) = self.store.get_project(project_id).await {
-                handle.set_perm_mode(project.perm_mode);
-            }
-        }
+        // Refresh the live session's permission mode from ITS OWN row so a
+        // change made in the composer between turns takes effect NOW — and so
+        // one session's change never leaks into siblings (per-session mode).
+        // Works for chat sessions too: they carry their own perm_mode with no
+        // project to consult.
+        handle.set_perm_mode(session.perm_mode);
         let prepared = self
             .prepare_attachments(session_pk, &prompt.agent, attachments)
             .await;
@@ -882,7 +885,11 @@ impl ControlPlane {
         // cold-resume, crash-resume) has already inserted the row before
         // reaching here, so this is a reliable single source of truth. A
         // missing row (shouldn't happen in practice) falls back to the kind
-        // implied by whether a project was resolved.
+        // implied by whether a project was resolved. The same row also carries
+        // the per-session permission mode (#100), which overrides the
+        // runtime/settings default computed above; when the row can't be read
+        // (a not-yet-persisted resume path) that default stands in — and it is
+        // already project-less-safe, so no `project` deref is needed here.
         let session_row = self.store.get_session(session_pk).await.ok().flatten();
         let kind = session_row
             .as_ref()
@@ -892,6 +899,10 @@ impl ControlPlane {
             } else {
                 SessionKind::Chat
             });
+        let perm_mode = session_row
+            .as_ref()
+            .map(|s| s.perm_mode)
+            .unwrap_or(perm_mode);
         let agent = session_row.and_then(|s| s.agent);
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
@@ -899,6 +910,7 @@ impl ControlPlane {
             kind,
             agent,
             work_dir: work_dir.to_path_buf(),
+            attachments_dir: Some(self.attachment_dest_dir(session_pk).await),
             perm_mode,
             model,
             effort,

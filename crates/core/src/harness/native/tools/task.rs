@@ -154,6 +154,7 @@ impl Tool for Task {
                     .join("\n\n");
                 Ok(ToolOutput {
                     for_model: format!("{total} sub-agents finished ({ok} ok):\n\n{digest}"),
+                    model_blocks: None,
                     display: Some(json!({
                         "summary": format!("{total} sub-agents: {ok} ok, {} failed", total - ok)
                     })),

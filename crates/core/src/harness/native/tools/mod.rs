@@ -172,6 +172,10 @@ pub struct ToolCtx {
     pub session_pk: String,
     /// The session worktree — the sandbox jail root.
     pub work_dir: PathBuf,
+    /// The session's attachment folder (`…/.harness-attachments/{session_pk}`)
+    /// — a SECOND read root beside the worktree jail, so the model can open
+    /// files the user attached. `None` in bare test contexts.
+    pub attachments_dir: Option<PathBuf>,
     /// Plugin-bundled skill directories (see
     /// `crate::plugins::PluginHost::enabled_skill_dirs`), consulted by the
     /// `skill` tool alongside `work_dir`'s own skill dirs.
@@ -198,6 +202,10 @@ pub struct ToolOutput {
     /// Text replayed to the model as the `tool_result` content (already
     /// truncated to caps by the tool).
     pub for_model: String,
+    /// Optional content blocks (e.g. `{type:"image",…}`) PREPENDED to the
+    /// tool_result content before `for_model`'s text block. `None` for
+    /// text-only results (every tool but image reads).
+    pub model_blocks: Option<Vec<Value>>,
     /// Optional extra fields merged into the persisted `tool_call` payload for
     /// the UI (e.g. a status summary). `None` for most tools.
     pub display: Option<Value>,
@@ -208,6 +216,7 @@ impl ToolOutput {
     pub fn ok(text: impl Into<String>) -> Self {
         ToolOutput {
             for_model: text.into(),
+            model_blocks: None,
             display: None,
             is_error: false,
         }
@@ -216,6 +225,7 @@ impl ToolOutput {
     pub fn error(text: impl Into<String>) -> Self {
         ToolOutput {
             for_model: text.into(),
+            model_blocks: None,
             display: None,
             is_error: true,
         }
@@ -384,6 +394,7 @@ pub(crate) mod testutil {
         ToolCtx {
             session_pk: "test-session".into(),
             work_dir: dir.to_path_buf(),
+            attachments_dir: None,
             extra_skill_dirs: vec![],
             store,
             cancel: CancellationToken::new(),

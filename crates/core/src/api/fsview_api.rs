@@ -293,6 +293,7 @@ mod tests {
                 last_active: Some(now),
                 resume_attempts: 0,
                 branch_owned: false,
+                perm_mode: crate::domain::PermMode::Default,
                 kind: crate::domain::SessionKind::Chat,
                 speaker: None,
                 agent: None,
