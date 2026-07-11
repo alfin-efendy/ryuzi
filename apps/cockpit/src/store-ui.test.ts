@@ -80,6 +80,17 @@ test("hideInvalidModels toggle flips state and persists to localStorage", () => 
   expect(localStorage.getItem("cockpit.ui.hideInvalidModels")).toBe("0");
 });
 
+test("notificationsEnabled defaults on and toggles + persists", () => {
+  useUi.setState({ notificationsEnabled: true });
+  expect(useUi.getState().notificationsEnabled).toBe(true);
+  useUi.getState().toggleNotifications();
+  expect(useUi.getState().notificationsEnabled).toBe(false);
+  expect(localStorage.getItem("cockpit.ui.notificationsEnabled")).toBe("0");
+  useUi.getState().toggleNotifications();
+  expect(useUi.getState().notificationsEnabled).toBe(true);
+  expect(localStorage.getItem("cockpit.ui.notificationsEnabled")).toBe("1");
+});
+
 function sess(pk: string, lastActive: number | null): Session {
   return {
     sessionPk: pk,
@@ -141,4 +152,22 @@ test("toggleStatusFilter and toggleUnreadOnly persist", () => {
   // toggling again removes the status
   useUi.getState().toggleStatusFilter("running");
   expect(useUi.getState().sessionFilter.statuses).toEqual({});
+});
+
+test("togglePin maintains pinnedOrder (append on pin, remove on unpin) and persists", () => {
+  useUi.setState({ pinned: {}, pinnedOrder: [] });
+  useUi.getState().togglePin("a");
+  useUi.getState().togglePin("b");
+  expect(useUi.getState().pinnedOrder).toEqual(["a", "b"]);
+  expect(JSON.parse(localStorage.getItem("cockpit.ui.pinnedOrder") ?? "[]")).toEqual(["a", "b"]);
+  useUi.getState().togglePin("a"); // unpin a
+  expect(useUi.getState().pinnedOrder).toEqual(["b"]);
+  expect(useUi.getState().pinned.a).toBeUndefined();
+});
+
+test("reorderPinned reorders and persists pinnedOrder", () => {
+  useUi.setState({ pinned: { a: true, b: true, c: true }, pinnedOrder: ["a", "b", "c"] });
+  useUi.getState().reorderPinned("a", "c");
+  expect(useUi.getState().pinnedOrder).toEqual(["b", "c", "a"]);
+  expect(JSON.parse(localStorage.getItem("cockpit.ui.pinnedOrder") ?? "[]")).toEqual(["b", "c", "a"]);
 });

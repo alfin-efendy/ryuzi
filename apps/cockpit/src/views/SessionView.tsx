@@ -3,7 +3,7 @@ import { ArrowUp, ChevronDown, CircleAlert, FileText, GitBranch, Mic, PanelBotto
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
 import { commands } from "@/bindings";
-import { useStore } from "@/store";
+import { useStore, type ChatOptions } from "@/store";
 import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
@@ -25,6 +25,7 @@ import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer"
 import { TodoPanel } from "@/components/session/TodoPanel";
 import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { SessionCostPanel } from "@/components/session/SessionCostPanel";
+import { QueuedMessages } from "@/components/session/QueuedMessages";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -33,6 +34,7 @@ import { HISTORY_IDLE, historyEntries, shouldNavigateHistory, stepHistory, type 
 export function SessionView() {
   const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setSessionPermMode } =
     useStore();
+  const enqueueMessage = useStore((s) => s.enqueueMessage);
   const nav = useNav();
   // Draft text lives in the persisted useNav drafts map keyed by session, so
   // switching sessions/views (SessionView renders un-keyed in App.tsx) swaps
@@ -180,16 +182,21 @@ export function SessionView() {
     if (!t && composerFiles.attachments.length === 0) return;
     const key = session.sessionPk;
     const typed = draft;
-    // Clear optimistically; a rejected send puts the text back (unless the
-    // user already started typing something new — restoreDraft is a no-op then).
+    const options: ChatOptions = {
+      context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
+      attachments: composerFiles.attachments,
+    };
+    // Clear optimistically; a rejected *send* puts the text back. Enqueue never
+    // fails, so no restore path there.
     useNav.getState().clearDraft(key);
     historyRef.current = HISTORY_IDLE;
     composerFiles.clear();
     setContextRefs([]);
-    void send(key, t, {
-      context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-      attachments: composerFiles.attachments,
-    }).then((ok) => {
+    if (running) {
+      enqueueMessage(key, { id: crypto.randomUUID(), text: t, options });
+      return;
+    }
+    void send(key, t, options).then((ok) => {
       if (!ok) useNav.getState().restoreDraft(key, typed);
     });
   };
@@ -287,6 +294,7 @@ export function SessionView() {
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
+          <QueuedMessages sessionPk={session.sessionPk} />
           <div
             className={`acrylic-card relative mx-auto w-full max-w-3xl rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
           >
@@ -316,7 +324,7 @@ export function SessionView() {
                 }
               }}
               onPaste={composerFiles.onPaste}
-              placeholder="Ask for follow-up changes"
+              placeholder={running ? "Enter to queue" : "Ask for follow-up changes"}
               className="max-h-[40vh] min-h-0 resize-none overflow-y-auto border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
             />
             {slashMatches.length > 0 && (

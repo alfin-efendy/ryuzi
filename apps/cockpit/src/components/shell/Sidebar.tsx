@@ -28,6 +28,9 @@ import {
   Modal,
   ModalFooter,
 } from "@ryuzi/ui";
+import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
+import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
+import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
@@ -45,8 +48,10 @@ import {
   type Ordering,
 } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
-import { StatusDot } from "@/components/common/bits";
+import { StatusDot, TreeGuide } from "@/components/common/bits";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
+import { SessionRow } from "@/components/shell/SessionRow";
+import { SortableSessionRow } from "@/components/shell/SortableSessionRow";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
@@ -60,39 +65,32 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
 // Layout-only overrides for the tiny ghost icon Buttons in tree rows.
 const iconBtn = "shrink-0 rounded-sm text-muted-foreground";
 
-const guideColor = "color-mix(in srgb, var(--sidebar-foreground) 20%, var(--sidebar))";
-
-// Tree connector in front of session rows: a rounded elbow into the row, plus
-// a vertical rail continuing to the next sibling. `reach` extends the lines
-// past the row edges to bridge the 1px gaps between rows.
-function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
-  return (
-    <span aria-hidden className="relative w-6 shrink-0 self-stretch">
-      <span
-        className="absolute left-3.5 box-border w-[9px] rounded-bl-[7px]"
-        style={{
-          top: -reach,
-          height: `calc(50% + ${reach}px)`,
-          borderLeft: `1.5px solid ${guideColor}`,
-          borderBottom: `1.5px solid ${guideColor}`,
-        }}
-      />
-      {tail && (
-        <span
-          className="absolute left-3.5 box-border w-[9px]"
-          style={{ top: -reach, bottom: -reach, borderLeft: `1.5px solid ${guideColor}` }}
-        />
-      )}
-    </span>
-  );
-}
-
 export function Sidebar() {
   const { projects, sessions, setFocused, focusedSessionPk, selectProject, end } = useStore();
   const pendingCount = useStore((s) => s.pendingApprovals.length);
-  const { pinned, archived, togglePin, setArchived, readAt, sessionFilter, toggleStatusFilter, toggleUnreadOnly, markAllRead } = useUi();
+  const {
+    pinned,
+    archived,
+    togglePin,
+    setArchived,
+    readAt,
+    sessionFilter,
+    toggleStatusFilter,
+    toggleUnreadOnly,
+    markAllRead,
+    pinnedOrder,
+    reorderPinned,
+  } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
   const [archivingPk, setArchivingPk] = useState<string | null>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const onPinnedDragEnd = (e: DragEndEvent) => {
+    const { active, over } = e;
+    if (over && active.id !== over.id) reorderPinned(String(active.id), String(over.id));
+  };
 
   // Archive = real teardown: end the session (interrupt + stop the agent,
   // kill its terminals, remove the worktree and its harness/* branch), then
@@ -367,7 +365,7 @@ export function Sidebar() {
       <div className="box-border flex w-[260px] min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2.5">
         {projList.map((p) => {
           const showArch = archivedGlobal || !!showArchived[p.projectId];
-          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, filter);
+          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, filter, pinnedOrder);
           const archCount = archivedCount(sessions, p.projectId, archived);
           const open = q.trim() ? sess.length > 0 : (expanded[p.projectId] ?? true);
           return (
@@ -413,62 +411,42 @@ export function Sidebar() {
               </div>
               {open && (
                 <>
-                  {sess.map((s, i) => {
-                    const m = statusMeta(s.status);
-                    const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
-                    const isPinned = !!pinned[s.sessionPk];
-                    const unread = isUnreadVisible(s, readAt, focusedSessionPk);
-                    const showArchivedLabel = archCount > 0 && !archivedGlobal;
-                    const hasTail = i < sess.length - 1 || showArchivedLabel;
-                    return (
-                      <div
-                        key={s.sessionPk}
-                        className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[s.sessionPk] ? "opacity-55" : ""}`}
-                      >
-                        <TreeGuide tail={hasTail} reach={3} />
-                        <span
-                          className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-[7px] pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
-                        >
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            onClick={() => openSession(s.sessionPk)}
-                            className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
-                          >
-                            <StatusDot color={m.color} pulse={m.pulse} />
-                            <span className={`min-w-0 flex-1 truncate ${unread ? "font-semibold text-foreground" : ""}`}>
-                              {sessionTitle(s)}
-                            </span>
-                            <span aria-hidden className="flex w-2 shrink-0 items-center justify-center">
-                              {unread && <span data-testid={`unread-dot-${s.sessionPk}`} className="size-1.5 rounded-full bg-primary" />}
-                            </span>
-                            {unread && <span className="sr-only">unread</span>}
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-xs"
-                            title={isPinned ? "Unpin" : "Pin"}
-                            className={`size-[22px] shrink-0 rounded-sm ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
-                            onClick={() => togglePin(s.sessionPk)}
-                          >
-                            <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-xs"
-                            title={archived[s.sessionPk] ? "Restore" : "Archive — ends the session and removes its worktree"}
-                            disabled={archivingPk === s.sessionPk}
-                            className="hidden size-[22px] shrink-0 rounded-sm text-muted-foreground disabled:opacity-40 group-hover:flex"
-                            onClick={() => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s))}
-                          >
-                            <Archive aria-hidden size={12} strokeWidth={2} />
-                          </Button>
-                        </span>
-                      </div>
-                    );
-                  })}
+                  <DndContext
+                    sensors={sensors}
+                    collisionDetection={closestCenter}
+                    modifiers={[restrictToVerticalAxis]}
+                    onDragEnd={onPinnedDragEnd}
+                  >
+                    <SortableContext
+                      items={sess.filter((s) => pinned[s.sessionPk]).map((s) => s.sessionPk)}
+                      strategy={verticalListSortingStrategy}
+                    >
+                      {sess.map((s, i) => {
+                        const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
+                        const isPinned = !!pinned[s.sessionPk];
+                        const unread = isUnreadVisible(s, readAt, focusedSessionPk);
+                        const showArchivedLabel = archCount > 0 && !archivedGlobal;
+                        const hasTail = i < sess.length - 1 || showArchivedLabel;
+                        const rowProps = {
+                          session: s,
+                          isActive,
+                          isPinned,
+                          unread,
+                          isArchived: !!archived[s.sessionPk],
+                          hasTail,
+                          archiveDisabled: archivingPk === s.sessionPk,
+                          onOpen: () => openSession(s.sessionPk),
+                          onTogglePin: () => togglePin(s.sessionPk),
+                          onToggleArchive: () => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s)),
+                        };
+                        return isPinned ? (
+                          <SortableSessionRow key={s.sessionPk} {...rowProps} />
+                        ) : (
+                          <SessionRow key={s.sessionPk} {...rowProps} />
+                        );
+                      })}
+                    </SortableContext>
+                  </DndContext>
                   {archCount > 0 && !archivedGlobal && (
                     <Button
                       type="button"

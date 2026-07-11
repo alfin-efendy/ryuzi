@@ -10,6 +10,8 @@ import { PROJECTS_ROOT_KEY } from "@/constants";
 import { useAgent } from "@/store-agent";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
 import { normalizeLoopSetting } from "@/lib/loop-settings";
+import { ensurePermission } from "@/lib/notify";
+import { useUi } from "@/store-ui";
 // Canonical brand assets (assets/brand/README.md). Explicit light/dark variants:
 // the app theme is class-driven, so the prefers-color-scheme adaptive SVG can't follow it.
 import wordmarkDark from "../../../../assets/brand/wordmark-dark.svg";
@@ -308,6 +310,9 @@ export function SettingsView() {
   const transparency = useTheme((s) => s.transparency);
   const setTransparency = useTheme((s) => s.setTransparency);
 
+  const notificationsEnabled = useUi((s) => s.notificationsEnabled);
+  const toggleNotifications = useUi((s) => s.toggleNotifications);
+
   const [version, setVersion] = useState<string | null>(null);
   useEffect(() => {
     getVersion()
@@ -392,6 +397,26 @@ export function SettingsView() {
               <div className="mt-0.5 text-[12.5px] text-muted-foreground">Start Cockpit when you sign in.</div>
             </div>
             <Switch on={openAtLogin === true} onToggle={toggleOpenAtLogin} label="Open at login" />
+          </div>
+        </Card>
+
+        <Card className="mt-3">
+          <div className="flex items-center gap-3.5 px-[18px] py-4">
+            <div className="flex-1">
+              <div className="text-[13.5px] font-semibold">Desktop notifications</div>
+              <div className="mt-0.5 text-[12.5px] text-muted-foreground">
+                Notify me when an agent finishes, needs approval, or errors while Cockpit is in the background.
+              </div>
+            </div>
+            <Switch
+              on={notificationsEnabled}
+              onToggle={() => {
+                const turningOn = !notificationsEnabled;
+                toggleNotifications();
+                if (turningOn) void ensurePermission();
+              }}
+              label="Desktop notifications"
+            />
           </div>
         </Card>
 

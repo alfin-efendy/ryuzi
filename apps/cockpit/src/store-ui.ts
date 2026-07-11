@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { Session } from "./bindings";
 import { basename } from "./lib/paths";
 import type { ViewMode } from "./lib/preview";
+import { reorder } from "@/lib/sidebar";
 
 export type DockTab = { id: string; kind: "file"; path: string; title: string; mode?: ViewMode };
 
@@ -35,8 +36,10 @@ const KEY = {
   tabs: "cockpit.ui.tabs",
   active: "cockpit.ui.activeTab",
   pinned: "cockpit.ui.pinned",
+  pinnedOrder: "cockpit.ui.pinnedOrder",
   archived: "cockpit.ui.archived",
   hideInvalidModels: "cockpit.ui.hideInvalidModels",
+  notificationsEnabled: "cockpit.ui.notificationsEnabled",
   readAt: "cockpit.ui.readAt",
   sessionFilter: "cockpit.ui.sessionFilter",
 };
@@ -62,6 +65,15 @@ function readSet(key: string): Record<string, true> {
     return raw ? (JSON.parse(raw) as Record<string, true>) : {};
   } catch {
     return {};
+  }
+}
+function readList(key: string): string[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
   }
 }
 function readNumMap(key: string): Record<string, number> {
@@ -103,6 +115,7 @@ type UiState = {
   tabs: DockTab[];
   activeTabId: string | null;
   pinned: Record<string, true>;
+  pinnedOrder: string[];
   archived: Record<string, true>;
   /** Per-session last-read epoch-ms cursor (unread = lastActive > cursor). */
   readAt: Record<string, number>;
@@ -113,6 +126,9 @@ type UiState = {
    *  runtime config). A picker's current selection always stays visible,
    *  flagged as invalid. */
   hideInvalidModels: boolean;
+  /** Gates OS/desktop notifications (native alerts) for session events. The
+   *  dock badge always reflects attention regardless of this flag. */
+  notificationsEnabled: boolean;
   toggleLeft: () => void;
   toggleRight: () => void;
   setLeft: (open: boolean) => void;
@@ -122,10 +138,12 @@ type UiState = {
   setActiveTab: (id: string) => void;
   setTabMode: (id: string, mode: ViewMode) => void;
   togglePin: (sessionPk: string) => void;
+  reorderPinned: (fromId: string, toId: string) => void;
   toggleArchive: (sessionPk: string) => void;
   /** Idempotent write — archive flows must not race a pure toggle. */
   setArchived: (sessionPk: string, on: boolean) => void;
   toggleHideInvalidModels: () => void;
+  toggleNotifications: () => void;
   markRead: (sessionPk: string, ts: number) => void;
   markAllRead: (sessions: Session[]) => void;
   seedReadState: (sessions: Session[]) => void;
@@ -139,10 +157,12 @@ export const useUi = create<UiState>((set, get) => ({
   tabs: readTabs(),
   activeTabId: normalizeActive(typeof localStorage !== "undefined" ? localStorage.getItem(KEY.active) : null),
   pinned: readSet(KEY.pinned),
+  pinnedOrder: readList(KEY.pinnedOrder),
   archived: readSet(KEY.archived),
   readAt: readNumMap(KEY.readAt),
   sessionFilter: readSessionFilter(KEY.sessionFilter),
   hideInvalidModels: readBool(KEY.hideInvalidModels, false),
+  notificationsEnabled: readBool(KEY.notificationsEnabled, true),
   toggleLeft: () =>
     set((s) => {
       const v = !s.leftPanelOpen;
@@ -194,8 +214,17 @@ export const useUi = create<UiState>((set, get) => ({
   },
   togglePin: (sessionPk) => {
     const pinned = toggleKey(get().pinned, sessionPk);
+    const nowPinned = !!pinned[sessionPk];
+    const cur = get().pinnedOrder;
+    const pinnedOrder = nowPinned ? (cur.includes(sessionPk) ? cur : [...cur, sessionPk]) : cur.filter((id) => id !== sessionPk);
     persist(KEY.pinned, JSON.stringify(pinned));
-    set({ pinned });
+    persist(KEY.pinnedOrder, JSON.stringify(pinnedOrder));
+    set({ pinned, pinnedOrder });
+  },
+  reorderPinned: (fromId, toId) => {
+    const pinnedOrder = reorder(get().pinnedOrder, fromId, toId);
+    persist(KEY.pinnedOrder, JSON.stringify(pinnedOrder));
+    set({ pinnedOrder });
   },
   toggleArchive: (sessionPk) => {
     const archived = toggleKey(get().archived, sessionPk);
@@ -214,6 +243,12 @@ export const useUi = create<UiState>((set, get) => ({
       const v = !s.hideInvalidModels;
       persist(KEY.hideInvalidModels, v ? "1" : "0");
       return { hideInvalidModels: v };
+    }),
+  toggleNotifications: () =>
+    set((s) => {
+      const v = !s.notificationsEnabled;
+      persist(KEY.notificationsEnabled, v ? "1" : "0");
+      return { notificationsEnabled: v };
     }),
   markRead: (sessionPk, ts) => {
     const readAt = { ...get().readAt, [sessionPk]: ts };
