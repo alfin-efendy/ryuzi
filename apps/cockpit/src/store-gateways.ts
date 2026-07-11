@@ -16,6 +16,7 @@ type GatewaysState = {
   hydrate: () => Promise<void>;
   probe: () => Promise<void>;
   add: (name: string, host: string, port: number, username: string) => Promise<boolean>;
+  addRunner: (name: string, host: string, port: number, fingerprint: string, code: string) => Promise<boolean>;
   remove: (id: string) => Promise<void>;
   updateFs: (id: string, fsMode: string, paths: string[]) => Promise<void>;
   loadEvents: (id: string) => Promise<void>;
@@ -55,6 +56,14 @@ export const useGateways = create<GatewaysState>((set, get) => ({
 
   add: async (name, host, port, username) => {
     const ok = applyResult(set, await commands.addGateway("local", name, host, port, username), "Add gateway");
+    return ok;
+  },
+
+  // Pairs a remote runner over pinned TLS and persists + live-adds it — all
+  // handled backend-side (Cockpit's `add_runner` Tauri command); the device
+  // token it mints along the way never crosses into this store or the webview.
+  addRunner: async (name, host, port, fingerprint, code) => {
+    const ok = applyResult(set, await commands.addRunner(name, host, port, fingerprint, code), "Add runner");
     return ok;
   },
 

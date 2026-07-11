@@ -360,6 +360,58 @@ fn pinned_client(fingerprint: &str) -> reqwest::Client {
         .expect("reqwest client builds over the preconfigured pinned rustls config")
 }
 
+/// P3-6: pair with a remote runner the user just typed Host/Port/Fingerprint
+/// for. No [`EngineClient`] exists yet for this runner — pairing IS the
+/// bootstrap that produces its device token — so this is a free function
+/// rather than an instance method. Builds a one-shot [`pinned_client`]
+/// trusting `fingerprint` (TOFU: the operator copied it from `ryuzi pair`'s
+/// printout on the remote host) and POSTs the pairing code to
+/// `{base_url}/pair`, mirroring the wire shape `serve.rs`'s `PairRequest`
+/// /pair handler expects and returns (see
+/// `remote_pair_then_authed_rpc_and_sse_over_pinned_tls` in
+/// `crates/core/tests/control_api.rs`, which exercises the exact same call
+/// shape end-to-end). On success, returns the plaintext `device_token`;
+/// the only caller (`gateways_cmd::add_runner`) hands it straight to the
+/// LOCAL engine's `save_runner` RPC and to `EngineManager::add_runner` —
+/// it is never returned to a `#[tauri::command]`'s own return value, so it
+/// never reaches the webview.
+pub async fn pair_over_pinned_tls(
+    base_url: &str,
+    fingerprint: &str,
+    code: &str,
+    device_name: &str,
+) -> Result<String, CmdError> {
+    let client = pinned_client(fingerprint);
+    let resp = client
+        .post(format!("{base_url}/pair"))
+        .json(&serde_json::json!({ "code": code, "device_name": device_name }))
+        .send()
+        .await
+        .map_err(|e| CmdError {
+            message: format!("pairing request failed: {e}"),
+        })?;
+    let status = resp.status();
+    let body: Value = resp.json().await.map_err(|e| CmdError {
+        message: format!("pairing response decode failed: {e}"),
+    })?;
+    if status.is_success() {
+        body.get("device_token")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| CmdError {
+                message: "pairing response missing device_token".to_string(),
+            })
+    } else {
+        Err(CmdError {
+            message: body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pairing failed")
+                .to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +536,87 @@ mod tests {
         );
         assert_eq!(engine.base_url, "https://127.0.0.1:9999");
         assert_eq!(engine.token, "device-token");
+    }
+
+    /// A TLS-enabled variant of `test_server`, standing up a real ring
+    /// `ServerConfig` (same construction `control_api.rs`'s
+    /// `remote_pair_then_authed_rpc_and_sse_over_pinned_tls` uses) so
+    /// `pair_over_pinned_tls`'s pinned-client `/pair` POST performs a
+    /// genuine TLS handshake, not a plaintext connection. Returns the base
+    /// URL, the server's real cert fingerprint, and an `Arc<Store>` handle
+    /// so tests can mint pairing codes against the same backing store.
+    async fn test_tls_server(token: &str) -> (String, String, std::sync::Arc<ryuzi_core::Store>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("ryuzi.sqlite");
+        let store = ryuzi_core::Store::open(&db_path).await.unwrap();
+        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
+        let material = ryuzi_core::tls::load_or_generate(tmp.path()).unwrap();
+        let tls_cfg = ryuzi_core::tls::server_config(&material).unwrap();
+        let store_handle = cp.store().clone();
+        let state = ryuzi_core::serve::ApiState {
+            router_server: Arc::new(ryuzi_core::llm_router::server::RouterServer::new(
+                store_handle.clone(),
+            )),
+            cp: cp.clone(),
+            control_token: token.to_string(),
+        };
+        let opts = ryuzi_core::serve::ServeOpts {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            tls: Some(tls_cfg),
+        };
+        let port = ryuzi_core::serve::serve(state, opts).await.unwrap();
+        // Keep the temp dir (and its TLS key material / sqlite file) alive
+        // for the lifetime of the test — same pattern `test_server` uses.
+        std::mem::forget(tmp);
+        (
+            format!("https://127.0.0.1:{port}"),
+            material.fingerprint,
+            store_handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn pair_over_pinned_tls_redeems_a_valid_code() {
+        let (base, fingerprint, store) = test_tls_server("tok").await;
+        let code = ryuzi_core::pairing::mint_code(&store, 60_000, ryuzi_core::paths::now_ms())
+            .await
+            .unwrap();
+
+        let token = pair_over_pinned_tls(&base, &fingerprint, &code, "cockpit-test")
+            .await
+            .expect("a freshly minted code pairs successfully");
+        assert_eq!(token.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn pair_over_pinned_tls_rejects_a_wrong_code() {
+        let (base, fingerprint, _store) = test_tls_server("tok").await;
+
+        let err = pair_over_pinned_tls(&base, &fingerprint, "not-a-real-code", "cockpit-test")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "invalid or expired pairing code");
+    }
+
+    /// The whole point of `fingerprint` pinning: a wrong fingerprint must
+    /// reject the TLS handshake itself, before the pairing code is even
+    /// sent — distinct from `pair_over_pinned_tls_rejects_a_wrong_code`,
+    /// which exercises the correct-pin/wrong-code case.
+    #[tokio::test]
+    async fn pair_over_pinned_tls_rejects_a_wrong_fingerprint() {
+        let (base, _fingerprint, store) = test_tls_server("tok").await;
+        let code = ryuzi_core::pairing::mint_code(&store, 60_000, ryuzi_core::paths::now_ms())
+            .await
+            .unwrap();
+
+        let err = pair_over_pinned_tls(&base, "wrong-fingerprint==", &code, "cockpit-test")
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("pairing request failed"),
+            "a wrong pin should fail the TLS handshake itself: {}",
+            err.message
+        );
     }
 }

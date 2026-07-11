@@ -245,6 +245,34 @@ async addGateway(runnerId: string | null, name: string, host: string, port: numb
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * P3-6 "Add Runner" flow. The user copies Name/Host/Port/Fingerprint/code
+ * off `ryuzi pair`'s printout on the REMOTE host and enters them here.
+ * Three steps, all in Cockpit's Tauri backend (never core — core stays
+ * free of outbound HTTP to arbitrary hosts):
+ * 
+ * 1. Pair over a pinned-TLS client trusting `fingerprint` (TOFU):
+ * `POST https://{host}:{port}/pair {code, device_name}` ->
+ * `{device_token}` ([`crate::engine::pair_over_pinned_tls`]).
+ * 2. Persist the paired row via the LOCAL engine's `save_runner` RPC
+ * (encrypts `device_token` at rest — see `gateways_api::save_runner`).
+ * 3. Live-add the runner to the [`EngineManager`] (pinned client + SSE
+ * bridge) so it's usable immediately, no Cockpit restart required.
+ * 
+ * SECURITY: `device_token` never leaves this function — it's consumed by
+ * step 1's caller and handed straight to steps 2 and 3, never placed on
+ * the `Vec<GatewayInfo>` this command returns (that DTO has no token
+ * field) and never logged. See `engine_manager.rs`'s module docs for the
+ * broader invariant this preserves.
+ */
+async addRunner(name: string, host: string, port: number, fingerprint: string, code: string) : Promise<Result<GatewayInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_runner", { name, host, port, fingerprint, code }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async removeGateway(runnerId: string | null, id: string) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remove_gateway", { runnerId, id }) };

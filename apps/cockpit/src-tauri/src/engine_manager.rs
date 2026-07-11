@@ -105,6 +105,37 @@ impl EngineManager {
             .insert(runner_id, handle);
     }
 
+    /// Live-add a single just-paired runner (P3-6's "Add Runner" flow):
+    /// build its pinned `EngineClient` and spawn its SSE bridge, exactly
+    /// like one iteration of [`EngineManager::load_remotes`]'s loop, so a
+    /// freshly paired runner is usable immediately — no Cockpit restart
+    /// required to pick it up. The row itself must already be persisted (by
+    /// the LOCAL engine's `save_runner` RPC) before this is called; this
+    /// method only updates in-memory state. `device_token` is plaintext —
+    /// same security posture as `load_remotes`: it's used solely to build
+    /// the pinned client's bearer header and is never logged, stored here,
+    /// or handed back to a caller.
+    pub fn add_runner(
+        &self,
+        runner_id: String,
+        host: String,
+        port: u16,
+        device_token: String,
+        fingerprint: String,
+        app_handle: &AppHandle,
+    ) {
+        let client = Arc::new(EngineClient::new_pinned(
+            format!("https://{host}:{port}"),
+            device_token,
+            fingerprint,
+        ));
+        self.clients
+            .write()
+            .expect("EngineManager::clients lock poisoned")
+            .insert(runner_id.clone(), client.clone());
+        self.start_bridge(runner_id, client, app_handle);
+    }
+
     /// (Re)load paired remote runners: ask the LOCAL engine's backend-only
     /// `list_runner_credentials` RPC for every `remote`-kind row with its
     /// `device_token` decrypted (see module docs for why this never reaches

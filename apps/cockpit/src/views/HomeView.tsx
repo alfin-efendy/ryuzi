@@ -186,6 +186,10 @@ export function HomeView() {
     // No project attached → a chat-first session (the Home default);
     // a picked project starts a normal project session, unchanged. Home has no
     // runner picker yet — new sessions always start on the local engine.
+    // TODO(P3-6 deferred): add a small LOCAL/remote-runner dropdown here once
+    // `useStore().projects` is runner-scoped (today it's a single flat list
+    // sourced from the local engine only, so picking a remote runner would
+    // need its own project listing first — bigger than a composer tweak).
     const ok = project ? await start(LOCAL_RUNNER, project.projectId, t, opts) : await startChat(LOCAL_RUNNER, t, opts);
     if (ok) nav.navigate({ kind: "session" });
     else useNav.getState().restoreDraft(draftKey, typed);

@@ -57,6 +57,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             gateways_cmd::list_gateways,
             gateways_cmd::probe_gateways,
             gateways_cmd::add_gateway,
+            gateways_cmd::add_runner,
             gateways_cmd::remove_gateway,
             gateways_cmd::update_gateway,
             gateways_cmd::gateway_events,
