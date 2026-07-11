@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { MonitorUp } from "lucide-react";
 import { SettingsCard as Card } from "@ryuzi/ui";
 import { useStore } from "./store";
-import { useRuntimes } from "./store-runtimes";
+import { useAgent } from "./store-agent";
 import { useModelStatuses } from "./store-model-statuses";
 import { useNav } from "./store-nav";
 import { usePlugins } from "./store-plugins";
@@ -16,8 +16,6 @@ import { SessionView } from "./views/SessionView";
 import { ModelsView } from "./views/ModelsView";
 import { ProviderDetailView } from "./views/ProviderDetailView";
 import { ConnectionDetailView } from "./views/ConnectionDetailView";
-import { RuntimeView } from "./views/RuntimeView";
-import { RuntimeDetailView } from "./views/RuntimeDetailView";
 import { SchedulerView } from "./views/SchedulerView";
 import { JobDetailView } from "./views/JobDetailView";
 import { JobNewView } from "./views/JobNewView";
@@ -44,10 +42,6 @@ function MainView() {
       return <ProviderDetailView provider={view.provider} />;
     case "connectionDetail":
       return <ConnectionDetailView id={view.id} />;
-    case "runtime":
-      return <RuntimeView />;
-    case "runtimeDetail":
-      return <RuntimeDetailView id={view.id} />;
     case "scheduler":
       return <SchedulerView />;
     case "jobDetail":
@@ -73,20 +67,20 @@ const WARN = "#F59E0B";
 
 export default function App() {
   const init = useStore((s) => s.init);
-  const hydrateAgents = useRuntimes((s) => s.hydrate);
+  const loadAgent = useAgent((s) => s.load);
   const hydrateModelStatuses = useModelStatuses((s) => s.hydrate);
   const restartRequired = usePlugins((s) => s.restartRequired);
   useDisableContextMenu();
   useEffect(() => {
     init();
-    void hydrateAgents();
+    void loadAgent();
     void hydrateModelStatuses();
     // Read the store directly (not via the reactive selector above) so this
     // mount-time fetch runs exactly once, guarded the same way every other
     // domain store's `load()` is — visiting the Plugins hub first is not a
     // precondition for the restart banner below to be accurate.
     if (!usePlugins.getState().loaded) void usePlugins.getState().load();
-  }, [init, hydrateAgents, hydrateModelStatuses]);
+  }, [init, loadAgent, hydrateModelStatuses]);
   return (
     <div className="relative flex h-screen flex-col overflow-hidden text-sm text-foreground antialiased">
       {/* Wallpaper behind the glass chrome; collapses to transparent when an OS backdrop is active. */}

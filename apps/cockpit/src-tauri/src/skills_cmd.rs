@@ -1,75 +1,51 @@
+//! Skills screen commands: thin proxies to the engine daemon's
+//! `crates/core/src/api/skills_api.rs` RPC family (list/install/remove/refresh
+//! git-backed native skills and plugin-bundled skill packs). DTOs stay
+//! imported from `ryuzi_core::skills_install` — that's their real home, it
+//! was never moved to `ryuzi_core::api::types`.
+
+use crate::engine::EngineClient;
 use ryuzi_core::skills_install::{InstalledSkillInfo, InstalledSkillPack};
-use ryuzi_core::ControlPlane;
 use std::sync::Arc;
 use tauri::State;
 
-fn command_result<T>(result: anyhow::Result<T>) -> Result<T, String> {
-    result.map_err(|err| err.to_string())
-}
+type Engine<'a> = State<'a, Arc<EngineClient>>;
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_skills() -> Result<Vec<InstalledSkillInfo>, String> {
-    command_result(ryuzi_core::skills_install::list_installed_skills())
-}
-
-/// Remove a single-skill install. Ledger-aware: also deletes the pack's
-/// `plugin_installs`/`plugin_attach_status` rows (via
-/// `remove_installed_skill_recorded`) so a reinstall starts from a clean
-/// ledger state instead of resurrecting stale trust/pin metadata, and marks
-/// `plugins_restart_required` — an uninstall changes what's on disk.
-#[tauri::command]
-#[specta::specta]
-pub async fn remove_skill(cp: State<'_, Arc<ControlPlane>>, id: String) -> Result<(), String> {
-    let result = ryuzi_core::skills_install::remove_installed_skill_recorded(&id, cp.store())
+pub async fn list_skills(engine: Engine<'_>) -> Result<Vec<InstalledSkillInfo>, String> {
+    engine
+        .rpc("list_skills", serde_json::json!({}))
         .await
-        .map_err(|err| err.to_string());
-    if result.is_ok() {
-        cp.mark_plugins_restart_required();
-    }
-    result
+        .map_err(|e| e.message)
 }
 
-/// Refresh a single-skill install. Ledger-aware: also keeps the pack's
-/// `plugin_installs` fingerprint in sync (via
-/// `refresh_installed_skill_recorded`) so a bare refresh doesn't leave the
-/// ledger's fingerprint stale — which would otherwise false-positive a
-/// `LocalEdits` result on the next update — and marks
-/// `plugins_restart_required`, since a refresh reinstalls fresh content.
 #[tauri::command]
 #[specta::specta]
-pub async fn refresh_skill(
-    cp: State<'_, Arc<ControlPlane>>,
-    id: String,
+pub async fn install_skill(
+    engine: Engine<'_>,
+    source: String,
 ) -> Result<InstalledSkillPack, String> {
-    let result = ryuzi_core::skills_install::refresh_installed_skill_recorded(&id, cp.store())
+    engine
+        .rpc("install_skill", serde_json::json!({ "source": source }))
         .await
-        .map_err(|err| err.to_string());
-    if result.is_ok() {
-        cp.mark_plugins_restart_required();
-    }
-    result
+        .map_err(|e| e.message)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_skill(engine: Engine<'_>, id: String) -> Result<(), String> {
+    engine
+        .rpc("remove_skill", serde_json::json!({ "id": id }))
+        .await
+        .map_err(|e| e.message)
+}
 
-    #[test]
-    fn command_result_maps_invalid_source_errors_to_strings() {
-        let err = command_result::<InstalledSkillPack>(Err(anyhow::anyhow!(
-            "unsupported skill source: not a valid source"
-        )))
-        .expect_err("invalid source should error");
-        assert!(err.contains("unsupported skill source"));
-    }
-
-    #[test]
-    fn command_result_maps_unknown_skill_errors_to_strings() {
-        let err = command_result::<()>(Err(anyhow::anyhow!(
-            "unknown installed skill: missing-skill"
-        )))
-        .expect_err("missing install should error");
-        assert!(err.contains("unknown installed skill"));
-    }
+#[tauri::command]
+#[specta::specta]
+pub async fn refresh_skill(engine: Engine<'_>, id: String) -> Result<InstalledSkillPack, String> {
+    engine
+        .rpc("refresh_skill", serde_json::json!({ "id": id }))
+        .await
+        .map_err(|e| e.message)
 }

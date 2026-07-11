@@ -154,9 +154,17 @@ async setSetting(key: string, value: string) : Promise<Result<null, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async updateProject(projectId: string, model: string | null, permMode: PermMode, harness: string) : Promise<Result<Project, CmdError>> {
+async updateProject(projectId: string, model: string | null, permMode: PermMode) : Promise<Result<Project, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_project", { projectId, model, permMode, harness }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_project", { projectId, model, permMode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateSessionPermMode(sessionPk: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_session_perm_mode", { sessionPk, permMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -170,86 +178,25 @@ async listBranches(projectId: string) : Promise<Result<BranchList, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async listRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
+async getAgentSettings() : Promise<Result<AgentSettingsInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_runtimes") };
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_settings") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-/**
- * Re-probe every catalog agent (PATH + --version + npm latest + local model
- * list for ollama), persist the snapshot, and return the fresh assembly.
- */
-async refreshRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
+async setAgentSettings(model: string | null, permMode: string | null) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("refresh_runtimes") };
+    return { status: "ok", data: await TAURI_INVOKE("set_agent_settings", { model, permMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateRuntimeConfig(id: string, enabled: boolean, model: string | null, permMode: string, flags: string) : Promise<Result<RuntimeInfo[], CmdError>> {
+async listSelectableModels() : Promise<Result<string[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_runtime_config", { id, enabled, model, permMode, flags }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Fire-and-forget npm update; progress streams via CoreEvent
- * RuntimeUpdateLog / RuntimeUpdateDone, then a refreshed snapshot matters —
- * the UI calls refreshRuntimes() on Done.
- */
-async updateRuntime(id: string) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("update_runtime", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setRuntimeTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<RuntimeInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_runtime_tier", { id, tierId, value, combo }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setDefaultRuntime(id: string) : Promise<Result<RuntimeInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_default_runtime", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async runtimeConfigStatus(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("runtime_config_status", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Guard (spec §5): refuse to write configs that point at a dead endpoint —
- * the server must be running and at least one endpoint key must exist.
- */
-async applyRuntimeConfig(id: string, mapping: RuntimeMappingArg) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("apply_runtime_config", { id, mapping }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async resetRuntimeConfig(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reset_runtime_config", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("list_selectable_models") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -894,13 +841,14 @@ async listSkills() : Promise<Result<InstalledSkillInfo[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
-/**
- * Remove a single-skill install. Ledger-aware: also deletes the pack's
- * `plugin_installs`/`plugin_attach_status` rows (via
- * `remove_installed_skill_recorded`) so a reinstall starts from a clean
- * ledger state instead of resurrecting stale trust/pin metadata, and marks
- * `plugins_restart_required` — an uninstall changes what's on disk.
- */
+async installSkill(source: string) : Promise<Result<InstalledSkillPack, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_skill", { source }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async removeSkill(id: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remove_skill", { id }) };
@@ -909,14 +857,6 @@ async removeSkill(id: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
-/**
- * Refresh a single-skill install. Ledger-aware: also keeps the pack's
- * `plugin_installs` fingerprint in sync (via
- * `refresh_installed_skill_recorded`) so a bare refresh doesn't leave the
- * ledger's fingerprint stale — which would otherwise false-positive a
- * `LocalEdits` result on the next update — and marks
- * `plugins_restart_required`, since a refresh reinstalls fresh content.
- */
 async refreshSkill(id: string) : Promise<Result<InstalledSkillPack, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("refresh_skill", { id }) };
@@ -966,6 +906,10 @@ async setPluginSetting(key: string, value: string) : Promise<Result<null, CmdErr
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Kind-symmetric uninstall on the daemon; returns the refreshed list so the
+ * entry's `installed` flips false and it reappears in Browse.
+ */
 async uninstallPlugin(id: string) : Promise<Result<PluginInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("uninstall_plugin", { id }) };
@@ -1007,12 +951,16 @@ async pluginModels(id: string) : Promise<Result<string[], CmdError>> {
 }
 },
 /**
- * The install wizard's entry point (spec 8-step resolution order). Steps
- * 1-6 live in `resolve_plugin_install`; this command adds step 7 (bind
- * 8976 — retried briefly — + background callback/exchange task, degrading
- * to `callback_mode: "manual"` only when the port is still taken after
- * the retries) and step 8 (emit `PluginOauthAuthorizeUrlMsg` + open the
- * browser), exactly like `begin_plugin_oauth` does for the detail view.
+ * The install wizard's entry point. The daemon (steps 1-6) resolves the auth
+ * kind, discovers / registers OAuth endpoints, builds the authorize URL,
+ * stores the PKCE flow state, and emits `CoreEvent::PluginOauthAuthorizeUrl`
+ * (the lib.rs SSE bridge opens the browser). When an OAuth flow was prepared,
+ * Cockpit adds step 7 here: it binds the fixed local callback port `8976`
+ * (retried briefly — a same-plugin Retry's previous axum server shuts down
+ * asynchronously), spawns a background task that awaits the loopback callback
+ * (or a cancel), validates `state` locally, and hands the code back to the
+ * daemon via `complete_plugin_oauth` for exchange + token storage. Degrades
+ * to `callback_mode: "manual"` (paste) only when the port stays taken.
  */
 async beginPluginInstall(pluginId: string) : Promise<Result<PluginInstallBeginResult, CmdError>> {
     try {
@@ -1022,6 +970,11 @@ async beginPluginInstall(pluginId: string) : Promise<Result<PluginInstallBeginRe
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Persist a manually-entered OAuth client id (external-OAuth plugins store
+ * it under the declared `auth.setting`; everyone else in
+ * `plugin_oauth_clients`). Pure daemon write.
+ */
 async setPluginOauthClientId(pluginId: string, clientId: string) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_plugin_oauth_client_id", { pluginId, clientId }) };
@@ -1031,10 +984,8 @@ async setPluginOauthClientId(pluginId: string, clientId: string) : Promise<Resul
 }
 },
 /**
- * Cancel the pending OAuth flow for this plugin, if any: shuts down the
- * callback listener and removes the flow-map entry. `state_token` narrows
- * to a specific flow when known; `None` cancels whatever is pending for
- * the id.
+ * Cancel a pending install: fire the LOCAL loopback shutdown first (frees
+ * port 8976 immediately), then drop the daemon's flow state.
  */
 async cancelPluginInstall(pluginId: string, stateToken: string | null) : Promise<Result<null, CmdError>> {
     try {
@@ -1045,10 +996,10 @@ async cancelPluginInstall(pluginId: string, stateToken: string | null) : Promise
 }
 },
 /**
- * Phase 1 of the two-phase tiered trust gate (see
- * `ryuzi_core::skills_install::begin_install`): curated sources install
- * immediately (`completed: true`); arbitrary sources stop at a trust prompt
- * the wizard must show before `confirm_skill_install` can proceed.
+ * Phase 1 of the two-phase tiered trust gate: curated sources install
+ * immediately (`completed: true`); arbitrary sources stop at a
+ * `TrustPromptDto` the wizard must show before `confirm_skill_install` can
+ * proceed.
  */
 async beginSkillInstall(source: string) : Promise<Result<SkillInstallBegin, CmdError>> {
     try {
@@ -1060,10 +1011,7 @@ async beginSkillInstall(source: string) : Promise<Result<SkillInstallBegin, CmdE
 },
 /**
  * Phase 2: complete a staged install (or update) after the user has
- * acknowledged its `TrustPromptDto`. The token is single-use — see
- * `ryuzi_core::skills_install::confirm_install`. Always marks
- * `plugins_restart_required`: reaching this point always means an install
- * (or reack-triggered update) just completed.
+ * acknowledged its `TrustPromptDto`. The token is single-use.
  */
 async confirmSkillInstall(token: string) : Promise<Result<InstalledSkillPack, CmdError>> {
     try {
@@ -1075,8 +1023,7 @@ async confirmSkillInstall(token: string) : Promise<Result<InstalledSkillPack, Cm
 },
 /**
  * Update one installed pack. `force` overrides the local-edits guard but
- * never the pinned guard or the hook-script re-ack gate — see
- * `ryuzi_core::skills_install::update_installed_pack`'s decision order.
+ * never the pinned guard or the hook-script re-ack gate.
  */
 async updatePlugin(id: string, force: boolean) : Promise<Result<UpdateOutcomeDto, CmdError>> {
     try {
@@ -1087,9 +1034,9 @@ async updatePlugin(id: string, force: boolean) : Promise<Result<UpdateOutcomeDto
 }
 },
 /**
- * Update every installed pack (skipping pinned ones); never fails as a
- * whole — a single pack's error surfaces as that pack's
- * `UpdateOutcomeDto::Failed` entry.
+ * Update every installed pack (skipping pinned ones); never fails as a whole
+ * — a single pack's error surfaces as that pack's `UpdateOutcomeDto::Failed`
+ * entry.
  */
 async updateAllPlugins() : Promise<Result<UpdateOutcomeEntry[], CmdError>> {
     try {
@@ -1111,9 +1058,9 @@ async setPluginPin(id: string, pinned: boolean, reason: string | null) : Promise
 }
 },
 /**
- * Read-only plugin health aggregation — see
- * `ryuzi_core::plugins::doctor::plugin_doctor`'s doc comment for the full
- * list of checks. Never mutates state.
+ * Read-only plugin health aggregation — see the daemon's
+ * `plugins::doctor::plugin_doctor` for the full list of checks. Never mutates
+ * state.
  */
 async pluginDoctor() : Promise<Result<DoctorFinding[], CmdError>> {
     try {
@@ -1124,9 +1071,9 @@ async pluginDoctor() : Promise<Result<DoctorFinding[], CmdError>> {
 }
 },
 /**
- * Whether a plugin install/update since the last app start requires a
- * restart to take effect (in-memory flag on `ControlPlane`, cleared only by
- * process restart).
+ * Whether a plugin install/update since the daemon's last start requires a
+ * restart to take effect (in-memory flag on the daemon's `ControlPlane`,
+ * cleared only by a daemon restart).
  */
 async pluginsRestartRequired() : Promise<Result<boolean, CmdError>> {
     try {
@@ -1285,9 +1232,15 @@ transport: string; command: string | null; args: string[];
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
+export type AgentSettingsInfo = { model: string | null; 
+/**
+ * "plan" | "ask" | "edit" | "full"; None = engine default ("ask").
+ */
+permMode: string | null }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 /**
- * The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+ * The user's decision on a tool-approval request from the native runtime's
+ * permission gate.
  */
 export type ApprovalDecision = "allowOnce" | "allowAlways" | "rejectOnce" | "rejectAlways" | "cancel"
 /**
@@ -1343,11 +1296,16 @@ export type CatalogEntry = { id: string; name: string;
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
-export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[]; 
+export type ChatRequestOptions = { model: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**
  * None => engine default (worktree ON, new engine-named branch from HEAD).
  */
-git: GitOptions | null }
+git: GitOptions | null; 
+/**
+ * Initial permission mode for the session being started (new-chat
+ * picker). `None` ⇒ inherit the project default.
+ */
+permMode: PermMode | null }
 export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
@@ -1386,14 +1344,6 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  */
 { kind: "orchTaskChanged"; task_id: string; root_id: string | null; status: string } | 
 /**
- * A runtime npm install/update produced an output line.
- */
-{ kind: "runtimeUpdateLog"; runtime_id: string; line: string } | 
-/**
- * A runtime npm install/update finished (ok=false → message has detail).
- */
-{ kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null } | 
-/**
  * Per-response context usage for a native session (drives the
  * "% context left" indicator).
  */
@@ -1402,7 +1352,29 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).
  */
-{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number }
+{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number } | 
+/**
+ * A provider OAuth flow produced its authorize URL. Surfaces open it
+ * (Cockpit maps this onto the legacy OauthAuthorizeUrlMsg Tauri event).
+ */
+{ kind: "oauthAuthorizeUrl"; provider: string; authorize_url: string } | 
+/**
+ * Same for a plugin OAuth flow.
+ */
+{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } | 
+/**
+ * Per-session accumulated cost: total USD and a per-model token+dollar
+ * breakdown. Emitted alongside `ContextUsage`.
+ * 
+ * Like its sibling context-telemetry variants above, this variant's own
+ * fields stay snake_case (`session_pk`, `total_usd`): the enum-level
+ * `rename_all = "camelCase"` on `CoreEvent` only renames the `kind` tag
+ * value, not each variant's field names (see `ContextUsage`'s
+ * `session_pk`). The nested `ModelCost` struct carries its own
+ * `rename_all = "camelCase"`, so its fields (e.g. `cache_read` →
+ * `cacheRead`) are camelCased independently.
+ */
+{ kind: "sessionCost"; session_pk: string; total_usd: number; models: ModelCost[] }
 export type CoreEventMsg = { event: CoreEvent }
 /**
  * Device-code flow info shown to the user while they complete the browser
@@ -1412,9 +1384,9 @@ export type CoreEventMsg = { event: CoreEvent }
 export type DeviceFlowInfo = { flowId: string; userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number; interval: number }
 export type DirEntryInfo = { name: string; dir: boolean }
 /**
- * Mirror of `ryuzi_core::plugins::doctor::DoctorFinding`. Already
- * secret-free at the source (see that module's doc comment) — this DTO adds
- * no new fields, just the specta `Type` the core struct doesn't derive.
+ * Mirror of `crate::plugins::doctor::DoctorFinding`. Already secret-free at
+ * the source (see that module's doc comment) — this DTO adds no new fields,
+ * just the specta `Type` the core struct doesn't derive.
  */
 export type DoctorFinding = { pluginId: string; 
 /**
@@ -1445,8 +1417,8 @@ export type GitOptions = { useWorktree: boolean; createBranch: boolean; branchNa
 export type InstalledSkillEntry = { id: string; name: string }
 export type InstalledSkillInfo = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skillCount: number }
 export type InstalledSkillPack = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skills: InstalledSkillEntry[] }
-export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
-export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
+export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
+export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Where the process's master key actually came from. Surfaced to the UI
@@ -1473,9 +1445,15 @@ export type KeychainStatus =
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
- * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
+ * A persisted transcript entry, one row per native-runtime event block.
  */
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
+/**
+ * One model's accumulated billed tokens + computed dollar cost within a
+ * session. Token fields are the durable truth; `usd` is derived from the
+ * current price table at emit time.
+ */
+export type ModelCost = { model: string; input: number; output: number; cacheRead: number; cacheCreation: number; usd: number }
 export type ModelRouteInfo = { id: string; name: string; enabled: boolean; strategy: ModelRouteStrategy; targets: ModelRouteTarget[]; createdAt: number; updatedAt: number }
 export type ModelRouteStrategy = "fallback" | "round-robin"
 export type ModelRouteTarget = { 
@@ -1532,8 +1510,9 @@ source: string;
  */
 capabilities: string[]; 
 /**
- * `integration` | `provider` | `gateway` | `skill-pack`. Runtime-kind
- * plugins are excluded from the list — the Runtime page owns them.
+ * `integration` | `provider` | `gateway` | `skill-pack`. There is no
+ * `runtime` kind: the native agent is built-in engine behavior, not an
+ * installable/listed plugin, so it never appears in this payload.
  */
 kind: string; 
 /**
@@ -1557,8 +1536,7 @@ pinned: boolean;
 /**
  * The ledger row's git origin (`PluginInstallRecord.source_spec`).
  * Distinct from `source` (the stable builtin/catalog/skill-pack enum
- * label) — the daemon's `/plugins` route (`serve::merge_install_record`)
- * draws the same distinction.
+ * label) — the Provenance card in Cockpit renders it only when present.
  */
 sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null }
 export type PluginInstallBeginResult = { 
@@ -1615,7 +1593,7 @@ export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string;
  * failure — the flow entry survives failures so manual paste still works.
  */
 export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
-export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
+export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —
  * NOT a DB column. Self-corrects if the user later runs `git init`.
@@ -1626,18 +1604,12 @@ export type ProviderQuotaInfo = { provider: string; plan: string | null; message
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
-export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
+export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; 
 /**
- * False for runtimes without an F1 handler (gemini, ollama).
+ * Per-session permission mode. Copied from the project (or the new-chat
+ * picker) at creation; changing it affects THIS session only.
  */
-supported: boolean }
-export type RuntimeInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
-/**
- * Whether Cockpit has a session harness for this agent today.
- */
-runnable: boolean }
-export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
-export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
+permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
 /**
  * True when the engine auto-generated the branch name (`harness/{short}`).
  * `end_session` deletes the branch ONLY when this is set; user-named and
@@ -1646,11 +1618,10 @@ export type Session = { sessionPk: string; projectId: string; agentSessionId: st
 branchOwned: boolean }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 /**
- * Mirror of `ryuzi_core::skills_install::BeginInstall`, flattened into a
- * single `{completed, trust?, plugin?}` shape the wizard can branch on
- * without a tagged-union match in TS. `trust` is set for
- * `NeedsConfirmation`, `plugin` for `Completed` — exactly one is ever
- * `Some`.
+ * Mirror of `crate::skills_install::BeginInstall`, flattened into a single
+ * `{completed, trust?, plugin?}` shape the wizard can branch on without a
+ * tagged-union match in TS. `trust` is set for `NeedsConfirmation`, `plugin`
+ * for `Completed` — exactly one is ever `Some`.
  */
 export type SkillInstallBegin = { completed: boolean; trust: TrustPromptDto | null; plugin: InstalledSkillPack | null }
 export type TermExitMsg = { id: string }
@@ -1669,7 +1640,6 @@ ok: boolean;
  * Tri-state probe verdict: "valid" | "invalid" | "unknown".
  */
 status: string; message: string }
-export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type TodoItem = { content: string; status: string }
 export type ToolInfo = { name: string; desc: string; perm: string }
 /**
@@ -1677,7 +1647,7 @@ export type ToolInfo = { name: string; desc: string; perm: string }
  */
 export type ToolPolicyRow = { projectId: string; tool: string; decision: string }
 /**
- * Mirror of `ryuzi_core::skills_install::TrustPrompt`. `total_bytes` stays a
+ * Mirror of `crate::skills_install::TrustPrompt`. `total_bytes` stays a
  * `u64` (not narrowed to `u32`) to avoid silently truncating a large pack's
  * byte count — `export_bindings`'s `BigIntExportBehavior::Number` already
  * renders any bigint-sized field as a plain TS `number`, so there's no
@@ -1685,16 +1655,16 @@ export type ToolPolicyRow = { projectId: string; tool: string; decision: string 
  */
 export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: string; resolvedCommit: string | null; skills: string[]; hookScripts: string[]; totalBytes: number }
 /**
- * Mirror of `ryuzi_core::skills_install::UpdateOutcome`. Keeps the same
+ * Mirror of `crate::skills_install::UpdateOutcome`. Keeps the same
  * `#[serde(tag = "kind", content = "detail")]` shape so the discriminated
  * union round-trips identically to the core enum.
  */
 export type UpdateOutcomeDto = { kind: "updated" } | { kind: "alreadyCurrent" } | { kind: "skippedPinned" } | { kind: "localEdits" } | { kind: "failed"; detail: string } | { kind: "needsReack"; detail: TrustPromptDto }
 /**
- * One pack's outcome from `update_all_plugins` — `ryuzi_core::skills_install
- * ::update_all_packs` returns `Vec<(String, UpdateOutcome)>`; specta can't
- * name a bare tuple usefully in the generated TS, so this wraps it in a
- * named struct.
+ * One pack's outcome from `update_all_plugins` —
+ * `crate::skills_install::update_all_packs` returns
+ * `Vec<(String, UpdateOutcome)>`; specta can't name a bare tuple usefully in
+ * the generated TS, so this wraps it in a named struct.
  */
 export type UpdateOutcomeEntry = { id: string; outcome: UpdateOutcomeDto }
 export type UsagePoint = { day: string; requests: number; inputTokens: number; outputTokens: number }

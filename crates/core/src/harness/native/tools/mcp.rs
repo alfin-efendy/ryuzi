@@ -64,6 +64,7 @@ impl Tool for McpTool {
                 let (text, is_error) = render_tool_result(&result);
                 Ok(ToolOutput {
                     for_model: truncate(&text, &ctx.caps),
+                    model_blocks: None,
                     display: None,
                     is_error,
                 })

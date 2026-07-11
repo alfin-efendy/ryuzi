@@ -4,47 +4,86 @@
 //! `attach`) can drive and observe sessions.
 
 use crate::control::ControlPlane;
+use crate::llm_router::server::RouterServer;
 use crate::plugins::{CorePlugin, PluginSource};
 use crate::settings::SettingsStore;
 use axum::extract::{Path, State};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
+/// Shared state for the control API router.
+#[derive(Clone)]
+pub struct ApiState {
+    pub cp: Arc<ControlPlane>,
+    pub router_server: Arc<RouterServer>,
+    /// `None` disables auth (tests, legacy embedded serve).
+    pub token: Option<String>,
+}
+
 /// Build the HTTP router over a control plane.
-pub fn router(cp: Arc<ControlPlane>) -> Router {
-    Router::new()
-        .route("/health", get(health))
+pub fn router(state: ApiState) -> Router {
+    let authed = Router::new()
         .route("/sessions", get(list_sessions))
         .route("/sessions/{pk}/messages", get(list_messages))
         .route("/sessions/{pk}/prompt", post(prompt))
         .route("/projects/{id}/session", post(start))
         .route("/events", get(events))
         .route("/plugins", get(list_plugins))
-        .route("/plugins/doctor", get(plugins_doctor))
-        .route("/plugins/install", post(install_plugin))
-        .route("/plugins/install/confirm", post(confirm_plugin_install))
-        .route("/plugins/update-all", post(update_all_plugins))
-        .route(
-            "/plugins/{id}",
-            get(get_plugin).delete(uninstall_plugin_route),
-        )
-        .route("/plugins/{id}/update", post(update_plugin_route))
-        .route("/plugins/{id}/pin", post(pin_plugin_route))
-        .with_state(cp)
+        .route("/plugins/{id}", get(get_plugin))
+        .route("/rpc/{method}", post(rpc))
+        .route("/approvals/{request_id}", post(resolve_approval_route))
+        .layer(middleware::from_fn_with_state(state.clone(), require_token));
+    Router::new()
+        .route("/health", get(health))
+        .merge(authed)
+        .with_state(state)
 }
 
-/// Bind `127.0.0.1:port` and serve until the process exits.
-pub async fn serve(cp: Arc<ControlPlane>, port: u16) -> anyhow::Result<u16> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+/// Reject requests without a valid `Authorization: Bearer <token>` header.
+/// Never applied to `GET /health`. A `None` token (tests, legacy embedded
+/// serve) disables auth entirely.
+async fn require_token(
+    State(state): State<ApiState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let Some(expected) = &state.token else {
+        return next.run(req).await; // auth disabled
+    };
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(p) if crate::control_token::verify(p, expected) => next.run(req).await,
+        _ => (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid bearer token" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Bind `127.0.0.1:port` and serve until the process exits. Falls back to an
+/// ephemeral port (0) if the fixed port is already busy (e.g. a stale
+/// `ryuzi serve`) — clients discover the real port from `daemon.json`, never
+/// hardcode it.
+pub async fn serve(state: ApiState, port: u16) -> anyhow::Result<u16> {
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(l) => l,
+        Err(_) if port != 0 => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
+        Err(e) => return Err(e.into()),
+    };
     let bound = listener.local_addr()?.port();
-    let app = router(cp);
+    let app = router(state);
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -55,42 +94,39 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": "ryuzi", "version": env!("CARGO_PKG_VERSION") }))
 }
 
-async fn list_sessions(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse {
-    match cp.list_sessions(None).await {
+async fn list_sessions(State(state): State<ApiState>) -> impl IntoResponse {
+    match state.cp.list_sessions(None).await {
         Ok(sessions) => Json(json!({ "sessions": sessions })).into_response(),
         Err(e) => err(&e),
     }
 }
 
-async fn list_messages(
-    State(cp): State<Arc<ControlPlane>>,
-    Path(pk): Path<String>,
-) -> impl IntoResponse {
-    match cp.list_messages(&pk).await {
+async fn list_messages(State(state): State<ApiState>, Path(pk): Path<String>) -> impl IntoResponse {
+    match state.cp.list_messages(&pk).await {
         Ok(messages) => Json(json!({ "messages": messages })).into_response(),
         Err(e) => err(&e),
     }
 }
 
 async fn prompt(
-    State(cp): State<Arc<ControlPlane>>,
+    State(state): State<ApiState>,
     Path(pk): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let text = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-    match cp.continue_session(&pk, text, &[]).await {
+    match state.cp.continue_session(&pk, text, &[]).await {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => err(&e),
     }
 }
 
 async fn start(
-    State(cp): State<Arc<ControlPlane>>,
+    State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let text = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-    match cp.start_session(&id, text, "http", &[]).await {
+    match state.cp.start_session(&id, text, "http", &[]).await {
         Ok(session) => Json(json!({ "session": session })).into_response(),
         Err(e) => err(&e),
     }
@@ -98,10 +134,10 @@ async fn start(
 
 /// Live SSE stream of core events.
 async fn events(
-    State(cp): State<Arc<ControlPlane>>,
+    State(state): State<ApiState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     use futures::StreamExt;
-    let rx = cp.subscribe();
+    let rx = state.cp.subscribe();
     let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|ev| async move {
         let ev = ev.ok()?;
         let data = serde_json::to_string(&ev).ok()?;
@@ -112,28 +148,10 @@ async fn events(
 
 /// `GET /plugins` — every installed plugin as a compact summary (identity,
 /// categories, verification/experimental flags, computed capabilities, and
-/// current enablement), enriched with its `plugin_installs`/
-/// `plugin_attach_status` ledger rows (when present) and the daemon-wide
-/// `restartRequired` flag. See [`plugin_summary`], [`merge_install_record`],
-/// [`merge_attach_status`], and [`CorePlugin::capabilities`].
-///
-/// The install/attach ledgers are fetched exactly once (`list_plugin_installs`/
-/// `list_plugin_attach`) and indexed by plugin id, rather than queried per
-/// plugin, so this stays O(1) round-trips regardless of the plugin count.
-async fn list_plugins(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse {
+/// current enablement). See [`plugin_summary`] and [`CorePlugin::capabilities`].
+async fn list_plugins(State(state): State<ApiState>) -> impl IntoResponse {
+    let cp = &state.cp;
     let settings = SettingsStore::new(cp.store().clone());
-    let installs: HashMap<String, crate::store::PluginInstallRecord> =
-        match cp.store().list_plugin_installs().await {
-            Ok(rows) => rows.into_iter().map(|r| (r.plugin_id.clone(), r)).collect(),
-            Err(e) => return err(&e),
-        };
-    let attach: HashMap<String, crate::store::PluginAttachStatus> =
-        match cp.store().list_plugin_attach().await {
-            Ok(rows) => rows.into_iter().map(|r| (r.plugin_id.clone(), r)).collect(),
-            Err(e) => return err(&e),
-        };
-    let restart_required = cp.plugins_restart_required();
-
     let mut entries = Vec::new();
     for plugin in cp.plugins().list() {
         match cp
@@ -141,19 +159,7 @@ async fn list_plugins(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse 
             .is_enabled(&settings, &plugin.manifest.id)
             .await
         {
-            Ok(enabled) => {
-                let mut value = plugin_summary(&plugin, enabled);
-                if let Some(map) = value.as_object_mut() {
-                    map.insert("restartRequired".to_string(), json!(restart_required));
-                    if let Some(rec) = installs.get(&plugin.manifest.id) {
-                        merge_install_record(map, rec);
-                    }
-                    if let Some(status) = attach.get(&plugin.manifest.id) {
-                        merge_attach_status(map, status);
-                    }
-                }
-                entries.push(value);
-            }
+            Ok(enabled) => entries.push(plugin_summary(&plugin, enabled)),
             Err(e) => return err(&e),
         }
     }
@@ -162,16 +168,12 @@ async fn list_plugins(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse 
 
 /// `GET /plugins/{id}` — the plugin's full manifest (via `PluginManifest`'s
 /// own `Serialize`, so new manifest fields show up automatically) with
-/// `enabled`, `source`, and `restartRequired` merged in as extra top-level
-/// keys, plus its `plugin_installs`/`plugin_attach_status` ledger rows (when
-/// present — see [`merge_install_record`], [`merge_attach_status`]). The
-/// manifest carries no secret VALUES (only setting/env key names — see
+/// `enabled` and `source` merged in as extra top-level keys. The manifest
+/// carries no secret VALUES (only setting/env key names — see
 /// `ryuzi_plugin_sdk::AuthSpec`), so this is safe to return verbatim; do not
 /// add settings-value lookups here.
-async fn get_plugin(
-    State(cp): State<Arc<ControlPlane>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn get_plugin(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
+    let cp = &state.cp;
     let Some(plugin) = cp.plugins().get(&id) else {
         return not_found(&id);
     };
@@ -188,194 +190,52 @@ async fn get_plugin(
     if let Some(map) = value.as_object_mut() {
         map.insert("enabled".to_string(), json!(enabled));
         map.insert("source".to_string(), json!(source_label(&plugin.source)));
-        map.insert(
-            "restartRequired".to_string(),
-            json!(cp.plugins_restart_required()),
-        );
-        match cp.store().get_plugin_install(&id).await {
-            Ok(Some(rec)) => merge_install_record(map, &rec),
-            Ok(None) => {}
-            Err(e) => return err(&e),
-        }
-        match cp.store().get_plugin_attach(&id).await {
-            Ok(Some(status)) => merge_attach_status(map, &status),
-            Ok(None) => {}
-            Err(e) => return err(&e),
-        }
     }
     Json(value).into_response()
 }
 
-/// Merge a `plugin_installs` ledger row into a plugin's JSON summary/manifest
-/// object. The record's origin lands under the DISTINCT `sourceSpec` key (a
-/// git URL / source spec), deliberately NOT the existing `source` field —
-/// `source` stays the stable [`source_label`] enum tag (`"builtin" |
-/// "catalog" | "skill-pack"`) so consumers matching on those labels keep
-/// working even once a plugin has a ledger row.
-fn merge_install_record(
-    map: &mut serde_json::Map<String, Value>,
-    rec: &crate::store::PluginInstallRecord,
-) {
-    map.insert("sourceSpec".to_string(), json!(rec.source_spec));
-    map.insert("resolvedCommit".to_string(), json!(rec.resolved_commit));
-    map.insert("pinned".to_string(), json!(rec.pinned));
-    map.insert("installedAt".to_string(), json!(rec.installed_at));
-    map.insert("updatedAt".to_string(), json!(rec.updated_at));
-    map.insert("trustTier".to_string(), json!(rec.trust_tier));
-}
-
-/// Merge a `plugin_attach_status` ledger row into a plugin's JSON summary/
-/// manifest object.
-fn merge_attach_status(
-    map: &mut serde_json::Map<String, Value>,
-    status: &crate::store::PluginAttachStatus,
-) {
-    map.insert("attachOutcome".to_string(), json!(status.outcome));
-    map.insert("attachReason".to_string(), json!(status.reason));
-}
-
-/// `GET /plugins/doctor` — read-only aggregation of plugin health findings
-/// (reconnect-required/missing-binary/attach-failed). Never mutates state;
-/// see `crate::plugins::doctor::plugin_doctor`.
-async fn plugins_doctor(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse {
-    match crate::plugins::doctor::plugin_doctor(&cp).await {
-        Ok(findings) => Json(findings).into_response(),
-        Err(e) => err(&e),
+/// `POST /rpc/{method}` — the generic RPC entry point. `method` is a Rust
+/// snake_case command name (see `crate::api::dispatch`); the request body is
+/// that command's params object. Errors from `dispatch` are surfaced with
+/// the `ApiError`'s own status code, not always 500.
+async fn rpc(
+    State(state): State<ApiState>,
+    Path(method): Path<String>,
+    Json(params): Json<Value>,
+) -> impl IntoResponse {
+    match crate::api::dispatch(&state, &method, params).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::from_u16(e.status)
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            Json(json!({ "error": e.message })),
+        )
+            .into_response(),
     }
 }
 
-/// `POST /plugins/install` `{source}` — phase 1 of the two-phase tiered trust
-/// gate. Curated sources install immediately; arbitrary sources stop at a
-/// `TrustPrompt` for the caller to show the user before `confirm_install` can
-/// proceed. Marks the daemon dirty (`restartRequired`) only when the install
-/// actually completed.
-async fn install_plugin(
-    State(cp): State<Arc<ControlPlane>>,
+/// `POST /approvals/{request_id}` — resolve a pending tool-permission
+/// approval (see `ApprovalHub`) with body `{"response": ApprovalResponse}`.
+/// A missing or malformed `response` leniently denies via
+/// `ApprovalResponse::once(false)`. `resolved` is `false` if no approval with
+/// this id was pending (already resolved, unknown id, or the request timed
+/// out).
+async fn resolve_approval_route(
+    State(state): State<ApiState>,
+    Path(request_id): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let source = body
-        .get("source")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    match crate::skills_install::begin_install(&source, cp.store()).await {
-        Ok(crate::skills_install::BeginInstall::Completed(pack)) => {
-            cp.mark_plugins_restart_required();
-            Json(json!({ "completed": true, "plugin": pack })).into_response()
-        }
-        Ok(crate::skills_install::BeginInstall::NeedsConfirmation(trust)) => {
-            Json(json!({ "completed": false, "trust": trust })).into_response()
-        }
-        Err(e) => err(&e),
-    }
-}
-
-/// `POST /plugins/install/confirm` `{token}` — phase 2 of the trust gate:
-/// completes a staged install (or update) after the user has acknowledged
-/// its `TrustPrompt`.
-async fn confirm_plugin_install(
-    State(cp): State<Arc<ControlPlane>>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let token = body
-        .get("token")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    match crate::skills_install::confirm_install(&token, cp.store()).await {
-        Ok(pack) => {
-            cp.mark_plugins_restart_required();
-            Json(json!({ "plugin": pack })).into_response()
-        }
-        Err(e) => err(&e),
-    }
-}
-
-/// `POST /plugins/{id}/update` `{force?}` — update one installed pack to its
-/// latest upstream commit. See `UpdateOutcome` for the full set of results
-/// (including `NeedsReack`, which routes back through `confirm_install`).
-async fn update_plugin_route(
-    State(cp): State<Arc<ControlPlane>>,
-    Path(id): Path<String>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    match crate::skills_install::update_installed_pack(&id, force, cp.store()).await {
-        Ok(outcome) => {
-            // Only an actual reinstall changes what's on disk / loaded;
-            // AlreadyCurrent/SkippedPinned/LocalEdits/NeedsReack are no-ops.
-            if matches!(outcome, crate::skills_install::UpdateOutcome::Updated) {
-                cp.mark_plugins_restart_required();
-            }
-            Json(outcome).into_response()
-        }
-        Err(e) => err(&e),
-    }
-}
-
-/// `POST /plugins/update-all` — update every installed pack, skipping pinned
-/// ones. Never fails as a whole: a single pack's error becomes an
-/// `UpdateOutcome::Failed` entry so the rest of the batch still runs.
-async fn update_all_plugins(State(cp): State<Arc<ControlPlane>>) -> impl IntoResponse {
-    match crate::skills_install::update_all_packs(cp.store()).await {
-        Ok(list) => {
-            // Only mark dirty if at least one pack actually reinstalled.
-            if list
-                .iter()
-                .any(|(_, o)| matches!(o, crate::skills_install::UpdateOutcome::Updated))
-            {
-                cp.mark_plugins_restart_required();
-            }
-            Json(
-                list.into_iter()
-                    .map(|(id, outcome)| json!({ "id": id, "outcome": outcome }))
-                    .collect::<Vec<_>>(),
-            )
-            .into_response()
-        }
-        Err(e) => err(&e),
-    }
-}
-
-/// `POST /plugins/{id}/pin` `{pinned, reason?}` — pin (or unpin) an installed
-/// pack against future updates. Does not require a restart — pin state does
-/// not change what is on disk or loaded in-process.
-async fn pin_plugin_route(
-    State(cp): State<Arc<ControlPlane>>,
-    Path(id): Path<String>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let pinned = body
-        .get("pinned")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let reason = body.get("reason").and_then(|v| v.as_str());
-    match crate::skills_install::set_pack_pin(&id, pinned, reason, cp.store()).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => err(&e),
-    }
-}
-
-/// `DELETE /plugins/{id}` — uninstall a recorded skill pack: removes it from
-/// disk and deletes its `plugin_installs`/`plugin_attach_status` ledger rows.
-async fn uninstall_plugin_route(
-    State(cp): State<Arc<ControlPlane>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    match crate::skills_install::remove_installed_skill_recorded(&id, cp.store()).await {
-        Ok(()) => {
-            cp.mark_plugins_restart_required();
-            Json(json!({ "ok": true })).into_response()
-        }
-        Err(e) => err(&e),
-    }
+    let response = body
+        .get("response")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<crate::domain::ApprovalResponse>(v).ok())
+        .unwrap_or_else(|| crate::domain::ApprovalResponse::once(false));
+    let resolved = state.cp.resolve_approval(&request_id, response);
+    Json(json!({ "resolved": resolved })).into_response()
 }
 
 /// The `{id, name, description, categories, verified, experimental, enabled,
-/// source, capabilities}` shape `GET /plugins` returns for one plugin.
-/// `source` is the stable [`source_label`] enum tag (`"builtin" | "catalog" |
-/// "skill-pack"`); a plugin's git origin, when it has a ledger row, is added
-/// separately under `sourceSpec` (see [`merge_install_record`]).
+/// capabilities}` shape `GET /plugins` returns for one plugin.
 fn plugin_summary(plugin: &CorePlugin, enabled: bool) -> Value {
     let m = &plugin.manifest;
     json!({
@@ -386,7 +246,6 @@ fn plugin_summary(plugin: &CorePlugin, enabled: bool) -> Value {
         "verified": m.verified,
         "experimental": m.experimental,
         "enabled": enabled,
-        "source": source_label(&plugin.source),
         "capabilities": plugin.capabilities(),
     })
 }
@@ -430,6 +289,29 @@ mod tests {
         ControlPlane::new(store, Registries::new()).await
     }
 
+    /// Auth-disabled `ApiState` for pre-existing tests that don't exercise
+    /// the bearer-token middleware.
+    fn no_auth_state(cp: Arc<ControlPlane>) -> ApiState {
+        ApiState {
+            router_server: Arc::new(crate::llm_router::server::RouterServer::new(
+                cp.store().clone(),
+            )),
+            cp,
+            token: None,
+        }
+    }
+
+    async fn test_state() -> ApiState {
+        let cp = test_cp().await;
+        ApiState {
+            router_server: Arc::new(crate::llm_router::server::RouterServer::new(
+                cp.store().clone(),
+            )),
+            cp,
+            token: Some("sekrit".to_string()),
+        }
+    }
+
     /// A connector that contributes no MCP servers — enough to exercise the
     /// connector-only branch of `PluginHost::is_enabled` (`plugin.<id>.
     /// enabled`, defaulting to `false`) without depending on a real
@@ -461,7 +343,6 @@ mod tests {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         }
     }
 
@@ -491,20 +372,20 @@ mod tests {
         assert_eq!(v["status"], "ok");
         assert_eq!(v["service"], "ryuzi");
         // Router builds without panicking.
-        let _ = router(cp);
+        let _ = router(no_auth_state(cp));
     }
 
     #[tokio::test]
     async fn serve_binds_an_ephemeral_port() {
         let cp = test_cp().await;
-        let port = serve(cp, 0).await.unwrap();
+        let port = serve(no_auth_state(cp), 0).await.unwrap();
         assert!(port > 0);
     }
 
     #[tokio::test]
     async fn list_plugins_shows_anthropic_enabled_with_provider_capability() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(cp, 0).await.unwrap();
+        let port = serve(no_auth_state(cp), 0).await.unwrap();
 
         let body: Vec<Value> = reqwest::get(format!("http://127.0.0.1:{port}/plugins"))
             .await
@@ -525,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn get_plugin_returns_manifest_fields_plus_enabled_and_source() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(cp, 0).await.unwrap();
+        let port = serve(no_auth_state(cp), 0).await.unwrap();
 
         let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/anthropic"))
             .await
@@ -543,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_plugin_id_is_404_with_error_envelope() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(cp, 0).await.unwrap();
+        let port = serve(no_auth_state(cp), 0).await.unwrap();
 
         let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/nope"))
             .await
@@ -554,95 +435,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_confirm_and_doctor_routes_exist() {
-        let cp = test_cp_with_plugins().await;
-        let port = serve(cp, 0).await.unwrap();
-        // doctor returns a JSON array (possibly empty) with 200.
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/doctor"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        let _: Vec<serde_json::Value> = resp.json().await.unwrap();
-        // update-all on a fresh DB returns an empty outcome list.
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("http://127.0.0.1:{port}/plugins/update-all"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        let outcomes: Vec<serde_json::Value> = resp.json().await.unwrap();
-        assert!(outcomes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn get_plugin_enrichment_keeps_source_enum_and_adds_source_spec() {
-        // Seed a plugin_installs ledger row for a builtin id, then confirm the
-        // enrichment adds record fields under DISTINCT keys and leaves the
-        // stable `source` enum label untouched (regression guard for the
-        // `source`/`sourceSpec` collision).
-        let cp = test_cp_with_plugins().await;
-        let store = cp.store().clone();
-        store
-            .upsert_plugin_install(&crate::store::PluginInstallRecord {
-                plugin_id: "anthropic".to_string(),
-                kind: "plugin_pack".to_string(),
-                source_spec: "https://github.com/acme/anthropic-pack".to_string(),
-                resolved_commit: Some("abc123".to_string()),
-                fingerprint: "sha256:deadbeef".to_string(),
-                installed_at: 1_700_000_000,
-                updated_at: 1_700_000_500,
-                pinned: false,
-                pin_reason: None,
-                trust_tier: "acknowledged".to_string(),
-                trust_ack_at: Some(1_700_000_000),
-                trust_ack_summary: None,
-            })
-            .await
-            .unwrap();
-
-        let port = serve(cp, 0).await.unwrap();
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/anthropic"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        let body: Value = resp.json().await.unwrap();
-
-        // `source` stays the enum label — NOT overwritten by the git spec.
-        assert_eq!(body["source"], "builtin");
-        // The record's origin lands under the distinct `sourceSpec` key.
-        assert_eq!(body["sourceSpec"], "https://github.com/acme/anthropic-pack");
-        assert_eq!(body["trustTier"], "acknowledged");
-        assert_eq!(body["installedAt"], 1_700_000_000_i64);
-        assert_eq!(body["resolvedCommit"], "abc123");
-        assert_eq!(body["pinned"], false);
-
-        // The same enrichment is visible in the LIST payload's entry.
-        let list: Vec<Value> = reqwest::get(format!("http://127.0.0.1:{port}/plugins"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let entry = list
-            .iter()
-            .find(|p| p["id"] == "anthropic")
-            .expect("anthropic present in /plugins");
-        assert_eq!(entry["source"], "builtin");
-        assert_eq!(
-            entry["sourceSpec"],
-            "https://github.com/acme/anthropic-pack"
-        );
-        assert_eq!(entry["trustTier"], "acknowledged");
-    }
-
-    #[tokio::test]
     async fn connector_only_plugin_is_disabled_until_setting_flips_true() {
         let cp = test_cp_with_plugins().await;
         // Keep a handle to write the setting directly after the server (which
         // consumes an `Arc<ControlPlane>` into its router state) is started.
         let store = cp.store().clone();
-        let port = serve(cp, 0).await.unwrap();
+        let port = serve(no_auth_state(cp), 0).await.unwrap();
 
         let fetch = || {
             let url = format!("http://127.0.0.1:{port}/plugins");
@@ -675,5 +473,58 @@ mod tests {
             .find(|p| p["id"] == "acme-test-connector")
             .unwrap();
         assert_eq!(entry["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn authed_routes_reject_missing_or_wrong_token() {
+        let state = test_state().await;
+        let port = serve(state, 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let r = client
+            .get(format!("http://127.0.0.1:{port}/sessions"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let r = client
+            .get(format!("http://127.0.0.1:{port}/sessions"))
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let r = client
+            .get(format!("http://127.0.0.1:{port}/sessions"))
+            .bearer_auth("sekrit")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_needs_no_token_and_reports_version() {
+        let state = test_state().await;
+        let port = serve(state, 0).await.unwrap();
+        let v: Value = reqwest::get(format!("http://127.0.0.1:{port}/health"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn busy_port_falls_back_to_ephemeral() {
+        let state = test_state().await;
+        let first = serve(state.clone(), 0).await.unwrap();
+        // Ask for the port that's now busy — must succeed on a different one.
+        let second = serve(test_state().await, first).await.unwrap();
+        assert_ne!(first, second);
     }
 }

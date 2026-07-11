@@ -10,8 +10,6 @@ pub struct Deps {
     pub err: Box<dyn FnMut(&str)>,
     pub prompt: Box<dyn FnMut(&str) -> String>,
     pub detect_git: fn() -> Detected,
-    pub detect_claude: fn() -> Detected,
-    pub sidecar_status: Box<dyn Fn() -> ryuzi_core::sidecar::SidecarStatus>,
     pub build_registries: Box<dyn Fn() -> anyhow::Result<ryuzi_core::Registries>>,
 }
 

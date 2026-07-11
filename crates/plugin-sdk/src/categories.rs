@@ -12,7 +12,6 @@ pub const KNOWN: &[&str] = &[
     "oauth",
     "free",
     "runtime",
-    "cli-agent",
     "chat-gateway",
     "vcs",
     "issues",
@@ -37,8 +36,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn known_has_exactly_twenty_two_entries() {
-        assert_eq!(KNOWN.len(), 22);
+    fn known_has_exactly_twenty_one_entries() {
+        assert_eq!(KNOWN.len(), 21);
     }
 
     #[test]

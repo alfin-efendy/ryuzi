@@ -46,7 +46,7 @@ fn help_flag_and_bare_help_and_no_args_print_usage() {
 }
 
 #[test]
-fn doctor_prints_six_report_lines() {
+fn doctor_prints_three_report_lines() {
     let tmp = tempfile::tempdir().unwrap();
     let assert = Command::cargo_bin("ryuzi")
         .unwrap()
@@ -59,19 +59,16 @@ fn doctor_prints_six_report_lines() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
         lines.len(),
-        6,
-        "doctor must print exactly 6 lines, got: {stdout}"
+        3,
+        "doctor must print exactly 3 lines, got: {stdout}"
     );
     assert!(lines[0].starts_with("git:    "), "line 1: {}", lines[0]);
-    assert!(lines[1].starts_with("claude: "), "line 2: {}", lines[1]);
-    assert!(lines[2].starts_with("auth:   "), "line 3: {}", lines[2]);
-    assert!(lines[3].starts_with("settings: "), "line 4: {}", lines[3]);
-    assert!(lines[4].starts_with("acp:    "), "line 5: {}", lines[4]);
-    assert!(lines[5].starts_with("doctor: "), "line 6: {}", lines[5]);
-    // Exit code must agree with the verdict line (environment-tolerant: claude may
-    // legitimately be missing on CI runners). The acp: line never affects it.
+    assert!(lines[1].starts_with("settings: "), "line 2: {}", lines[1]);
+    assert!(lines[2].starts_with("doctor: "), "line 3: {}", lines[2]);
+    // Exit code must agree with the verdict line (environment-tolerant:
+    // a fresh DB always has missing settings, so FAIL is expected here).
     let code = output.status.code().unwrap();
-    if lines[5] == "doctor: PASS" {
+    if lines[2] == "doctor: PASS" {
         assert_eq!(code, 0);
     } else {
         assert_eq!(code, 1);

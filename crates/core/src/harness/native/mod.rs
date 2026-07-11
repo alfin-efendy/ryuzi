@@ -1,12 +1,10 @@
 //! Native agent runtime.
 //!
-//! Unlike the ACP harness ([`super::acp`]), which delegates all reasoning and
-//! tool execution to an external Claude Code adapter process, the native
-//! runtime runs the agentic loop in-process: it calls LLMs through
+//! The native runtime runs the agentic loop in-process: it calls LLMs through
 //! [`crate::llm_router::client`], executes its own built-in tools
 //! ([`tools`]), enforces permissions ([`permission`]), and persists a
-//! provider-turn ledger ([`ledger`]) — registered under the harness id
-//! `"native"` beside `"claude-code"`.
+//! provider-turn ledger ([`ledger`]). It is the engine's only session
+//! harness, held as the single factory slot in [`crate::plugins::Registries`].
 //!
 //! See `docs/design/2026-07-05-native-agent-runtime-design.md`.
 
@@ -14,6 +12,7 @@ pub mod agents;
 pub mod commands;
 pub mod context;
 pub mod context_manager;
+pub mod cost;
 pub mod format;
 pub mod hooks;
 pub mod ledger;
@@ -34,7 +33,7 @@ use ryuzi_plugin_sdk::PluginManifest;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-/// The native runtime harness id, stored in `projects.harness`.
+/// The native runtime harness id — the sole in-process agent runtime.
 pub const NATIVE_ID: &str = "native";
 
 /// The native agent runtime as a [`Harness`]. Each session runs the agentic
@@ -150,6 +149,7 @@ impl Harness for NativeHarness {
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 work_dir: ctx.work_dir,
+                attachments_dir: ctx.attachments_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 model,
                 effort: ctx.effort,
@@ -288,7 +288,6 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         },
         harness: Some(Arc::new(NativeHarnessFactory::with_llm_factory(
             llm_factory,
@@ -323,6 +322,7 @@ mod tests {
         SessionCtx {
             session_pk: "sess".into(),
             work_dir,
+            attachments_dir: None,
             perm_mode: PermMode::BypassPermissions,
             model: Some("test/model".into()),
             effort: None,
@@ -339,8 +339,8 @@ mod tests {
     fn native_plugin_registers_under_native_id() {
         let mut regs = crate::plugins::Registries::new();
         regs.add_plugin(native_plugin());
-        assert!(regs.harness.get("native").is_some());
-        assert!(regs.gateway.get("native").is_none());
+        assert!(regs.plugins.get(NATIVE_ID).is_some());
+        assert!(regs.gateway.get(NATIVE_ID).is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! The native turn drain: one `run_turn` runs a prompt to completion, calling
 //! the model, executing tools, and persisting + streaming everything through
-//! the same [`CoreEvent`] surface the ACP harness uses.
+//! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
 use super::commands::CommandRegistry;
@@ -26,8 +26,9 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-/// Upper bound on provider turns per drain, to bound runaway tool loops.
-const MAX_PROVIDER_TURNS: usize = 50;
+/// Default upper bound on provider turns per drain, to bound runaway tool
+/// loops. Overridable via the `agent.max_provider_turns` setting (floor 1).
+const DEFAULT_MAX_PROVIDER_TURNS: usize = 50;
 /// Flush the streaming-text buffer into a persisted row at this size or on a
 /// newline, whichever comes first (keeps rows delta-shaped without spamming).
 const TEXT_FLUSH_BYTES: usize = 120;
@@ -39,6 +40,8 @@ const TEXT_FLUSH_BYTES: usize = 120;
 pub struct RunnerDeps {
     pub session_pk: String,
     pub work_dir: PathBuf,
+    /// Session attachments folder (second read root for the `read` tool).
+    pub attachments_dir: Option<PathBuf>,
     /// Plugin-bundled skill directories folded in beside the worktree/global
     /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
     pub extra_skill_dirs: Vec<PathBuf>,
@@ -169,8 +172,21 @@ pub async fn run_turn(
                 cache_read_tokens: 0,
                 output_tokens: 0,
             });
+            // Re-emit the accumulated session cost from what's already
+            // persisted — no accumulation here, just pricing the saved tally
+            // at current rates (spec: resume must not double-count).
+            let tally = super::cost::Tally::from_payload(&saved);
+            if !tally.is_empty() {
+                emit_session_cost(deps, &tally).await;
+            }
         }
-        _ => emit_context_usage(deps, &cm, true).await,
+        // No persisted tally yet (fresh session) or a read error — either
+        // way this is a display re-emit, never an accumulation: `cm` hasn't
+        // committed any response yet, so `cm.last_*` would be all-zero at
+        // best and stale at worst. `emit_context_usage` would otherwise
+        // persist a spurious zero-token model entry (and a `total_usd=0`
+        // `SessionCost`) on every brand-new session.
+        _ => emit_context_display(deps, &cm, true).await,
     }
     cm.append_user(user_content_blocks(&prompt.blocks, &agent_text))
         .await?;
@@ -236,7 +252,11 @@ async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::R
     match cm.compact(&deps.llm, &model, "manual").await {
         Ok(outcome) => {
             emit_compaction(deps, "manual", &outcome, true).await;
-            emit_context_usage(deps, &cm, true).await;
+            // Display-only: `compact()` never calls `commit_response()`, so
+            // `cm.last_*` still hold whatever the last real assistant turn
+            // committed (or nothing, if none has run yet this session) —
+            // re-accumulating them here would double-count that response.
+            emit_context_display(deps, &cm, true).await;
             Ok(())
         }
         Err(e) => {
@@ -443,232 +463,287 @@ async fn drive(
     };
     let thinking_budget = thinking_budget(deps.effort.as_deref(), &deps.meta, max_tokens);
 
-    for provider_turn in 0..MAX_PROVIDER_TURNS {
-        if cancel.is_cancelled() {
-            return Ok(final_text);
-        }
-        // Pre-turn (iteration 0) / mid-turn compaction check (spec §7.1).
-        if cm.status().needs_compaction {
-            let trigger = if provider_turn == 0 {
-                "pre_turn"
-            } else {
-                "mid_turn"
-            };
-            match cm.compact(&deps.llm, &model, trigger).await {
-                Ok(outcome) => emit_compaction(deps, trigger, &outcome, display.text()).await,
-                Err(e) => {
-                    tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
-                    if display.text() {
-                        emit_row(
-                            deps,
-                            "system",
-                            "notice",
-                            json!({ "text": format!(
-                                "Compaction failed ({e}); continuing with full history."
-                            ) }),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-        let system_value: Value = if deps.meta.supports_prompt_cache {
-            json!([{ "type": "text", "text": system, "cache_control": {"type": "ephemeral"} }])
-        } else {
-            json!(system)
-        };
-        let mut body = json!({
-            "model": model,
-            "system": system_value,
-            // `cm.messages_for_request()` applies the sanitized projection:
-            // dangling tool_use ids from an interrupted prior turn get
-            // synthesized error tool_results, or Anthropic 400s the whole
-            // request (and the session stays poisoned).
-            "messages": cm.messages_for_request(),
-            "tools": tool_defs,
-            "max_tokens": max_tokens,
-            "stream": true,
-        });
-        if let Some(budget) = thinking_budget {
-            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
-        }
+    let max_turns = crate::settings::usize_setting(
+        &deps.store,
+        "agent.max_provider_turns",
+        DEFAULT_MAX_PROVIDER_TURNS,
+    )
+    .await;
+    // Auto-continue is a top-level convenience only; sub-agents keep the hard
+    // stop. Read without usize_setting's floor so "0" can disable it.
+    let auto_budget = if display.text() {
+        deps.store
+            .get_setting("agent.auto_continue_budget")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+    } else {
+        0
+    };
 
-        let mut rx = match deps.llm.stream(body).await {
-            Ok(rx) => rx,
-            Err(e) if is_context_overflow(&e.to_string()) => {
-                cm.mark_full();
-                emit_context_usage(deps, cm, display.text()).await;
-                anyhow::bail!(
-                    "context window exceeded — send another message and the session \
-                     will compact before retrying: {e}"
-                );
-            }
-            Err(e) => return Err(e),
-        };
-        let mut turn = TurnAccum::default();
-        let mut text_buf = String::new();
-
-        while let Some(item) = rx.recv().await {
+    for auto_continue in 0..=auto_budget {
+        for provider_turn in 0..max_turns {
             if cancel.is_cancelled() {
-                // Mid-stream cancel: the assistant turn was not appended, so the
-                // ledger still ends at the user turn — valid for a later resume.
                 return Ok(final_text);
             }
-            let ev = match item {
-                Ok(ev) => ev,
-                Err(e) => {
-                    flush_text(deps, &mut text_buf, display.text()).await;
-                    if is_context_overflow(&e.to_string()) {
-                        cm.mark_full();
-                        emit_context_usage(deps, cm, display.text()).await;
-                        anyhow::bail!(
-                            "context window exceeded — send another message and the session \
-                             will compact before retrying: {e}"
-                        );
+            // Pre-turn (iteration 0) / mid-turn compaction check (spec §7.1).
+            if cm.status().needs_compaction {
+                let trigger = if provider_turn == 0 {
+                    "pre_turn"
+                } else {
+                    "mid_turn"
+                };
+                match cm.compact(&deps.llm, &model, trigger).await {
+                    Ok(outcome) => emit_compaction(deps, trigger, &outcome, display.text()).await,
+                    Err(e) => {
+                        tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
+                        if display.text() {
+                            emit_row(
+                                deps,
+                                "system",
+                                "notice",
+                                json!({ "text": format!(
+                                "Compaction failed ({e}); continuing with full history."
+                            ) }),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
                     }
-                    return Err(e);
                 }
+            }
+            let system_value: Value = if deps.meta.supports_prompt_cache {
+                json!([{ "type": "text", "text": system, "cache_control": {"type": "ephemeral"} }])
+            } else {
+                json!(system)
             };
-            let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
-                continue;
+            let mut body = json!({
+                "model": model,
+                "system": system_value,
+                // `cm.messages_for_request()` applies the sanitized projection:
+                // dangling tool_use ids from an interrupted prior turn get
+                // synthesized error tool_results, or Anthropic 400s the whole
+                // request (and the session stays poisoned).
+                "messages": cm.messages_for_request(),
+                "tools": tool_defs,
+                "max_tokens": max_tokens,
+                "stream": true,
+            });
+            if let Some(budget) = thinking_budget {
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+            }
+
+            let mut rx = match deps.llm.stream(body).await {
+                Ok(rx) => rx,
+                Err(e) if is_context_overflow(&e.to_string()) => {
+                    cm.mark_full();
+                    // Display-only: `mark_full` does not reset `cm.last_*`, so
+                    // they still hold the PREVIOUS committed response's buckets
+                    // — accumulating here would double-count it.
+                    emit_context_display(deps, cm, display.text()).await;
+                    anyhow::bail!(
+                        "context window exceeded — send another message and the session \
+                     will compact before retrying: {e}"
+                    );
+                }
+                Err(e) => return Err(e),
             };
-            match decoded {
-                MessageStreamEvent::TextDelta { text, .. } => {
-                    turn.text.push_str(&text);
-                    text_buf.push_str(&text);
-                    if text_buf.len() >= TEXT_FLUSH_BYTES || text_buf.contains('\n') {
+            let mut turn = TurnAccum::default();
+            let mut text_buf = String::new();
+
+            while let Some(item) = rx.recv().await {
+                if cancel.is_cancelled() {
+                    // Mid-stream cancel: the assistant turn was not appended, so the
+                    // ledger still ends at the user turn — valid for a later resume.
+                    return Ok(final_text);
+                }
+                let ev = match item {
+                    Ok(ev) => ev,
+                    Err(e) => {
                         flush_text(deps, &mut text_buf, display.text()).await;
+                        if is_context_overflow(&e.to_string()) {
+                            cm.mark_full();
+                            // Display-only — see the comment on the `deps.llm.stream` overflow arm above.
+                            emit_context_display(deps, cm, display.text()).await;
+                            anyhow::bail!(
+                                "context window exceeded — send another message and the session \
+                             will compact before retrying: {e}"
+                            );
+                        }
+                        return Err(e);
                     }
-                }
-                MessageStreamEvent::ThinkingDelta { text, .. } => {
-                    if display.text() {
-                        emit_row(
-                            deps,
-                            "assistant",
-                            "thought",
-                            json!({ "text": text }),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+                };
+                let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
+                    continue;
+                };
+                match decoded {
+                    MessageStreamEvent::TextDelta { text, .. } => {
+                        turn.text.push_str(&text);
+                        text_buf.push_str(&text);
+                        if text_buf.len() >= TEXT_FLUSH_BYTES || text_buf.contains('\n') {
+                            flush_text(deps, &mut text_buf, display.text()).await;
+                        }
                     }
-                }
-                MessageStreamEvent::ContentBlockStart { index, block } => {
-                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                        turn.tools.insert(
-                            index,
-                            ToolAccum {
-                                id: block
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                name: block
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                start_input: block.get("input").cloned().unwrap_or(json!({})),
-                                input_json: String::new(),
-                            },
-                        );
+                    MessageStreamEvent::ThinkingDelta { text, .. } => {
+                        if display.text() {
+                            emit_row(
+                                deps,
+                                "assistant",
+                                "thought",
+                                json!({ "text": text }),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
                     }
-                }
-                MessageStreamEvent::InputJsonDelta {
-                    index,
-                    partial_json,
-                } => {
-                    if let Some(t) = turn.tools.get_mut(&index) {
-                        t.input_json.push_str(&partial_json);
+                    MessageStreamEvent::ContentBlockStart { index, block } => {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                            turn.tools.insert(
+                                index,
+                                ToolAccum {
+                                    id: block
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    name: block
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    start_input: block.get("input").cloned().unwrap_or(json!({})),
+                                    input_json: String::new(),
+                                },
+                            );
+                        }
                     }
-                }
-                MessageStreamEvent::MessageDelta {
-                    stop_reason,
-                    output_tokens,
-                    input_tokens,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                } => {
-                    turn.stop_reason = stop_reason;
-                    cm.observe_message_delta(
+                    MessageStreamEvent::InputJsonDelta {
+                        index,
+                        partial_json,
+                    } => {
+                        if let Some(t) = turn.tools.get_mut(&index) {
+                            t.input_json.push_str(&partial_json);
+                        }
+                    }
+                    MessageStreamEvent::MessageDelta {
+                        stop_reason,
                         output_tokens,
                         input_tokens,
                         cache_read_tokens,
                         cache_creation_tokens,
-                    );
-                }
-                MessageStreamEvent::Error(msg) => {
-                    flush_text(deps, &mut text_buf, display.text()).await;
-                    if is_context_overflow(&msg) {
-                        cm.mark_full();
-                        emit_context_usage(deps, cm, display.text()).await;
-                        anyhow::bail!(
-                            "context window exceeded — send another message and the session \
-                             will compact before retrying: {msg}"
+                    } => {
+                        turn.stop_reason = stop_reason;
+                        cm.observe_message_delta(
+                            output_tokens,
+                            input_tokens,
+                            cache_read_tokens,
+                            cache_creation_tokens,
                         );
                     }
-                    anyhow::bail!("{msg}");
+                    MessageStreamEvent::Error(msg) => {
+                        flush_text(deps, &mut text_buf, display.text()).await;
+                        if is_context_overflow(&msg) {
+                            cm.mark_full();
+                            // Display-only — see the comment on the `deps.llm.stream` overflow arm above.
+                            emit_context_display(deps, cm, display.text()).await;
+                            anyhow::bail!(
+                                "context window exceeded — send another message and the session \
+                             will compact before retrying: {msg}"
+                            );
+                        }
+                        anyhow::bail!("{msg}");
+                    }
+                    MessageStreamEvent::MessageStop => break,
+                    MessageStreamEvent::MessageStart(msg) => {
+                        cm.observe_message_start(&msg);
+                    }
+                    MessageStreamEvent::ContentBlockStop { .. } => {}
                 }
-                MessageStreamEvent::MessageStop => break,
-                MessageStreamEvent::MessageStart(msg) => {
-                    cm.observe_message_start(&msg);
-                }
-                MessageStreamEvent::ContentBlockStop { .. } => {}
             }
-        }
-        flush_text(deps, &mut text_buf, display.text()).await;
-        cm.commit_response();
-        emit_context_usage(deps, cm, display.text()).await;
-        if !turn.text.is_empty() {
-            final_text = turn.text.clone();
-        }
+            flush_text(deps, &mut text_buf, display.text()).await;
+            cm.commit_response();
+            emit_context_usage(deps, cm, display.text()).await;
+            if !turn.text.is_empty() {
+                final_text = turn.text.clone();
+            }
 
-        // Assemble the assistant turn's content for the ledger.
-        let mut content: Vec<Value> = Vec::new();
-        if !turn.text.is_empty() {
-            content.push(json!({ "type": "text", "text": turn.text }));
-        }
-        let tool_calls: Vec<ToolAccum> = turn.tools.into_values().collect();
-        for t in &tool_calls {
-            content.push(json!({
-                "type": "tool_use",
-                "id": t.id,
-                "name": t.name,
-                "input": t.parsed_input(),
-            }));
-        }
-        if content.is_empty() {
-            // An assistant turn must exist for valid role alternation, but an
-            // EMPTY text block ({"text":""}) makes Anthropic 400 the NEXT
-            // request ("text content blocks must be non-empty") — which
-            // poisons the whole session. Use a non-empty sentinel instead.
-            content.push(json!({ "type": "text", "text": "(no output)" }));
-        }
-        cm.append_assistant(json!(content)).await?;
+            // Assemble the assistant turn's content for the ledger.
+            let mut content: Vec<Value> = Vec::new();
+            if !turn.text.is_empty() {
+                content.push(json!({ "type": "text", "text": turn.text }));
+            }
+            let tool_calls: Vec<ToolAccum> = turn.tools.into_values().collect();
+            for t in &tool_calls {
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": t.id,
+                    "name": t.name,
+                    "input": t.parsed_input(),
+                }));
+            }
+            if content.is_empty() {
+                // An assistant turn must exist for valid role alternation, but an
+                // EMPTY text block ({"text":""}) makes Anthropic 400 the NEXT
+                // request ("text content blocks must be non-empty") — which
+                // poisons the whole session. Use a non-empty sentinel instead.
+                content.push(json!({ "type": "text", "text": "(no output)" }));
+            }
+            cm.append_assistant(json!(content)).await?;
 
-        if tool_calls.is_empty() {
-            return Ok(final_text); // end_turn
-        }
+            if tool_calls.is_empty() {
+                return Ok(final_text); // end_turn
+            }
 
-        // Execute each tool call, collecting tool_result blocks.
-        let mut results: Vec<Value> = Vec::new();
-        for (i, t) in tool_calls.iter().enumerate() {
+            // Execute each tool call, collecting tool_result blocks.
+            let mut results: Vec<Value> = Vec::new();
+            for (i, t) in tool_calls.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    for rest in &tool_calls[i..] {
+                        results.push(tool_result(&rest.id, "Interrupted by user", true));
+                    }
+                    break;
+                }
+                results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
+            }
+            cm.append_tool_results(results).await?;
+
             if cancel.is_cancelled() {
-                for rest in &tool_calls[i..] {
-                    results.push(tool_result(&rest.id, "Interrupted by user", true));
-                }
-                break;
+                return Ok(final_text);
             }
-            results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
         }
-        cm.append_tool_results(results).await?;
-
-        if cancel.is_cancelled() {
-            return Ok(final_text);
+        // Provider turns exhausted without an end_turn. Spend one
+        // auto-continue if any remain: tell the user, then append a synthetic
+        // "continue" user turn to the ledger (ledger-only — NOT a display
+        // row, so the transcript shows the notice, not a fake user message).
+        // Guarded by `!cancel.is_cancelled()`: if the user stopped the run
+        // right as this inner loop exhausted, we must not announce an
+        // auto-continue or append a synthetic turn the run will never act
+        // on — the very next iteration's top-of-loop check (above) returns
+        // early anyway, but only after this block would otherwise have run.
+        if auto_continue < auto_budget && !cancel.is_cancelled() {
+            if display.text() {
+                emit_row(
+                    deps,
+                    "system",
+                    "notice",
+                    json!({ "text": format!(
+                        "Turn limit reached ({max_turns} provider turns) — continuing automatically ({}/{auto_budget})…",
+                        auto_continue + 1
+                    ) }),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            cm.append_user(json!([{ "type": "text", "text": "continue" }]))
+                .await?;
         }
     }
     if display.text() {
@@ -677,7 +752,7 @@ async fn drive(
             "system",
             "notice",
             json!({ "text": format!(
-                "Turn limit reached ({MAX_PROVIDER_TURNS} provider turns) — send a message to continue."
+                "Turn limit reached ({max_turns} provider turns) — send a message to continue."
             ) }),
             None,
             None,
@@ -1004,6 +1079,7 @@ async fn run_tool_call(
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
         work_dir: deps.work_dir.clone(),
+        attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
         store: deps.store.clone(),
         cancel: cancel.clone(),
@@ -1020,11 +1096,22 @@ async fn run_tool_call(
         })),
     };
     match tool.execute(&ctx, input).await {
-        Ok(out) => {
-            let extras = merge_display_duration(out.display, elapsed_ms(started));
+        Ok(mut out) => {
+            let extras = merge_display_duration(out.display.take(), elapsed_ms(started));
             finish_tool_row_with_display(deps, &t.id, &out.for_model, out.is_error, Some(extras))
                 .await;
-            tool_result(&t.id, &out.for_model, out.is_error)
+            match out.model_blocks.take() {
+                Some(mut blocks) => {
+                    blocks.push(json!({ "type": "text", "text": out.for_model }));
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": t.id,
+                        "content": blocks,
+                        "is_error": out.is_error,
+                    })
+                }
+                None => tool_result(&t.id, &out.for_model, out.is_error),
+            }
         }
         Err(e) => {
             let msg = format!("{}: {e}", t.name);
@@ -1178,6 +1265,18 @@ async fn emit_row(
 
 /// Broadcast ContextUsage and persist it for resume seeding. Sub-agent
 /// (ephemeral) loops skip both — their usage must not clobber the session's.
+/// Also folds this response's billed buckets into the per-session, per-model
+/// cost tally and emits `SessionCost` alongside `ContextUsage`.
+///
+/// Call this ONLY immediately after a fresh `cm.commit_response()` — it is
+/// the single site allowed to accumulate, because `cm.last_input()` /
+/// `last_output()` / `last_cache_read()` / `last_cache_creation()` hold
+/// exactly the response that was just committed there and nowhere else.
+/// Every other `ContextUsage` re-emit (context-overflow `mark_full`, manual
+/// `/compact`, the pre-turn resume/fallback seed) reads those same stale
+/// accessors from a PREVIOUS commit and must go through
+/// [`emit_context_display`] instead, or that response's buckets get added to
+/// the tally a second time.
 async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) {
     if !emit {
         return;
@@ -1192,10 +1291,42 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
         cache_read_tokens: cm.last_cache_read(),
         output_tokens: cm.last_output(),
     });
+
+    // Accumulate this response's billed buckets into the per-model tally, then
+    // emit the session cost. Read-modify-write is race-free: native turns are
+    // serialized by the session turn_lock.
+    let saved = match deps.store.get_session_context(&deps.session_pk).await {
+        Ok(saved) => saved,
+        Err(e) => {
+            // A transient read error must never be treated as "no tally yet"
+            // — that would drop everything accumulated so far the moment we
+            // write back. Skip this emit's accumulation/persist entirely and
+            // let the next successful read pick the tally back up.
+            tracing::warn!(
+                "native: get_session_context failed, skipping cost accumulation to avoid \
+                 clobbering the persisted tally: {e}"
+            );
+            return;
+        }
+    };
+    let mut tally = saved
+        .as_ref()
+        .map(super::cost::Tally::from_payload)
+        .unwrap_or_default();
+    tally.add(
+        deps.model.as_deref().unwrap_or("unknown"),
+        cm.last_input(),
+        cm.last_output(),
+        cm.last_cache_read(),
+        cm.last_cache_creation(),
+    );
+    emit_session_cost(deps, &tally).await;
+
     let payload = json!({
         "active_tokens": st.active_tokens,
         "usable_window": st.usable_window,
         "percent_left": st.percent_left,
+        "models": tally.to_payload_value(),
     });
     if let Err(e) = deps
         .store
@@ -1204,6 +1335,94 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
     {
         tracing::warn!("native: upsert_session_context failed: {e}");
     }
+}
+
+/// Display-only `ContextUsage` re-emit, for every site that is NOT
+/// immediately after a fresh `cm.commit_response()`: the context-overflow
+/// `mark_full` sites, manual `/compact`, and the pre-turn resume/fallback
+/// seed. `cm.last_*` at those sites still hold whatever the last real
+/// committed response left behind (`mark_full` and `compact()` never reset
+/// them), so this function never calls `Tally::add` — it only re-broadcasts
+/// the tally exactly as already persisted (if any) and refreshes the context
+/// snapshot fields (`active_tokens`/`usable_window`/`percent_left`), leaving
+/// `"models"` byte-for-byte untouched.
+async fn emit_context_display(deps: &RunnerDeps, cm: &ContextManager, emit: bool) {
+    if !emit {
+        return;
+    }
+    let st = cm.status();
+    let _ = deps.events.send(CoreEvent::ContextUsage {
+        session_pk: deps.session_pk.clone(),
+        active_tokens: st.active_tokens,
+        context_window: st.context_window,
+        usable_window: st.usable_window,
+        percent_left: st.percent_left,
+        cache_read_tokens: cm.last_cache_read(),
+        output_tokens: cm.last_output(),
+    });
+
+    let saved = match deps.store.get_session_context(&deps.session_pk).await {
+        Ok(saved) => saved,
+        Err(e) => {
+            // Same clobber hazard as `emit_context_usage`: without a good
+            // read we don't know what's already persisted, so skip the
+            // persist for this emit rather than writing a models-less
+            // payload over a real tally.
+            tracing::warn!(
+                "native: get_session_context failed, skipping context-display persist to avoid \
+                 clobbering the persisted tally: {e}"
+            );
+            return;
+        }
+    };
+    // `Ok(None)` (genuinely no tally yet) is a legitimate empty base.
+    let tally = saved
+        .as_ref()
+        .map(super::cost::Tally::from_payload)
+        .unwrap_or_default();
+    // Keep the UI in sync with the resume block: re-emit from the UNCHANGED
+    // saved tally when there's something to show — no accumulation, just
+    // pricing it at current rates like the resume re-emit does.
+    if !tally.is_empty() {
+        emit_session_cost(deps, &tally).await;
+    }
+
+    let payload = json!({
+        "active_tokens": st.active_tokens,
+        "usable_window": st.usable_window,
+        "percent_left": st.percent_left,
+        "models": tally.to_payload_value(),
+    });
+    if let Err(e) = deps
+        .store
+        .upsert_session_context(&deps.session_pk, &payload)
+        .await
+    {
+        tracing::warn!("native: upsert_session_context failed: {e}");
+    }
+}
+
+/// Price a tally against the current model metadata and broadcast SessionCost.
+async fn emit_session_cost(deps: &RunnerDeps, tally: &super::cost::Tally) {
+    // Resolve each model's meta once, up front (async), into a map the pure
+    // pricer closes over.
+    let mut metas: std::collections::HashMap<String, crate::llm_router::model_meta::ModelMeta> =
+        std::collections::HashMap::new();
+    for model in tally.model_ids() {
+        let meta = crate::llm_router::model_meta::resolve(&deps.store, &model).await;
+        metas.insert(model, meta);
+    }
+    let (total_usd, models) = tally.to_model_costs(|id| {
+        metas
+            .get(id)
+            .copied()
+            .unwrap_or(crate::llm_router::model_meta::FALLBACK)
+    });
+    let _ = deps.events.send(CoreEvent::SessionCost {
+        session_pk: deps.session_pk.clone(),
+        total_usd,
+        models,
+    });
 }
 
 /// Sub-agent (ephemeral) compactions must never surface to the parent
@@ -1444,6 +1663,7 @@ mod tests {
         RunnerDeps {
             session_pk: "s1".into(),
             work_dir: dir.to_path_buf(),
+            attachments_dir: None,
             extra_skill_dirs: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
@@ -1476,7 +1696,6 @@ mod tests {
                 name: "p".into(),
                 workdir: "/w".into(),
                 source: None,
-                harness: "native".into(),
                 model: model.map(str::to_string),
                 effort: None,
                 perm_mode: PermMode::BypassPermissions,
@@ -1494,6 +1713,7 @@ mod tests {
                 branch: None,
                 title: Some("titled".into()),
                 status: SessionStatus::Running,
+                perm_mode: PermMode::BypassPermissions,
                 started_by: None,
                 created_at: Some(0),
                 last_active: Some(0),
@@ -1558,7 +1778,6 @@ mod tests {
                 "p",
                 Some("anthropic/model-b".into()),
                 PermMode::BypassPermissions,
-                "native",
             )
             .await
             .unwrap();
@@ -1657,6 +1876,10 @@ mod tests {
             max_output_tokens: 8_192,
             supports_prompt_cache: false,
             supports_reasoning: false,
+            cost_input: 0.0,
+            cost_output: 0.0,
+            cost_cache_read: 0.0,
+            cost_cache_write: 0.0,
         }
     }
 
@@ -1696,6 +1919,263 @@ mod tests {
         // Persisted for resume seeding.
         let ctx = deps.store.get_session_context("s1").await.unwrap().unwrap();
         assert!(ctx["percent_left"].is_number());
+    }
+
+    /// Drain every `SessionCost` event currently queued on `rx`, returning the
+    /// last one seen (mirrors how a real subscriber only cares about the
+    /// latest snapshot).
+    fn last_session_cost(
+        rx: &mut broadcast::Receiver<CoreEvent>,
+    ) -> Option<(f64, Vec<crate::domain::ModelCost>)> {
+        let mut saw = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::SessionCost {
+                total_usd, models, ..
+            } = ev
+            {
+                saw = Some((total_usd, models));
+            }
+        }
+        saw
+    }
+
+    #[tokio::test]
+    async fn session_cost_accumulates_per_model_across_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = || {
+            vec![
+                message_start_with_usage(5_000, 1_000),
+                text_delta("hi"),
+                message_delta("end_turn"),
+                message_stop(),
+            ]
+        };
+        let llm = Arc::new(ScriptedLlm::new(vec![turn(), turn()]));
+        let deps = deps_at(dir.path(), llm).await;
+        // "test/model" (deps_at's default) isn't in the vendored/refreshed
+        // price snapshot, so `resolve` would otherwise fall back to FALLBACK's
+        // $0 rates. Pin a settings override so the dollar total is checkable.
+        deps.store
+            .set_setting_raw(
+                "models.meta.test/model",
+                &json!({
+                    "cost_input": 3.0,
+                    "cost_output": 15.0,
+                    "cost_cache_read": 1.5,
+                    "cost_cache_write": 0.0
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let mut rx = deps.events.subscribe();
+
+        run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let (total1, models1) =
+            last_session_cost(&mut rx).expect("a SessionCost event after turn 1");
+        assert_eq!(models1.len(), 1);
+        assert_eq!(models1[0].model, "test/model");
+        assert_eq!(models1[0].input, 5_000);
+        assert_eq!(models1[0].output, 1);
+        assert_eq!(models1[0].cache_read, 1_000);
+        assert_eq!(models1[0].cache_creation, 0);
+        // 3.0/1e6*5000 + 15.0/1e6*1 + 1.5/1e6*1000 == 0.016515
+        assert!((total1 - 0.016515).abs() < 1e-9, "total1 {total1}");
+        assert!((models1[0].usd - total1).abs() < 1e-9);
+
+        run_turn(&deps, TurnPrompt::text("y", "y"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        // The SECOND turn's `emit_context_usage` accumulates on top of the
+        // first (the session_context "models" tally persists across turns) —
+        // note this also exercises the resume re-emit at the top of run_turn,
+        // since `session_context` now already exists.
+        let (total2, models2) =
+            last_session_cost(&mut rx).expect("a SessionCost event after turn 2");
+        assert_eq!(models2.len(), 1);
+        assert_eq!(models2[0].input, 10_000);
+        assert_eq!(models2[0].output, 2);
+        assert_eq!(models2[0].cache_read, 2_000);
+        assert!((total2 - total1 * 2.0).abs() < 1e-9, "total2 {total2}");
+
+        // Persisted payload stores TOKENS only under "models" — never dollars.
+        let ctx = deps.store.get_session_context("s1").await.unwrap().unwrap();
+        let saved = &ctx["models"]["test/model"];
+        assert_eq!(saved["input"], 10_000);
+        assert_eq!(saved["output"], 2);
+        assert_eq!(saved["cache_read"], 2_000);
+        assert!(
+            saved.get("usd").is_none(),
+            "session_context must never persist dollars"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_context_usage_with_emit_false_does_not_accumulate_or_persist() {
+        // Sub-agent (ephemeral) loops call `emit_context_usage(.., emit=false)`
+        // — they must not accumulate into the session's cost tally or touch
+        // `session_context` at all.
+        let dir = tempfile::tempdir().unwrap();
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+        let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
+            .await
+            .unwrap();
+        cm.observe_message_start(&json!({
+            "usage": {"input_tokens": 999, "cache_read_input_tokens": 3}
+        }));
+        cm.observe_message_delta(7, None, None, None);
+        cm.commit_response();
+
+        let mut rx = deps.events.subscribe();
+        emit_context_usage(&deps, &cm, false).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "emit=false must not send any event (ContextUsage or SessionCost)"
+        );
+        assert!(
+            deps.store
+                .get_session_context(&deps.session_pk)
+                .await
+                .unwrap()
+                .is_none(),
+            "emit=false must not write session_context"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_display_reemit_does_not_double_count_committed_cost() {
+        // Regression test for the commit-3c284b0 bug: `emit_context_usage`
+        // used to be called from BOTH the post-commit site AND the
+        // context-overflow `mark_full` re-emit sites, sharing the same
+        // accumulation logic. `mark_full` never resets `cm.last_*`, so on
+        // overflow those accessors still held the PREVIOUS committed
+        // response's buckets — which then got added to the persisted tally
+        // a SECOND time. This drives the REAL overflow path (a mid-stream
+        // `MessageStreamEvent::Error` after a committed response) and
+        // asserts the tally reflects that response's buckets exactly ONCE.
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1: commits a real response (buckets B: input 5_000, output 1,
+        // cache_read 1_000) with a tool_use so the drive loop continues into
+        // a second provider turn instead of returning.
+        let turn1 = vec![
+            message_start_with_usage(5_000, 1_000),
+            text_delta("Working on it.\n"),
+            tool_use_start(1, "call-1", "bash"),
+            input_json_delta(1, "{\"command\":\"echo hi > out.txt\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // Turn 2: a mid-stream overflow error. This hits the
+        // `MessageStreamEvent::Error` `mark_full` + display re-emit path
+        // WITHOUT ever calling `cm.commit_response()` again, so `cm.last_*`
+        // still hold turn 1's buckets when the display re-emit reads them.
+        let turn2 = vec![error_event(
+            "prompt is too long: 500000 tokens > 400000 maximum",
+        )];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm).await;
+        deps.store
+            .set_setting_raw(
+                "models.meta.test/model",
+                &json!({
+                    "cost_input": 3.0,
+                    "cost_output": 15.0,
+                    "cost_cache_read": 1.5,
+                    "cost_cache_write": 0.0
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let mut rx = deps.events.subscribe();
+
+        let err = run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("context"));
+
+        // The overflow pinned the indicator to 0%, proving the display
+        // re-emit did run (this isn't a no-op skip).
+        let ctx = deps.store.get_session_context("s1").await.unwrap().unwrap();
+        assert_eq!(ctx["percent_left"], 0);
+
+        // The per-model tally must equal buckets B exactly ONCE, not 2×B:
+        // input 5_000 (not 10_000), output 1 (not 2), cache_read 1_000 (not
+        // 2_000).
+        let saved = &ctx["models"]["test/model"];
+        assert_eq!(saved["input"], 5_000, "input must not be double-counted");
+        assert_eq!(saved["output"], 1, "output must not be double-counted");
+        assert_eq!(
+            saved["cache_read"], 1_000,
+            "cache_read must not be double-counted"
+        );
+        assert_eq!(saved["cache_creation"], 0);
+
+        // Same invariant on the broadcast side: the last `SessionCost` must
+        // price buckets B once, not twice.
+        let (total, models) = last_session_cost(&mut rx).expect("a SessionCost event");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].input, 5_000);
+        assert_eq!(models[0].output, 1);
+        assert_eq!(models[0].cache_read, 1_000);
+        // 3.0/1e6*5000 + 15.0/1e6*1 + 1.5/1e6*1000 == 0.016515
+        assert!((total - 0.016515).abs() < 1e-9, "total {total}");
+    }
+
+    #[tokio::test]
+    async fn emit_context_display_after_commit_does_not_change_persisted_totals() {
+        // Focused unit test (spec fallback tier): calling the display-only
+        // function after a real accumulation must be a complete no-op on the
+        // persisted tally and totals, even though it re-reads and re-writes
+        // the context snapshot fields.
+        let dir = tempfile::tempdir().unwrap();
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+        let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
+            .await
+            .unwrap();
+        cm.observe_message_start(&json!({
+            "usage": {"input_tokens": 999, "cache_read_input_tokens": 3}
+        }));
+        cm.observe_message_delta(7, None, None, None);
+        cm.commit_response();
+
+        // The one legitimate accumulation.
+        emit_context_usage(&deps, &cm, true).await;
+        let after_commit = deps
+            .store
+            .get_session_context(&deps.session_pk)
+            .await
+            .unwrap()
+            .unwrap();
+        let saved_after_commit = after_commit["models"]["test/model"].clone();
+        assert_eq!(saved_after_commit["input"], 999);
+        assert_eq!(saved_after_commit["output"], 7);
+        assert_eq!(saved_after_commit["cache_read"], 3);
+
+        // `cm.last_*` still report the SAME committed response (nothing
+        // reset them) — exactly the stale-accessor condition at the
+        // overflow/compact/fallback sites. The display-only re-emit must
+        // NOT add them again.
+        emit_context_display(&deps, &cm, true).await;
+        let after_display = deps
+            .store
+            .get_session_context(&deps.session_pk)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_display["models"]["test/model"], saved_after_commit,
+            "display-only re-emit must not change the persisted tally"
+        );
     }
 
     #[tokio::test]
@@ -1878,6 +2358,10 @@ mod tests {
             max_output_tokens: 64_000,
             supports_prompt_cache: true,
             supports_reasoning: true,
+            cost_input: 0.0,
+            cost_output: 0.0,
+            cost_cache_read: 0.0,
+            cost_cache_write: 0.0,
         };
         deps.effort = Some("high".into());
         run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
@@ -2542,7 +3026,6 @@ mod tests {
                 name: "p".into(),
                 workdir: dir.path().to_string_lossy().into(),
                 source: None,
-                harness: "native".into(),
                 model: None,
                 effort: None,
                 perm_mode: PermMode::Default,
@@ -2560,6 +3043,7 @@ mod tests {
                 branch: None,
                 title: None,
                 status: SessionStatus::Running,
+                perm_mode: PermMode::Default,
                 started_by: None,
                 created_at: Some(0),
                 last_active: Some(0),
@@ -2777,5 +3261,125 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Interrupted"));
+    }
+
+    /// With max_provider_turns=1 and auto_continue_budget=1: turn 1 is a tool
+    /// call (exhausts the 1-turn window), the loop auto-continues once with a
+    /// notice + synthetic "continue" user turn, and turn 2 ends normally.
+    #[tokio::test]
+    async fn turn_limit_auto_continues_with_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![
+            tool_use_start(0, "t1", "ls"),
+            input_json_delta(0, r#"{"path":"."}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+        add_anthropic_conn(&deps.store, &["model-a"]).await;
+        deps.store
+            .set_setting("agent.max_provider_turns", "1")
+            .await
+            .unwrap();
+        deps.store
+            .set_setting("agent.auto_continue_budget", "1")
+            .await
+            .unwrap();
+
+        let mut rx = deps.events.subscribe();
+        run_turn(
+            &deps,
+            TurnPrompt::text("list files", "list files"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut notices: Vec<String> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::Message {
+                block_type,
+                payload,
+                ..
+            } = ev
+            {
+                if block_type == "notice" {
+                    notices.push(payload["text"].as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("continuing automatically (1/1)")),
+            "expected auto-continue notice, got: {notices:?}"
+        );
+        // The synthetic continue turn must NOT be a display row — no user
+        // "continue" message row is persisted (only the ledger grows).
+        assert!(
+            !notices.iter().any(|n| n.contains("send a message")),
+            "budget was not exhausted, final stop notice must not appear: {notices:?}"
+        );
+    }
+
+    /// Budget 0 disables auto-continue: exhausting the window emits ONLY the
+    /// final "send a message" notice (legacy behavior).
+    #[tokio::test]
+    async fn turn_limit_stops_when_budget_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![
+            tool_use_start(0, "t1", "ls"),
+            input_json_delta(0, r#"{"path":"."}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn1]));
+        let deps = deps_at(dir.path(), llm).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+        add_anthropic_conn(&deps.store, &["model-a"]).await;
+        deps.store
+            .set_setting("agent.max_provider_turns", "1")
+            .await
+            .unwrap();
+        deps.store
+            .set_setting("agent.auto_continue_budget", "0")
+            .await
+            .unwrap();
+
+        let mut rx = deps.events.subscribe();
+        run_turn(
+            &deps,
+            TurnPrompt::text("list files", "list files"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut notices: Vec<String> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::Message {
+                block_type,
+                payload,
+                ..
+            } = ev
+            {
+                if block_type == "notice" {
+                    notices.push(payload["text"].as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+        assert!(notices
+            .iter()
+            .any(|n| n.contains("send a message to continue")));
+        assert!(!notices
+            .iter()
+            .any(|n| n.contains("continuing automatically")));
     }
 }

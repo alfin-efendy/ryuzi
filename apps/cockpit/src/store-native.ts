@@ -8,9 +8,12 @@ type NativeState = {
   agentsByProject: Record<string, AgentInfo[]>;
   commandsByProject: Record<string, CommandInfo[]>;
   todosBySession: Record<string, TodoItem[]>;
+  // Whether the floating plan panel is collapsed to a pill, per session.
+  planCollapsed: Record<string, boolean>;
   loadAgents: (projectId: string) => Promise<void>;
   loadCommands: (projectId: string) => Promise<void>;
   loadTodos: (sessionPk: string) => Promise<void>;
+  setPlanCollapsed: (sessionPk: string, collapsed: boolean) => void;
   exportSession: (sessionPk: string) => Promise<string | null>;
   importSession: (projectId: string, data: string) => Promise<boolean>;
   shareSession: (sessionPk: string) => Promise<string | null>;
@@ -25,6 +28,7 @@ export const useNative = create<NativeState>((set) => ({
   agentsByProject: {},
   commandsByProject: {},
   todosBySession: {},
+  planCollapsed: {},
 
   loadAgents: async (projectId) => {
     const res = await commands.nativeAgents(projectId);
@@ -48,6 +52,8 @@ export const useNative = create<NativeState>((set) => ({
       set((s) => ({ todosBySession: { ...s.todosBySession, [sessionPk]: res.data } }));
     }
   },
+
+  setPlanCollapsed: (sessionPk, collapsed) => set((s) => ({ planCollapsed: { ...s.planCollapsed, [sessionPk]: collapsed } })),
 
   // Returns the session's portable JSON, or null on failure.
   exportSession: async (sessionPk) => {

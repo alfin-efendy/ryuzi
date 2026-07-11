@@ -7,8 +7,7 @@ import type { Row } from "@/lib/transcript";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { commands } from "@/bindings";
-import { SEARCH_COMMANDS } from "@/constants";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { NATIVE_AGENT, SEARCH_COMMANDS } from "@/constants";
 import { projectLabel, sessionTitle } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
 import { StatusDot } from "@/components/common/bits";
@@ -43,9 +42,6 @@ export function TitleBar() {
   const nav = useNav();
   const { goBack, goForward, toggleSidebar, searchQuery, setSearchQuery } = nav;
   const { projects, sessions, transcripts, setFocused } = useStore();
-  const runtimes = useRuntimes((s) => s.runtimes);
-  // Ryuzi-only: every session runs the native runtime.
-  const sessionAgent = runtimeById(runtimes, "native");
   const ui = useUi();
   const searchRef = useRef<HTMLInputElement>(null);
   const [searchFocused, setSearchFocused] = useState(false);
@@ -231,7 +227,7 @@ export function TitleBar() {
                         </span>
                         <span className="shrink-0 text-[11px] text-muted-foreground">
                           {project ? projectLabel(project) : s.projectId}
-                          {sessionAgent ? ` · ${sessionAgent.name}` : ""}
+                          {` · ${NATIVE_AGENT.name}`}
                         </span>
                       </Button>
                     );

@@ -12,10 +12,11 @@ import {
   type PermMode,
   type ApprovalKind,
   type ApprovalResponse,
+  type ModelCost,
 } from "./bindings";
 import { basename } from "./lib/paths";
-import { useRuntimes } from "./store-runtimes";
 import { useNative } from "./store-native";
+import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 
 export type PendingApproval = {
@@ -27,7 +28,6 @@ export type PendingApproval = {
   input: unknown;
 };
 export type ChatOptions = {
-  runtimeId?: string | null;
   model?: string | null;
   context?: {
     branch?: string | null;
@@ -36,6 +36,7 @@ export type ChatOptions = {
   } | null;
   attachments?: string[];
   git?: GitOptions | null;
+  permMode?: PermMode | null;
 };
 
 type State = {
@@ -48,7 +49,19 @@ type State = {
   lastSeq: Record<string, number>;
   loaded: Record<string, boolean>;
   /** Per-session context-window usage from the latest `contextUsage` event. */
-  contextUsage: Record<string, { activeTokens: number; usableWindow: number; percentLeft: number }>;
+  contextUsage: Record<
+    string,
+    {
+      activeTokens: number;
+      usableWindow: number;
+      percentLeft: number;
+      contextWindow: number;
+      cacheReadTokens: number;
+      outputTokens: number;
+    }
+  >;
+  /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
+  sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
   applyCoreEvent: (e: CoreEvent) => void;
   clearApproval: (requestId: string) => void;
   setFocused: (pk: string | null) => void;
@@ -60,8 +73,8 @@ type State = {
   cloneProject: (url: string, destParent: string) => Promise<boolean>;
   /** Pin (or clear, with null) the model future turns of this project use. */
   setProjectModel: (projectId: string, model: string | null) => Promise<void>;
-  /** Change the permission mode future turns of this project run under. */
-  setProjectPermMode: (projectId: string, permMode: PermMode) => Promise<void>;
+  /** Change the permission mode this session (only this session) runs under. */
+  setSessionPermMode: (sessionPk: string, permMode: PermMode) => Promise<void>;
   /** Resolves true as soon as the backend accepts — navigate immediately;
    *  the session list refresh completes in the background. */
   start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
@@ -83,7 +96,6 @@ function append(map: Record<string, Row[]>, pk: string, row: Row): Record<string
 function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions | null {
   if (!options) return null;
   return {
-    runtimeId: options.runtimeId ?? null,
     model: options.model ?? null,
     context: options.context
       ? {
@@ -94,6 +106,7 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
       : null,
     attachments: options.attachments ?? [],
     git: options.git ?? null,
+    permMode: options.permMode ?? null,
   };
 }
 
@@ -107,6 +120,7 @@ export const useStore = create<State>((set, get) => ({
   lastSeq: {},
   loaded: {},
   contextUsage: {},
+  sessionCost: {},
 
   applyCoreEvent: (e) =>
     set((st) => {
@@ -188,7 +202,17 @@ export const useStore = create<State>((set, get) => ({
                 activeTokens: e.active_tokens,
                 usableWindow: e.usable_window,
                 percentLeft: e.percent_left,
+                contextWindow: e.context_window,
+                cacheReadTokens: e.cache_read_tokens,
+                outputTokens: e.output_tokens,
               },
+            },
+          };
+        case "sessionCost":
+          return {
+            sessionCost: {
+              ...st.sessionCost,
+              [e.session_pk]: { totalUsd: e.total_usd, models: e.models },
             },
           };
         case "contextCompacted":
@@ -203,6 +227,11 @@ export const useStore = create<State>((set, get) => ({
   clearApproval: (requestId) => set((st) => ({ pendingApprovals: st.pendingApprovals.filter((a) => a.requestId !== requestId) })),
 
   setFocused: (pk) => {
+    const prev = get().focusedSessionPk;
+    if (prev && prev !== pk) {
+      const prevSession = get().sessions.find((s) => s.sessionPk === prev);
+      if (prevSession) useUi.getState().markRead(prev, prevSession.lastActive ?? 0);
+    }
     set({ focusedSessionPk: pk });
     if (pk && !get().loaded[pk]) void get().hydrateTranscript(pk);
   },
@@ -237,7 +266,10 @@ export const useStore = create<State>((set, get) => ({
     const projects = await commands.listProjects();
     const sessions = await commands.listSessions(null);
     if (projects.status === "ok") set({ projects: projects.data });
-    if (sessions.status === "ok") set({ sessions: sessions.data });
+    if (sessions.status === "ok") {
+      set({ sessions: sessions.data });
+      useUi.getState().seedReadState(sessions.data);
+    }
   },
 
   addProject: async () => {
@@ -270,17 +302,17 @@ export const useStore = create<State>((set, get) => ({
     if ((project.model ?? null) === next) return;
     // Optimistic paint so the composer label updates immediately.
     set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, model: next } : p)) });
-    const res = await commands.updateProject(projectId, next, project.permMode, project.harness);
+    const res = await commands.updateProject(projectId, next, project.permMode);
     if (res.status === "error") {
       toast.error("Couldn't set model: " + res.error.message);
       await get().refresh();
     }
   },
-  setProjectPermMode: async (projectId, permMode) => {
-    const project = get().projects.find((p) => p.projectId === projectId);
-    if (!project || project.permMode === permMode) return;
-    set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode } : p)) });
-    const res = await commands.updateProject(projectId, project.model, permMode, project.harness);
+  setSessionPermMode: async (sessionPk, permMode) => {
+    const session = get().sessions.find((s) => s.sessionPk === sessionPk);
+    if (!session || session.permMode === permMode) return;
+    set({ sessions: get().sessions.map((s) => (s.sessionPk === sessionPk ? { ...s, permMode } : s)) });
+    const res = await commands.updateSessionPermMode(sessionPk, permMode);
     if (res.status === "error") {
       toast.error("Couldn't set permission mode: " + res.error.message);
       await get().refresh();
@@ -338,11 +370,25 @@ export const useStore = create<State>((set, get) => ({
     await events.coreEventMsg.listen((e) => {
       const event = e.payload.event;
       get().applyCoreEvent(event);
+      // Keep the actively-viewed session marked read as its activity streams in.
+      markFocusedSessionReadOnEvent(event, get().focusedSessionPk);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
-      else if (event.kind === "runtimeUpdateLog") useRuntimes.getState().onUpdateLog(event.runtime_id, event.line);
-      else if (event.kind === "runtimeUpdateDone") useRuntimes.getState().onUpdateDone(event.runtime_id, event.ok, event.message);
     });
   },
 }));
+
+/**
+ * A core event for the session currently focused in the UI counts as the
+ * user having "seen" it as it streams in — mark that session read so its
+ * unread dot never lags behind what's already on screen. Extracted from the
+ * `init()` listener so the decision is testable without driving a real Tauri
+ * event subscription.
+ */
+export function markFocusedSessionReadOnEvent(event: CoreEvent, focusedSessionPk: string | null): void {
+  const activePk = (event as { session_pk?: string }).session_pk;
+  if (activePk && activePk === focusedSessionPk) {
+    useUi.getState().markRead(activePk, Date.now());
+  }
+}

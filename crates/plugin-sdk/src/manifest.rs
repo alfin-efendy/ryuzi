@@ -48,8 +48,6 @@ pub struct PluginManifest {
     pub skills: Vec<SkillDef>,
     #[serde(default)]
     pub provider: Option<ProviderMeta>,
-    #[serde(default)]
-    pub runtime: Option<RuntimeMeta>,
 }
 
 /// How a plugin authenticates. `none` needs no credential; `api-key` and
@@ -156,16 +154,6 @@ pub struct ProviderMeta {
     pub base_url: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelDef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeMeta {
-    #[serde(default)]
-    pub binary: Option<String>,
-    #[serde(default)]
-    pub npm_package: Option<String>,
-    #[serde(default)]
-    pub default_model: Option<String>,
 }
 
 /// Errors from parsing or validating a `PluginManifest`.
@@ -373,7 +361,7 @@ path = "skills/github-triage"
     }
 
     #[test]
-    fn round_trips_provider_and_runtime_blocks() {
+    fn round_trips_the_provider_block() {
         let toml_str = r#"
 contract = 1
 id = "anthropic"
@@ -383,11 +371,6 @@ name = "Anthropic"
 format = "anthropic"
 base_url = "https://api.anthropic.com"
 models = [ { id = "claude-opus-4-5", label = "Opus 4.5", default = true } ]
-
-[runtime]
-binary = "claude"
-npm_package = "@anthropic-ai/claude-code"
-default_model = "claude-opus-4-5"
 "#;
         let manifest = PluginManifest::from_toml(toml_str).expect("should parse and validate");
 
@@ -401,14 +384,6 @@ default_model = "claude-opus-4-5"
         assert_eq!(provider.models[0].id, "claude-opus-4-5");
         assert_eq!(provider.models[0].label.as_deref(), Some("Opus 4.5"));
         assert!(provider.models[0].default);
-
-        let runtime = manifest.runtime.expect("runtime block");
-        assert_eq!(runtime.binary.as_deref(), Some("claude"));
-        assert_eq!(
-            runtime.npm_package.as_deref(),
-            Some("@anthropic-ai/claude-code")
-        );
-        assert_eq!(runtime.default_model.as_deref(), Some("claude-opus-4-5"));
     }
 
     #[test]

@@ -38,12 +38,11 @@ pub(crate) fn basename_of(path: &str) -> String {
 
 pub struct ControlPlane {
     store: Arc<Store>,
-    /// Extension registries (harness/gateway/connector). `Project.harness` is
-    /// resolved against `registries.harness`.
+    /// Extension registries (harness slot/gateway/connector/plugins).
     registries: Registries,
     events: broadcast::Sender<CoreEvent>,
-    /// Shared approval hub — handed to each `SessionCtx` so the ACP permission
-    /// bridge can route tool-permission prompts back to the UI.
+    /// Shared approval hub — handed to each `SessionCtx` so the permission
+    /// gate can route tool-permission prompts back to the UI.
     approvals: Arc<ApprovalHub>,
     /// Live sessions keyed by `session_pk`. Each value is the harness session
     /// handle returned by `Harness::start_session`, used to drive prompts and to
@@ -253,6 +252,16 @@ impl ControlPlane {
     /// fan-out timeout/deny paths).
     pub fn resolve_approval_bool(&self, request_id: &str, allow: bool) -> bool {
         self.resolve_approval(request_id, ApprovalResponse::once(allow))
+    }
+
+    /// Test-only: park a fake approval and return its receiver.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub fn approvals_for_test_register(
+        &self,
+        request_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<crate::domain::ApprovalResponse> {
+        self.approvals.register(request_id.to_string())
     }
 
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {

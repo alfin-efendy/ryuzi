@@ -1,10 +1,10 @@
 # Plugin SDK
 
-Ryuzi's extension points — model providers, CLI-agent runtimes, the Discord
-gateway, and third-party integrations (GitHub, Notion, Slack, memory
-backends, sandboxes, deploy platforms...) — are all **plugins**: one manifest
-each, surfaced identically through `ryuzi plugins`, `GET /plugins`, and
-Cockpit's Plugins hub.
+Ryuzi's extension points — model providers, the Discord gateway, and
+third-party integrations (GitHub, Notion, Slack, memory backends,
+sandboxes, deploy platforms...) — are all **plugins**: one manifest
+each, surfaced identically through `ryuzi plugins`, the daemon's
+`list_plugins` RPC, and Cockpit's Plugins hub.
 
 This guide covers the manifest format, how to author and install your own
 plugin, and how the built-in fleet is organized. It documents what is
@@ -34,19 +34,18 @@ two different crates:
 A manifest **on its own** can only ever produce a *connector* (an MCP-server
 contributor) — that's what `declarative_plugin()`
 (`crates/core/src/plugins/declarative.rs`) builds automatically whenever a
-manifest declares `[[mcp]]` entries. A *harness* (an agent runtime) or a
-*gateway* (a chat platform) requires actual Rust code, so those three
-capabilities are hand-built-in: the native runtime and the `claude-code`
-harness (beside their own modules, `harness::native` /
-`harness::acp`), and the `discord` gateway
+manifest declares `[[mcp]]` entries. A *harness* (the agent loop) or a
+*gateway* (a chat platform) requires actual Rust code, so those
+capabilities are hand-built-in: the native agent harness
+(`harness::native`) and the `discord` gateway
 (`crates/core/src/plugins/builtin.rs`).
 
 Manifests come from three places, merged in this order (first registration
 for a given `id` wins — see `PluginHost::add`):
 
-1. **Rust built-ins** — `native`, `claude-code`, `discord`, plus every model
-   provider and CLI agent, generated from two existing static catalogs
-   (`crates/core/src/plugins/providers.rs`, `runtimes_meta.rs`).
+1. **Rust built-ins** — `native`, `discord`, plus every model provider,
+   generated from the static provider catalog
+   (`crates/core/src/plugins/providers.rs`).
 2. **The embedded integration catalog** — 24 TOML manifests baked into the
    binary via `include_str!`, at `crates/core/plugins/catalog/*.toml`
    (`crates/core/src/plugins/catalog.rs`).
@@ -58,9 +57,8 @@ for a given `id` wins — see `PluginHost::add`):
 A real `ryuzi` process wires all of this at startup
 (`crates/cli/src/main.rs`'s `build_registries`, mirrored by
 `apps/cockpit/src-tauri/src/lib.rs`): register `native` unconditionally,
-register `claude-code` if the ACP sidecar resolves, register `discord`,
-then call `ryuzi_core::plugins::install_builtins` (providers, then CLI
-agents, then the embedded catalog) and finally
+register `discord`, then call `ryuzi_core::plugins::install_builtins`
+(providers, then the embedded catalog) and finally
 `ryuzi_core::plugins::load_skill_pack_plugins`. Because this all runs once at
 process startup, installing or refreshing a skill pack requires restarting
 `ryuzi` (or the Cockpit app) to pick it up — there is no hot-reload.
@@ -79,12 +77,12 @@ two tabs (`Segmented`), backed by thin Tauri commands:
 - **Installed** — DB-backed MCP apps already added to the local machine
   (`apps_cmd.rs` / `useApps`), plus every installed plugin the ledger and
   registries know about (providers, gateways, catalog connectors, and skill
-  packs) via `usePlugins`/`GET /plugins`. Every installed card exposes
+  packs) via `usePlugins`/the `list_plugins` RPC. Every installed card exposes
   Uninstall; skill-pack cards additionally show Update and Pin/Unpin, and a
   "Pinned" pill plus an "Attach failed" pill (from the doctor findings)
   surface inline. A separate "Skill sources" card lists any git-installed
   skill that isn't tied to a plugin id. Above the tabs, an **Update all** button batches
-  `POST /plugins/update-all` across every installed pack (skipping pinned
+  the `update_all_plugins` RPC across every installed pack (skipping pinned
   ones) and a **doctor** chip shows the current `plugin_doctor` issue count
   (opens `DoctorPanel`, a read-only findings list grouped by severity).
 - **Browse** — a pure grid of the embedded **catalog** manifests with a
@@ -107,9 +105,10 @@ installs immediately, while an arbitrary source stops at a trust-confirmation
 step in `SkillInstallModal` before anything touches the live install
 directory. Any successful install, update, uninstall, or confirm sets an
 in-memory "restart required" flag Cockpit polls via
-`pluginsRestartRequired`/`GET /plugins` — a banner ("Restart Cockpit to apply
-plugin changes.") appears above the main view (`App.tsx`) until the app is
-restarted, since registries are only built once at process startup.
+the `plugins_restart_required` RPC (and the `restartRequired` derived from
+`list_plugins`) — a banner ("Restart Cockpit to apply plugin changes.")
+appears above the main view (`App.tsx`) until the app is restarted, since
+registries are only built once at process startup.
 
 The plugin detail screen (`PluginDetailView.tsx`) additionally renders a
 **Provenance** card (source spec, resolved commit prefix, install/update
@@ -150,7 +149,7 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `name` | string | *(required)* | Display name; must be non-empty. |
 | `version` | string | `""` | Free-form; not validated. |
 | `publisher` | string | `""` | `"ryuzi"` for first-party; a vendor or maintainer name otherwise. |
-| `description` | string | `""` | Shown in `ryuzi plugins info`, `GET /plugins`, and the Cockpit catalog card. |
+| `description` | string | `""` | Shown in `ryuzi plugins info`, the `list_plugins` RPC, and the Cockpit catalog card. |
 | `homepage` | string \| null | `None` | |
 | `icon` | string \| null | `None` | A lucide icon name. Cockpit maps a small explicit set (`message-circle`, `terminal`, `cpu`, `globe`, `database`, `search`, `cloud`, `server`, `webhook`, `key`, `mail`, `bot`) and falls back to a generic puzzle icon for everything else — including brand-name icons like `github`, `slack`, or `figma`, since `lucide-react` dropped brand/logo icons (see `apps/cockpit/src/lib/plugin-icons.ts`). |
 | `categories` | string[] | `[]` | See the vocabulary table below. Unknown labels are a non-fatal warning (`PluginManifest::warnings()`), never a validation error. |
@@ -161,7 +160,6 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `mcp` | `[[mcp]]` array | `[]` | See [MCP server defs](#mcp-server-defs). |
 | `skills` | `[[skills]]` array | `[]` | See [Skills bundling](#skills-bundling). |
 | `provider` | `[provider]` table \| null | `None` | Model-provider capability block — see below. |
-| `runtime` | `[runtime]` table \| null | `None` | CLI-agent capability block — see below. |
 
 ### `[auth]`
 
@@ -212,18 +210,9 @@ See [MCP server defs](#mcp-server-defs) for the full field table.
 | `base_url` | string \| null | `None` |
 | `models` | `[{ id, label?, default? }]` | `[]` |
 
-### `[runtime]` (CLI-agent plugins)
-
-| Field | Type | Default |
-| --- | --- | --- |
-| `binary` | string \| null | `None` |
-| `npm_package` | string \| null | `None` |
-| `default_model` | string \| null | `None` |
-
-`[provider]`/`[runtime]` are populated by the generated built-in provider
-and CLI-agent plugins (`providers.rs`/`runtimes_meta.rs`); none of the 24
-embedded catalog manifests use them — a third-party integration is a
-connector, not a model provider or a CLI agent.
+`[provider]` is populated by the generated built-in provider plugins
+(`providers.rs`); none of the 24 embedded catalog manifests use it — a
+third-party integration is a connector, not a model provider.
 
 ### Full annotated example
 
@@ -289,8 +278,7 @@ without breaking existing manifests.
 | `api-key` | A model provider authenticated by API key (e.g. Anthropic, OpenAI) |
 | `oauth` | A model provider authenticated via OAuth (e.g. `anthropic-oauth`, `openai-oauth`) |
 | `free` | A free-tier model provider (e.g. `kiro`, `opencode-free`) |
-| `runtime` | An agent runtime with a live harness (`native`, `claude-code`) |
-| `cli-agent` | A CLI coding agent Cockpit can drive but doesn't run in-process (`claude`, `codex`, `gemini`, `opencode`, ...) |
+| `runtime` | The in-process native agent runtime (`native`) |
 | `chat-gateway` | A chat platform gateway (`discord`) |
 | `vcs` | Source control / repos (`github`, `atlassian`) |
 | `issues` | Issue trackers (`github`, `atlassian`, `linear`) |
@@ -710,41 +698,51 @@ via a "Doctor: OK" / "N issues" chip on the Plugins hub (opens `DoctorPanel`,
 findings grouped errors-first) and, per-plugin, as the attach-failure banner
 on the detail screen.
 
-### Daemon endpoints (`ryuzi serve`)
+### Daemon RPC methods (`POST /rpc/{method}`)
 
-`ryuzi serve`'s HTTP router (`crates/core/src/serve.rs`) exposes plugin
-management alongside the existing session/event routes:
+The engine daemon (`ryuzi serve` / `--engine-daemon`) exposes plugin
+management as RPC methods, dispatched by `crate::api::plugins_api::dispatch`
+(routed from `crate::api::dispatch` in `crates/core/src/api/mod.rs`). Cockpit
+calls each through a thin `EngineClient::rpc` proxy in
+`apps/cockpit/src-tauri/src/plugins_cmd.rs` — there are no REST plugin routes
+on the HTTP router anymore; `serve.rs` only owns `/rpc/{method}`, `/events`,
+and `/approvals`. Every method's params object uses the Rust snake_case
+parameter names; the Tauri command name matches the RPC method name 1:1.
 
-| Route | Method | Body | Notes |
+| Method | Params | Result | Notes |
 | --- | --- | --- | --- |
-| `/plugins` | GET | — | Every plugin as a compact summary, enriched with its ledger fields and `restartRequired` (see below) |
-| `/plugins/{id}` | GET | — | The plugin's full manifest plus `enabled`/`source`/`restartRequired` and the same ledger enrichment |
-| `/plugins/doctor` | GET | — | `plugin_doctor`'s findings array |
-| `/plugins/install` | POST | `{ source }` | Phase 1 of the trust gate — curated sources install immediately (sets `restartRequired`), arbitrary sources return `{ completed: false, trust: TrustPrompt }` |
-| `/plugins/install/confirm` | POST | `{ token }` | Phase 2 — completes a staged install/update after acknowledgment; sets `restartRequired` |
-| `/plugins/{id}/update` | POST | `{ force? }` | Runs `update_installed_pack`; only an `Updated` outcome sets `restartRequired` |
-| `/plugins/update-all` | POST | — | Runs `update_all_packs`; sets `restartRequired` if at least one pack actually reinstalled |
-| `/plugins/{id}/pin` | POST | `{ pinned, reason? }` | Flips the ledger's pin state; never sets `restartRequired` (pin doesn't change what's on disk or loaded) |
-| `/plugins/{id}` | DELETE | — | Uninstalls a recorded pack: removes it from disk and deletes its `plugin_installs`/`plugin_attach_status` rows; sets `restartRequired` |
+| `list_plugins` | — | `PluginInfo[]` | Every plugin as a compact summary, enriched with its ledger fields (see below) |
+| `plugin_detail` | `{ id }` | `PluginDetail` | The plugin's full manifest plus `enabled`/`source` and the same ledger enrichment |
+| `plugin_doctor` | — | `DoctorFinding[]` | `plugin_doctor`'s findings array |
+| `begin_skill_install` | `{ source }` | `SkillInstallBegin` | Phase 1 of the trust gate — curated sources install immediately (sets restart-required), arbitrary sources return `{ completed: false, trust: TrustPrompt }` |
+| `confirm_skill_install` | `{ token }` | `InstalledSkillPack` | Phase 2 — completes a staged install/update after acknowledgment; sets restart-required |
+| `update_plugin` | `{ id, force }` | `UpdateOutcomeDto` | Runs `update_installed_pack`; only an `Updated` outcome sets restart-required |
+| `update_all_plugins` | — | `UpdateOutcomeEntry[]` | Runs `update_all_packs`; sets restart-required if at least one pack actually reinstalled |
+| `set_plugin_pin` | `{ id, pinned, reason? }` | — | Flips the ledger's pin state; never sets restart-required (pin doesn't change what's on disk or loaded) |
+| `uninstall_plugin` | `{ id }` | `PluginInfo[]` | Uninstalls a recorded pack via the recorded remove path: removes it from disk and deletes its `plugin_installs`/`plugin_attach_status` rows; sets restart-required; returns the refreshed list |
+| `plugins_restart_required` | — | `boolean` | Reads the in-memory restart-required latch (see below) |
 
-`GET /plugins` and `GET /plugins/{id}` merge in, when a `plugin_installs` row
+`list_plugins` and `plugin_detail` merge in, when a `plugin_installs` row
 exists for that id: `sourceSpec`, `resolvedCommit`, `pinned`, `installedAt`,
-`updatedAt`, and `trustTier` (see `merge_install_record` in `serve.rs`) — note
-`sourceSpec` is deliberately a distinct key from the existing `source` field,
-which stays the stable `"builtin" | "catalog" | "skill-pack"` enum label.
-When a `plugin_attach_status` row exists, `attachOutcome`/`attachReason` are
-merged in too.
+`updatedAt`, and `trustTier` (see `install_ledger_index` /
+`InstallLedgerFields` in `plugins_api.rs`) — note `sourceSpec` is deliberately
+a distinct key from the existing `source` field, which stays the stable
+`"builtin" | "catalog" | "skill-pack"` enum label. `list_plugins` fetches the
+ledger once (`store.list_plugin_installs`) and indexes it by id so list
+assembly never does a per-plugin store round-trip; `plugin_detail` uses the
+single-id `store.get_plugin_install`.
 
-`restartRequired` is a single in-memory flag on `ControlPlane`
+`restartRequired` is a single in-memory flag on the daemon's `ControlPlane`
 (`mark_plugins_restart_required`/`plugins_restart_required`), not persisted —
 it's set by any install/update/uninstall that actually changed what's on
-disk or should be loaded, and read back on every `GET /plugins` response.
-It exists because plugin registries (`Registries`) are built exactly once at
-process startup (see [the wiring note above](#two-layers-manifest-vs-coreplugin));
+disk or should be loaded, and read back via the `plugins_restart_required`
+RPC. It exists because plugin registries (`Registries`) are built exactly
+once at process startup (see [the wiring note above](#two-layers-manifest-vs-coreplugin));
 there is no hot-reload, so a fresh install genuinely isn't live until the
-daemon (or Cockpit) restarts. Nothing today clears the flag except a
-restart — polling `GET /plugins` after a restart naturally starts a new
-process with the flag reset to `false`.
+daemon restarts. Nothing today clears the flag except a daemon restart —
+Cockpit is a thin client, so the flag lives on the daemon (the actual plugin
+host), and a daemon restart naturally starts a new process with it reset to
+`false`.
 
 ---
 
@@ -754,15 +752,15 @@ process with the flag reset to `false`.
 enablement by capability, in this priority order:
 
 1. Unknown `id` → `false`.
-2. Harness-capable (`native`, `claude-code`) → whether `id` is in the
-   `enabled_runtimes` CSV setting.
+2. `native` (the built-in agent harness) → always `true`; the agent is not
+   toggleable.
 3. Gateway-capable (`discord`) → whether `id` is in the `enabled_gateways`
    CSV setting.
 4. `experimental = true` (docs-only: `ngrok`, `vercel-sandbox`, `zep`) →
    always `false` — there is no capability to enable, and this wins even if
    a stray `plugin.<id>.enabled = true` row exists.
-5. No harness/gateway/connector capability at all (every model-provider and
-   CLI-agent plugin) → always `true`.
+5. No harness/gateway/connector capability at all (every model-provider
+   plugin) → always `true`.
 6. Otherwise (every catalog/skill-pack integration with a connector) →
    `plugin.<id>.enabled == "true"`, defaulting to `false`.
 
@@ -781,8 +779,8 @@ ryuzi plugins disable github
   there's nothing to enable); the plugin detail screen (reached from the
   sidebar's Plugins section or the Browse card's "Configure" button) has
   the same switch.
-- **Settings keys directly**: `enabled_runtimes`/`enabled_gateways` are CSV
-  strings (add/remove `id`, preserving order, no duplicates —
+- **Settings keys directly**: `enabled_gateways` is a CSV
+  string (add/remove `id`, preserving order, no duplicates —
   `toggle_enabled`'s `toggle_csv` helper); everything else is
   `plugin.<id>.enabled` (`"true"`/`"false"`). Both `ryuzi plugins enable/
   disable` and Cockpit's `set_plugin_enabled` command delegate to the same
@@ -814,18 +812,9 @@ per-plugin case in either function.
 | Plugin id(s) | Source | Capability |
 | --- | --- | --- |
 | `native` | `harness::native::native_plugin()` | harness (in-process agent loop) |
-| `claude-code` | `harness::acp::claude_code_plugin[_with_resolver]()` | harness (ACP sidecar) |
 | `discord` | `plugins::builtin::discord_plugin()` | gateway (feature-gated `serenity` factory) |
 | `anthropic`, `openai`, `ollama`, ... (every `llm_router::registry::CATALOG` entry) | `plugins::providers::provider_plugins()` | manifest-only, `[provider]` block; category `model-provider` + `api-key`/`oauth`/`free` |
-| `claude`, `codex`, `gemini`, `opencode`, ... (`runtimes::CATALOG`, minus `native`/`ollama`) | `plugins::runtimes_meta::cli_agent_plugins()` | manifest-only, `[runtime]` block; category `cli-agent` |
 | `github`, `atlassian`, ... (24 entries) | Embedded TOML, `plugins::catalog::catalog_plugins()` | connector (via `declarative_plugin`) |
-
-`native`/`ollama` are deliberately skipped from the CLI-agent catalog
-mapping: `native` already has a richer harness-backed plugin under that id,
-and `ollama` is already the `model-provider` plugin for the same underlying
-service (Cockpit's "detect the binary, list installed models" view of it) —
-mapping either again would just register a weaker duplicate that
-`PluginHost::add` would then silently drop.
 
 ---
 
@@ -932,7 +921,6 @@ Adding an entry to `crates/core/plugins/catalog/*.toml` (and
   substitution — never a literal token in the manifest.
 - Run `cargo test -p ryuzi-core` after adding an entry: `catalog.rs`'s test
   module parses/validates every embedded manifest, checks id uniqueness
-  (including against every built-in provider/CLI-agent/`native`/
-  `claude-code`/`discord` id), requires every non-experimental entry to
-  have `[[mcp]]`, and requires every `experimental` entry to have no
-  `[[mcp]]`.
+  (including against every built-in provider/`native`/`discord` id),
+  requires every non-experimental entry to have `[[mcp]]`, and requires
+  every `experimental` entry to have no `[[mcp]]`.

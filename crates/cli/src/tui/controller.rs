@@ -14,8 +14,8 @@ use ryuzi_core::daemon_status::{
     DaemonState, DaemonStatusFile,
 };
 use ryuzi_core::settings::{
-    csv, find_field, is_secret, ConfigField, GatewayDescriptor, RuntimeDescriptor, SettingsStore,
-    CATALOG, GLOBAL_FIELDS,
+    csv, find_field, is_secret, ConfigField, GatewayDescriptor, SettingsStore, CATALOG,
+    GLOBAL_FIELDS,
 };
 use ryuzi_core::Store;
 
@@ -36,14 +36,13 @@ pub type SpawnDaemon = Box<dyn Fn(&[String], &Path) -> std::io::Result<u32> + Se
 /// Sends SIGTERM to a pid. `None` means "really `kill(2)`" via
 /// `ryuzi_core::daemon_status::send_sigterm`.
 pub type KillFn = Box<dyn Fn(i32) + Send + Sync>;
-/// A sync environment-detector function pointer (`detect_git`/`detect_claude`).
+/// A sync environment-detector function pointer (`detect_git`).
 pub type DetectFn = fn() -> Detected;
 
 pub struct ControllerDeps {
     pub store: Arc<Store>,
     pub data_dir: PathBuf,
     pub detect_git: DetectFn,
-    pub detect_claude: DetectFn,
     pub spawn_daemon: Option<SpawnDaemon>,
     pub kill_daemon: Option<KillFn>,
 }
@@ -98,44 +97,18 @@ impl AppController {
         CATALOG.gateways
     }
 
-    pub fn runtime_descriptors(&self) -> &'static [RuntimeDescriptor] {
-        CATALOG.runtimes
-    }
-
     pub fn gateway_fields(&self, id: &str) -> &'static [ConfigField] {
         CATALOG.gateway(id).map(|g| g.fields).unwrap_or(&[])
-    }
-
-    pub fn runtime_fields(&self, id: &str) -> &'static [ConfigField] {
-        CATALOG.runtime(id).map(|r| r.fields).unwrap_or(&[])
     }
 
     pub async fn enabled_gateways(&self) -> Vec<String> {
         csv(self.get("enabled_gateways").await.as_deref())
     }
 
-    pub async fn enabled_runtimes(&self) -> Vec<String> {
-        csv(self.get("enabled_runtimes").await.as_deref())
-    }
-
-    pub async fn default_runtime(&self) -> String {
-        self.get("default_runtime").await.unwrap_or_default()
-    }
-
     /// Empty slice stores `""` (join of nothing) — "none enabled" is an
     /// empty string, not a missing key.
     pub async fn set_enabled_gateways(&self, ids: &[String]) -> anyhow::Result<()> {
         self.settings.set("enabled_gateways", &ids.join(",")).await
-    }
-
-    /// Empty slice stores `""` (join of nothing) — "none enabled" is an
-    /// empty string, not a missing key.
-    pub async fn set_enabled_runtimes(&self, ids: &[String]) -> anyhow::Result<()> {
-        self.settings.set("enabled_runtimes", &ids.join(",")).await
-    }
-
-    pub async fn set_default_runtime(&self, id: &str) -> anyhow::Result<()> {
-        self.settings.set("default_runtime", id).await
     }
 
     pub async fn required_missing_fields(&self) -> Vec<&'static ConfigField> {
@@ -146,24 +119,9 @@ impl AppController {
             .collect()
     }
 
-    /// `claude-code` -> the injected `detect_claude`; `native` is always
-    /// available (in-process, no external binary); any other id -> not found.
-    pub fn detect_runtime(&self, id: &str) -> Detected {
-        match id {
-            "claude-code" => (self.deps.detect_claude)(),
-            "native" => Detected {
-                found: true,
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            },
-            _ => Detected {
-                found: false,
-                version: None,
-            },
-        }
-    }
-
-    pub fn check_env(&self) -> (Detected, Detected) {
-        ((self.deps.detect_git)(), (self.deps.detect_claude)())
+    /// Environment probe: the `git` binary.
+    pub fn check_env(&self) -> Detected {
+        (self.deps.detect_git)()
     }
 
     // ---- daemon surface ----
@@ -213,22 +171,19 @@ impl AppController {
     }
 
     /// No-ops when already running/starting. Blocked (missing required
-    /// settings, or no gateway enabled) writes a synthetic error status
-    /// without spawning. Otherwise clears any stale status and spawns the
-    /// daemon detached, logging to `{data_dir}/daemon.log`.
+    /// settings) writes a synthetic error status without spawning. An empty
+    /// `enabled_gateways` is fine — the daemon is the always-on engine host
+    /// (control API, sessions, scheduler) regardless of whether any gateway
+    /// is enabled. Otherwise clears any stale status and spawns the daemon
+    /// detached, logging to `{data_dir}/daemon.log`.
     pub async fn start_daemon(&self) -> anyhow::Result<()> {
         let cur = self.daemon();
         if cur.running || cur.starting {
             return Ok(());
         }
         let missing = self.missing_required().await;
-        let gateways = self.enabled_gateways().await;
-        if !missing.is_empty() || gateways.is_empty() {
-            let why = if !missing.is_empty() {
-                format!("missing settings: {}", missing.join(", "))
-            } else {
-                "no gateways enabled".to_string()
-            };
+        if !missing.is_empty() {
+            let why = format!("missing settings: {}", missing.join(", "));
             let _ = write_status(
                 &self.deps.data_dir,
                 &DaemonStatusFile {
@@ -237,6 +192,7 @@ impl AppController {
                     started_at: ryuzi_core::paths::now_ms(),
                     last_error: Some(why),
                     version: None,
+                    port: None,
                 },
             );
             return Ok(());
@@ -297,10 +253,6 @@ pub(crate) async fn controller_in(dir: &Path) -> AppController {
             found: true,
             version: Some("2.45.0".into()),
         },
-        detect_claude: || Detected {
-            found: true,
-            version: Some("2.1.0".into()),
-        },
         spawn_daemon: None,
         kill_daemon: None,
     })
@@ -355,6 +307,27 @@ mod tests {
         assert!(err.to_lowercase().contains("missing"), "{err}");
     }
 
+    /// The daemon is the always-on engine host regardless of gateways: with
+    /// `enabled_gateways` cleared to empty (previously refused with "no
+    /// gateways enabled") and no required setting missing, `start_daemon`
+    /// now proceeds to spawn.
+    #[tokio::test]
+    async fn start_daemon_spawns_even_with_no_gateways_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawns: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let mut c = controller_in(dir.path()).await;
+        let log = spawns.clone();
+        c.deps.spawn_daemon = Some(Box::new(move |cmd, _log_path| {
+            log.lock().unwrap().push(cmd.to_vec());
+            Ok(4242)
+        }));
+        c.set_enabled_gateways(&[]).await.unwrap();
+        c.set("workdir_root", "/repos").await.unwrap();
+        c.start_daemon().await.unwrap();
+        assert_eq!(spawns.lock().unwrap().len(), 1);
+        assert!(c.daemon().last_error.is_none());
+    }
+
     #[tokio::test]
     async fn daemon_reflects_status_file_states() {
         let dir = tempfile::tempdir().unwrap();
@@ -369,6 +342,7 @@ mod tests {
                 started_at: 1,
                 last_error: None,
                 version: None,
+                port: None,
             },
         )
         .unwrap();
@@ -381,6 +355,7 @@ mod tests {
                 started_at: 1,
                 last_error: None,
                 version: None,
+                port: None,
             },
         )
         .unwrap();
@@ -393,6 +368,7 @@ mod tests {
                 started_at: 1,
                 last_error: Some("boom".into()),
                 version: None,
+                port: None,
             },
         )
         .unwrap();
@@ -415,6 +391,7 @@ mod tests {
                 started_at: 1,
                 last_error: None,
                 version: None,
+                port: None,
             },
         )
         .unwrap();
@@ -454,9 +431,6 @@ mod tests {
         for gw in c.gateway_descriptors() {
             keys.extend(c.gateway_fields(gw.id).iter().map(|f| f.key));
         }
-        for rt in c.runtime_descriptors() {
-            keys.extend(c.runtime_fields(rt.id).iter().map(|f| f.key));
-        }
         assert!(keys.contains(&"discord.token"));
         assert!(c.is_secret("discord.token"));
         assert!(!c.is_secret("workdir_root"));
@@ -466,15 +440,8 @@ mod tests {
     async fn check_env_uses_injected_detectors() {
         let dir = tempfile::tempdir().unwrap();
         let c = controller_in(dir.path()).await;
-        let (git, claude) = c.check_env();
+        let git = c.check_env();
         assert!(git.found);
         assert_eq!(git.version.as_deref(), Some("2.45.0"));
-        assert!(claude.found);
-        assert_eq!(claude.version.as_deref(), Some("2.1.0"));
-        assert_eq!(
-            c.detect_runtime("claude-code").version.as_deref(),
-            Some("2.1.0")
-        );
-        assert!(!c.detect_runtime("unknown-runtime").found);
     }
 }

@@ -15,7 +15,8 @@ type AppsState = {
   probe: (id: string) => Promise<void>;
   setScope: (id: string, scope: string, scopeGateways: string[]) => Promise<void>;
   setToolPerm: (id: string, tool: string, perm: string) => Promise<void>;
-  toggleAgent: (id: string, agentId: string, allowed: boolean) => Promise<void>;
+  /** Allow/deny the (single, native) agent to use this app. */
+  toggleAgent: (id: string, allowed: boolean) => Promise<void>;
 };
 
 function applyResult(set: (partial: Partial<AppsState>) => void, res: Result<AppInfo[], CmdError>, action: string): boolean {
@@ -62,13 +63,13 @@ export const useApps = create<AppsState>((set, get) => ({
     applyResult(set, await commands.setAppToolPerm(id, tool, perm), "Tool permission");
   },
 
-  toggleAgent: async (id, agentId, allowed) => {
+  toggleAgent: async (id, allowed) => {
     set({
       apps: get().apps.map((a) =>
-        a.id === id ? { ...a, agentAccess: a.agentAccess.map((x) => (x.agentId === agentId ? { ...x, allowed } : x)) } : a,
+        a.id === id ? { ...a, agentAccess: a.agentAccess.map((x) => (x.agentId === "native" ? { ...x, allowed } : x)) } : a,
       ),
     });
-    applyResult(set, await commands.toggleAppAgent(id, agentId, allowed), "Agent access");
+    applyResult(set, await commands.toggleAppAgent(id, "native", allowed), "Agent access");
   },
 }));
 
@@ -76,6 +77,7 @@ export function appById(apps: AppInfo[], id: string): AppInfo | undefined {
   return apps.find((a) => a.id === id);
 }
 
-export function agentAllowed(app: AppInfo, agentId: string): boolean {
-  return app.agentAccess.find((x) => x.agentId === agentId)?.allowed ?? true;
+/** Whether the native agent may use this app. Missing row = allowed. */
+export function agentAllowed(app: AppInfo): boolean {
+  return app.agentAccess.find((x) => x.agentId === "native")?.allowed ?? true;
 }

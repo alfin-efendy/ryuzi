@@ -41,7 +41,7 @@ workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-ryuzi-core = { path = "../../../crates/core" }
+ryuzi-core = { path = "../../../crates/core", features = ["discord"] }
 ryuzi-plugin-sdk = { path = "../../../crates/plugin-sdk" }
 tauri = { version = "2", features = ["protocol-asset", "macos-private-api"] }
 tauri-plugin-dialog = "2"
@@ -49,14 +49,14 @@ tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2"
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+tokio = { workspace = true, features = ["signal"] }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
+futures.workspace = true
 portable-pty.workspace = true
 specta = { workspace = true, features = ["derive"] }
 tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }
 specta-typescript = "0.0.9"
 anyhow.workspace = true
-dirs.workspace = true
 chrono.workspace = true
 base64 = "0.22"
 

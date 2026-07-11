@@ -14,8 +14,9 @@ The engine gates native tool calls through one pipeline:
 interaction tools:
 
 - `exitplanmode` (Plan kind): plan review. Approving switches the session's
-  permission mode (and persists it as the project default); rejecting sends
-  feedback back to the model.
+  permission mode and persists it to that SESSION's row (per-session; the
+  project's mode remains only the default seed for new sessions); rejecting
+  sends feedback back to the model.
 - `askuserquestion` (Question kind): a 1-4 question multiple-choice form whose
   answers become the tool result.
 
@@ -27,6 +28,4 @@ reports that no interactive surface answered.
 
 MCP tools are gated per-tool: the permission key is the tool's own full name
 (`mcp__server__tool`), so "don't ask again" rules never span multiple MCP
-tools or servers. ACP sessions (e.g. Claude Code) forward `*Always` decisions
-to the agent's own permission options and do not write ryuzi `tool_policies`
-rows — this is an accepted deviation from the native runtime's persistence.
+tools or servers.

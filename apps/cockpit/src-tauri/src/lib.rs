@@ -1,9 +1,12 @@
 mod accent;
+mod agent_cmd;
 mod apps_cmd;
 mod backdrop;
 mod commands;
 mod connections_cmd;
 mod endpoint_cmd;
+pub mod engine;
+pub mod engine_daemon;
 mod error;
 mod events;
 mod fsview_cmd;
@@ -11,248 +14,13 @@ mod gateways_cmd;
 mod native_cmd;
 mod open_cmd;
 mod plugins_cmd;
-mod runtimes_cmd;
 mod scheduler_cmd;
 mod session_io;
 mod skills_cmd;
 mod term;
 
-use ryuzi_core::harness::acp::claude_code_plugin_with_resolver;
-use ryuzi_core::harness::native::native_plugin;
-use ryuzi_core::{AcpAdapterDescriptor, ControlPlane, Registries, Store};
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
-
-/// The base name of the ACP adapter sidecar binary (no target-triple suffix,
-/// no `.exe`). Used only as the dev/PATH fallback name when the shared
-/// resolver (`ryuzi_core::sidecar::host_manager`) fails to resolve a cached
-/// or downloaded artifact — see `resolve_acp_adapter` below.
-///
-/// Package: @agentclientprotocol/claude-agent-acp
-/// NOTE: the adapter refuses to start inside a nested Claude Code session, so
-/// we unconditionally remove the `CLAUDECODE` env-var before spawning it.
-/// Authentication (claude login) is out-of-band — the host machine's `claude`
-/// session is reused; no credentials are managed here.
-const ADAPTER_BIN: &str = "claude-agent-acp";
-
-/// Resolve the ACP adapter via the shared tiered resolver (Spec 4 §4):
-/// RYUZI_ACP_PATH override → cached artifact → download (bun bundle if a
-/// host bun exists, else the standalone binary). First resolve needs network
-/// or Bun — the same contract as the CLI. Runs lazily on the first
-/// `claude-code` session start (never at app launch — see
-/// [`build_registries`]).
-///
-/// On resolver failure (dev builds embed `release_tag: v0.0.0`, so the
-/// download tier always 404s) we try, in order:
-///   1. the repo-local bundle produced by `bun scripts/build-acp-sidecar.ts
-///      --bundle` (dev builds only), run via the host `bun`;
-///   2. an explicit PATH scan for a globally installed `claude-agent-acp`;
-///   3. an actionable error — surfaced verbatim at session start, which
-///      beats the old bare-name fallback whose only symptom was
-///      "failed to spawn ACP adapter: program not found".
-fn resolve_acp_adapter() -> anyhow::Result<(String, Vec<String>)> {
-    let resolve_err = match ryuzi_core::sidecar::host_manager().resolve() {
-        Ok(r) => return Ok((r.command, r.args)),
-        Err(e) => e,
-    };
-    eprintln!("[ryuzi] sidecar resolve failed: {resolve_err:#}");
-
-    #[cfg(debug_assertions)]
-    if let Some(bundle) = dev_sidecar_bundle() {
-        eprintln!("[ryuzi] using repo-local ACP bundle: {bundle}");
-        return Ok(("bun".to_string(), vec![bundle]));
-    }
-
-    if let Some(found) = find_on_path(ADAPTER_BIN) {
-        eprintln!("[ryuzi] using PATH-installed ACP adapter: {found}");
-        return Ok((found, vec![]));
-    }
-
-    Err(anyhow::anyhow!(
-        "ACP adapter unavailable: {resolve_err:#}. Fix: install bun >= {} so the adapter \
-         can be fetched automatically, set RYUZI_ACP_PATH to an adapter binary, or (dev) \
-         run `bun scripts/build-acp-sidecar.ts --bundle --install-cache` from the repo root.",
-        ryuzi_core::sidecar::embedded_manifest().min_bun
-    ))
-}
-
-/// Dev builds only: the universal JS bundle emitted by
-/// `bun scripts/build-acp-sidecar.ts --bundle` into `<repo>/dist/sidecar/`.
-/// Returns the newest `claude-agent-acp-*.js` there, provided a host `bun`
-/// exists to run it.
-#[cfg(debug_assertions)]
-fn dev_sidecar_bundle() -> Option<String> {
-    ryuzi_core::sidecar::default_bun_probe()?;
-    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dist/sidecar");
-    let mut bundles: Vec<std::path::PathBuf> = std::fs::read_dir(dist)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(ADAPTER_BIN) && n.ends_with(".js"))
-        })
-        .collect();
-    bundles.sort();
-    bundles.pop().map(|p| p.to_string_lossy().into_owned())
-}
-
-/// Explicit PATH scan for a globally installed adapter (npm/bun global
-/// installs). Windows also probes `.exe`; `.cmd` shims are skipped because
-/// `CreateProcess` cannot spawn them without a shell.
-fn find_on_path(bin: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let plain = dir.join(bin);
-        if plain.is_file() {
-            return Some(plain.to_string_lossy().into_owned());
-        }
-        if cfg!(windows) {
-            let exe = dir.join(format!("{bin}.exe"));
-            if exe.is_file() {
-                return Some(exe.to_string_lossy().into_owned());
-            }
-        }
-    }
-    None
-}
-
-/// Map Rust's `std::env::consts::{OS, ARCH}` to the npm platform-package
-/// naming used by `@anthropic-ai/claude-agent-sdk`'s optional-dependency
-/// binaries (e.g. `claude-agent-sdk-win32-x64`). Pure and testable in
-/// isolation from the filesystem lookups in
-/// [`resolve_claude_code_executable`].
-fn sdk_platform_package(os: &str, arch: &str) -> String {
-    let os = match os {
-        "windows" => "win32",
-        "macos" => "darwin",
-        other => other,
-    };
-    let arch = match arch {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        other => other,
-    };
-    format!("claude-agent-sdk-{os}-{arch}")
-}
-
-/// Resolve a Claude Code CLI for the ACP adapter's `CLAUDE_CODE_EXECUTABLE`
-/// override. The bun-compiled adapter cannot resolve
-/// `@anthropic-ai/claude-agent-sdk` from its virtual filesystem (bunfs), so
-/// the engine locates the CLI on its behalf:
-///   1. Respect an operator-provided CLAUDE_CODE_EXECUTABLE (inherited env).
-///   2. A bundled `claude-code[.exe]` next to the app executable (reserved
-///      for future packaged builds; nothing bundles it yet).
-///   3. Dev builds only: the SDK platform package inside the sidecar
-///      isolated build dir produced by scripts/build-acp-sidecar.ts.
-///
-/// Returns None when nothing is found — the adapter then falls back to its
-/// own resolution, which works when it runs un-compiled under bun/node.
-fn resolve_claude_code_executable() -> Option<String> {
-    // 1. Operator-provided override — the child inherits it either way, so
-    // don't shadow it with our own resolution.
-    if std::env::var_os("CLAUDE_CODE_EXECUTABLE").is_some() {
-        return None;
-    }
-
-    // 2. Bundled `claude-code[.exe]` next to the app executable.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            #[cfg(windows)]
-            let candidate = dir.join("claude-code.exe");
-            #[cfg(not(windows))]
-            let candidate = dir.join("claude-code");
-
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-
-    // 3. Dev builds only: the SDK platform package inside the isolated
-    // sidecar build dir (see scripts/build-acp-sidecar.ts).
-    #[cfg(debug_assertions)]
-    {
-        let bin_name = if cfg!(windows) {
-            "claude.exe"
-        } else {
-            "claude"
-        };
-        let scope_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".sidecar-build")
-            .join("node_modules")
-            .join("@anthropic-ai");
-
-        let os = std::env::consts::OS;
-        let arch = std::env::consts::ARCH;
-        // On Linux, both glibc and musl platform packages may be installed;
-        // prefer glibc, mirroring the adapter's own resolution order.
-        let candidates = if os == "linux" {
-            vec![
-                sdk_platform_package(os, arch),
-                format!("{}-musl", sdk_platform_package(os, arch)),
-            ]
-        } else {
-            vec![sdk_platform_package(os, arch)]
-        };
-
-        for pkg in candidates {
-            let candidate = scope_dir.join(&pkg).join(bin_name);
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-
-    None
-}
-
-/// Build the extension registries: the in-process `native` harness (needs no
-/// external binary) plus the `claude-agent-acp` harness with a LAZY adapter
-/// resolver.
-///
-/// Registration performs no sidecar I/O: the resolver (which may download the
-/// adapter on first run) only executes when a `claude-code` session actually
-/// starts. App launch therefore never blocks on the resolve, and a setup that
-/// only runs the `native` harness never touches the resolver at all.
-///
-/// `env_remove: ["CLAUDECODE"]` is required: the adapter checks for this
-/// variable to detect a nested Claude Code session and refuses to start.
-fn build_registries() -> Registries {
-    let mut registries = Registries::new();
-    // The native runtime needs no external binary — register it unconditionally
-    // so projects with `harness = "native"` work in the desktop app.
-    registries.add_plugin(native_plugin());
-
-    registries.add_plugin(claude_code_plugin_with_resolver(|| {
-        let mut env = Vec::new();
-        if let Some(cli) = resolve_claude_code_executable() {
-            env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
-        }
-        let (command, args) = resolve_acp_adapter()?;
-        Ok(AcpAdapterDescriptor {
-            command,
-            args,
-            env,
-            // REQUIRED: strip CLAUDECODE so the adapter doesn't think it's
-            // running inside a Claude Code session and refuses to start.
-            env_remove: vec!["CLAUDECODE".to_string()],
-        })
-    }));
-
-    // Discord is a built-in gateway (its factory is a no-op unless the
-    // `discord` feature is on); register it like `native`/`claude-code` so
-    // Cockpit's `list_plugins`/`set_plugin_enabled` recognize it — the store
-    // seeds `enabled_gateways = "discord"` by default, so leaving this
-    // unregistered made Cockpit diverge from the CLI/`serve`, which both
-    // already register it (see `crates/cli/src/main.rs`'s `build_registries`).
-    registries.add_plugin(ryuzi_core::plugins::builtin::discord_plugin());
-
-    ryuzi_core::plugins::install_builtins(&mut registries);
-    ryuzi_core::plugins::load_skill_pack_plugins(&mut registries);
-    registries
-}
 
 fn make_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
@@ -278,16 +46,11 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::get_setting,
             commands::set_setting,
             commands::update_project,
+            commands::update_session_perm_mode,
             commands::list_branches,
-            runtimes_cmd::list_runtimes,
-            runtimes_cmd::refresh_runtimes,
-            runtimes_cmd::update_runtime_config,
-            runtimes_cmd::update_runtime,
-            runtimes_cmd::set_runtime_tier,
-            runtimes_cmd::set_default_runtime,
-            runtimes_cmd::runtime_config_status,
-            runtimes_cmd::apply_runtime_config,
-            runtimes_cmd::reset_runtime_config,
+            agent_cmd::get_agent_settings,
+            agent_cmd::set_agent_settings,
+            agent_cmd::list_selectable_models,
             gateways_cmd::list_gateways,
             gateways_cmd::probe_gateways,
             gateways_cmd::add_gateway,
@@ -359,6 +122,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_commands,
             native_cmd::session_todos,
             skills_cmd::list_skills,
+            skills_cmd::install_skill,
             skills_cmd::remove_skill,
             skills_cmd::refresh_skill,
             plugins_cmd::list_plugins,
@@ -436,29 +200,22 @@ pub fn run() {
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             builder.mount_events(app);
-            // Build the engine inside the async runtime so Store::open (and any
-            // harness setup) run within a Tokio context.
-            let (cp, attachments_root) = tauri::async_runtime::block_on(async move {
-                let store = Store::open(&ryuzi_core::paths::db_path())
+            // Cockpit no longer embeds the engine: attach to a live engine
+            // daemon or spawn one, then talk to it exclusively over
+            // `EngineClient` (the daemon's HTTP control API). The attachments
+            // root is derived engine-side (`workdir_root` setting) — fetch it
+            // over the same RPC so the asset-protocol scope below still works.
+            let (engine_handle, attachments_root) = tauri::async_runtime::block_on(async move {
+                let client = crate::engine::connect_or_spawn()
                     .await
-                    .expect("open ryuzi db");
-                // One-time (idempotent) upgrade of any legacy plaintext
-                // secrets to encrypted-at-rest; see
-                // `llm_router::secrets::init_and_sweep`'s doc for the
-                // atomicity/idempotency/degraded-state contract.
-                ryuzi_core::llm_router::secrets::init_and_sweep(&store).await;
-                let registries = build_registries();
-                let cp = ControlPlane::new(store, registries).await;
-                // Real app startup: run the one-time install-ledger backfill +
-                // crash-leftover sweep here (never in the ControlPlane
-                // constructor, which the cockpit test binary's `test_cp()`
-                // helper also drives — see `run_startup_maintenance`'s doc).
-                cp.run_startup_maintenance().await;
-                // Computed here (rather than a second `block_on`) because the
-                // async runtime does not support nested `block_on` calls.
-                let attachments_root = cp.attachments_root().await;
-                (cp, attachments_root)
+                    .expect("engine daemon unreachable");
+                let root: String = client
+                    .rpc("attachments_root", serde_json::json!({}))
+                    .await
+                    .expect("attachments root");
+                (std::sync::Arc::new(client), std::path::PathBuf::from(root))
             });
+            let bridge_client = engine_handle.clone();
             // Media previews: serve attachment files to the webview via the
             // asset protocol, scoped to the attachments root ONLY. The root
             // derives from the runtime-configurable `workdir_root` setting,
@@ -473,37 +230,6 @@ pub fn run() {
             {
                 eprintln!("[ryuzi] asset protocol scope: {e}");
             }
-            // Subscribe BEFORE manage() moves the Arc.
-            let mut rx = cp.subscribe();
-            // The scheduler loop fires enabled jobs for real (30s tick). Runs
-            // on the tauri async runtime — setup() has no ambient tokio context.
-            tauri::async_runtime::spawn(ryuzi_core::scheduler::run_loop(cp.clone()));
-            // The orch dispatcher drives auto-decomposed task graphs (5s tick).
-            tauri::async_runtime::spawn(ryuzi_core::orch::run_loop(cp.clone()));
-            // Capture clones BEFORE app.manage(cp) moves the Arc away.
-            let cp2 = cp.clone();
-            // Make Arc<ControlPlane> available to all Tauri commands.
-            app.manage(cp);
-            // Local router endpoint server (Models → Endpoint).
-            let router_srv = std::sync::Arc::new(
-                ryuzi_core::llm_router::server::RouterServer::new(cp2.store().clone()),
-            );
-            app.manage(router_srv.clone());
-            let cp3 = cp2.clone();
-            tauri::async_runtime::spawn(async move {
-                let auto = cp3
-                    .store()
-                    .get_setting("endpoint_autostart")
-                    .await
-                    .ok()
-                    .flatten();
-                if auto.as_deref() == Some("1") {
-                    let port = endpoint_cmd::configured_port(&cp3).await;
-                    if let Err(e) = router_srv.start(port).await {
-                        eprintln!("[ryuzi] endpoint autostart failed: {e}");
-                    }
-                }
-            });
             // UI terminal registry (session shells over portable-pty).
             app.manage(std::sync::Arc::new(term::UiTerms::default()));
             // Apply the OS backdrop (mica/vibrancy) at runtime and record what
@@ -514,24 +240,77 @@ pub fn run() {
             let cap = backdrop::apply_backdrop(&main_window);
             app.manage(backdrop::BackdropState(cap));
             accent::spawn_accent_watcher(app.handle());
-            // Bridge: forward every CoreEvent from the broadcast channel to the webview.
+            // Bridge: forward every CoreEvent from the engine daemon's SSE
+            // stream to the webview. Reconnects with exponential backoff
+            // (500ms -> 30s cap) whenever the stream ends or errors — the
+            // daemon may restart independently of Cockpit. OAuth-authorize-URL
+            // events are mapped onto their legacy Tauri events AND trigger a
+            // local browser open (the daemon has no webview to open one from).
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                use futures::StreamExt;
                 use tauri_specta::Event as _;
-                use tokio::sync::broadcast::error::RecvError;
+                let mut backoff_ms: u64 = 500;
                 loop {
-                    match rx.recv().await {
-                        Ok(ev) => {
-                            let _ = events::CoreEventMsg { event: ev }.emit(&app_handle);
+                    match bridge_client.events().await {
+                        Ok(stream) => {
+                            backoff_ms = 500;
+                            let mut stream = Box::pin(stream);
+                            while let Some(v) = stream.next().await {
+                                match v.get("kind").and_then(|k| k.as_str()) {
+                                    Some("oauthAuthorizeUrl") => {
+                                        let provider =
+                                            v["provider"].as_str().unwrap_or("").to_string();
+                                        let url =
+                                            v["authorize_url"].as_str().unwrap_or("").to_string();
+                                        let _ = tauri_plugin_opener::open_url(
+                                            url.clone(),
+                                            None::<String>,
+                                        );
+                                        let _ = events::OauthAuthorizeUrlMsg {
+                                            provider,
+                                            authorize_url: url,
+                                        }
+                                        .emit(&app_handle);
+                                    }
+                                    Some("pluginOauthAuthorizeUrl") => {
+                                        let plugin_id =
+                                            v["plugin_id"].as_str().unwrap_or("").to_string();
+                                        let url =
+                                            v["authorize_url"].as_str().unwrap_or("").to_string();
+                                        let _ = tauri_plugin_opener::open_url(
+                                            url.clone(),
+                                            None::<String>,
+                                        );
+                                        let _ = events::PluginOauthAuthorizeUrlMsg {
+                                            plugin_id,
+                                            authorize_url: url,
+                                        }
+                                        .emit(&app_handle);
+                                    }
+                                    _ => {
+                                        if let Ok(ev) =
+                                            serde_json::from_value::<ryuzi_core::CoreEvent>(v)
+                                        {
+                                            let _ = events::CoreEventMsg { event: ev }
+                                                .emit(&app_handle);
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!("[ryuzi] engine event stream ended — reconnecting");
                         }
-                        Err(RecvError::Lagged(n)) => {
-                            eprintln!("[ryuzi] CoreEvent bridge lagged, skipped {n} event(s)");
-                            continue;
-                        }
-                        Err(RecvError::Closed) => break,
+                        Err(e) => eprintln!(
+                            "[ryuzi] engine event stream error: {} — retrying",
+                            e.message
+                        ),
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(30_000);
                 }
             });
+            // Make Arc<EngineClient> available to all Tauri commands.
+            app.manage(engine_handle);
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -550,54 +329,5 @@ mod tests {
     fn export_bindings_test() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
         export_bindings(&out);
-    }
-
-    /// Registration must be hermetic: both harnesses appear in the registry
-    /// without any sidecar resolve (this test would touch the network under
-    /// the old eager resolution — laziness is what makes it runnable at all).
-    #[test]
-    fn build_registries_registers_both_harnesses_without_sidecar_io() {
-        let registries = build_registries();
-        let names = registries.harness.names();
-        assert!(names.iter().any(|n| n == "native"), "got: {names:?}");
-        assert!(names.iter().any(|n| n == "claude-code"), "got: {names:?}");
-    }
-
-    /// Regression test: Cockpit's composition root historically omitted
-    /// `discord_plugin()`, so `list_plugins` omitted discord and
-    /// `set_plugin_enabled("discord")` errored "unknown plugin: discord",
-    /// diverging from the CLI and `ryuzi serve` (both of which register it —
-    /// see `crates/cli/src/main.rs`'s `build_registries`).
-    #[test]
-    fn build_registries_registers_discord_plugin() {
-        let registries = build_registries();
-        assert!(
-            registries.plugins.get("discord").is_some(),
-            "discord plugin missing from Cockpit's composition root"
-        );
-    }
-
-    #[test]
-    fn sdk_platform_package_maps_windows_x86_64() {
-        assert_eq!(
-            sdk_platform_package("windows", "x86_64"),
-            "claude-agent-sdk-win32-x64"
-        );
-    }
-
-    #[test]
-    fn sdk_platform_package_maps_macos_aarch64() {
-        assert_eq!(
-            sdk_platform_package("macos", "aarch64"),
-            "claude-agent-sdk-darwin-arm64"
-        );
-    }
-
-    #[test]
-    fn sdk_platform_package_maps_linux_x86_64() {
-        assert_eq!(
-            sdk_platform_package("linux", "x86_64"),
-            "claude-agent-sdk-linux-x64"
-        );
     }
 }

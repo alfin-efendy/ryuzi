@@ -51,12 +51,22 @@ async fn run_serve(port: u16, deps: &mut Deps) -> u8 {
     // crash-leftover sweep (see `ControlPlane::run_startup_maintenance`).
     cp.run_startup_maintenance().await;
     // The orch dispatcher runs here so `ryuzi orch submit` works headless.
-    // (Its SQL claim transactions are safe if Cockpit's dispatcher is also
-    // running.) The cron scheduler stays Cockpit-only: its last-fired
-    // read-check-write anchor is NOT cross-process safe, so a second host
-    // could double-fire jobs.
+    // (Its SQL claim transactions are safe if another dispatcher, e.g. the
+    // daemon's, is also running.) `serve` does NOT host the cron scheduler:
+    // post-Phase-1, the scheduler is daemon-only (`ryuzi __daemon` /
+    // Cockpit's `--engine-daemon`, see `ryuzi_core::daemon::Daemon`) because
+    // its last-fired read-check-write anchor is NOT cross-process safe — a
+    // second host running it could double-fire jobs.
     ryuzi_core::orch::spawn_runner(cp.clone());
-    let bound = match serve::serve(cp, port).await {
+    let router_server = std::sync::Arc::new(ryuzi_core::llm_router::server::RouterServer::new(
+        cp.store().clone(),
+    ));
+    let state = serve::ApiState {
+        cp: cp.clone(),
+        router_server,
+        token: None,
+    };
+    let bound = match serve::serve(state, port).await {
         Ok(p) => p,
         Err(e) => {
             (deps.err)(&format!("✗ could not bind :{port}: {e}"));

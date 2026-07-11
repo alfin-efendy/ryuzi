@@ -64,7 +64,6 @@ pub struct Project {
     pub name: String,
     pub workdir: String,
     pub source: Option<String>,
-    pub harness: String,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub perm_mode: PermMode,
@@ -84,6 +83,9 @@ pub struct Session {
     pub branch: Option<String>,
     pub title: Option<String>,
     pub status: SessionStatus,
+    /// Per-session permission mode. Copied from the project (or the new-chat
+    /// picker) at creation; changing it affects THIS session only.
+    pub perm_mode: PermMode,
     pub started_by: Option<String>,
     pub created_at: Option<i64>,
     pub last_active: Option<i64>,
@@ -120,7 +122,7 @@ impl Default for SessionGitOptions {
     }
 }
 
-/// An MCP server the agent can use as tools (attached to an ACP session in Spec 3).
+/// An MCP server the native agent can use as tools (attached to a harness session).
 ///
 /// After plugin `${auth}`/setting substitution, a resolved `McpServerSpec`'s
 /// `transport` carries RESOLVED SECRETS in `Stdio::env`/`Http::headers` (API
@@ -198,7 +200,8 @@ pub struct ApprovalRequest {
     pub timeout_ms: Option<u64>,
 }
 
-/// The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+/// The user's decision on a tool-approval request from the native runtime's
+/// permission gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub enum ApprovalDecision {
@@ -275,7 +278,7 @@ pub struct ToolPolicyRow {
     pub decision: String,
 }
 
-/// A persisted transcript entry. Forward-compatible with ACP session/update blocks.
+/// A persisted transcript entry, one row per native-runtime event block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -359,6 +362,20 @@ impl NewProviderTurn {
     }
 }
 
+/// One model's accumulated billed tokens + computed dollar cost within a
+/// session. Token fields are the durable truth; `usd` is derived from the
+/// current price table at emit time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCost {
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+    pub usd: f64,
+}
+
 /// Public event broadcast to consumers (the Tauri layer re-emits these).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -419,17 +436,6 @@ pub enum CoreEvent {
         root_id: Option<String>,
         status: String,
     },
-    /// A runtime npm install/update produced an output line.
-    RuntimeUpdateLog {
-        runtime_id: String,
-        line: String,
-    },
-    /// A runtime npm install/update finished (ok=false → message has detail).
-    RuntimeUpdateDone {
-        runtime_id: String,
-        ok: bool,
-        message: Option<String>,
-    },
     /// Per-response context usage for a native session (drives the
     /// "% context left" indicator).
     ContextUsage {
@@ -449,6 +455,32 @@ pub enum CoreEvent {
         before_tokens: u64,
         after_tokens: u64,
         window_number: u32,
+    },
+    /// A provider OAuth flow produced its authorize URL. Surfaces open it
+    /// (Cockpit maps this onto the legacy OauthAuthorizeUrlMsg Tauri event).
+    OauthAuthorizeUrl {
+        provider: String,
+        authorize_url: String,
+    },
+    /// Same for a plugin OAuth flow.
+    PluginOauthAuthorizeUrl {
+        plugin_id: String,
+        authorize_url: String,
+    },
+    /// Per-session accumulated cost: total USD and a per-model token+dollar
+    /// breakdown. Emitted alongside `ContextUsage`.
+    ///
+    /// Like its sibling context-telemetry variants above, this variant's own
+    /// fields stay snake_case (`session_pk`, `total_usd`): the enum-level
+    /// `rename_all = "camelCase"` on `CoreEvent` only renames the `kind` tag
+    /// value, not each variant's field names (see `ContextUsage`'s
+    /// `session_pk`). The nested `ModelCost` struct carries its own
+    /// `rename_all = "camelCase"`, so its fields (e.g. `cache_read` →
+    /// `cacheRead`) are camelCased independently.
+    SessionCost {
+        session_pk: String,
+        total_usd: f64,
+        models: Vec<ModelCost>,
     },
 }
 
@@ -545,5 +577,52 @@ mod tests {
         let j = serde_json::to_value(&e).unwrap();
         assert_eq!(j["kind"], "contextCompacted");
         assert_eq!(j["window_number"], 2);
+    }
+
+    #[test]
+    fn oauth_authorize_url_event_serializes_with_kind_tag() {
+        let e = CoreEvent::OauthAuthorizeUrl {
+            provider: "anthropic-oauth".into(),
+            authorize_url: "https://x".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "oauthAuthorizeUrl");
+        assert_eq!(v["authorize_url"], "https://x");
+    }
+
+    #[test]
+    fn plugin_oauth_authorize_url_event_serializes_with_kind_tag() {
+        let e = CoreEvent::PluginOauthAuthorizeUrl {
+            plugin_id: "acme".into(),
+            authorize_url: "https://y".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "pluginOauthAuthorizeUrl");
+        assert_eq!(v["plugin_id"], "acme");
+        assert_eq!(v["authorize_url"], "https://y");
+    }
+
+    #[test]
+    fn session_cost_serializes_snake_variant_camel_nested() {
+        let e = CoreEvent::SessionCost {
+            session_pk: "s1".into(),
+            total_usd: 0.1234,
+            models: vec![ModelCost {
+                model: "claude-sonnet-4".into(),
+                input: 100,
+                output: 40,
+                cache_read: 20,
+                cache_creation: 5,
+                usd: 0.1234,
+            }],
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "sessionCost");
+        assert_eq!(v["session_pk"], "s1");
+        assert_eq!(v["total_usd"], 0.1234);
+        assert_eq!(v["models"][0]["model"], "claude-sonnet-4");
+        assert_eq!(v["models"][0]["cacheRead"], 20);
+        assert_eq!(v["models"][0]["cacheCreation"], 5);
+        assert_eq!(v["models"][0]["usd"], 0.1234);
     }
 }

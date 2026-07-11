@@ -1,14 +1,50 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { BranchList, CatalogEntry, CmdError, CommandInfo, ConnectionInfo, Project, Result, RuntimeInfo } from "@/bindings";
+import type {
+  BranchList,
+  CatalogEntry,
+  ChatRequestOptions,
+  CmdError,
+  CommandInfo,
+  ConnectionInfo,
+  Project,
+  Result,
+  Session,
+} from "@/bindings";
 
 const branchListData: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
 const listBranches = mock((): Promise<Result<BranchList, CmdError>> => Promise.resolve({ status: "ok", data: branchListData }));
 const nativeCommands = mock((): Promise<Result<CommandInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const searchFiles = mock((): Promise<Result<string[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
+// start() (via useStore.start) calls these three IPC commands — mocked here
+// so the permission-picker test can drive the real store's start() and
+// inspect what startSession actually received.
+const startSession = mock(
+  (_projectId: string, _prompt: string, _options: ChatRequestOptions | null): Promise<Result<Session, CmdError>> =>
+    Promise.resolve({
+      status: "ok",
+      data: {
+        sessionPk: "s1",
+        projectId: "p1",
+        agentSessionId: null,
+        worktreePath: null,
+        branch: null,
+        title: "ship it",
+        status: "running",
+        permMode: "bypassPermissions",
+        startedBy: "cockpit",
+        createdAt: 1,
+        lastActive: 1,
+        resumeAttempts: 0,
+        branchOwned: false,
+      },
+    }),
+);
+const listProjects = mock((): Promise<Result<Project[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
+const listSessions = mock((): Promise<Result<Session[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { listBranches, nativeCommands, searchFiles },
+  commands: { listBranches, nativeCommands, searchFiles, startSession, listProjects, listSessions },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // useComposerAttachments registers a Tauri drag-drop listener on mount.
@@ -20,7 +56,7 @@ const { HomeView } = await import("./HomeView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
-const { useRuntimes } = await import("@/store-runtimes");
+const { useAgent } = await import("@/store-agent");
 const { useModelStatuses, statusKey } = await import("@/store-model-statuses");
 const { useUi } = await import("@/store-ui");
 
@@ -30,7 +66,6 @@ function project(overrides: Partial<Project> = {}): Project {
     name: "demo",
     workdir: "C:\\code\\demo",
     source: null,
-    harness: "native",
     model: null,
     effort: null,
     permMode: "default",
@@ -39,26 +74,6 @@ function project(overrides: Partial<Project> = {}): Project {
     ...overrides,
   };
 }
-
-const nativeRuntime: RuntimeInfo = {
-  id: "native",
-  name: "Ryuzi",
-  color: "#8B5CF6",
-  initial: "R",
-  connection: "In-process",
-  binaryPath: "in-process",
-  installedVersion: "0.5.0",
-  latestVersion: null,
-  npmPackage: null,
-  models: ["anthropic/claude-opus-4", "anthropic/claude-sonnet-4"],
-  enabled: true,
-  model: "",
-  permMode: "ask",
-  flags: "",
-  tiers: [],
-  isDefault: true,
-  runnable: true,
-};
 
 const catalogEntries: CatalogEntry[] = [
   {
@@ -98,12 +113,15 @@ beforeEach(() => {
   useStore.setState({ projects: [project()], selectedProjectId: "p1" });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ catalog: catalogEntries, connections: [anthropicConnection], loaded: true });
-  useRuntimes.setState({ runtimes: [nativeRuntime], loaded: true });
+  useAgent.setState({ models: ["anthropic/claude-opus-4", "anthropic/claude-sonnet-4"], model: null, permMode: "ask" });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
   useNav.setState({ composerBranch: null, composerModel: null });
   listBranches.mockClear();
   nativeCommands.mockClear();
+  startSession.mockClear();
+  listProjects.mockClear();
+  listSessions.mockClear();
 });
 
 // Reset the shared zustand singletons so later test files in the same bun
@@ -111,7 +129,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   useConnections.setState({ catalog: [], connections: [], loaded: false });
-  useRuntimes.setState({ runtimes: [], loaded: false });
+  useAgent.setState({ models: [], model: null, permMode: null });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
 });
@@ -168,4 +186,25 @@ test("hide-invalid filters the composer model list, keeping untested models", as
   fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
   expect(await screen.findByRole("option", { name: "claude-opus-4" })).toBeTruthy();
   expect(screen.queryByRole("option", { name: "claude-sonnet-4" })).toBeNull();
+});
+
+test("permission picker seeds the new session's mode", async () => {
+  render(<HomeView />);
+
+  // Default label reflects the project's own default mode ("ask").
+  const trigger = screen.getByRole("combobox", { name: "Permission mode" });
+  expect(trigger.textContent).toContain("Ask");
+
+  fireEvent.click(trigger);
+  fireEvent.click(await screen.findByRole("option", { name: /Full/ }));
+  // The trigger label updates to reflect the picked mode.
+  await waitFor(() => expect(trigger.textContent).toContain("Full"));
+
+  const box = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  fireEvent.change(box, { target: { value: "ship it" } });
+  fireEvent.keyDown(box, { key: "Enter" });
+
+  await waitFor(() => expect(startSession).toHaveBeenCalled());
+  const [, , options] = startSession.mock.calls[0];
+  expect(options?.permMode).toBe("bypassPermissions");
 });
