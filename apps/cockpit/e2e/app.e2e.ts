@@ -1,8 +1,13 @@
 import { expect, test } from "@playwright/test";
-import { installMockIPC, mockCalls } from "./mock-ipc";
+import { installMockIPC, mockCalls, PROVIDER_FAMILY_ROUTE_SELECTIONS } from "./mock-ipc";
 
-test.beforeEach(async ({ page }) => {
-  await installMockIPC(page);
+test.beforeEach(async ({ page }, testInfo) => {
+  await installMockIPC(
+    page,
+    testInfo.title === "resolved provider and family changes are durable identity changes"
+      ? { route_selections: PROVIDER_FAMILY_ROUTE_SELECTIONS }
+      : {},
+  );
 });
 
 test("boots to Home with the project loaded", async ({ page }) => {
@@ -171,4 +176,29 @@ test("route switch notices render live once and survive reload", async ({ page }
   await expect(page.getByText("Switched to Model Beta · Ultra", { exact: true })).toHaveCount(1);
   await expect(page.getByText("Account switched to Backup account · round robin", { exact: true })).toHaveCount(1);
   await expect(switchNotices).toHaveCount(2);
+});
+
+test("resolved provider and family changes are durable identity changes", async ({ page }) => {
+  await page.goto("/");
+  await page.getByPlaceholder("Do anything").fill("establish resolved route baseline");
+  await page.getByTitle("Start session").click();
+  await page.getByTitle("Stop").click();
+
+  const sendTurn = async (text: string) => {
+    await page.getByPlaceholder("Ask for follow-up changes").fill(text);
+    await page.getByTitle("Send").click();
+    await expect(page.getByTitle("Send")).toBeVisible();
+  };
+
+  const combined = page.getByText("Switched to Shared Model · High via Fixture account · round robin", { exact: true });
+  await sendTurn("change only the resolved provider and family");
+  await expect(combined).toHaveCount(1);
+
+  await sendTurn("change only mutable aliases and labels");
+  await expect(page.getByText(/^(Switched to|Account switched to)/)).toHaveCount(1);
+
+  await page.reload();
+  await page.getByText("Untitled session", { exact: true }).click();
+  await expect(combined).toHaveCount(1);
+  await expect(page.getByText(/^(Switched to|Account switched to)/)).toHaveCount(1);
 });

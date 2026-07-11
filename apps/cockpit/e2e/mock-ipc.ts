@@ -134,6 +134,45 @@ export const SESSION = {
   resumeAttempts: 0,
 };
 
+export const PROVIDER_FAMILY_ROUTE_SELECTIONS = [
+  {
+    requestedModel: "route:primary",
+    resolvedProviderId: "fixture-provider-a",
+    resolvedFamily: "fixture-family-a",
+    resolvedModel: "shared-model",
+    effectiveEffort: "high",
+    connectionId: "fixture-account",
+    resolvedModelDisplayName: "Shared Model",
+    effectiveEffortLabel: "High",
+    connectionLabel: "Fixture account",
+    reason: "initial",
+  },
+  {
+    requestedModel: "route:provider-family-change",
+    resolvedProviderId: "fixture-provider-b",
+    resolvedFamily: "fixture-family-b",
+    resolvedModel: "shared-model",
+    effectiveEffort: "high",
+    connectionId: "fixture-account",
+    resolvedModelDisplayName: "Shared Model",
+    effectiveEffortLabel: "High",
+    connectionLabel: "Fixture account",
+    reason: "roundRobin",
+  },
+  {
+    requestedModel: "route:mutable-alias-only",
+    resolvedProviderId: "fixture-provider-b",
+    resolvedFamily: "fixture-family-b",
+    resolvedModel: "shared-model",
+    effectiveEffort: "high",
+    connectionId: "fixture-account",
+    resolvedModelDisplayName: "Renamed Shared Model",
+    effectiveEffortLabel: "High (renamed)",
+    connectionLabel: "Renamed account label",
+    reason: "quotaUnavailable",
+  },
+];
+
 /** Tauri command → resolved value (Result-typed commands get the raw data). */
 const FIXTURES: Record<string, unknown> = {
   list_projects: [PROJECT],
@@ -186,10 +225,18 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         createdAt: number;
       };
       type RouteIdentity = {
-        model: string | null;
-        effort: string | null;
+        resolvedProviderId: string;
+        resolvedFamily: string;
+        resolvedModel: string;
+        effectiveEffort: string | null;
         connectionId: string;
+      };
+      type RouteSelection = RouteIdentity & {
+        requestedModel: string | null;
+        resolvedModelDisplayName: string;
+        effectiveEffortLabel: string | null;
         connectionLabel: string;
+        reason: string;
       };
       type DurableState = {
         sessions: (typeof SESSION)[];
@@ -234,11 +281,25 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           (model) => model.requestValue === projectRuntime.model,
         );
         const useBackup = durable.routeRequests >= 2;
-        const current: RouteIdentity = {
-          model: projectRuntime.model,
-          effort: projectRuntime.effectiveEffort,
+        const scripted = fixtures.route_selections as RouteSelection[] | undefined;
+        const currentSelection: RouteSelection = scripted?.[Math.min(durable.routeRequests, scripted.length - 1)] ?? {
+          requestedModel: projectRuntime.model,
+          resolvedProviderId: "fixture",
+          resolvedFamily: modelInfo?.preferenceKey?.family ?? "fixture",
+          resolvedModel: modelInfo?.preferenceKey?.model ?? projectRuntime.model ?? "default",
+          effectiveEffort: projectRuntime.effectiveEffort,
           connectionId: useBackup ? "fixture-backup" : "fixture-account",
+          resolvedModelDisplayName: modelInfo?.displayName ?? projectRuntime.model ?? "Default model",
+          effectiveEffortLabel: projectRuntime.effectiveEffortLabel,
           connectionLabel: useBackup ? "Backup account" : "Fixture account",
+          reason: useBackup ? "roundRobin" : "initial",
+        };
+        const current: RouteIdentity = {
+          resolvedProviderId: currentSelection.resolvedProviderId,
+          resolvedFamily: currentSelection.resolvedFamily,
+          resolvedModel: currentSelection.resolvedModel,
+          effectiveEffort: currentSelection.effectiveEffort,
+          connectionId: currentSelection.connectionId,
         };
         const previous = durable.route;
         durable.route = current;
@@ -246,13 +307,27 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
 
         let text: string | null = null;
         if (previous) {
-          const modelChanged = previous.model !== current.model || previous.effort !== current.effort;
-          const accountChanged = previous.connectionId !== current.connectionId;
-          const effortLabel = modelInfo?.supported.find((option) => option.value === current.effort)?.label;
+          const modelChanged =
+            previous.resolvedFamily !== current.resolvedFamily ||
+            previous.resolvedModel !== current.resolvedModel ||
+            previous.effectiveEffort !== current.effectiveEffort;
+          const accountChanged =
+            previous.resolvedProviderId !== current.resolvedProviderId || previous.connectionId !== current.connectionId;
+          const reason =
+            {
+              ordered: "account order",
+              roundRobin: "round robin",
+              authenticationUnavailable: "authentication unavailable",
+              quotaUnavailable: "quota unavailable",
+              rateLimit: "rate limit",
+              providerUnavailable: "provider unavailable",
+              transportUnavailable: "transport unavailable",
+            }[currentSelection.reason] ?? null;
           if (modelChanged) {
-            text = `Switched to ${modelInfo?.displayName ?? current.model ?? "Default model"}${effortLabel ? ` · ${effortLabel}` : ""}`;
+            text = `Switched to ${currentSelection.resolvedModelDisplayName}${currentSelection.effectiveEffortLabel ? ` · ${currentSelection.effectiveEffortLabel}` : ""}`;
+            if (accountChanged && reason) text += ` via ${currentSelection.connectionLabel} · ${reason}`;
           } else if (accountChanged) {
-            text = `Account switched to ${current.connectionLabel} · round robin`;
+            text = `Account switched to ${currentSelection.connectionLabel}${reason ? ` · ${reason}` : ""}`;
           }
         }
 
