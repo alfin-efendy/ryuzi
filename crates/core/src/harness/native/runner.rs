@@ -1387,9 +1387,14 @@ impl RunnerSpawner {
             });
         }
         // Tool rows only (tagged with the sub-agent label), no memory access;
-        // history is ephemeral.
+        // history is ephemeral. Sub-agents also get NO app-control facade — the
+        // curated app surface is a top-level-session capability only (spec §9.1).
+        // Reset it here so the `ctx.app == None for sub-agents` invariant holds
+        // unconditionally at the facade layer, not merely because the SUBAGENT
+        // name-blocklist (Task 8) hides the tools — defense in depth.
         let mut child_deps = self.deps.clone();
         child_deps.memory = None;
+        child_deps.app_control = None;
         child_deps.agent = child.clone();
         let child_spawn: Option<Arc<dyn SubagentSpawner>> = if delegates {
             Some(Arc::new(RunnerSpawner {
