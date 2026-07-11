@@ -1,4 +1,4 @@
-use crate::engine::EngineClient;
+use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
 use ryuzi_core::branches::BranchList;
 use ryuzi_core::domain::{ApprovalResponse, ToolPolicyRow};
@@ -18,20 +18,34 @@ pub use ryuzi_core::api::types::ChatRequestOptions;
 type R<T> = Result<T, CmdError>;
 // The old in-process `ControlPlane` state extractor is gone: every engine
 // command below is a thin proxy over the daemon's HTTP control API instead.
-type Engine<'a> = State<'a, Arc<EngineClient>>;
+// P3-4: `Engine` now holds the multi-runner `EngineManager`; each command
+// resolves the runner-specific `EngineClient` via `runner_id` (default
+// `"local"`) before proxying.
+type Engine<'a> = State<'a, Arc<EngineManager>>;
 
 #[tauri::command]
 #[specta::specta]
-pub async fn get_setting(engine: Engine<'_>, key: String) -> R<Option<String>> {
-    engine
+pub async fn get_setting(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    key: String,
+) -> R<Option<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("get_setting", serde_json::json!({ "key": key }))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn set_setting(engine: Engine<'_>, key: String, value: String) -> R<()> {
-    engine
+pub async fn set_setting(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    key: String,
+    value: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "set_setting",
             serde_json::json!({ "key": key, "value": value }),
@@ -43,11 +57,13 @@ pub async fn set_setting(engine: Engine<'_>, key: String, value: String) -> R<()
 #[specta::specta]
 pub async fn update_project(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     project_id: String,
     model: Option<String>,
     perm_mode: PermMode,
 ) -> R<Project> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "update_project",
             serde_json::json!({
@@ -62,10 +78,12 @@ pub async fn update_project(
 #[specta::specta]
 pub async fn update_session_perm_mode(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     session_pk: String,
     perm_mode: PermMode,
 ) -> R<()> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "update_session_perm_mode",
             serde_json::json!({ "session_pk": session_pk, "perm_mode": perm_mode }),
@@ -75,14 +93,20 @@ pub async fn update_session_perm_mode(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_projects(engine: Engine<'_>) -> R<Vec<Project>> {
-    engine.rpc("list_projects", serde_json::json!({})).await
+pub async fn list_projects(engine: Engine<'_>, runner_id: Option<String>) -> R<Vec<Project>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client.rpc("list_projects", serde_json::json!({})).await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_sessions(engine: Engine<'_>, project_id: Option<String>) -> R<Vec<Session>> {
-    engine
+pub async fn list_sessions(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: Option<String>,
+) -> R<Vec<Session>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "list_sessions",
             serde_json::json!({ "project_id": project_id }),
@@ -92,8 +116,14 @@ pub async fn list_sessions(engine: Engine<'_>, project_id: Option<String>) -> R<
 
 #[tauri::command]
 #[specta::specta]
-pub async fn connect_project(engine: Engine<'_>, workdir: String, name: String) -> R<Project> {
-    engine
+pub async fn connect_project(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    workdir: String,
+    name: String,
+) -> R<Project> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "connect_project",
             serde_json::json!({ "workdir": workdir, "name": name }),
@@ -103,8 +133,14 @@ pub async fn connect_project(engine: Engine<'_>, workdir: String, name: String) 
 
 #[tauri::command]
 #[specta::specta]
-pub async fn clone_project(engine: Engine<'_>, url: String, dest_parent: String) -> R<Project> {
-    engine
+pub async fn clone_project(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    url: String,
+    dest_parent: String,
+) -> R<Project> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "clone_project",
             serde_json::json!({ "url": url, "dest_parent": dest_parent }),
@@ -114,8 +150,13 @@ pub async fn clone_project(engine: Engine<'_>, url: String, dest_parent: String)
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_branches(engine: Engine<'_>, project_id: String) -> R<BranchList> {
-    engine
+pub async fn list_branches(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+) -> R<BranchList> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "list_branches",
             serde_json::json!({ "project_id": project_id }),
@@ -127,11 +168,13 @@ pub async fn list_branches(engine: Engine<'_>, project_id: String) -> R<BranchLi
 #[specta::specta]
 pub async fn start_session(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     project_id: String,
     prompt: String,
     options: Option<ChatRequestOptions>,
 ) -> R<Session> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "start_session",
             serde_json::json!({
@@ -145,10 +188,12 @@ pub async fn start_session(
 #[specta::specta]
 pub async fn start_chat_session(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     prompt: String,
     options: Option<ChatRequestOptions>,
 ) -> R<Session> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "start_chat_session",
             serde_json::json!({ "prompt": prompt, "options": options }),
@@ -160,11 +205,13 @@ pub async fn start_chat_session(
 #[specta::specta]
 pub async fn continue_session(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     session_pk: String,
     prompt: String,
     options: Option<ChatRequestOptions>,
 ) -> R<()> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "continue_session",
             serde_json::json!({
@@ -176,8 +223,14 @@ pub async fn continue_session(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn steer_session(engine: Engine<'_>, session_pk: String, text: String) -> R<bool> {
-    engine
+pub async fn steer_session(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    text: String,
+) -> R<bool> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "steer",
             serde_json::json!({ "session_pk": session_pk, "text": text }),
@@ -187,8 +240,13 @@ pub async fn steer_session(engine: Engine<'_>, session_pk: String, text: String)
 
 #[tauri::command]
 #[specta::specta]
-pub async fn stop_session(engine: Engine<'_>, session_pk: String) -> R<()> {
-    engine
+pub async fn stop_session(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "stop_session",
             serde_json::json!({ "session_pk": session_pk }),
@@ -198,8 +256,13 @@ pub async fn stop_session(engine: Engine<'_>, session_pk: String) -> R<()> {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn end_session(engine: Engine<'_>, session_pk: String) -> R<()> {
-    engine
+pub async fn end_session(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "end_session",
             serde_json::json!({ "session_pk": session_pk }),
@@ -209,16 +272,26 @@ pub async fn end_session(engine: Engine<'_>, session_pk: String) -> R<()> {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_tool_policies(engine: Engine<'_>) -> R<Vec<ToolPolicyRow>> {
-    engine
+pub async fn list_tool_policies(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<ToolPolicyRow>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("list_tool_policies", serde_json::json!({}))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_tool_policy(engine: Engine<'_>, project_id: String, tool: String) -> R<()> {
-    engine
+pub async fn delete_tool_policy(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+    tool: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "delete_tool_policy",
             serde_json::json!({ "project_id": project_id, "tool": tool }),
@@ -230,6 +303,7 @@ pub async fn delete_tool_policy(engine: Engine<'_>, project_id: String, tool: St
 #[specta::specta]
 pub fn resolve_approval(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     request_id: String,
     response: ApprovalResponse,
 ) -> bool {
@@ -238,16 +312,27 @@ pub fn resolve_approval(
     // sync (bindings-stable: specta emits `Promise<boolean>` either way) and
     // bridges into the async engine call via `block_in_place` + `block_on`,
     // which is safe here because command handlers already run on a blocking
-    // thread of the tauri async runtime.
+    // thread of the tauri async runtime. The runner-client resolution happens
+    // up front (sync, no I/O) — an unknown runner_id resolves to `false`, the
+    // same "not resolved" signal `EngineClient::resolve_approval` itself
+    // returns on any transport error.
+    let Ok(client) = engine.client(runner_id.as_deref().unwrap_or("local")) else {
+        return false;
+    };
     tokio::task::block_in_place(|| {
-        tauri::async_runtime::block_on(engine.resolve_approval(&request_id, response))
+        tauri::async_runtime::block_on(client.resolve_approval(&request_id, response))
     })
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_messages(engine: Engine<'_>, session_pk: String) -> R<Vec<Message>> {
-    engine
+pub async fn list_messages(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<Vec<Message>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "list_messages",
             serde_json::json!({ "session_pk": session_pk }),
@@ -310,8 +395,14 @@ fn content_type_for_path(path: &Path) -> Option<String> {
 /// pipeline on send. Staging is wiped on app start (see lib.rs setup).
 #[tauri::command]
 #[specta::specta]
-pub async fn stage_attachment(engine: Engine<'_>, name: String, data_base64: String) -> R<String> {
-    engine
+pub async fn stage_attachment(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    name: String,
+    data_base64: String,
+) -> R<String> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "stage_attachment",
             serde_json::json!({ "name": name, "data_base64": data_base64 }),

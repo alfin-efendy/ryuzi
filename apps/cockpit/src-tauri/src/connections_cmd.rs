@@ -12,7 +12,7 @@
 //! `start_kiro_device_flow` / `start_device_flow` open the browser AFTER the
 //! RPC returns, using the verification URL in the returned `DeviceFlowInfo`.
 
-use crate::engine::EngineClient;
+use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
 use ryuzi_core::llm_router::oauth;
 use ryuzi_core::llm_router::quota::{CodexResetCreditResult, ProviderQuotaInfo};
@@ -32,7 +32,7 @@ pub use ryuzi_core::api::types::{
 };
 
 type R<T> = Result<T, CmdError>;
-type Engine<'a> = State<'a, Arc<EngineClient>>;
+type Engine<'a> = State<'a, Arc<EngineManager>>;
 
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -88,20 +88,26 @@ pub async fn list_provider_catalog() -> R<Vec<CatalogEntry>> {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_connections(engine: Engine<'_>) -> R<Vec<ConnectionInfo>> {
-    engine.rpc("list_connections", serde_json::json!({})).await
+pub async fn list_connections(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<ConnectionInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client.rpc("list_connections", serde_json::json!({})).await
 }
 
 #[tauri::command]
 #[specta::specta]
 pub async fn add_connection(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     provider: String,
     label: String,
     api_key: String,
     base_url: Option<String>,
 ) -> R<Vec<ConnectionInfo>> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "add_connection",
             serde_json::json!({
@@ -116,6 +122,7 @@ pub async fn add_connection(
 #[specta::specta]
 pub async fn update_connection(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     id: String,
     label: String,
     enabled: bool,
@@ -124,7 +131,8 @@ pub async fn update_connection(
     models: Vec<String>,
     claude_cloaking: Option<bool>,
 ) -> R<Vec<ConnectionInfo>> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "update_connection",
             serde_json::json!({
@@ -137,16 +145,27 @@ pub async fn update_connection(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn remove_connection(engine: Engine<'_>, id: String) -> R<Vec<ConnectionInfo>> {
-    engine
+pub async fn remove_connection(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<Vec<ConnectionInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("remove_connection", serde_json::json!({ "id": id }))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn move_connection(engine: Engine<'_>, id: String, dir: i32) -> R<Vec<ConnectionInfo>> {
-    engine
+pub async fn move_connection(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+    dir: i32,
+) -> R<Vec<ConnectionInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "move_connection",
             serde_json::json!({ "id": id, "dir": dir }),
@@ -158,16 +177,27 @@ pub async fn move_connection(engine: Engine<'_>, id: String, dir: i32) -> R<Vec<
 /// (401/403) from network trouble, and persist the discovered model ids.
 #[tauri::command]
 #[specta::specta]
-pub async fn test_connection(engine: Engine<'_>, id: String) -> R<TestResult> {
-    engine
+pub async fn test_connection(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<TestResult> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("test_connection", serde_json::json!({ "id": id }))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn test_connection_model(engine: Engine<'_>, id: String, model: String) -> R<TestResult> {
-    engine
+pub async fn test_connection_model(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+    model: String,
+) -> R<TestResult> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "test_connection_model",
             serde_json::json!({ "id": id, "model": model }),
@@ -179,8 +209,13 @@ pub async fn test_connection_model(engine: Engine<'_>, id: String, model: String
 /// provider Models card so earlier Test All results show immediately.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_model_statuses(engine: Engine<'_>, family: String) -> R<Vec<ModelStatusInfo>> {
-    engine
+pub async fn list_model_statuses(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    family: String,
+) -> R<Vec<ModelStatusInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "list_model_statuses",
             serde_json::json!({ "family": family }),
@@ -193,8 +228,12 @@ pub async fn list_model_statuses(engine: Engine<'_>, family: String) -> R<Vec<Mo
 /// variant feeds the app-wide picker filter.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_all_model_statuses(engine: Engine<'_>) -> R<Vec<ModelStatusEntry>> {
-    engine
+pub async fn list_all_model_statuses(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<ModelStatusEntry>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("list_all_model_statuses", serde_json::json!({}))
         .await
 }
@@ -206,9 +245,11 @@ pub async fn list_all_model_statuses(engine: Engine<'_>) -> R<Vec<ModelStatusEnt
 #[specta::specta]
 pub async fn refresh_provider_models(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     family: String,
 ) -> R<Vec<RefreshModelsResult>> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "refresh_provider_models",
             serde_json::json!({ "family": family }),
@@ -218,38 +259,62 @@ pub async fn refresh_provider_models(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn connection_provider_quota(engine: Engine<'_>, id: String) -> R<ProviderQuotaInfo> {
-    engine
+pub async fn connection_provider_quota(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<ProviderQuotaInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("connection_provider_quota", serde_json::json!({ "id": id }))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn reset_codex_credit(engine: Engine<'_>, id: String) -> R<CodexResetCreditResult> {
-    engine
+pub async fn reset_codex_credit(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<CodexResetCreditResult> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("reset_codex_credit", serde_json::json!({ "id": id }))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_model_routes(engine: Engine<'_>) -> R<Vec<ModelRouteInfo>> {
-    engine.rpc("list_model_routes", serde_json::json!({})).await
+pub async fn list_model_routes(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<ModelRouteInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client.rpc("list_model_routes", serde_json::json!({})).await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn save_model_route(engine: Engine<'_>, route: ModelRouteInfo) -> R<Vec<ModelRouteInfo>> {
-    engine
+pub async fn save_model_route(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    route: ModelRouteInfo,
+) -> R<Vec<ModelRouteInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("save_model_route", serde_json::json!({ "route": route }))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_model_route(engine: Engine<'_>, id: String) -> R<Vec<ModelRouteInfo>> {
-    engine
+pub async fn delete_model_route(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<Vec<ModelRouteInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("delete_model_route", serde_json::json!({ "id": id }))
         .await
 }
@@ -258,9 +323,11 @@ pub async fn delete_model_route(engine: Engine<'_>, id: String) -> R<Vec<ModelRo
 #[specta::specta]
 pub async fn provider_account_route(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     provider: String,
 ) -> R<ProviderAccountRouteInfo> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "provider_account_route",
             serde_json::json!({ "provider": provider }),
@@ -272,10 +339,12 @@ pub async fn provider_account_route(
 #[specta::specta]
 pub async fn set_provider_account_route(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     provider: String,
     strategy: ModelRouteStrategy,
 ) -> R<ProviderAccountRouteInfo> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "set_provider_account_route",
             serde_json::json!({ "provider": provider, "strategy": strategy }),
@@ -291,10 +360,12 @@ pub async fn set_provider_account_route(
 #[specta::specta]
 pub async fn connect_oauth(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     provider: String,
     label: String,
 ) -> R<Vec<ConnectionInfo>> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "connect_oauth",
             serde_json::json!({ "provider": provider, "label": label }),
@@ -309,8 +380,13 @@ pub async fn connect_oauth(
 /// `route_model`'s `priority ASC` ordering.
 #[tauri::command]
 #[specta::specta]
-pub async fn reconnect_oauth(engine: Engine<'_>, connection_id: String) -> R<Vec<ConnectionInfo>> {
-    engine
+pub async fn reconnect_oauth(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    connection_id: String,
+) -> R<Vec<ConnectionInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "reconnect_oauth",
             serde_json::json!({ "connection_id": connection_id }),
@@ -342,6 +418,7 @@ pub async fn begin_oauth_manual(app: tauri::AppHandle, provider: String) -> R<Ma
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_oauth_manual(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     provider: String,
     label: String,
     verifier: String,
@@ -349,7 +426,8 @@ pub async fn complete_oauth_manual(
     pasted: String,
     redirect_uri: String,
 ) -> R<Vec<ConnectionInfo>> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "complete_oauth_manual",
             serde_json::json!({
@@ -366,10 +444,12 @@ pub async fn complete_oauth_manual(
 #[specta::specta]
 pub async fn add_free_connection(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     provider: String,
     label: String,
 ) -> R<Vec<ConnectionInfo>> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "add_free_connection",
             serde_json::json!({ "provider": provider, "label": label }),
@@ -386,9 +466,11 @@ pub async fn add_free_connection(
 #[specta::specta]
 pub async fn start_kiro_device_flow(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     app: tauri::AppHandle,
 ) -> R<DeviceFlowInfo> {
-    let info: DeviceFlowInfo = engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    let info: DeviceFlowInfo = client
         .rpc("start_kiro_device_flow", serde_json::json!({}))
         .await?;
     let _ = app
@@ -406,10 +488,12 @@ pub async fn start_kiro_device_flow(
 #[specta::specta]
 pub async fn await_kiro_device_flow(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     label: String,
     flow_id: String,
 ) -> R<Vec<ConnectionInfo>> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "await_kiro_device_flow",
             serde_json::json!({ "label": label, "flow_id": flow_id }),
@@ -425,8 +509,13 @@ pub async fn await_kiro_device_flow(
 /// import token surfaces its error instead of a connection that can't route.
 #[tauri::command]
 #[specta::specta]
-pub async fn import_kiro_token(engine: Engine<'_>, label: String) -> R<Vec<ConnectionInfo>> {
-    engine
+pub async fn import_kiro_token(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    label: String,
+) -> R<Vec<ConnectionInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("import_kiro_token", serde_json::json!({ "label": label }))
         .await
 }
@@ -440,10 +529,12 @@ pub async fn import_kiro_token(engine: Engine<'_>, label: String) -> R<Vec<Conne
 #[specta::specta]
 pub async fn start_device_flow(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     app: tauri::AppHandle,
     provider: String,
 ) -> R<DeviceFlowInfo> {
-    let info: DeviceFlowInfo = engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    let info: DeviceFlowInfo = client
         .rpc(
             "start_device_flow",
             serde_json::json!({ "provider": provider }),
@@ -463,11 +554,13 @@ pub async fn start_device_flow(
 #[specta::specta]
 pub async fn await_device_flow(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     provider: String,
     label: String,
     flow_id: String,
 ) -> R<Vec<ConnectionInfo>> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "await_device_flow",
             serde_json::json!({ "provider": provider, "label": label, "flow_id": flow_id }),

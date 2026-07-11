@@ -24,6 +24,7 @@
 //! `state` locally, and hands the code back via `complete_plugin_oauth`.
 
 use crate::engine::EngineClient;
+use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
 use crate::events::PluginOauthCompletedMsg;
 use ryuzi_core::oauth_loopback;
@@ -47,18 +48,24 @@ pub use ryuzi_core::api::types::{
 };
 
 type R<T> = Result<T, CmdError>;
-type Engine<'a> = State<'a, Arc<EngineClient>>;
+type Engine<'a> = State<'a, Arc<EngineManager>>;
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_plugins(engine: Engine<'_>) -> R<Vec<PluginInfo>> {
-    engine.rpc("list_plugins", serde_json::json!({})).await
+pub async fn list_plugins(engine: Engine<'_>, runner_id: Option<String>) -> R<Vec<PluginInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client.rpc("list_plugins", serde_json::json!({})).await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn plugin_detail(engine: Engine<'_>, id: String) -> R<PluginDetail> {
-    engine
+pub async fn plugin_detail(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<PluginDetail> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("plugin_detail", serde_json::json!({ "id": id }))
         .await
 }
@@ -67,8 +74,14 @@ pub async fn plugin_detail(engine: Engine<'_>, id: String) -> R<PluginDetail> {
 /// shared core helper so the two surfaces never drift.
 #[tauri::command]
 #[specta::specta]
-pub async fn set_plugin_enabled(engine: Engine<'_>, id: String, enabled: bool) -> R<()> {
-    engine
+pub async fn set_plugin_enabled(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+    enabled: bool,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "set_plugin_enabled",
             serde_json::json!({ "id": id, "enabled": enabled }),
@@ -81,8 +94,14 @@ pub async fn set_plugin_enabled(engine: Engine<'_>, id: String, enabled: bool) -
 /// returns a value, so no secret can leak back through this command.
 #[tauri::command]
 #[specta::specta]
-pub async fn set_plugin_setting(engine: Engine<'_>, key: String, value: String) -> R<()> {
-    engine
+pub async fn set_plugin_setting(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    key: String,
+    value: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "set_plugin_setting",
             serde_json::json!({ "key": key, "value": value }),
@@ -94,9 +113,11 @@ pub async fn set_plugin_setting(engine: Engine<'_>, key: String, value: String) 
 #[specta::specta]
 pub async fn begin_plugin_oauth(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     plugin_id: String,
 ) -> R<PluginOauthBeginResult> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "begin_plugin_oauth",
             serde_json::json!({ "plugin_id": plugin_id }),
@@ -108,11 +129,13 @@ pub async fn begin_plugin_oauth(
 #[specta::specta]
 pub async fn complete_plugin_oauth(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     plugin_id: String,
     code: String,
     state_token: String,
 ) -> R<PluginAuthInfo> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "complete_plugin_oauth",
             serde_json::json!({ "plugin_id": plugin_id, "code": code, "state_token": state_token }),
@@ -122,8 +145,13 @@ pub async fn complete_plugin_oauth(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn disconnect_plugin_oauth(engine: Engine<'_>, plugin_id: String) -> R<PluginAuthInfo> {
-    engine
+pub async fn disconnect_plugin_oauth(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    plugin_id: String,
+) -> R<PluginAuthInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "disconnect_plugin_oauth",
             serde_json::json!({ "plugin_id": plugin_id }),
@@ -133,8 +161,13 @@ pub async fn disconnect_plugin_oauth(engine: Engine<'_>, plugin_id: String) -> R
 
 #[tauri::command]
 #[specta::specta]
-pub async fn plugin_models(engine: Engine<'_>, id: String) -> R<Vec<String>> {
-    engine
+pub async fn plugin_models(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<Vec<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("plugin_models", serde_json::json!({ "id": id }))
         .await
 }
@@ -193,8 +226,13 @@ fn cancel_pending_local_flows(plugin_id: &str, state_token: Option<&str>) {
 /// entry's `installed` flips false and it reappears in Browse.
 #[tauri::command]
 #[specta::specta]
-pub async fn uninstall_plugin(engine: Engine<'_>, id: String) -> R<Vec<PluginInfo>> {
-    engine
+pub async fn uninstall_plugin(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<Vec<PluginInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("uninstall_plugin", serde_json::json!({ "id": id }))
         .await
 }
@@ -206,10 +244,12 @@ pub async fn uninstall_plugin(engine: Engine<'_>, id: String) -> R<Vec<PluginInf
 #[specta::specta]
 pub async fn set_plugin_oauth_client_id(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     plugin_id: String,
     client_id: String,
 ) -> R<()> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "set_plugin_oauth_client_id",
             serde_json::json!({ "plugin_id": plugin_id, "client_id": client_id }),
@@ -232,9 +272,11 @@ pub async fn set_plugin_oauth_client_id(
 pub async fn begin_plugin_install(
     app: AppHandle,
     engine: Engine<'_>,
+    runner_id: Option<String>,
     plugin_id: String,
 ) -> R<PluginInstallBeginResult> {
-    let mut result: PluginInstallBeginResult = engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    let mut result: PluginInstallBeginResult = client
         .rpc(
             "begin_plugin_install",
             serde_json::json!({ "plugin_id": plugin_id }),
@@ -282,7 +324,7 @@ pub async fn begin_plugin_install(
                 listener,
                 &plugin_oauth_callback_path(&plugin_id),
             );
-            let engine_client = engine.inner().clone();
+            let engine_client = client.clone();
             let app_handle = app.clone();
             let task_plugin_id = plugin_id.clone();
             let state_token = begin.state_token.clone();
@@ -401,11 +443,13 @@ async fn complete_local_callback(
 #[specta::specta]
 pub async fn cancel_plugin_install(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     plugin_id: String,
     state_token: Option<String>,
 ) -> R<()> {
     cancel_pending_local_flows(&plugin_id, state_token.as_deref());
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "cancel_plugin_install",
             serde_json::json!({ "plugin_id": plugin_id, "state_token": state_token }),
@@ -428,8 +472,13 @@ pub async fn cancel_plugin_install(
 /// proceed.
 #[tauri::command]
 #[specta::specta]
-pub async fn begin_skill_install(engine: Engine<'_>, source: String) -> R<SkillInstallBegin> {
-    engine
+pub async fn begin_skill_install(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    source: String,
+) -> R<SkillInstallBegin> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "begin_skill_install",
             serde_json::json!({ "source": source }),
@@ -441,8 +490,13 @@ pub async fn begin_skill_install(engine: Engine<'_>, source: String) -> R<SkillI
 /// acknowledged its `TrustPromptDto`. The token is single-use.
 #[tauri::command]
 #[specta::specta]
-pub async fn confirm_skill_install(engine: Engine<'_>, token: String) -> R<InstalledSkillPack> {
-    engine
+pub async fn confirm_skill_install(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    token: String,
+) -> R<InstalledSkillPack> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "confirm_skill_install",
             serde_json::json!({ "token": token }),
@@ -454,8 +508,14 @@ pub async fn confirm_skill_install(engine: Engine<'_>, token: String) -> R<Insta
 /// never the pinned guard or the hook-script re-ack gate.
 #[tauri::command]
 #[specta::specta]
-pub async fn update_plugin(engine: Engine<'_>, id: String, force: bool) -> R<UpdateOutcomeDto> {
-    engine
+pub async fn update_plugin(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+    force: bool,
+) -> R<UpdateOutcomeDto> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "update_plugin",
             serde_json::json!({ "id": id, "force": force }),
@@ -468,8 +528,12 @@ pub async fn update_plugin(engine: Engine<'_>, id: String, force: bool) -> R<Upd
 /// entry.
 #[tauri::command]
 #[specta::specta]
-pub async fn update_all_plugins(engine: Engine<'_>) -> R<Vec<UpdateOutcomeEntry>> {
-    engine
+pub async fn update_all_plugins(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<UpdateOutcomeEntry>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("update_all_plugins", serde_json::json!({}))
         .await
 }
@@ -479,11 +543,13 @@ pub async fn update_all_plugins(engine: Engine<'_>) -> R<Vec<UpdateOutcomeEntry>
 #[specta::specta]
 pub async fn set_plugin_pin(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     id: String,
     pinned: bool,
     reason: Option<String>,
 ) -> R<()> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "set_plugin_pin",
             serde_json::json!({ "id": id, "pinned": pinned, "reason": reason }),
@@ -496,8 +562,9 @@ pub async fn set_plugin_pin(
 /// state.
 #[tauri::command]
 #[specta::specta]
-pub async fn plugin_doctor(engine: Engine<'_>) -> R<Vec<DoctorFinding>> {
-    engine.rpc("plugin_doctor", serde_json::json!({})).await
+pub async fn plugin_doctor(engine: Engine<'_>, runner_id: Option<String>) -> R<Vec<DoctorFinding>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client.rpc("plugin_doctor", serde_json::json!({})).await
 }
 
 /// Whether a plugin install/update since the daemon's last start requires a
@@ -505,8 +572,9 @@ pub async fn plugin_doctor(engine: Engine<'_>) -> R<Vec<DoctorFinding>> {
 /// cleared only by a daemon restart).
 #[tauri::command]
 #[specta::specta]
-pub async fn plugins_restart_required(engine: Engine<'_>) -> R<bool> {
-    engine
+pub async fn plugins_restart_required(engine: Engine<'_>, runner_id: Option<String>) -> R<bool> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("plugins_restart_required", serde_json::json!({}))
         .await
 }

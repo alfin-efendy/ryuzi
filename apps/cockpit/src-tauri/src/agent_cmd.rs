@@ -3,7 +3,7 @@
 //! via `ryuzi_core::agent_settings`) plus the selectable-model list the
 //! composer and Settings share.
 
-use crate::engine::EngineClient;
+use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
 use std::sync::Arc;
 use tauri::State;
@@ -14,12 +14,16 @@ use tauri::State;
 pub use ryuzi_core::api::types::AgentSettingsInfo;
 
 type R<T> = Result<T, CmdError>;
-type Engine<'a> = State<'a, Arc<EngineClient>>;
+type Engine<'a> = State<'a, Arc<EngineManager>>;
 
 #[tauri::command]
 #[specta::specta]
-pub async fn get_agent_settings(engine: Engine<'_>) -> R<AgentSettingsInfo> {
-    engine
+pub async fn get_agent_settings(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<AgentSettingsInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("get_agent_settings", serde_json::json!({}))
         .await
 }
@@ -28,10 +32,12 @@ pub async fn get_agent_settings(engine: Engine<'_>) -> R<AgentSettingsInfo> {
 #[specta::specta]
 pub async fn set_agent_settings(
     engine: Engine<'_>,
+    runner_id: Option<String>,
     model: Option<String>,
     perm_mode: Option<String>,
 ) -> R<()> {
-    engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "set_agent_settings",
             serde_json::json!({ "model": model, "perm_mode": perm_mode }),
@@ -41,8 +47,12 @@ pub async fn set_agent_settings(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_selectable_models(engine: Engine<'_>) -> R<Vec<String>> {
-    engine
+pub async fn list_selectable_models(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("list_selectable_models", serde_json::json!({}))
         .await
 }

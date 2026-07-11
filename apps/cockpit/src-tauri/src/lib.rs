@@ -258,22 +258,11 @@ pub fn run() {
             let cap = backdrop::apply_backdrop(&main_window);
             app.manage(backdrop::BackdropState(cap));
             accent::spawn_accent_watcher(app.handle());
-            let manager = std::sync::Arc::new(manager);
-            // P3-3 dual-manage bridge (temporary — removed in P3-4): every
-            // existing Tauri command still expects `State<Arc<EngineClient>>`
-            // (the pre-multi-runner alias in `commands.rs`/`gateways_cmd.rs`/
-            // etc.). Rather than rewrite every command's signature in this
-            // task, keep the `"local"` client separately managed alongside
-            // the new `EngineManager` so the crate keeps compiling and every
-            // existing command keeps resolving exactly as before. P3-4 flips
-            // those `Engine<'a>` aliases over to `State<'a, Arc<EngineManager>>`
-            // plus a `runner_id` command param and deletes this line.
-            app.manage(
-                manager
-                    .client("local")
-                    .expect("EngineManager::bootstrap_local always seeds \"local\""),
-            );
-            app.manage(manager);
+            // P3-4: every engine-backed command now resolves its runner's
+            // client through `EngineManager` directly (`runner_id: Option<
+            // String>` param, defaulting to `"local"`) — the temporary P3-3
+            // dual-manage of a bare `Arc<EngineClient>` is gone.
+            app.manage(std::sync::Arc::new(manager));
             Ok(())
         })
         .run(tauri::generate_context!())
