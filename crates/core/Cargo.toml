@@ -77,6 +77,10 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 # `-i aws-lc-sys` after any dependency bump: neither must appear.
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Direct dep (was already transitive via axum-server/reqwest/ureq) so
+# tls.rs can build a real rustls::ServerConfig to validate a loaded
+# cert/key pair before trusting it. ring-only — see the note above.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

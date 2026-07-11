@@ -61,21 +61,31 @@ fn key_path(dir: &Path) -> PathBuf {
 /// depends on (a client that already pinned a fingerprint must keep trusting
 /// the daemon after a restart).
 pub fn load_or_generate(dir: &Path) -> anyhow::Result<TlsMaterial> {
-    let cert_path = cert_path(dir);
-    let key_path = key_path(dir);
+    let cert_file = cert_path(dir);
+    let key_file = key_path(dir);
 
     if let (Ok(cert_pem), Ok(key_pem)) = (
-        std::fs::read_to_string(&cert_path),
-        std::fs::read_to_string(&key_path),
+        std::fs::read_to_string(&cert_file),
+        std::fs::read_to_string(&key_file),
     ) {
         let cert_der = pem_to_der(&cert_pem)?;
         let key_der = pem_to_der(&key_pem)?;
-        let fingerprint = fingerprint_cert_der(&cert_der);
-        return Ok(TlsMaterial {
-            cert_der,
-            key_der,
-            fingerprint,
-        });
+        if pair_is_valid(&cert_der, &key_der) {
+            let fingerprint = fingerprint_cert_der(&cert_der);
+            return Ok(TlsMaterial {
+                cert_der,
+                key_der,
+                fingerprint,
+            });
+        }
+        // A mismatched pair (e.g. a partial-write failure left a fresh cert
+        // paired with a stale key, or one file was deleted/replaced out from
+        // under us) would otherwise be silently trusted and only fail much
+        // later at TLS handshake time. Fall through to regeneration instead.
+        eprintln!(
+            "tls: cert/key pair on disk at {} failed validation, regenerating",
+            dir.display()
+        );
     }
 
     // SAN is a placeholder — clients pin by fingerprint, not hostname.
@@ -85,8 +95,8 @@ pub fn load_or_generate(dir: &Path) -> anyhow::Result<TlsMaterial> {
     let key_pem = key_pair.serialize_pem();
 
     std::fs::create_dir_all(dir)?;
-    std::fs::write(&cert_path, &cert_pem)?;
-    write_key_pem(&key_path, &key_pem)?;
+    std::fs::write(&cert_file, &cert_pem)?;
+    write_key_pem(&key_file, &key_pem)?;
 
     let cert_der = cert.der().to_vec();
     let key_der = key_pair.serialize_der();
@@ -97,6 +107,30 @@ pub fn load_or_generate(dir: &Path) -> anyhow::Result<TlsMaterial> {
         key_der,
         fingerprint,
     })
+}
+
+/// Whether `cert_der` + `key_der` form a usable TLS server identity — the
+/// exact check is "can we build a rustls `ServerConfig` from them", since
+/// that's the operation a real consumer performs. Explicit ring provider to
+/// stay ring-only (see module docs).
+fn pair_is_valid(cert_der: &[u8], key_der: &[u8]) -> bool {
+    let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
+    let key = match rustls::pki_types::PrivateKeyDer::try_from(key_der.to_vec()) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let builder = match rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    builder
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .is_ok()
 }
 
 /// Write the private key PEM 0600 on unix (same rationale as
@@ -179,6 +213,40 @@ mod tests {
     #[test]
     fn fingerprint_differs_for_different_der() {
         assert_ne!(fingerprint_cert_der(b"one"), fingerprint_cert_der(b"two"));
+    }
+
+    #[test]
+    fn mismatched_key_on_disk_triggers_regeneration() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_generate(dir.path()).unwrap();
+
+        // Corrupt the pair by overwriting the key file with a key from a
+        // *different* identity — same shape as a real key PEM, but it does
+        // not match the cert already on disk.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = load_or_generate(other_dir.path()).unwrap();
+        assert_ne!(
+            first.key_der, other.key_der,
+            "test setup: the two generated keys must differ"
+        );
+        let other_key_pem = std::fs::read_to_string(key_path(other_dir.path())).unwrap();
+        std::fs::write(key_path(dir.path()), &other_key_pem).unwrap();
+
+        // Sanity: the pair really is now invalid (cert from `first`, key
+        // from `other`) before we exercise the fix.
+        let corrupted_key_der = pem_to_der(&other_key_pem).unwrap();
+        assert!(!pair_is_valid(&first.cert_der, &corrupted_key_der));
+
+        let regenerated = load_or_generate(dir.path()).unwrap();
+        assert!(pair_is_valid(&regenerated.cert_der, &regenerated.key_der));
+        // The stale key must not have leaked through.
+        assert_ne!(regenerated.key_der, corrupted_key_der);
+
+        // And the freshly-regenerated pair is now stable on disk.
+        let third = load_or_generate(dir.path()).unwrap();
+        assert_eq!(regenerated.fingerprint, third.fingerprint);
+        assert_eq!(regenerated.cert_der, third.cert_der);
+        assert_eq!(regenerated.key_der, third.key_der);
     }
 
     #[cfg(unix)]
