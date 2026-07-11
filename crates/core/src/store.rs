@@ -686,6 +686,24 @@ fn migrations() -> Migrations<'static> {
                 reason TEXT\
             );",
         ),
+        // Migration 24 — Phase 2 remote pairing: `devices` holds paired remote
+        // clients (hashed bearer token); `pairing_codes` holds single-use,
+        // TTL-bounded enrollment codes (hashed). IF NOT EXISTS so the replay
+        // migration tests re-run this as a no-op.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS devices (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                name TEXT NOT NULL,\
+                token_hash TEXT NOT NULL UNIQUE,\
+                created_at INTEGER NOT NULL,\
+                last_seen INTEGER,\
+                revoked INTEGER NOT NULL DEFAULT 0\
+            );\
+            CREATE TABLE IF NOT EXISTS pairing_codes (\
+                code_hash TEXT PRIMARY KEY NOT NULL,\
+                expires_at INTEGER NOT NULL\
+            );",
+        ),
     ])
 }
 
@@ -806,6 +824,16 @@ fn map_plugin_attach_row(r: &Row) -> rusqlite::Result<PluginAttachStatus> {
         last_attach_at: r.get(1)?,
         outcome: r.get(2)?,
         reason: r.get(3)?,
+    })
+}
+
+fn map_device_row(r: &Row) -> rusqlite::Result<Device> {
+    Ok(Device {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        created_at: r.get(2)?,
+        last_seen: r.get(3)?,
+        revoked: r.get::<_, i64>(4)? != 0,
     })
 }
 
@@ -950,6 +978,20 @@ pub struct PluginAttachStatus {
     pub last_attach_at: i64,
     pub outcome: String,
     pub reason: Option<String>,
+}
+
+/// One row of `devices`: a paired remote client. `id` is caller-assigned;
+/// `token_hash` is the SHA-256 of the device's bearer token (hashing happens
+/// in the caller — this layer only stores/compares the hash). A revoked
+/// device is kept for audit but no longer resolves via
+/// `find_device_by_token_hash`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_seen: Option<i64>,
+    pub revoked: bool,
 }
 
 /// Check out a pooled connection and run `f` on its dedicated blocking
@@ -2341,6 +2383,121 @@ impl Store {
         })
         .await
     }
+
+    /// Register a newly paired remote device. `token_hash` is already the
+    /// SHA-256 of the device's bearer token — this layer never sees the
+    /// plaintext token.
+    pub async fn insert_device(
+        &self,
+        id: &str,
+        name: &str,
+        token_hash: &str,
+    ) -> anyhow::Result<()> {
+        let id = id.to_string();
+        let name = name.to_string();
+        let token_hash = token_hash.to_string();
+        let created_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO devices(id, name, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, name, token_hash, created_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Resolve a device by its hashed bearer token. Revoked devices never
+    /// resolve here (they still appear in `list_devices` for audit).
+    pub async fn find_device_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<Device>> {
+        let token_hash = token_hash.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT id, name, created_at, last_seen, revoked FROM devices \
+                 WHERE token_hash = ?1 AND revoked = 0",
+                params![token_hash],
+                map_device_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, name, created_at, last_seen, revoked FROM devices ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], map_device_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Revoke a device by id. Returns `true` iff a row was found and revoked.
+    pub async fn revoke_device(&self, id: &str) -> anyhow::Result<bool> {
+        let id = id.to_string();
+        let rows = self
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE devices SET revoked = 1 WHERE id = ?1 AND revoked = 0",
+                    params![id],
+                )
+            })
+            .await?;
+        Ok(rows == 1)
+    }
+
+    pub async fn touch_device_last_seen(&self, id: &str, now_ms: i64) -> anyhow::Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE devices SET last_seen = ?2 WHERE id = ?1",
+                params![id, now_ms],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Insert a single-use, TTL-bounded pairing code. `code_hash` is already
+    /// hashed — this layer never sees the plaintext enrollment code.
+    pub async fn insert_pairing_code(
+        &self,
+        code_hash: &str,
+        expires_at: i64,
+    ) -> anyhow::Result<()> {
+        let code_hash = code_hash.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO pairing_codes(code_hash, expires_at) VALUES (?1, ?2)",
+                params![code_hash, expires_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Atomically consume a pairing code: deletes it iff it exists and has
+    /// not expired, returning whether it was consumed. A code can only ever
+    /// be consumed once (the row is gone after the first success).
+    pub async fn consume_pairing_code(&self, code_hash: &str, now_ms: i64) -> anyhow::Result<bool> {
+        let code_hash = code_hash.to_string();
+        let rows_affected = self
+            .with_conn(move |c| {
+                c.execute(
+                    "DELETE FROM pairing_codes WHERE code_hash = ?1 AND expires_at > ?2",
+                    params![code_hash, now_ms],
+                )
+            })
+            .await?;
+        Ok(rows_affected == 1)
+    }
 }
 
 const SESSION_COLS: &str =
@@ -3289,7 +3446,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 23, "forward migration must land at v23");
+        assert_eq!(user_version, 24, "forward migration must land at v24");
     }
 
     #[tokio::test]
@@ -3432,7 +3589,7 @@ mod tests {
     #[tokio::test]
     async fn migrations_13_to_23_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back ten so the
+        // DB, seed the old values, then wind user_version back eleven so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
@@ -3444,17 +3601,18 @@ mod tests {
         // 22 sessions rebuild — nullable project_id + kind/speaker/agent/
         // parent_session_pk, copies every existing column forward including
         // perm_mode; 23 plugin_installs + plugin_attach_status — CREATE TABLE
-        // IF NOT EXISTS; all no-ops on replay) re-run on the next open.
+        // IF NOT EXISTS; 24 devices + pairing_codes — CREATE TABLE IF NOT
+        // EXISTS; all no-ops on replay) re-run on the next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 23
-        // defined, wind back eleven.
+        // this test starts failing its assertions). With migrations through 24
+        // defined, wind back twelve.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 11)
+            c.pragma_update(None, "user_version", v - 12)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -3511,14 +3669,15 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back three, and reopen so 21 (and the tail
-        // migrations 22 sessions rebuild + 23 plugin-install ledger) replay
-        // against it. Back THREE: the fully migrated tail is now v23, so
-        // rewinding to v20 is what makes migration 21 (native-only) replay.
+        // wind user_version back four, and reopen so 21 (and the tail
+        // migrations 22 sessions rebuild + 23 plugin-install ledger + 24
+        // devices/pairing_codes) replay against it. Back FOUR: the fully
+        // migrated tail is now v24, so rewinding to v20 is what makes
+        // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 3)
+            c.pragma_update(None, "user_version", v - 4)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -4083,5 +4242,107 @@ mod tests {
         assert_eq!(got.outcome, "ok");
         assert_eq!(got.last_attach_at, 9);
         assert_eq!(store.list_plugin_attach().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_24_creates_devices_and_pairing_codes_tables() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let counts = store
+            .with_conn(|c| {
+                let devices: i64 = c.query_row("SELECT count(*) FROM devices", [], |r| r.get(0))?;
+                let codes: i64 =
+                    c.query_row("SELECT count(*) FROM pairing_codes", [], |r| r.get(0))?;
+                Ok((devices, codes))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn device_insert_find_and_revoke_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .insert_device("dev-1", "alfin-laptop", "hash-abc")
+            .await
+            .unwrap();
+
+        let found = store
+            .find_device_by_token_hash("hash-abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, "dev-1");
+        assert_eq!(found.name, "alfin-laptop");
+        assert!(!found.revoked);
+        assert!(found.last_seen.is_none());
+
+        assert!(store
+            .find_device_by_token_hash("no-such-hash")
+            .await
+            .unwrap()
+            .is_none());
+
+        store.touch_device_last_seen("dev-1", 12_345).await.unwrap();
+        let touched = store
+            .find_device_by_token_hash("hash-abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(touched.last_seen, Some(12_345));
+
+        assert_eq!(store.list_devices().await.unwrap().len(), 1);
+
+        let revoked = store.revoke_device("dev-1").await.unwrap();
+        assert!(revoked);
+        // Revoked devices no longer resolve by token hash...
+        assert!(store
+            .find_device_by_token_hash("hash-abc")
+            .await
+            .unwrap()
+            .is_none());
+        // ...but still show up in the full listing, marked revoked.
+        let all = store.list_devices().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].revoked);
+
+        // Revoking an unknown device id is a no-op, not an error.
+        assert!(!store.revoke_device("no-such-device").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pairing_code_is_single_use_and_expiry_bounded() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = 1_700_000_000_000_i64;
+
+        store
+            .insert_pairing_code("code-hash-1", now + 60_000)
+            .await
+            .unwrap();
+
+        // First consume succeeds...
+        assert!(store
+            .consume_pairing_code("code-hash-1", now)
+            .await
+            .unwrap());
+        // ...second consume of the same (now-deleted) code fails.
+        assert!(!store
+            .consume_pairing_code("code-hash-1", now)
+            .await
+            .unwrap());
+
+        // An expired code never consumes, even on the first attempt.
+        store
+            .insert_pairing_code("code-hash-2", now - 1)
+            .await
+            .unwrap();
+        assert!(!store
+            .consume_pairing_code("code-hash-2", now)
+            .await
+            .unwrap());
     }
 }
