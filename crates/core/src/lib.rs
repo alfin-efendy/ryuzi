@@ -1,3 +1,4 @@
+pub mod agent_settings;
 pub mod api;
 pub mod approval;
 pub mod attachments;
@@ -23,12 +24,9 @@ pub mod policy;
 pub mod process_util;
 pub mod registry;
 pub mod router;
-pub mod runtime_config;
-pub mod runtimes;
 pub mod scheduler;
 pub mod serve;
 pub mod settings;
-pub mod sidecar;
 pub mod skills_install;
 pub mod store;
 pub mod telemetry;
@@ -43,10 +41,7 @@ pub use domain::{
     PermMode, Project, Session, SessionGitOptions, SessionKind, SessionStatus, Surface,
 };
 pub use gateway::{Gateway, GatewayFactory, GatewayRegistry, MessageRef};
-pub use harness::acp::AcpAdapterDescriptor;
-pub use harness::{
-    Harness, HarnessFactory, HarnessRegistry, HarnessSession, SessionCtx, TurnPrompt,
-};
+pub use harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 pub use plugins::{CorePlugin, PluginHost, PluginSource, Registries};
 pub use registry::Registry;
 pub use router::{chunk, ConnectOpts, ConnectOutcome, Router};

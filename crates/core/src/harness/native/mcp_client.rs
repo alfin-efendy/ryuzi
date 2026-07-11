@@ -1,7 +1,6 @@
 //! Native MCP client: a persistent stdio JSON-RPC connection that can
 //! `initialize`, `tools/list`, and `tools/call`, so the native runtime can
-//! execute MCP tools itself (the ACP harness only forwards server specs to the
-//! external agent).
+//! execute MCP tools itself.
 
 use crate::domain::{McpServerSpec, McpTransport};
 use async_trait::async_trait;

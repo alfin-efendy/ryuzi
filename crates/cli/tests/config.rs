@@ -17,11 +17,6 @@ fn deps_for(
             found: true,
             version: None,
         },
-        detect_claude: || ryuzi_cli::detect::Detected {
-            found: true,
-            version: None,
-        },
-        sidecar_status: Box::new(|| ryuzi_core::sidecar::SidecarStatus::CachedStandalone),
         build_registries: Box::new(|| Ok(ryuzi_core::Registries::new())),
     }
 }
@@ -88,7 +83,7 @@ fn list_shows_redaction_defaults_and_unset() {
     assert!(text.contains("default_perm_mode = default (default)"));
     assert!(text.contains("workdir_root = (unset)"));
     assert!(text.contains("enabled_gateways = discord")); // seeded, persisted (no "(default)")
-    assert_eq!(out.len(), 30); // one line per schema key, catalog order (27 global + 3 discord)
+    assert_eq!(out.len(), 28); // one line per schema key, catalog order (25 global + 3 discord)
     assert_eq!(out[0].split(" = ").next(), Some("workdir_root"));
 }
 

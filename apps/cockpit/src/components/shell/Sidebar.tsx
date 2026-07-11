@@ -2,7 +2,6 @@
 import { useEffect, useState } from "react";
 import {
   Archive,
-  Bot,
   CalendarClock,
   ChevronRight,
   ChevronsUpDown,
@@ -53,7 +52,6 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
   { label: "Inbox", icon: Inbox, view: { kind: "inbox" }, group: ["inbox"] },
   { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail", "connectionDetail"] },
-  { label: "Runtime", icon: Bot, view: { kind: "runtime" }, group: ["runtime", "runtimeDetail"] },
   { label: "Scheduler", icon: CalendarClock, view: { kind: "scheduler" }, group: ["scheduler", "jobDetail", "jobNew"] },
   { label: "Plugins", icon: LayoutGrid, view: { kind: "plugins" }, group: ["plugins", "appDetail", "pluginDetail"] },
   { label: "Settings", icon: Settings, view: { kind: "settings" }, group: ["settings"] },

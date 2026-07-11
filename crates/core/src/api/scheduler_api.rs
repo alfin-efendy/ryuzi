@@ -118,7 +118,6 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<JobInfo>> {
             project_id: job.project_id,
             project_name,
             branch: job.branch,
-            agent: job.agent,
             gateway: job.gateway,
             enabled: job.enabled,
             prompt: job.prompt,
@@ -157,7 +156,6 @@ async fn create_job(state: &ApiState, input: JobInput) -> Result<Vec<JobInfo>, A
             natural_text: input.natural,
             project_id: input.project_id,
             branch: input.branch,
-            agent: input.agent,
             gateway: input.gateway,
             enabled: true,
             prompt: input.prompt,
@@ -191,7 +189,6 @@ async fn update_job(
             natural_text: input.natural,
             project_id: input.project_id,
             branch: input.branch,
-            agent: input.agent,
             gateway: input.gateway,
             enabled: existing.enabled,
             prompt: input.prompt,
@@ -249,7 +246,6 @@ mod tests {
             cron: cron.into(),
             project_id: "p1".into(),
             branch: "main".into(),
-            agent: "agent".into(),
             gateway: "local".into(),
             prompt: "do it".into(),
             notify_success: false,
@@ -302,7 +298,7 @@ mod tests {
             "create_job",
             json!({ "input": {
                 "name": "nightly", "mode": "cron", "natural": "", "cron": "0 3 * * *",
-                "projectId": "p1", "branch": "", "agent": "", "gateway": "",
+                "projectId": "p1", "branch": "", "gateway": "",
                 "prompt": "check things", "notifySuccess": false, "notifyFail": true
             }}),
         )

@@ -6,8 +6,7 @@
 //! assembles the built-ins and produces the Anthropic `tools` array.
 //!
 //! All file-touching tools resolve paths through [`jail`], which confines them
-//! to the session worktree (reusing the ACP fs sandbox), and cap their output
-//! via [`truncate`].
+//! to the session worktree, and cap their output via [`truncate`].
 
 use crate::store::Store;
 use async_trait::async_trait;
@@ -341,10 +340,120 @@ impl Default for ToolRegistry {
     }
 }
 
-/// Resolve `rel` against the session worktree, rejecting any escape. Reuses
-/// the ACP fs sandbox so both runtimes share one path-jail implementation.
+/// Resolve `rel` against the session worktree, rejecting any escape.
 pub fn jail(work_dir: &Path, rel: &str) -> anyhow::Result<PathBuf> {
-    crate::harness::acp::fs::sandbox(work_dir, Path::new(rel))
+    sandbox(work_dir, Path::new(rel))
+}
+
+/// Strip a Windows `\\?\` verbatim-path prefix, if present. A no-op on
+/// non-verbatim paths (including every Unix path), so it's safe to apply
+/// unconditionally.
+fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+    match p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) => PathBuf::from(rest),
+        None => p.to_path_buf(),
+    }
+}
+
+/// Resolve `path` relative to `work_dir` and verify it stays inside `work_dir`.
+///
+/// Rules:
+/// - If `path` is relative it is joined onto `work_dir`.
+/// - If `path` is absolute it must already start with `work_dir`.
+/// - After joining, `..` components are resolved lexically by normalizing the
+///   combined path, then the lowest existing ancestor is canonicalized. This
+///   blocks traversal escapes while allowing the file (or its parent dirs) to
+///   not exist yet (e.g. for write targets).
+///
+/// Returns the resolved absolute path on success, or an error if the path
+/// escapes the worktree.
+fn sandbox(work_dir: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    // Canonicalize work_dir so we compare against the real on-disk root and so
+    // a symlinked work_dir doesn't cause false rejections on relative paths.
+    let canonical_root = work_dir.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "sandbox: cannot canonicalize work_dir {}: {e}",
+            work_dir.display()
+        )
+    })?;
+
+    // Construct the candidate (absolute) path, resolving `..` lexically.
+    // Use the *canonicalized* root as the base for relative joins so that any
+    // symlink in work_dir is resolved before we concatenate the user path.
+    let raw = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        canonical_root.join(path)
+    };
+
+    // Lexically normalize: walk components and collapse `..` without I/O.
+    // This catches `..` escapes before any canonicalize call.
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in raw.components() {
+        use std::path::Component;
+        match component {
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::CurDir => {}
+            other => parts.push(other.as_os_str().to_owned()),
+        }
+    }
+    let normalized: PathBuf = parts.iter().collect();
+
+    // Quick check on the lexically normalized path before canonicalization.
+    // An absolute path that isn't a prefix of canonical_root after normalization
+    // is definitely an escape.
+    //
+    // `canonical_root` came through `canonicalize()`, which on Windows prefixes
+    // the result with the `\\?\` verbatim marker. A caller-supplied ABSOLUTE
+    // `path` (e.g. an attachment path handed to a tool) was never canonicalized,
+    // so it never carries that marker — comparing it against `canonical_root`
+    // as-is would reject a perfectly in-tree path on a false prefix mismatch.
+    // Compare against both the marker-bearing and marker-stripped forms; the
+    // stripped form is a no-op on non-Windows / non-verbatim roots.
+    if !normalized.starts_with(&canonical_root)
+        && !normalized.starts_with(strip_verbatim_prefix(&canonical_root))
+    {
+        anyhow::bail!(
+            "sandbox: path {} escapes the worktree {}",
+            path.display(),
+            canonical_root.display()
+        );
+    }
+
+    // Now canonicalize the deepest existing ancestor to resolve any symlinks in
+    // the directory chain and re-verify. Walk upward until we find an extant dir.
+    let mut ancestor = normalized.as_path();
+    loop {
+        if ancestor.exists() {
+            let canonical_ancestor = ancestor.canonicalize().map_err(|e| {
+                anyhow::anyhow!("sandbox: cannot canonicalize {}: {e}", ancestor.display())
+            })?;
+            // Verify the canonicalized ancestor is still under the root.
+            if !canonical_ancestor.starts_with(&canonical_root) {
+                anyhow::bail!(
+                    "sandbox: path {} escapes the worktree {} (symlink)",
+                    path.display(),
+                    canonical_root.display()
+                );
+            }
+            // Reconstruct: canonical_ancestor + the suffix that didn't exist.
+            // NOTE: PathBuf::join("") appends a trailing slash which causes
+            // "Not a directory" on stat, so guard the empty-suffix case.
+            let suffix = normalized
+                .strip_prefix(ancestor)
+                .unwrap_or(std::path::Path::new(""));
+            if suffix == std::path::Path::new("") {
+                return Ok(canonical_ancestor);
+            }
+            return Ok(canonical_ancestor.join(suffix));
+        }
+        match ancestor.parent() {
+            Some(p) => ancestor = p,
+            None => anyhow::bail!("sandbox: cannot resolve any ancestor of {}", path.display()),
+        }
+    }
 }
 
 /// Truncate model-visible output to the caps, preserving the head and tail and
@@ -449,6 +558,62 @@ mod tests {
         assert!(jail(root, "../etc/passwd").is_err());
         // Absolute outside path is rejected.
         assert!(jail(root, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn sandbox_confines_to_work_dir_and_rejects_escapes() {
+        let root = tempfile::tempdir().unwrap();
+        // Canonicalize the root: on macOS tempdir() lives under /var -> /private/var,
+        // and sandbox() canonicalizes work_dir, so the raw root.path() prefix wouldn't
+        // match the returned canonicalized path.
+        let root_path = root.path().canonicalize().unwrap();
+        // an in-root relative path resolves under root:
+        let ok = sandbox(&root_path, Path::new("sub/file.txt")).unwrap();
+        assert!(ok.starts_with(&root_path));
+        // escapes are rejected:
+        assert!(
+            sandbox(&root_path, Path::new("../../etc/passwd")).is_err(),
+            "expected .. escape to be rejected"
+        );
+        assert!(
+            sandbox(&root_path, Path::new("/etc/passwd")).is_err(),
+            "expected absolute path outside root to be rejected"
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_removes_windows_marker_and_is_noop_otherwise() {
+        // Marker present: stripped.
+        let verbatim = Path::new(r"\\?\C:\work\notes.txt");
+        assert_eq!(
+            strip_verbatim_prefix(verbatim),
+            PathBuf::from(r"C:\work\notes.txt")
+        );
+        // No marker: unchanged (covers every Unix path too).
+        let plain = Path::new("/work/notes.txt");
+        assert_eq!(strip_verbatim_prefix(plain), plain.to_path_buf());
+    }
+
+    #[test]
+    fn sandbox_accepts_absolute_path_matching_verbatim_canonical_root() {
+        // Regression test for the merge-lost Windows fix: `work_dir.canonicalize()`
+        // prefixes the result with `\\?\` on Windows, but a caller-supplied
+        // ABSOLUTE path (e.g. an attachment path handed to a tool) is never
+        // canonicalized, so it never carries that marker. Simulate the mismatch
+        // directly so the assertion holds on every platform (a no-op prefix
+        // strip on non-Windows), rather than only reproducing on Windows.
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let file_path = root_path.join("notes.txt");
+        fs::write(&file_path, "hello\n").unwrap();
+
+        // Mimic a caller-supplied absolute path that never went through
+        // canonicalize() and therefore lacks any verbatim marker the real
+        // root picked up.
+        let uncanonicalized_abs = strip_verbatim_prefix(&file_path);
+
+        let resolved = sandbox(&root_path, &uncanonicalized_abs).unwrap();
+        assert!(resolved.starts_with(&root_path));
     }
 
     #[test]

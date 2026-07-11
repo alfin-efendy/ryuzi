@@ -9,12 +9,14 @@
 //! _>>` capability fields — the manifest is the thing a catalog/user plugin
 //! can actually author (as TOML), while a Rust built-in constructs both the
 //! manifest and its capabilities in code (see `plugins::builtin` and
-//! `harness::{native, acp}`).
+//! `harness::native`).
 //!
 //! `Registries::add_plugin` is the one place a `CorePlugin` becomes "live":
-//! it fans `harness`/`gateway` into the matching registry under
-//! `manifest.id`, AND records the plugin in `self.plugins` so `PluginHost`
-//! can answer identity/enablement questions later (e.g. for a settings UI).
+//! a `harness` capability replaces the single `Registries.harness` slot, a
+//! `gateway` capability is fanned into `GatewayRegistry` under
+//! `manifest.id`, AND the plugin is recorded in `self.plugins` so
+//! `PluginHost` can answer identity/enablement questions later (e.g. for a
+//! settings UI).
 //! `connector` is deliberately NOT fanned into `ConnectorRegistry` here — a
 //! `CorePlugin` carries a live `Arc<dyn Connector>` instance (not a
 //! `ConnectorFactory`), consumed directly from the host by
@@ -29,7 +31,7 @@ use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 
 use crate::connector::{Connector, ConnectorRegistry};
 use crate::gateway::{GatewayFactory, GatewayRegistry};
-use crate::harness::{HarnessFactory, HarnessRegistry};
+use crate::harness::HarnessFactory;
 use crate::settings::{csv, SettingsStore};
 
 /// Process-wide registry of every `plugin.*` settings key any installed
@@ -108,7 +110,7 @@ fn register_plugin_fields(manifest: &PluginManifest) {
 /// Where a plugin's manifest/behavior came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginSource {
-    /// Shipped inside the `ryuzi` binary (native, claude-code, discord).
+    /// Shipped inside the `ryuzi` binary (the native harness, the discord gateway).
     Builtin,
     /// Bundled in the embedded plugin catalog.
     Catalog,
@@ -131,10 +133,7 @@ pub struct CorePlugin {
 
 impl CorePlugin {
     /// Which of the four extension axes this plugin advertises. `runtime`
-    /// counts both a live `HarnessFactory` (native/claude-code) AND a
-    /// manifest-only `RuntimeMeta` (a CLI-agent catalog entry with no
-    /// in-process factory) — the same distinction `runtimes_meta` draws
-    /// between the two.
+    /// means a live `HarnessFactory` (the native runtime).
     ///
     /// Single source of truth for `ryuzi_core::serve`'s `GET /plugins`
     /// endpoint, the Cockpit `list_plugins`/`plugin_detail` commands, and
@@ -145,7 +144,7 @@ impl CorePlugin {
         if self.manifest.provider.is_some() {
             caps.push("provider");
         }
-        if self.harness.is_some() || self.manifest.runtime.is_some() {
+        if self.harness.is_some() {
             caps.push("runtime");
         }
         if self.gateway.is_some() {
@@ -200,7 +199,8 @@ impl PluginHost {
 
     /// Whether `id` is enabled, in priority order:
     /// - unknown id → `false`
-    /// - harness-capable → the `enabled_runtimes` CSV setting contains `id`
+    /// - harness-capable → always `true` (the native runtime cannot be
+    ///   disabled)
     /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
     /// - experimental → always `false` (see below)
     /// - manifest-only (no harness/gateway/connector capability) → always
@@ -212,8 +212,8 @@ impl PluginHost {
             return Ok(false);
         };
         if plugin.harness.is_some() {
-            let enabled = csv(settings.get("enabled_runtimes").await?.as_deref());
-            return Ok(enabled.iter().any(|r| r == id));
+            // The native runtime is the only harness and is always enabled.
+            return Ok(true);
         }
         if plugin.gateway.is_some() {
             let enabled = csv(settings.get("enabled_gateways").await?.as_deref());
@@ -225,12 +225,12 @@ impl PluginHost {
             // so there is nothing to actually enable. Report disabled
             // unconditionally — this wins over the manifest-only fallback
             // below even if a stray `plugin.<id>.enabled = true` setting
-            // exists. Real capabilities (providers, cli-agents) always
-            // hardcode `experimental = false`, so this never affects them.
+            // exists. Real capabilities (providers) always hardcode
+            // `experimental = false`, so this never affects them.
             return Ok(false);
         }
         if plugin.connector.is_none() {
-            // Manifest-only plugin (e.g. a provider/cli-agent metadata entry
+            // Manifest-only plugin (e.g. a provider metadata entry
             // with no behavioral capability of its own) — always enabled.
             return Ok(true);
         }
@@ -272,14 +272,27 @@ impl PluginHost {
     }
 }
 
-/// The three extension registries, plus the plugin host recording every
-/// installed [`CorePlugin`].
-#[derive(Default)]
+/// The extension registries, plus the plugin host recording every
+/// installed [`CorePlugin`]. `harness` is a single slot: the native
+/// runtime is the only harness — production leaves the default, tests
+/// swap in fakes (directly, or via a harness-capable plugin's
+/// `add_plugin`, which overwrites the slot).
 pub struct Registries {
-    pub harness: HarnessRegistry,
+    pub harness: Arc<dyn HarnessFactory>,
     pub gateway: GatewayRegistry,
     pub connector: ConnectorRegistry,
     pub plugins: PluginHost,
+}
+
+impl Default for Registries {
+    fn default() -> Self {
+        Registries {
+            harness: Arc::new(crate::harness::native::NativeHarnessFactory::new()),
+            gateway: GatewayRegistry::default(),
+            connector: ConnectorRegistry::default(),
+            plugins: PluginHost::default(),
+        }
+    }
 }
 
 impl Registries {
@@ -287,10 +300,10 @@ impl Registries {
         Registries::default()
     }
 
-    /// Install a plugin: fan its harness/gateway capabilities into the
-    /// matching registry under `manifest.id`, and record it in
-    /// `self.plugins`. A duplicate `manifest.id` is rejected entirely (no
-    /// registry is touched) — see [`PluginHost::add`].
+    /// Install a plugin: a harness capability replaces the single harness
+    /// slot, a gateway capability registers under `manifest.id`, and the
+    /// plugin is recorded in `self.plugins`. A duplicate `manifest.id` is
+    /// rejected entirely (no registry is touched) — see [`PluginHost::add`].
     pub fn add_plugin(&mut self, plugin: CorePlugin) {
         let id = plugin.manifest.id.clone();
         if self.plugins.get(&id).is_some() {
@@ -298,7 +311,7 @@ impl Registries {
             return;
         }
         if let Some(h) = &plugin.harness {
-            self.harness.register(id.clone(), h.clone());
+            self.harness = h.clone();
         }
         if let Some(g) = &plugin.gateway {
             self.gateway.register(id.clone(), g.clone());
@@ -411,7 +424,6 @@ mod tests {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         }
     }
 
@@ -501,15 +513,12 @@ mod tests {
         regs.add_plugin(harness_only("claude-code"));
         regs.add_plugin(gateway_only("discord"));
 
-        assert!(regs.harness.get("claude-code").is_some());
         assert!(regs.gateway.get("claude-code").is_none());
         assert!(regs.gateway.get("discord").is_some());
-        assert!(regs.harness.get("discord").is_none());
 
         // both recorded in the host too
         assert!(regs.plugins.get("claude-code").is_some());
         assert!(regs.plugins.get("discord").is_some());
-        assert_eq!(regs.harness.names(), vec!["claude-code".to_string()]);
         assert_eq!(regs.gateway.names(), vec!["discord".to_string()]);
     }
 
@@ -531,7 +540,10 @@ mod tests {
         regs.add_plugin(harness_only("dup"));
         regs.add_plugin(gateway_only("dup"));
 
-        assert!(regs.harness.get("dup").is_some());
+        assert!(
+            regs.plugins.get("dup").unwrap().harness.is_some(),
+            "first registration wins"
+        );
         assert!(
             regs.gateway.get("dup").is_none(),
             "the duplicate's gateway factory must never be registered"
@@ -548,19 +560,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn is_enabled_harness_capability_follows_enabled_runtimes() {
+    async fn is_enabled_harness_capability_is_always_true() {
         let (_store, settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
         host.add(harness_only("native"));
-
-        // A fresh `Store` now seeds `enabled_runtimes = "native"` by default
-        // (migration #13, ryuzi-only defaults) — clear it first so the "off
-        // by default" half of this toggle test still holds, mirroring how
-        // `is_enabled_gateway_capability_follows_enabled_gateways` deliberately
-        // avoids the gateway seed default.
-        settings.set("enabled_runtimes", "").await.unwrap();
-        assert!(!host.is_enabled(&settings, "native").await.unwrap());
-        settings.set("enabled_runtimes", "native").await.unwrap();
         assert!(host.is_enabled(&settings, "native").await.unwrap());
     }
 

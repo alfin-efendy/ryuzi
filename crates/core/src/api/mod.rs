@@ -3,6 +3,7 @@
 //! names match the Tauri command names 1:1; params objects use the Rust
 //! snake_case parameter names. One submodule per command family.
 
+pub mod agent_api;
 pub mod apps_api;
 pub mod connections_api;
 pub mod endpoint_api;
@@ -10,7 +11,6 @@ pub mod fsview_api;
 pub mod gateways_api;
 pub mod native_api;
 pub mod plugins_api;
-pub mod runtimes_api;
 pub mod scheduler_api;
 pub mod session_io_api;
 pub mod sessions;
@@ -77,10 +77,10 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if gateways_api::HANDLES.contains(&m) => gateways_api::dispatch(state, m, p).await,
         m if apps_api::HANDLES.contains(&m) => apps_api::dispatch(state, m, p).await,
         m if native_api::HANDLES.contains(&m) => native_api::dispatch(state, m, p).await,
+        m if agent_api::HANDLES.contains(&m) => agent_api::dispatch(state, m, p).await,
         m if session_io_api::HANDLES.contains(&m) => session_io_api::dispatch(state, m, p).await,
         m if fsview_api::HANDLES.contains(&m) => fsview_api::dispatch(state, m, p).await,
         m if skills_api::HANDLES.contains(&m) => skills_api::dispatch(state, m, p).await,
-        m if runtimes_api::HANDLES.contains(&m) => runtimes_api::dispatch(state, m, p).await,
         m if endpoint_api::HANDLES.contains(&m) => endpoint_api::dispatch(state, m, p).await,
         m if connections_api::HANDLES.contains(&m) => connections_api::dispatch(state, m, p).await,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
@@ -168,9 +168,7 @@ pub(crate) mod tests_support {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(tmp.path()).await.unwrap();
         let mut registries = crate::plugins::Registries::new();
-        registries
-            .harness
-            .register("native", Arc::new(FakeHarnessFactory));
+        registries.harness = Arc::new(FakeHarnessFactory);
         let cp = crate::control::ControlPlane::new(store, registries).await;
         std::mem::forget(tmp);
         ApiState {

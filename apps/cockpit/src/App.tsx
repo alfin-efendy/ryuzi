@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useStore } from "./store";
-import { useRuntimes } from "./store-runtimes";
+import { useAgent } from "./store-agent";
 import { useModelStatuses } from "./store-model-statuses";
 import { useNav } from "./store-nav";
 import { useDisableContextMenu } from "./lib/contextMenu";
@@ -13,8 +13,6 @@ import { SessionView } from "./views/SessionView";
 import { ModelsView } from "./views/ModelsView";
 import { ProviderDetailView } from "./views/ProviderDetailView";
 import { ConnectionDetailView } from "./views/ConnectionDetailView";
-import { RuntimeView } from "./views/RuntimeView";
-import { RuntimeDetailView } from "./views/RuntimeDetailView";
 import { SchedulerView } from "./views/SchedulerView";
 import { JobDetailView } from "./views/JobDetailView";
 import { JobNewView } from "./views/JobNewView";
@@ -41,10 +39,6 @@ function MainView() {
       return <ProviderDetailView provider={view.provider} />;
     case "connectionDetail":
       return <ConnectionDetailView id={view.id} />;
-    case "runtime":
-      return <RuntimeView />;
-    case "runtimeDetail":
-      return <RuntimeDetailView id={view.id} />;
     case "scheduler":
       return <SchedulerView />;
     case "jobDetail":
@@ -68,14 +62,14 @@ function MainView() {
 
 export default function App() {
   const init = useStore((s) => s.init);
-  const hydrateAgents = useRuntimes((s) => s.hydrate);
+  const loadAgent = useAgent((s) => s.load);
   const hydrateModelStatuses = useModelStatuses((s) => s.hydrate);
   useDisableContextMenu();
   useEffect(() => {
     init();
-    void hydrateAgents();
+    void loadAgent();
     void hydrateModelStatuses();
-  }, [init, hydrateAgents, hydrateModelStatuses]);
+  }, [init, loadAgent, hydrateModelStatuses]);
   return (
     <div className="relative flex h-screen flex-col overflow-hidden text-sm text-foreground antialiased">
       {/* Wallpaper behind the glass chrome; collapses to transparent when an OS backdrop is active. */}

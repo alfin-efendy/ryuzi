@@ -422,7 +422,7 @@ test("error event appends no transient row — the durable error row arrives via
   listSessions.mockRestore();
 });
 
-test("start forwards chat options so composer runtime, context, and attachments reach IPC", async () => {
+test("start forwards chat options so composer model, context, and attachments reach IPC", async () => {
   reset();
   const start = spyOn(commands, "startSession").mockResolvedValue({
     status: "ok",
@@ -450,14 +450,12 @@ test("start forwards chat options so composer runtime, context, and attachments 
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
 
   await useStore.getState().start("p1", "/review", {
-    runtimeId: "native",
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
   });
 
   expect(start).toHaveBeenCalledWith("p1", "/review", {
-    runtimeId: "native",
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
@@ -503,7 +501,6 @@ test("start forwards composer git options to IPC", async () => {
   });
 
   expect(start).toHaveBeenCalledWith("p1", "go", {
-    runtimeId: null,
     model: null,
     context: null,
     attachments: [],
@@ -596,10 +593,9 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  const ok = await useStore.getState().startChat("hey", { runtimeId: "native", model: "fable" });
+  const ok = await useStore.getState().startChat("hey", { model: "fable" });
 
   expect(startChat).toHaveBeenCalledWith("hey", {
-    runtimeId: "native",
     model: "fable",
     permMode: null,
     context: null,
@@ -636,7 +632,6 @@ test("cloneProject clones via IPC and refreshes on success", async () => {
       name: "repo",
       workdir: "C:\\proj\\repo",
       source: "https://github.com/user/repo.git",
-      harness: "native",
       model: null,
       effort: null,
       permMode: "default",

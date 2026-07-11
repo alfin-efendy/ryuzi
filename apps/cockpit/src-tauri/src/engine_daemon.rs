@@ -56,22 +56,10 @@ async fn run_inner() -> i32 {
 
     let opts = BuildDaemonOpts {
         db_path,
-        adapter: Box::new(|| {
-            let mut env = Vec::new();
-            if let Some(cli) = crate::resolve_claude_code_executable() {
-                env.push(("CLAUDE_CODE_EXECUTABLE".to_string(), cli));
-            }
-            let (command, args) = crate::resolve_acp_adapter()?;
-            Ok(ryuzi_core::AcpAdapterDescriptor {
-                command,
-                args,
-                env,
-                env_remove: vec!["CLAUDECODE".to_string()],
-            })
-        }),
         telemetry: None,
         extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
-        extra_harness_factories: vec![],
+        // Native-only: production uses the real in-process native harness.
+        harness_factory: None,
     };
 
     let daemon = match tokio::time::timeout(Duration::from_millis(CONNECT_TIMEOUT_MS), async {

@@ -1,8 +1,8 @@
 # Plugin SDK
 
-Ryuzi's extension points — model providers, CLI-agent runtimes, the Discord
-gateway, and third-party integrations (GitHub, Notion, Slack, memory
-backends, sandboxes, deploy platforms...) — are all **plugins**: one manifest
+Ryuzi's extension points — model providers, the Discord gateway, and
+third-party integrations (GitHub, Notion, Slack, memory backends,
+sandboxes, deploy platforms...) — are all **plugins**: one manifest
 each, surfaced identically through `ryuzi plugins`, `GET /plugins`, and
 Cockpit's Plugins hub.
 
@@ -34,19 +34,18 @@ two different crates:
 A manifest **on its own** can only ever produce a *connector* (an MCP-server
 contributor) — that's what `declarative_plugin()`
 (`crates/core/src/plugins/declarative.rs`) builds automatically whenever a
-manifest declares `[[mcp]]` entries. A *harness* (an agent runtime) or a
-*gateway* (a chat platform) requires actual Rust code, so those three
-capabilities are hand-built-in: the native runtime and the `claude-code`
-harness (beside their own modules, `harness::native` /
-`harness::acp`), and the `discord` gateway
+manifest declares `[[mcp]]` entries. A *harness* (the agent loop) or a
+*gateway* (a chat platform) requires actual Rust code, so those
+capabilities are hand-built-in: the native agent harness
+(`harness::native`) and the `discord` gateway
 (`crates/core/src/plugins/builtin.rs`).
 
 Manifests come from three places, merged in this order (first registration
 for a given `id` wins — see `PluginHost::add`):
 
-1. **Rust built-ins** — `native`, `claude-code`, `discord`, plus every model
-   provider and CLI agent, generated from two existing static catalogs
-   (`crates/core/src/plugins/providers.rs`, `runtimes_meta.rs`).
+1. **Rust built-ins** — `native`, `discord`, plus every model provider,
+   generated from the static provider catalog
+   (`crates/core/src/plugins/providers.rs`).
 2. **The embedded integration catalog** — 24 TOML manifests baked into the
    binary via `include_str!`, at `crates/core/plugins/catalog/*.toml`
    (`crates/core/src/plugins/catalog.rs`).
@@ -58,9 +57,8 @@ for a given `id` wins — see `PluginHost::add`):
 A real `ryuzi` process wires all of this at startup
 (`crates/cli/src/main.rs`'s `build_registries`, mirrored by
 `apps/cockpit/src-tauri/src/lib.rs`): register `native` unconditionally,
-register `claude-code` if the ACP sidecar resolves, register `discord`,
-then call `ryuzi_core::plugins::install_builtins` (providers, then CLI
-agents, then the embedded catalog) and finally
+register `discord`, then call `ryuzi_core::plugins::install_builtins`
+(providers, then the embedded catalog) and finally
 `ryuzi_core::plugins::load_skill_pack_plugins`. Because this all runs once at
 process startup, installing or refreshing a skill pack requires restarting
 `ryuzi` (or the Cockpit app) to pick it up — there is no hot-reload.
@@ -76,7 +74,7 @@ split into four tabs backed by thin Tauri commands:
 
 - **Installed** — DB-backed MCP apps already added to the local machine
   (`apps_cmd.rs` / `useApps`).
-- **Access** — which runtimes are allowed to call each installed app.
+- **Access** — whether the agent is allowed to use each installed app.
 - **Browse** — a pure grid of the embedded **catalog** manifests with a
   category filter. The old MCP-registry browser (`registry_cmd.rs` /
   `registry_search`) has been removed entirely; MCP-server apps installed
@@ -128,7 +126,6 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `mcp` | `[[mcp]]` array | `[]` | See [MCP server defs](#mcp-server-defs). |
 | `skills` | `[[skills]]` array | `[]` | See [Skills bundling](#skills-bundling). |
 | `provider` | `[provider]` table \| null | `None` | Model-provider capability block — see below. |
-| `runtime` | `[runtime]` table \| null | `None` | CLI-agent capability block — see below. |
 
 ### `[auth]`
 
@@ -179,18 +176,9 @@ See [MCP server defs](#mcp-server-defs) for the full field table.
 | `base_url` | string \| null | `None` |
 | `models` | `[{ id, label?, default? }]` | `[]` |
 
-### `[runtime]` (CLI-agent plugins)
-
-| Field | Type | Default |
-| --- | --- | --- |
-| `binary` | string \| null | `None` |
-| `npm_package` | string \| null | `None` |
-| `default_model` | string \| null | `None` |
-
-`[provider]`/`[runtime]` are populated by the generated built-in provider
-and CLI-agent plugins (`providers.rs`/`runtimes_meta.rs`); none of the 24
-embedded catalog manifests use them — a third-party integration is a
-connector, not a model provider or a CLI agent.
+`[provider]` is populated by the generated built-in provider plugins
+(`providers.rs`); none of the 24 embedded catalog manifests use it — a
+third-party integration is a connector, not a model provider.
 
 ### Full annotated example
 
@@ -256,8 +244,7 @@ without breaking existing manifests.
 | `api-key` | A model provider authenticated by API key (e.g. Anthropic, OpenAI) |
 | `oauth` | A model provider authenticated via OAuth (e.g. `anthropic-oauth`, `openai-oauth`) |
 | `free` | A free-tier model provider (e.g. `kiro`, `opencode-free`) |
-| `runtime` | An agent runtime with a live harness (`native`, `claude-code`) |
-| `cli-agent` | A CLI coding agent Cockpit can drive but doesn't run in-process (`claude`, `codex`, `gemini`, `opencode`, ...) |
+| `runtime` | The in-process native agent runtime (`native`) |
 | `chat-gateway` | A chat platform gateway (`discord`) |
 | `vcs` | Source control / repos (`github`, `atlassian`) |
 | `issues` | Issue trackers (`github`, `atlassian`, `linear`) |
@@ -518,15 +505,15 @@ at process startup.
 enablement by capability, in this priority order:
 
 1. Unknown `id` → `false`.
-2. Harness-capable (`native`, `claude-code`) → whether `id` is in the
-   `enabled_runtimes` CSV setting.
+2. `native` (the built-in agent harness) → always `true`; the agent is not
+   toggleable.
 3. Gateway-capable (`discord`) → whether `id` is in the `enabled_gateways`
    CSV setting.
 4. `experimental = true` (docs-only: `ngrok`, `vercel-sandbox`, `zep`) →
    always `false` — there is no capability to enable, and this wins even if
    a stray `plugin.<id>.enabled = true` row exists.
-5. No harness/gateway/connector capability at all (every model-provider and
-   CLI-agent plugin) → always `true`.
+5. No harness/gateway/connector capability at all (every model-provider
+   plugin) → always `true`.
 6. Otherwise (every catalog/skill-pack integration with a connector) →
    `plugin.<id>.enabled == "true"`, defaulting to `false`.
 
@@ -545,8 +532,8 @@ ryuzi plugins disable github
   there's nothing to enable); the plugin detail screen (reached from the
   sidebar's Plugins section or the Browse card's "Configure" button) has
   the same switch.
-- **Settings keys directly**: `enabled_runtimes`/`enabled_gateways` are CSV
-  strings (add/remove `id`, preserving order, no duplicates —
+- **Settings keys directly**: `enabled_gateways` is a CSV
+  string (add/remove `id`, preserving order, no duplicates —
   `toggle_enabled`'s `toggle_csv` helper); everything else is
   `plugin.<id>.enabled` (`"true"`/`"false"`). Both `ryuzi plugins enable/
   disable` and Cockpit's `set_plugin_enabled` command delegate to the same
@@ -578,18 +565,9 @@ per-plugin case in either function.
 | Plugin id(s) | Source | Capability |
 | --- | --- | --- |
 | `native` | `harness::native::native_plugin()` | harness (in-process agent loop) |
-| `claude-code` | `harness::acp::claude_code_plugin[_with_resolver]()` | harness (ACP sidecar) |
 | `discord` | `plugins::builtin::discord_plugin()` | gateway (feature-gated `serenity` factory) |
 | `anthropic`, `openai`, `ollama`, ... (every `llm_router::registry::CATALOG` entry) | `plugins::providers::provider_plugins()` | manifest-only, `[provider]` block; category `model-provider` + `api-key`/`oauth`/`free` |
-| `claude`, `codex`, `gemini`, `opencode`, ... (`runtimes::CATALOG`, minus `native`/`ollama`) | `plugins::runtimes_meta::cli_agent_plugins()` | manifest-only, `[runtime]` block; category `cli-agent` |
 | `github`, `atlassian`, ... (24 entries) | Embedded TOML, `plugins::catalog::catalog_plugins()` | connector (via `declarative_plugin`) |
-
-`native`/`ollama` are deliberately skipped from the CLI-agent catalog
-mapping: `native` already has a richer harness-backed plugin under that id,
-and `ollama` is already the `model-provider` plugin for the same underlying
-service (Cockpit's "detect the binary, list installed models" view of it) —
-mapping either again would just register a weaker duplicate that
-`PluginHost::add` would then silently drop.
 
 ---
 
@@ -687,7 +665,6 @@ Adding an entry to `crates/core/plugins/catalog/*.toml` (and
   substitution — never a literal token in the manifest.
 - Run `cargo test -p ryuzi-core` after adding an entry: `catalog.rs`'s test
   module parses/validates every embedded manifest, checks id uniqueness
-  (including against every built-in provider/CLI-agent/`native`/
-  `claude-code`/`discord` id), requires every non-experimental entry to
-  have `[[mcp]]`, and requires every `experimental` entry to have no
-  `[[mcp]]`.
+  (including against every built-in provider/`native`/`discord` id),
+  requires every non-experimental entry to have `[[mcp]]`, and requires
+  every `experimental` entry to have no `[[mcp]]`.

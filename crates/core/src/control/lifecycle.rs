@@ -51,38 +51,23 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
 
-        // A project without a pinned MODEL inherits THIS session's runtime
-        // config (Runtime screen → real effect), keyed off the project's own
-        // harness — otherwise a native session would inherit the Claude card's
-        // model and every turn would hit the Claude subscription.
+        // A project without a pinned MODEL inherits the agent's default model
+        // (Settings → Agent, stored under the `agent_model` settings key).
         //
-        // Permission mode is NOT inherited from the runtime card: this new
-        // session's mode comes from `perm_mode` above (the picker) or falls
-        // back to the project's own `perm_mode` — never the runtime card's
-        // default. `Default` means "Ask" (prompt before edits/commands) —
-        // inheriting the card's default (e.g. "Full") here is exactly what
-        // made a project set to Ask silently run without asking. Once
-        // created, the SESSION's own row is the source of truth (per-session
-        // mode) — the project's `perm_mode` only seeds new sessions.
+        // Permission mode is per-session: this new session's mode comes from
+        // `perm_mode` above (the picker) or falls back to the project's own
+        // `perm_mode` — it is NOT inherited from a global/agent default.
+        // `Default` means "Ask" (prompt before edits/commands) — inheriting a
+        // global default here is exactly what made a project set to Ask
+        // silently run without asking. Once created, the SESSION's own row is
+        // the source of truth (per-session mode) — the project's `perm_mode`
+        // only seeds new sessions.
         if project.model.is_none() {
-            let runtime_id = crate::runtimes::runtime_id_for_harness(&project.harness);
-            if let Ok(defaults) =
-                crate::runtimes::session_defaults_for(&self.store, runtime_id).await
-            {
-                project.model = defaults.model;
+            if let Ok(agent) = crate::agent_settings::get(&self.store).await {
+                project.model = agent.model.filter(|m| !m.trim().is_empty());
             }
         }
 
-        // Cheap validation only — the session row must be returnable
-        // immediately. Anything disk- or process-heavy runs in the background
-        // startup task below and surfaces failures in the transcript.
-        if self.registries.harness.get(&project.harness).is_none() {
-            anyhow::bail!(
-                "unknown harness '{}' (registered: {:?})",
-                project.harness,
-                self.registries.harness.names()
-            );
-        }
         let git = git.unwrap_or_default();
         // Git options (branch name / worktree) only apply to git projects; a
         // plain folder runs in-place with no branch, so skip the branch-name
@@ -136,10 +121,7 @@ impl ControlPlane {
             &self.store,
             "local",
             "info",
-            &format!(
-                "session {short} started ({} · {})",
-                project.harness, project.name
-            ),
+            &format!("session {short} started ({})", project.name),
         )
         .await;
 
@@ -293,17 +275,10 @@ impl ControlPlane {
 
     /// Send a follow-up prompt on an existing session.
     ///
-    /// The ACP session built by `start_harness_session` is long-lived: its
-    /// handle holds an mpsc `ClientRequest` channel whose client loop stays
-    /// connected to serve many prompts on ONE session. So the fast (normal)
-    /// path here REUSES the live handle from the `running` map — no new adapter
-    /// process, no `session/load` replay, because the live adapter already holds
-    /// the full conversation context.
-    ///
-    /// Only when the handle is ABSENT — e.g. the in-memory `running` map was
-    /// wiped by an app restart — do we start a FRESH session that resumes via
-    /// `session/load` (passing `session.agent_session_id` as `resume`). That
-    /// cold-resume path is the single place `session/load` is needed.
+    /// The harness session built by `start_harness_session` is long-lived;
+    /// the fast path reuses the live handle from the `running` map; only
+    /// when the handle is absent (app restart) does a fresh session resume
+    /// from the persisted agent session id.
     pub async fn continue_session(
         self: &Arc<Self>,
         session_pk: &str,
@@ -344,17 +319,19 @@ impl ControlPlane {
             self.wait_for_startup(session_pk).await;
         }
 
-        // Fast path: reuse the live ACP session if its handle is still in the
-        // `running` map. The live adapter already holds context, so no new
-        // adapter is spawned and no `session/load` replay happens.
+        // Fast path: reuse the live native session if its handle is still in
+        // the `running` map. The live harness already holds context, so no
+        // new session is spawned and no transcript replay happens.
         let existing = self.running.lock().unwrap().get(session_pk).cloned();
         let handle = match existing {
             Some(handle) => handle,
             None => {
                 // Cold-resume path: the in-memory handle is gone (e.g. after an
-                // app restart). Start a FRESH session that resumes the prior
-                // conversation via `session/load` using the persisted agent id.
-                // A chat (project-less) session has no project to resolve — it
+                // app restart). Start a FRESH native session; it reconstructs
+                // conversation context from the persisted transcript keyed by
+                // `session_pk` (the `resume` id passed through is currently
+                // unused by `NativeHarness`, which resumes from the Store). A
+                // chat (project-less) session has no project to resolve — it
                 // cold-resumes straight into its managed scratch dir.
                 let resume = async {
                     let project = match session.project_id.as_deref() {
@@ -782,20 +759,15 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Resolve the harness in the registry, build a `SessionCtx`, and start
-    /// the session. Records the returned handle in the `running` map and
+    /// Create the native harness, build a `SessionCtx`, and start the
+    /// session. Records the returned handle in the `running` map and
     /// returns a clone for driving the first prompt.
     ///
     /// `project` is `None` for a chat (project-less) session — there is no
-    /// `Project` row to inherit `harness`/`perm_mode`/`model`/`effort` from,
-    /// so those fall back to engine-wide settings: `perm_mode` from the
-    /// `default_perm_mode` setting (the same fallback a brand-new project
-    /// gets at `connect_project` time), `model` from the resolved runtime's
-    /// own persisted config (mirrors how a project without a pinned model
-    /// inherits its runtime card, above in `start_session_with_prompt`), and
-    /// `effort` from `default_effort`. The harness/mcp-agent id itself comes
-    /// from the `default_agent` setting (same fallback `native` that
-    /// `session_defaults` uses), mapped onto the harness registry's id space.
+    /// `Project` row to inherit `perm_mode`/`model`/`effort` from, so those
+    /// fall back to engine-wide settings: `perm_mode` from `default_perm_mode`,
+    /// `model` from the native agent's configured model (`agent_settings`), and
+    /// `effort` from `default_effort`. The harness is always native.
     async fn start_harness_session(
         self: &Arc<Self>,
         project: Option<&Project>,
@@ -804,34 +776,17 @@ impl ControlPlane {
         resume: Option<String>,
     ) -> anyhow::Result<Arc<dyn HarnessSession>> {
         let settings = SettingsStore::new(self.store.clone());
-        let (harness_id, perm_mode, model, effort): (
-            String,
-            PermMode,
-            Option<String>,
-            Option<String>,
-        ) = match project {
-            Some(p) => (
-                p.harness.clone(),
-                p.perm_mode,
-                p.model.clone(),
-                p.effort.clone(),
-            ),
+        // Native-only (#105): a single harness, so no harness/runtime id
+        // resolution. model/effort/perm_mode come from the project when one is
+        // bound; a chat (project-less) session falls back to engine-wide
+        // settings — model from the native agent's configured model
+        // (`agent_settings`, replacing the deleted `runtimes::session_defaults`),
+        // perm_mode from `default_perm_mode`, effort from `default_effort`.
+        // (perm_mode here is only a fallback; the session row's own perm_mode
+        // overrides it below.)
+        let (perm_mode, model, effort): (PermMode, Option<String>, Option<String>) = match project {
+            Some(p) => (p.perm_mode, p.model.clone(), p.effort.clone()),
             None => {
-                let runtime_id = settings
-                    .get("default_agent")
-                    .await
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "native".to_string());
-                // Runtime ids and harness ids diverge only for Claude:
-                // runtime "claude" ⇒ harness "claude-code" (the inverse of
-                // `runtimes::runtime_id_for_harness`).
-                let harness_id = if runtime_id == "claude" {
-                    "claude-code".to_string()
-                } else {
-                    runtime_id.clone()
-                };
                 let default_perm_raw = settings
                     .get("default_perm_mode")
                     .await
@@ -839,40 +794,29 @@ impl ControlPlane {
                     .flatten()
                     .unwrap_or_else(|| "default".to_string());
                 let perm_mode = PermMode::from_db(&default_perm_raw);
-                let model = crate::runtimes::session_defaults_for(&self.store, &runtime_id)
+                let model = crate::agent_settings::get(&self.store)
                     .await
                     .ok()
-                    .and_then(|d| d.model);
+                    .and_then(|a| a.model)
+                    .filter(|m| !m.trim().is_empty());
                 let effort = settings
                     .get("default_effort")
                     .await
                     .ok()
                     .flatten()
                     .filter(|v| !v.trim().is_empty());
-                (harness_id, perm_mode, model, effort)
+                (perm_mode, model, effort)
             }
         };
 
-        let factory = self.registries.harness.get(&harness_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown harness '{harness_id}' (registered: {:?})",
-                self.registries.harness.names()
-            )
-        })?;
-        let harness = factory.create()?;
+        let harness = self.registries.harness.create()?;
 
         // Attach the Apps screen's enabled MCP servers to the session. The MCP
-        // per-agent allowlist is keyed by runtime id, which differs from the
-        // harness id: the claude-code harness maps to the "claude" runtime;
-        // other harnesses (e.g. "native") use their own id.
-        let mcp_agent_id = if harness_id == "claude-code" {
-            "claude"
-        } else {
-            harness_id.as_str()
-        };
-        let mut mcp_servers = crate::mcp::servers_for_session(&self.store, mcp_agent_id)
-            .await
-            .unwrap_or_default();
+        // per-agent allowlist has a single agent id: "native".
+        let mut mcp_servers =
+            crate::mcp::servers_for_session(&self.store, crate::harness::native::NATIVE_ID)
+                .await
+                .unwrap_or_default();
         // A chat session has no project to scope plugin connectors by —
         // `ConnectorCtx.project_id` isn't read by any connector today, so the
         // session id is a harmless, uniquely-scoped stand-in.
@@ -993,7 +937,7 @@ impl ControlPlane {
     }
 
     /// Drive a prompt on `handle` in the background. `send_prompt` blocks until
-    /// the turn completes (ACP `EndTurn`); on completion we atomically demote
+    /// the turn completes (turn end); on completion we atomically demote
     /// `Running → Idle` (unless the session was already Interrupted/Ended) and
     /// broadcast a `Result`. Errors are persisted as a durable error row
     /// (via `emit_error`), the row is demoted Running→Idle, and only then
@@ -1112,8 +1056,9 @@ impl ControlPlane {
     }
 
     /// Tear down a session. This is the ONLY place the persistent live-session
-    /// handle is removed from `running` and `end()`ed (graceful ACP teardown),
-    /// after which the worktree is cleaned up and the session marked `Ended`.
+    /// handle is removed from `running` and `end()`ed (graceful native-harness
+    /// teardown), after which the worktree is cleaned up and the session
+    /// marked `Ended`.
     pub async fn end_session(&self, session_pk: &str) -> anyhow::Result<()> {
         // Abort any in-flight background startup and WAIT for it to unwind
         // before tearing down: the teardown below must read the FINAL

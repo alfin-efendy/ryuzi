@@ -1,12 +1,12 @@
 //! `WizardState` — the first-run wizard as a pure, terminal-free state
 //! machine (rendering lives in `render.rs`).
 //!
-//! Three phases: pick gateways, pick runtimes, then fill in any still-missing
-//! required settings. Persistence is eager — each list phase's Enter writes
-//! straight through `AppController` before advancing, so quitting mid-fields
-//! still leaves the gateway/runtime choice saved.
+//! Two phases: pick gateways, then fill in any still-missing required
+//! settings. Persistence is eager — the gateway phase's Enter writes
+//! straight through `AppController` before advancing, so quitting
+//! mid-fields still leaves the gateway choice saved.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ryuzi_core::settings::ConfigField;
 
@@ -16,7 +16,6 @@ use crate::tui::Key;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WizardPhase {
     Gateways,
-    Runtimes,
     Fields,
 }
 
@@ -26,10 +25,6 @@ pub struct WizardState {
     /// cursor on its first row.
     pub cursor: usize,
     pub gw_sel: Vec<String>,
-    pub rt_sel: Vec<String>,
-    /// runtime id -> "✓ 1.2.3" / "✗ not found"; absent = still pending ("…"
-    /// is a rendering concern, not state).
-    pub detected: HashMap<String, String>,
     pub fields: Vec<&'static ConfigField>,
     pub field_idx: usize,
     pub draft: String,
@@ -39,30 +34,13 @@ pub struct WizardState {
 }
 
 impl WizardState {
-    /// Pre-checks `gw_sel`/`rt_sel` from the persisted `enabled_*` settings
-    /// and eagerly detects every catalog runtime up front (detection is
-    /// synchronous, so results are complete before the first render).
+    /// Pre-checks `gw_sel` from the persisted `enabled_gateways` setting.
     pub async fn new(controller: &AppController) -> Self {
         let gw_sel = controller.enabled_gateways().await;
-        let rt_sel = controller.enabled_runtimes().await;
-        let mut detected = HashMap::new();
-        for r in controller.runtime_descriptors() {
-            let info = controller.detect_runtime(r.id);
-            let value = if info.found {
-                format!("✓ {}", info.version.unwrap_or_default())
-                    .trim()
-                    .to_string()
-            } else {
-                "✗ not found".to_string()
-            };
-            detected.insert(r.id.to_string(), value);
-        }
         Self {
             phase: WizardPhase::Gateways,
             cursor: 0,
             gw_sel,
-            rt_sel,
-            detected,
             fields: Vec::new(),
             field_idx: 0,
             draft: String::new(),
@@ -72,34 +50,19 @@ impl WizardState {
         }
     }
 
-    /// Catalog ids for whichever list is on screen; empty once in `Fields`.
-    fn phase_ids(&self, controller: &AppController) -> Vec<&'static str> {
-        match self.phase {
-            WizardPhase::Gateways => controller
-                .gateway_descriptors()
-                .iter()
-                .map(|g| g.id)
-                .collect(),
-            WizardPhase::Runtimes => controller
-                .runtime_descriptors()
-                .iter()
-                .map(|r| r.id)
-                .collect(),
-            WizardPhase::Fields => Vec::new(),
-        }
-    }
-
     pub async fn handle(&mut self, key: Key, controller: &AppController) {
         match self.phase {
-            WizardPhase::Gateways | WizardPhase::Runtimes => {
-                self.handle_list(key, controller).await
-            }
+            WizardPhase::Gateways => self.handle_list(key, controller).await,
             WizardPhase::Fields => self.handle_fields(key, controller).await,
         }
     }
 
     async fn handle_list(&mut self, key: Key, controller: &AppController) {
-        let ids = self.phase_ids(controller);
+        let ids: Vec<&'static str> = controller
+            .gateway_descriptors()
+            .iter()
+            .map(|g| g.id)
+            .collect();
         match key {
             Key::Up if !ids.is_empty() => {
                 self.cursor = if self.cursor > 0 {
@@ -117,55 +80,23 @@ impl WizardState {
             }
             Key::Space => {
                 if let Some(&id) = ids.get(self.cursor) {
-                    let sel = match self.phase {
-                        WizardPhase::Gateways => &mut self.gw_sel,
-                        WizardPhase::Runtimes => &mut self.rt_sel,
-                        WizardPhase::Fields => return,
-                    };
-                    toggle(sel, id);
+                    toggle(&mut self.gw_sel, id);
                 }
             }
-            Key::Enter => match self.phase {
-                WizardPhase::Gateways => self.confirm_gateways(controller).await,
-                WizardPhase::Runtimes => self.confirm_runtimes(controller).await,
-                WizardPhase::Fields => {}
-            },
+            Key::Enter => self.confirm_gateways(controller).await,
             Key::Esc => self.exit = true,
             _ => {}
         }
     }
 
-    /// Enter is a no-op while nothing is selected.
+    /// Enter is a no-op while nothing is selected. Persists the gateway
+    /// selection, then advances to Fields (or finishes immediately when
+    /// nothing required is still missing).
     async fn confirm_gateways(&mut self, controller: &AppController) {
         if self.gw_sel.is_empty() {
             return;
         }
         let _ = controller.set_enabled_gateways(&self.gw_sel).await;
-        self.phase = WizardPhase::Runtimes;
-        self.cursor = 0;
-    }
-
-    /// Enter is a no-op while nothing is selected. Persists the runtime
-    /// selection, sets the default runtime to the first *selected* runtime
-    /// in catalog order, then advances to Fields (or finishes immediately
-    /// when nothing required is still missing).
-    async fn confirm_runtimes(&mut self, controller: &AppController) {
-        if self.rt_sel.is_empty() {
-            return;
-        }
-        let _ = controller.set_enabled_runtimes(&self.rt_sel).await;
-        let ordered_rt: Vec<&'static str> = controller
-            .runtime_descriptors()
-            .iter()
-            .map(|r| r.id)
-            .filter(|id| self.rt_sel.iter().any(|s| s == id))
-            .collect();
-        let default_id = ordered_rt
-            .first()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.rt_sel[0].clone());
-        let _ = controller.set_default_runtime(&default_id).await;
-
         let missing = controller.required_missing_fields().await;
         let ordered = order_fields(controller, &missing).await;
         self.cursor = 0;
@@ -217,9 +148,8 @@ fn toggle(sel: &mut Vec<String>, id: &str) {
     }
 }
 
-/// Re-order missing fields so provider fields (gateway then runtime, in
-/// that relative order) come before global fields, preserving each group's
-/// original relative order.
+/// Re-order missing fields so gateway provider fields come before global
+/// fields, preserving each group's original relative order.
 async fn order_fields(
     controller: &AppController,
     missing: &[&'static ConfigField],
@@ -227,11 +157,6 @@ async fn order_fields(
     let mut provider_keys: HashSet<&'static str> = HashSet::new();
     for id in controller.enabled_gateways().await {
         for f in controller.gateway_fields(&id) {
-            provider_keys.insert(f.key);
-        }
-    }
-    for id in controller.enabled_runtimes().await {
-        for f in controller.runtime_fields(&id) {
             provider_keys.insert(f.key);
         }
     }
@@ -254,30 +179,20 @@ mod tests {
     use crate::tui::controller::controller_in;
 
     #[tokio::test]
-    async fn wizard_flow_gateways_runtimes_fields_done() {
+    async fn wizard_flow_gateways_fields_done() {
         let dir = tempfile::tempdir().unwrap();
-        let c = controller_in(dir.path()).await; // reuse Task 4's test helper (make it pub(crate) in controller tests or duplicate minimally)
-        c.set_enabled_gateways(&[]).await.unwrap(); // start from blank selections
-        c.set_enabled_runtimes(&[]).await.unwrap();
+        let c = controller_in(dir.path()).await;
+        c.set_enabled_gateways(&[]).await.unwrap(); // start from a blank selection
         let mut w = WizardState::new(&c).await;
         assert_eq!(w.phase, WizardPhase::Gateways);
-        assert_eq!(
-            w.detected.get("claude-code").map(String::as_str),
-            Some("✓ 2.1.0")
-        );
 
         w.handle(Key::Enter, &c).await; // Enter with empty selection: no-op
         assert_eq!(w.phase, WizardPhase::Gateways);
         w.handle(Key::Space, &c).await; // toggle discord
         w.handle(Key::Enter, &c).await;
-        assert_eq!(w.phase, WizardPhase::Runtimes);
-        assert_eq!(c.enabled_gateways().await, vec!["discord"]); // persisted eagerly
-
-        w.handle(Key::Space, &c).await; // toggle claude-code
-        w.handle(Key::Enter, &c).await;
         assert_eq!(w.phase, WizardPhase::Fields);
-        assert_eq!(c.default_runtime().await, "claude-code");
-        // provider fields before globals:
+        assert_eq!(c.enabled_gateways().await, vec!["discord"]); // persisted eagerly
+                                                                 // provider fields before globals:
         let keys: Vec<&str> = w.fields.iter().map(|f| f.key).collect();
         assert_eq!(
             keys,
@@ -323,7 +238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtimes_enter_with_zero_missing_fields_finishes_immediately() {
+    async fn gateways_enter_with_zero_missing_fields_finishes_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let c = controller_in(dir.path()).await;
         for (k, v) in [
@@ -334,9 +249,8 @@ mod tests {
         ] {
             c.set(k, v).await.unwrap();
         }
-        let mut w = WizardState::new(&c).await; // pre-checked from seeds
-        w.handle(Key::Enter, &c).await; // gateways confirmed (discord pre-checked)
-        w.handle(Key::Enter, &c).await; // runtimes confirmed → no missing → done
+        let mut w = WizardState::new(&c).await; // discord pre-checked from seeds
+        w.handle(Key::Enter, &c).await; // gateways confirmed → no missing → done
         assert!(w.done);
     }
 
@@ -345,7 +259,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = controller_in(dir.path()).await;
         c.set_enabled_gateways(&[]).await.unwrap();
-        c.set_enabled_runtimes(&[]).await.unwrap();
         let mut w = WizardState::new(&c).await;
         // Force into Fields phase at workdir_root field
         w.phase = WizardPhase::Fields;

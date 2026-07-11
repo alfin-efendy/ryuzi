@@ -43,7 +43,6 @@ function project() {
     name: "proj",
     workdir: "/w",
     source: null,
-    harness: "native",
     model: null,
     effort: null,
     permMode: "default" as const,

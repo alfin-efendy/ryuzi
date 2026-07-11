@@ -308,30 +308,6 @@ pub async fn servers_for_session(
     Ok(out)
 }
 
-/// Convert an engine spec into the ACP wire type for `session/new`.
-pub fn to_acp(spec: &McpServerSpec) -> agent_client_protocol_schema::v1::McpServer {
-    use agent_client_protocol_schema::v1 as acp;
-    match &spec.transport {
-        McpTransport::Stdio { command, args, env } => acp::McpServer::Stdio(
-            acp::McpServerStdio::new(spec.name.clone(), command.clone())
-                .args(args.clone())
-                .env(
-                    env.iter()
-                        .map(|(k, v)| acp::EnvVariable::new(k.clone(), v.clone()))
-                        .collect(),
-                ),
-        ),
-        McpTransport::Http { url, headers } => acp::McpServer::Http(
-            acp::McpServerHttp::new(spec.name.clone(), url.clone()).headers(
-                headers
-                    .iter()
-                    .map(|(k, v)| acp::HttpHeader::new(k.clone(), v.clone()))
-                    .collect(),
-            ),
-        ),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tool-permission bridge (`mcp__<server>__<tool>` names)
 // ---------------------------------------------------------------------------

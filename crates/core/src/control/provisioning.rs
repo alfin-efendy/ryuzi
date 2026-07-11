@@ -13,7 +13,6 @@ use std::sync::Arc;
 /// to the admin-configured default setting" (see `provision_project`).
 #[derive(Debug, Clone, Default)]
 pub struct ProvisionSettings {
-    pub harness: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub perm_mode: Option<PermMode>,
@@ -73,31 +72,17 @@ async fn run_git(args: &[&str]) -> anyhow::Result<()> {
 }
 
 impl ControlPlane {
-    /// Connect an existing local folder (git repo or not) as a project driven
-    /// by the default `native` (Ryuzi) harness. Prefer
-    /// [`connect_project_with_harness`] to select a runtime.
+    /// Connect an existing local folder (git repo or not) as a project.
+    /// Non-git folders are allowed — git features (branches, worktrees,
+    /// review diffs) are disabled for them in the UI, and the flag
+    /// self-corrects after a later `git init`.
     pub async fn connect_project(&self, workdir: &Path, name: &str) -> anyhow::Result<Project> {
-        self.connect_project_with_harness(workdir, name, "native")
-            .await
-    }
-
-    /// Connect an existing local folder as a project driven by `harness`
-    /// (e.g. `"native"` or `"claude-code"`). Non-git folders are allowed —
-    /// git features (branches, worktrees, review diffs) are disabled for
-    /// them in the UI, and the flag self-corrects after a later `git init`.
-    pub async fn connect_project_with_harness(
-        &self,
-        workdir: &Path,
-        name: &str,
-        harness: &str,
-    ) -> anyhow::Result<Project> {
         let is_git = git2::Repository::open(workdir).is_ok();
         let project = Project {
             project_id: new_id(),
             name: name.to_string(),
             workdir: workdir.to_string_lossy().into_owned(),
             source: None,
-            harness: harness.to_string(),
             model: None,
             effort: None,
             perm_mode: PermMode::Default,
@@ -141,7 +126,6 @@ impl ControlPlane {
             name,
             workdir: wd,
             source: Some(url.to_string()),
-            harness: "native".to_string(),
             model: None,
             effort: None,
             perm_mode: PermMode::Default,
@@ -226,11 +210,6 @@ impl ControlPlane {
         let admin = is_admin(&req.actor_role_ids, &admin_role_ids);
         let (perm_mode, _downgraded) = gate_perm_mode(requested_mode, admin);
 
-        let default_runtime = settings
-            .get("default_runtime")
-            .await?
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "claude-code".to_string());
         let default_model = settings
             .get("default_model")
             .await?
@@ -245,7 +224,6 @@ impl ControlPlane {
             name,
             workdir: workdir.to_string_lossy().into_owned(),
             source,
-            harness: s.harness.clone().unwrap_or(default_runtime),
             model: s.model.clone().or(default_model),
             effort: s.effort.clone().or(default_effort),
             perm_mode,

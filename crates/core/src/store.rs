@@ -356,10 +356,18 @@ fn migrations() -> Migrations<'static> {
         // one pass. The claude-code harness itself STAYS registered so an
         // unrewritten row (restored DB) still resolves at session start.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
-            tx.execute(
-                "UPDATE projects SET harness='native' WHERE harness='claude-code'",
-                [],
-            )?;
+            // Guarded: migration 21 drops projects.harness, and the
+            // rewind-and-replay migration test re-runs THIS hook on a post-21
+            // schema (where the column no longer exists).
+            let has_harness = tx
+                .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name='harness'")?
+                .exists([])?;
+            if has_harness {
+                tx.execute(
+                    "UPDATE projects SET harness='native' WHERE harness='claude-code'",
+                    [],
+                )?;
+            }
             tx.execute(
                 "UPDATE settings SET value='native' WHERE key='default_runtime' AND value='claude-code'",
                 [],
@@ -404,7 +412,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migration_13_rewrites_claude_code_defaults_to_native`,
+        // rewind-and-replay in `migrations_13_to_21_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -512,12 +520,14 @@ fn migrations() -> Migrations<'static> {
             DROP TABLE plugin_oauth_clients;\
             ALTER TABLE plugin_oauth_clients_rebuild RENAME TO plugin_oauth_clients;",
         ),
-        // Per-session permission mode (batch-3 design): sessions previously
-        // shared the project's mode; now each session carries its own,
-        // seeded from the owning project. Hook-guarded (SQLite has no ADD
+        // Migration 20 — Per-session permission mode (batch-3 design): sessions
+        // previously shared the project's mode; now each session carries its
+        // own, seeded from the owning project. Hook-guarded (SQLite has no ADD
         // COLUMN IF NOT EXISTS) like branch_owned above: the rewind-and-replay
         // test re-runs every migration appended after 13 on a DB that already
         // has this column, so a plain ALTER would fail with "duplicate column".
+        // This batch-3 migration shipped to main first, so it keeps slot 20 and
+        // runs BEFORE the native-only migration on upgrade.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
             let exists = tx
                 .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='perm_mode'")?
@@ -536,7 +546,70 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
-        // Chat-first sessions (design: docs/superpowers/specs/
+        // Migration 21 — Native-only runtime (design:
+        // docs/design/2026-07-10-native-only-runtime-design.md §5): the runtime
+        // concept dies. Renumbered from 20 to 21 in integration merge #2 because
+        // batch-3's per-session perm_mode migration (above) shipped to main
+        // first and takes slot 20; this native-only migration is now the tail.
+        // Drop the legacy per-project harness and per-job agent columns
+        // (SQLite >= 3.35 DROP COLUMN; bundled 3.45), copy the native agents-row
+        // model/perm_mode into the agent_model / agent_perm_mode settings KV
+        // (only when the KV key is absent), drop the agents/agent_tiers tables,
+        // delete the dead settings keys, and prune non-native mcp_agent_access
+        // rows. Every statement is existence-guarded so the rewind-and-replay
+        // migration test's re-run on an already-migrated DB is a no-op. Ordering
+        // is safe: batch-3's migration 20 only touches sessions.perm_mode (a
+        // column this migration never removes), so running it first is inert
+        // with respect to the harness/agents/settings artifacts dropped here.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let col_exists = |table: &str, col: &str| -> rusqlite::Result<bool> {
+                tx.prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'"
+                ))?
+                .exists([])
+            };
+            let table_exists = |name: &str| -> rusqlite::Result<bool> {
+                tx.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
+                    .exists([name])
+            };
+            if col_exists("projects", "harness")? {
+                tx.execute("ALTER TABLE projects DROP COLUMN harness", [])?;
+            }
+            if col_exists("jobs", "agent")? {
+                tx.execute("ALTER TABLE jobs DROP COLUMN agent", [])?;
+            }
+            if table_exists("agents")? {
+                // Preserve the user's native model/perm-mode choices in settings
+                // KV — but never clobber a value the new Settings UI already wrote.
+                tx.execute(
+                    "INSERT INTO settings(key, value) \
+                     SELECT 'agent_model', model FROM agents \
+                     WHERE id='native' AND model IS NOT NULL AND trim(model) != '' \
+                     AND NOT EXISTS (SELECT 1 FROM settings WHERE key='agent_model')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO settings(key, value) \
+                     SELECT 'agent_perm_mode', perm_mode FROM agents \
+                     WHERE id='native' AND trim(perm_mode) != '' \
+                     AND NOT EXISTS (SELECT 1 FROM settings WHERE key='agent_perm_mode')",
+                    [],
+                )?;
+                tx.execute("DROP TABLE agents", [])?;
+            }
+            tx.execute("DROP TABLE IF EXISTS agent_tiers", [])?;
+            tx.execute(
+                "DELETE FROM settings WHERE key IN \
+                 ('enabled_runtimes','default_runtime','default_agent','agents_snapshot')",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM mcp_agent_access WHERE agent_id != 'native'",
+                [],
+            )?;
+            Ok(())
+        }),
+        // Migration 22 — Chat-first sessions (design: docs/superpowers/specs/
         // 2026-07-11-chat-first-sessions-design.md, Phase 2 Task A1):
         // sessions.project_id becomes nullable (chat/worker/review sessions
         // aren't bound to a project) and gains `kind` + `speaker`/`agent`/
@@ -544,10 +617,12 @@ fn migrations() -> Migrations<'static> {
         // constraint in place, so rebuild the table: create the new shape,
         // copy every existing column, drop, rename. Existing rows all get
         // kind='project' with null lineage columns — correct, they were all
-        // project sessions before this migration. This rebuild is appended
-        // AFTER the perm_mode migration above, so `sessions` already carries
-        // `perm_mode` here: sessions_new must include it and copy it forward,
-        // or the rebuild would silently drop the column perm_mode just added.
+        // project sessions before this migration. Appended as the tail (after
+        // migration 20 perm_mode and migration 21 native-only, neither of which
+        // adds or removes a sessions column beyond perm_mode), so `sessions`
+        // carries exactly the original 12 columns + perm_mode here: sessions_new
+        // must include perm_mode and copy it forward, or the rebuild would
+        // silently drop the column migration 20 added.
         M::up(
             r#"
             CREATE TABLE sessions_new (
@@ -596,7 +671,7 @@ pub struct ContextCheckpoint {
 }
 
 fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
-    let perm: String = r.get(7)?;
+    let perm: String = r.get(6)?;
     let workdir: String = r.get(2)?;
     Ok(Project {
         project_id: r.get(0)?,
@@ -606,16 +681,14 @@ fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
         is_git: git2::Repository::open(&workdir).is_ok(),
         workdir,
         source: r.get(3)?,
-        harness: r.get(4)?,
-        model: r.get(5)?,
-        effort: r.get(6)?,
+        model: r.get(4)?,
+        effort: r.get(5)?,
         perm_mode: PermMode::from_db(&perm),
-        created_at: r.get(8)?,
+        created_at: r.get(7)?,
     })
 }
 
-const PROJECT_COLS: &str =
-    "project_id,name,workdir,source,harness,model,effort,perm_mode,created_at";
+const PROJECT_COLS: &str = "project_id,name,workdir,source,model,effort,perm_mode,created_at";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageRecord {
@@ -833,9 +906,7 @@ impl Store {
         .await?;
         interact_on(&pool, |c| {
             c.execute_batch(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_gateways', 'discord');\
-                 INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_runtimes', 'native');\
-                 INSERT OR IGNORE INTO settings(key, value) VALUES ('default_runtime', 'native');",
+                "INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_gateways', 'discord');",
             )
         })
         .await?;
@@ -959,14 +1030,12 @@ impl Store {
         id: &str,
         model: Option<String>,
         perm_mode: PermMode,
-        harness: &str,
     ) -> anyhow::Result<Option<Project>> {
         let id_owned = id.to_string();
-        let harness = harness.to_string();
         self.with_conn(move |c| {
             c.execute(
-                "UPDATE projects SET model=?2, perm_mode=?3, harness=?4 WHERE project_id=?1",
-                params![id_owned, model, perm_mode.as_str(), harness],
+                "UPDATE projects SET model=?2, perm_mode=?3 WHERE project_id=?1",
+                params![id_owned, model, perm_mode.as_str()],
             )
             .map(|_| ())
         })
@@ -977,10 +1046,10 @@ impl Store {
     pub async fn insert_project(&self, p: Project) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO projects(project_id,name,workdir,source,harness,model,effort,perm_mode,created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                "INSERT INTO projects(project_id,name,workdir,source,model,effort,perm_mode,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
-                    p.project_id, p.name, p.workdir, p.source, p.harness,
+                    p.project_id, p.name, p.workdir, p.source,
                     p.model, p.effort, p.perm_mode.as_str(), p.created_at
                 ],
             )
@@ -2110,7 +2179,6 @@ mod tests {
             name: "demo".into(),
             workdir: "/tmp/demo".into(),
             source: None,
-            harness: "claude-code".into(),
             model: None,
             effort: None,
             perm_mode: PermMode::Default,
@@ -2748,12 +2816,7 @@ mod tests {
         store.insert_project(sample_project()).await.unwrap();
 
         let updated = store
-            .update_project(
-                "p1",
-                Some("claude-opus-4-5".into()),
-                PermMode::AcceptEdits,
-                "claude-code",
-            )
+            .update_project("p1", Some("claude-opus-4-5".into()), PermMode::AcceptEdits)
             .await
             .unwrap()
             .unwrap();
@@ -2762,7 +2825,7 @@ mod tests {
 
         // Unknown project → Ok(None), not an error.
         assert!(store
-            .update_project("missing", None, PermMode::Default, "claude-code")
+            .update_project("missing", None, PermMode::Default)
             .await
             .unwrap()
             .is_none());
@@ -2875,22 +2938,6 @@ mod tests {
                 .as_deref(),
             Some("discord")
         );
-        assert_eq!(
-            store
-                .get_setting_raw("enabled_runtimes")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native")
-        );
-        assert_eq!(
-            store
-                .get_setting_raw("default_runtime")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native")
-        );
         // Upsert + empty string is a real value:
         store
             .set_setting_raw("workdir_root", "/repos")
@@ -3001,7 +3048,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 21, "forward migration must land at v21");
+        assert_eq!(user_version, 22, "forward migration must land at v22");
     }
 
     #[tokio::test]
@@ -3142,9 +3189,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_13_rewrites_claude_code_defaults_to_native() {
+    async fn migrations_13_to_21_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back nine so the
+        // DB, seed the old values, then wind user_version back ten so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
@@ -3152,27 +3199,33 @@ mod tests {
         // CREATE TABLE IF NOT EXISTS; 18 plugin_oauth_clients — CREATE TABLE
         // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
         // copy-drop-rename; 20 sessions.perm_mode — hook-guarded, like
-        // branch_owned; 21 sessions rebuild — nullable project_id + kind/
-        // speaker/agent/parent_session_pk, copies every existing column
-        // forward including perm_mode, so it's also a no-op on replay) re-run
-        // on the next open. `Migrations` always fast-forwards to the latest
-        // defined version, so there is no way to replay 13 alone once
-        // something is appended after it. Bump this offset by one for every
-        // migration appended after 13 — a stale offset silently skips
-        // migration 13 (the DB opens fine, but this test starts failing its
-        // assertions). With migrations through 21 defined, wind back nine.
+        // branch_owned; 21 native-only cleanup — fully existence-guarded;
+        // 22 sessions rebuild — nullable project_id + kind/speaker/agent/
+        // parent_session_pk, copies every existing column forward including
+        // perm_mode; all no-ops on replay) re-run on the next open.
+        // `Migrations` always fast-forwards to the latest defined version, so
+        // there is no way to replay 13 alone once something is appended after
+        // it. Bump this offset by one for every migration appended after 13 —
+        // a stale offset silently skips migration 13 (the DB opens fine, but
+        // this test starts failing its assertions). With migrations through 22
+        // defined, wind back ten.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 9)
+            c.pragma_update(None, "user_version", v - 10)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
+                    // The DB is fully migrated to v21 here, so `harness` was
+                    // already dropped: re-add it (and rows) so migration 13's
+                    // guarded UPDATE and migration 21's guarded DROP both run
+                    // their real paths on replay.
                     c.execute_batch(
-                        "INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p-old', 'old', '/w', 'claude-code');
-                         INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p-new', 'new', '/w2', 'native');
+                        "ALTER TABLE projects ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude-code';
+                         INSERT INTO projects(project_id, name, workdir) VALUES ('p-old', 'old', '/w');
+                         INSERT INTO projects(project_id, name, workdir) VALUES ('p-new', 'new', '/w2');
                          UPDATE settings SET value='claude-code' WHERE key='default_runtime';
                          UPDATE settings SET value='claude-code,codex' WHERE key='enabled_runtimes';
                          INSERT INTO settings(key, value) VALUES ('default_agent', 'claude');",
@@ -3184,53 +3237,149 @@ mod tests {
         }
 
         let store = Store::open(tmp.path()).await.unwrap();
-        assert_eq!(
-            store.get_project("p-old").await.unwrap().unwrap().harness,
-            "native",
-            "claude-code project rows must be rewritten to native"
-        );
-        assert_eq!(
-            store.get_project("p-new").await.unwrap().unwrap().harness,
-            "native"
-        );
-        assert_eq!(
-            store
-                .get_setting("default_runtime")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native")
-        );
-        assert_eq!(
-            store.get_setting("default_agent").await.unwrap().as_deref(),
-            Some("native")
-        );
-        // CSV: claude-code swapped for native, other entries preserved.
-        assert_eq!(
-            store
-                .get_setting("enabled_runtimes")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native,codex")
-        );
+        // Migration 13 rewrote the legacy values; migration 21 then deleted the
+        // runtime-era keys and the harness column outright.
+        assert!(store
+            .get_setting("default_runtime")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.get_setting("default_agent").await.unwrap().is_none());
+        assert!(store
+            .get_setting("enabled_runtimes")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.get_project("p-old").await.unwrap().is_some());
+        assert!(store.get_project("p-new").await.unwrap().is_some());
 
-        // Idempotent: winding back and re-running must not change anything
-        // (e.g. it must not duplicate 'native' in the CSV).
+        // Idempotent: winding back and re-running must not error or resurrect keys.
+        store.with_conn(rewind).await.unwrap();
+        drop(store);
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store
+            .get_setting("enabled_runtimes")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.get_project("p-old").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn migration_21_drops_the_runtime_concept() {
+        // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
+        // manually re-create every legacy artifact migration 21 handles,
+        // wind user_version back two, and reopen so 21 (and the tail migration
+        // 22 sessions rebuild) replay against it.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            c.pragma_update(None, "user_version", v - 2)
+        };
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        "ALTER TABLE projects ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude-code';
+                         INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p1', 'legacy', '/w', 'claude-code');
+                         ALTER TABLE jobs ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude';
+                         INSERT INTO jobs(id, name, cron, project_id, prompt, agent) VALUES ('j1', 'audit', '0 2 * * *', 'p1', 'run it', 'claude');
+                         CREATE TABLE agents (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, model TEXT, perm_mode TEXT NOT NULL DEFAULT 'ask', flags TEXT NOT NULL DEFAULT '');
+                         INSERT INTO agents(id, enabled, model, perm_mode) VALUES ('native', 1, 'openrouter/qwen3:free', 'edit');
+                         INSERT INTO agents(id, enabled, model, perm_mode) VALUES ('claude', 1, 'claude-opus-4-5', 'ask');
+                         CREATE TABLE agent_tiers (agent_id TEXT NOT NULL, tier_id TEXT NOT NULL, value TEXT, combo INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (agent_id, tier_id));
+                         INSERT INTO agent_tiers(agent_id, tier_id, value) VALUES ('claude', 'fast', 'claude-haiku-4-5');
+                         INSERT OR REPLACE INTO settings(key, value) VALUES ('enabled_runtimes', 'native,codex');
+                         INSERT OR REPLACE INTO settings(key, value) VALUES ('default_runtime', 'native');
+                         INSERT OR REPLACE INTO settings(key, value) VALUES ('default_agent', 'native');
+                         INSERT OR REPLACE INTO settings(key, value) VALUES ('agents_snapshot', '[]');
+                         INSERT INTO mcp_agent_access(server_id, agent_id, allowed) VALUES ('srv1', 'native', 1);
+                         INSERT INTO mcp_agent_access(server_id, agent_id, allowed) VALUES ('srv1', 'claude', 1);
+                         INSERT INTO mcp_agent_access(server_id, agent_id, allowed) VALUES ('srv1', 'codex', 0);",
+                    )?;
+                    rewind(c)
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        // Columns gone.
+        let (has_harness, has_agent, has_agents_table) = store
+            .with_conn(|c| {
+                let h = c
+                    .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name='harness'")?
+                    .exists([])?;
+                let a = c
+                    .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='agent'")?
+                    .exists([])?;
+                let t = c
+                    .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('agents','agent_tiers')")?
+                    .exists([])?;
+                Ok((h, a, t))
+            })
+            .await
+            .unwrap();
+        assert!(!has_harness, "projects.harness must be dropped");
+        assert!(!has_agent, "jobs.agent must be dropped");
+        assert!(!has_agents_table, "agents/agent_tiers must be dropped");
+        // Rows survive the column drops and still load through the new readers.
+        assert_eq!(
+            store.get_project("p1").await.unwrap().unwrap().name,
+            "legacy"
+        );
+        assert_eq!(
+            crate::scheduler::get_job(&store, "j1")
+                .await
+                .unwrap()
+                .unwrap()
+                .prompt,
+            "run it"
+        );
+        // Native prefs copied into KV; dead settings keys deleted.
+        assert_eq!(
+            store.get_setting("agent_model").await.unwrap().as_deref(),
+            Some("openrouter/qwen3:free")
+        );
+        assert_eq!(
+            store
+                .get_setting("agent_perm_mode")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("edit")
+        );
+        for key in [
+            "enabled_runtimes",
+            "default_runtime",
+            "default_agent",
+            "agents_snapshot",
+        ] {
+            assert!(
+                store.get_setting(key).await.unwrap().is_none(),
+                "{key} must be deleted"
+            );
+        }
+        // Only the native mcp_agent_access row survives.
+        let rows: i64 = store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM mcp_agent_access", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        // KV-absent rule: a pre-existing agent_model must NOT be clobbered on replay.
+        store
+            .set_setting("agent_model", "user-chose-this")
+            .await
+            .unwrap();
         store.with_conn(rewind).await.unwrap();
         drop(store);
         let store = Store::open(tmp.path()).await.unwrap();
         assert_eq!(
-            store
-                .get_setting("enabled_runtimes")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native,codex")
-        );
-        assert_eq!(
-            store.get_project("p-old").await.unwrap().unwrap().harness,
-            "native"
+            store.get_setting("agent_model").await.unwrap().as_deref(),
+            Some("user-chose-this"),
+            "replay on an already-migrated DB must be a no-op"
         );
     }
 
