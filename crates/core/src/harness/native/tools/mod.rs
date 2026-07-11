@@ -24,6 +24,7 @@ pub mod ls;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;
+pub mod orch_block;
 pub mod plan;
 pub mod question;
 pub mod read;
@@ -337,6 +338,10 @@ impl ToolRegistry {
             Arc::new(session_search::SessionSearch),
             Arc::new(plan::ExitPlanMode),
             Arc::new(question::AskUserQuestion),
+            // Gated to `kind='worker'` sessions — see
+            // `runner::visible_tool_defs` (schema) and its own
+            // `Store::task_by_session` guard (runtime).
+            Arc::new(orch_block::OrchBlock),
         ];
         let mut tools = BTreeMap::new();
         for t in list {
@@ -699,11 +704,12 @@ mod tests {
             "session_search",
             "exitplanmode",
             "askuserquestion",
+            "orch_block",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 20);
+        assert_eq!(defs.len(), 21);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

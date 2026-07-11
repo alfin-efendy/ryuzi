@@ -550,6 +550,32 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Deliver a human's answer to a blocked worker (spec §8, Task E6). The
+    /// answer flows back over the rail (`kind='unblock'`) as a clean new user
+    /// turn once the worker session is idle — never a mid-turn splice; the
+    /// idle-only drainer resumes the worker. Returns whether the task was
+    /// actually blocked (a stale/unknown/already-resumed task id is a no-op,
+    /// not an error).
+    pub async fn answer_orch_block(&self, task_id: &str, answer: &str) -> anyhow::Result<bool> {
+        let Some(task) = crate::orch::get_task(&self.store, task_id).await? else {
+            return Ok(false);
+        };
+        if task.status != "blocked" {
+            return Ok(false);
+        }
+        let Some(worker) = task.session_pk.as_deref() else {
+            return Ok(false);
+        };
+        let block = format!(
+            "[HUMAN ANSWER — orchestration block for task {task_id}] The user answered your \
+             blocking question. Continue the subtask using this answer.\n\n{answer}"
+        );
+        self.store
+            .enqueue_background_event(worker, "unblock", &block)
+            .await?;
+        Ok(true)
+    }
+
     /// Background half of `start_session_with_prompt`. Registers a
     /// cancellation token in `starting` for the duration of the phases so a
     /// stop/end that lands mid-startup can abort them cleanly.
@@ -1371,6 +1397,7 @@ impl ControlPlane {
 
         let deps = RunnerDeps {
             session_pk: review_pk.clone(),
+            kind: SessionKind::Review,
             work_dir,
             attachments_dir: None,
             extra_skill_dirs,

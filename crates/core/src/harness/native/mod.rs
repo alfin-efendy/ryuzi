@@ -227,6 +227,7 @@ impl Harness for NativeHarness {
             steer: steer.clone(),
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
+                kind: ctx.kind,
                 work_dir: ctx.work_dir,
                 attachments_dir: ctx.attachments_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,

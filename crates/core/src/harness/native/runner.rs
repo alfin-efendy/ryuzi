@@ -17,7 +17,7 @@ use super::tools::{
 };
 use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
-use crate::domain::{CoreEvent, NewMessage, PermMode};
+use crate::domain::{CoreEvent, NewMessage, PermMode, SessionKind};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
 use crate::llm_router::model_effort::TurnEffortPolicy;
@@ -89,6 +89,10 @@ pub struct LearningPayload {
 #[derive(Clone)]
 pub struct RunnerDeps {
     pub session_pk: String,
+    /// The session's kind (`Project`, `Chat`, `Worker`, `Review`), mirroring
+    /// `SessionCtx::kind`. Consulted by `visible_tool_defs` to schema-gate
+    /// `orch_block` (Task E6, spec §8) to `Worker` sessions only.
+    pub kind: SessionKind,
     pub work_dir: PathBuf,
     /// Session attachments folder (second read root for the `read` tool).
     pub attachments_dir: Option<PathBuf>,
@@ -566,6 +570,30 @@ const BUDGET_EXHAUSTED_PROMPT: &str = "You've reached the maximum number of \
     summarizing what you've found and accomplished so far, without calling \
     any more tools.";
 
+/// The tool definitions a turn advertises to the model: the registry's
+/// tools filtered by the agent's allow-list, with `orch_block` additionally
+/// hidden from every session kind but `Worker` (Task E6, spec §8) — the
+/// SCHEMA-level half of the gate. This is advisory, not the safety boundary:
+/// dispatch (`run_tool_call`'s `agent.tools.allows` check) still enforces the
+/// agent's real whitelist regardless of what's advertised, and `orch_block`'s
+/// own `Store::task_by_session` lookup is the authoritative RUNTIME guard — a
+/// non-worker session has no orch task row for its `session_pk` even if it
+/// somehow called the tool anyway.
+fn visible_tool_defs(tools: &ToolRegistry, agent: &Agent, kind: SessionKind) -> Vec<Value> {
+    tools
+        .definitions()
+        .into_iter()
+        .filter(|d| {
+            d.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| {
+                    agent.tools.allows(n) && (n != "orch_block" || kind == SessionKind::Worker)
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 /// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
 /// `display` gates persistence of display rows: sub-agents stream only their
 /// tool rows (tagged with their label) so their text/thinking stay internal.
@@ -594,17 +622,7 @@ async fn drive(
     // non-whitelisted call is refused, not merely hidden from the model.
     let tool_defs: Vec<Value> = match &deps.review_tool_defs {
         Some(captured) => captured.clone(),
-        None => deps
-            .tools
-            .definitions()
-            .into_iter()
-            .filter(|d| {
-                d.get("name")
-                    .and_then(|n| n.as_str())
-                    .map(|n| agent.tools.allows(n))
-                    .unwrap_or(false)
-            })
-            .collect(),
+        None => visible_tool_defs(&deps.tools, agent, deps.kind),
     };
     let model = deps.model.clone().unwrap_or_default();
     let mut final_text = String::new();
@@ -2398,6 +2416,7 @@ mod tests {
         let agent = agents.default_agent();
         RunnerDeps {
             session_pk: "s1".into(),
+            kind: SessionKind::Chat,
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
             extra_skill_dirs: vec![],
@@ -4285,6 +4304,31 @@ mod tests {
         let eff = effective_child_filter(&ToolFilter::All, &ToolFilter::All, &names, &["memory"]);
         assert!(eff.allows("task") && eff.allows("read"));
         assert!(!eff.allows("memory"));
+    }
+
+    /// Task E6 schema gate: `orch_block` is hidden from every session kind
+    /// but `Worker`, even for an agent (`build`) whose own `ToolFilter` is
+    /// `All`. The tool's own `Store::task_by_session` lookup (exercised in
+    /// `tools::orch_block`'s tests) is the runtime backstop this pairs with.
+    #[test]
+    fn visible_tool_defs_hides_orch_block_outside_worker_sessions() {
+        let tools = ToolRegistry::builtin();
+        let agent = AgentRegistry::builtin().default_agent();
+        assert_eq!(agent.tools, super::super::agents::ToolFilter::All);
+        let names = |defs: &[Value]| -> Vec<String> {
+            defs.iter()
+                .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        };
+        for kind in [SessionKind::Chat, SessionKind::Project, SessionKind::Review] {
+            let defs = visible_tool_defs(&tools, &agent, kind);
+            assert!(
+                !names(&defs).contains(&"orch_block".to_string()),
+                "{kind:?} must not see orch_block"
+            );
+        }
+        let worker_defs = visible_tool_defs(&tools, &agent, SessionKind::Worker);
+        assert!(names(&worker_defs).contains(&"orch_block".to_string()));
     }
 
     #[test]

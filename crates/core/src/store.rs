@@ -3602,6 +3602,29 @@ impl Store {
         })
         .await
     }
+
+    /// The orch task whose worker (or judge) session is `session_pk`, if any.
+    /// The `orch_block` tool's runtime guard (Task E6, spec §8): a session
+    /// with no matching row here is not an orchestrated worker turn, so the
+    /// tool refuses regardless of what the schema-level gate advertised.
+    pub async fn task_by_session(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<crate::orch::OrchTask>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM orch_tasks WHERE session_pk=?1",
+                    crate::orch::ORCH_COLS
+                ),
+                params![session_pk],
+                crate::orch::task_from,
+            )
+            .optional()
+        })
+        .await
+    }
 }
 
 const SESSION_COLS: &str =
