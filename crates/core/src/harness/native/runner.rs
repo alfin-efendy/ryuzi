@@ -138,6 +138,19 @@ pub struct RunnerDeps {
     /// Hydrated once in `NativeHarness::start_session`; shared (same `Arc`)
     /// with every sub-agent this session spawns.
     pub nudge: Arc<NudgeState>,
+    /// Task 9 cache-parity override: when `Some`, `drive()` advertises THESE
+    /// tool definitions verbatim instead of filtering `tools.definitions()`
+    /// by `agent.tools` — the review fork must send the parent's exact
+    /// captured `tool_defs` for the provider cache to hit, while dispatch
+    /// (`run_tool_call`'s `agent.tools.allows` check) still enforces the
+    /// fork's real whitelist regardless of what's advertised. `None` for
+    /// every non-review turn (parent and sub-agent).
+    pub review_tool_defs: Option<Vec<Value>>,
+    /// Which actor is driving this session's tool calls (Phase 4 §7) —
+    /// threaded into every `ToolCtx` this session's `run_tool_call` builds.
+    /// `User` for ordinary interactive sessions; the background review fork
+    /// (Task 9) sets `BackgroundReview` so Task 6's skill-write guard applies.
+    pub write_origin: crate::domain::WriteOrigin,
 }
 
 impl RunnerDeps {
@@ -523,6 +536,13 @@ enum DisplayMode {
     /// thinking, notices, and context usage stay internal (the report arrives
     /// via the parent's `task` tool output).
     ToolsOnly { label: String },
+    /// Background review fork (Task 9): nothing but its own tool_call rows
+    /// (on the review session, never the parent) — no text/thinking/notice/
+    /// context-usage display, no auto-continue, no compaction, and —
+    /// crucially — `display.text()` gates `maybe_enqueue_review`'s nudge
+    /// trigger, so a review fork can never recursively enqueue another
+    /// review of itself.
+    Silent,
 }
 
 impl DisplayMode {
@@ -534,7 +554,7 @@ impl DisplayMode {
     fn subagent(&self) -> Option<&str> {
         match self {
             DisplayMode::ToolsOnly { label } => Some(label),
-            DisplayMode::Full => None,
+            DisplayMode::Full | DisplayMode::Silent => None,
         }
     }
 }
@@ -566,18 +586,26 @@ async fn drive(
             context::assemble_system(&deps.work_dir, &deps.extra_skill_dirs, memory.as_deref())
         }
     };
-    // Tools restricted to what this agent may use.
-    let tool_defs: Vec<Value> = deps
-        .tools
-        .definitions()
-        .into_iter()
-        .filter(|d| {
-            d.get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| agent.tools.allows(n))
-                .unwrap_or(false)
-        })
-        .collect();
+    // Tools restricted to what this agent may use — UNLESS a review fork
+    // (Task 9) supplies the parent's exact captured `tool_defs` for cache
+    // parity. Advertising the full parent tool set here is safe even though
+    // the review agent's `ToolFilter` only allows a few of them: dispatch
+    // (`run_tool_call`, below) enforces the real whitelist at call time, so a
+    // non-whitelisted call is refused, not merely hidden from the model.
+    let tool_defs: Vec<Value> = match &deps.review_tool_defs {
+        Some(captured) => captured.clone(),
+        None => deps
+            .tools
+            .definitions()
+            .into_iter()
+            .filter(|d| {
+                d.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| agent.tools.allows(n))
+                    .unwrap_or(false)
+            })
+            .collect(),
+    };
     let model = deps.model.clone().unwrap_or_default();
     let mut final_text = String::new();
 
@@ -632,7 +660,11 @@ async fn drive(
                 return Ok(final_text);
             }
             // Pre-turn (iteration 0) / mid-turn compaction check (spec §7.1).
-            if cm.status().needs_compaction {
+            // Skipped for a review fork (`DisplayMode::Silent`, Task 9): its
+            // budget is tiny (16) and its whole point is to replay the
+            // parent's captured prefix byte-for-byte — compacting it would
+            // both defeat cache parity and is never needed at this size.
+            if !matches!(display, DisplayMode::Silent) && cm.status().needs_compaction {
                 let trigger = if provider_turn == 0 {
                     "pre_turn"
                 } else {
@@ -1085,6 +1117,105 @@ async fn maybe_enqueue_review(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Review fork (Phase 4 Task 9): consumes a `LearningPayload` captured by
+// `maybe_enqueue_review` above and replays it as a byte-identical-prefix,
+// tool-whitelisted turn. `ControlPlane::run_review_fork` (control/
+// lifecycle.rs) owns session bookkeeping (insert/end the `kind='review'`
+// row, resolve the model, build `RunnerDeps`) and calls [`drive_review`].
+// ---------------------------------------------------------------------------
+
+/// Tools the review fork's dispatch gate allows, in addition to whatever
+/// `tool_defs` it advertises for cache parity (Task 9). Enforced by
+/// `run_tool_call`'s `agent.tools.allows` check — a call to anything else is
+/// refused with a tool_result error, never executed.
+pub const REVIEW_TOOL_WHITELIST: &[&str] = &["memory", "skill", "skill_manage"];
+
+/// Hermes-agent's memory review prompt, ported verbatim (Task 9 §3).
+pub const MEMORY_REVIEW_PROMPT: &str = "\
+Take a moment to review the conversation above for durable facts worth \
+remembering. Use the `memory` tool to add or consolidate entries. Only record \
+things that will still be true and useful next week: user preferences and \
+style (user scope), environment and conventions (global scope), or codebase \
+facts (project scope). Do not record task state, transient details, or secrets. \
+Prefer editing an existing entry over adding a near-duplicate. If nothing is \
+worth remembering, do nothing and end your turn.";
+
+/// Hermes-agent's skill review prompt, ported verbatim (Task 9 §3).
+pub const SKILL_REVIEW_PROMPT: &str = "\
+Review the conversation above for a reusable procedure worth capturing as a \
+skill. A good skill is a repeatable, generalizable workflow — not a one-off. \
+Preference ladder: (1) improve an existing skill with `skill_manage` patch/edit \
+before (2) creating a new one. Never capture user-specific secrets or a single \
+task's state (anti-capture). You MUST `skill` (view) a skill before editing it. \
+If nothing generalizes, do nothing and end your turn.";
+
+/// Appended to whichever review prompt(s) run, teaching the enforced
+/// whitelist so the model doesn't waste a turn probing for a denied tool.
+pub const REVIEW_TOOL_RESTRICTION_NOTE: &str = "\
+For this review you may ONLY use the tools `memory`, `skill`, and \
+`skill_manage`. All other tools are disabled and will return an error.";
+
+/// The final user turn appended after the replayed/digested prefix:
+/// `review_kind`'s prompt(s) plus the tool-restriction note. `"combined"`
+/// (and any other value — defensively, the safest choice) runs both.
+pub(crate) fn review_prompt_text(review_kind: &str) -> String {
+    let body = match review_kind {
+        "memory" => MEMORY_REVIEW_PROMPT.to_string(),
+        "skill" => SKILL_REVIEW_PROMPT.to_string(),
+        _ => format!("{MEMORY_REVIEW_PROMPT}\n\n{SKILL_REVIEW_PROMPT}"),
+    };
+    format!("{body}\n\n{REVIEW_TOOL_RESTRICTION_NOTE}")
+}
+
+/// The synthetic primary agent a review fork drives as — `prompt` carries the
+/// captured (or digested) RAW system string verbatim (`drive()` uses it as-is
+/// when `Some`, see the `system` binding at the top of `drive()`), and
+/// `tools` is the dispatch-time whitelist (`REVIEW_TOOL_WHITELIST`) that
+/// `run_tool_call`'s `agent.tools.allows` check enforces regardless of what
+/// `RunnerDeps::review_tool_defs` advertises.
+pub(crate) fn review_agent(system: String) -> Agent {
+    Agent {
+        name: "review".into(),
+        description: "Background self-improvement review fork".into(),
+        mode: super::agents::AgentMode::Primary,
+        prompt: Some(system),
+        tools: super::agents::ToolFilter::Only(
+            REVIEW_TOOL_WHITELIST
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        can_delegate: false,
+        builtin: true,
+    }
+}
+
+/// Thin `drive()` wrapper fixing the review fork's shape: no sub-agent
+/// spawner, `DisplayMode::Silent` (no text/notice/context-usage display, no
+/// auto-continue, no compaction, and — via `display.text()` — no recursive
+/// nudge), and a small fixed budget. `deps`/`agent`/`cm` are caller-built
+/// (`ControlPlane::run_review_fork`) so this stays a pure driving seam,
+/// testable with a scripted `LlmStream` and no `ControlPlane` at all.
+pub(crate) async fn drive_review(
+    deps: &RunnerDeps,
+    agent: &Agent,
+    cm: &mut ContextManager,
+    cancel: &CancellationToken,
+) -> anyhow::Result<String> {
+    const REVIEW_MAX_ITERS: usize = 16;
+    drive(
+        deps,
+        agent,
+        cm,
+        cancel,
+        None,
+        DisplayMode::Silent,
+        &IterationBudget::new(REVIEW_MAX_ITERS),
+    )
+    .await
+}
+
 /// Tools delegated children may never use regardless of filters. `task` is
 /// re-armed for delegator agents (the orchestrator role); `memory` never is —
 /// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`. The todo
@@ -1499,7 +1630,7 @@ async fn run_tool_call(
             perm_mode: deps.perm_mode.clone(),
             project_id: deps.project_id.clone(),
         })),
-        write_origin: crate::domain::WriteOrigin::User,
+        write_origin: deps.write_origin,
         viewed_skills: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
     };
     match tool.execute(&ctx, input).await {
@@ -2115,6 +2246,7 @@ mod tests {
     use super::testutil::*;
     use super::*;
     use crate::domain::CoreEvent;
+    use serial_test::serial;
 
     #[tokio::test]
     async fn chat_turn_model_reads_the_durable_session_runtime() {
@@ -2291,6 +2423,8 @@ mod tests {
             steer: SteerBuffer::new(),
             background: super::super::background::BackgroundRegistry::new(),
             nudge: Arc::new(NudgeState::default()),
+            review_tool_defs: None,
+            write_origin: crate::domain::WriteOrigin::User,
         }
     }
 
@@ -2664,6 +2798,235 @@ mod tests {
         assert_eq!(decoded.system, payload.system);
         assert_eq!(decoded.tool_defs, payload.tool_defs);
         assert_eq!(decoded.messages, payload.messages);
+    }
+
+    /// The load-bearing Task 9 invariant: the review fork's FIRST request
+    /// reproduces the captured payload's `system` (re-wrapped exactly like
+    /// the parent's own request), `tools`, and `messages` prefix byte-for-
+    /// byte — the whole point of prompt-cache parity — and a non-whitelisted
+    /// tool call (`bash`, still present in the advertised `tools` array for
+    /// cache parity) is refused at DISPATCH, not merely hidden from the
+    /// model.
+    #[tokio::test]
+    async fn review_fork_replays_byte_identical_prefix_and_denies_a_non_whitelisted_tool() {
+        let meta = crate::llm_router::model_meta::ModelMeta {
+            supports_prompt_cache: true,
+            ..crate::llm_router::model_meta::FALLBACK
+        };
+        // Build the captured prefix through the REAL ContextManager (the same
+        // mechanism `maybe_enqueue_review` uses) so `payload.messages` carries
+        // exactly the `cache_control` marker a live parent turn would have
+        // produced — no hand-authored JSON standing in for the real shape.
+        let mut seed_cm =
+            ContextManager::ephemeral("parent-1", ContextConfig::with_meta(meta.clone()));
+        seed_cm
+            .append_user(json!([{"type": "text", "text": "hi"}]))
+            .await
+            .unwrap();
+        seed_cm
+            .append_assistant(json!([{"type": "text", "text": "hello"}]))
+            .await
+            .unwrap();
+        let captured_messages = seed_cm.messages_for_request();
+
+        let payload = LearningPayload {
+            review_kind: "memory".into(),
+            parent_session_pk: "parent-1".into(),
+            model: "test/model".into(),
+            supports_prompt_cache: true,
+            system: "You are ryuzi, the parent agent.".into(),
+            tool_defs: vec![
+                json!({"name": "bash", "description": "run a shell command", "input_schema": {"type": "object"}}),
+                json!({"name": "memory", "description": "persistent memory", "input_schema": {"type": "object"}}),
+            ],
+            messages: captured_messages,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "call-1", "bash"),
+                input_json_delta(0, "{\"command\":\"echo hi\"}"),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("Reviewed, nothing to add."),
+        ]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.meta = meta.clone();
+        deps.model = Some(payload.model.clone());
+        deps.review_tool_defs = Some(payload.tool_defs.clone());
+        deps.write_origin = crate::domain::WriteOrigin::BackgroundReview;
+
+        let agent = review_agent(payload.system.clone());
+        let cfg = ContextConfig::with_meta(deps.meta.clone());
+        let mut cm = ContextManager::seed_projected("review-1", cfg, payload.messages.clone());
+        cm.append_user_text(&review_prompt_text(&payload.review_kind))
+            .await
+            .unwrap();
+
+        let final_text = drive_review(&deps, &agent, &mut cm, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_text, "Reviewed, nothing to add.");
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "a dispatch-time refusal must not skip the scripted second (final) turn"
+        );
+
+        let first = &bodies[0];
+        assert_eq!(
+            first["system"],
+            json!([{ "type": "text", "text": payload.system, "cache_control": {"type": "ephemeral"} }]),
+            "system must be re-wrapped EXACTLY like the parent's own request \
+             (the two-branch formula in `drive()`, keyed on `supports_prompt_cache`)"
+        );
+        assert_eq!(
+            first["tools"],
+            json!(payload.tool_defs),
+            "tools must be byte-identical to the captured payload, including `bash`"
+        );
+        let msgs = first["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), payload.messages.len() + 1);
+        assert_eq!(
+            &msgs[..payload.messages.len()],
+            payload.messages.as_slice(),
+            "the captured prefix must be byte-identical, unmodified by seeding or appending"
+        );
+        let review_turn = &msgs[payload.messages.len()];
+        assert_eq!(review_turn["role"], "user");
+        let review_text = review_turn["content"][0]["text"].as_str().unwrap();
+        assert!(review_text.starts_with(MEMORY_REVIEW_PROMPT));
+        assert!(review_text.contains(REVIEW_TOOL_RESTRICTION_NOTE));
+
+        // The SECOND request's trailing tool_result proves `bash` was refused
+        // at dispatch (the exact `run_tool_call` whitelist-deny wording), not
+        // silently dropped, denied by the (bypassed) permission gate, or
+        // actually executed.
+        let second = &bodies[1];
+        let msgs2 = second["messages"].as_array().unwrap();
+        let denial = msgs2.last().unwrap();
+        assert_eq!(denial["role"], "user");
+        let result_block = &denial["content"][0];
+        assert_eq!(result_block["type"], "tool_result");
+        assert_eq!(result_block["is_error"], true);
+        assert!(result_block["content"]
+            .as_str()
+            .unwrap()
+            .contains("not permitted"));
+    }
+
+    /// `seed_digest` (the non-cache-parity fallback, used when the resolved
+    /// review model differs from the payload's captured model) keeps only
+    /// the trailing `tail` messages.
+    #[test]
+    fn seed_digest_keeps_only_the_last_tail_messages() {
+        let msgs: Vec<Value> = (0..5)
+            .map(|i| {
+                json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": [{"type": "text", "text": format!("m{i}")}],
+                })
+            })
+            .collect();
+        let cfg = ContextConfig::with_meta(crate::llm_router::model_meta::FALLBACK);
+        let cm = ContextManager::seed_digest("review-1", cfg, msgs, 3);
+        let seeded = cm.messages_for_request();
+        assert_eq!(seeded.len(), 3);
+        assert_eq!(seeded[0]["content"][0]["text"], "m2");
+        assert_eq!(seeded[2]["content"][0]["text"], "m4");
+    }
+
+    /// Guard for `RYUZI_TEST_CONFIG_ROOT`, mirroring
+    /// `tools::skill_manage::tests::ConfigRootGuard` — redirects
+    /// `skills_install::skills_root()` into a tempdir so this module's
+    /// `skill_manage`-exercising test never touches the real
+    /// `~/.config/ryuzi/skills`. Process-global env — every test using it
+    /// must be `#[serial]`.
+    struct ReviewConfigRootGuard {
+        _dir: tempfile::TempDir,
+    }
+    impl ReviewConfigRootGuard {
+        fn new() -> (Self, std::path::PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("RYUZI_TEST_CONFIG_ROOT", dir.path());
+            let root = dir.path().join("skills");
+            (ReviewConfigRootGuard { _dir: dir }, root)
+        }
+    }
+    impl Drop for ReviewConfigRootGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("RYUZI_TEST_CONFIG_ROOT");
+        }
+    }
+
+    /// The load-bearing Task 6/9 handoff: a whitelisted `skill_manage create`
+    /// call inside the review fork actually writes to disk (proving the
+    /// fork's own perm_mode/whitelist let it through) AND is stamped
+    /// `created_by="agent"` — which `skill_manage`'s `execute` only does when
+    /// `ctx.write_origin.is_autonomous()`. If `run_tool_call` still hardcoded
+    /// `WriteOrigin::User` (the pre-Task-9 state), this stamp would never
+    /// appear — so this is a real regression test for the write_origin wire,
+    /// not just a smoke test that the call didn't error.
+    #[tokio::test]
+    #[serial]
+    async fn review_fork_writes_via_whitelisted_tools_carrying_background_review_write_origin() {
+        let (_guard, skills_root) = ReviewConfigRootGuard::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let create_args = json!({
+            "action": "create",
+            "name": "deploy",
+            "description": "How to deploy",
+            "body": "Run make deploy.",
+        });
+        let llm = Arc::new(RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "call-1", "skill_manage"),
+                input_json_delta(0, &create_args.to_string()),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("Created a new skill."),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.write_origin = crate::domain::WriteOrigin::BackgroundReview;
+
+        let agent = review_agent("You are ryuzi, reviewing.".into());
+        let cfg = ContextConfig::with_meta(deps.meta.clone());
+        let mut cm = ContextManager::seed_projected(
+            "review-1",
+            cfg,
+            vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})],
+        );
+        cm.append_user_text(&review_prompt_text("skill"))
+            .await
+            .unwrap();
+
+        let final_text = drive_review(&deps, &agent, &mut cm, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_text, "Created a new skill.");
+
+        let md = std::fs::read_to_string(skills_root.join("deploy/SKILL.md"))
+            .expect("skill_manage create must have written SKILL.md");
+        assert!(md.contains("Run make deploy."));
+
+        let usage = deps
+            .store
+            .get_skill_usage("deploy")
+            .await
+            .unwrap()
+            .expect("skill_manage create must record skill_usage");
+        assert_eq!(
+            usage.created_by.as_deref(),
+            Some("agent"),
+            "the fork's ToolCtx must carry an autonomous write_origin \
+             (BackgroundReview), not the hardcoded User of the pre-Task-9 runner"
+        );
     }
 
     #[tokio::test]

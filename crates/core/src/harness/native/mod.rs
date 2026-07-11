@@ -242,6 +242,8 @@ impl Harness for NativeHarness {
                 steer,
                 background: ctx.background,
                 nudge,
+                review_tool_defs: None,
+                write_origin: crate::domain::WriteOrigin::User,
             },
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),

@@ -79,6 +79,16 @@ pub struct ControlPlane {
     /// every startup, so a stale `true` surviving a restart would be
     /// meaningless).
     plugins_restart_required: std::sync::atomic::AtomicBool,
+    /// Builds the `LlmStream` the background review fork (Task 9) drives
+    /// through. Bypasses `registries.harness` (an opaque `Harness` trait
+    /// object with no way to recover its concrete `LlmStreamFactory`)
+    /// because the review fork is a native-runtime-only capability that
+    /// talks to `harness::native::runner::drive_review` directly, not
+    /// through the generic `Harness` trait. Real
+    /// (`RouterLlmStreamFactory`) in production; tests swap in a scripted
+    /// stream via `set_review_llm_factory_for_test` to capture and assert on
+    /// the exact request body the fork sends.
+    review_llm_factory: Mutex<Arc<dyn crate::harness::native::llm::LlmStreamFactory>>,
 }
 
 impl ControlPlane {
@@ -139,6 +149,9 @@ impl ControlPlane {
             active_turns: std::sync::atomic::AtomicUsize::new(0),
             background: crate::harness::native::background::BackgroundRegistry::new(),
             plugins_restart_required: std::sync::atomic::AtomicBool::new(false),
+            review_llm_factory: Mutex::new(Arc::new(
+                crate::harness::native::llm::RouterLlmStreamFactory,
+            )),
         })
     }
 
@@ -180,18 +193,25 @@ impl ControlPlane {
         &self.background
     }
 
-    /// Drive one learning-fork replay for a claimed `kind='learning'`
-    /// background-event payload (spec §3.1/§7.2): `kind='review'`, no parent
-    /// persistence, dispatch-time tool whitelist, budget 16, approvals
-    /// auto-denied. Called by `learning::tick` once per claimed row; a
-    /// successful return marks the row delivered, an error releases the
-    /// claim so a later tick retries it.
-    ///
-    /// Task 8 wires the claim → dispatch → mark-delivered/release skeleton
-    /// only; this is a stub so it compiles and the rail-split claim tests
-    /// pass. Task 9 replaces the body with the actual review-fork replay.
-    pub async fn run_review_fork(&self, _payload: &str) -> anyhow::Result<()> {
-        Ok(())
+    /// The `LlmStreamFactory` `run_review_fork` (control/lifecycle.rs)
+    /// builds its `RunnerDeps.llm` from. See the field doc for why this
+    /// bypasses `registries.harness`.
+    pub(crate) fn review_llm_factory(
+        &self,
+    ) -> Arc<dyn crate::harness::native::llm::LlmStreamFactory> {
+        self.review_llm_factory.lock().unwrap().clone()
+    }
+
+    /// Test-only: override the `LlmStreamFactory` a review fork drives
+    /// through, so a test can inject a scripted/recording stream and assert
+    /// on the exact request the fork sends (Task 9).
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub fn set_review_llm_factory_for_test(
+        &self,
+        factory: Arc<dyn crate::harness::native::llm::LlmStreamFactory>,
+    ) {
+        *self.review_llm_factory.lock().unwrap() = factory;
     }
 
     /// The plugin host — every installed plugin's manifest, capabilities, and

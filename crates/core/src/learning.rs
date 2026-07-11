@@ -85,11 +85,60 @@ pub fn spawn_runner(cp: Arc<ControlPlane>) -> tokio::task::JoinHandle<()> {
 mod tests {
     use super::*;
     use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+    use crate::harness::native::llm::{LlmStream, LlmStreamFactory};
+    use crate::harness::native::runner::testutil::{
+        message_delta, message_stop, text_delta, ScriptedLlm,
+    };
+    use crate::harness::native::runner::LearningPayload;
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::plugins::Registries;
     use crate::store::Store;
     use async_trait::async_trait;
     use serial_test::serial;
+
+    /// Always hands out the SAME scripted stream regardless of `store` — the
+    /// worker's `run_review_fork` builds its own `RunnerDeps.llm` via
+    /// `ControlPlane::review_llm_factory()`, bypassing `Registries.harness`
+    /// entirely (see that field's doc in `control.rs`), so these tests inject
+    /// through `ControlPlane::set_review_llm_factory_for_test` instead of the
+    /// `FakeHarnessFactory` below.
+    struct FixedLlmFactory(Arc<dyn LlmStream>);
+    impl LlmStreamFactory for FixedLlmFactory {
+        fn create(&self, _store: Arc<Store>) -> Arc<dyn LlmStream> {
+            self.0.clone()
+        }
+    }
+
+    /// A review-fork LLM factory that always replies with one plain end_turn
+    /// (no tool calls) — enough to drive `run_review_fork` to completion
+    /// without touching the network.
+    fn scripted_review_factory(text: &str) -> Arc<dyn LlmStreamFactory> {
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![vec![
+            text_delta(text),
+            message_delta("end_turn"),
+            message_stop(),
+        ]]));
+        Arc::new(FixedLlmFactory(llm))
+    }
+
+    /// A minimal, valid `LearningPayload` JSON string targeting `parent_pk` —
+    /// enough for `run_review_fork` to decode and drive without erroring
+    /// (these tests care about the claim → dispatch → mark-delivered
+    /// skeleton, not the payload's content).
+    fn learning_payload_json(parent_pk: &str) -> String {
+        let payload = LearningPayload {
+            review_kind: "memory".into(),
+            parent_session_pk: parent_pk.into(),
+            model: "test/model".into(),
+            supports_prompt_cache: false,
+            system: "You are ryuzi.".into(),
+            tool_defs: vec![],
+            messages: vec![
+                serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
+            ],
+        };
+        serde_json::to_string(&payload).unwrap()
+    }
 
     /// Redirects `dirs::data_dir()`/HOME into a tempdir for the duration of a
     /// test — see `background_rail::tests::StateDirGuard`'s doc for why.
@@ -107,8 +156,10 @@ mod tests {
     }
 
     /// A minimal harness: this module's tests never dispatch a real turn
-    /// (the learning worker never calls into the harness registry directly —
-    /// `run_review_fork` is Task 9's job), but `control_plane_with` needs
+    /// through it — the learning worker never calls into the harness
+    /// registry directly; `run_review_fork` drives the native runner
+    /// straight, via `ControlPlane::review_llm_factory()` (see
+    /// `scripted_review_factory`, above) — but `control_plane_with` needs
     /// some `HarnessFactory` to construct a `ControlPlane`.
     struct FakeSession;
     #[async_trait]
@@ -216,17 +267,19 @@ mod tests {
         assert_eq!(ev.kind, "learning");
     }
 
-    /// `tick` claims a learning row, drives the (stub) review fork, and marks
-    /// the row delivered — proving the worker's claim → dispatch →
-    /// mark-delivered skeleton is wired end to end.
+    /// `tick` claims a learning row, drives the review fork (Task 9) to
+    /// completion against a scripted end_turn, and marks the row delivered —
+    /// proving the worker's claim → dispatch → mark-delivered skeleton is
+    /// wired end to end.
     #[tokio::test]
     #[serial]
     async fn tick_claims_and_delivers_a_learning_row() {
         let _guard = StateDirGuard::new();
         let (cp, _db) = control_plane_with(Arc::new(FakeHarnessFactory)).await;
+        cp.set_review_llm_factory_for_test(scripted_review_factory("nothing to add"));
         idle_chat(&cp, "chat-1").await;
         cp.store()
-            .enqueue_background_event("chat-1", "learning", "{\"note\":1}")
+            .enqueue_background_event("chat-1", "learning", &learning_payload_json("chat-1"))
             .await
             .unwrap();
 
@@ -243,6 +296,7 @@ mod tests {
     async fn tick_delivers_a_learning_row_even_when_the_parent_session_is_running() {
         let _guard = StateDirGuard::new();
         let (cp, _db) = control_plane_with(Arc::new(FakeHarnessFactory)).await;
+        cp.set_review_llm_factory_for_test(scripted_review_factory("nothing to add"));
         let now = crate::paths::now_ms();
         cp.store()
             .insert_session(Session {
@@ -267,7 +321,7 @@ mod tests {
             .await
             .unwrap();
         cp.store()
-            .enqueue_background_event("busy-1", "learning", "{}")
+            .enqueue_background_event("busy-1", "learning", &learning_payload_json("busy-1"))
             .await
             .unwrap();
 
