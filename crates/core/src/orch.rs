@@ -1007,6 +1007,31 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
     });
 }
 
+/// Post the root's final verdict as an `"orchestrator"` bubble AND re-enter it
+/// into the home chat over the rail (spec §8: orchestrator output re-enters
+/// the originating chat). The rail delivery is the ONLY turn-driving path —
+/// the daemon's background-rail drainer injects it as a clean new user turn
+/// once the home chat is idle (never mid-turn). Both the bubble post and the
+/// rail enqueue are best-effort: a delivery failure must not fail or abort
+/// judge/orchestration completion.
+async fn deliver_outcome(cp: &Arc<ControlPlane>, root: &OrchTask, verdict: &str) {
+    let Some(home) = root.home_session_pk.as_deref() else {
+        return; // headless submit (CLI/tests) — nothing to deliver into
+    };
+    let _ = cp
+        .post_speaker_bubble(home, "orchestrator", "text", verdict)
+        .await;
+    let block = format!(
+        "[ORCHESTRATION COMPLETE — {}] The orchestrated goal below finished. \
+         The full verdict from the orchestrator follows.\n\nGoal:\n{}\n\nVerdict:\n{}",
+        root.id, root.body, verdict
+    );
+    let _ = cp
+        .store()
+        .enqueue_background_event(home, "orch", &block)
+        .await;
+}
+
 /// Start the judge session for a root whose children are all done.
 async fn start_judge(cp: &Arc<ControlPlane>, root: OrchTask) {
     let store = cp.store();
@@ -1055,13 +1080,18 @@ async fn start_judge(cp: &Arc<ControlPlane>, root: OrchTask) {
             Err(e) => finish_task(cp2.store(), &root_id, "judging", "failed", None, Some(e)).await,
         };
         if changed.unwrap_or(false) {
-            let status = get_task(cp2.store(), &root_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|t| t.status)
+            let root_now = get_task(cp2.store(), &root_id).await.ok().flatten();
+            let status = root_now
+                .as_ref()
+                .map(|t| t.status.clone())
                 .unwrap_or_else(|| "done".into());
             emit_changed(&cp2, &root_id, None, &status);
+            if let Some(root_now) = root_now {
+                if status == "done" {
+                    let verdict = root_now.result.clone().unwrap_or_default();
+                    deliver_outcome(&cp2, &root_now, &verdict).await;
+                }
+            }
         }
     });
 }
@@ -1600,6 +1630,50 @@ mod tests {
         assert!(rows
             .iter()
             .any(|m| m.speaker.as_deref() == Some("build") && m.block_type == "text"));
+    }
+
+    #[tokio::test]
+    async fn root_completion_enqueues_an_orch_rail_event_to_the_home_chat() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        let home = cp
+            .start_chat_session(crate::harness::TurnPrompt::text("hi", "hi"), "test", &[])
+            .await
+            .unwrap();
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            Some(&home.session_pk),
+        )
+        .await
+        .unwrap();
+        drive_until(&cp, &root, "done", 10_000).await;
+        // Exactly one pending 'orch' rail row targets the home chat with the marker.
+        let ev = cp
+            .store()
+            .claim_deliverable_background_event("t")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.target_session_pk, home.session_pk);
+        assert_eq!(ev.kind, "orch");
+        assert!(ev.payload.contains("[ORCHESTRATION COMPLETE"));
+        // Nothing else pending — exactly one row was enqueued for this root.
+        assert!(cp
+            .store()
+            .claim_deliverable_background_event("t2")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
