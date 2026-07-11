@@ -172,6 +172,13 @@ pub struct JobInfo {
     pub notify_fail: bool,
     pub next_run_ms: Option<i64>,
     pub history: Vec<RunInfo>,
+    /// Model id this job's session starts with, overriding the project/agent
+    /// default. `None` when the job uses ordinary model resolution. Not yet
+    /// editable from the scheduler panel — set programmatically today (e.g.
+    /// by a future `app_jobs` tool); surfaced here so a later job editor can
+    /// read and round-trip it without another DTO change.
+    #[serde(default)]
+    pub model_override: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -187,6 +194,9 @@ pub struct JobInput {
     pub prompt: String,
     pub notify_success: bool,
     pub notify_fail: bool,
+    /// See `JobInfo::model_override`.
+    #[serde(default)]
+    pub model_override: Option<String>,
 }
 
 // --- gateways_api (moved verbatim from apps/cockpit/src-tauri/src/gateways_cmd.rs) ---

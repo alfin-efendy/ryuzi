@@ -29,10 +29,12 @@ impl ControlPlane {
             attachments,
             None,
             None,
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_session_with_prompt(
         self: &Arc<Self>,
         project_id: &str,
@@ -41,6 +43,7 @@ impl ControlPlane {
         attachments: &[AttachmentRef],
         git: Option<SessionGitOptions>,
         perm_mode: Option<PermMode>,
+        model_override: Option<String>,
     ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
@@ -66,6 +69,13 @@ impl ControlPlane {
             if let Ok(agent) = crate::agent_settings::get(&self.store).await {
                 project.model = agent.model.filter(|m| !m.trim().is_empty());
             }
+        }
+
+        // A caller-supplied override (currently: a job's `model_override`)
+        // wins over both the project's pinned model and the agent default
+        // resolved just above — scoped to this one session's start.
+        if let Some(m) = model_override.filter(|m| !m.trim().is_empty()) {
+            project.model = Some(m);
         }
 
         let git = git.unwrap_or_default();
@@ -893,6 +903,7 @@ impl ControlPlane {
             extra_skill_dirs,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
+            background: self.background.clone(),
             store: self.store.clone(),
         };
 
@@ -1140,6 +1151,21 @@ impl ControlPlane {
             let _ = handle.cancel().await;
             let _ = handle.end().await;
         }
+        // Cancel any in-flight background delegations this session dispatched
+        // and purge its pending rail rows — orphaned background work must not
+        // survive to leak into a new chat or be delivered to a dead session
+        // (spec §6.1). This runs AFTER the turn interrupt above: a still-running
+        // turn could spawn a new background worker, so the turn is stopped
+        // first, then its background children are cancelled, then their rail
+        // rows are dropped. A narrow race remains — a worker could reserve a
+        // fresh slot in the instant between `interrupt_for_session` and this
+        // delete — accepted as a known limitation rather than closed with a
+        // new locking mechanism.
+        self.background.interrupt_for_session(session_pk);
+        let _ = self
+            .store
+            .delete_background_events_for_session(session_pk)
+            .await;
         if let Some(session) = self.store.get_session(session_pk).await? {
             match session.project_id.as_deref() {
                 Some(project_id) => {

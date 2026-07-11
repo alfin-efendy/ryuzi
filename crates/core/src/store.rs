@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_23_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_27_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -885,6 +885,34 @@ fn migrations() -> Migrations<'static> {
                 updated_at INTEGER NOT NULL\
             )",
         ),
+        // Migration 27 — Phase 3 background rail (spec §4/§6): durable re-entry
+        // channel + jobs.model_override. Appended as the tail across merges with
+        // main (24 model-effort normalize, 25 route-state, 26 runtime-settings —
+        // none touch a sessions/jobs column this migration reads). Every
+        // statement is existence-guarded so the rewind-and-replay migration
+        // test's replay on an already-migrated DB is a no-op.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS background_events (\
+                    id TEXT PRIMARY KEY NOT NULL,\
+                    target_session_pk TEXT NOT NULL,\
+                    kind TEXT NOT NULL,\
+                    payload TEXT NOT NULL,\
+                    created_at INTEGER NOT NULL,\
+                    claimed_by TEXT,\
+                    delivered_at INTEGER\
+                );\
+                CREATE INDEX IF NOT EXISTS idx_background_events_target \
+                    ON background_events(target_session_pk, delivered_at);",
+            )?;
+            let has_override = tx
+                .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_override'")?
+                .exists([])?;
+            if !has_override {
+                tx.execute("ALTER TABLE jobs ADD COLUMN model_override TEXT", [])?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -2284,6 +2312,140 @@ impl Store {
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
+        })
+        .await
+    }
+
+    /// Enqueue a durable background-rail row (spec §6.1). Returns the new id.
+    pub async fn enqueue_background_event(
+        &self,
+        target_session_pk: &str,
+        kind: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        let id = crate::paths::new_id();
+        let (id2, target, kind, payload, now) = (
+            id.clone(),
+            target_session_pk.to_string(),
+            kind.to_string(),
+            payload.to_string(),
+            crate::paths::now_ms(),
+        );
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO background_events(id, target_session_pk, kind, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id2, target, kind, payload, now],
+            )
+            .map(|_| ())
+        })
+        .await?;
+        Ok(id)
+    }
+
+    /// Atomically claim the OLDEST undelivered, unclaimed rail row whose target
+    /// session is IDLE (the idle-only invariant, spec §6.1). Returns `None`
+    /// when nothing is deliverable. The claim + read run in one transaction so
+    /// two drainers never claim the same row.
+    pub async fn claim_deliverable_background_event(
+        &self,
+        claimer: &str,
+    ) -> anyhow::Result<Option<crate::domain::BackgroundEvent>> {
+        let claimer = claimer.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let picked: Option<String> = tx
+                .query_row(
+                    "SELECT be.id FROM background_events be \
+                     JOIN sessions s ON s.session_pk = be.target_session_pk \
+                     WHERE be.delivered_at IS NULL AND be.claimed_by IS NULL \
+                       AND s.status = 'idle' \
+                     ORDER BY be.created_at ASC LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(id) = picked else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE background_events SET claimed_by = ?2 WHERE id = ?1",
+                params![id, claimer],
+            )?;
+            let row = tx.query_row(
+                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                 FROM background_events WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(crate::domain::BackgroundEvent {
+                        id: r.get(0)?,
+                        target_session_pk: r.get(1)?,
+                        kind: r.get(2)?,
+                        payload: r.get(3)?,
+                        created_at: r.get(4)?,
+                        claimed_by: r.get(5)?,
+                        delivered_at: r.get(6)?,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(Some(row))
+        })
+        .await
+    }
+
+    /// Mark a claimed rail row delivered (its user turn has been injected).
+    pub async fn mark_background_delivered(&self, id: &str) -> anyhow::Result<()> {
+        let (id, now) = (id.to_string(), crate::paths::now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE background_events SET delivered_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Release a claim so the row is retried next tick (target went busy, or
+    /// delivery errored). Never touches `delivered_at`.
+    pub async fn release_background_claim(&self, id: &str) -> anyhow::Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE background_events SET claimed_by = NULL WHERE id = ?1 AND delivered_at IS NULL",
+                params![id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Remove every pending rail row targeting a session (session-end cascade,
+    /// spec §6.1: orphaned background work must not leak into a new chat).
+    /// Delivered rows are kept as an audit trail. Returns the count removed.
+    pub async fn delete_background_events_for_session(
+        &self,
+        target_session_pk: &str,
+    ) -> anyhow::Result<u64> {
+        let target = target_session_pk.to_string();
+        self.with_conn(move |c| {
+            Ok(c.execute(
+                "DELETE FROM background_events WHERE target_session_pk = ?1 AND delivered_at IS NULL",
+                params![target],
+            )? as u64)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn pending_background_count(&self) -> anyhow::Result<i64> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM background_events WHERE delivered_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
         })
         .await
     }
@@ -4541,7 +4703,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 26, "forward migration must land at v26");
+        assert_eq!(user_version, 27, "forward migration must land at v27");
     }
 
     #[tokio::test]
@@ -4682,7 +4844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_26_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_27_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -4698,24 +4860,25 @@ mod tests {
         // parent_session_pk, copies every existing column forward including
         // perm_mode; 23 plugin_installs + plugin_attach_status; 24 typed model
         // effort preferences + legacy normalization; 25 session_route_state;
-        // 26 session_runtime_settings —
-        // all convergent or CREATE TABLE IF NOT EXISTS) re-run on next open.
+        // 26 session_runtime_settings; 27 background_events + jobs.model_override
+        // — all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
+        // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 26
-        // defined, wind back fourteen.
+        // this test starts failing its assertions). With migrations through 27
+        // defined, wind back fifteen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 14)
+            c.pragma_update(None, "user_version", v - 15)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v26 here, so `harness` was
+                    // The DB is fully migrated to v27 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -4766,14 +4929,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back six, and reopen so 21 (and the tail
-        // migrations 22–26) replay against it. Back SIX: the fully migrated
-        // tail is now v26, so
-        // rewinding to v20 is what makes migration 21 (native-only) replay.
+        // wind user_version back seven, and reopen so 21 (and the tail
+        // migrations 22–27) replay against it. Back SEVEN: the fully migrated
+        // tail is now v27, so rewinding to v20 is what makes migration 21
+        // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 6)
+            c.pragma_update(None, "user_version", v - 7)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -4890,6 +5053,30 @@ mod tests {
             .await
             .unwrap();
         assert!(route_state_exists);
+    }
+
+    #[tokio::test]
+    async fn migration_27_adds_background_events_and_job_model_override() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let (uv, has_bg, has_override) = store
+            .with_conn(|c| {
+                let uv: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                let has_bg = c
+                    .prepare(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_events'",
+                    )?
+                    .exists([])?;
+                let has_override = c
+                    .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_override'")?
+                    .exists([])?;
+                Ok((uv, has_bg, has_override))
+            })
+            .await
+            .unwrap();
+        assert_eq!(uv, 27, "forward migration must land at v27");
+        assert!(has_bg, "background_events table must exist");
+        assert!(has_override, "jobs.model_override column must exist");
     }
 
     #[tokio::test]
@@ -5261,6 +5448,78 @@ mod tests {
             .unwrap();
         let ctx = store.get_session_context("s1").await.unwrap().unwrap();
         assert_eq!(ctx["percent_left"], 17);
+    }
+
+    #[tokio::test]
+    async fn background_rail_enqueue_claim_deliver_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        // An IDLE target and a RUNNING target.
+        let mk = |pk: &str, status: crate::domain::SessionStatus| crate::domain::Session {
+            session_pk: pk.into(),
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status,
+            perm_mode: crate::domain::PermMode::Default,
+            started_by: None,
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: crate::domain::SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        };
+        store
+            .insert_session(mk("idle-1", crate::domain::SessionStatus::Idle))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk("busy-1", crate::domain::SessionStatus::Running))
+            .await
+            .unwrap();
+
+        store
+            .enqueue_background_event("busy-1", "delegation", "{\"x\":1}")
+            .await
+            .unwrap();
+        let id_idle = store
+            .enqueue_background_event("idle-1", "delegation", "{\"x\":2}")
+            .await
+            .unwrap();
+
+        // Only the idle-target row is claimable.
+        let claimed = store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, id_idle);
+        assert_eq!(claimed.target_session_pk, "idle-1");
+        // A second claim finds nothing (the busy target is skipped, the idle row is now claimed).
+        assert!(store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .is_none());
+
+        store.mark_background_delivered(&claimed.id).await.unwrap();
+        assert_eq!(store.pending_background_count().await.unwrap(), 1); // busy row still pending
+
+        // Session-end cascade removes the busy target's row.
+        assert_eq!(
+            store
+                .delete_background_events_for_session("busy-1")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.pending_background_count().await.unwrap(), 0);
     }
 
     #[tokio::test]

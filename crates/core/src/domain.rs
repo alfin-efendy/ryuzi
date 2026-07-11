@@ -106,6 +106,53 @@ impl SessionKind {
     }
 }
 
+/// A durable background-rail row (spec §6.1). Producers (async delegation,
+/// learning forks, scheduled jobs, orch events) enqueue one; the daemon
+/// drainer delivers it into `target_session_pk` as a new user turn while
+/// that session is idle. `kind` is one of [`BackgroundKind`]'s db strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundEvent {
+    pub id: String,
+    pub target_session_pk: String,
+    pub kind: String,
+    pub payload: String,
+    pub created_at: i64,
+    pub claimed_by: Option<String>,
+    pub delivered_at: Option<i64>,
+}
+
+/// The producers that write to the background rail. Stored as a db string in
+/// `background_events.kind`; not part of the IPC surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundKind {
+    Delegation,
+    Learning,
+    Job,
+    Orch,
+    Unblock,
+}
+
+impl BackgroundKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackgroundKind::Delegation => "delegation",
+            BackgroundKind::Learning => "learning",
+            BackgroundKind::Job => "job",
+            BackgroundKind::Orch => "orch",
+            BackgroundKind::Unblock => "unblock",
+        }
+    }
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "learning" => BackgroundKind::Learning,
+            "job" => BackgroundKind::Job,
+            "orch" => BackgroundKind::Orch,
+            "unblock" => BackgroundKind::Unblock,
+            _ => BackgroundKind::Delegation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {

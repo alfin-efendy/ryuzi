@@ -1304,7 +1304,7 @@ transport: string; command: string | null; args: string[];
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
-export type AgentSettingsInfo = { model: string | null;
+export type AgentSettingsInfo = { model: string | null; 
 /**
  * "plan" | "ask" | "edit" | "full"; None = engine default ("ask").
  */
@@ -1368,11 +1368,11 @@ export type CatalogEntry = { id: string; name: string;
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
-export type ChatRequestOptions = { model: string | null; effort: string | null; context: ChatContextArg | null; attachments?: string[];
+export type ChatRequestOptions = { model: string | null; effort: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**
  * None => engine default (worktree ON, new engine-named branch from HEAD).
  */
-git: GitOptions | null;
+git: GitOptions | null; 
 /**
  * Initial permission mode for the session being started (new-chat
  * picker). `None` ⇒ inherit the project default.
@@ -1383,7 +1383,7 @@ export type CodexResetCreditInfo = { status: string; grantedAt: string | null; e
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
 export type CommandInfo = { name: string; description: string; agent: string | null }
-export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[];
+export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[]; 
 /**
  * OAuth connections only: true once refresh has failed terminally and
  * the user needs to reconnect via the browser/paste flow again.
@@ -1392,7 +1392,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } |
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -1416,20 +1416,20 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).
  */
-{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number } |
+{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number } | 
 /**
  * A provider OAuth flow produced its authorize URL. Surfaces open it
  * (Cockpit maps this onto the legacy OauthAuthorizeUrlMsg Tauri event).
  */
-{ kind: "oauthAuthorizeUrl"; provider: string; authorize_url: string } |
+{ kind: "oauthAuthorizeUrl"; provider: string; authorize_url: string } | 
 /**
  * Same for a plugin OAuth flow.
  */
-{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } |
+{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } | 
 /**
  * Per-session accumulated cost: total USD and a per-model token+dollar
  * breakdown. Emitted alongside `ContextUsage`.
- *
+ * 
  * Like its sibling context-telemetry variants above, this variant's own
  * fields stay snake_case (`session_pk`, `total_usd`): the enum-level
  * `rename_all = "camelCase"` on `CoreEvent` only renames the `kind` tag
@@ -1446,22 +1446,22 @@ export type CoreEventMsg = { event: CoreEvent }
  * cadence the frontend's `await_kiro_device_flow` call will honor.
  */
 export type DeviceFlowInfo = { flowId: string; userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number; interval: number }
-export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
 export type DirEntryInfo = { name: string; dir: boolean }
 /**
  * Mirror of `crate::plugins::doctor::DoctorFinding`. Already secret-free at
  * the source (see that module's doc comment) — this DTO adds no new fields,
  * just the specta `Type` the core struct doesn't derive.
  */
-export type DoctorFinding = { pluginId: string;
+export type DoctorFinding = { pluginId: string; 
 /**
  * `warn` | `error`.
  */
-severity: string;
+severity: string; 
 /**
  * `reconnect-required` | `missing-binary` | `attach-failed`.
  */
 kind: string; message: string; suggestedAction: string }
+export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
 export type GatewayEventInfo = { at: number; level: string; text: string }
@@ -1482,8 +1482,20 @@ export type GitOptions = { useWorktree: boolean; createBranch: boolean; branchNa
 export type InstalledSkillEntry = { id: string; name: string }
 export type InstalledSkillInfo = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skillCount: number }
 export type InstalledSkillPack = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skills: InstalledSkillEntry[] }
-export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
-export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
+export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[]; 
+/**
+ * Model id this job's session starts with, overriding the project/agent
+ * default. `None` when the job uses ordinary model resolution. Not yet
+ * editable from the scheduler panel — set programmatically today (e.g.
+ * by a future `app_jobs` tool); surfaced here so a later job editor can
+ * read and round-trip it without another DTO change.
+ */
+modelOverride?: string | null }
+export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean; 
+/**
+ * See `JobInfo::model_override`.
+ */
+modelOverride?: string | null }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Where the process's master key actually came from. Surfaced to the UI
@@ -1534,7 +1546,7 @@ provider: string; model: string;
  * Compatibility-only storage for legacy Codex virtual model suffixes.
  * New route writes cannot edit this value directly.
  */
-effort: string | null }
+effort?: string | null }
 /**
  * One persisted probe verdict row across ALL families — hydrates the
  * app-wide model-status store consumed by every model picker.
@@ -1580,31 +1592,31 @@ source: string;
 /**
  * Any of `provider` | `runtime` | `gateway` | `connector`.
  */
-capabilities: string[];
+capabilities: string[]; 
 /**
  * `integration` | `provider` | `gateway` | `skill-pack`. There is no
  * `runtime` kind: the native agent is built-in engine behavior, not an
  * installable/listed plugin, so it never appears in this payload.
  */
-kind: string;
+kind: string; 
 /**
  * Kind-specific "already set up" flag: integration = configured ||
  * enabled; provider = ≥1 connection in the provider's family; gateway =
  * all manifest settings present; skill-pack = installed on disk.
  */
-installed: boolean;
+installed: boolean; 
 /**
  * Provider family head id (providers only) — the Models `providerDetail`
  * navigation target. `None` for other kinds.
  */
-family: string | null;
+family: string | null; 
 /**
  * Mirrors `crate::store::PluginInstallRecord.pinned` — `false` when the
  * plugin has no `plugin_installs` ledger row (never installed via the
  * tracked git-clone path, e.g. builtins/catalog integrations with no
  * skill-pack install).
  */
-pinned: boolean;
+pinned: boolean; 
 /**
  * The ledger row's git origin (`PluginInstallRecord.source_spec`).
  * Distinct from `source` (the stable builtin/catalog/skill-pack enum
@@ -1665,7 +1677,7 @@ export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string;
  * failure — the flow entry survives failures so manual paste still works.
  */
 export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
-export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null;
+export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —
  * NOT a DB column. Self-corrects if the user later runs `git init`.
@@ -1681,33 +1693,33 @@ export type RefreshModelsResult = { connectionId: string; label: string; ok: boo
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type SelectableModelInfo = { kind: SelectableModelKind; requestValue: string; displayName: string; preferenceKey: ModelPreferenceKey | null; supported: ReasoningEffortOption[]; configuredDefault: string | null; resolvedDefault: string | null; defaultSource: ModelDefaultSource }
 export type SelectableModelKind = "concrete" | "namedRoute"
-export type Session = { sessionPk: string;
+export type Session = { sessionPk: string; 
 /**
  * `None` for chat-first sessions (`kind != Project`); a project-bound
  * session always has this set.
  */
-projectId: string | null; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus;
+projectId: string | null; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; 
 /**
  * Per-session permission mode. Copied from the project (or the new-chat
  * picker) at creation; changing it affects THIS session only.
  */
-permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number;
+permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
 /**
  * True when the engine auto-generated the branch name (`harness/{short}`).
  * `end_session` deletes the branch ONLY when this is set; user-named and
  * pre-existing branches survive teardown.
  */
-branchOwned: boolean; kind: SessionKind;
+branchOwned: boolean; kind: SessionKind; 
 /**
  * Who is speaking in this session (chat-first; e.g. a Discord user id
  * or `"cockpit"`). Unused for `Project` sessions.
  */
-speaker: string | null;
+speaker: string | null; 
 /**
  * Which agent persona/config is driving this session. Unused for
  * `Project` sessions.
  */
-agent: string | null;
+agent: string | null; 
 /**
  * The session this one was spawned from (`Worker`/`Review` lineage).
  */
@@ -1720,9 +1732,8 @@ parentSessionPk: string | null }
  * or project session that spawned them.
  */
 export type SessionKind = "project" | "chat" | "worker" | "review"
-export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type SessionRuntimeInfo = { sessionPk: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
-export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
+export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 /**
  * Mirror of `crate::skills_install::BeginInstall`, flattened into a single
  * `{completed, trust?, plugin?}` shape the wizard can branch on without a
@@ -1730,6 +1741,7 @@ export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
  * for `Completed` — exactly one is ever `Some`.
  */
 export type SkillInstallBegin = { completed: boolean; trust: TrustPromptDto | null; plugin: InstalledSkillPack | null }
+export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 
 /**
