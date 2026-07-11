@@ -54,9 +54,16 @@ impl Action {
 /// stamp ([`skills_install::PROVENANCE_FILE`]) plus the protected-builtin set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provenance {
-    /// No provenance stamp: created by a user or an agent directly through
-    /// `skill_manage`, never installed from a pack.
+    /// No provenance stamp and no `skill_usage.created_by == "agent"` stamp:
+    /// authored by a human directly through `skill_manage`, never installed
+    /// from a pack. Off-limits to autonomous origins.
     UserAuthored,
+    /// No provenance stamp, but `skill_usage.created_by == "agent"`
+    /// ([`crate::store::Store::mark_skill_created_by_agent`]): created by an
+    /// autonomous origin through `skill_manage`'s own `create` action. The
+    /// ONE non-`Installed`/non-builtin provenance an autonomous origin may
+    /// mutate — it may only tamper with skills it made itself.
+    AgentCreated,
     /// Carries a `.ryuzi-skill.json` stamp: materialized by `skills_install`
     /// from a git-backed source (curated or arbitrary), possibly as part of a
     /// plugin pack.
@@ -98,20 +105,23 @@ pub fn guard_decision(
     if pinned && action.is_removal() {
         return Err("this skill is pinned (delete-protected); unpin it first".into());
     }
-    // 3. Installed (bundled/hub/external) skills are read-only to autonomous
-    //    origins — only an interactive user may edit what they installed.
-    if prov == Provenance::Installed && origin.is_autonomous() {
+    // 3. Autonomous origins (agent turns, the review fork) may only mutate
+    //    skills THEY created. Installed packs and human-authored skills are
+    //    off-limits — only the interactive user edits those. `Create` is exempt
+    //    (a brand-new skill has nothing to tamper with).
+    if origin.is_autonomous()
+        && action != Action::Create
+        && !matches!(prov, Provenance::AgentCreated)
+    {
         return Err(
-            "installed skills are read-only to the agent; only the user may edit them".into(),
+            "the agent may only modify skills it created; this skill is not agent-created".into(),
         );
     }
-    // 4. The background self-review fork — the strictest origin — must have
-    //    `skill`-viewed the exact skill THIS turn before mutating it, so it
-    //    never edits a skill blind. Creation is exempt (nothing to view yet).
-    if origin == WriteOrigin::BackgroundReview && action != Action::Create && viewed.is_empty() {
-        return Err(
-            "background review must `skill` (view) this exact skill before mutating it".into(),
-        );
+    // 4. An autonomous origin must have `skill`-viewed the exact skill THIS
+    //    turn before mutating it (even one it created), so it never edits
+    //    blind. Creation is exempt (nothing to view yet).
+    if origin.is_autonomous() && action != Action::Create && viewed.is_empty() {
+        return Err("must `skill` (view) this exact skill before mutating it".into());
     }
     Ok(())
 }
@@ -171,6 +181,7 @@ async fn provenance_and_pin(ctx: &ToolCtx, dir: &Path, name: &str) -> (Provenanc
     if PROTECTED_BUILTIN_SKILLS.contains(&name) {
         return (Provenance::ProtectedBuiltin, false);
     }
+    let usage = ctx.store.get_skill_usage(name).await.ok().flatten();
     let stamp_path = dir.join(skills_install::PROVENANCE_FILE);
     let (provenance, plugin_id) = match std::fs::read_to_string(&stamp_path) {
         Ok(text) => {
@@ -179,16 +190,21 @@ async fn provenance_and_pin(ctx: &ToolCtx, dir: &Path, name: &str) -> (Provenanc
                 .and_then(|s| s.plugin_id);
             (Provenance::Installed, plugin_id)
         }
-        Err(_) => (Provenance::UserAuthored, None),
+        Err(_) => {
+            // No install stamp: distinguish a skill an agent created (carries
+            // the `created_by='agent'` usage stamp) from a human-authored one,
+            // so autonomous origins are scoped to only their own skills.
+            let created_by_agent =
+                usage.as_ref().and_then(|u| u.created_by.as_deref()) == Some("agent");
+            let prov = if created_by_agent {
+                Provenance::AgentCreated
+            } else {
+                Provenance::UserAuthored
+            };
+            (prov, None)
+        }
     };
-    let mut pinned = ctx
-        .store
-        .get_skill_usage(name)
-        .await
-        .ok()
-        .flatten()
-        .map(|u| u.pinned)
-        .unwrap_or(false);
+    let mut pinned = usage.as_ref().map(|u| u.pinned).unwrap_or(false);
     if let Some(pid) = plugin_id {
         if let Ok(Some(rec)) = ctx.store.get_plugin_install(&pid).await {
             pinned = pinned || rec.pinned;
@@ -589,10 +605,47 @@ mod tests {
             &viewed(&["s"])
         )
         .is_ok());
-        // A review fork must have skill_view'd the exact skill before mutating it.
+        // Autonomous origins may not mutate a human-authored skill, viewed or
+        // not — only skills they created themselves.
+        assert!(guard_decision(
+            Action::Edit,
+            Provenance::UserAuthored,
+            WriteOrigin::Agent,
+            false,
+            &viewed(&[])
+        )
+        .is_err());
+        assert!(guard_decision(
+            Action::Edit,
+            Provenance::UserAuthored,
+            WriteOrigin::Agent,
+            false,
+            &viewed(&["s"])
+        )
+        .is_err());
+        // AgentCreated: the one non-builtin provenance an autonomous origin
+        // may mutate — but still gated on having viewed it this turn.
+        assert!(guard_decision(
+            Action::Edit,
+            Provenance::AgentCreated,
+            WriteOrigin::Agent,
+            false,
+            &viewed(&["s"])
+        )
+        .is_ok());
+        assert!(guard_decision(
+            Action::Edit,
+            Provenance::AgentCreated,
+            WriteOrigin::Agent,
+            false,
+            &viewed(&[])
+        )
+        .is_err());
+        // A review fork must have skill_view'd the exact skill before mutating
+        // an AgentCreated skill.
         assert!(guard_decision(
             Action::Patch,
-            Provenance::UserAuthored,
+            Provenance::AgentCreated,
             WriteOrigin::BackgroundReview,
             false,
             &viewed(&[])
@@ -600,7 +653,7 @@ mod tests {
         .is_err());
         assert!(guard_decision(
             Action::Patch,
-            Provenance::UserAuthored,
+            Provenance::AgentCreated,
             WriteOrigin::BackgroundReview,
             false,
             &viewed(&["s"])
@@ -799,7 +852,11 @@ mod tests {
             .unwrap();
 
         assert!(out.is_error, "{}", out.for_model);
-        assert!(out.for_model.contains("read-only"), "{}", out.for_model);
+        assert!(
+            out.for_model.contains("not agent-created"),
+            "{}",
+            out.for_model
+        );
         let after = std::fs::read_to_string(root.join("pdf/SKILL.md")).unwrap();
         assert_eq!(before, after, "a denied write must not touch the file");
         // No patch bookkeeping either — a denied call is a full no-op.
@@ -828,11 +885,136 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn agent_cannot_edit_a_user_authored_skill_and_file_is_unchanged() {
+        // The Critical-finding regression test: `seed_skill` never stamps
+        // `skill_usage.created_by`, so this skill is `UserAuthored` — an
+        // autonomous origin must be denied even though it has viewed it.
+        let (_guard, root) = ConfigRootGuard::new();
+        seed_skill(&root, "deploy", "Original body.", None);
+        let wd = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_origin(wd.path(), WriteOrigin::Agent).await;
+        ctx.viewed_skills.lock().await.insert("deploy".to_string());
+        let before = std::fs::read_to_string(root.join("deploy/SKILL.md")).unwrap();
+
+        let edit_out = SkillManage
+            .execute(
+                &ctx,
+                json!({"action": "edit", "name": "deploy", "body": "HACKED"}),
+            )
+            .await
+            .unwrap();
+        assert!(edit_out.is_error, "{}", edit_out.for_model);
+        assert!(
+            edit_out.for_model.contains("not agent-created"),
+            "{}",
+            edit_out.for_model
+        );
+        assert_eq!(
+            before,
+            std::fs::read_to_string(root.join("deploy/SKILL.md")).unwrap(),
+            "a denied edit must not touch the file"
+        );
+
+        let patch_out = SkillManage
+            .execute(
+                &ctx,
+                json!({"action": "patch", "name": "deploy", "text": "HACKED"}),
+            )
+            .await
+            .unwrap();
+        assert!(patch_out.is_error, "{}", patch_out.for_model);
+        assert_eq!(
+            before,
+            std::fs::read_to_string(root.join("deploy/SKILL.md")).unwrap(),
+            "a denied patch must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn agent_cannot_delete_a_user_authored_skill() {
+        let (_guard, root) = ConfigRootGuard::new();
+        seed_skill(&root, "deploy", "Original body.", None);
+        let wd = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_origin(wd.path(), WriteOrigin::Agent).await;
+        ctx.viewed_skills.lock().await.insert("deploy".to_string());
+
+        let out = SkillManage
+            .execute(
+                &ctx,
+                json!({"action": "delete", "name": "deploy", "absorbed_into": "deploy-v2"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.for_model);
+        assert!(
+            out.for_model.contains("not agent-created"),
+            "{}",
+            out.for_model
+        );
+        assert!(root.join("deploy").exists(), "the skill dir must survive");
+        assert!(
+            !root.join(".archive").exists(),
+            "a denied delete must not archive"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn agent_can_manage_an_agent_created_skill_after_viewing() {
+        let (_guard, root) = ConfigRootGuard::new();
+        let wd = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_origin(wd.path(), WriteOrigin::Agent).await;
+
+        // Create it as the agent, so `skill_usage.created_by == "agent"`.
+        let create_out = SkillManage
+            .execute(
+                &ctx,
+                json!({"action": "create", "name": "deploy", "description": "d", "body": "v1"}),
+            )
+            .await
+            .unwrap();
+        assert!(!create_out.is_error, "{}", create_out.for_model);
+
+        // Without viewing, the view-gate (rule 4) still denies a patch.
+        let unviewed_out = SkillManage
+            .execute(
+                &ctx,
+                json!({"action": "patch", "name": "deploy", "text": "v2"}),
+            )
+            .await
+            .unwrap();
+        assert!(unviewed_out.is_error, "{}", unviewed_out.for_model);
+
+        // View it, then the same patch succeeds — an agent may manage its own
+        // creation once it has looked at it this turn.
+        ctx.viewed_skills.lock().await.insert("deploy".to_string());
+        let patch_out = SkillManage
+            .execute(
+                &ctx,
+                json!({"action": "patch", "name": "deploy", "text": "v2"}),
+            )
+            .await
+            .unwrap();
+        assert!(!patch_out.is_error, "{}", patch_out.for_model);
+        let md = std::fs::read_to_string(root.join("deploy/SKILL.md")).unwrap();
+        assert!(md.contains("v2"), "{md}");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn background_review_must_view_before_patching_and_file_is_unchanged_until_then() {
         let (_guard, root) = ConfigRootGuard::new();
         seed_skill(&root, "deploy", "Original body.", None);
         let wd = tempfile::tempdir().unwrap();
         let ctx = ctx_with_origin(wd.path(), WriteOrigin::BackgroundReview).await;
+        // AgentCreated (not UserAuthored) so this test isolates the view-gate
+        // (rule 4) — a UserAuthored skill would be denied outright by rule 3
+        // regardless of viewing.
+        ctx.store
+            .mark_skill_created_by_agent("deploy")
+            .await
+            .unwrap();
         let before = std::fs::read_to_string(root.join("deploy/SKILL.md")).unwrap();
 
         // Not viewed yet: denied, file untouched.
@@ -930,6 +1112,16 @@ mod tests {
         seed_skill(&root, "deploy", "Original body.", None);
         let wd = tempfile::tempdir().unwrap();
         let ctx = ctx_with_origin(wd.path(), WriteOrigin::Agent).await;
+        // An agent may archive-delete only a skill it created itself; stamp
+        // it AgentCreated so this test exercises the archive-not-hard-delete
+        // behavior rather than the (separate, now-denied) UserAuthored case.
+        ctx.store
+            .mark_skill_created_by_agent("deploy")
+            .await
+            .unwrap();
+        // Satisfy the view-gate (rule 4) so the deletes below fail/succeed on
+        // the `absorbed_into` requirement being tested, not on unviewed-ness.
+        ctx.viewed_skills.lock().await.insert("deploy".to_string());
 
         // Missing `absorbed_into`: fail closed, nothing touched.
         let out = SkillManage
