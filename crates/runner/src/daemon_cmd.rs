@@ -128,7 +128,7 @@ async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<u16> {
     let state = ryuzi_core::serve::ApiState {
         cp: daemon.cp.clone(),
         router_server: daemon.router_server.clone(),
-        token: Some(token),
+        control_token: token,
     };
     // TODO(P2-7/P2-8): loopback-only for now — wire real TLS + the
     // non-loopback-requires-TLS enforcement once the caller-side pieces land.

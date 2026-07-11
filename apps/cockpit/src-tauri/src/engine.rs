@@ -250,7 +250,7 @@ mod tests {
                 cp.store().clone(),
             )),
             cp: cp.clone(),
-            token: Some(token.to_string()),
+            control_token: token.to_string(),
         };
         let opts = ryuzi_core::serve::ServeOpts {
             addr: std::net::Ipv4Addr::LOCALHOST.into(),

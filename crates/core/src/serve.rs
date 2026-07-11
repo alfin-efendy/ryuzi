@@ -7,7 +7,8 @@ use crate::control::ControlPlane;
 use crate::llm_router::server::RouterServer;
 use crate::plugins::{CorePlugin, PluginSource};
 use crate::settings::SettingsStore;
-use axum::extract::{Path, State};
+use crate::store::Device;
+use axum::extract::{ConnectInfo, Path, State};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -28,8 +29,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub struct ApiState {
     pub cp: Arc<ControlPlane>,
     pub router_server: Arc<RouterServer>,
-    /// `None` disables auth (tests, legacy embedded serve).
-    pub token: Option<String>,
+    /// The loopback-only control token (see [`require_token`]). Always a
+    /// real secret — there is no auth-disable mode.
+    pub control_token: String,
 }
 
 /// Build the HTTP router over a control plane.
@@ -52,29 +54,83 @@ pub fn router(state: ApiState) -> Router {
 }
 
 /// Reject requests without a valid `Authorization: Bearer <token>` header.
-/// Never applied to `GET /health`. A `None` token (tests, legacy embedded
-/// serve) disables auth entirely.
+/// Never applied to `GET /health`. Two-tier auth (see [`authorize`] for the
+/// pure decision logic this delegates to):
+///
+/// 1. A bearer whose SHA-256 hash matches a non-revoked `devices.token_hash`
+///    row authenticates from ANY peer — this is how a paired remote client
+///    (Phase 2 pairing) reaches the control API.
+/// 2. Otherwise, the daemon's own `control_token` authenticates ONLY when
+///    the peer is loopback (`ConnectInfo`'s `ip.is_loopback()`) — the
+///    control token must never be accepted from a remote peer, even if
+///    somehow leaked/guessed.
+///
+/// There is no auth-disable mode: every `ApiState` carries a real
+/// `control_token`.
 async fn require_token(
     State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
-    let Some(expected) = &state.token else {
-        return next.run(req).await; // auth disabled
-    };
     let presented = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(p) if crate::control_token::verify(p, expected) => next.run(req).await,
-        _ => (
-            axum::http::StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "missing or invalid bearer token" })),
-        )
-            .into_response(),
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+
+    let Some(presented) = presented else {
+        return unauthorized();
+    };
+
+    let device_hash = crate::update::asset::sha256_hex(presented.as_bytes());
+    let device = state
+        .cp
+        .store()
+        .find_device_by_token_hash(&device_hash)
+        .await
+        .ok()
+        .flatten();
+
+    if authorize(
+        peer.ip().is_loopback(),
+        &presented,
+        &state.control_token,
+        device.as_ref(),
+    ) {
+        next.run(req).await
+    } else {
+        unauthorized()
     }
+}
+
+/// Pure two-tier auth decision, factored out of [`require_token`] so the
+/// "control token from a non-loopback peer must be rejected" branch is
+/// unit-testable without standing up a real non-loopback socket (test
+/// servers only ever bind loopback). `device` is the already-resolved,
+/// already-revoked-filtered `devices` row for the presented bearer's hash
+/// (see `Store::find_device_by_token_hash`) — a `Some` here authenticates
+/// unconditionally (device tokens work from any peer); otherwise the
+/// `control_token` authenticates only when `peer_is_loopback`.
+fn authorize(
+    peer_is_loopback: bool,
+    presented: &str,
+    control_token: &str,
+    device: Option<&Device>,
+) -> bool {
+    if device.is_some() {
+        return true;
+    }
+    peer_is_loopback && crate::control_token::verify(presented, control_token)
+}
+
+fn unauthorized() -> axum::response::Response {
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "missing or invalid bearer token" })),
+    )
+        .into_response()
 }
 
 /// Configuration for [`serve`]: which address/port to bind, and an optional
@@ -340,27 +396,26 @@ mod tests {
         ControlPlane::new(store, Registries::new()).await
     }
 
-    /// Auth-disabled `ApiState` for pre-existing tests that don't exercise
-    /// the bearer-token middleware.
-    fn no_auth_state(cp: Arc<ControlPlane>) -> ApiState {
+    /// The control token every test `ApiState` uses — there is no
+    /// auth-disable mode, so every test needs a real one.
+    const TEST_CONTROL_TOKEN: &str = "sekrit";
+
+    /// `ApiState` wrapping `cp` with the shared test control token. Used
+    /// both by tests that don't exercise the bearer-token middleware at all
+    /// (e.g. `serve_binds_an_ephemeral_port`) and by tests that hit `/health`
+    /// only (public) — as well as ones that authenticate explicitly.
+    fn state_for(cp: Arc<ControlPlane>) -> ApiState {
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
                 cp.store().clone(),
             )),
             cp,
-            token: None,
+            control_token: TEST_CONTROL_TOKEN.to_string(),
         }
     }
 
     async fn test_state() -> ApiState {
-        let cp = test_cp().await;
-        ApiState {
-            router_server: Arc::new(crate::llm_router::server::RouterServer::new(
-                cp.store().clone(),
-            )),
-            cp,
-            token: Some("sekrit".to_string()),
-        }
+        state_for(test_cp().await)
     }
 
     /// A connector that contributes no MCP servers — enough to exercise the
@@ -423,22 +478,25 @@ mod tests {
         assert_eq!(v["status"], "ok");
         assert_eq!(v["service"], "ryuzi");
         // Router builds without panicking.
-        let _ = router(no_auth_state(cp));
+        let _ = router(state_for(cp));
     }
 
     #[tokio::test]
     async fn serve_binds_an_ephemeral_port() {
         let cp = test_cp().await;
-        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
         assert!(port > 0);
     }
 
     #[tokio::test]
     async fn list_plugins_shows_anthropic_enabled_with_provider_capability() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
 
-        let body: Vec<Value> = reqwest::get(format!("http://127.0.0.1:{port}/plugins"))
+        let body: Vec<Value> = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/plugins"))
+            .bearer_auth(TEST_CONTROL_TOKEN)
+            .send()
             .await
             .unwrap()
             .json()
@@ -457,9 +515,12 @@ mod tests {
     #[tokio::test]
     async fn get_plugin_returns_manifest_fields_plus_enabled_and_source() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
 
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/anthropic"))
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/plugins/anthropic"))
+            .bearer_auth(TEST_CONTROL_TOKEN)
+            .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -475,9 +536,12 @@ mod tests {
     #[tokio::test]
     async fn unknown_plugin_id_is_404_with_error_envelope() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
 
-        let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/nope"))
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/plugins/nope"))
+            .bearer_auth(TEST_CONTROL_TOKEN)
+            .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
@@ -491,12 +555,15 @@ mod tests {
         // Keep a handle to write the setting directly after the server (which
         // consumes an `Arc<ControlPlane>` into its router state) is started.
         let store = cp.store().clone();
-        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
 
         let fetch = || {
             let url = format!("http://127.0.0.1:{port}/plugins");
             async move {
-                reqwest::get(url)
+                reqwest::Client::new()
+                    .get(url)
+                    .bearer_auth(TEST_CONTROL_TOKEN)
+                    .send()
                     .await
                     .unwrap()
                     .json::<Vec<Value>>()
@@ -612,7 +679,7 @@ mod tests {
 
         let cp = test_cp().await;
         let port = serve(
-            no_auth_state(cp),
+            state_for(cp),
             ServeOpts {
                 addr: Ipv4Addr::LOCALHOST.into(),
                 port: 0,
@@ -622,5 +689,123 @@ mod tests {
         .await
         .unwrap();
         assert!(port > 0);
+    }
+
+    // ---- P2-5: two-tier auth (device tokens + loopback control token) ----
+
+    /// A minimal non-revoked `Device` row for `authorize` unit tests — the
+    /// exact field values don't matter, only that it's `Some`.
+    fn fake_device() -> Device {
+        Device {
+            id: "dev-1".to_string(),
+            name: "test-device".to_string(),
+            created_at: 0,
+            last_seen: None,
+            revoked: false,
+        }
+    }
+
+    #[test]
+    fn authorize_allows_loopback_peer_with_valid_control_token() {
+        assert!(authorize(
+            true,
+            "the-control-token",
+            "the-control-token",
+            None
+        ));
+    }
+
+    #[test]
+    fn authorize_rejects_control_token_from_non_loopback_peer() {
+        // The whole point of the two-tier scheme: the control token must
+        // never authenticate a remote peer, even with the exact right value.
+        assert!(!authorize(
+            false,
+            "the-control-token",
+            "the-control-token",
+            None
+        ));
+    }
+
+    #[test]
+    fn authorize_allows_a_resolved_device_from_any_peer() {
+        let device = fake_device();
+        // Loopback...
+        assert!(authorize(
+            true,
+            "device-secret",
+            "the-control-token",
+            Some(&device)
+        ));
+        // ...and non-loopback: device tokens work from anywhere.
+        assert!(authorize(
+            false,
+            "device-secret",
+            "the-control-token",
+            Some(&device)
+        ));
+    }
+
+    #[test]
+    fn authorize_rejects_unknown_bearer() {
+        assert!(!authorize(true, "nope", "the-control-token", None));
+        assert!(!authorize(false, "nope", "the-control-token", None));
+    }
+
+    /// A bearer whose SHA-256 hash matches a non-revoked `devices` row
+    /// authenticates via the real middleware end-to-end (not just the pure
+    /// `authorize` decision), from the loopback peer a `serve()`-bound test
+    /// server always presents.
+    #[tokio::test]
+    async fn device_token_authenticates_through_the_real_middleware() {
+        let cp = test_cp().await;
+        let store = cp.store().clone();
+        let raw_token = "device-secret-abc";
+        store
+            .insert_device(
+                "dev-1",
+                "test-device",
+                &crate::update::asset::sha256_hex(raw_token.as_bytes()),
+            )
+            .await
+            .unwrap();
+
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let r = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/sessions"))
+            .bearer_auth(raw_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+    }
+
+    /// A revoked device's token must no longer authenticate — even though it
+    /// once did, and even though `find_device_by_token_hash` already filters
+    /// revoked rows at the store layer, this exercises that guarantee
+    /// through the full middleware, not just `store.rs`'s own tests.
+    #[tokio::test]
+    async fn revoked_device_token_is_rejected_by_the_real_middleware() {
+        let cp = test_cp().await;
+        let store = cp.store().clone();
+        let raw_token = "device-secret-xyz";
+        store
+            .insert_device(
+                "dev-2",
+                "test-device-2",
+                &crate::update::asset::sha256_hex(raw_token.as_bytes()),
+            )
+            .await
+            .unwrap();
+        store.revoke_device("dev-2").await.unwrap();
+
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let r = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/sessions"))
+            .bearer_auth(raw_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 }

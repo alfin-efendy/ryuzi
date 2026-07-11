@@ -108,7 +108,7 @@ async fn run_inner() -> i32 {
         ryuzi_core::serve::ApiState {
             cp: daemon.cp.clone(),
             router_server: daemon.router_server.clone(),
-            token: Some(token),
+            control_token: token,
         },
         ryuzi_core::serve::ServeOpts {
             addr: std::net::Ipv4Addr::LOCALHOST.into(),

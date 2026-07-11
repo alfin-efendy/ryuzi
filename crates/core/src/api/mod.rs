@@ -111,7 +111,7 @@ pub(crate) mod tests_support {
                 cp.store().clone(),
             )),
             cp,
-            token: Some("t".into()),
+            control_token: "t".into(),
         }
     }
 
@@ -176,7 +176,7 @@ pub(crate) mod tests_support {
                 cp.store().clone(),
             )),
             cp,
-            token: Some("t".into()),
+            control_token: "t".into(),
         }
     }
 }
