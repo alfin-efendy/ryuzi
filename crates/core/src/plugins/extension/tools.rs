@@ -158,9 +158,14 @@ impl ExtensionTools for ExtensionHost {
                         });
                     }
                     None => {
+                        // `raw` is extension-controlled; cap it so a large or
+                        // sensitive-looking tool def can't flood or leak into
+                        // the daemon log wholesale. `chars().take` keeps the
+                        // cut on a UTF-8 boundary (String::truncate would panic).
+                        let preview: String = raw.to_string().chars().take(200).collect();
                         tracing::warn!(
                             extension = %entry.name,
-                            tool_def = %raw,
+                            tool_def_preview = %preview,
                             "skipping malformed tool def from extension/initialize"
                         );
                     }

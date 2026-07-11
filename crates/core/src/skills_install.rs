@@ -212,24 +212,12 @@ impl RepoCloner for GitRepoCloner {
     }
 }
 
-pub async fn install_skill_source(source: &str) -> Result<InstalledSkillPack> {
-    let roots = InstallRoots::for_user()?;
-    let cloner = GitRepoCloner;
-    install_skill_source_with(source, &roots, &cloner).await
-}
-
-/// Like `install_skill_source`, but also writes a `plugin_installs` ledger
-/// row (resolved commit, content fingerprint, and trust tier) for the
-/// installed pack. Used by the daemon/Tauri paths, which always have a
-/// `Store` handle; `install_skill_source` remains for callers without one.
-pub async fn install_skill_source_recorded(
-    source: &str,
-    store: &crate::store::Store,
-) -> Result<InstalledSkillPack> {
-    let roots = InstallRoots::for_user()?;
-    let cloner = GitRepoCloner;
-    install_skill_source_with_recorded(source, &roots, &cloner, store).await
-}
+// NOTE: the ungated `install_skill_source` / `install_skill_source_recorded`
+// convenience wrappers were removed — every production install path now routes
+// through the trust gate (`begin_install`/`confirm_install` or
+// `install_skill_source_gated`). The injectable core `install_skill_source_with`
+// remains for `refresh_installed_skill` and tests; `install_skill_source_with_recorded`
+// is now test-only (the gated/begin paths inline the equivalent ledger write).
 
 pub fn list_installed_skills() -> Result<Vec<InstalledSkillInfo>> {
     let roots = InstallRoots::for_user()?;
@@ -411,6 +399,12 @@ async fn install_skill_source_with_commit(
 /// `trust_tier` = `"curated"` for `CURATED_SKILL_SOURCES` repos, otherwise
 /// `"acknowledged"` (immediately acked, since an explicit install is itself
 /// the acknowledgement).
+///
+/// Test-only: production ledger-recording installs go through the trust gate
+/// (`install_skill_source_gated_with` / `begin_install_with`), which inline the
+/// equivalent recording; this helper is retained to exercise that recording
+/// logic directly.
+#[cfg(test)]
 async fn install_skill_source_with_recorded(
     source: &str,
     roots: &InstallRoots,
