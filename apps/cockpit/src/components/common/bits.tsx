@@ -82,7 +82,7 @@ export function Pill({
   className,
 }: {
   children: ReactNode;
-  variant?: "secondary" | "primary" | "warn" | "mono";
+  variant?: "secondary" | "primary" | "warn" | "danger" | "mono";
   className?: string;
 }) {
   const base = "rounded-full px-2 py-[2px] text-[10.5px] font-semibold tracking-[0.02em]";
@@ -94,9 +94,24 @@ export function Pill({
         {children}
       </span>
     );
+  if (variant === "danger")
+    return (
+      <span className={cn(base, className)} style={{ background: "color-mix(in oklab, #EF4444 18%, transparent)", color: "#EF4444" }}>
+        {children}
+      </span>
+    );
   if (variant === "mono")
     return <span className={cn(base, "bg-secondary font-mono font-normal text-secondary-foreground", className)}>{children}</span>;
   return <span className={cn(base, "bg-secondary text-secondary-foreground", className)}>{children}</span>;
+}
+
+// Red "Blocked" badge for a plugin the remote catalog's signed feed revoked
+// (`PluginInfo.blockedReason` set) — the Browse card hides its Install
+// button alongside this, and the Installed card shows it if a previously
+// installed entry gets revoked later. Shares the `Pill` "danger" styling
+// convention with `DoctorPanel`'s error-severity color.
+export function BlockedBadge() {
+  return <Pill variant="danger">Blocked</Pill>;
 }
 
 const CATEGORY_BADGES: Record<string, { label: string; color: string; outline?: boolean }> = {

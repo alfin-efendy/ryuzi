@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AddAppInput, AppInfo, PluginDetail, PluginInfo, PluginInstallBeginResult } from "@/bindings";
+import type { AddAppInput, AppInfo, CatalogStatus, PluginDetail, PluginInfo, PluginInstallBeginResult } from "@/bindings";
 
 function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}): PluginInfo {
   return {
@@ -24,6 +24,9 @@ function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}
     installedAt: null,
     updatedAt: null,
     trustTier: null,
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
     ...over,
   };
 }
@@ -62,6 +65,7 @@ const githubApp: AppInfo = {
 let appsFixture: AppInfo[] = [];
 let pluginsFixture: PluginInfo[] = [github, notion];
 let doctorFindingsFixture: { pluginId: string; severity: string; kind: string; message: string; suggestedAction: string }[] = [];
+let catalogStatusFixture: CatalogStatus = { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 };
 
 const listApps = mock(async () => ({ status: "ok" as const, data: appsFixture }));
 const addApp = mock(async (_input: AddAppInput) => ({ status: "ok" as const, data: appsFixture }));
@@ -71,6 +75,10 @@ const uninstallPlugin = mock(async (id: string) => ({
   data: pluginsFixture.filter((p) => p.id !== id),
 }));
 const pluginsRestartRequired = mock(async () => ({ status: "ok" as const, data: false }));
+const catalogStatus = mock(async () => ({ status: "ok" as const, data: catalogStatusFixture }));
+// Simulates a real (verified) fetch by default — matches the RPC's own
+// `refresh_catalog` behavior of returning the fresh `catalog_status` snapshot.
+const refreshCatalog = mock(async () => ({ status: "ok" as const, data: catalogStatusFixture }));
 const pluginDoctor = mock(async () => ({ status: "ok" as const, data: doctorFindingsFixture }));
 const updatePlugin = mock(async (_id: string, _force: boolean) => ({ status: "ok" as const, data: { kind: "updated" as const } }));
 const updateAllPlugins = mock(async () => ({ status: "ok" as const, data: [] as { id: string; outcome: { kind: string } }[] }));
@@ -193,6 +201,8 @@ mock.module("@/bindings", () => ({
     listPlugins,
     uninstallPlugin,
     pluginsRestartRequired,
+    catalogStatus,
+    refreshCatalog,
     pluginDoctor,
     updatePlugin,
     updateAllPlugins,
@@ -210,6 +220,16 @@ mock.module("@/bindings", () => ({
     setPluginSetting,
     setPluginEnabled,
   },
+}));
+// `refreshCatalog`'s store action toasts the outcome — mock the boundary
+// (matches `DoctorPanel.test.tsx`/`SkillInstallModal.test.tsx`'s convention)
+// so tests can assert on it instead of exercising real sonner DOM state.
+const toastSuccess = mock((_message: string) => {});
+const toastWarning = mock((_message: string) => {});
+const toastError = mock((_message: string) => {});
+mock.module("sonner", () => ({
+  toast: { success: toastSuccess, warning: toastWarning, error: toastError, info: mock(() => {}) },
+  Toaster: () => null,
 }));
 
 const { useSkills } = await import("../store-skills");
@@ -236,6 +256,7 @@ function resetPluginsStore() {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
+    catalogStatus: null,
   });
 }
 
@@ -243,11 +264,14 @@ beforeEach(() => {
   appsFixture = [];
   pluginsFixture = [github, notion];
   doctorFindingsFixture = [];
+  catalogStatusFixture = { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 };
   listApps.mockClear();
   addApp.mockClear();
   listPlugins.mockClear();
   uninstallPlugin.mockClear();
   pluginsRestartRequired.mockClear();
+  catalogStatus.mockClear();
+  refreshCatalog.mockClear();
   pluginDoctor.mockClear();
   updatePlugin.mockClear();
   updateAllPlugins.mockClear();
@@ -266,6 +290,9 @@ beforeEach(() => {
   setPluginEnabled.mockClear();
   pluginOauthCompletedMsgListen.mockClear();
   oauthAuthorizeUrlMsgListen.mockClear();
+  toastSuccess.mockClear();
+  toastWarning.mockClear();
+  toastError.mockClear();
   useApps.setState({ apps: [], loaded: false, probing: null });
   resetPluginsStore();
   useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
@@ -520,4 +547,37 @@ test("filterByCategory matches a plugin tagged with several categories from any 
 
 test("filterByCategory returns an empty list when nothing matches", () => {
   expect(filterByCategory(all, "sandbox")).toEqual([]);
+});
+
+test("Browse's Refresh catalog button calls refreshCatalog and toasts the outcome", async () => {
+  catalogStatusFixture = { sequence: 4, lastFetchAt: 1_700_000_000_000, outcome: "ok", entries: 12, blocked: 1 };
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  await screen.findByText("github");
+
+  fireEvent.click(screen.getByRole("button", { name: "Refresh catalog" }));
+
+  await waitFor(() => expect(refreshCatalog).toHaveBeenCalled());
+  await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+});
+
+test("Browse shows a subtle catalog status line once catalogStatus has loaded", async () => {
+  catalogStatusFixture = { sequence: 4, lastFetchAt: 1_700_000_000_000, outcome: "ok", entries: 12, blocked: 1 };
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+
+  expect(await screen.findByText(/Catalog seq 4/)).toBeTruthy();
+});
+
+test("a blocked catalog entry renders the Blocked badge and hides the Install button", async () => {
+  const blockedPlugin = plugin("evil-plugin", ["vcs"], { blockedReason: "revoked: known-malicious update" });
+  pluginsFixture = [blockedPlugin];
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+
+  expect(await screen.findByText("Blocked")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Install evil-plugin" })).toBeNull();
 });

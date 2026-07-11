@@ -5,10 +5,11 @@
 //! (`set_plugin_setting`), plugin OAuth sign-in, a provider's effective
 //! model list (`plugin_models`), kind-symmetric `uninstall_plugin`, the
 //! install wizard (`begin_plugin_install` / `set_plugin_oauth_client_id` /
-//! `cancel_plugin_install`), and the skill/plugin distribution surface
+//! `cancel_plugin_install`), the skill/plugin distribution surface
 //! (`begin_skill_install` / `confirm_skill_install` / `update_plugin` /
 //! `update_all_plugins` / `set_plugin_pin` / `plugin_doctor` /
-//! `plugins_restart_required`).
+//! `plugins_restart_required`), and the remote catalog surface
+//! (`refresh_catalog` / `catalog_status`).
 //!
 //! Behavior change from the pre-daemon version: `begin_plugin_oauth` and
 //! `begin_plugin_install` no longer open the system browser directly — the
@@ -41,7 +42,7 @@ use tokio::sync::oneshot;
 // way.
 #[allow(unused_imports)]
 pub use ryuzi_core::api::types::{
-    DoctorFinding, PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo,
+    CatalogStatus, DoctorFinding, PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo,
     PluginInstallBeginResult, PluginMcpInfo, PluginOauthBeginResult, SkillInstallBegin,
     TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
 };
@@ -509,4 +510,23 @@ pub async fn plugins_restart_required(engine: Engine<'_>) -> R<bool> {
     engine
         .rpc("plugins_restart_required", serde_json::json!({}))
         .await
+}
+
+// ---------- Remote catalog: force-refresh + status ----------
+
+/// Force an out-of-cadence catalog fetch right now — `RemoteCatalogManager`'s
+/// background timer lives daemon-side and is not otherwise user-triggerable.
+/// Returns the same snapshot shape as `catalog_status`.
+#[tauri::command]
+#[specta::specta]
+pub async fn refresh_catalog(engine: Engine<'_>) -> R<CatalogStatus> {
+    engine.rpc("refresh_catalog", serde_json::json!({})).await
+}
+
+/// Last accepted feed's sequence/outcome plus cached entry/blocked counts.
+/// Read-only, never mutates state.
+#[tauri::command]
+#[specta::specta]
+pub async fn catalog_status(engine: Engine<'_>) -> R<CatalogStatus> {
+    engine.rpc("catalog_status", serde_json::json!({})).await
 }

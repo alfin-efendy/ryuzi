@@ -1100,6 +1100,31 @@ async pluginsRestartRequired() : Promise<Result<boolean, CmdError>> {
 }
 },
 /**
+ * Force an out-of-cadence catalog fetch right now — `RemoteCatalogManager`'s
+ * background timer lives daemon-side and is not otherwise user-triggerable.
+ * Returns the same snapshot shape as `catalog_status`.
+ */
+async refreshCatalog() : Promise<Result<CatalogStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_catalog") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Last accepted feed's sequence/outcome plus cached entry/blocked counts.
+ * Read-only, never mutates state.
+ */
+async catalogStatus() : Promise<Result<CatalogStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("catalog_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Export a session as a pretty JSON string.
  */
 async exportSession(sessionPk: string) : Promise<Result<string, CmdError>> {
@@ -1311,6 +1336,15 @@ export type CatalogEntry = { id: string; name: string;
  * provider card; the entry whose id == family is the display head.
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
+/**
+ * `refresh_catalog`/`catalog_status` rpc result — a thin snapshot of the
+ * `catalog_feed_state` row plus counts from the cached
+ * `plugin_catalog_cache` table (`crate::store::RemoteCatalogRow`). `sequence`
+ * stays a `u64` for the same reason `TrustPromptDto.total_bytes` does: no
+ * bindings-shape cost, since `export_bindings`'s `BigIntExportBehavior::Number`
+ * already renders it as a plain TS `number`.
+ */
+export type CatalogStatus = { sequence: number; lastFetchAt: number | null; outcome: string | null; entries: number; blocked: number }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
 export type ChatRequestOptions = { model: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**
@@ -1410,7 +1444,7 @@ export type DoctorFinding = { pluginId: string;
  */
 severity: string; 
 /**
- * `reconnect-required` | `missing-binary` | `attach-failed`.
+ * `reconnect-required` | `missing-binary` | `attach-failed` | `blocked`.
  */
 kind: string; message: string; suggestedAction: string }
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
@@ -1554,7 +1588,23 @@ pinned: boolean;
  * Distinct from `source` (the stable builtin/catalog/skill-pack enum
  * label) — the Provenance card in Cockpit renders it only when present.
  */
-sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null }
+sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null; 
+/**
+ * `embedded` | `remote` — which catalog source won for this id.
+ * `None` for builtins and skill packs (never from either catalog).
+ */
+catalogSource: string | null; 
+/**
+ * The remote catalog feed's `version` for this id, when a cached
+ * `plugin_catalog_cache` row matches. `None` when the id was never seen
+ * in a fetched feed.
+ */
+catalogVersion: string | null; 
+/**
+ * Set when the remote catalog's signed feed blocked (revoked) this id —
+ * mirrors `RemoteCatalogRow.blocked_reason`. `None` when not blocked.
+ */
+blockedReason: string | null }
 export type PluginInstallBeginResult = { 
 /**
  * `none` | `api-key` | `token` | `oauth`.
