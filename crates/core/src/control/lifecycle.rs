@@ -528,7 +528,16 @@ impl ControlPlane {
                 },
             )
             .await;
-            let worktree_candidate = worktree_path_for(None, &project.project_id, session_pk);
+            let settings = SettingsStore::new(self.store.clone());
+            let worktree_base = settings
+                .get("worktree_dir")
+                .await
+                .ok()
+                .flatten()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| crate::settings::expand_home(s.trim()));
+            let worktree_candidate =
+                worktree_path_for(worktree_base.as_deref(), &project.project_id, session_pk);
             let repo_dir = std::path::PathBuf::from(&project.workdir);
             let prep_pk = session_pk.to_string();
             let prep_git = git;
