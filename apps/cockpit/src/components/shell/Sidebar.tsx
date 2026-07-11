@@ -14,7 +14,6 @@ import {
   LayoutGrid,
   ListFilter,
   Pencil,
-  Pin,
   Plus,
   Server,
   Settings,
@@ -44,9 +43,9 @@ import {
   sessionsForProject,
   type Ordering,
 } from "@/lib/sidebar";
-import { statusMeta } from "@/lib/status";
-import { StatusDot } from "@/components/common/bits";
+import { StatusDot, TreeGuide } from "@/components/common/bits";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
+import { SessionRow } from "@/components/shell/SessionRow";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
@@ -60,33 +59,6 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
 
 // Layout-only overrides for the tiny ghost icon Buttons in tree rows.
 const iconBtn = "shrink-0 rounded-sm text-muted-foreground";
-
-const guideColor = "color-mix(in srgb, var(--sidebar-foreground) 20%, var(--sidebar))";
-
-// Tree connector in front of session rows: a rounded elbow into the row, plus
-// a vertical rail continuing to the next sibling. `reach` extends the lines
-// past the row edges to bridge the 1px gaps between rows.
-function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
-  return (
-    <span aria-hidden className="relative w-6 shrink-0 self-stretch">
-      <span
-        className="absolute left-3.5 box-border w-[9px] rounded-bl-[7px]"
-        style={{
-          top: -reach,
-          height: `calc(50% + ${reach}px)`,
-          borderLeft: `1.5px solid ${guideColor}`,
-          borderBottom: `1.5px solid ${guideColor}`,
-        }}
-      />
-      {tail && (
-        <span
-          className="absolute left-3.5 box-border w-[9px]"
-          style={{ top: -reach, bottom: -reach, borderLeft: `1.5px solid ${guideColor}` }}
-        />
-      )}
-    </span>
-  );
-}
 
 export function Sidebar() {
   const { projects, sessions, setFocused, focusedSessionPk, selectProject, end } = useStore();
@@ -346,59 +318,25 @@ export function Sidebar() {
               {open && (
                 <>
                   {sess.map((s, i) => {
-                    const m = statusMeta(s.status);
                     const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
                     const isPinned = !!pinned[s.sessionPk];
                     const unread = isUnreadVisible(s, readAt, focusedSessionPk);
                     const showArchivedLabel = archCount > 0 && !archivedGlobal;
                     const hasTail = i < sess.length - 1 || showArchivedLabel;
                     return (
-                      <div
+                      <SessionRow
                         key={s.sessionPk}
-                        className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[s.sessionPk] ? "opacity-55" : ""}`}
-                      >
-                        <TreeGuide tail={hasTail} reach={3} />
-                        <span
-                          className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-[7px] pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
-                        >
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            onClick={() => openSession(s.sessionPk)}
-                            className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
-                          >
-                            <StatusDot color={m.color} pulse={m.pulse} />
-                            <span className={`min-w-0 flex-1 truncate ${unread ? "font-semibold text-foreground" : ""}`}>
-                              {sessionTitle(s)}
-                            </span>
-                            <span aria-hidden className="flex w-2 shrink-0 items-center justify-center">
-                              {unread && <span data-testid={`unread-dot-${s.sessionPk}`} className="size-1.5 rounded-full bg-primary" />}
-                            </span>
-                            {unread && <span className="sr-only">unread</span>}
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-xs"
-                            title={isPinned ? "Unpin" : "Pin"}
-                            className={`size-[22px] shrink-0 rounded-sm ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
-                            onClick={() => togglePin(s.sessionPk)}
-                          >
-                            <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-xs"
-                            title={archived[s.sessionPk] ? "Restore" : "Archive — ends the session and removes its worktree"}
-                            disabled={archivingPk === s.sessionPk}
-                            className="hidden size-[22px] shrink-0 rounded-sm text-muted-foreground disabled:opacity-40 group-hover:flex"
-                            onClick={() => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s))}
-                          >
-                            <Archive aria-hidden size={12} strokeWidth={2} />
-                          </Button>
-                        </span>
-                      </div>
+                        session={s}
+                        isActive={isActive}
+                        isPinned={isPinned}
+                        unread={unread}
+                        isArchived={!!archived[s.sessionPk]}
+                        hasTail={hasTail}
+                        archiveDisabled={archivingPk === s.sessionPk}
+                        onOpen={() => openSession(s.sessionPk)}
+                        onTogglePin={() => togglePin(s.sessionPk)}
+                        onToggleArchive={() => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s))}
+                      />
                     );
                   })}
                   {archCount > 0 && !archivedGlobal && (
