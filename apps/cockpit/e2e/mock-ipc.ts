@@ -28,6 +28,21 @@ export const SESSION = {
   createdAt: 0,
   lastActive: 0,
   resumeAttempts: 0,
+  branchOwned: false,
+  permMode: "default",
+  kind: "project",
+  speaker: null,
+  agent: null,
+  parentSessionPk: null,
+};
+
+/** A project-less chat session (kind "chat"), returned by start_chat_session. */
+export const CHAT_SESSION = {
+  ...SESSION,
+  sessionPk: "c-1",
+  projectId: null,
+  branch: null,
+  kind: "chat",
 };
 
 /** Tauri command → resolved value (Result-typed commands get the raw data). */
@@ -48,6 +63,7 @@ const FIXTURES: Record<string, unknown> = {
   backdrop_capability: "none",
   system_accent_color: null,
   start_session: SESSION,
+  start_chat_session: CHAT_SESSION,
 };
 
 /**
