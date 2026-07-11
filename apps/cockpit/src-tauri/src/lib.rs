@@ -42,6 +42,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::resolve_approval,
             commands::stage_attachment,
             commands::read_local_media,
+            commands::fetch_attachment,
             commands::pick_directory,
             commands::pick_files,
             commands::backdrop_capability,

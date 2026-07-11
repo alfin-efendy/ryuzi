@@ -205,20 +205,43 @@ test("closeDanglingFence closes an odd number of line-start fences and leaves ba
   expect(closeDanglingFence("no fences")).toBe("no fences");
 });
 
-test("messageToRow extracts attachments metadata from user payloads", () => {
+test("messageToRow extracts attachments metadata from user payloads, preferring a recorded rel", () => {
   const row = messageToRow(
     3,
     "user",
     "text",
-    { text: "look", attachments: [{ name: "a.png", path: "C:\\att\\a.png", contentType: "image/png", size: 42 }] },
+    {
+      text: "look",
+      attachments: [{ name: "a.png", path: "C:\\att\\sess-9\\a.png", contentType: "image/png", size: 42, rel: "sess-9/a.png" }],
+    },
     null,
     null,
     null,
     1700000000000,
+    "sess-9",
   );
   expect(row.text).toBe("look");
   expect(row.createdAt).toBe(1700000000000);
-  expect(row.attachments).toEqual([{ name: "a.png", path: "C:\\att\\a.png", contentType: "image/png", size: 42 }]);
+  expect(row.attachments).toEqual([
+    { name: "a.png", path: "C:\\att\\sess-9\\a.png", contentType: "image/png", size: 42, rel: "sess-9/a.png" },
+  ]);
+});
+
+test("messageToRow derives rel from sessionPk + basename for pre-P4-3 rows with no recorded rel", () => {
+  const row = messageToRow(
+    3,
+    "user",
+    "text",
+    { text: "look", attachments: [{ name: "a.png", path: "C:\\att\\sess-9\\a.png", contentType: "image/png", size: 42 }] },
+    null,
+    null,
+    null,
+    null,
+    "sess-9",
+  );
+  expect(row.attachments).toEqual([
+    { name: "a.png", path: "C:\\att\\sess-9\\a.png", contentType: "image/png", size: 42, rel: "sess-9/a.png" },
+  ]);
 });
 
 test("messageToRow tolerates missing/malformed attachments", () => {

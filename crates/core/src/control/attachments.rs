@@ -118,7 +118,10 @@ impl ControlPlane {
             };
 
         let (image_blocks, inlined) = crate::attachments::image_blocks_for(&result.saved).await;
-        let attachments_meta = crate::attachments::attachment_display_meta(&result.saved);
+        let attachments_meta = crate::attachments::attachment_display_meta(
+            &result.saved,
+            &self.attachments_root().await,
+        );
         let manifest = build_manifest(&result, &inlined);
         let agent = if manifest.is_empty() {
             prompt.to_string()

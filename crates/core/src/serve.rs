@@ -55,6 +55,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/plugins/{id}", get(get_plugin))
         .route("/rpc/{method}", post(rpc))
         .route("/approvals/{request_id}", post(resolve_approval_route))
+        .route("/attachments/{*rel}", get(get_attachment))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
     let pair_limiter = PairLimiter::new();
     let pair_route = post(
@@ -504,6 +505,83 @@ async fn resolve_approval_route(
         .unwrap_or_else(|| crate::domain::ApprovalResponse::once(false));
     let resolved = state.cp.resolve_approval(&request_id, response);
     Json(json!({ "resolved": resolved })).into_response()
+}
+
+/// Largest attachment file this route will read into memory before serving —
+/// matches `prepare_attachments`'s own default `attachment_max_bytes` cap (25
+/// MB; see `control/attachments.rs`), so anything that was ever accepted
+/// into `.harness-attachments` can still be served back through here.
+const MAX_ATTACHMENT_READ_BYTES: u64 = 26_214_400;
+
+/// `GET /attachments/{*rel}` — serves one file out of `attachments_root()`,
+/// remote-safe (this is how the cockpit previews a REMOTE runner's
+/// attachments, which never touch the cockpit's own disk — see
+/// `Transcript.tsx`'s `MediaItem` and `EngineClient::get_attachment_bytes`).
+///
+/// Jailed like every other file-serving surface in this crate
+/// (`fsview_api::jailed_readable`, `fsview::revert_file`'s untracked-delete
+/// branch): `rel` is joined onto the root, then BOTH sides are
+/// canonicalized and the result is checked with `starts_with` before any
+/// byte is read. This is deliberately NOT just a component-level check
+/// (rejecting `..`/absolute components) — canonicalize also resolves
+/// symlinks, so a symlink planted inside the attachments tree pointing
+/// outside it is caught too, and it correctly handles Windows'
+/// `Path::join` replacing the base entirely for drive-absolute or rooted
+/// `rel` values (same reasoning as `revert_file`'s doc comment).
+///
+/// A missing root, a missing/non-file target, or a jail escape are all a
+/// flat 404 with the same body — deliberately indistinguishable, so a
+/// caller can't use the response to probe which failure occurred. An
+/// over-cap file is a distinct 400 (not a security-relevant signal — the
+/// size is already recorded in plain on the transcript row).
+async fn get_attachment(
+    State(state): State<ApiState>,
+    Path(rel): Path<String>,
+) -> axum::response::Response {
+    let root = state.cp.attachments_root().await;
+    let target = root.join(&rel);
+
+    let Ok(root_canon) = tokio::fs::canonicalize(&root).await else {
+        return attachment_not_found();
+    };
+    let Ok(target_canon) = tokio::fs::canonicalize(&target).await else {
+        return attachment_not_found();
+    };
+    if !target_canon.starts_with(&root_canon) {
+        return attachment_not_found();
+    }
+
+    let meta = match tokio::fs::metadata(&target_canon).await {
+        Ok(m) => m,
+        Err(_) => return attachment_not_found(),
+    };
+    if !meta.is_file() {
+        return attachment_not_found();
+    }
+    if meta.len() > MAX_ATTACHMENT_READ_BYTES {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("attachment too large ({} bytes)", meta.len()) })),
+        )
+            .into_response();
+    }
+
+    let bytes = match tokio::fs::read(&target_canon).await {
+        Ok(b) => b,
+        Err(_) => return attachment_not_found(),
+    };
+
+    let mime = crate::api::fsview_api::content_type_for_path(&target_canon)
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    ([(axum::http::header::CONTENT_TYPE, mime)], bytes).into_response()
+}
+
+fn attachment_not_found() -> axum::response::Response {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({ "error": "attachment not found" })),
+    )
+        .into_response()
 }
 
 /// The `{id, name, description, categories, verified, experimental, enabled,
@@ -1188,5 +1266,157 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body, json!([]));
+    }
+
+    // ---- P4-3: authed GET /attachments/{*rel} (jailed, remote-safe media previews) ----
+
+    /// Points `attachments_root()` at `<dir>/.harness-attachments` by writing
+    /// the `workdir_root` setting the real method reads — same pattern
+    /// `control/tests.rs`'s attachment tests use. Returns the attachments
+    /// root itself for convenience.
+    async fn set_attachments_root(cp: &ControlPlane, dir: &std::path::Path) -> std::path::PathBuf {
+        SettingsStore::new(cp.store().clone())
+            .set("workdir_root", dir.to_str().unwrap())
+            .await
+            .unwrap();
+        cp.attachments_root().await
+    }
+
+    #[tokio::test]
+    async fn get_attachment_serves_a_jailed_file_with_its_content_type() {
+        let cp = test_cp().await;
+        let dir = tempfile::tempdir().unwrap();
+        let root = set_attachments_root(&cp, dir.path()).await;
+        std::fs::create_dir_all(root.join("sess-1")).unwrap();
+        std::fs::write(
+            root.join("sess-1").join("shot.png"),
+            [0x89, 0x50, 0x4e, 0x47],
+        )
+        .unwrap();
+
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/attachments/sess-1/shot.png"
+            ))
+            .bearer_auth(TEST_CONTROL_TOKEN)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "image/png"
+        );
+        let bytes = resp.bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), [0x89, 0x50, 0x4e, 0x47]);
+    }
+
+    /// The route sits on the `authed` sub-router — no bearer at all must be
+    /// a flat 401, the same as every other authed route, before the handler
+    /// ever touches the filesystem (no attachments root is even configured
+    /// here).
+    #[tokio::test]
+    async fn get_attachment_requires_a_bearer_token() {
+        let state = test_state().await;
+        let port = serve(state, opts(0)).await.unwrap();
+
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/attachments/sess-1/shot.png"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// A nonexistent file under a real root is a 404 — the ordinary "not
+    /// there" case, not a jail escape.
+    #[tokio::test]
+    async fn get_attachment_404s_for_a_missing_file() {
+        let cp = test_cp().await;
+        let dir = tempfile::tempdir().unwrap();
+        set_attachments_root(&cp, dir.path()).await;
+
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/attachments/sess-1/nope.png"
+            ))
+            .bearer_auth(TEST_CONTROL_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    /// The security-critical case: a `rel` that escapes the attachments root
+    /// via `..` must never be served, even when the resolved target exists
+    /// on disk. This is exercised by calling the handler directly rather
+    /// than through a real HTTP request — a well-behaved HTTP client (this
+    /// crate's `reqwest`/`url` stack included) removes literal AND
+    /// percent-encoded `..` path segments per the WHATWG URL Standard's
+    /// dot-segment-removal step BEFORE the request ever leaves the process,
+    /// so `GET /attachments/sess-1/../../secret.txt` (or its `%2e%2e`
+    /// encoding) can never actually reach the server that way — only a
+    /// non-conforming client (or a raw socket) could produce that request on
+    /// the wire. Calling the handler directly with the raw `rel` string is
+    /// the only way to exercise the canonicalize+starts_with jail itself,
+    /// mirroring how `rpc_rejects_list_runner_credentials_from_a_non_loopback_peer`
+    /// above already constructs extractors by hand for the same reason.
+    #[tokio::test]
+    async fn get_attachment_rejects_a_traversal_escape_even_when_the_target_exists() {
+        let cp = test_cp().await;
+        let dir = tempfile::tempdir().unwrap();
+        // "secret.txt" sits OUTSIDE .harness-attachments, as a sibling of it —
+        // exactly what "sess-1/../../secret.txt" resolves to once joined onto
+        // the attachments root and its two ".." components are walked back up.
+        std::fs::write(dir.path().join("secret.txt"), b"do not serve me").unwrap();
+        let root = set_attachments_root(&cp, dir.path()).await;
+        std::fs::create_dir_all(root.join("sess-1")).unwrap();
+
+        let state = state_for(cp);
+        let resp = get_attachment(State(state), Path("sess-1/../../secret.txt".to_string())).await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body
+                .as_ref()
+                .windows(b"do not serve me".len())
+                .any(|w| w == b"do not serve me"),
+            "the escaped file's content must never appear in the response"
+        );
+    }
+
+    /// A file over `MAX_ATTACHMENT_READ_BYTES` is rejected with a 400 before
+    /// its bytes are ever read into memory — distinct from the 404 family
+    /// above since size isn't a security signal (it's already visible on the
+    /// transcript row).
+    #[tokio::test]
+    async fn get_attachment_rejects_a_file_over_the_size_cap() {
+        let cp = test_cp().await;
+        let dir = tempfile::tempdir().unwrap();
+        let root = set_attachments_root(&cp, dir.path()).await;
+        std::fs::create_dir_all(root.join("sess-1")).unwrap();
+        let big = vec![0u8; (MAX_ATTACHMENT_READ_BYTES + 1) as usize];
+        std::fs::write(root.join("sess-1").join("huge.bin"), &big).unwrap();
+
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/attachments/sess-1/huge.bin"
+            ))
+            .bearer_auth(TEST_CONTROL_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 }

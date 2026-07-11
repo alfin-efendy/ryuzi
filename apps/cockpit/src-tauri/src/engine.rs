@@ -71,6 +71,52 @@ impl EngineClient {
         }
     }
 
+    /// Authed `GET {base_url}/attachments/{rel}` — the raw bytes of one
+    /// attachment file (plus its `Content-Type` header, if the server sent
+    /// one) reused for both the local engine and a pinned-TLS remote runner
+    /// exactly like [`EngineClient::rpc`]/[`EngineClient::events`]. `rel` is
+    /// interpolated directly into the URL path (same convention as `rpc`'s
+    /// `method` and `resolve_approval`'s `request_id` above) — the `reqwest`/
+    /// `url` stack percent-encodes anything that needs it (spaces, non-ASCII
+    /// filename bytes) while parsing, so callers never need to encode `rel`
+    /// themselves. The route itself (`serve.rs::get_attachment`) is jailed
+    /// and size-capped on the engine side; this is just the thin proxy.
+    pub async fn get_attachment_bytes(
+        &self,
+        rel: &str,
+    ) -> Result<(Vec<u8>, Option<String>), CmdError> {
+        let resp = self
+            .http
+            .get(format!("{}/attachments/{}", self.base_url, rel))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| CmdError {
+                message: format!("engine unreachable: {e}"),
+            })?;
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if !status.is_success() {
+            // Best-effort error message: the route's error envelope is JSON
+            // `{"error": "..."}`, but a non-JSON body (e.g. an intermediary's
+            // own error page) must not fail the whole call.
+            let body = resp.bytes().await.unwrap_or_default();
+            let message = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or_else(|| format!("engine returned {status}"));
+            return Err(CmdError { message });
+        }
+        let bytes = resp.bytes().await.map_err(|e| CmdError {
+            message: format!("engine attachment read failed: {e}"),
+        })?;
+        Ok((bytes.to_vec(), content_type))
+    }
+
     pub async fn resolve_approval(
         &self,
         request_id: &str,
@@ -437,6 +483,58 @@ mod tests {
         };
         let port = ryuzi_core::serve::serve(state, opts).await.unwrap();
         (format!("http://127.0.0.1:{port}"), cp)
+    }
+
+    /// Points `cp`'s `attachments_root()` at `<dir>/.harness-attachments` by
+    /// writing the `workdir_root` setting the real method reads — same
+    /// pattern `serve.rs`'s own attachment-route tests use.
+    async fn set_attachments_root(
+        cp: &ryuzi_core::ControlPlane,
+        dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        ryuzi_core::settings::SettingsStore::new(cp.store().clone())
+            .set("workdir_root", dir.to_str().unwrap())
+            .await
+            .unwrap();
+        cp.attachments_root().await
+    }
+
+    #[tokio::test]
+    async fn get_attachment_bytes_round_trips_a_real_file_over_the_authed_route() {
+        let (base, cp) = test_server("tok").await;
+        let dir = tempfile::tempdir().unwrap();
+        let root = set_attachments_root(&cp, dir.path()).await;
+        std::fs::create_dir_all(root.join("sess-1")).unwrap();
+        std::fs::write(
+            root.join("sess-1").join("shot.png"),
+            [0x89, 0x50, 0x4e, 0x47],
+        )
+        .unwrap();
+
+        let client = EngineClient::new(base, "tok".into());
+        let (bytes, content_type) = client
+            .get_attachment_bytes("sess-1/shot.png")
+            .await
+            .unwrap();
+        assert_eq!(bytes, vec![0x89, 0x50, 0x4e, 0x47]);
+        assert_eq!(content_type.as_deref(), Some("image/png"));
+    }
+
+    /// A missing attachment surfaces the engine's own JSON error message
+    /// (`"attachment not found"`, from `serve.rs::attachment_not_found`)
+    /// rather than a decode failure or a generic transport error string.
+    #[tokio::test]
+    async fn get_attachment_bytes_surfaces_the_engines_error_message_on_404() {
+        let (base, cp) = test_server("tok").await;
+        let dir = tempfile::tempdir().unwrap();
+        set_attachments_root(&cp, dir.path()).await;
+
+        let client = EngineClient::new(base, "tok".into());
+        let err = client
+            .get_attachment_bytes("sess-1/nope.png")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "attachment not found");
     }
 
     #[tokio::test]

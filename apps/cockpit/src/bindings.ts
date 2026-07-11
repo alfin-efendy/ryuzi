@@ -144,6 +144,24 @@ async readLocalMedia(path: string) : Promise<Result<MediaFile, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Base64-encoded read of one saved attachment, proxied through the engine's
+ * authed `GET /attachments/{rel}` route (`EngineClient::get_attachment_bytes`)
+ * — remote-safe: the bytes are read on the RUNNER's disk (local or a
+ * pinned-TLS remote), unlike `read_local_media` above (which is correctly
+ * always-local, since composer previews are of files still on the user's
+ * own machine). `rel` is the `RowAttachment.rel` the transcript row carries
+ * (or the caller's `sessionPk + basename(path)` fallback for pre-P4-3 rows
+ * with no `rel` recorded).
+ */
+async fetchAttachment(runnerId: string | null, rel: string) : Promise<Result<MediaFile, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_attachment", { runnerId, rel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async pickDirectory() : Promise<string | null> {
     return await TAURI_INVOKE("pick_directory");
 },

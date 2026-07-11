@@ -387,6 +387,30 @@ pub async fn read_local_media(path: String) -> R<MediaFile> {
     })
 }
 
+/// Base64-encoded read of one saved attachment, proxied through the engine's
+/// authed `GET /attachments/{rel}` route (`EngineClient::get_attachment_bytes`)
+/// — remote-safe: the bytes are read on the RUNNER's disk (local or a
+/// pinned-TLS remote), unlike `read_local_media` above (which is correctly
+/// always-local, since composer previews are of files still on the user's
+/// own machine). `rel` is the `RowAttachment.rel` the transcript row carries
+/// (or the caller's `sessionPk + basename(path)` fallback for pre-P4-3 rows
+/// with no `rel` recorded).
+#[tauri::command]
+#[specta::specta]
+pub async fn fetch_attachment(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    rel: String,
+) -> R<MediaFile> {
+    use base64::Engine as _;
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    let (bytes, content_type) = client.get_attachment_bytes(&rel).await?;
+    Ok(MediaFile {
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        content_type: content_type.or_else(|| content_type_for_path(Path::new(&rel))),
+    })
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn pick_directory(app: tauri::AppHandle) -> Option<String> {

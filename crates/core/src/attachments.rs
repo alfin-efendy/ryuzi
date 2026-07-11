@@ -540,16 +540,33 @@ pub async fn image_blocks_for(
 }
 
 /// Display metadata persisted on the user transcript row so the cockpit can
-/// re-render previews after reload: `{name, path, contentType, size}`.
-pub fn attachment_display_meta(saved: &[SavedAttachment]) -> Vec<serde_json::Value> {
+/// re-render previews after reload: `{name, path, contentType, size, rel}`.
+///
+/// `rel` is `path` stripped of `root` (forward-slash normalized, e.g.
+/// `"{session_pk}/{filename}"`) — the root-relative form the authed
+/// `GET /attachments/{*rel}` route (`serve.rs::get_attachment`) expects, so
+/// the cockpit can fetch the bytes from whichever host (local or remote)
+/// actually holds them instead of reading `path` off ITS OWN disk (which
+/// only works when the session's runner is local — see `Transcript.tsx`'s
+/// `MediaItem`). Empty when `path` isn't under `root` at all (shouldn't
+/// happen for anything `materialize_attachments` itself wrote, since it
+/// always saves under `root.join(session_pk)`) — the frontend falls back to
+/// deriving `rel` itself for rows persisted before this field existed.
+pub fn attachment_display_meta(saved: &[SavedAttachment], root: &Path) -> Vec<serde_json::Value> {
     saved
         .iter()
         .map(|f| {
+            let rel = f
+                .path
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
             serde_json::json!({
                 "name": f.name,
                 "path": f.path.to_string_lossy(),
                 "contentType": f.content_type,
                 "size": f.size,
+                "rel": rel,
             })
         })
         .collect()
@@ -1109,17 +1126,32 @@ mod tests {
 
     #[test]
     fn attachment_display_meta_maps_saved_files() {
+        let root = PathBuf::from("/tmp/x");
         let saved = vec![SavedAttachment {
-            path: PathBuf::from("/tmp/x/a.png"),
+            path: PathBuf::from("/tmp/x/sess-1/a.png"),
             name: "a.png".into(),
             content_type: Some("image/png".into()),
             size: 12,
         }];
-        let meta = attachment_display_meta(&saved);
+        let meta = attachment_display_meta(&saved, &root);
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0]["name"], "a.png");
         assert_eq!(meta[0]["contentType"], "image/png");
         assert_eq!(meta[0]["size"], 12);
         assert!(meta[0]["path"].as_str().unwrap().ends_with("a.png"));
+        assert_eq!(meta[0]["rel"], "sess-1/a.png");
+    }
+
+    #[test]
+    fn attachment_display_meta_rel_is_empty_when_path_is_not_under_root() {
+        let root = PathBuf::from("/tmp/x");
+        let saved = vec![SavedAttachment {
+            path: PathBuf::from("/elsewhere/a.png"),
+            name: "a.png".into(),
+            content_type: None,
+            size: 1,
+        }];
+        let meta = attachment_display_meta(&saved, &root);
+        assert_eq!(meta[0]["rel"], "");
     }
 }
