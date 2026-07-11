@@ -176,7 +176,7 @@ function AccentRow() {
 // ——— Agent (native) settings ———
 // The default model, persisted in the engine settings KV via store-agent.
 // The permission-mode knob that used to live in this card was dropped per
-// review (dead at runtime — the composer's per-project permission control at
+// review (dead at runtime — the composer's per-session permission control at
 // @/constants' PERM_MODES / uiPermToCore is the one that actually gates
 // tool calls). The picker stays inert until store-agent finishes hydrating,
 // so an early interaction can't round-trip null model/permMode and wipe the
