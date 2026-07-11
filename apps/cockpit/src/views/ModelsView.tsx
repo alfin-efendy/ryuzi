@@ -20,7 +20,7 @@ import {
   Switch,
 } from "@ryuzi/ui";
 import { ModelPicker } from "@/components/ModelPicker";
-import { CategoryBadge, Chip, Pill, StatusDot } from "@/components/common/bits";
+import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
 
@@ -31,7 +31,6 @@ type ProviderRowInfo = {
   name: string;
   color: string;
   initial: string;
-  badges: string[];
   accounts: ConnectionInfo[];
   catalogModels: number;
   modelCount: number;
@@ -53,17 +52,6 @@ function modelLabel(count: number, catalog = false): string {
   return `${count} ${catalog ? "catalog " : ""}model${count === 1 ? "" : "s"}`;
 }
 
-const BADGE_ORDER = ["free", "free_tier", "oauth", "api_key"];
-
-function badgeKeys(entries: CatalogEntry[]): string[] {
-  const keys = new Set<string>();
-  for (const entry of entries) {
-    keys.add(entry.category === "device" ? "free" : entry.category);
-    if (entry.freeTier) keys.add("free_tier");
-  }
-  return Array.from(keys).sort((a, b) => BADGE_ORDER.indexOf(a) - BADGE_ORDER.indexOf(b));
-}
-
 function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[]): ProviderRowInfo[] {
   const rows = new Map<string, ProviderRowInfo>();
   const familyByProvider = new Map(catalog.map((entry) => [entry.id, entry.family]));
@@ -79,15 +67,11 @@ function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[
         name: head.name,
         color: head.color,
         initial: head.initial,
-        badges: [],
         accounts: [],
         catalogModels: 0,
         modelCount: 0,
       });
     }
-  }
-  for (const [family, row] of rows) {
-    row.badges = badgeKeys(catalog.filter((entry) => entry.family === family));
   }
   for (const [family, models] of catalogModelsByFamily) {
     const row = rows.get(family);
@@ -105,7 +89,6 @@ function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[
         name: conn.providerName,
         color: conn.color,
         initial: conn.initial,
-        badges: [conn.authType === "oauth" ? "oauth" : conn.authType === "free" ? "free" : "api_key"],
         accounts: [],
         catalogModels: 0,
         modelCount: 0,
@@ -310,12 +293,7 @@ function ProviderRow({ row }: { row: ProviderRowInfo }) {
     >
       <Chip initial={row.initial} color={row.color} size={34} />
       <span className="min-w-0 flex-1">
-        <span className="flex min-w-0 flex-wrap items-center gap-1.5 text-sm font-semibold text-foreground">
-          <span className="truncate">{row.name}</span>
-          {row.badges.map((badge) => (
-            <CategoryBadge key={badge} category={badge} />
-          ))}
-        </span>
+        <span className="block truncate text-sm font-semibold text-foreground">{row.name}</span>
         <span className="block text-xs font-normal text-muted-foreground">
           {accountLabel(row.accounts.length)} · {modelText}
         </span>

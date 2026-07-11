@@ -312,20 +312,22 @@ test("providers tab groups anthropic + anthropic-oauth accounts into one Anthrop
   expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
 });
 
-test("provider rows show one category badge per auth method in the family", async () => {
+test("provider rows show plain account and model counts without category or active badges", async () => {
   useConnections.setState({ catalog, connections: [], loaded: true });
   render(<ModelsView />);
 
   const anthropicRow = await screen.findByRole("button", { name: "Anthropic No accounts 2 catalog models" });
-  expect(within(anthropicRow).getByText("API key")).toBeTruthy();
-  expect(within(anthropicRow).getByText("OAuth")).toBeTruthy();
+  expect(within(anthropicRow).getByText("No accounts · 2 catalog models")).toBeTruthy();
+  expect(within(anthropicRow).queryByText("API key")).toBeNull();
+  expect(within(anthropicRow).queryByText("OAuth")).toBeNull();
 
   const openaiRow = screen.getByRole("button", { name: "OpenAI No accounts 2 catalog models" });
-  expect(within(openaiRow).getByText("API key")).toBeTruthy();
+  expect(within(openaiRow).getByText("No accounts · 2 catalog models")).toBeTruthy();
+  expect(within(openaiRow).queryByText("API key")).toBeNull();
   expect(within(openaiRow).queryByText("OAuth")).toBeNull();
 });
 
-test("free-tier providers get a Free tier badge and device maps to Free", async () => {
+test("free-tier and device providers do not render pricing badges", async () => {
   useConnections.setState({
     catalog: [
       ...catalog,
@@ -364,9 +366,9 @@ test("free-tier providers get a Free tier badge and device maps to Free", async 
   render(<ModelsView />);
 
   const openrouterRow = await screen.findByRole("button", { name: /OpenRouter/ });
-  expect(within(openrouterRow).getByText("Free tier")).toBeTruthy();
+  expect(within(openrouterRow).queryByText("Free tier")).toBeNull();
   const kiroRow = screen.getByRole("button", { name: /Kiro/ });
-  expect(within(kiroRow).getByText("Free")).toBeTruthy();
+  expect(within(kiroRow).queryByText("Free")).toBeNull();
   expect(within(kiroRow).queryByText("device")).toBeNull();
 });
 
