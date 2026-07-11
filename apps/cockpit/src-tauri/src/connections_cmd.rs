@@ -120,6 +120,7 @@ pub async fn add_connection(
 
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)] // Tauri command: params map 1:1 to a JS call; runner_id added for multi-runner routing
 pub async fn update_connection(
     engine: Engine<'_>,
     runner_id: Option<String>,
