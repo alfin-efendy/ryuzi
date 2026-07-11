@@ -676,6 +676,11 @@ pub struct TrustPromptDto {
     pub skills: Vec<String>,
     pub hook_scripts: Vec<String>,
     pub total_bytes: u64,
+    /// Mirrors `TrustPrompt::runs_code`: true when the staged manifest
+    /// declares `[[extension]]` (code execution, Track D) — the wizard must
+    /// show a distinct warning for this, not just fold it into the
+    /// hook-script list.
+    pub runs_code: bool,
 }
 
 impl From<crate::skills_install::TrustPrompt> for TrustPromptDto {
@@ -688,6 +693,7 @@ impl From<crate::skills_install::TrustPrompt> for TrustPromptDto {
             skills: p.skills,
             hook_scripts: p.hook_scripts,
             total_bytes: p.total_bytes,
+            runs_code: p.runs_code,
         }
     }
 }

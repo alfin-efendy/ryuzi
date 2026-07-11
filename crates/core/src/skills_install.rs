@@ -538,6 +538,16 @@ pub struct TrustPrompt {
     pub skills: Vec<String>,
     pub hook_scripts: Vec<String>,
     pub total_bytes: u64,
+    /// Whether the staged manifest declares `[[extension]]` — i.e. installing
+    /// it means running code in a supervised subprocess (Track D), not just
+    /// materializing skill/hook data. Derived from
+    /// `!manifest.extensions.is_empty()` (see `discovery_runs_code`). The
+    /// caller (Cockpit's trust step) must surface this distinctly from the
+    /// hook-script warning below: an extension is long-lived, event-driven
+    /// code, not a one-shot script. `begin_install_with` also uses this
+    /// signal to force even a curated source through this prompt instead of
+    /// installing immediately — see its doc comment.
+    pub runs_code: bool,
 }
 
 /// Outcome of `begin_install`: curated sources install immediately (an
@@ -551,12 +561,21 @@ pub enum BeginInstall {
 
 /// Phase 1 of the two-phase tiered trust gate. Clones `source` into a temp
 /// dir, classifies its trust tier, and either installs it immediately
-/// (curated) or stages the clone and returns a `TrustPrompt` for the caller
-/// to show the user before `confirm_install` can proceed (arbitrary).
+/// (curated, and not code-running) or stages the clone and returns a
+/// `TrustPrompt` for the caller to show the user before `confirm_install` can
+/// proceed (arbitrary, or curated-but-runs-code).
 pub async fn begin_install(source: &str, store: &crate::store::Store) -> Result<BeginInstall> {
     let roots = InstallRoots::for_user()?;
     let cloner = GitRepoCloner;
     begin_install_with(source, &roots, &cloner, store).await
+}
+
+/// Whether a `Discovery`'s manifest declares `[[extension]]` — i.e. whether
+/// installing it means running code in a supervised subprocess (Track D).
+/// Only `Discovery::Pack` ever carries a manifest; a single skill install has
+/// none and can never declare an extension.
+fn discovery_runs_code(discovered: &Discovery) -> bool {
+    matches!(discovered, Discovery::Pack(pack) if !pack.manifest.extensions.is_empty())
 }
 
 async fn begin_install_with(
@@ -568,16 +587,57 @@ async fn begin_install_with(
     roots.ensure_exists()?;
     let parsed = parse_skill_source(source)?;
 
-    // Curated → frictionless: reuse the recorded install path directly.
-    if is_curated_source(&parsed.repo) {
-        let pack = install_skill_source_with_recorded(source, roots, cloner, store).await?;
-        return Ok(BeginInstall::Completed(pack));
-    }
-
-    // Arbitrary → stage into a temp dir, build the prompt, hold for confirm.
+    // Clone into a temp dir up front — even for a curated source — so the
+    // manifest can be inspected for `[[extension]]` before deciding
+    // curated-immediate vs. trust-prompt. An extension plugin (code
+    // execution) is never curated-immediate: the Track A trust gate treats
+    // it as higher-risk and always routes it through the two-phase
+    // `confirm_install` acknowledgment below, curated source or not (see the
+    // Track D design doc's "Trust integration" section).
     let temp = tempfile::tempdir()?;
     let repo_dir = temp.path().join("repo");
     let commit = cloner.clone_repo(&parsed, &repo_dir).await?;
+    let discovered = discover_install_target(&repo_dir, &parsed)?;
+
+    // Curated AND no code execution → frictionless, install immediately.
+    // This mirrors `install_skill_source_with_recorded`'s curated branch,
+    // just reusing the clone/discovery already done above instead of
+    // re-cloning the repo a second time.
+    if is_curated_source(&parsed.repo) && !discovery_runs_code(&discovered) {
+        let pack = match discovered {
+            Discovery::Single(skill) => install_single_skill(roots, &parsed, skill)?,
+            Discovery::Pack(pack) => install_plugin_pack(roots, &parsed, *pack)?,
+        };
+        let fingerprint = fingerprint_dir(&installed_pack_dir(roots, &pack))?;
+        let now = crate::paths::now_ms();
+        store
+            .upsert_plugin_install(&crate::store::PluginInstallRecord {
+                plugin_id: pack.id.clone(),
+                kind: if pack.plugin_id.is_some() {
+                    "plugin_pack".into()
+                } else {
+                    "single_skill".into()
+                },
+                source_spec: source.to_string(),
+                resolved_commit: commit,
+                fingerprint,
+                installed_at: now,
+                updated_at: now,
+                pinned: false,
+                pin_reason: None,
+                trust_tier: "curated".into(),
+                trust_ack_at: None,
+                trust_ack_summary: None,
+            })
+            .await?;
+        return Ok(BeginInstall::Completed(pack));
+    }
+
+    // Arbitrary source, or a curated source whose manifest runs code →
+    // stage into a temp dir, build the prompt, hold for confirm.
+    // `stage_for_trust_prompt` re-derives `Discovery` from the same on-disk
+    // clone (cheap relative to the network clone above) so it can also set
+    // `TrustPrompt::skills`/`runs_code` from the same manifest.
     let prompt = stage_for_trust_prompt(source, parsed, roots, temp, repo_dir, commit, None)?;
     Ok(BeginInstall::NeedsConfirmation(prompt))
 }
@@ -669,6 +729,7 @@ fn stage_for_trust_prompt(
 ) -> Result<TrustPrompt> {
     let discovered = discover_install_target(&repo_dir, &parsed)?;
     let skills = discovered_skill_names(&discovered);
+    let runs_code = discovery_runs_code(&discovered);
     let hook_scripts = list_pack_hook_scripts(&repo_dir);
     let total_bytes = dir_size(&repo_dir);
     let owner_repo = parsed
@@ -707,6 +768,7 @@ fn stage_for_trust_prompt(
         skills,
         hook_scripts,
         total_bytes,
+        runs_code,
     })
 }
 
@@ -3922,6 +3984,9 @@ path = "skills/focus"
             prompt.hook_scripts,
             vec!["tool.before/guard.sh".to_string()]
         );
+        // No `[[extension]]` in this fixture — the new field must default to
+        // false and the flow must stay exactly as before DT7.
+        assert!(!prompt.runs_code);
         assert!(store.get_plugin_install("s").await.unwrap().is_none()); // not installed yet
 
         let pack = confirm_install(&prompt.token, &store).await.unwrap();
@@ -3933,6 +3998,154 @@ path = "skills/focus"
         // the identity/skills/hooks fields.
         let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
         assert_eq!(summary["totalBytes"], serde_json::json!(prompt.total_bytes));
+    }
+
+    /// Writes a plugin pack repo (`.codex-plugin/plugin.json` +
+    /// `ryuzi-plugin.toml`) declaring one skill and one `[[extension]]`, so
+    /// `discover_install_target` parses a real manifest with
+    /// `extensions.is_empty() == false` — the DT7 trust-gate tests need this
+    /// to exercise `discovery_runs_code` through the real manifest parser
+    /// rather than asserting against a hand-built `Discovery`.
+    fn write_extension_plugin_repo(dir: &std::path::Path, plugin_id: &str) {
+        std::fs::create_dir_all(dir.join(".codex-plugin")).unwrap();
+        std::fs::write(
+            dir.join(".codex-plugin/plugin.json"),
+            serde_json::json!({ "name": plugin_id }).to_string(),
+        )
+        .unwrap();
+        write_skill(
+            &dir.join("bundled/brainstorming"),
+            "brainstorming",
+            "Explore ideas",
+            "body",
+        );
+        let manifest = format!(
+            r#"
+contract = 1
+id = "{plugin_id}"
+name = "{plugin_id}"
+
+[[skills]]
+name = "brainstorming"
+description = "Explore ideas"
+path = "bundled/brainstorming"
+
+[[extension]]
+name = "my-ext"
+command = "my-ext-binary"
+events = ["tool.before"]
+"#
+        );
+        std::fs::write(dir.join("ryuzi-plugin.toml"), manifest.trim_start()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn begin_curated_source_with_extension_forces_confirmation_not_immediate() {
+        // The key new DT7 rule: a curated source whose manifest declares
+        // `[[extension]]` must NOT take the curated-immediate shortcut —
+        // it has to stop at the trust prompt just like an arbitrary source,
+        // with `runs_code: true` so the wizard can name the elevated risk.
+        let repo = tempfile::tempdir().unwrap();
+        write_extension_plugin_repo(repo.path(), "superpowers");
+        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
+        let cloner = FakeRepoCloner {
+            repos: BTreeMap::from([(
+                "https://github.com/obra/superpowers".into(),
+                repo.path().to_path_buf(),
+            )]),
+            commit: Some("c1".into()),
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+
+        let prompt = match begin_install_with("superpowers", &roots, &cloner, &store)
+            .await
+            .unwrap()
+        {
+            BeginInstall::NeedsConfirmation(p) => p,
+            BeginInstall::Completed(_) => {
+                panic!("a curated source that runs code must not install immediately")
+            }
+        };
+        assert!(prompt.runs_code);
+        // Nothing installed yet, and no ledger row written — the
+        // curated-immediate branch never ran.
+        assert!(store
+            .get_plugin_install("superpowers")
+            .await
+            .unwrap()
+            .is_none());
+
+        // confirm_install completes the staged install and records
+        // "acknowledged" — NOT "curated" — because this plugin runs code and
+        // therefore always requires the explicit two-phase acknowledgment.
+        let pack = confirm_install(&prompt.token, &store).await.unwrap();
+        let rec = store.get_plugin_install(&pack.id).await.unwrap().unwrap();
+        assert_eq!(rec.trust_tier, "acknowledged");
+        assert!(rec.trust_ack_at.is_some());
+        assert!(rec.trust_ack_summary.is_some());
+    }
+
+    #[tokio::test]
+    async fn begin_curated_source_without_extension_still_installs_immediately() {
+        // Unchanged-behavior guard alongside the new rule above: a curated
+        // pack with NO `[[extension]]` must still take the frictionless
+        // curated-immediate path.
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "S", "d", "b");
+        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
+        let cloner = FakeRepoCloner {
+            repos: BTreeMap::from([(
+                "https://github.com/obra/superpowers".into(),
+                repo.path().to_path_buf(),
+            )]),
+            commit: Some("c1".into()),
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+
+        match begin_install_with("superpowers", &roots, &cloner, &store)
+            .await
+            .unwrap()
+        {
+            BeginInstall::Completed(p) => {
+                let rec = store.get_plugin_install(&p.id).await.unwrap().unwrap();
+                assert_eq!(rec.trust_tier, "curated");
+                assert!(rec.trust_ack_at.is_none());
+            }
+            BeginInstall::NeedsConfirmation(_) => {
+                panic!("curated, non-extension install must stay immediate")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_arbitrary_source_with_extension_sets_runs_code() {
+        let repo = tempfile::tempdir().unwrap();
+        write_extension_plugin_repo(repo.path(), "acme-ext");
+        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
+        let cloner = FakeRepoCloner {
+            repos: BTreeMap::from([(
+                "https://github.com/acme/ext-plugin".into(),
+                repo.path().to_path_buf(),
+            )]),
+            commit: Some("c1".into()),
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+
+        let prompt = match begin_install_with("acme/ext-plugin", &roots, &cloner, &store)
+            .await
+            .unwrap()
+        {
+            BeginInstall::NeedsConfirmation(p) => p,
+            BeginInstall::Completed(_) => panic!("arbitrary source must always prompt"),
+        };
+        assert!(prompt.runs_code);
+
+        let pack = confirm_install(&prompt.token, &store).await.unwrap();
+        let rec = store.get_plugin_install(&pack.id).await.unwrap().unwrap();
+        assert_eq!(rec.trust_tier, "acknowledged");
     }
 
     #[tokio::test]

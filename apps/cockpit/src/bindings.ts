@@ -1868,7 +1868,14 @@ export type ToolPolicyRow = { projectId: string; tool: string; decision: string 
  * renders any bigint-sized field as a plain TS `number`, so there's no
  * bindings-shape cost to keeping the wider type.
  */
-export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: string; resolvedCommit: string | null; skills: string[]; hookScripts: string[]; totalBytes: number }
+export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: string; resolvedCommit: string | null; skills: string[]; hookScripts: string[]; totalBytes: number; 
+/**
+ * Mirrors `TrustPrompt::runs_code`: true when the staged manifest
+ * declares `[[extension]]` (code execution, Track D) — the wizard must
+ * show a distinct warning for this, not just fold it into the
+ * hook-script list.
+ */
+runsCode: boolean }
 /**
  * Mirror of `crate::skills_install::UpdateOutcome`. Keeps the same
  * `#[serde(tag = "kind", content = "detail")]` shape so the discriminated
