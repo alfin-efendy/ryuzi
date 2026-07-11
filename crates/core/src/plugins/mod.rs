@@ -35,6 +35,19 @@ pub use doctor::{plugin_doctor, DoctorFinding};
 pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Add every generated manifest-only builtin — every model provider
+/// ([`providers::provider_plugins`]) — to `regs`. Factored out of
+/// [`install_builtins`] so the daemon composition root can add providers,
+/// then the (embedded + remote-catalog) merged set from
+/// [`catalog::merged_catalog_plugins`], in place of the embedded-only
+/// `catalog_plugins()` loop `install_builtins` still runs for callers that
+/// don't read the remote cache (e.g. `test_cp`, `ryuzi config`).
+pub fn install_providers(regs: &mut Registries) {
+    for plugin in providers::provider_plugins() {
+        regs.add_plugin(plugin);
+    }
+}
+
+/// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) — plus the embedded integration catalog
 /// ([`catalog::catalog_plugins`]) to `regs`.
 ///
@@ -48,10 +61,15 @@ pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
 /// over a same-id catalog entry, and both of those always lose to
 /// `native`/`discord` (added by the composition root before calling this
 /// function).
+///
+/// This is the embedded-catalog-only path. The daemon's real composition
+/// root (`daemon::build_daemon`) does NOT call this — it calls
+/// [`install_providers`] followed by [`catalog::merged_catalog_plugins`] so
+/// the remote catalog cache can version-gate override the embedded catalog.
+/// `install_builtins` stays embedded-only for every other caller (tests,
+/// `ryuzi config`) so their behavior is unaffected by the remote cache.
 pub fn install_builtins(regs: &mut Registries) {
-    for plugin in providers::provider_plugins() {
-        regs.add_plugin(plugin);
-    }
+    install_providers(regs);
     for plugin in catalog::catalog_plugins() {
         regs.add_plugin(plugin);
     }

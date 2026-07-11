@@ -295,7 +295,7 @@ async fn update_all_plugins(cp: &ControlPlane) -> anyhow::Result<Vec<UpdateOutco
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
-        PluginSource::Catalog => "catalog",
+        PluginSource::Catalog | PluginSource::RemoteCatalog => "catalog",
         PluginSource::SkillPack(_) => "skill-pack",
     }
 }

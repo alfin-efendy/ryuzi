@@ -271,7 +271,16 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
 
     let mut registries = Registries::new();
     registries.add_plugin(native_plugin());
-    crate::plugins::install_builtins(&mut registries);
+    crate::plugins::install_providers(&mut registries);
+    // Merge the (version-gated) remote catalog cache over the embedded
+    // catalog before anything is added to the host — `Registries::add_plugin`
+    // is first-registration-wins with no removal, so the winner per id must
+    // already be decided (see `catalog::merged_catalog_plugins`'s doc). An
+    // empty/unreadable cache degrades to the embedded catalog alone.
+    let remote = store.list_remote_catalog().await.unwrap_or_default();
+    for plugin in crate::plugins::catalog::merged_catalog_plugins(&remote) {
+        registries.add_plugin(plugin);
+    }
     crate::plugins::load_skill_pack_plugins(&mut registries);
     if let Some(factory) = opts.harness_factory {
         registries.harness = factory;
@@ -834,6 +843,48 @@ mod tests {
         assert_eq!(cfg["discord.token"], "tok-xyz");
         assert_eq!(cfg["discord.app_id"], "");
         assert_eq!(cfg["discord.guild_id"], "");
+    }
+
+    #[tokio::test]
+    async fn build_daemon_merges_remote_catalog_cache_over_the_embedded_catalog() {
+        let (_guard, db_path) = temp_db_path();
+        const NEW_TOML: &str = "contract=1\nid=\"acme-remote\"\nname=\"Acme Remote\"\nversion=\"1.0.0\"\n[[mcp]]\nname=\"m\"\ntransport=\"http\"\nurl=\"https://x\"";
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            store
+                .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
+                    id: "acme-remote".to_string(),
+                    manifest_toml: NEW_TOML.to_string(),
+                    version: "1.0.0".to_string(),
+                    sequence: 1,
+                    blocked: false,
+                    blocked_reason: None,
+                    fetched_at: 0,
+                }])
+                .await
+                .unwrap();
+        }
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path: db_path.clone(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+
+        let ids: Vec<String> = daemon
+            .cp
+            .plugins()
+            .list()
+            .iter()
+            .map(|p| p.manifest.id.clone())
+            .collect();
+        assert!(
+            ids.contains(&"acme-remote".to_string()),
+            "remote catalog cache entry must be merged into the running host: {ids:?}"
+        );
     }
 
     // ---------- (b)/(c)/(d) handle_approval unit tests ----------
