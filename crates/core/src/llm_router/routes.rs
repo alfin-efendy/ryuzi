@@ -121,9 +121,22 @@ pub async fn ordered_provider_connection_ids(
     scope: &str,
     ids: &[String],
 ) -> anyhow::Result<Vec<String>> {
+    Ok(
+        ordered_provider_connection_ids_with_strategy(store, provider, scope, ids)
+            .await?
+            .0,
+    )
+}
+
+pub(crate) async fn ordered_provider_connection_ids_with_strategy(
+    store: &Store,
+    provider: &str,
+    scope: &str,
+    ids: &[String],
+) -> anyhow::Result<(Vec<String>, ModelRouteStrategy)> {
     let route = provider_account_route(store, provider).await?;
     if route.strategy != ModelRouteStrategy::RoundRobin || ids.len() <= 1 {
-        return Ok(ids.to_vec());
+        return Ok((ids.to_vec(), route.strategy));
     }
     let key = format!("{ACCOUNT_ROUND_ROBIN_KEY_PREFIX}{provider}.{scope}");
     let start = store
@@ -135,11 +148,14 @@ pub async fn ordered_provider_connection_ids(
     let next = (start + 1) % ids.len();
     store.set_setting(&key, &next.to_string()).await?;
 
-    Ok(ids[start..]
-        .iter()
-        .chain(ids[..start].iter())
-        .cloned()
-        .collect())
+    Ok((
+        ids[start..]
+            .iter()
+            .chain(ids[..start].iter())
+            .cloned()
+            .collect(),
+        route.strategy,
+    ))
 }
 
 pub async fn peek_provider_connection_ids(

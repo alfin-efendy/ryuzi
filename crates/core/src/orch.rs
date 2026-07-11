@@ -797,9 +797,10 @@ pub async fn decompose_goal(
         }],
         "stream": true,
     });
-    let mut rx = client::anthropic_messages_stream(&ctx, body, effort_policy).await?;
+    let crate::llm_router::provenance::RoutedStream { mut events, .. } =
+        client::anthropic_messages_stream(&ctx, body, effort_policy).await?;
     let mut text = String::new();
-    while let Some(item) = rx.recv().await {
+    while let Some(item) = events.recv().await {
         let ev = item?;
         if let Some(MessageStreamEvent::TextDelta { text: t, .. }) =
             MessageStreamEvent::from_event(&ev)
