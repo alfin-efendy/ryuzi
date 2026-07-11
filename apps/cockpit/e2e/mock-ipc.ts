@@ -1,7 +1,9 @@
 import type { Page } from "@playwright/test";
+import type { ConnectionInfo } from "../src/bindings";
 
 /**
- * Fixtures mirror the generated types in src/bindings.ts (Project, Session).
+ * Fixtures mirror the generated types in src/bindings.ts (Project, Session,
+ * ConnectionInfo).
  * Keep field names in sync when bindings regenerate.
  */
 export const PROJECT = {
@@ -101,13 +103,11 @@ const CONNECTIONS = [
     label: "Fixture account",
     priority: 0,
     enabled: true,
-    baseUrl: null,
+    quotaCapability: null,
     models: ["model-alpha", "model-beta"],
-    keyMasked: "fixture-…key",
     needsRelogin: false,
-    claudeCloaking: false,
   },
-];
+] satisfies ConnectionInfo[];
 
 const initialProjectRuntime = {
   projectId: PROJECT.projectId,

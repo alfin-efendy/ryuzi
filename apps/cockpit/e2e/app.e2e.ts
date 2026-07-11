@@ -18,6 +18,21 @@ test("boots to Home with the project loaded", async ({ page }) => {
   expect(calls.some((c) => c.cmd === "list_sessions")).toBe(true);
 });
 
+test("connection fixtures match the public account contract", async ({ page }) => {
+  await page.goto("/");
+  const connections = await page.evaluate(async () => {
+    const tauri = (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: unknown) => Promise<unknown> } })
+      .__TAURI_INTERNALS__;
+    return (await tauri.invoke("list_connections", {})) as Array<Record<string, unknown>>;
+  });
+
+  expect(connections).toHaveLength(1);
+  expect(connections[0]).toMatchObject({ quotaCapability: null, models: ["model-alpha", "model-beta"], needsRelogin: false });
+  expect(connections[0]).not.toHaveProperty("baseUrl");
+  expect(connections[0]).not.toHaveProperty("keyMasked");
+  expect(connections[0]).not.toHaveProperty("claudeCloaking");
+});
+
 test("sidebar navigation leaves the Home view", async ({ page }) => {
   await page.goto("/");
   const homeHeading = page.getByRole("heading", { name: /What should we build/ });
