@@ -113,7 +113,10 @@ export function RightPanel({
         />
       )}
       {/* Tab bar */}
-      <div data-testid="right-panel-header" className="box-border flex h-[55px] shrink-0 items-center border-b border-border px-2.5">
+      <div
+        data-testid="right-panel-header"
+        className="box-border flex h-[55px] shrink-0 items-center border-b border-border px-2.5 pr-[92px]"
+      >
         <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {rightTabs.map((t) => {
             const sel = nav.rightTab === t.id;

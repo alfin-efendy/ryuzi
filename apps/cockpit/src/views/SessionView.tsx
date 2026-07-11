@@ -282,223 +282,243 @@ export function SessionView() {
   };
 
   return (
-    <div className="flex min-h-0 flex-1">
-      {/* Chat column */}
-      <div className={`flex min-h-0 min-w-0 flex-1 flex-col ${nav.rightMaximized && nav.rightOpen ? "hidden" : ""}`}>
-        <div className="box-border flex h-[55px] shrink-0 items-center gap-3 border-b border-border px-5">
-          <StatusDot color={meta.color} pulse={meta.pulse} size={9} />
-          <div className="min-w-0">
-            <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
-            <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-              <span>{headerAgentLine(project, agentModel)}</span>
-              {session.branch && (
-                <span className="inline-flex items-center gap-1">
-                  <GitBranch aria-hidden size={11} strokeWidth={2} />
-                  {session.branch}
-                </span>
-              )}
-            </div>
-          </div>
-          <div className="flex-1" />
-          <OpenInMenu sessionPk={session.sessionPk} />
-          <div className="mx-0.5 h-[18px] w-px bg-border" />
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            title="Toggle bottom panel"
-            onClick={nav.toggleBottom}
-            className={nav.bottomOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
-          >
-            <PanelBottom aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            title="Toggle right panel"
-            onClick={nav.toggleRight}
-            className={nav.rightOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
-          >
-            <PanelRight aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
-          </Button>
-        </div>
-
-        {/* Transcript, with the floating plan panel overlaying it */}
-        <div className="relative flex min-h-0 flex-1 flex-col">
-          <TranscriptFileContext.Provider value={transcriptFileCtx}>
-            <Transcript
-              sessionPk={session.sessionPk}
-              rows={rows}
-              agentName={NATIVE_AGENT.name}
-              agentColor={NATIVE_AGENT.color}
-              running={running}
-            >
-              {pendingForSession.map((a, i) => (
-                <div key={a.requestId} className="px-4 pb-2">
-                  <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
-                </div>
-              ))}
-            </Transcript>
-          </TranscriptFileContext.Provider>
-          {/* Agent plan (todowrite) — floating rounded panel */}
-          <TodoPanel sessionPk={session.sessionPk} running={running} />
-        </div>
-
-        {/* Session composer */}
-        <div className="shrink-0 px-6 pb-4 pt-3">
-          <QueuedMessages sessionPk={session.sessionPk} />
-          <div
-            className={`acrylic-card relative mx-auto w-full max-w-3xl rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
-          >
-            <Textarea
-              value={draft}
-              onChange={(e) => {
-                // Typing exits history mode: the edited text becomes the live draft.
-                historyRef.current = HISTORY_IDLE;
-                setDraft(e.target.value);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  submit();
-                  return;
-                }
-                if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
-                  const dir = e.key === "ArrowUp" ? ("up" as const) : ("down" as const);
-                  const popupOpen = slashMatches.length > 0 || contextHits.length > 0;
-                  const el = e.currentTarget;
-                  if (!shouldNavigateHistory(dir, draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, popupOpen)) return;
-                  const step = stepHistory(dir, history, historyRef.current, draft);
-                  if (!step) return;
-                  e.preventDefault();
-                  historyRef.current = step.state;
-                  setDraft(step.text);
-                }
-              }}
-              onPaste={composerFiles.onPaste}
-              placeholder={running ? "Enter to queue" : "Ask for follow-up changes"}
-              className="max-h-[40vh] min-h-0 resize-none overflow-y-auto border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
-            />
-            {slashMatches.length > 0 && (
-              <MenuPanel onClose={() => undefined} className="bottom-full left-2.5 z-50 mb-1.5 w-[320px]">
-                <MenuSectionLabel>Commands</MenuSectionLabel>
-                {slashMatches.map((cmd) => (
-                  <MenuItem key={cmd.name} onClick={() => setDraft(`/${cmd.name} `)} className="font-medium">
-                    <span className="font-mono text-[12px] text-muted-foreground">/{cmd.name}</span>
-                    <span className="min-w-0 flex-1 truncate">{cmd.description}</span>
-                  </MenuItem>
-                ))}
-              </MenuPanel>
-            )}
-            {contextHits.length > 0 && (
-              <MenuPanel onClose={() => setContextHits([])} className="bottom-full left-2.5 z-50 mb-1.5 w-[360px]">
-                <MenuSectionLabel>Context</MenuSectionLabel>
-                {contextHits.map((path) => (
-                  <MenuItem key={path} onClick={() => pickContext(path)} className="font-medium">
-                    <FileText aria-hidden size={13} strokeWidth={2} className="size-[13px] text-muted-foreground" />
-                    <span className="min-w-0 flex-1 truncate">{path}</span>
-                  </MenuItem>
-                ))}
-              </MenuPanel>
-            )}
-            <div className="relative flex items-center gap-1.5 px-2.5 pb-2.5 pt-1.5">
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                title="Attach"
-                onClick={() => void composerFiles.attachFiles()}
-                className="rounded-full text-muted-foreground"
-              >
-                <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
-              </Button>
-              <Combobox
-                aria-label="Permission mode"
-                options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
-                value={permUi}
-                onValueChange={(mode) => {
-                  void setSessionPermMode(session.sessionPk, uiPermToCore(mode as UiPermMode));
-                }}
-                trigger={
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    title="Permission mode"
-                    className="font-medium"
-                    style={{ color: permUi === "full" ? "#E8703A" : undefined }}
-                  >
-                    <CircleAlert aria-hidden size={12} strokeWidth={2} className="size-3" />
-                    {permMeta.label}
-                    <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                  </Button>
-                }
-              />
-              <div className="flex-1" />
-              <SessionCostPanel sessionPk={session.sessionPk} />
-              <ComposerModelEffortMenu
-                models={agentModels}
-                runtime={runtime}
-                onChange={(model, effort) => {
-                  if (runtimeScope === "project" && projectId) void setProjectRuntime(projectId, model, effort);
-                  else if (runtimeScope === "session") void setSessionRuntime(session.sessionPk, model, effort);
-                }}
-                disabled={agentModels.length === 0 || runtimeScope === null}
-                running={running}
-              />
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                title="Voice"
-                onClick={toggleVoice}
-                className={`rounded-full ${listening ? "bg-accent text-accent-foreground" : "text-muted-foreground"}`}
-              >
-                <Mic aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-              </Button>
-              {composerMode(session.status) === "stop" ? (
-                <Button size="icon" title="Stop" onClick={() => void stop(session.sessionPk)} className="rounded-full">
-                  <span className="h-[11px] w-[11px] rounded-[2px] bg-current" />
-                </Button>
-              ) : (
-                <Button size="icon" title="Send" onClick={submit} className="rounded-full">
-                  <ArrowUp aria-hidden size={14} strokeWidth={2.2} className="size-3.5" />
-                </Button>
-              )}
-            </div>
-            {(composerFiles.attachments.length > 0 || contextRefs.length > 0) && (
-              <div className="flex flex-wrap gap-1.5 px-2.5 pb-2">
-                {contextRefs.map((path) => (
-                  <Button
-                    key={`ctx-${path}`}
-                    variant="outline"
-                    size="sm"
-                    title={path}
-                    onClick={() => setContextRefs((cur) => cur.filter((p) => p !== path))}
-                    className="max-w-[220px] rounded-full px-2 text-[12px] text-muted-foreground"
-                  >
-                    <FileText aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
-                    <span className="truncate">{path}</span>
-                    <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
-                  </Button>
-                ))}
-                <AttachmentChips attachments={composerFiles.attachments} onRemove={composerFiles.remove} />
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Bottom terminal drawer — a real shell in the session worktree */}
-        {nav.bottomOpen && <BottomTerminalDrawer sessionPk={session.sessionPk} projectName={projectName} />}
+    <div className="relative flex min-h-0 flex-1 flex-col">
+      {/* Workspace-level panel controls — always mounted at the workspace's
+          top-right, independent of the chat header, so toggling either
+          panel doesn't relocate or unmount these buttons. */}
+      <div
+        data-testid="session-panel-controls"
+        className="absolute right-2.5 top-2.5 z-30 flex items-center gap-1 rounded-md border border-border bg-background/80 p-1 shadow-xs backdrop-blur"
+      >
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          title="Toggle bottom panel"
+          aria-pressed={nav.bottomOpen}
+          onClick={nav.toggleBottom}
+          className={nav.bottomOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
+        >
+          <PanelBottom aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          title="Toggle right panel"
+          aria-pressed={nav.rightOpen}
+          onClick={nav.toggleRight}
+          className={nav.rightOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
+        >
+          <PanelRight aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+        </Button>
       </div>
 
-      {/* Right panel — keyed by session so switching sessions remounts it: per-session
-          review/file state resets, while diff data lives in the useDiff store keyed
-          by sessionPk so sessions never see each other's results. */}
-      {nav.rightOpen && (
-        <RightPanel
-          key={session.sessionPk}
-          sessionPk={session.sessionPk}
-          branch={session.branch ?? null}
-          running={running}
-          isGit={project?.isGit ?? false}
-        />
+      <div data-testid="session-main-row" className="flex min-h-0 min-w-0 flex-1">
+        {/* Chat column */}
+        <div className={`flex min-h-0 min-w-0 flex-1 flex-col ${nav.rightMaximized && nav.rightOpen ? "hidden" : ""}`}>
+          <div
+            data-testid="session-chat-header"
+            className="box-border flex h-[55px] shrink-0 items-center gap-3 border-b border-border px-5 pr-[92px]"
+          >
+            <StatusDot color={meta.color} pulse={meta.pulse} size={9} />
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
+              <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
+                <span>{headerAgentLine(project, agentModel)}</span>
+                {session.branch && (
+                  <span className="inline-flex items-center gap-1">
+                    <GitBranch aria-hidden size={11} strokeWidth={2} />
+                    {session.branch}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="flex-1" />
+            <OpenInMenu sessionPk={session.sessionPk} />
+          </div>
+
+          {/* Transcript, with the floating plan panel overlaying it */}
+          <div className="relative flex min-h-0 flex-1 flex-col">
+            <TranscriptFileContext.Provider value={transcriptFileCtx}>
+              <Transcript
+                sessionPk={session.sessionPk}
+                rows={rows}
+                agentName={NATIVE_AGENT.name}
+                agentColor={NATIVE_AGENT.color}
+                running={running}
+              >
+                {pendingForSession.map((a, i) => (
+                  <div key={a.requestId} className="px-4 pb-2">
+                    <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
+                  </div>
+                ))}
+              </Transcript>
+            </TranscriptFileContext.Provider>
+            {/* Agent plan (todowrite) — floating rounded panel */}
+            <TodoPanel sessionPk={session.sessionPk} running={running} />
+          </div>
+
+          {/* Session composer */}
+          <div className="shrink-0 px-6 pb-4 pt-3">
+            <QueuedMessages sessionPk={session.sessionPk} />
+            <div
+              className={`acrylic-card relative mx-auto w-full max-w-3xl rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
+            >
+              <Textarea
+                value={draft}
+                onChange={(e) => {
+                  // Typing exits history mode: the edited text becomes the live draft.
+                  historyRef.current = HISTORY_IDLE;
+                  setDraft(e.target.value);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    submit();
+                    return;
+                  }
+                  if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                    const dir = e.key === "ArrowUp" ? ("up" as const) : ("down" as const);
+                    const popupOpen = slashMatches.length > 0 || contextHits.length > 0;
+                    const el = e.currentTarget;
+                    if (!shouldNavigateHistory(dir, draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, popupOpen)) return;
+                    const step = stepHistory(dir, history, historyRef.current, draft);
+                    if (!step) return;
+                    e.preventDefault();
+                    historyRef.current = step.state;
+                    setDraft(step.text);
+                  }
+                }}
+                onPaste={composerFiles.onPaste}
+                placeholder={running ? "Enter to queue" : "Ask for follow-up changes"}
+                className="max-h-[40vh] min-h-0 resize-none overflow-y-auto border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
+              />
+              {slashMatches.length > 0 && (
+                <MenuPanel onClose={() => undefined} className="bottom-full left-2.5 z-50 mb-1.5 w-[320px]">
+                  <MenuSectionLabel>Commands</MenuSectionLabel>
+                  {slashMatches.map((cmd) => (
+                    <MenuItem key={cmd.name} onClick={() => setDraft(`/${cmd.name} `)} className="font-medium">
+                      <span className="font-mono text-[12px] text-muted-foreground">/{cmd.name}</span>
+                      <span className="min-w-0 flex-1 truncate">{cmd.description}</span>
+                    </MenuItem>
+                  ))}
+                </MenuPanel>
+              )}
+              {contextHits.length > 0 && (
+                <MenuPanel onClose={() => setContextHits([])} className="bottom-full left-2.5 z-50 mb-1.5 w-[360px]">
+                  <MenuSectionLabel>Context</MenuSectionLabel>
+                  {contextHits.map((path) => (
+                    <MenuItem key={path} onClick={() => pickContext(path)} className="font-medium">
+                      <FileText aria-hidden size={13} strokeWidth={2} className="size-[13px] text-muted-foreground" />
+                      <span className="min-w-0 flex-1 truncate">{path}</span>
+                    </MenuItem>
+                  ))}
+                </MenuPanel>
+              )}
+              <div className="relative flex items-center gap-1.5 px-2.5 pb-2.5 pt-1.5">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  title="Attach"
+                  onClick={() => void composerFiles.attachFiles()}
+                  className="rounded-full text-muted-foreground"
+                >
+                  <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+                </Button>
+                <Combobox
+                  aria-label="Permission mode"
+                  options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
+                  value={permUi}
+                  onValueChange={(mode) => {
+                    void setSessionPermMode(session.sessionPk, uiPermToCore(mode as UiPermMode));
+                  }}
+                  trigger={
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      title="Permission mode"
+                      className="font-medium"
+                      style={{ color: permUi === "full" ? "#E8703A" : undefined }}
+                    >
+                      <CircleAlert aria-hidden size={12} strokeWidth={2} className="size-3" />
+                      {permMeta.label}
+                      <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                    </Button>
+                  }
+                />
+                <div className="flex-1" />
+                <SessionCostPanel sessionPk={session.sessionPk} />
+                <ComposerModelEffortMenu
+                  models={agentModels}
+                  runtime={runtime}
+                  onChange={(model, effort) => {
+                    if (runtimeScope === "project" && projectId) void setProjectRuntime(projectId, model, effort);
+                    else if (runtimeScope === "session") void setSessionRuntime(session.sessionPk, model, effort);
+                  }}
+                  disabled={agentModels.length === 0 || runtimeScope === null}
+                  running={running}
+                />
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  title="Voice"
+                  onClick={toggleVoice}
+                  className={`rounded-full ${listening ? "bg-accent text-accent-foreground" : "text-muted-foreground"}`}
+                >
+                  <Mic aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                </Button>
+                {composerMode(session.status) === "stop" ? (
+                  <Button size="icon" title="Stop" onClick={() => void stop(session.sessionPk)} className="rounded-full">
+                    <span className="h-[11px] w-[11px] rounded-[2px] bg-current" />
+                  </Button>
+                ) : (
+                  <Button size="icon" title="Send" onClick={submit} className="rounded-full">
+                    <ArrowUp aria-hidden size={14} strokeWidth={2.2} className="size-3.5" />
+                  </Button>
+                )}
+              </div>
+              {(composerFiles.attachments.length > 0 || contextRefs.length > 0) && (
+                <div className="flex flex-wrap gap-1.5 px-2.5 pb-2">
+                  {contextRefs.map((path) => (
+                    <Button
+                      key={`ctx-${path}`}
+                      variant="outline"
+                      size="sm"
+                      title={path}
+                      onClick={() => setContextRefs((cur) => cur.filter((p) => p !== path))}
+                      className="max-w-[220px] rounded-full px-2 text-[12px] text-muted-foreground"
+                    >
+                      <FileText aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
+                      <span className="truncate">{path}</span>
+                      <X aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0" />
+                    </Button>
+                  ))}
+                  <AttachmentChips attachments={composerFiles.attachments} onRemove={composerFiles.remove} />
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Right panel — keyed by session so switching sessions remounts it: per-session
+            review/file state resets, while diff data lives in the useDiff store keyed
+            by sessionPk so sessions never see each other's results. */}
+        {nav.rightOpen && (
+          <RightPanel
+            key={session.sessionPk}
+            sessionPk={session.sessionPk}
+            branch={session.branch ?? null}
+            running={running}
+            isGit={project?.isGit ?? false}
+          />
+        )}
+      </div>
+
+      {/* Bottom terminal drawer — a real shell in the session worktree, spanning
+          the full workspace width below both the chat column and right panel. */}
+      {nav.bottomOpen && (
+        <div data-testid="session-bottom-row" className="min-w-0 shrink-0">
+          <BottomTerminalDrawer sessionPk={session.sessionPk} projectName={projectName} />
+        </div>
       )}
     </div>
   );
