@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 // Bun's `mock.module(...)` registers a module override for the whole
 // `bun test` process, not just this file. Several of the modules SessionView
@@ -126,8 +126,9 @@ afterAll(() => {
   mock.module("@/components/ComposerModelEffortMenu", () => realComposerModelEffortMenu);
 });
 
-test("panel controls live at workspace scope and expose pressed state", () => {
+test("panel controls live at workspace scope and expose pressed state", async () => {
   render(<SessionView />);
+  await act(async () => {});
   const controls = screen.getByTestId("session-panel-controls");
   const chatHeader = screen.getByTestId("session-chat-header");
   const bottomToggle = screen.getByTitle("Toggle bottom panel");
@@ -140,8 +141,9 @@ test("panel controls live at workspace scope and expose pressed state", () => {
   expect(rightToggle.getAttribute("aria-pressed")).toBe("true");
 });
 
-test("bottom terminal is outside the horizontal main row", () => {
+test("bottom terminal is outside the horizontal main row", async () => {
   render(<SessionView />);
+  await act(async () => {});
   const mainRow = screen.getByTestId("session-main-row");
   const bottomRow = screen.getByTestId("session-bottom-row");
   const terminal = screen.getByTestId("bottom-terminal");
@@ -152,8 +154,9 @@ test("bottom terminal is outside the horizontal main row", () => {
   expect(mainRow.parentElement).toBe(bottomRow.parentElement);
 });
 
-test("workspace toggles remain rendered and update panel state when panels close", () => {
+test("workspace toggles remain rendered and update panel state when panels close", async () => {
   render(<SessionView />);
+  await act(async () => {});
   fireEvent.click(screen.getByTitle("Toggle right panel"));
   fireEvent.click(screen.getByTitle("Toggle bottom panel"));
 
