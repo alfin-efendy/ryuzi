@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Project, Session, SessionStatus } from "../bindings";
-import { archivedCount, isUnreadVisible, orderProjects, sessionTitle, sessionsForProject, type SessionFilterCtx } from "./sidebar";
+import { archivedCount, isUnreadVisible, orderProjects, reorder, sessionTitle, sessionsForProject, type SessionFilterCtx } from "./sidebar";
 
 function sess(pk: string, projectId: string, title: string | null, lastActive = 0): Session {
   return {
@@ -152,4 +152,60 @@ describe("sessionsForProject filter", () => {
     // both running; a is pinned so it sorts first despite older lastActive
     expect(rows.map((r) => r.sessionPk)).toEqual(["a", "b"]);
   });
+});
+
+test("reorder moves fromId to toId's slot (forward and backward), immutably", () => {
+  const a = ["1", "2", "3", "4"];
+  expect(reorder(a, "1", "3")).toEqual(["2", "3", "1", "4"]);
+  expect(reorder(a, "4", "2")).toEqual(["1", "4", "2", "3"]);
+  expect(a).toEqual(["1", "2", "3", "4"]); // original untouched
+});
+
+test("reorder no-ops on missing id or equal ids", () => {
+  expect(reorder(["1", "2"], "x", "1")).toEqual(["1", "2"]);
+  expect(reorder(["1", "2"], "1", "x")).toEqual(["1", "2"]);
+  expect(reorder(["1", "2"], "1", "1")).toEqual(["1", "2"]);
+});
+
+test("sessionsForProject orders pinned by pinnedOrder index; unordered pinned fall after by recency", () => {
+  const mk = (pk: string, lastActive: number) => ({
+    sessionPk: pk,
+    projectId: "p",
+    agentSessionId: null,
+    worktreePath: null,
+    branch: null,
+    title: pk,
+    status: "idle" as const,
+    startedBy: null,
+    createdAt: 0,
+    lastActive,
+    resumeAttempts: 0,
+    branchOwned: false,
+  });
+  const sessions = [mk("a", 100), mk("b", 200), mk("c", 300)];
+  const noFilter = { statuses: {}, unreadOnly: false, readAt: {}, focusedSessionPk: null };
+  // a,b,c all pinned; pinnedOrder = [c, a] → c, a first (by order), then b (unordered → recency)
+  const out = sessionsForProject(sessions, "p", "", false, { a: true, b: true, c: true }, {}, noFilter, ["c", "a"]);
+  expect(out.map((s) => s.sessionPk)).toEqual(["c", "a", "b"]);
+});
+
+test("sessionsForProject with empty pinnedOrder keeps legacy pinned-first-then-recency", () => {
+  const mk = (pk: string, lastActive: number) => ({
+    sessionPk: pk,
+    projectId: "p",
+    agentSessionId: null,
+    worktreePath: null,
+    branch: null,
+    title: pk,
+    status: "idle" as const,
+    startedBy: null,
+    createdAt: 0,
+    lastActive,
+    resumeAttempts: 0,
+    branchOwned: false,
+  });
+  const sessions = [mk("a", 100), mk("b", 300)];
+  const noFilter = { statuses: {}, unreadOnly: false, readAt: {}, focusedSessionPk: null };
+  // a pinned, b not → a first despite older lastActive (no pinnedOrder arg → default [])
+  expect(sessionsForProject(sessions, "p", "", false, { a: true }, {}, noFilter).map((s) => s.sessionPk)).toEqual(["a", "b"]);
 });

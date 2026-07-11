@@ -25,6 +25,19 @@ export type SessionFilterCtx = {
   focusedSessionPk: string | null;
 };
 
+/** Move `fromId` to occupy `toId`'s position (immutably). No-op if either id is
+ *  absent or they are equal. */
+export function reorder(list: string[], fromId: string, toId: string): string[] {
+  if (fromId === toId) return list;
+  const from = list.indexOf(fromId);
+  const to = list.indexOf(toId);
+  if (from === -1 || to === -1) return list;
+  const next = [...list];
+  const [moved] = next.splice(from, 1);
+  next.splice(to, 0, moved);
+  return next;
+}
+
 // Sessions shown under one project row: query-filtered, archived hidden unless
 // revealed, status/unread filtered, pinned first, newest first within each group.
 export function sessionsForProject(
@@ -35,6 +48,7 @@ export function sessionsForProject(
   pinned: Record<string, true>,
   archived: Record<string, true>,
   filter: SessionFilterCtx,
+  pinnedOrder: string[] = [],
 ): Session[] {
   const q = query.trim().toLowerCase();
   const statusActive = Object.keys(filter.statuses).length > 0;
@@ -45,9 +59,17 @@ export function sessionsForProject(
     .filter((s) => !statusActive || filter.statuses[s.status])
     .filter((s) => !filter.unreadOnly || isUnreadVisible(s, filter.readAt, filter.focusedSessionPk))
     .sort((a, b) => {
-      const pin = (pinned[b.sessionPk] ? 1 : 0) - (pinned[a.sessionPk] ? 1 : 0);
-      if (pin !== 0) return pin;
-      return (b.lastActive ?? 0) - (a.lastActive ?? 0);
+      const ap = pinned[a.sessionPk] ? 1 : 0;
+      const bp = pinned[b.sessionPk] ? 1 : 0;
+      if (ap !== bp) return bp - ap; // pinned first
+      if (ap === 1) {
+        const ai = pinnedOrder.indexOf(a.sessionPk);
+        const bi = pinnedOrder.indexOf(b.sessionPk);
+        const av = ai === -1 ? Number.POSITIVE_INFINITY : ai;
+        const bv = bi === -1 ? Number.POSITIVE_INFINITY : bi;
+        if (av !== bv) return av - bv; // by manual order; unordered → after
+      }
+      return (b.lastActive ?? 0) - (a.lastActive ?? 0); // recency within group
     });
 }
 
