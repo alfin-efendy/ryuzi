@@ -15,6 +15,7 @@ pub mod fsview;
 pub mod gateway;
 pub mod gateways;
 pub mod harness;
+pub mod learning;
 pub mod llm_router;
 pub mod mcp;
 pub mod oauth_loopback;

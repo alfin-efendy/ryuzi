@@ -2574,6 +2574,12 @@ impl Store {
     /// session is IDLE (the idle-only invariant, spec §6.1). Returns `None`
     /// when nothing is deliverable. The claim + read run in one transaction so
     /// two drainers never claim the same row.
+    ///
+    /// Excludes `kind='learning'` rows (spec §3.1/§7.2 rail split): a
+    /// learning fork is never delivered as a chat user turn — it is claimed
+    /// separately by [`Store::claim_learning_event`] and driven by the
+    /// dedicated learning worker (`learning.rs`), never by this generic
+    /// drainer.
     pub async fn claim_deliverable_background_event(
         &self,
         claimer: &str,
@@ -2586,8 +2592,63 @@ impl Store {
                     "SELECT be.id FROM background_events be \
                      JOIN sessions s ON s.session_pk = be.target_session_pk \
                      WHERE be.delivered_at IS NULL AND be.claimed_by IS NULL \
+                       AND be.kind != 'learning' \
                        AND s.status = 'idle' \
                      ORDER BY be.created_at ASC LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(id) = picked else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE background_events SET claimed_by = ?2 WHERE id = ?1",
+                params![id, claimer],
+            )?;
+            let row = tx.query_row(
+                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                 FROM background_events WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(crate::domain::BackgroundEvent {
+                        id: r.get(0)?,
+                        target_session_pk: r.get(1)?,
+                        kind: r.get(2)?,
+                        payload: r.get(3)?,
+                        created_at: r.get(4)?,
+                        claimed_by: r.get(5)?,
+                        delivered_at: r.get(6)?,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(Some(row))
+        })
+        .await
+    }
+
+    /// Atomically claim the OLDEST undelivered, unclaimed `kind='learning'`
+    /// row (spec §3.1/§7.2), for the dedicated learning worker
+    /// (`learning.rs`) — the counterpart to
+    /// [`Store::claim_deliverable_background_event`], which excludes these
+    /// rows. Deliberately has NO idle-target filter: a learning fork drives
+    /// an isolated review session, not the target chat's turn, so it must
+    /// run regardless of whether the parent chat is idle or mid-turn. The
+    /// claim + read run in one transaction so two learning workers never
+    /// claim the same row.
+    pub async fn claim_learning_event(
+        &self,
+        claimer: &str,
+    ) -> anyhow::Result<Option<crate::domain::BackgroundEvent>> {
+        let claimer = claimer.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let picked: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM background_events \
+                     WHERE kind = 'learning' AND delivered_at IS NULL AND claimed_by IS NULL \
+                     ORDER BY created_at ASC LIMIT 1",
                     [],
                     |r| r.get::<_, String>(0),
                 )
@@ -6161,6 +6222,79 @@ mod tests {
             1
         );
         assert_eq!(store.pending_background_count().await.unwrap(), 0);
+    }
+
+    /// Pins the Task 8 rail split (spec §3.1/§7.2): the generic drainer's
+    /// claim must NEVER return a `kind='learning'` row (it would otherwise
+    /// inject a learning payload as a chat user turn), and
+    /// `claim_learning_event` must be the only way to claim one. A
+    /// `delegation` row (Phase 3 behavior) must still be claimable by the
+    /// generic drainer — proving the exclusion is scoped to `learning` only,
+    /// not a regression of ordinary background delivery.
+    #[tokio::test]
+    async fn claim_deliverable_background_event_skips_learning_rows_claim_learning_event_takes_them(
+    ) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(crate::domain::Session {
+                session_pk: "idle-1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: crate::domain::SessionStatus::Idle,
+                perm_mode: crate::domain::PermMode::Default,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        let learning_id = store
+            .enqueue_background_event("idle-1", "learning", "{}")
+            .await
+            .unwrap();
+        let delegation_id = store
+            .enqueue_background_event("idle-1", "delegation", "{\"x\":1}")
+            .await
+            .unwrap();
+
+        // The generic drainer must skip the learning row and reach the
+        // delegation row instead (no Phase-3 regression).
+        let claimed = store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, delegation_id);
+        assert_eq!(claimed.kind, "delegation");
+        // With the only non-learning row now claimed, the generic drainer
+        // finds nothing else — specifically NOT the still-pending learning
+        // row.
+        assert!(store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .is_none());
+
+        // The dedicated learning claim DOES pick up the learning row.
+        let learning_claimed = store
+            .claim_learning_event("learner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(learning_claimed.id, learning_id);
+        assert_eq!(learning_claimed.kind, "learning");
     }
 
     #[tokio::test]

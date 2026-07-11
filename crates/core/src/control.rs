@@ -180,6 +180,20 @@ impl ControlPlane {
         &self.background
     }
 
+    /// Drive one learning-fork replay for a claimed `kind='learning'`
+    /// background-event payload (spec §3.1/§7.2): `kind='review'`, no parent
+    /// persistence, dispatch-time tool whitelist, budget 16, approvals
+    /// auto-denied. Called by `learning::tick` once per claimed row; a
+    /// successful return marks the row delivered, an error releases the
+    /// claim so a later tick retries it.
+    ///
+    /// Task 8 wires the claim → dispatch → mark-delivered/release skeleton
+    /// only; this is a stub so it compiles and the rail-split claim tests
+    /// pass. Task 9 replaces the body with the actual review-fork replay.
+    pub async fn run_review_fork(&self, _payload: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// The plugin host — every installed plugin's manifest, capabilities, and
     /// enablement state (see `plugins::host::PluginHost`). Used by `serve.rs`
     /// to expose plugins over HTTP without duplicating `Registries`' shape.

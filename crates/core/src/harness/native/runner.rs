@@ -2510,7 +2510,7 @@ mod tests {
         .unwrap();
         assert!(
             deps.store
-                .claim_deliverable_background_event("peek")
+                .claim_learning_event("peek")
                 .await
                 .unwrap()
                 .is_none(),
@@ -2524,9 +2524,21 @@ mod tests {
         )
         .await
         .unwrap();
+        // A learning row is claimed via the dedicated `claim_learning_event`
+        // (Task 8's rail split) — the generic chat drainer's
+        // `claim_deliverable_background_event` must NEVER see it, proven
+        // right below.
+        assert!(
+            deps.store
+                .claim_deliverable_background_event("chat-drainer")
+                .await
+                .unwrap()
+                .is_none(),
+            "the generic chat drainer must never claim a learning row"
+        );
         let ev = deps
             .store
-            .claim_deliverable_background_event("learner")
+            .claim_learning_event("learner")
             .await
             .unwrap()
             .expect("threshold crossed on turn 2 — a learning row must be enqueued");
@@ -2543,7 +2555,7 @@ mod tests {
         // Firing resets the counter: no second row is left queued.
         assert!(deps
             .store
-            .claim_deliverable_background_event("learner2")
+            .claim_learning_event("learner2")
             .await
             .unwrap()
             .is_none());
