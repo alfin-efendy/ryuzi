@@ -4,22 +4,18 @@
 //! a scripted implementation via [`LlmStreamFactory`] so the runner can be
 //! driven without a network.
 
-use crate::llm_router::client::{self, AnthropicEvent, MessageStreamEvent, UpstreamCtx};
+use crate::llm_router::client::{self, MessageStreamEvent, UpstreamCtx};
 use crate::llm_router::model_effort::TurnEffortPolicy;
+use crate::llm_router::provenance::{LlmRequest, LlmRequestMetadata, RoutedStream};
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 /// One provider turn as a stream of Anthropic events.
 #[async_trait]
 pub trait LlmStream: Send + Sync {
-    async fn stream(
-        &self,
-        body: Value,
-        effort_policy: Arc<TurnEffortPolicy>,
-    ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>>;
+    async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream>;
 }
 
 /// Builds an [`LlmStream`] for a session, given its store. Kept separate from
@@ -36,14 +32,9 @@ pub struct RouterLlmStream {
 
 #[async_trait]
 impl LlmStream for RouterLlmStream {
-    async fn stream(
-        &self,
-        body: Value,
-        effort_policy: Arc<TurnEffortPolicy>,
-    ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
-        let crate::llm_router::provenance::RoutedStream { events, .. } =
-            client::anthropic_messages_stream(&self.ctx, body, &effort_policy).await?;
-        Ok(events)
+    async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+        client::anthropic_messages_stream(&self.ctx, request.body, &request.metadata.effort_policy)
+            .await
     }
 }
 
@@ -66,9 +57,17 @@ pub async fn collect_text(
     body: Value,
     effort_policy: Arc<TurnEffortPolicy>,
 ) -> anyhow::Result<String> {
-    let mut rx = llm.stream(body, effort_policy).await?;
+    let RoutedStream { mut events, .. } = llm
+        .stream(LlmRequest {
+            body,
+            metadata: LlmRequestMetadata {
+                effort_policy,
+                observation: None,
+            },
+        })
+        .await?;
     let mut out = String::new();
-    while let Some(item) = rx.recv().await {
+    while let Some(item) = events.recv().await {
         let ev = item?;
         match MessageStreamEvent::from_event(&ev) {
             Some(MessageStreamEvent::TextDelta { text, .. }) => out.push_str(&text),

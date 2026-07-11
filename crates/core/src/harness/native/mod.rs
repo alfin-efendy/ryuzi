@@ -426,10 +426,8 @@ mod tests {
         impl llm::LlmStream for OverlapLlm {
             async fn stream(
                 &self,
-                _body: serde_json::Value,
-                _effort_policy: Arc<crate::llm_router::model_effort::TurnEffortPolicy>,
-            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<AnthropicEvent>>>
-            {
+                _request: crate::llm_router::provenance::LlmRequest,
+            ) -> anyhow::Result<crate::llm_router::provenance::RoutedStream> {
                 let n = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_seen.fetch_max(n, Ordering::SeqCst);
                 let (tx, rx) = tokio::sync::mpsc::channel(8);
@@ -444,7 +442,10 @@ mod tests {
                     active.fetch_sub(1, Ordering::SeqCst);
                     let _ = tx.send(Ok(message_stop())).await;
                 });
-                Ok(rx)
+                Ok(crate::llm_router::provenance::RoutedStream {
+                    selection: runner::testutil::test_route_selection(),
+                    events: rx,
+                })
             }
         }
 
@@ -507,10 +508,9 @@ mod tests {
         impl llm::LlmStream for SnapshotLlm {
             async fn stream(
                 &self,
-                _body: serde_json::Value,
-                effort_policy: Arc<TurnEffortPolicy>,
-            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<AnthropicEvent>>>
-            {
+                request: crate::llm_router::provenance::LlmRequest,
+            ) -> anyhow::Result<crate::llm_router::provenance::RoutedStream> {
+                let effort_policy = request.metadata.effort_policy;
                 let index = {
                     let mut policies = self.policies.lock().unwrap();
                     let index = policies.len();
@@ -527,7 +527,10 @@ mod tests {
                     let _ = tx.send(Ok(message_delta("end_turn"))).await;
                     let _ = tx.send(Ok(message_stop())).await;
                 });
-                Ok(rx)
+                Ok(crate::llm_router::provenance::RoutedStream {
+                    selection: runner::testutil::test_route_selection(),
+                    events: rx,
+                })
             }
         }
 

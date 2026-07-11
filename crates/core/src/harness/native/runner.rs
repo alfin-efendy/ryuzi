@@ -18,6 +18,9 @@ use crate::domain::{CoreEvent, NewMessage, PermMode};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
 use crate::llm_router::model_effort::TurnEffortPolicy;
+use crate::llm_router::provenance::{
+    LlmRequest, LlmRequestMetadata, RouteObservationContext, RouteSelection, RoutedStream,
+};
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -474,8 +477,21 @@ async fn drive(
             "max_tokens": max_tokens,
             "stream": true,
         });
-        let mut rx = match deps.llm.stream(body, deps.turn_effort_policy.clone()).await {
-            Ok(rx) => rx,
+        let observation = emit_display.then(|| RouteObservationContext {
+            session_pk: deps.session_pk.clone(),
+        });
+        let request = LlmRequest {
+            body,
+            metadata: LlmRequestMetadata {
+                effort_policy: deps.turn_effort_policy.clone(),
+                observation: observation.clone(),
+            },
+        };
+        let RoutedStream {
+            selection,
+            events: mut rx,
+        } = match deps.llm.stream(request).await {
+            Ok(routed) => routed,
             Err(e) if is_context_overflow(&e.to_string()) => {
                 cm.mark_full();
                 emit_context_usage(deps, cm, emit_display).await;
@@ -486,6 +502,9 @@ async fn drive(
             }
             Err(e) => return Err(e),
         };
+        if let Some(context) = observation.as_ref() {
+            observe_route_selection(deps, context, &selection).await;
+        }
         let mut turn = TurnAccum::default();
         let mut text_buf = String::new();
 
@@ -1134,6 +1153,36 @@ async fn emit_row(
     }
 }
 
+async fn observe_route_selection(
+    deps: &RunnerDeps,
+    context: &RouteObservationContext,
+    selection: &RouteSelection,
+) {
+    match deps
+        .store
+        .observe_session_route(&context.session_pk, selection)
+        .await
+    {
+        Ok(Some(message)) => {
+            let _ = deps.events.send(CoreEvent::Message {
+                session_pk: message.session_pk,
+                seq: message.seq,
+                role: message.role,
+                block_type: message.block_type,
+                payload: message.payload,
+                tool_call_id: message.tool_call_id,
+                status: message.status,
+                tool_kind: message.tool_kind,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            "native[{NATIVE_ID}]: observe_session_route failed for {}: {error}",
+            context.session_pk
+        ),
+    }
+}
+
 /// Broadcast ContextUsage and persist it for resume seeding. Sub-agent
 /// (ephemeral) loops skip both — their usage must not clobber the session's.
 async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) {
@@ -1242,6 +1291,9 @@ pub(crate) mod testutil {
     use super::super::llm::LlmStream;
     use crate::llm_router::client::AnthropicEvent;
     use crate::llm_router::model_effort::TurnEffortPolicy;
+    use crate::llm_router::provenance::{
+        LlmRequest, LlmRequestMetadata, RouteSelection, RouteSelectionReason, RoutedStream,
+    };
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
@@ -1250,25 +1302,51 @@ pub(crate) mod testutil {
     /// An `LlmStream` that replays scripted turns: the first `stream()` call
     /// returns turn 0's events, the next returns turn 1's, and so on.
     pub struct ScriptedLlm {
-        turns: Mutex<std::collections::VecDeque<Vec<AnthropicEvent>>>,
+        turns: Mutex<std::collections::VecDeque<(RouteSelection, Vec<AnthropicEvent>)>>,
+        pub metadata: Mutex<Vec<LlmRequestMetadata>>,
     }
 
     impl ScriptedLlm {
         pub fn new(turns: Vec<Vec<AnthropicEvent>>) -> Self {
             ScriptedLlm {
-                turns: Mutex::new(turns.into_iter().collect()),
+                turns: Mutex::new(
+                    turns
+                        .into_iter()
+                        .map(|events| (test_route_selection(), events))
+                        .collect(),
+                ),
+                metadata: Mutex::new(Vec::new()),
             }
+        }
+
+        pub fn with_selections(turns: Vec<(RouteSelection, Vec<AnthropicEvent>)>) -> Self {
+            Self {
+                turns: Mutex::new(turns.into_iter().collect()),
+                metadata: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    pub fn test_route_selection() -> RouteSelection {
+        RouteSelection {
+            requested_model: "test/model".into(),
+            resolved_provider_id: "test".into(),
+            resolved_family: "test".into(),
+            resolved_model: "model".into(),
+            resolved_model_display_name: "Test Model".into(),
+            effective_effort: None,
+            effective_effort_label: None,
+            connection_id: "ignored".into(),
+            connection_label: "Ignored".into(),
+            reason: RouteSelectionReason::Initial,
         }
     }
 
     #[async_trait]
     impl LlmStream for ScriptedLlm {
-        async fn stream(
-            &self,
-            _body: Value,
-            _effort_policy: Arc<TurnEffortPolicy>,
-        ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
-            let events = self
+        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            self.metadata.lock().unwrap().push(request.metadata);
+            let (selection, events) = self
                 .turns
                 .lock()
                 .unwrap()
@@ -1282,7 +1360,10 @@ pub(crate) mod testutil {
                     }
                 }
             });
-            Ok(rx)
+            Ok(RoutedStream {
+                selection,
+                events: rx,
+            })
         }
     }
 
@@ -1305,14 +1386,13 @@ pub(crate) mod testutil {
 
     #[async_trait]
     impl LlmStream for RecordingLlm {
-        async fn stream(
-            &self,
-            body: Value,
-            effort_policy: Arc<TurnEffortPolicy>,
-        ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
-            self.bodies.lock().unwrap().push(body.clone());
-            self.policies.lock().unwrap().push(effort_policy.clone());
-            self.inner.stream(body, effort_policy).await
+        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            self.bodies.lock().unwrap().push(request.body.clone());
+            self.policies
+                .lock()
+                .unwrap()
+                .push(request.metadata.effort_policy.clone());
+            self.inner.stream(request).await
         }
     }
 
@@ -1388,9 +1468,40 @@ mod tests {
     use crate::domain::CoreEvent;
     use crate::store::Store;
 
+    fn route_selection(
+        connection_id: &str,
+        label: &str,
+    ) -> crate::llm_router::provenance::RouteSelection {
+        let mut selection = test_route_selection();
+        selection.connection_id = connection_id.into();
+        selection.connection_label = label.into();
+        selection
+    }
+
+    fn final_turn(text: &str) -> Vec<crate::llm_router::client::AnthropicEvent> {
+        vec![text_delta(text), message_delta("end_turn"), message_stop()]
+    }
+
+    fn tool_turn() -> Vec<crate::llm_router::client::AnthropicEvent> {
+        vec![
+            tool_use_start(0, "call-1", "bash"),
+            input_json_delta(0, "{\"command\":\"echo route\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ]
+    }
+
     async fn deps_at(dir: &std::path::Path, llm: Arc<dyn LlmStream>) -> RunnerDeps {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        deps_with_store(dir, llm, store).await
+    }
+
+    async fn deps_with_store(
+        dir: &std::path::Path,
+        llm: Arc<dyn LlmStream>,
+        store: Arc<Store>,
+    ) -> RunnerDeps {
         let (events, _rx) = broadcast::channel(256);
         let agents = Arc::new(AgentRegistry::builtin());
         let agent = agents.default_agent();
@@ -1422,6 +1533,202 @@ mod tests {
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    #[tokio::test]
+    async fn route_notice_first_visible_request_establishes_silent_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![(
+            route_selection("a", "Primary"),
+            final_turn("hello"),
+        )]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        run_turn(
+            &deps,
+            TurnPrompt::text("hi", "hi"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(deps
+            .store
+            .list_messages("s1")
+            .await
+            .unwrap()
+            .iter()
+            .all(|message| message.block_type != "notice"));
+        assert_eq!(llm.metadata.lock().unwrap().len(), 1);
+        assert!(llm.metadata.lock().unwrap()[0].observation.is_some());
+    }
+
+    #[tokio::test]
+    async fn route_notice_changed_visible_request_persists_and_broadcasts_before_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (route_selection("a", "Primary"), final_turn("one")),
+            (route_selection("b", "Backup"), final_turn("two")),
+        ]));
+        let deps = deps_at(dir.path(), llm).await;
+        let mut events = deps.events.subscribe();
+        run_turn(
+            &deps,
+            TurnPrompt::text("one", "one"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        run_turn(
+            &deps,
+            TurnPrompt::text("two", "two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let messages = deps.store.list_messages("s1").await.unwrap();
+        let notice = messages.iter().find(|m| m.block_type == "notice").unwrap();
+        let content = messages
+            .iter()
+            .find(|m| m.role == "assistant" && m.payload["text"] == "two")
+            .unwrap();
+        assert!(notice.seq < content.seq);
+        let broadcasts: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(broadcasts.iter().any(|event| matches!(event,
+            CoreEvent::Message { seq, block_type, payload, .. }
+                if *seq == notice.seq && block_type == "notice" && payload == &notice.payload
+        )));
+    }
+
+    #[tokio::test]
+    async fn route_notice_unchanged_tool_loop_request_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let selection = route_selection("a", "Primary");
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (selection.clone(), tool_turn()),
+            (selection, final_turn("done")),
+        ]));
+        let deps = deps_at(dir.path(), llm).await;
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deps.store
+                .list_messages("s1")
+                .await
+                .unwrap()
+                .iter()
+                .filter(|m| m.block_type == "notice")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn route_notice_changed_tool_loop_account_emits_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (route_selection("a", "Primary"), tool_turn()),
+            (route_selection("b", "Backup"), final_turn("done")),
+        ]));
+        let deps = deps_at(dir.path(), llm).await;
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let messages = deps.store.list_messages("s1").await.unwrap();
+        assert_eq!(
+            messages.iter().filter(|m| m.block_type == "notice").count(),
+            1
+        );
+        assert!(messages
+            .iter()
+            .any(|m| m.payload["text"] == "Account switched to Backup"));
+    }
+
+    #[tokio::test]
+    async fn route_notice_subagent_title_and_compaction_have_no_observation_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            final_turn("subagent"),
+            final_turn("title"),
+            final_turn("summary"),
+        ]));
+        let llm_dyn: Arc<dyn LlmStream> = llm.clone();
+        let deps = deps_at(dir.path(), llm_dyn.clone()).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+        let mut cm = ContextManager::load(deps.store.clone(), "subagent", cfg)
+            .await
+            .unwrap();
+        cm.append_user(json!([{"type": "text", "text": "delegated"}]))
+            .await
+            .unwrap();
+        drive(
+            &deps,
+            &deps.agent,
+            &mut cm,
+            &CancellationToken::new(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        for purpose in ["title", "compaction"] {
+            super::super::llm::collect_text(
+                &llm_dyn,
+                json!({"purpose": purpose}),
+                deps.turn_effort_policy.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(llm
+            .metadata
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|metadata| metadata.observation.is_none()));
+    }
+
+    #[tokio::test]
+    async fn route_notice_reload_reads_persisted_system_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (route_selection("a", "Primary"), final_turn("one")),
+            (route_selection("b", "Backup"), final_turn("two")),
+        ]));
+        let deps = deps_with_store(dir.path(), llm, store).await;
+        run_turn(
+            &deps,
+            TurnPrompt::text("one", "one"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        run_turn(
+            &deps,
+            TurnPrompt::text("two", "two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        drop(deps);
+        let reopened = Store::open(db.path()).await.unwrap();
+        let reloaded = reopened.list_messages("s1").await.unwrap();
+        assert!(reloaded.iter().any(|m| {
+            m.role == "system"
+                && m.block_type == "notice"
+                && m.payload["text"] == "Account switched to Backup"
+        }));
     }
 
     /// Seed a project (pinned to `model`) plus a TITLED session "s1" so the
