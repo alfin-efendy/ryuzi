@@ -273,9 +273,15 @@ async fn fetch_and_cache_with(
 /// — matching the design doc's "changed = new/removed/version-changed/blocked
 /// entries", not raw-row equality. `list_remote_catalog` already returns rows
 /// `ORDER BY id`, so a plain `Vec` comparison is order-stable.
-type CatalogContent = (String, String, String, bool, Option<String>);
+pub(crate) type CatalogContent = (String, String, String, bool, Option<String>);
 
-fn catalog_content(rows: &[RemoteCatalogRow]) -> Vec<CatalogContent> {
+/// Project cached rows down to their content-relevant fields — the same
+/// comparison basis [`RemoteCatalogManager::refresh_verified`] uses to decide
+/// whether the effective catalog changed. `pub(crate)` so the `refresh_catalog`
+/// RPC handler (`crate::api::remote_catalog_api`) can reuse this instead of
+/// re-deriving the projection and risking drift between the two change
+/// detectors.
+pub(crate) fn catalog_content(rows: &[RemoteCatalogRow]) -> Vec<CatalogContent> {
     rows.iter()
         .map(|r| {
             (
