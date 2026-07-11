@@ -20,7 +20,9 @@ pub fn cmd_service(args: &[String], deps: &mut Deps) -> u8 {
 }
 
 /// systemd user unit: foreground `ryuzi start`, restart on failure.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+// Used by the linux `install`; dead on macos/windows (whose `install` is cfg'd
+// out) except in `#[cfg(test)]`, so allow dead code everywhere but linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn systemd_unit(exec: &str) -> String {
     format!(
         "[Unit]\n\
@@ -38,7 +40,9 @@ pub(crate) fn systemd_unit(exec: &str) -> String {
 }
 
 /// launchd user agent: KeepAlive so crashes restart it, like Restart=on-failure.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+// Used by the macos `install`; dead on linux/windows (whose `install` is cfg'd
+// out) except in `#[cfg(test)]`, so allow dead code everywhere but macos.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn launchd_plist(exec: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
