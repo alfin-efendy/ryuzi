@@ -132,6 +132,13 @@ pub fn notice_text(previous: Option<&RouteSelection>, current: &RouteSelection) 
         || previous.effective_effort != current.effective_effort;
     let account_changed = previous.resolved_provider_id != current.resolved_provider_id
         || previous.connection_id != current.connection_id;
+    let include_account_suffix = account_changed
+        && matches!(
+            current.reason,
+            RouteSelectionReason::Ordered
+                | RouteSelectionReason::RoundRobin
+                | RouteSelectionReason::Failover(_)
+        );
 
     let mut copy = if model_changed {
         let mut copy = format!("Switched to {}", current.resolved_model_display_name);
@@ -139,7 +146,7 @@ pub fn notice_text(previous: Option<&RouteSelection>, current: &RouteSelection) 
             copy.push_str(" · ");
             copy.push_str(effort_label);
         }
-        if account_changed {
+        if include_account_suffix {
             copy.push_str(" via ");
             copy.push_str(&current.connection_label);
         }
@@ -148,7 +155,7 @@ pub fn notice_text(previous: Option<&RouteSelection>, current: &RouteSelection) 
         format!("Account switched to {}", current.connection_label)
     };
 
-    if account_changed {
+    if include_account_suffix {
         if let Some(reason) = reason_text(&current.reason) {
             copy.push_str(" · ");
             copy.push_str(reason);
@@ -267,6 +274,24 @@ mod tests {
         assert_eq!(
             notice_text(Some(&previous), &current).as_deref(),
             Some("Switched to Opus 4.1 via Backup Claude · authentication unavailable")
+        );
+    }
+
+    #[test]
+    fn formats_combined_initial_without_account_suffix() {
+        let previous = selection();
+        let mut current = previous.clone();
+        current.resolved_model = "claude-opus-4-1".into();
+        current.resolved_model_display_name = "Opus 4.1".into();
+        current.effective_effort = Some("ultra".into());
+        current.effective_effort_label = Some("Ultra".into());
+        current.connection_id = "connection-backup".into();
+        current.connection_label = "Backup Claude".into();
+        current.reason = RouteSelectionReason::Initial;
+
+        assert_eq!(
+            notice_text(Some(&previous), &current).as_deref(),
+            Some("Switched to Opus 4.1 · Ultra")
         );
     }
 
