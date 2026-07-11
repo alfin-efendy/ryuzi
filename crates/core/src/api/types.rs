@@ -681,6 +681,11 @@ pub struct TrustPromptDto {
     /// show a distinct warning for this, not just fold it into the
     /// hook-script list.
     pub runs_code: bool,
+    /// Mirrors `TrustPrompt::curated`: true when the source is one of the
+    /// curated skill packs, so this prompt only exists because `runs_code`
+    /// is true — the wizard uses this to avoid the misleading "this source
+    /// isn't curated" framing for a curated-but-code-running install.
+    pub curated: bool,
 }
 
 impl From<crate::skills_install::TrustPrompt> for TrustPromptDto {
@@ -694,6 +699,7 @@ impl From<crate::skills_install::TrustPrompt> for TrustPromptDto {
             hook_scripts: p.hook_scripts,
             total_bytes: p.total_bytes,
             runs_code: p.runs_code,
+            curated: p.curated,
         }
     }
 }

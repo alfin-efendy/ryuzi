@@ -131,7 +131,9 @@ export function SkillInstallModal({
       {step === "trust" && trust && (
         <>
           <p className="mb-3 mt-0 text-[12.5px] text-muted-foreground">
-            This source isn't a curated pack — review what it installs before Cockpit trusts it.
+            {trust.curated
+              ? "This is a curated pack, but it runs code — review what it installs before Cockpit trusts it."
+              : "This source isn't a curated pack — review what it installs before Cockpit trusts it."}
           </p>
 
           {trust.runsCode && (

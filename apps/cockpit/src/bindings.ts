@@ -1875,7 +1875,14 @@ export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: str
  * show a distinct warning for this, not just fold it into the
  * hook-script list.
  */
-runsCode: boolean }
+runsCode: boolean; 
+/**
+ * Mirrors `TrustPrompt::curated`: true when the source is one of the
+ * curated skill packs, so this prompt only exists because `runs_code`
+ * is true — the wizard uses this to avoid the misleading "this source
+ * isn't curated" framing for a curated-but-code-running install.
+ */
+curated: boolean }
 /**
  * Mirror of `crate::skills_install::UpdateOutcome`. Keeps the same
  * `#[serde(tag = "kind", content = "detail")]` shape so the discriminated

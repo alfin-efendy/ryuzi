@@ -548,6 +548,14 @@ pub struct TrustPrompt {
     /// signal to force even a curated source through this prompt instead of
     /// installing immediately — see its doc comment.
     pub runs_code: bool,
+    /// Whether the source is one of `CURATED_SKILL_SOURCES` (see
+    /// `is_curated_source`) — i.e. this prompt exists ONLY because
+    /// `runs_code` is true (a curated-but-code-running install), not because
+    /// the source itself is unvetted. The caller uses this to avoid the
+    /// misleading "this source isn't a curated pack" framing when the source
+    /// actually is curated and the real reason for the prompt is the
+    /// elevated code-execution risk.
+    pub curated: bool,
 }
 
 /// Outcome of `begin_install`: curated sources install immediately (an
@@ -642,6 +650,59 @@ async fn begin_install_with(
     Ok(BeginInstall::NeedsConfirmation(prompt))
 }
 
+/// Gate for the raw, single-call `install_skill` entry point — distinct from
+/// the two-phase `begin_install`/`confirm_install` flow the Cockpit trust
+/// wizard drives. `install_skill` has no confirmation step of its own (it
+/// never hands back a token a caller could later pass to `confirm_install`),
+/// so it must never complete an install that `begin_install`'s
+/// curated-immediate branch wouldn't also complete immediately: reuses
+/// `begin_install_with`'s classification and only ever returns `Ok` for the
+/// same "curated AND doesn't run code" condition. Anything else — an
+/// arbitrary source, or a curated source whose manifest declares
+/// `[[extension]]` — is refused with an error naming the two-phase flow
+/// instead; nothing is installed and no ledger row is written.
+pub async fn install_skill_source_gated(
+    source: &str,
+    store: &crate::store::Store,
+) -> Result<InstalledSkillPack> {
+    let roots = InstallRoots::for_user()?;
+    let cloner = GitRepoCloner;
+    install_skill_source_gated_with(source, &roots, &cloner, store).await
+}
+
+async fn install_skill_source_gated_with(
+    source: &str,
+    roots: &InstallRoots,
+    cloner: &impl RepoCloner,
+    store: &crate::store::Store,
+) -> Result<InstalledSkillPack> {
+    match begin_install_with(source, roots, cloner, store).await? {
+        BeginInstall::Completed(pack) => Ok(pack),
+        BeginInstall::NeedsConfirmation(prompt) => {
+            // This entry point never returns `prompt.token` to its caller,
+            // so nothing could ever reach `confirm_install` with it — drop
+            // the staged clone right away instead of leaving it in
+            // `staging_map()` for the full TTL (see `StagedInstall`'s doc
+            // comment on why an abandoned entry otherwise just sits there).
+            discard_staged_install(&prompt.token);
+            bail!(
+                "source `{source}` needs review before it can install — it is either not a \
+                 curated pack or its manifest runs code. Use the two-phase begin_install/\
+                 confirm_install flow (`begin_skill_install`/`confirm_skill_install`) to \
+                 review and confirm it first."
+            );
+        }
+    }
+}
+
+/// Remove a staged install (or update) from `staging_map()` before it was
+/// ever confirmed — used by `install_skill_source_gated_with` when it
+/// refuses a `NeedsConfirmation` outcome outright. Frees the staged clone's
+/// tempdir immediately rather than waiting out `STAGED_INSTALL_TTL_MS`.
+fn discard_staged_install(token: &str) {
+    staging_map().lock().unwrap().remove(token);
+}
+
 /// Phase 2: complete a staged install (or update) after the user has
 /// acknowledged its `TrustPrompt`. Single-use — the token is removed from
 /// `staging_map()` up front, so a stale or already-consumed token can never
@@ -730,6 +791,7 @@ fn stage_for_trust_prompt(
     let discovered = discover_install_target(&repo_dir, &parsed)?;
     let skills = discovered_skill_names(&discovered);
     let runs_code = discovery_runs_code(&discovered);
+    let curated = is_curated_source(&parsed.repo);
     let hook_scripts = list_pack_hook_scripts(&repo_dir);
     let total_bytes = dir_size(&repo_dir);
     let owner_repo = parsed
@@ -769,6 +831,7 @@ fn stage_for_trust_prompt(
         hook_scripts,
         total_bytes,
         runs_code,
+        curated,
     })
 }
 
@@ -978,13 +1041,25 @@ pub async fn update_installed_pack(
 /// `LocalEdits` (unless `force`); re-clone resolves to the same commit
 /// already recorded → `AlreadyCurrent` (unless `force`); the re-clone
 /// contains a hook script not already covered by the recorded
-/// `trust_ack_summary` → `NeedsReack` (stages the clone into `staging_map()`
-/// and routes back through `confirm_install` — checked regardless of
-/// `force`, since hook scripts execute code and re-acknowledging that isn't
-/// something `force` should be able to skip); otherwise reinstall (staged),
-/// clean up stale refresh artifacts, and rewrite the ledger row with the new
-/// commit/fingerprint/`updated_at`, preserving `installed_at`/pin/trust
-/// fields from the old row.
+/// `trust_ack_summary`, OR its manifest runs code (`discovery_runs_code`,
+/// i.e. declares `[[extension]]`) → `NeedsReack` (stages the clone into
+/// `staging_map()` and routes back through `confirm_install` — checked
+/// regardless of `force`, since both hook scripts and extensions execute
+/// code and re-acknowledging that isn't something `force` should be able to
+/// skip); otherwise reinstall (staged), clean up stale refresh artifacts,
+/// and rewrite the ledger row with the new commit/fingerprint/`updated_at`,
+/// preserving `installed_at`/pin/trust fields from the old row.
+///
+/// The code-execution check fires on EVERY update whose manifest runs code,
+/// not just a newly-introduced one — unlike hook scripts, the ledger row
+/// carries no explicit "this pack was already acknowledged as code-running"
+/// signal (`trust_ack_summary` is a free-form JSON blob that predates the
+/// `runs_code` concept), so there's no reliable way to distinguish "still
+/// running the same acknowledged code" from "running changed/different code"
+/// from the ledger alone. Re-prompting on every code-running update is the
+/// deliberate, safe default: it costs an extra confirm on later updates of
+/// an already-acknowledged extension plugin, but it can never let a new or
+/// changed code-running version land silently.
 async fn update_installed_pack_with(
     id: &str,
     force: bool,
@@ -1027,25 +1102,31 @@ async fn update_installed_pack_with(
     // or curated record's `trust_ack_summary` is `None` (nothing
     // acknowledged), so ANY hook script in the update trips this check.
     let hook_scripts_in_update = list_pack_hook_scripts(&repo_dir);
-    if !hook_scripts_in_update.is_empty() {
-        let acked = acked_hook_scripts(rec.trust_ack_summary.as_deref());
-        if hook_scripts_in_update.iter().any(|h| !acked.contains(h)) {
-            let prompt = stage_for_trust_prompt(
-                &rec.source_spec,
-                parsed,
-                roots,
-                temp,
-                repo_dir,
-                new_commit,
-                Some(rec.plugin_id.clone()),
-            )?;
-            return Ok(UpdateOutcome::NeedsReack(prompt));
-        }
+    let acked = acked_hook_scripts(rec.trust_ack_summary.as_deref());
+    let new_hook_script = hook_scripts_in_update.iter().any(|h| !acked.contains(h));
+
+    // Re-ack-on-code: the updated manifest itself is the source of truth for
+    // whether this update runs code (`discovery_runs_code`) — see the
+    // function doc comment above for why this fires unconditionally on every
+    // code-running update rather than only a newly-introduced one.
+    let discovered = discover_install_target(&repo_dir, &parsed)?;
+    let update_runs_code = discovery_runs_code(&discovered);
+
+    if new_hook_script || update_runs_code {
+        let prompt = stage_for_trust_prompt(
+            &rec.source_spec,
+            parsed,
+            roots,
+            temp,
+            repo_dir,
+            new_commit,
+            Some(rec.plugin_id.clone()),
+        )?;
+        return Ok(UpdateOutcome::NeedsReack(prompt));
     }
 
     // Perform the reinstall (staged, atomic) + stale-artifact cleanup, then
     // rewrite the ledger row to reflect the new install.
-    let discovered = discover_install_target(&repo_dir, &parsed)?;
     let refreshed = match discovered {
         Discovery::Single(skill) => install_single_skill(roots, &parsed, skill)?,
         Discovery::Pack(pack) => install_plugin_pack(roots, &parsed, *pack)?,
@@ -4367,5 +4448,314 @@ events = ["tool.before"]
             .await
             .unwrap();
         assert_eq!(outcome, UpdateOutcome::Updated);
+    }
+
+    // --- DT7 fix-wave: close the two trust-gate bypasses (update path +
+    // raw `install_skill`) — see task-dt7-report.md's "Fix wave" section. ---
+
+    #[tokio::test]
+    async fn update_needs_reack_when_update_adds_an_extension_without_hooks() {
+        // A plain, non-code plugin pack (no `[[extension]]`, no
+        // `ryuzi-plugin.toml` at all — the plugin.json-only discovery path).
+        let config_root = tempfile::tempdir().unwrap().keep();
+        let roots = InstallRoots::new(config_root);
+        let repo_dir = roots_repo(&roots);
+        std::fs::create_dir_all(repo_dir.join(".codex-plugin")).unwrap();
+        std::fs::write(
+            repo_dir.join(".codex-plugin/plugin.json"),
+            serde_json::json!({ "name": "acme-pack", "skills": "./skills/" }).to_string(),
+        )
+        .unwrap();
+        write_skill(
+            &repo_dir.join("skills/brainstorming"),
+            "brainstorming",
+            "Explore ideas",
+            "body",
+        );
+
+        let db_path = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let store = crate::store::Store::open(&db_path).await.unwrap();
+        let cloner_c1 = fake_cloner("https://github.com/acme/pack", &repo_dir, "c1");
+        let pack = install_skill_source_with_recorded(
+            "https://github.com/acme/pack",
+            &roots,
+            &cloner_c1,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pack.plugin_id.as_deref(), Some("acme-pack"));
+        let rec = store
+            .get_plugin_install("acme-pack")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.trust_tier, "acknowledged"); // not curated, no ack summary
+        assert!(rec.trust_ack_summary.is_none());
+
+        // Upstream now ships a `ryuzi-plugin.toml` declaring the SAME skill
+        // plus an `[[extension]]` — no hook scripts anywhere in this update.
+        // Before the fix-wave, `update_installed_pack_with` only consulted
+        // `list_pack_hook_scripts`, so this landed as a silent `Updated`
+        // with no trust prompt at all (CRITICAL #1).
+        std::fs::write(
+            repo_dir.join("ryuzi-plugin.toml"),
+            r#"
+contract = 1
+id = "acme-pack"
+name = "acme-pack"
+
+[[skills]]
+name = "brainstorming"
+description = "Explore ideas"
+path = "skills/brainstorming"
+
+[[extension]]
+name = "my-ext"
+command = "my-ext-binary"
+events = ["tool.before"]
+"#
+            .trim_start(),
+        )
+        .unwrap();
+        let cloner_c2 = fake_cloner("https://github.com/acme/pack", &repo_dir, "c2");
+
+        let outcome = update_installed_pack_with("acme-pack", false, &roots, &cloner_c2, &store)
+            .await
+            .unwrap();
+        let prompt = match outcome {
+            UpdateOutcome::NeedsReack(p) => p,
+            other => panic!(
+                "an update that newly declares [[extension]] must NeedsReack, not silently \
+                 install — got {other:?}"
+            ),
+        };
+        assert!(prompt.runs_code);
+        assert!(prompt.hook_scripts.is_empty());
+
+        // The live install must be untouched — no swap happened yet, still on c1.
+        let rec = store
+            .get_plugin_install("acme-pack")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.resolved_commit.as_deref(), Some("c1"));
+
+        // Confirming completes the update and records the acknowledgment.
+        let confirmed = confirm_install(&prompt.token, &store).await.unwrap();
+        assert_eq!(confirmed.id, "acme-pack");
+        let rec = store
+            .get_plugin_install("acme-pack")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.resolved_commit.as_deref(), Some("c2"));
+        assert_eq!(rec.trust_tier, "acknowledged");
+    }
+
+    #[tokio::test]
+    async fn update_returns_updated_when_no_hooks_or_extensions_are_involved() {
+        let (roots, cloner_c1, store) = recorded_setup("https://github.com/acme/p", "c1").await;
+        install_skill_source_with_recorded("https://github.com/acme/p", &roots, &cloner_c1, &store)
+            .await
+            .unwrap();
+
+        // Upstream just changes the skill body — no hooks, no manifest, no
+        // extensions anywhere in this update. Must update normally.
+        let repo_dir = roots_repo(&roots);
+        write_skill(&repo_dir, "P", "d", "body-v2");
+        let cloner_c2 = fake_cloner("https://github.com/acme/p", &repo_dir, "c2");
+
+        let outcome = update_installed_pack_with("p", false, &roots, &cloner_c2, &store)
+            .await
+            .unwrap();
+        assert_eq!(outcome, UpdateOutcome::Updated);
+        let rec = store.get_plugin_install("p").await.unwrap().unwrap();
+        assert_eq!(rec.resolved_commit.as_deref(), Some("c2"));
+    }
+
+    #[tokio::test]
+    async fn update_needs_reack_again_for_an_already_code_running_pack() {
+        // Chosen semantics for "already acknowledged as code" (see
+        // `update_installed_pack_with`'s doc comment): the ledger carries no
+        // reliable "already ack'd as code" signal distinct from
+        // `trust_ack_summary`'s free-form JSON, so re-ack-on-code fires on
+        // EVERY code-running update, not just a newly-introduced one — even
+        // for a pack that was already installed and acknowledged as code.
+        let repo = tempfile::tempdir().unwrap();
+        write_extension_plugin_repo(repo.path(), "acme-ext");
+        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
+        let cloner_c1 = FakeRepoCloner {
+            repos: BTreeMap::from([(
+                "https://github.com/acme/ext-plugin".into(),
+                repo.path().to_path_buf(),
+            )]),
+            commit: Some("c1".into()),
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+
+        let prompt = match begin_install_with("acme/ext-plugin", &roots, &cloner_c1, &store)
+            .await
+            .unwrap()
+        {
+            BeginInstall::NeedsConfirmation(p) => p,
+            BeginInstall::Completed(_) => panic!("extension source must always prompt"),
+        };
+        confirm_install(&prompt.token, &store).await.unwrap();
+        let rec = store.get_plugin_install("acme-ext").await.unwrap().unwrap();
+        assert_eq!(rec.trust_tier, "acknowledged");
+
+        // Upstream ships a new commit of the SAME extension-declaring
+        // manifest (still `[[extension]]`, no new hook scripts).
+        let cloner_c2 = FakeRepoCloner {
+            repos: BTreeMap::from([(
+                "https://github.com/acme/ext-plugin".into(),
+                repo.path().to_path_buf(),
+            )]),
+            commit: Some("c2".into()),
+        };
+        let outcome = update_installed_pack_with("acme-ext", false, &roots, &cloner_c2, &store)
+            .await
+            .unwrap();
+        let prompt2 = match outcome {
+            UpdateOutcome::NeedsReack(p) => p,
+            other => panic!(
+                "expected NeedsReack again for an already-code pack (chosen safe-default: \
+                 re-ack on every code-running update), got {other:?}"
+            ),
+        };
+        assert!(prompt2.runs_code);
+
+        let confirmed = confirm_install(&prompt2.token, &store).await.unwrap();
+        assert_eq!(confirmed.id, "acme-ext");
+        let rec = store.get_plugin_install("acme-ext").await.unwrap().unwrap();
+        assert_eq!(rec.resolved_commit.as_deref(), Some("c2"));
+    }
+
+    #[tokio::test]
+    async fn install_skill_source_gated_installs_curated_non_code_source() {
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "S", "d", "b");
+        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
+        let cloner = FakeRepoCloner {
+            repos: BTreeMap::from([(
+                "https://github.com/obra/superpowers".into(),
+                repo.path().to_path_buf(),
+            )]),
+            commit: Some("c1".into()),
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+
+        let pack = install_skill_source_gated_with("superpowers", &roots, &cloner, &store)
+            .await
+            .unwrap();
+        assert!(roots.skills_root.join(&pack.id).exists());
+        let rec = store.get_plugin_install(&pack.id).await.unwrap().unwrap();
+        assert_eq!(rec.trust_tier, "curated");
+    }
+
+    #[tokio::test]
+    async fn install_skill_source_gated_refuses_an_arbitrary_source() {
+        let repo = tempfile::tempdir().unwrap();
+        write_skill(repo.path(), "S", "d", "b");
+        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
+        let cloner = FakeRepoCloner {
+            repos: BTreeMap::from([(
+                "https://github.com/acme/p".into(),
+                repo.path().to_path_buf(),
+            )]),
+            commit: Some("c1".into()),
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+
+        let err = install_skill_source_gated_with("acme/p", &roots, &cloner, &store)
+            .await
+            .expect_err("an arbitrary source must be refused, not silently installed");
+        assert!(err.to_string().contains("begin_install"));
+        assert!(list_installed_skills_in(&roots).unwrap().is_empty());
+        assert!(store.get_plugin_install("p").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn install_skill_source_gated_refuses_a_curated_source_that_runs_code() {
+        let repo = tempfile::tempdir().unwrap();
+        write_extension_plugin_repo(repo.path(), "superpowers");
+        let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
+        let cloner = FakeRepoCloner {
+            repos: BTreeMap::from([(
+                "https://github.com/obra/superpowers".into(),
+                repo.path().to_path_buf(),
+            )]),
+            commit: Some("c1".into()),
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+
+        let err = install_skill_source_gated_with("superpowers", &roots, &cloner, &store)
+            .await
+            .expect_err("a code-running manifest must be refused even for a curated source");
+        assert!(err.to_string().contains("begin_install"));
+        assert!(list_installed_skills_in(&roots).unwrap().is_empty());
+        assert!(store
+            .get_plugin_install("superpowers")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// `install_skill_source_gated_with` discards a refused
+    /// `NeedsConfirmation` outcome's staged entry right away instead of
+    /// leaving it in `staging_map()` for the full TTL (see
+    /// `discard_staged_install`). Checked directly against two tokens this
+    /// test owns — not against the map's global emptiness, which would be
+    /// racy under `cargo test`'s default parallel execution (other tests may
+    /// have their own entries staged concurrently).
+    #[test]
+    fn discard_staged_install_removes_only_the_given_token() {
+        fn fake_staged_install() -> StagedInstall {
+            let roots = InstallRoots::new(tempfile::tempdir().unwrap().keep());
+            let temp = tempfile::tempdir().unwrap();
+            let repo_dir = temp.path().join("repo");
+            std::fs::create_dir_all(&repo_dir).unwrap();
+            StagedInstall {
+                parsed: parse_skill_source("acme/p").unwrap(),
+                source_spec: "acme/p".to_string(),
+                roots,
+                _temp: temp,
+                repo_dir,
+                commit: None,
+                ack_summary: "{}".to_string(),
+                created_ms: crate::paths::now_ms(),
+                prior_id: None,
+            }
+        }
+        let keep_token = crate::paths::new_id();
+        let drop_token = crate::paths::new_id();
+        staging_map()
+            .lock()
+            .unwrap()
+            .insert(keep_token.clone(), fake_staged_install());
+        staging_map()
+            .lock()
+            .unwrap()
+            .insert(drop_token.clone(), fake_staged_install());
+
+        discard_staged_install(&drop_token);
+
+        {
+            let map = staging_map().lock().unwrap();
+            assert!(!map.contains_key(&drop_token));
+            assert!(map.contains_key(&keep_token));
+        }
+        // Don't leak this test's fixture into other parallel tests' view of
+        // the (process-global) staging map.
+        staging_map().lock().unwrap().remove(&keep_token);
     }
 }
