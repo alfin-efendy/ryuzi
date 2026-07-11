@@ -78,6 +78,14 @@ pub(crate) fn parse_tool_def(raw: &Value) -> Option<ExtensionToolDef> {
     })
 }
 
+/// The wire tool name `harness::native::tools::extension::ExtensionTool`
+/// exposes to the model — `ext__<extension>__<tool>`. Single source of truth
+/// shared by [`ExtensionTools::session_tools`]'s collision dedup (below) and
+/// `ExtensionTool::from_binding`'s own naming, so the two can never drift.
+pub(crate) fn full_tool_name(extension_name: &str, tool_name: &str) -> String {
+    format!("ext__{extension_name}__{tool_name}")
+}
+
 /// Everything `harness::native::tools::extension::ExtensionTool` needs to
 /// wrap one extension-provided tool: the typed def, the owning extension's
 /// name (for `ext__<extension>__<tool>` naming — kept separate from
@@ -106,6 +114,24 @@ pub trait ExtensionTools: Send + Sync {
 #[async_trait]
 impl ExtensionTools for ExtensionHost {
     async fn session_tools(&self) -> Vec<ExtensionToolBinding> {
+        // `ExtensionSpec::name` is only unique WITHIN one plugin's own
+        // manifest, not globally (see its own doc) — two different plugins
+        // can each declare an `[[extension]]`/tool pair that formats to the
+        // identical `ext__<extension>__<tool>` full name. Left unguarded,
+        // `harness::native::tools::ToolRegistry::with_extra`'s plain
+        // `BTreeMap::insert` would let the later one silently shadow the
+        // earlier with no log, and — because `tool_provision_entries` used
+        // to walk raw `HashMap` iteration order — WHICH one "later" meant
+        // was randomly reseeded every process start.
+        // `tool_provision_entries` now returns entries pre-sorted by
+        // `(plugin_id, extension name)`, so iterating it in order here and
+        // tracking already-emitted full names is enough to make the winner
+        // of a collision deterministic and stable across restarts: the
+        // first entry (by that sort) to claim a full name always wins,
+        // mirroring `ControlPlane::attach_plugin_mcp_servers`'s own
+        // first-registration-wins `HashSet` discipline for MCP server names.
+        let mut seen_full_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut out = Vec::new();
         for entry in self.tool_provision_entries().await {
             if !entry.provides_tools || !matches!(entry.status, ExtensionStatus::Running) {
@@ -113,12 +139,24 @@ impl ExtensionTools for ExtensionHost {
             }
             for raw in &entry.tools {
                 match parse_tool_def(raw) {
-                    Some(def) => out.push(ExtensionToolBinding {
-                        def,
-                        extension_name: entry.name.clone(),
-                        principal: entry.principal.clone(),
-                        caller: entry.caller.clone(),
-                    }),
+                    Some(def) => {
+                        let full_name = full_tool_name(&entry.name, &def.name);
+                        if !seen_full_names.insert(full_name.clone()) {
+                            tracing::warn!(
+                                full_name = %full_name,
+                                extension = %entry.name,
+                                plugin = %entry.principal.plugin_id,
+                                "skipping extension tool: full name already claimed by an earlier plugin's extension"
+                            );
+                            continue;
+                        }
+                        out.push(ExtensionToolBinding {
+                            def,
+                            extension_name: entry.name.clone(),
+                            principal: entry.principal.clone(),
+                            caller: entry.caller.clone(),
+                        });
+                    }
                     None => {
                         tracing::warn!(
                             extension = %entry.name,
@@ -322,6 +360,141 @@ mod tests {
         assert_eq!(bindings[0].extension_name, "linter");
         assert_eq!(bindings[0].principal.plugin_id, "linter-plugin");
         assert_eq!(bindings[0].principal.plugin_name, "Linter Plugin");
+
+        ext_host.shutdown_all(Duration::from_millis(200)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_tools_registers_non_colliding_tools_from_two_plugins() {
+        // Sanity/regression guard for the dedup guard added alongside the
+        // collision test below: two DIFFERENT plugins with DISTINCT
+        // extension names must still both register — the dedup guard must
+        // never reject a non-colliding full name.
+        let (ctx, store, _tmp) = open_ctx().await;
+        let mut host = PluginHost::new();
+        let linter_body = init_ack_with_tools(r#"[{"name":"lint","description":"lint code"}]"#);
+        host.add(extension_only(
+            "linter-plugin",
+            "Linter Plugin",
+            vec![base_spec(
+                "linter",
+                &linter_body,
+                true,
+                Duration::from_millis(500),
+            )],
+        ));
+        let formatter_body =
+            init_ack_with_tools(r#"[{"name":"format","description":"format code"}]"#);
+        host.add(extension_only(
+            "formatter-plugin",
+            "Formatter Plugin",
+            vec![base_spec(
+                "formatter",
+                &formatter_body,
+                true,
+                Duration::from_millis(500),
+            )],
+        ));
+        store
+            .set_setting_raw("plugin.linter-plugin.enabled", "true")
+            .await
+            .unwrap();
+        store
+            .set_setting_raw("plugin.formatter-plugin.enabled", "true")
+            .await
+            .unwrap();
+
+        let ext_host = ExtensionHost::new();
+        ext_host.spawn_all(&host, &ctx).await;
+
+        let mut bindings = ext_host.session_tools().await;
+        bindings.sort_by(|a, b| a.extension_name.cmp(&b.extension_name));
+        assert_eq!(
+            bindings.len(),
+            2,
+            "two plugins with distinct extension/tool names must both register"
+        );
+        assert_eq!(bindings[0].extension_name, "formatter");
+        assert_eq!(bindings[0].def.name, "format");
+        assert_eq!(bindings[1].extension_name, "linter");
+        assert_eq!(bindings[1].def.name, "lint");
+
+        ext_host.shutdown_all(Duration::from_millis(200)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_tools_dedups_a_cross_plugin_full_name_collision_deterministically() {
+        // Two DIFFERENT plugins each declare an `[[extension]] name =
+        // "linter"` providing a tool named "lint" — `ExtensionSpec::name` is
+        // only unique WITHIN one plugin's own manifest (see its doc), not
+        // globally, so both format to the identical `ext__linter__lint`
+        // full name (`tools::full_tool_name`). Without a dedup guard, one
+        // would silently shadow the other in
+        // `harness::native::tools::ToolRegistry::with_extra`'s plain
+        // `BTreeMap::insert`.
+        let (ctx, store, _tmp) = open_ctx().await;
+        let mut host = PluginHost::new();
+        // Register the alphabetically-LATER plugin id FIRST. If the winner
+        // were determined by `host.add`/registration order (or by raw
+        // `HashMap` iteration order) rather than the `(plugin_id, ...)` sort
+        // `tool_provision_entries` now applies, this ordering would catch
+        // it: the deterministic winner must still be `aaa-linter-plugin`.
+        let zzz_body = init_ack_with_tools(r#"[{"name":"lint","description":"lint from zzz"}]"#);
+        host.add(extension_only(
+            "zzz-linter-plugin",
+            "Zzz Linter Plugin",
+            vec![base_spec(
+                "linter",
+                &zzz_body,
+                true,
+                Duration::from_millis(500),
+            )],
+        ));
+        let aaa_body = init_ack_with_tools(r#"[{"name":"lint","description":"lint from aaa"}]"#);
+        host.add(extension_only(
+            "aaa-linter-plugin",
+            "Aaa Linter Plugin",
+            vec![base_spec(
+                "linter",
+                &aaa_body,
+                true,
+                Duration::from_millis(500),
+            )],
+        ));
+        store
+            .set_setting_raw("plugin.zzz-linter-plugin.enabled", "true")
+            .await
+            .unwrap();
+        store
+            .set_setting_raw("plugin.aaa-linter-plugin.enabled", "true")
+            .await
+            .unwrap();
+
+        let ext_host = ExtensionHost::new();
+        ext_host.spawn_all(&host, &ctx).await;
+
+        let bindings = ext_host.session_tools().await;
+        assert_eq!(
+            bindings.len(),
+            1,
+            "a cross-plugin full-name collision must yield exactly one \
+             registered tool, never two silently-shadowing ones"
+        );
+        assert_eq!(bindings[0].extension_name, "linter");
+        assert_eq!(bindings[0].def.name, "lint");
+        assert_eq!(
+            bindings[0].principal.plugin_id, "aaa-linter-plugin",
+            "the deterministic winner is the plugin whose id sorts first \
+             (`aaa-linter-plugin` < `zzz-linter-plugin`) — regardless of \
+             `host.add`/spawn call order"
+        );
+        assert_eq!(
+            bindings[0].def.description, "lint from aaa",
+            "the SURVIVING binding must be the deterministic winner's own def, \
+             not the loser's"
+        );
 
         ext_host.shutdown_all(Duration::from_millis(200)).await;
     }

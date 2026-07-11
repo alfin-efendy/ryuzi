@@ -1304,6 +1304,19 @@ impl ExtensionHost {
     /// window mid-`spawn_all`, between two separate lock acquisitions) is
     /// skipped rather than panicking — its tools simply appear on the NEXT
     /// `session_tools()` call once `spawn_all` catches up.
+    ///
+    /// Sorted by `(plugin_id, extension name)` before returning — NOT raw
+    /// `procs`/`HashMap` iteration order, which is randomly seeded per
+    /// process. `plugin_id` is unique per entry (it is the `procs` key), so
+    /// this fully determines cross-plugin order; the extension-name
+    /// tie-break only matters within a single plugin's own `Vec`, which is
+    /// already spawn-order-stable. `tools::ExtensionTools::session_tools`
+    /// relies on this stable order for its first-wins collision dedup on
+    /// `ext__<extension>__<tool>` full names (two different plugins may both
+    /// declare an extension/tool pair that formats to the same full name —
+    /// `ExtensionSpec::name` is only unique within one plugin's manifest, not
+    /// globally) — without a fixed order here, which entry "wins" a
+    /// collision would vary across daemon restarts.
     pub(crate) async fn tool_provision_entries(&self) -> Vec<ToolProvisionEntry> {
         let procs = self.procs.read().await;
         let principals = self.principals.read().await;
@@ -1324,6 +1337,10 @@ impl ExtensionHost {
                 });
             }
         }
+        out.sort_by(|a, b| {
+            (a.principal.plugin_id.as_str(), a.name.as_str())
+                .cmp(&(b.principal.plugin_id.as_str(), b.name.as_str()))
+        });
         out
     }
 }

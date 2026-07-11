@@ -35,10 +35,16 @@ pub struct ExtensionTool {
 
 impl ExtensionTool {
     /// Wrap one gathered [`ExtensionToolBinding`] (DT6's
-    /// `ExtensionTools::session_tools`) as a native `Tool`.
+    /// `ExtensionTools::session_tools`) as a native `Tool`. Naming goes
+    /// through `plugins::extension::tools::full_tool_name` — the same helper
+    /// `session_tools`'s own cross-plugin collision dedup uses — so the two
+    /// can never drift apart on what "the full name" is.
     pub fn from_binding(binding: ExtensionToolBinding) -> ExtensionTool {
         ExtensionTool {
-            full_name: format!("ext__{}__{}", binding.extension_name, binding.def.name),
+            full_name: crate::plugins::extension::tools::full_tool_name(
+                &binding.extension_name,
+                &binding.def.name,
+            ),
             tool_name: binding.def.name,
             description: binding.def.description,
             schema: binding.def.input_schema,
