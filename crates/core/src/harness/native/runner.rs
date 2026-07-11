@@ -12,9 +12,10 @@ use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::steer::SteerBuffer;
 use super::tools::{
-    OutputCaps, SubagentSpawner, SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
+    BackgroundDispatch, OutputCaps, SubagentSpawner, SubtaskResult, SubtaskSpec, SubtaskStatus,
+    ToolCtx, ToolRegistry,
 };
-use super::{context, NATIVE_ID};
+use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
 use crate::domain::{CoreEvent, NewMessage, PermMode};
 use crate::harness::TurnPrompt;
@@ -992,6 +993,24 @@ impl RunnerSpawner {
         crate::settings::usize_setting(&self.deps.store, "max_concurrent_runs", 3).await
     }
 
+    /// The parent session's remaining context headroom in tokens (usable
+    /// window − active), read from its persisted context. 0 when unknown.
+    async fn parent_headroom_tokens(&self) -> u64 {
+        match self
+            .deps
+            .store
+            .get_session_context(&self.deps.session_pk)
+            .await
+        {
+            Ok(Some(saved)) => {
+                let usable = saved["usable_window"].as_u64().unwrap_or(0);
+                let active = saved["active_tokens"].as_u64().unwrap_or(0);
+                usable.saturating_sub(active)
+            }
+            _ => 0,
+        }
+    }
+
     /// Run one delegated child to completion; failures become the result's
     /// status, never a panic or batch abort.
     async fn run_child(
@@ -1137,6 +1156,83 @@ impl SubagentSpawner for RunnerSpawner {
             .into_iter()
             .map(|a| a.name)
             .collect()
+    }
+
+    async fn run_background(&self, spec: SubtaskSpec) -> BackgroundDispatch {
+        // Background delegation is a top-level capability only; a nested
+        // (delegated) spawner must not fan out detached workers.
+        if self.depth != 0 {
+            return BackgroundDispatch::Rejected {
+                note: "background delegation is only available at the top level; \
+                       run this task synchronously (background=false)."
+                    .to_string(),
+            };
+        }
+        let cap = self.concurrency().await; // shared max_concurrent_runs (default 3)
+        let Some(reservation) = self.deps.background.try_reserve(cap, &self.deps.session_pk) else {
+            // Hermes' choice (async_delegation.py:196-206): reject with a
+            // fallback-to-sync note, never queue. Wording adapted only where
+            // Ryuzi's mechanism differs from Hermes' (no config.yaml; the
+            // setting is `max_concurrent_runs`, not
+            // `delegation.max_concurrent_children`) — everything else is
+            // byte-for-byte the same sentence structure and wording.
+            return BackgroundDispatch::Rejected {
+                note: format!(
+                    "Async delegation capacity reached ({cap} running). Wait for one to \
+                     finish (its result will re-enter the chat), or run this task \
+                     synchronously (background=false). Raise max_concurrent_runs to allow \
+                     more concurrent background subagents."
+                ),
+            };
+        };
+        let id = crate::paths::new_id();
+        let deps = self.deps.clone();
+        let this_spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: reservation.token(),
+            depth: 0,
+        };
+        let (deleg_id, goal) = (id.clone(), spec.prompt.clone());
+        let parent_pk = deps.session_pk.clone();
+        // Read the parent's persisted headroom on the CALLER's task (a quick
+        // DB read) before detaching — the spawned worker only needs the
+        // resulting number, not a live store round-trip mid-flight.
+        let headroom = self.parent_headroom_tokens().await;
+        tokio::spawn(async move {
+            // Holding the reservation for the task's whole lifetime keeps the
+            // slot taken; its Drop (on completion, panic, or cancellation)
+            // frees the slot and deregisters the cancel token.
+            let _reservation = reservation;
+            let cancel = _reservation.token();
+            let child = this_spawner.run_child(0, spec, cancel.clone()).await;
+            // A cancelled worker (its parent ended, or was interrupted via
+            // `interrupt_for_session`) must not write a stale completion to
+            // the rail — the session that would receive it may already be
+            // gone, or a fresh one may have taken its session_pk.
+            if cancel.is_cancelled() {
+                return;
+            }
+            let cap_chars = summary_budget::budget_cap_chars(headroom, 1);
+            let spill_dir = crate::paths::chat_scratch_dir(&parent_pk).join("delegations");
+            let budgeted =
+                summary_budget::budget_summary(&child.report, cap_chars, &spill_dir, &deleg_id);
+            let block = delegation::format_delegation_block(&delegation::DelegationResult {
+                id: deleg_id.clone(),
+                goal,
+                agent_type: child.agent_type.clone(),
+                model: deps.model.clone().unwrap_or_default(),
+                status: child.status.as_str().to_string(),
+                summary: budgeted.text,
+                error: (child.status == SubtaskStatus::Error).then(|| child.report.clone()),
+            });
+            // Durable re-entry (survives a daemon restart). The drainer
+            // delivers it as a new user turn once the parent is idle.
+            let _ = deps
+                .store
+                .enqueue_background_event(&parent_pk, "delegation", &block)
+                .await;
+        });
+        BackgroundDispatch::Dispatched { id }
     }
 }
 
@@ -3725,5 +3821,210 @@ mod tests {
         assert!(!notices
             .iter()
             .any(|n| n.contains("continuing automatically")));
+    }
+
+    /// Redirect `dirs::data_dir()` into a tempdir for the duration of a test —
+    /// `run_background`'s spill path (`paths::chat_scratch_dir`) resolves
+    /// under the real state dir otherwise, which a test must never touch.
+    /// Process-global env, so every test using this needs `#[serial]`
+    /// (mirrors `harness::native::tests::StateDirGuard`).
+    struct StateDirGuard {
+        _dir: tempfile::TempDir,
+    }
+    impl StateDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            StateDirGuard { _dir: dir }
+        }
+    }
+
+    /// Insert an IDLE session row for `session_pk` — the rail's
+    /// `claim_deliverable_background_event` only claims rows whose target
+    /// session is idle (spec §6.1's idle-only invariant).
+    async fn seed_idle_session(store: &Store, session_pk: &str) {
+        use crate::domain::{Session, SessionKind, SessionStatus};
+        store
+            .insert_session(Session {
+                session_pk: session_pk.to_string(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("bg-parent".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::BypassPermissions,
+                started_by: None,
+                created_at: Some(0),
+                last_active: Some(0),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Poll the rail (bounded) until the detached worker for `session_pk`
+    /// writes its completion row, claiming (and thus returning) it.
+    async fn wait_for_rail_row(store: &Store, session_pk: &str) -> crate::domain::BackgroundEvent {
+        for _ in 0..200 {
+            if let Some(row) = store
+                .claim_deliverable_background_event("test-poll")
+                .await
+                .unwrap()
+            {
+                assert_eq!(row.target_session_pk, session_pk);
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("no rail row appeared for {session_pk} within the poll window");
+    }
+
+    #[tokio::test]
+    async fn run_background_rejects_at_capacity_with_fallback_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        deps.store
+            .set_setting("max_concurrent_runs", "1")
+            .await
+            .unwrap();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+        };
+        // Fill the one slot with a manual reservation.
+        let _held = deps.background.try_reserve(1, &deps.session_pk).unwrap();
+        let out = spawner
+            .run_background(SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "do it".into(),
+            })
+            .await;
+        match out {
+            BackgroundDispatch::Rejected { note } => {
+                assert!(note.contains("capacity reached"));
+                assert!(
+                    note.contains("background=false"),
+                    "teaches the sync fallback"
+                );
+            }
+            _ => panic!("expected rejection at capacity"),
+        }
+        // Nothing was dispatched — capacity stays exactly as the manual hold left it.
+        assert_eq!(deps.background.active(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_background_at_nonzero_depth_rejects_without_reserving() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 1,
+        };
+        let out = spawner
+            .run_background(SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "do it".into(),
+            })
+            .await;
+        match out {
+            BackgroundDispatch::Rejected { note } => {
+                assert!(note.contains("top level"));
+            }
+            _ => panic!("expected rejection at nonzero depth"),
+        }
+        assert_eq!(deps.background.active(), 0, "no reservation taken");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_background_dispatch_writes_a_rail_row_on_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = StateDirGuard::new();
+        let child_turn = vec![
+            text_delta("all done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![child_turn]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.model = Some("anthropic/model-a".into());
+        // The parent session row must exist + be idle for the rail JOIN later.
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        // Generous headroom so the short child report is not spilled.
+        deps.store
+            .upsert_session_context(
+                &deps.session_pk,
+                &json!({"usable_window": 100_000u64, "active_tokens": 0u64}),
+            )
+            .await
+            .unwrap();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+        };
+        let out = spawner
+            .run_background(SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "audit auth".into(),
+            })
+            .await;
+        let id = match out {
+            BackgroundDispatch::Dispatched { id } => id,
+            _ => panic!("expected dispatch"),
+        };
+        let row = wait_for_rail_row(&deps.store, &deps.session_pk).await;
+        assert_eq!(row.kind, "delegation");
+        assert!(row
+            .payload
+            .contains(&format!("[ASYNC DELEGATION COMPLETE — {id}]")));
+        assert!(row.payload.contains("all done"));
+    }
+
+    #[tokio::test]
+    async fn run_background_cancelled_worker_writes_nothing_to_the_rail() {
+        let dir = tempfile::tempdir().unwrap();
+        // No scripted turns: the cancelled worker must never reach the model.
+        let llm = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+        };
+        let out = spawner
+            .run_background(SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "audit auth".into(),
+            })
+            .await;
+        assert!(matches!(out, BackgroundDispatch::Dispatched { .. }));
+        // Single-threaded test runtime: the detached worker cannot have run
+        // any code yet (no `.await` has yielded since `run_background`
+        // returned), so this cancellation always lands before the worker
+        // observes anything but a cancelled token.
+        deps.background.interrupt_for_session(&deps.session_pk);
+        // Let the detached task run to completion (or early-return).
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            deps.store.pending_background_count().await.unwrap(),
+            0,
+            "a cancelled worker must not write a stale completion to the rail"
+        );
     }
 }

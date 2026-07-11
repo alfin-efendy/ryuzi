@@ -85,6 +85,15 @@ pub struct SubtaskResult {
     pub report: String,
 }
 
+/// Outcome of a `background: true` delegation dispatch (spec §6.2): either
+/// accepted (the result will re-enter the chat via the rail) or rejected at
+/// capacity (the caller falls back to a synchronous `task`).
+#[derive(Debug, Clone)]
+pub enum BackgroundDispatch {
+    Dispatched { id: String },
+    Rejected { note: String },
+}
+
 /// Spawns sub-agents for the `task` tool. Implemented by the runner; `None`
 /// inside a sub-agent's own `ToolCtx` unless that agent may delegate.
 #[async_trait]
@@ -113,6 +122,15 @@ pub trait SubagentSpawner: Send + Sync {
             SubtaskStatus::Completed => Ok(r.report),
             SubtaskStatus::Interrupted => anyhow::bail!("interrupted"),
             SubtaskStatus::Error => anyhow::bail!("{}", r.report),
+        }
+    }
+
+    /// Dispatch one subtask to run in the BACKGROUND (does not block the
+    /// parent turn); its result re-enters the parent chat via the rail. The
+    /// default rejects — only the top-level runner spawner supports it.
+    async fn run_background(&self, _spec: SubtaskSpec) -> BackgroundDispatch {
+        BackgroundDispatch::Rejected {
+            note: "background delegation is not available for this agent".to_string(),
         }
     }
 }
