@@ -689,6 +689,18 @@ fn migrations() -> Migrations<'static> {
         // route JSON value aborts without partially rewriting projects or
         // defaults. Every write converges, so rewind/replay is safe.
         M::up_with_hook("", migration_20_normalize),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS session_route_state (\
+                session_pk TEXT PRIMARY KEY NOT NULL,\
+                requested_model TEXT NOT NULL,\
+                resolved_provider TEXT NOT NULL,\
+                resolved_family TEXT NOT NULL,\
+                resolved_model TEXT NOT NULL,\
+                effective_effort TEXT,\
+                connection_id TEXT NOT NULL,\
+                updated_at INTEGER NOT NULL\
+            )",
+        ),
     ])
 }
 
@@ -1486,6 +1498,96 @@ impl Store {
                         m.tool_call_id, m.status, m.tool_kind, created],
                 |r| r.get::<_, i64>(0),
             )
+        })
+        .await
+    }
+
+    pub async fn observe_session_route(
+        &self,
+        session_pk: &str,
+        selection: &crate::llm_router::provenance::RouteSelection,
+    ) -> anyhow::Result<Option<Message>> {
+        let session_pk = session_pk.to_string();
+        let selection = selection.clone();
+        self.with_conn(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let previous = tx
+                .query_row(
+                    "SELECT requested_model,resolved_provider,resolved_family,resolved_model,effective_effort,connection_id \
+                     FROM session_route_state WHERE session_pk=?1",
+                    params![session_pk],
+                    |r| {
+                        Ok(crate::llm_router::provenance::RouteSelection {
+                            requested_model: r.get(0)?,
+                            resolved_provider_id: r.get(1)?,
+                            resolved_family: r.get(2)?,
+                            resolved_model: r.get(3)?,
+                            resolved_model_display_name: String::new(),
+                            effective_effort: r.get(4)?,
+                            effective_effort_label: None,
+                            connection_id: r.get(5)?,
+                            connection_label: String::new(),
+                            reason: crate::llm_router::provenance::RouteSelectionReason::Initial,
+                        })
+                    },
+                )
+                .optional()?;
+            let created_at = now_ms();
+            let notice = crate::llm_router::provenance::notice_text(previous.as_ref(), &selection)
+                .map(|copy| -> rusqlite::Result<Message> {
+                    let payload = serde_json::json!({ "text": copy });
+                    let payload_json = serde_json::to_string(&payload).map_err(to_sql_json_error)?;
+                    let seq = tx.query_row(
+                        "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at) \
+                         SELECT ?1, COALESCE(MAX(seq),0)+1, 'system', 'notice', ?2, NULL, NULL, NULL, ?3 \
+                         FROM messages WHERE session_pk=?1 \
+                         RETURNING seq",
+                        params![session_pk, payload_json, created_at],
+                        |r| r.get::<_, i64>(0),
+                    )?;
+                    tx.execute(
+                        "UPDATE sessions SET last_active=?2 WHERE session_pk=?1",
+                        params![session_pk, created_at],
+                    )?;
+                    Ok(Message {
+                        session_pk: session_pk.clone(),
+                        seq,
+                        role: "system".into(),
+                        block_type: "notice".into(),
+                        payload,
+                        tool_call_id: None,
+                        status: None,
+                        tool_kind: None,
+                        created_at,
+                    })
+                })
+                .transpose()?;
+            tx.execute(
+                "INSERT INTO session_route_state(\
+                    session_pk,requested_model,resolved_provider,resolved_family,resolved_model,\
+                    effective_effort,connection_id,updated_at\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+                 ON CONFLICT(session_pk) DO UPDATE SET \
+                    requested_model=excluded.requested_model,\
+                    resolved_provider=excluded.resolved_provider,\
+                    resolved_family=excluded.resolved_family,\
+                    resolved_model=excluded.resolved_model,\
+                    effective_effort=excluded.effective_effort,\
+                    connection_id=excluded.connection_id,\
+                    updated_at=excluded.updated_at",
+                params![
+                    session_pk,
+                    selection.requested_model,
+                    selection.resolved_provider_id,
+                    selection.resolved_family,
+                    selection.resolved_model,
+                    selection.effective_effort,
+                    selection.connection_id,
+                    created_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(notice)
         })
         .await
     }
@@ -2288,6 +2390,9 @@ mod tests {
     use super::*;
     use crate::domain::{NewMessage, PermMode, Project};
     use crate::domain::{Session, SessionStatus};
+    use crate::llm_router::provenance::{
+        RouteFailureCategory, RouteSelection, RouteSelectionReason,
+    };
     use crate::llm_router::secrets::use_test_key_file;
     use crate::plugins::oauth::PluginOauthToken;
 
@@ -2470,6 +2575,312 @@ mod tests {
             resume_attempts: 0,
             branch_owned: true,
         }
+    }
+
+    fn route_selection() -> RouteSelection {
+        RouteSelection {
+            requested_model: "sol".into(),
+            resolved_provider_id: "openai-oauth".into(),
+            resolved_family: "openai".into(),
+            resolved_model: "gpt-5.6-sol".into(),
+            resolved_model_display_name: "5.6 Sol".into(),
+            effective_effort: Some("high".into()),
+            effective_effort_label: Some("High".into()),
+            connection_id: "connection-a".into(),
+            connection_label: "Personal Codex".into(),
+            reason: RouteSelectionReason::Initial,
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_21_creates_session_route_state_idempotently() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            let columns = store
+                .with_conn(|c| {
+                    let mut stmt = c.prepare(
+                        "SELECT name FROM pragma_table_info('session_route_state') ORDER BY cid",
+                    )?;
+                    let columns = stmt
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(columns)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                columns,
+                [
+                    "session_pk",
+                    "requested_model",
+                    "resolved_provider",
+                    "resolved_family",
+                    "resolved_model",
+                    "effective_effort",
+                    "connection_id",
+                    "updated_at",
+                ]
+            );
+            store
+                .with_conn(|c| c.pragma_update(None, "user_version", 20))
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let count: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session_route_state'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn session_route_state_first_observation_is_silent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+
+        assert_eq!(
+            store
+                .observe_session_route("s1", &route_selection())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(store.list_messages("s1").await.unwrap().is_empty());
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().last_active,
+            Some(1)
+        );
+        let stored: (String, String, String, String, Option<String>, String) = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT requested_model,resolved_provider,resolved_family,resolved_model,effective_effort,connection_id FROM session_route_state WHERE session_pk='s1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "sol".into(),
+                "openai-oauth".into(),
+                "openai".into(),
+                "gpt-5.6-sol".into(),
+                Some("high".into()),
+                "connection-a".into(),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn session_route_state_equal_identity_deduplicates_mutable_labels_and_reason() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .observe_session_route("s1", &route_selection())
+            .await
+            .unwrap();
+
+        let mut renamed = route_selection();
+        renamed.requested_model = "friendly-alias".into();
+        renamed.resolved_model_display_name = "Renamed Sol".into();
+        renamed.effective_effort_label = Some("Maximum".into());
+        renamed.connection_label = "Renamed account".into();
+        renamed.reason = RouteSelectionReason::Failover(RouteFailureCategory::Quota);
+        assert_eq!(
+            store.observe_session_route("s1", &renamed).await.unwrap(),
+            None
+        );
+        assert!(store.list_messages("s1").await.unwrap().is_empty());
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().last_active,
+            Some(1)
+        );
+        let requested: String = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT requested_model FROM session_route_state WHERE session_pk='s1'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(requested, "friendly-alias");
+    }
+
+    #[tokio::test]
+    async fn session_route_state_change_inserts_notice_and_updates_atomically() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .observe_session_route("s1", &route_selection())
+            .await
+            .unwrap();
+
+        let mut changed = route_selection();
+        changed.connection_id = "connection-b".into();
+        changed.connection_label = "Work Codex".into();
+        changed.reason = RouteSelectionReason::RoundRobin;
+        let notice = store
+            .observe_session_route("s1", &changed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(notice.session_pk, "s1");
+        assert_eq!(notice.seq, 1);
+        assert_eq!(notice.role, "system");
+        assert_eq!(notice.block_type, "notice");
+        assert_eq!(
+            notice.payload,
+            serde_json::json!({"text": "Account switched to Work Codex · round robin"})
+        );
+        assert_eq!(notice.tool_call_id, None);
+        assert_eq!(notice.status, None);
+        assert_eq!(notice.tool_kind, None);
+        assert_eq!(
+            store.list_messages("s1").await.unwrap(),
+            vec![notice.clone()]
+        );
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().last_active,
+            Some(notice.created_at)
+        );
+        let state: (String, i64) = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT connection_id,updated_at FROM session_route_state WHERE session_pk='s1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, ("connection-b".into(), notice.created_at));
+    }
+
+    #[tokio::test]
+    async fn session_route_state_survives_cold_reopen() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store.insert_session(sample_session()).await.unwrap();
+            store
+                .observe_session_route("s1", &route_selection())
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let mut changed = route_selection();
+        changed.resolved_model = "gpt-5.6-sol-plus".into();
+        changed.resolved_model_display_name = "5.6 Sol Plus".into();
+        let notice = store
+            .observe_session_route("s1", &changed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            notice.payload,
+            serde_json::json!({"text": "Switched to 5.6 Sol Plus · High"})
+        );
+    }
+
+    #[tokio::test]
+    async fn session_route_state_message_trigger_failure_rolls_back_state() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .observe_session_route("s1", &route_selection())
+            .await
+            .unwrap();
+        store
+            .with_conn(|c| {
+                c.execute_batch(
+                    "CREATE TEMP TRIGGER abort_route_notice BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'route notice rejected'); END;",
+                )
+            })
+            .await
+            .unwrap();
+
+        let mut changed = route_selection();
+        changed.connection_id = "connection-b".into();
+        changed.connection_label = "Work Codex".into();
+        assert!(store.observe_session_route("s1", &changed).await.is_err());
+        let state: String = store
+            .with_conn(|c| {
+                c.execute_batch("DROP TRIGGER abort_route_notice")?;
+                c.query_row(
+                    "SELECT connection_id FROM session_route_state WHERE session_pk='s1'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "connection-a");
+        assert!(store.list_messages("s1").await.unwrap().is_empty());
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().last_active,
+            Some(1)
+        );
+        assert!(store
+            .observe_session_route("s1", &changed)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn session_route_state_concurrent_store_instances_emit_once() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store_a = Store::open(tmp.path()).await.unwrap();
+        let store_b = Store::open(tmp.path()).await.unwrap();
+        store_a.insert_session(sample_session()).await.unwrap();
+        store_a
+            .observe_session_route("s1", &route_selection())
+            .await
+            .unwrap();
+        let mut changed = route_selection();
+        changed.connection_id = "connection-b".into();
+        changed.connection_label = "Work Codex".into();
+        changed.reason = RouteSelectionReason::RoundRobin;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let changed_b = changed.clone();
+        let barrier_a = barrier.clone();
+        let a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            store_a.observe_session_route("s1", &changed).await.unwrap()
+        });
+        let b = tokio::spawn(async move {
+            barrier.wait().await;
+            store_b
+                .observe_session_route("s1", &changed_b)
+                .await
+                .unwrap()
+        });
+
+        let outcomes = [a.await.unwrap(), b.await.unwrap()];
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_some()).count(),
+            1
+        );
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(store.list_messages("s1").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3658,7 +4069,7 @@ mod tests {
     #[tokio::test]
     async fn migration_13_rewrites_claude_code_defaults_to_native() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back eight so the
+        // DB, seed the old values, then wind user_version back nine so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
@@ -3666,7 +4077,8 @@ mod tests {
         // CREATE TABLE IF NOT EXISTS; 18 plugin_oauth_clients — CREATE TABLE
         // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
         // copy-drop-rename; 20 model_effort_preferences + legacy normalization —
-        // convergent and CREATE TABLE IF NOT EXISTS; all no-ops on replay)
+        // convergent and CREATE TABLE IF NOT EXISTS; 21 session_route_state —
+        // CREATE TABLE IF NOT EXISTS; all no-ops on replay)
         // re-run on the next open.
         // `Migrations` always fast-forwards to the latest defined version,
         // so there is no way to replay 13 alone once something is appended
@@ -3674,7 +4086,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 8)
+            c.pragma_update(None, "user_version", v - 9)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -3742,6 +4154,16 @@ mod tests {
             store.get_project("p-old").await.unwrap().unwrap().harness,
             "native"
         );
+        let route_state_exists: bool = store
+            .with_conn(|c| {
+                c.prepare(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_route_state'",
+                )?
+                .exists([])
+            })
+            .await
+            .unwrap();
+        assert!(route_state_exists);
     }
 
     #[tokio::test]
