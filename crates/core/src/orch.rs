@@ -725,13 +725,21 @@ pub fn single_task_plan(goal: &str) -> Vec<PlannedTask> {
 /// Store-only goal submission (no events, no ControlPlane): validate the
 /// project, insert a `waiting` root plus the single-task plan. Used by the
 /// CLI, whose daemonless process has no event bus; a running daemon host's
-/// dispatcher picks the rows up on its next tick. The CLI has no chat to bind
-/// a home session to, so this always inserts with `home_session_pk: None`.
-pub async fn queue_goal(store: &Store, project_id: &str, goal: &str) -> anyhow::Result<String> {
+/// dispatcher picks the rows up on its next tick. `home_session_pk` is
+/// threaded straight to `insert_root` — today's only caller (the CLI) always
+/// passes `None`, since a daemonless process has no chat to bind a home
+/// session to, but the parameter exists so a future caller with a real chat
+/// doesn't need a signature change.
+pub async fn queue_goal(
+    store: &Store,
+    project_id: &str,
+    goal: &str,
+    home_session_pk: Option<&str>,
+) -> anyhow::Result<String> {
     if store.get_project(project_id).await?.is_none() {
         anyhow::bail!("unknown project: {project_id}");
     }
-    let root = insert_root(store, project_id, goal, "waiting", None).await?;
+    let root = insert_root(store, project_id, goal, "waiting", home_session_pk).await?;
     insert_children(store, &root, project_id, &single_task_plan(goal)).await?;
     Ok(root)
 }
