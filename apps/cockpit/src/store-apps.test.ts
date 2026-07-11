@@ -1,6 +1,7 @@
 import { test, expect, spyOn } from "bun:test";
 import { agentAllowed, useApps } from "./store-apps";
 import { commands, type AppInfo } from "./bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 function makeApp(overrides: Partial<AppInfo> = {}): AppInfo {
   return {
@@ -41,7 +42,7 @@ test("toggleAgent flips the native row optimistically and persists agent_id nati
     data: [makeApp({ agentAccess: [{ agentId: "native", allowed: false }] })],
   });
   await useApps.getState().toggleAgent("github", false);
-  expect(spy).toHaveBeenCalledWith("github", "native", false);
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "github", "native", false);
   expect(agentAllowed(useApps.getState().apps[0])).toBe(false);
   spy.mockRestore();
   useApps.setState({ apps: [], loaded: false });

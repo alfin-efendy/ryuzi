@@ -14,14 +14,24 @@ export function collectOpenDirs(nodes: Node[]): string[] {
 
 // Real lazy file tree over the session worktree; clicking a file opens it in
 // the dock's file viewer through the existing read_file path.
-export function FileTreePane({ sessionPk, filter, refreshKey }: { sessionPk: string; filter: string; refreshKey: number }) {
+export function FileTreePane({
+  runnerId,
+  sessionPk,
+  filter,
+  refreshKey,
+}: {
+  runnerId: string;
+  sessionPk: string;
+  filter: string;
+  refreshKey: number;
+}) {
   const openFile = useUi((s) => s.openFile);
   const [root, setRoot] = useState<Node[]>([]);
   const [workdir, setWorkdir] = useState<string | null>(null);
 
   const load = useCallback(
     async (rel: string, depth: number): Promise<Node[]> => {
-      const res = await commands.listDir(sessionPk, rel);
+      const res = await commands.listDir(runnerId, sessionPk, rel);
       if (res.status !== "ok") return [];
       return res.data.map((e) => ({
         rel: rel ? `${rel}/${e.name}` : e.name,
@@ -30,15 +40,15 @@ export function FileTreePane({ sessionPk, filter, refreshKey }: { sessionPk: str
         depth,
       }));
     },
-    [sessionPk],
+    [runnerId, sessionPk],
   );
 
   useEffect(() => {
     void load("", 0).then(setRoot);
-    void commands.sessionWorkdir(sessionPk).then((res) => {
+    void commands.sessionWorkdir(runnerId, sessionPk).then((res) => {
       if (res.status === "ok") setWorkdir(res.data);
     });
-  }, [sessionPk, load]);
+  }, [runnerId, sessionPk, load]);
 
   const reload = useCallback(async () => {
     const open = new Set(collectOpenDirs(root));

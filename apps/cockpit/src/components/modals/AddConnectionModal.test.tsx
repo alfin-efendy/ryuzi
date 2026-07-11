@@ -1,6 +1,7 @@
 import type { CatalogEntry, CmdError, ConnectionInfo, Result } from "@/bindings";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const addConnection = mock((): Promise<Result<ConnectionInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const connectOauth = mock((): Promise<Result<ConnectionInfo[], CmdError>> => new Promise(() => {}));
@@ -155,7 +156,7 @@ test("submitting api key for anthropic family calls addConnection with the membe
   fireEvent.click(screen.getByRole("button", { name: "Add account" }));
 
   await screen.findByText("Add account");
-  expect(addConnection).toHaveBeenCalledWith("anthropic", "Anthropic", "sk-ant-test", null);
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic", "Anthropic", "sk-ant-test", null);
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
@@ -168,7 +169,7 @@ test("connecting subscription calls connectOauth with the oauth member id and tr
   fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
 
   fireEvent.click(screen.getByRole("button", { name: /connect with browser/i }));
-  expect(connectOauth).toHaveBeenCalledWith("anthropic-oauth", "Claude Code");
+  expect(connectOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic-oauth", "Claude Code");
 
   const authorizeUrl = "https://claude.ai/oauth/authorize?client_id=test";
   await act(async () => {
@@ -218,7 +219,7 @@ test("single-member custom-openai family requires a base URL before it can be su
 
   fireEvent.click(submit);
   await screen.findByText("Add account");
-  expect(addConnection).toHaveBeenCalledWith("custom-openai", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-openai", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 

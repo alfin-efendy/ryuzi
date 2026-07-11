@@ -12,7 +12,7 @@ import { projectLabel, sessionTitle } from "@/lib/sidebar";
 import { statusMeta } from "@/lib/status";
 import { StatusDot } from "@/components/common/bits";
 import { WindowControls } from "./WindowControls";
-import type { Session } from "@/bindings";
+import { LOCAL_RUNNER, isSession, refOf, sessionKey, type UiSession } from "@/lib/session-key";
 
 const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);
 
@@ -68,7 +68,7 @@ export function TitleBar() {
     return sessions
       .map((s) => {
         const titleHit = sessionTitle(s).toLowerCase().includes(lower);
-        const snippet = transcriptSnippet(transcripts[s.sessionPk] ?? [], q);
+        const snippet = transcriptSnippet(transcripts[sessionKey(s)] ?? [], q);
         return { session: s, titleHit, snippet };
       })
       .filter((r) => r.titleHit || r.snippet)
@@ -83,7 +83,7 @@ export function TitleBar() {
 
   // Live filename search over the active project's workdir.
   const searchProject = useMemo(() => {
-    const focused = sessions.find((s) => s.sessionPk === useStore.getState().focusedSessionPk);
+    const focused = sessions.find((s) => isSession(s, useStore.getState().focusedSession));
     return projects.find((p) => p.projectId === focused?.projectId) ?? projects[0];
   }, [sessions, projects]);
   const [projectFileHits, setProjectFileHits] = useState<string[]>([]);
@@ -94,7 +94,7 @@ export function TitleBar() {
     }
     let cancelled = false;
     const t = setTimeout(() => {
-      void commands.searchFiles(searchProject.projectId, q).then((res) => {
+      void commands.searchFiles(LOCAL_RUNNER, searchProject.projectId, q).then((res) => {
         if (!cancelled && res.status === "ok") setProjectFileHits(res.data.slice(0, 6));
       });
     }, 250);
@@ -117,8 +117,8 @@ export function TitleBar() {
     setSearchQuery("");
   };
 
-  const openSessionHit = (s: Session) => {
-    setFocused(s.sessionPk);
+  const openSessionHit = (s: UiSession) => {
+    setFocused(refOf(s));
     nav.navigate({ kind: "session" });
     closePalette();
   };
@@ -213,7 +213,7 @@ export function TitleBar() {
                     const m = statusMeta(s.status);
                     const project = projects.find((p) => p.projectId === s.projectId);
                     return (
-                      <Button key={s.sessionPk} type="button" variant="ghost" className={resultBtn} onClick={() => openSessionHit(s)}>
+                      <Button key={sessionKey(s)} type="button" variant="ghost" className={resultBtn} onClick={() => openSessionHit(s)}>
                         <StatusDot color={m.color} pulse={m.pulse} className="mt-[5px]" />
                         <span className="min-w-0 flex-1">
                           <span className="block truncate font-medium">{sessionTitle(s)}</span>

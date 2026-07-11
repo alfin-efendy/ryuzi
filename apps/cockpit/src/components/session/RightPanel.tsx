@@ -4,6 +4,7 @@ import { useUi } from "@/store-ui";
 import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav";
 import { useDiff, reviewFileIndex, EMPTY } from "@/store-diff";
 import { commands } from "@/bindings";
+import { sessKey } from "@/lib/session-key";
 import { diffLineStyle, type ReviewFile } from "@/lib/diff";
 import { basename, joinPath } from "@/lib/paths";
 import { Button, Input, Segmented } from "@ryuzi/ui";
@@ -15,11 +16,13 @@ import { DiffStat } from "@/components/common/bits";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
 
 export function RightPanel({
+  runnerId,
   sessionPk,
   branch,
   running,
   isGit,
 }: {
+  runnerId: string;
   sessionPk: string;
   branch: string | null;
   running: boolean;
@@ -31,7 +34,7 @@ export function RightPanel({
   const [pathDraft, setPathDraft] = useState("");
   const [treeFilter, setTreeFilter] = useState("");
   const [treeRefresh, setTreeRefresh] = useState(0);
-  const diff = useDiff((s) => s.bySession[sessionPk]) ?? EMPTY;
+  const diff = useDiff((s) => s.bySession[sessKey(runnerId, sessionPk)]) ?? EMPTY;
   const fetchDiff = useDiff((s) => s.fetch);
   const pendingReview = useDiff((s) => s.pendingReview);
   const setPendingReview = useDiff((s) => s.setPendingReview);
@@ -52,20 +55,20 @@ export function RightPanel({
   // Non-git projects have no diff to fetch (git_diff would just error).
   useEffect(() => {
     if (!nav.rightOpen || nav.rightTab !== "review" || running || !isGit) return;
-    void fetchDiff(sessionPk);
-  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit]);
+    void fetchDiff(runnerId, sessionPk);
+  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, runnerId, sessionPk, isGit]);
 
   // Consume a pending jump from a transcript edit card: select the file once
   // it appears in this session's diff, then clear the intent. A pending jump
   // for another session is left alone — its own panel consumes it.
   useEffect(() => {
-    if (pendingReview === null || pendingReview.sessionPk !== sessionPk) return;
+    if (pendingReview === null || pendingReview.runnerId !== runnerId || pendingReview.sessionPk !== sessionPk) return;
     const idx = reviewFileIndex(diff.files, pendingReview.path);
     if (idx >= 0) {
       setReviewFile(idx);
       setPendingReview(null);
     }
-  }, [pendingReview, diff.files, setPendingReview, sessionPk]);
+  }, [pendingReview, diff.files, setPendingReview, runnerId, sessionPk]);
 
   useEffect(() => {
     if (!nav.rightMaximized) return;
@@ -87,7 +90,7 @@ export function RightPanel({
   const reviewDel = diff.files.reduce((n, f) => n + f.del, 0);
 
   const openInFiles = async (f: ReviewFile) => {
-    const res = await commands.sessionWorkdir(sessionPk);
+    const res = await commands.sessionWorkdir(runnerId, sessionPk);
     if (res.status !== "ok") return;
     ui.openFile(joinPath(res.data, `${f.dir}${f.name}`));
     nav.setRightTab("file");
@@ -154,7 +157,7 @@ export function RightPanel({
               variant="ghost"
               size="icon-xs"
               title="Refresh diff"
-              onClick={() => void fetchDiff(sessionPk)}
+              onClick={() => void fetchDiff(runnerId, sessionPk)}
               className="text-muted-foreground"
             >
               <RotateCw aria-hidden size={12} strokeWidth={2} className={diff.loading ? "animate-spin" : ""} />
@@ -341,13 +344,13 @@ export function RightPanel({
                   <RotateCw aria-hidden size={12} strokeWidth={2} className="size-3" />
                 </Button>
               </div>
-              <FileTreePane sessionPk={sessionPk} filter={treeFilter} refreshKey={treeRefresh} />
+              <FileTreePane runnerId={runnerId} sessionPk={sessionPk} filter={treeFilter} refreshKey={treeRefresh} />
             </div>
           </div>
         </>
       )}
 
-      {nav.rightTab === "agents" && <SubagentList sessionPk={sessionPk} />}
+      {nav.rightTab === "agents" && <SubagentList runnerId={runnerId} sessionPk={sessionPk} />}
     </div>
   );
 }

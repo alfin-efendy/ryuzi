@@ -4,6 +4,19 @@ import { commands } from "./bindings";
 import { useNative } from "./store-native";
 import { useUi } from "./store-ui";
 import type { QueuedMessage } from "./lib/queue";
+import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
+
+const k1 = sessKey(LOCAL_RUNNER, "s1");
+const k2 = sessKey(LOCAL_RUNNER, "s2");
+
+// refresh() (called fire-and-forget by start/startChat/send/stop/end/cloneProject, and by the
+// result/error event handlers, and awaited directly by send()) always fans out to
+// listGateways too. Mock it wherever listProjects/listSessions are given RESOLVING mocks
+// (never-resolving stubs never reach it, since refresh() awaits listProjects first) so the
+// unmocked Tauri IPC call doesn't reject the chain.
+function mockGateways() {
+  return spyOn(commands, "listGateways").mockResolvedValue({ status: "ok", data: [] });
+}
 
 function reset() {
   useStore.setState({
@@ -11,7 +24,7 @@ function reset() {
     sessions: [],
     transcripts: {},
     pendingApprovals: [],
-    focusedSessionPk: null,
+    focusedSession: null,
     selectedProjectId: null,
     lastSeq: {},
     loaded: {},
@@ -21,63 +34,75 @@ function reset() {
 
 test("selectProject sets the selected project and clears the focused session", () => {
   reset();
-  useStore.setState({ focusedSessionPk: "s1" });
+  useStore.setState({ focusedSession: { runnerId: LOCAL_RUNNER, pk: "s1" } });
   useStore.getState().selectProject("p1");
   expect(useStore.getState().selectedProjectId).toBe("p1");
-  expect(useStore.getState().focusedSessionPk).toBeNull();
+  expect(useStore.getState().focusedSession).toBeNull();
 });
 
 test("message events project to rows by role/blockType and dedupe by seq", () => {
   reset();
   const s = useStore.getState();
-  s.applyCoreEvent({ kind: "sessionCreated", session_pk: "s1", project_id: "p1" });
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 1,
-    role: "user",
-    block_type: "text",
-    payload: { text: "hi" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 2,
-    role: "assistant",
-    block_type: "thought",
-    payload: { text: "pondering" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 3,
-    role: "assistant",
-    block_type: "text",
-    payload: { text: "hello" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
+  s.applyCoreEvent({ kind: "sessionCreated", session_pk: "s1", project_id: "p1" }, LOCAL_RUNNER);
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 1,
+      role: "user",
+      block_type: "text",
+      payload: { text: "hi" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    LOCAL_RUNNER,
+  );
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 2,
+      role: "assistant",
+      block_type: "thought",
+      payload: { text: "pondering" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    LOCAL_RUNNER,
+  );
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 3,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "hello" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    LOCAL_RUNNER,
+  );
   // A duplicate/stale seq is ignored.
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 2,
-    role: "assistant",
-    block_type: "text",
-    payload: { text: "dup" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 2,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "dup" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    LOCAL_RUNNER,
+  );
 
-  const rows = useStore.getState().transcripts.s1;
+  const rows = useStore.getState().transcripts[k1];
   expect(rows.map((r) => [r.seq, r.role, r.blockType, r.text])).toEqual([
     [1, "user", "text", "hi"],
     [2, "assistant", "thought", "pondering"],
@@ -88,43 +113,52 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
 test("tool_call events append once, then merge in place by toolCallId (same-seq update)", () => {
   reset();
   const s = useStore.getState();
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 1,
-    role: "assistant",
-    block_type: "tool_call",
-    payload: { name: "Bash", input: { command: "ls" } },
-    tool_call_id: "tc-1",
-    status: "pending",
-    tool_kind: "execute",
-  });
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 1,
+      role: "assistant",
+      block_type: "tool_call",
+      payload: { name: "Bash", input: { command: "ls" } },
+      tool_call_id: "tc-1",
+      status: "pending",
+      tool_kind: "execute",
+    },
+    LOCAL_RUNNER,
+  );
   // Completion re-emit re-uses seq 1 — must merge, not append, not be dropped.
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 1,
-    role: "assistant",
-    block_type: "tool_call",
-    payload: { name: "Bash", input: { command: "ls" }, output: "file.txt" },
-    tool_call_id: "tc-1",
-    status: "completed",
-    tool_kind: "execute",
-  });
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 1,
+      role: "assistant",
+      block_type: "tool_call",
+      payload: { name: "Bash", input: { command: "ls" }, output: "file.txt" },
+      tool_call_id: "tc-1",
+      status: "completed",
+      tool_kind: "execute",
+    },
+    LOCAL_RUNNER,
+  );
   // lastSeq high-water mark is untouched by the merge: a later fresh row still lands.
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 2,
-    role: "assistant",
-    block_type: "text",
-    payload: { text: "done" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 2,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "done" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    LOCAL_RUNNER,
+  );
 
-  const rows = useStore.getState().transcripts.s1;
+  const rows = useStore.getState().transcripts[k1];
   expect(rows).toHaveLength(2);
   expect(rows[0].toolCallId).toBe("tc-1");
   expect(rows[0].toolStatus).toBe("completed");
@@ -159,38 +193,44 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
       createdAt: 2,
     },
   ];
-  await useStore.getState().hydrateTranscript("s1", async () => rows);
+  await useStore.getState().hydrateTranscript(LOCAL_RUNNER, "s1", async () => rows);
   const st = useStore.getState();
-  expect(st.transcripts.s1[0].text).toBe("hi");
-  expect(st.transcripts.s1[1].toolName).toBe("Read");
-  expect(st.transcripts.s1[1].toolOutput).toBe(JSON.stringify({ ok: true }, null, 2));
-  expect(st.lastSeq.s1).toBe(2);
-  expect(st.loaded.s1).toBe(true);
+  expect(st.transcripts[k1][0].text).toBe("hi");
+  expect(st.transcripts[k1][1].toolName).toBe("Read");
+  expect(st.transcripts[k1][1].toolOutput).toBe(JSON.stringify({ ok: true }, null, 2));
+  expect(st.lastSeq[k1]).toBe(2);
+  expect(st.loaded[k1]).toBe(true);
 
   // A live non-tool event with seq <= lastSeq is ignored; a newer one appends.
-  st.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 2,
-    role: "assistant",
-    block_type: "text",
-    payload: { text: "again" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
-  st.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 3,
-    role: "assistant",
-    block_type: "text",
-    payload: { text: "next" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
-  expect(useStore.getState().transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3]);
+  st.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 2,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "again" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    LOCAL_RUNNER,
+  );
+  st.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 3,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "next" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    LOCAL_RUNNER,
+  );
+  expect(useStore.getState().transcripts[k1].map((r) => r.seq)).toEqual([1, 2, 3]);
 });
 
 test("hydrateTranscript keeps live rows that arrived during the fetch (and never regresses lastSeq)", async () => {
@@ -219,69 +259,82 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
       createdAt: 2,
     },
   ];
-  await useStore.getState().hydrateTranscript("s1", async () => {
+  await useStore.getState().hydrateTranscript(LOCAL_RUNNER, "s1", async () => {
     // Simulates an event landing while listMessages is in flight.
-    useStore.getState().applyCoreEvent({
-      kind: "message",
-      session_pk: "s1",
-      seq: 3,
-      role: "assistant",
-      block_type: "text",
-      payload: { text: "live" },
-      tool_call_id: null,
-      status: null,
-      tool_kind: null,
-    });
+    useStore.getState().applyCoreEvent(
+      {
+        kind: "message",
+        session_pk: "s1",
+        seq: 3,
+        role: "assistant",
+        block_type: "text",
+        payload: { text: "live" },
+        tool_call_id: null,
+        status: null,
+        tool_kind: null,
+      },
+      LOCAL_RUNNER,
+    );
     return dbRows;
   });
   const st = useStore.getState();
-  expect(st.transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3]);
-  expect(st.transcripts.s1[2].text).toBe("live");
-  expect(st.lastSeq.s1).toBe(3);
+  expect(st.transcripts[k1].map((r) => r.seq)).toEqual([1, 2, 3]);
+  expect(st.transcripts[k1][2].text).toBe("live");
+  expect(st.lastSeq[k1]).toBe(3);
 });
 
 test("approval.requested adds a pending approval; resolving removes it", () => {
   reset();
   const s = useStore.getState();
-  s.applyCoreEvent({
-    kind: "approvalRequested",
-    session_pk: "s1",
-    request_id: "r1",
-    tool: "Bash",
-    summary: "Bash: rm",
-    approval_kind: "tool",
-    input: {},
-  });
+  s.applyCoreEvent(
+    {
+      kind: "approvalRequested",
+      session_pk: "s1",
+      request_id: "r1",
+      tool: "Bash",
+      summary: "Bash: rm",
+      approval_kind: "tool",
+      input: {},
+    },
+    LOCAL_RUNNER,
+  );
   expect(useStore.getState().pendingApprovals).toHaveLength(1);
   useStore.getState().clearApproval("r1");
   expect(useStore.getState().pendingApprovals).toHaveLength(0);
 });
 
 test("pending approvals from different sessions both count", () => {
-  useStore.setState({ projects: [], sessions: [], transcripts: {}, pendingApprovals: [], focusedSessionPk: null });
+  useStore.setState({ projects: [], sessions: [], transcripts: {}, pendingApprovals: [], focusedSession: null });
   const s = useStore.getState();
-  s.applyCoreEvent({
-    kind: "approvalRequested",
-    session_pk: "s1",
-    request_id: "r1",
-    tool: "Bash",
-    summary: "x",
-    approval_kind: "tool",
-    input: {},
-  });
-  s.applyCoreEvent({
-    kind: "approvalRequested",
-    session_pk: "s2",
-    request_id: "r2",
-    tool: "Write",
-    summary: "y",
-    approval_kind: "tool",
-    input: {},
-  });
+  s.applyCoreEvent(
+    {
+      kind: "approvalRequested",
+      session_pk: "s1",
+      request_id: "r1",
+      tool: "Bash",
+      summary: "x",
+      approval_kind: "tool",
+      input: {},
+    },
+    LOCAL_RUNNER,
+  );
+  s.applyCoreEvent(
+    {
+      kind: "approvalRequested",
+      session_pk: "s2",
+      request_id: "r2",
+      tool: "Write",
+      summary: "y",
+      approval_kind: "tool",
+      input: {},
+    },
+    LOCAL_RUNNER,
+  );
   expect(useStore.getState().pendingApprovals).toHaveLength(2);
 });
 
 const runningSession = (pk: string) => ({
+  runnerId: LOCAL_RUNNER,
   sessionPk: pk,
   projectId: "p1",
   agentSessionId: null,
@@ -308,7 +361,7 @@ test("result event flips the session status back to idle (so the composer leaves
   // like the "start" tests do) so nothing hits the real Tauri binding after this test ends.
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
-  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
+  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" }, LOCAL_RUNNER);
   expect(useStore.getState().sessions[0].status).toBe("idle");
   listProjects.mockRestore();
   listSessions.mockRestore();
@@ -320,11 +373,14 @@ test("result event triggers a refresh so the git/harness backfill (branch, workt
   const backfilled = { ...runningSession("s1"), status: "idle" as const, branch: "harness/s1", worktreePath: "C:\\wt\\s1" };
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [backfilled] });
+  const listGateways = mockGateways();
 
-  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
-  // refresh() is fire-and-forget; let its microtasks flush.
-  await Promise.resolve();
-  await Promise.resolve();
+  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" }, LOCAL_RUNNER);
+  // refresh() is fire-and-forget; a setTimeout(0) tick drains the whole microtask
+  // queue (unlike a fixed count of Promise.resolve() flushes, which can under-count
+  // the listProjects → listGateways → Promise.all(listSessions) → set() chain and
+  // leave refresh() dangling into the next test).
+  await new Promise((resolve) => setTimeout(resolve, 0));
 
   expect(listProjects).toHaveBeenCalled();
   expect(listSessions).toHaveBeenCalled();
@@ -333,12 +389,13 @@ test("result event triggers a refresh so the git/harness backfill (branch, workt
 
   listProjects.mockRestore();
   listSessions.mockRestore();
+  listGateways.mockRestore();
 });
 
 test("sessionEnded event marks the session ended", () => {
   reset();
   useStore.setState({ sessions: [runningSession("s1")] });
-  useStore.getState().applyCoreEvent({ kind: "sessionEnded", session_pk: "s1" });
+  useStore.getState().applyCoreEvent({ kind: "sessionEnded", session_pk: "s1" }, LOCAL_RUNNER);
   expect(useStore.getState().sessions[0].status).toBe("ended");
 });
 
@@ -349,7 +406,7 @@ test("result event leaves other sessions' status untouched", () => {
   // like the "start" tests do) so nothing hits the real Tauri binding after this test ends.
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
-  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" });
+  useStore.getState().applyCoreEvent({ kind: "result", session_pk: "s1" }, LOCAL_RUNNER);
   const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
   expect(byPk).toEqual({ s1: "idle", s2: "running" });
   listProjects.mockRestore();
@@ -364,7 +421,7 @@ test("error event flips the failed session back to idle and leaves others untouc
   // binding after this test ends.
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
-  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "upstream quota exhausted" });
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "upstream quota exhausted" }, LOCAL_RUNNER);
   const byPk = Object.fromEntries(useStore.getState().sessions.map((s) => [s.sessionPk, s.status]));
   expect(byPk).toEqual({ s1: "idle", s2: "running" });
   listProjects.mockRestore();
@@ -377,11 +434,13 @@ test("error event triggers a refresh so the DB-side demotion lands in the UI", a
   const demoted = { ...runningSession("s1"), status: "idle" as const };
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [demoted] });
+  const listGateways = mockGateways();
 
-  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "boom" });
-  // refresh() is fire-and-forget; let its microtasks flush.
-  await Promise.resolve();
-  await Promise.resolve();
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "boom" }, LOCAL_RUNNER);
+  // refresh() is fire-and-forget; a setTimeout(0) tick drains the whole microtask queue
+  // (see the "result event triggers a refresh" test above for why this beats a fixed
+  // count of Promise.resolve() flushes).
+  await new Promise((resolve) => setTimeout(resolve, 0));
 
   expect(listProjects).toHaveBeenCalled();
   expect(listSessions).toHaveBeenCalled();
@@ -389,6 +448,7 @@ test("error event triggers a refresh so the DB-side demotion lands in the UI", a
 
   listProjects.mockRestore();
   listSessions.mockRestore();
+  listGateways.mockRestore();
 });
 
 test("error event appends no transient row — the durable error row arrives via the message event", () => {
@@ -397,23 +457,26 @@ test("error event appends no transient row — the durable error row arrives via
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "upstream quota exhausted" });
-  expect(useStore.getState().transcripts.s1 ?? []).toHaveLength(0);
+  useStore.getState().applyCoreEvent({ kind: "error", session_pk: "s1", message: "upstream quota exhausted" }, LOCAL_RUNNER);
+  expect(useStore.getState().transcripts[k1] ?? []).toHaveLength(0);
 
   // The backend persists the same text via emit_error and broadcasts it as a
   // normal message row (role=system, block_type=error) — THAT renders it.
-  useStore.getState().applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 7,
-    role: "system",
-    block_type: "error",
-    payload: { message: "upstream quota exhausted" },
-    tool_call_id: null,
-    status: null,
-    tool_kind: null,
-  });
-  const rows = useStore.getState().transcripts.s1;
+  useStore.getState().applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 7,
+      role: "system",
+      block_type: "error",
+      payload: { message: "upstream quota exhausted" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    LOCAL_RUNNER,
+  );
+  const rows = useStore.getState().transcripts[k1];
   expect(rows).toHaveLength(1);
   expect(rows[0].blockType).toBe("error");
   expect(rows[0].text).toBe("upstream quota exhausted");
@@ -447,23 +510,27 @@ test("start forwards chat options so composer model, context, and attachments re
       parentSessionPk: null,
     },
   });
-  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
-  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  // refresh() must not gate start(), and this test only checks the IPC call shape and
+  // the optimistic focus/seed — never-resolving avoids racing mockRestore() below
+  // against a fire-and-forget refresh() still in flight (see "start resolves and
+  // focuses the session without waiting for refresh").
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  await useStore.getState().start("p1", "/review", {
+  await useStore.getState().start(LOCAL_RUNNER, "p1", "/review", {
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
   });
 
-  expect(start).toHaveBeenCalledWith("p1", "/review", {
+  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "/review", {
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
     git: null,
     permMode: null,
   });
-  expect(useStore.getState().focusedSessionPk).toBe("s1");
+  expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s1" });
 
   start.mockRestore();
   listProjects.mockRestore();
@@ -494,14 +561,16 @@ test("start forwards composer git options to IPC", async () => {
       parentSessionPk: null,
     },
   });
-  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
-  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  // See "start forwards chat options" above: never-resolving avoids racing
+  // mockRestore() against a fire-and-forget refresh() still in flight.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  await useStore.getState().start("p1", "go", {
+  await useStore.getState().start(LOCAL_RUNNER, "p1", "go", {
     git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
   });
 
-  expect(start).toHaveBeenCalledWith("p1", "go", {
+  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "go", {
     model: null,
     context: null,
     attachments: [],
@@ -542,10 +611,10 @@ test("start resolves and focuses the session without waiting for refresh", async
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  const ok = await useStore.getState().start("p1", "go", null);
+  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "go", null);
 
   expect(ok).toBe(true);
-  expect(useStore.getState().focusedSessionPk).toBe("s3");
+  expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s3" });
   // The returned row is seeded so the session view renders immediately.
   expect(useStore.getState().sessions.map((s) => s.sessionPk)).toContain("s3");
 
@@ -560,9 +629,9 @@ test("start returns false and does not focus on backend error", async () => {
     status: "error",
     error: { message: "boom" },
   });
-  const ok = await useStore.getState().start("p1", "go", null);
+  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "go", null);
   expect(ok).toBe(false);
-  expect(useStore.getState().focusedSessionPk).toBeNull();
+  expect(useStore.getState().focusedSession).toBeNull();
   start.mockRestore();
 });
 
@@ -594,9 +663,9 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  const ok = await useStore.getState().startChat("hey", { model: "fable" });
+  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "hey", { model: "fable" });
 
-  expect(startChat).toHaveBeenCalledWith("hey", {
+  expect(startChat).toHaveBeenCalledWith(LOCAL_RUNNER, "hey", {
     model: "fable",
     permMode: null,
     context: null,
@@ -604,7 +673,7 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
     git: null,
   });
   expect(ok).toBe(true);
-  expect(useStore.getState().focusedSessionPk).toBe("c1");
+  expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "c1" });
   expect(useStore.getState().sessions.map((s) => s.sessionPk)).toContain("c1");
 
   startChat.mockRestore();
@@ -618,9 +687,9 @@ test("startChat returns false and does not focus on backend error", async () => 
     status: "error",
     error: { message: "boom" },
   });
-  const ok = await useStore.getState().startChat("hey", null);
+  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "hey", null);
   expect(ok).toBe(false);
-  expect(useStore.getState().focusedSessionPk).toBeNull();
+  expect(useStore.getState().focusedSession).toBeNull();
   startChat.mockRestore();
 });
 
@@ -642,63 +711,75 @@ test("cloneProject clones via IPC and refreshes on success", async () => {
   });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  const listGateways = mockGateways();
 
+  // cloneProject is a project-management action — always runs on the local engine.
   const ok = await useStore.getState().cloneProject("https://github.com/user/repo.git", "C:\\proj");
 
   expect(ok).toBe(true);
-  expect(clone).toHaveBeenCalledWith("https://github.com/user/repo.git", "C:\\proj");
+  expect(clone).toHaveBeenCalledWith(LOCAL_RUNNER, "https://github.com/user/repo.git", "C:\\proj");
   expect(listProjects).toHaveBeenCalled();
 
   clone.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+  listGateways.mockRestore();
 });
 
 test("a completed todowrite tool_call triggers a todo refetch for its session", () => {
   reset();
   const original = useNative.getState().loadTodos;
-  const loadTodos = mock((_pk: string) => Promise.resolve());
+  const loadTodos = mock((_runnerId: string, _pk: string) => Promise.resolve());
   useNative.setState({ loadTodos });
   const s = useStore.getState();
   // Initial in_progress insert: the tool hasn't executed yet — no fetch.
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 4,
-    role: "assistant",
-    block_type: "tool_call",
-    payload: { name: "todowrite", input: { todos: [{ content: "a", status: "pending" }] } },
-    tool_call_id: "tc-todo",
-    status: "in_progress",
-    tool_kind: "other",
-  });
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 4,
+      role: "assistant",
+      block_type: "tool_call",
+      payload: { name: "todowrite", input: { todos: [{ content: "a", status: "pending" }] } },
+      tool_call_id: "tc-todo",
+      status: "in_progress",
+      tool_kind: "other",
+    },
+    LOCAL_RUNNER,
+  );
   expect(loadTodos).not.toHaveBeenCalled();
   // Completion re-emit (same seq, merged by toolCallId): the DB changed — refetch.
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 4,
-    role: "assistant",
-    block_type: "tool_call",
-    payload: { name: "todowrite", input: { todos: [{ content: "a", status: "pending" }] }, output: "Updated todo list (0/1 done)" },
-    tool_call_id: "tc-todo",
-    status: "completed",
-    tool_kind: "other",
-  });
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 4,
+      role: "assistant",
+      block_type: "tool_call",
+      payload: { name: "todowrite", input: { todos: [{ content: "a", status: "pending" }] }, output: "Updated todo list (0/1 done)" },
+      tool_call_id: "tc-todo",
+      status: "completed",
+      tool_kind: "other",
+    },
+    LOCAL_RUNNER,
+  );
   expect(loadTodos).toHaveBeenCalledTimes(1);
-  expect(loadTodos).toHaveBeenCalledWith("s1");
+  expect(loadTodos).toHaveBeenCalledWith(LOCAL_RUNNER, "s1");
   // Other completed tools never trigger a todo fetch.
-  s.applyCoreEvent({
-    kind: "message",
-    session_pk: "s1",
-    seq: 5,
-    role: "assistant",
-    block_type: "tool_call",
-    payload: { name: "bash", input: { command: "ls" }, output: "ok" },
-    tool_call_id: "tc-bash",
-    status: "completed",
-    tool_kind: "execute",
-  });
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 5,
+      role: "assistant",
+      block_type: "tool_call",
+      payload: { name: "bash", input: { command: "ls" }, output: "ok" },
+      tool_call_id: "tc-bash",
+      status: "completed",
+      tool_kind: "execute",
+    },
+    LOCAL_RUNNER,
+  );
   expect(loadTodos).toHaveBeenCalledTimes(1);
   useNative.setState({ loadTodos: original });
 });
@@ -708,15 +789,17 @@ test("send resolves true on success and false on backend error (drives composer 
   const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  const listGateways = mockGateways();
 
-  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(true);
 
   cont.mockResolvedValue({ status: "error", error: { message: "quota exhausted" } });
-  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(false);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(false);
 
   cont.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+  listGateways.mockRestore();
 });
 
 test("send steers a RUNNING session instead of starting a new turn via continue", async () => {
@@ -726,15 +809,17 @@ test("send steers a RUNNING session instead of starting a new turn via continue"
   const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  const listGateways = mockGateways();
 
-  await expect(useStore.getState().send("s1", "hold on", null)).resolves.toBe(true);
-  expect(steer).toHaveBeenCalledWith("s1", "hold on");
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hold on", null)).resolves.toBe(true);
+  expect(steer).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "hold on");
   expect(cont).not.toHaveBeenCalled();
 
   steer.mockRestore();
   cont.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+  listGateways.mockRestore();
 });
 
 test("send falls back to continue for a session that is not running", async () => {
@@ -744,8 +829,9 @@ test("send falls back to continue for a session that is not running", async () =
   const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  const listGateways = mockGateways();
 
-  await expect(useStore.getState().send("s1", "go", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "go", null)).resolves.toBe(true);
   expect(cont).toHaveBeenCalled();
   expect(steer).not.toHaveBeenCalled();
 
@@ -753,14 +839,16 @@ test("send falls back to continue for a session that is not running", async () =
   cont.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+  listGateways.mockRestore();
 });
 
 test("setFocused marks the previously-focused session read up to its lastActive", () => {
   useUi.setState({ readAt: {} });
   useStore.setState({
-    focusedSessionPk: "s1",
+    focusedSession: { runnerId: LOCAL_RUNNER, pk: "s1" },
     sessions: [
       {
+        runnerId: LOCAL_RUNNER,
         sessionPk: "s1",
         projectId: "p",
         agentSessionId: null,
@@ -780,11 +868,11 @@ test("setFocused marks the previously-focused session read up to its lastActive"
         parentSessionPk: null,
       },
     ],
-    loaded: { s1: true, s2: true },
+    loaded: { [k1]: true, [k2]: true },
   });
-  useStore.getState().setFocused("s2");
-  expect(useUi.getState().readAt.s1).toBe(4200);
-  expect(useStore.getState().focusedSessionPk).toBe("s2");
+  useStore.getState().setFocused({ runnerId: LOCAL_RUNNER, pk: "s2" });
+  expect(useUi.getState().readAt[k1]).toBe(4200);
+  expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s2" });
 });
 
 // markFocusedSessionReadOnEvent is the extracted decision the init() coreEventMsg
@@ -805,9 +893,10 @@ test("markFocusedSessionReadOnEvent marks the focused session read as live activ
       status: null,
       tool_kind: null,
     },
-    "s1",
+    LOCAL_RUNNER,
+    { runnerId: LOCAL_RUNNER, pk: "s1" },
   );
-  expect(useUi.getState().readAt.s1).toBeGreaterThanOrEqual(before);
+  expect(useUi.getState().readAt[k1]).toBeGreaterThanOrEqual(before);
 });
 
 test("markFocusedSessionReadOnEvent leaves read state untouched for events on a non-focused session", () => {
@@ -824,43 +913,97 @@ test("markFocusedSessionReadOnEvent leaves read state untouched for events on a 
       status: null,
       tool_kind: null,
     },
-    "s1",
+    LOCAL_RUNNER,
+    { runnerId: LOCAL_RUNNER, pk: "s1" },
   );
-  expect(useUi.getState().readAt.s2).toBeUndefined();
+  expect(useUi.getState().readAt[k2]).toBeUndefined();
+});
+
+test("two runners with the same session_pk keep separate transcripts and separate focus (collision safety)", () => {
+  reset();
+  const s = useStore.getState();
+  const remote = "remote-1";
+  const localKey = sessKey(LOCAL_RUNNER, "s1");
+  const remoteKey = sessKey(remote, "s1");
+
+  // sessionCreated seeds `loaded` for the composite key, so setFocused below never
+  // trips a hydrateTranscript IPC call.
+  s.applyCoreEvent({ kind: "sessionCreated", session_pk: "s1", project_id: "p1" }, LOCAL_RUNNER);
+  s.applyCoreEvent({ kind: "sessionCreated", session_pk: "s1", project_id: "p1" }, remote);
+
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 1,
+      role: "user",
+      block_type: "text",
+      payload: { text: "local hi" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    LOCAL_RUNNER,
+  );
+  s.applyCoreEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 1,
+      role: "user",
+      block_type: "text",
+      payload: { text: "remote hi" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    remote,
+  );
+
+  // Same session_pk on two different runners must never share a transcript bucket.
+  expect(useStore.getState().transcripts[localKey].map((r) => r.text)).toEqual(["local hi"]);
+  expect(useStore.getState().transcripts[remoteKey].map((r) => r.text)).toEqual(["remote hi"]);
+
+  // Focus is runner-qualified too: focusing the remote session must not read back as
+  // "the same session" as the local one, even though their `pk` is identical.
+  useStore.getState().setFocused({ runnerId: LOCAL_RUNNER, pk: "s1" });
+  expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s1" });
+  useStore.getState().setFocused({ runnerId: remote, pk: "s1" });
+  expect(useStore.getState().focusedSession).toEqual({ runnerId: remote, pk: "s1" });
 });
 
 const qmsg = (id: string, text = id): QueuedMessage => ({ id, text, options: null });
 
 test("enqueueMessage appends per session; removeQueued removes by id", () => {
   useStore.setState({ queued: {} });
-  useStore.getState().enqueueMessage("s1", qmsg("a"));
-  useStore.getState().enqueueMessage("s1", qmsg("b"));
-  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["a", "b"]);
-  useStore.getState().removeQueued("s1", "a");
-  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["b"]);
+  useStore.getState().enqueueMessage(LOCAL_RUNNER, "s1", qmsg("a"));
+  useStore.getState().enqueueMessage(LOCAL_RUNNER, "s1", qmsg("b"));
+  expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["a", "b"]);
+  useStore.getState().removeQueued(LOCAL_RUNNER, "s1", "a");
+  expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["b"]);
 });
 
 test("sendNextQueued sends the head and removes it on success", async () => {
-  const calls: Array<[string, string]> = [];
+  const calls: Array<[string, string, string]> = [];
   useStore.setState({
-    queued: { s1: [qmsg("a", "hello"), qmsg("b", "world")] },
-    send: async (pk, text) => {
-      calls.push([pk, text]);
+    queued: { [k1]: [qmsg("a", "hello"), qmsg("b", "world")] },
+    send: async (runnerId, pk, text) => {
+      calls.push([runnerId, pk, text]);
       return true;
     },
   });
-  await useStore.getState().sendNextQueued("s1");
-  expect(calls).toEqual([["s1", "hello"]]);
-  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["b"]);
+  await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
+  expect(calls).toEqual([[LOCAL_RUNNER, "s1", "hello"]]);
+  expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["b"]);
 });
 
 test("sendNextQueued unshifts the head back when send fails", async () => {
   useStore.setState({
-    queued: { s1: [qmsg("a", "hello")] },
+    queued: { [k1]: [qmsg("a", "hello")] },
     send: async () => false,
   });
-  await useStore.getState().sendNextQueued("s1");
-  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["a"]); // still queued
+  await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
+  expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["a"]); // still queued
 });
 
 test("sendNextQueued on an empty queue does not call send", async () => {
@@ -872,15 +1015,15 @@ test("sendNextQueued on an empty queue does not call send", async () => {
       return true;
     },
   });
-  await useStore.getState().sendNextQueued("s1");
+  await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
   expect(called).toBe(false);
 });
 
 test("drainQueueOnEvent drains on result but not on error", () => {
   const drained: string[] = [];
-  useStore.setState({ sendNextQueued: async (pk) => void drained.push(pk) });
-  drainQueueOnEvent({ kind: "error", session_pk: "s1" } as never);
+  useStore.setState({ sendNextQueued: async (_runnerId, pk) => void drained.push(pk) });
+  drainQueueOnEvent({ kind: "error", session_pk: "s1" } as never, LOCAL_RUNNER);
   expect(drained).toEqual([]);
-  drainQueueOnEvent({ kind: "result", session_pk: "s1" } as never);
+  drainQueueOnEvent({ kind: "result", session_pk: "s1" } as never, LOCAL_RUNNER);
   expect(drained).toEqual(["s1"]);
 });

@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import { useAgent } from "./store-agent";
 import { NATIVE_AGENT } from "./constants";
 import { commands } from "./bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 function reset() {
   useAgent.setState({ models: [], model: null, permMode: null, loaded: false });
@@ -64,7 +65,7 @@ test("setModel writes optimistically and passes through the hydrated permMode un
   const spy = spyOn(commands, "setAgentSettings").mockResolvedValue({ status: "ok", data: null });
   await useAgent.getState().setModel("smart");
   expect(useAgent.getState().model).toBe("smart");
-  expect(spy).toHaveBeenCalledWith("smart", "ask");
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "smart", "ask");
   spy.mockRestore();
 });
 

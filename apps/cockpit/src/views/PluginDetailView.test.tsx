@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { DoctorFinding, PluginDetail } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The view fetches straight from `commands.pluginDetail` (bypassing the
 // `usePlugins` list store, which only carries the flattened `PluginInfo`)
@@ -207,7 +208,7 @@ const err = (message: string) => Promise.resolve({ status: "error" as const, err
 // it, it doesn't just paint a session-only flag).
 let acmePackPinned = false;
 
-const pluginDetail = mock((id: string) => {
+const pluginDetail = mock((_runnerId: string, id: string) => {
   if (id === "github") return ok(githubDetail);
   if (id === "ollama") return ok(ollamaDetail);
   if (id === "acme-oauth") return ok(oauthDetail);
@@ -215,23 +216,25 @@ const pluginDetail = mock((id: string) => {
   if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
   return err("unknown plugin");
 });
-const setPluginEnabled = mock((_id: string, _enabled: boolean) => ok(null));
-const setPluginSetting = mock((_key: string, _value: string) => ok(null));
-const beginPluginOauth = mock((_pluginId: string) =>
+const setPluginEnabled = mock((_runnerId: string, _id: string, _enabled: boolean) => ok(null));
+const setPluginSetting = mock((_runnerId: string, _key: string, _value: string) => ok(null));
+const beginPluginOauth = mock((_runnerId: string, _pluginId: string) =>
   ok({
     stateToken: "state-123",
     authorizeUrl: "https://acme.example.com/oauth/authorize?client_id=acme-client",
     redirectUri: "http://127.0.0.1:8976/plugin-oauth/acme-oauth/callback",
   }),
 );
-const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken: string) => ok(oauthDetail.auth));
-const disconnectPluginOauth = mock((_pluginId: string) => ok({ ...oauthDetail.auth, configured: false, oauthTokenStored: false }));
+const completePluginOauth = mock((_runnerId: string, _pluginId: string, _code: string, _stateToken: string) => ok(oauthDetail.auth));
+const disconnectPluginOauth = mock((_runnerId: string, _pluginId: string) =>
+  ok({ ...oauthDetail.auth, configured: false, oauthTokenStored: false }),
+);
 const listPlugins = mock(() => ok([]));
 const pluginsRestartRequired = mock(() => ok(false));
 let doctorFindingsFixture: DoctorFinding[] = [];
 const pluginDoctor = mock(() => ok(doctorFindingsFixture));
-const updatePlugin = mock((_id: string, _force: boolean) => ok({ kind: "updated" as const }));
-const setPluginPin = mock((id: string, pinned: boolean, _reason: string | null) => {
+const updatePlugin = mock((_runnerId: string, _id: string, _force: boolean) => ok({ kind: "updated" as const }));
+const setPluginPin = mock((_runnerId: string, id: string, pinned: boolean, _reason: string | null) => {
   if (id === "acme-pack") acmePackPinned = pinned;
   return ok(null);
 });
@@ -323,7 +326,7 @@ test("renders identity, about, and category/status badges from the manifest deta
   render(<PluginDetailView id="github" />);
   await screen.findByText("GitHub");
 
-  expect(pluginDetail).toHaveBeenCalledWith("github");
+  expect(pluginDetail).toHaveBeenCalledWith(LOCAL_RUNNER, "github");
   // "GitHub (official)" appears as the header subtitle.
   expect(screen.getAllByText("GitHub (official)").length).toBeGreaterThanOrEqual(1);
   expect(screen.getByText(/Repos, issues, and pull requests/)).toBeTruthy();
@@ -348,7 +351,7 @@ test("shows Not configured for an unset credential, disables Save until typed, a
   expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(false);
 
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
-  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith("plugin.github.token", "ghp_test123"));
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith(LOCAL_RUNNER, "plugin.github.token", "ghp_test123"));
   await waitFor(() => expect(pluginDetail).toHaveBeenCalledTimes(2));
 });
 
@@ -365,7 +368,7 @@ test("oauth plugins start Cockpit sign-in through beginPluginOauth", async () =>
   await screen.findByText("Acme OAuth");
 
   fireEvent.click(screen.getByRole("button", { name: "Connect" }));
-  await waitFor(() => expect(beginPluginOauth).toHaveBeenCalledWith("acme-oauth"));
+  await waitFor(() => expect(beginPluginOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-oauth"));
 });
 
 test("lists MCP servers with their transport and endpoint", async () => {
@@ -410,7 +413,7 @@ test("disables the enable switch for experimental plugins", async () => {
 
 test("shows a not-found state for an unknown plugin id", async () => {
   render(<PluginDetailView id="ghost" />);
-  await waitFor(() => expect(pluginDetail).toHaveBeenCalledWith("ghost"));
+  await waitFor(() => expect(pluginDetail).toHaveBeenCalledWith(LOCAL_RUNNER, "ghost"));
   expect(await screen.findByText("Plugin not found.")).toBeTruthy();
 });
 
@@ -444,10 +447,10 @@ test("skill-pack plugins show Update and Pin actions that call updatePlugin/setP
   await screen.findByText("Acme Pack");
 
   fireEvent.click(screen.getByRole("button", { name: "Update" }));
-  await waitFor(() => expect(updatePlugin).toHaveBeenCalledWith("acme-pack", false));
+  await waitFor(() => expect(updatePlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-pack", false));
 
   fireEvent.click(screen.getByRole("button", { name: "Pin" }));
-  await waitFor(() => expect(setPluginPin).toHaveBeenCalledWith("acme-pack", true, "Pinned from Cockpit"));
+  await waitFor(() => expect(setPluginPin).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-pack", true, "Pinned from Cockpit"));
 
   // Pin toggles the ledger, then this view reloads `pluginDetail` — the
   // pill/button reflect the REAL persisted `info.pinned`, not a session-only

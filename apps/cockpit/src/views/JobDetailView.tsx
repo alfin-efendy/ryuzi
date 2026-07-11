@@ -5,6 +5,7 @@ import { formatDuration, formatNextRun, formatStarted, jobById, toInput, useSche
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 import { useStore } from "@/store";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import {
   Button,
   Input,
@@ -358,7 +359,8 @@ export function JobDetailView({ id }: { id: string }) {
                       size="xs"
                       onClick={() => {
                         if (!r.sessionPk) return;
-                        setFocused(r.sessionPk);
+                        // Scheduler jobs always run on the local engine.
+                        setFocused({ runnerId: LOCAL_RUNNER, pk: r.sessionPk });
                         nav.navigate({ kind: "session" });
                       }}
                     >

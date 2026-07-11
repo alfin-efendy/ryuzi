@@ -11,6 +11,7 @@ import {
 } from "@ryuzi/ui";
 import { commands, type ToolPolicyRow } from "@/bindings";
 import { useStore } from "@/store";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // Settings → Permissions: lists every persisted "don't ask again" rule
 // (allowAlways/rejectAlways) created from approval prompts, and lets the user
@@ -21,7 +22,7 @@ export function PermissionsCard() {
   const [rules, setRules] = useState<ToolPolicyRow[]>([]);
 
   const load = useCallback(async () => {
-    const res = await commands.listToolPolicies();
+    const res = await commands.listToolPolicies(LOCAL_RUNNER);
     if (res.status === "ok") setRules(res.data);
   }, []);
 
@@ -32,7 +33,7 @@ export function PermissionsCard() {
   const projectName = (id: string) => projects.find((p) => p.projectId === id)?.name ?? id;
 
   const revoke = async (row: ToolPolicyRow) => {
-    await commands.deleteToolPolicy(row.projectId, row.tool);
+    await commands.deleteToolPolicy(LOCAL_RUNNER, row.projectId, row.tool);
     void load();
   };
 

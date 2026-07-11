@@ -3,6 +3,9 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { TodoPanel, todoStepSummary } from "./TodoPanel";
 import { useNative } from "@/store-native";
 import type { TodoItem } from "@/bindings";
+import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
+
+const KEY = sessKey(LOCAL_RUNNER, "s1");
 
 const TODOS: TodoItem[] = [
   { content: "Map the four subsystems", status: "completed" },
@@ -34,8 +37,8 @@ describe("todoStepSummary", () => {
 
 describe("TodoPanel", () => {
   test("expanded panel shows steps and the Step X / N footer; collapses to pill", () => {
-    useNative.setState({ todosBySession: { s1: TODOS }, planCollapsed: {}, loadTodos });
-    render(<TodoPanel sessionPk="s1" running={true} />);
+    useNative.setState({ todosBySession: { [KEY]: TODOS }, planCollapsed: {}, loadTodos });
+    render(<TodoPanel runnerId={LOCAL_RUNNER} sessionPk="s1" running={true} />);
     expect(screen.getByText("Write the modal plan")).toBeTruthy();
     expect(screen.getByText(/Step/)).toBeTruthy();
     // collapse via the header button
@@ -49,11 +52,11 @@ describe("TodoPanel", () => {
 
   test("renders nothing once settled with everything complete", () => {
     useNative.setState({
-      todosBySession: { s1: TODOS.map((t) => ({ ...t, status: "completed" })) },
+      todosBySession: { [KEY]: TODOS.map((t) => ({ ...t, status: "completed" })) },
       planCollapsed: {},
       loadTodos,
     });
-    const { container } = render(<TodoPanel sessionPk="s1" running={false} />);
+    const { container } = render(<TodoPanel runnerId={LOCAL_RUNNER} sessionPk="s1" running={false} />);
     expect(container.innerHTML).toBe("");
   });
 });

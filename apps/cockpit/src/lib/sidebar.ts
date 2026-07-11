@@ -1,5 +1,6 @@
 import type { Project, Session } from "../bindings";
 import { basename } from "./paths";
+import { sessionKey, isSession, type SessionRef, type UiSession } from "./session-key";
 
 export type Ordering = "updated" | "name";
 
@@ -21,8 +22,9 @@ export function sessionTitle(s: Session): string {
 export type SessionFilterCtx = {
   statuses: Record<string, true>;
   unreadOnly: boolean;
+  /** Keyed by `sessKey(runnerId, pk)`. */
   readAt: Record<string, number>;
-  focusedSessionPk: string | null;
+  focusedSession: SessionRef | null;
 };
 
 /** Move `fromId` to occupy `toId`'s position (immutably). No-op if either id is
@@ -43,7 +45,7 @@ export function reorder(list: string[], fromId: string, toId: string): string[] 
 // group. `kind === "project"` is required too — chat/worker/review sessions
 // carry `projectId: null` and must never leak into a project's bucket.
 export function sessionsForProject(
-  sessions: Session[],
+  sessions: UiSession[],
   projectId: string,
   query: string,
   showArchived: boolean,
@@ -51,22 +53,22 @@ export function sessionsForProject(
   archived: Record<string, true>,
   filter: SessionFilterCtx,
   pinnedOrder: string[] = [],
-): Session[] {
+): UiSession[] {
   const q = query.trim().toLowerCase();
   const statusActive = Object.keys(filter.statuses).length > 0;
   return sessions
     .filter((s) => s.projectId === projectId && s.kind === "project")
     .filter((s) => !q || sessionTitle(s).toLowerCase().includes(q))
-    .filter((s) => showArchived || !archived[s.sessionPk])
+    .filter((s) => showArchived || !archived[sessionKey(s)])
     .filter((s) => !statusActive || filter.statuses[s.status])
-    .filter((s) => !filter.unreadOnly || isUnreadVisible(s, filter.readAt, filter.focusedSessionPk))
+    .filter((s) => !filter.unreadOnly || isUnreadVisible(s, filter.readAt, filter.focusedSession))
     .sort((a, b) => {
-      const ap = pinned[a.sessionPk] ? 1 : 0;
-      const bp = pinned[b.sessionPk] ? 1 : 0;
+      const ap = pinned[sessionKey(a)] ? 1 : 0;
+      const bp = pinned[sessionKey(b)] ? 1 : 0;
       if (ap !== bp) return bp - ap; // pinned first
       if (ap === 1) {
-        const ai = pinnedOrder.indexOf(a.sessionPk);
-        const bi = pinnedOrder.indexOf(b.sessionPk);
+        const ai = pinnedOrder.indexOf(sessionKey(a));
+        const bi = pinnedOrder.indexOf(sessionKey(b));
         const av = ai === -1 ? Number.POSITIVE_INFINITY : ai;
         const bv = bi === -1 ? Number.POSITIVE_INFINITY : bi;
         if (av !== bv) return av - bv; // by manual order; unordered → after
@@ -76,19 +78,19 @@ export function sessionsForProject(
 }
 
 // Chat-first sessions (no project attached) — the sidebar's own "Chat" bucket.
-export function chatSessions(sessions: Session[]): Session[] {
+export function chatSessions(sessions: UiSession[]): UiSession[] {
   return sessions.filter((s) => s.kind === "chat");
 }
 
-export function archivedCount(sessions: Session[], projectId: string, archived: Record<string, true>): number {
-  return sessions.filter((s) => s.projectId === projectId && archived[s.sessionPk]).length;
+export function archivedCount(sessions: UiSession[], projectId: string, archived: Record<string, true>): number {
+  return sessions.filter((s) => s.projectId === projectId && archived[sessionKey(s)]).length;
 }
 
 /** A session has unseen activity iff its last-active timestamp is newer than
  *  the stored read cursor. Absent cursor → not unread (seeded on first sight);
  *  the currently-focused session is never unread — you are looking at it. */
-export function isUnreadVisible(session: Session, readAt: Record<string, number>, focusedSessionPk: string | null): boolean {
-  if (session.sessionPk === focusedSessionPk) return false;
-  const cursor = readAt[session.sessionPk];
+export function isUnreadVisible(session: UiSession, readAt: Record<string, number>, focusedSession: SessionRef | null): boolean {
+  if (isSession(session, focusedSession)) return false;
+  const cursor = readAt[sessionKey(session)];
   return cursor != null && session.lastActive != null && session.lastActive > cursor;
 }

@@ -8,6 +8,7 @@ import { useStore } from "@/store";
 import { commands } from "@/bindings";
 import { statusMeta } from "@/lib/status";
 import { sessionTitle } from "@/lib/sidebar";
+import { refOf } from "@/lib/session-key";
 import {
   Button,
   Segmented,
@@ -51,8 +52,9 @@ export function GatewayDetailView({ id }: { id: string }) {
   const statusColor = online ? "#22C55E" : "var(--muted-foreground)";
   const fsDesc = GW_FS_MODES.find((m) => m.id === g.fsMode)?.desc;
 
-  // Real sessions all run on the local gateway until the remote daemon ships.
-  const gwSessions = id === "local" ? sessions.filter((s) => s.status !== "ended") : [];
+  // Sessions are stamped with the runner (gateway) that owns them — this gateway's
+  // route id IS a runner id (LOCAL_RUNNER for the local one, gateway.id for a remote).
+  const gwSessions = sessions.filter((s) => s.runnerId === id && s.status !== "ended");
 
   const addFolder = async () => {
     const dir = await commands.pickDirectory();
@@ -180,7 +182,7 @@ export function GatewayDetailView({ id }: { id: string }) {
                     key={s.sessionPk}
                     variant="ghost"
                     onClick={() => {
-                      setFocused(s.sessionPk);
+                      setFocused(refOf(s));
                       nav.navigate({ kind: "session" });
                     }}
                     className="h-auto w-full justify-start gap-2.5 rounded-none px-[18px] py-2 text-left"

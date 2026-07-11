@@ -64,10 +64,10 @@ export function getTerm(termId: string): TermInstance | undefined {
   return cache.get(termId);
 }
 
-export async function createTerm(sessionPk: string): Promise<TermInstance | { error: string }> {
+export async function createTerm(runnerId: string, sessionPk: string): Promise<TermInstance | { error: string }> {
   await ensureListeners();
   // The PTY opens at a nominal size; the first attach() refits to reality.
-  const res = await commands.termOpen(sessionPk, 80, 24);
+  const res = await commands.termOpen(runnerId, sessionPk, 80, 24);
   if (res.status === "error") return { error: res.error.message };
   const termId = res.data;
 

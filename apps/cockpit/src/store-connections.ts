@@ -67,29 +67,29 @@ export const useConnections = create<ConnectionsState>((set) => ({
   loaded: false,
 
   hydrate: async () => {
-    const [cat, conns] = await Promise.all([commands.listProviderCatalog(), commands.listConnections()]);
+    const [cat, conns] = await Promise.all([commands.listProviderCatalog(), commands.listConnections("local")]);
     if (cat.status === "ok") set({ catalog: cat.data });
     if (conns.status === "ok") set({ connections: conns.data });
     set({ loaded: true });
   },
   add: async (provider, label, apiKey, baseUrl) =>
-    apply(set, await commands.addConnection(provider, label, apiKey, baseUrl), "Add connection"),
+    apply(set, await commands.addConnection("local", provider, label, apiKey, baseUrl), "Add connection"),
   update: async (id, p) =>
     void apply(
       set,
-      await commands.updateConnection(id, p.label, p.enabled, p.apiKey, p.baseUrl, p.models, p.claudeCloaking),
+      await commands.updateConnection("local", id, p.label, p.enabled, p.apiKey, p.baseUrl, p.models, p.claudeCloaking),
       "Update connection",
     ),
-  remove: async (id) => void apply(set, await commands.removeConnection(id), "Remove connection"),
-  move: async (id, dir) => void apply(set, await commands.moveConnection(id, dir), "Reorder"),
+  remove: async (id) => void apply(set, await commands.removeConnection("local", id), "Remove connection"),
+  move: async (id, dir) => void apply(set, await commands.moveConnection("local", id, dir), "Reorder"),
   test: async (id) => {
-    const res = await commands.testConnection(id);
+    const res = await commands.testConnection("local", id);
     if (res.status === "ok") return res.data;
     toast.error(`Test failed: ${res.error.message}`);
     return null;
   },
-  connectOauth: async (provider, label) => apply(set, await commands.connectOauth(provider, label), "Connect"),
-  reconnectOauth: async (connectionId) => apply(set, await commands.reconnectOauth(connectionId), "Reconnect"),
+  connectOauth: async (provider, label) => apply(set, await commands.connectOauth("local", provider, label), "Connect"),
+  reconnectOauth: async (connectionId) => apply(set, await commands.reconnectOauth("local", connectionId), "Reconnect"),
   beginOauthManual: async (provider) => {
     const res = await commands.beginOauthManual(provider);
     if (res.status === "ok") return res.data;
@@ -97,21 +97,22 @@ export const useConnections = create<ConnectionsState>((set) => ({
     return null;
   },
   completeOauthManual: async (provider, label, verifier, state, pasted, redirectUri) =>
-    apply(set, await commands.completeOauthManual(provider, label, verifier, state, pasted, redirectUri), "Connect"),
-  addFree: async (provider, label) => apply(set, await commands.addFreeConnection(provider, label), "Add connection"),
+    apply(set, await commands.completeOauthManual("local", provider, label, verifier, state, pasted, redirectUri), "Connect"),
+  addFree: async (provider, label) => apply(set, await commands.addFreeConnection("local", provider, label), "Add connection"),
   startKiroDevice: async () => {
-    const res = await commands.startKiroDeviceFlow();
+    const res = await commands.startKiroDeviceFlow("local");
     if (res.status === "ok") return res.data;
     toast.error(`${KIRO_SIGNIN_ACTION} failed: ${res.error.message}`);
     return null;
   },
-  awaitKiroDevice: async (label, flowId) => apply(set, await commands.awaitKiroDeviceFlow(label, flowId), KIRO_SIGNIN_ACTION),
-  importKiro: async (label) => apply(set, await commands.importKiroToken(label), KIRO_IMPORT_ACTION),
+  awaitKiroDevice: async (label, flowId) => apply(set, await commands.awaitKiroDeviceFlow("local", label, flowId), KIRO_SIGNIN_ACTION),
+  importKiro: async (label) => apply(set, await commands.importKiroToken("local", label), KIRO_IMPORT_ACTION),
   startDeviceFlow: async (provider) => {
-    const res = await commands.startDeviceFlow(provider);
+    const res = await commands.startDeviceFlow("local", provider);
     if (res.status === "ok") return res.data;
     toast.error(`Sign in failed: ${res.error.message}`);
     return null;
   },
-  awaitDeviceFlow: async (provider, label, flowId) => apply(set, await commands.awaitDeviceFlow(provider, label, flowId), "Sign in"),
+  awaitDeviceFlow: async (provider, label, flowId) =>
+    apply(set, await commands.awaitDeviceFlow("local", provider, label, flowId), "Sign in"),
 }));

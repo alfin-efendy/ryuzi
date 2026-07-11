@@ -1,19 +1,22 @@
 import type { ReactNode } from "react";
-import { Button } from "@ryuzi/ui";
+import { Badge, Button } from "@ryuzi/ui";
 import { Archive, Pin } from "lucide-react";
-import type { Session } from "@/bindings";
+import type { UiSession } from "@/lib/session-key";
 import { StatusDot, TreeGuide } from "@/components/common/bits";
 import { statusMeta } from "@/lib/status";
 import { sessionTitle } from "@/lib/sidebar";
 
 export type SessionRowProps = {
-  session: Session;
+  session: UiSession;
   isActive: boolean;
   isPinned: boolean;
   unread: boolean;
   isArchived: boolean;
   hasTail: boolean;
   archiveDisabled: boolean;
+  /** Non-null for sessions on a non-local runner — rendered as a small chip
+   *  next to the title so multi-runner sessions are distinguishable. */
+  runnerLabel?: string | null;
   onOpen: () => void;
   onTogglePin: () => void;
   onToggleArchive: () => void;
@@ -29,6 +32,7 @@ export function SessionRow({
   isArchived,
   hasTail,
   archiveDisabled,
+  runnerLabel,
   onOpen,
   onTogglePin,
   onToggleArchive,
@@ -50,6 +54,11 @@ export function SessionRow({
         >
           <StatusDot color={m.color} pulse={m.pulse} />
           <span className={`min-w-0 flex-1 truncate ${unread ? "font-semibold text-foreground" : ""}`}>{sessionTitle(session)}</span>
+          {runnerLabel && (
+            <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[9.5px] font-medium">
+              {runnerLabel}
+            </Badge>
+          )}
           <span aria-hidden className="flex w-2 shrink-0 items-center justify-center">
             {unread && <span data-testid={`unread-dot-${session.sessionPk}`} className="size-1.5 rounded-full bg-primary" />}
           </span>

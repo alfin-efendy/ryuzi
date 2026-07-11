@@ -1,9 +1,15 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import type { CmdError, Result } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
-const gitDiff = mock((): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "" }));
-const sessionWorkdir = mock((): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "C:\\code\\demo" }));
+const gitDiff = mock(
+  (_runnerId: string | null, _sessionPk: string): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "" }),
+);
+const sessionWorkdir = mock(
+  (_runnerId: string | null, _sessionPk: string): Promise<Result<string, CmdError>> =>
+    Promise.resolve({ status: "ok", data: "C:\\code\\demo" }),
+);
 
 mock.module("@/bindings", () => ({
   commands: { gitDiff, sessionWorkdir },
@@ -25,7 +31,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 test("non-git session: Review shows the empty state and never fetches a diff", () => {
-  render(<RightPanel sessionPk="s1" branch={null} running={false} isGit={false} />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch={null} running={false} isGit={false} />);
   expect(screen.getByText(/Not a git repository/)).toBeTruthy();
   expect(screen.queryByText("No changes yet.")).toBeNull();
   // Mount effects already ran synchronously under act() — no fetch fired.
@@ -33,7 +39,7 @@ test("non-git session: Review shows the empty state and never fetches a diff", (
 });
 
 test("git session: Review fetches the diff as before", async () => {
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
-  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith("s1"));
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith(LOCAL_RUNNER, "s1"));
   expect(screen.queryByText(/Not a git repository/)).toBeNull();
 });

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { CmdError, PluginDetail, PluginFieldInfo, PluginInstallBeginResult, Result } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The wizard talks only to the Tauri IPC boundary (`@/bindings`) and the
 // real usePlugins zustand store — mock the boundary, seed the store.
@@ -194,7 +195,7 @@ test("calls beginPluginInstall on mount and shows the checking spinner", async (
   beginPluginInstall.mockImplementationOnce(() => new Promise<never>(() => {}));
   await renderWizard();
 
-  expect(beginPluginInstall).toHaveBeenCalledWith("notion");
+  expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "notion");
   expect(screen.getByText("Checking configuration…")).toBeTruthy();
 });
 
@@ -301,7 +302,7 @@ test("tokenInput saves through the manifest auth.setting key and continues", asy
   fireEvent.change(screen.getByPlaceholderText("Required — not set"), { target: { value: "secret-token" } });
   fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
-  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith("plugin.notion.token", "secret-token"));
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith(LOCAL_RUNNER, "plugin.notion.token", "secret-token"));
   expect(await screen.findByText("Notion is installed.")).toBeTruthy();
 });
 
@@ -337,7 +338,7 @@ test("manualClientId shows dcrError, saves the id, and re-begin starts the brows
   });
   fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
-  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith("notion", "client-abc"));
+  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", "client-abc"));
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledTimes(2));
   expect(await screen.findByText("Browser opened — finish signing in there.")).toBeTruthy();
 });
@@ -378,7 +379,7 @@ test("manualClientId toasts and stays put with no dead end when the re-begin cal
   beginPluginInstall.mockImplementationOnce(() => Promise.resolve({ status: "error" as const, error: { message: "network unreachable" } }));
   fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
-  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith("notion", "client-xyz"));
+  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", "client-xyz"));
   await waitFor(() => expect(toastError).toHaveBeenCalledWith("network unreachable"));
   expect(screen.getByText(/doesn't support automatic app registration/)).toBeTruthy();
   expect(input.value).toBe("client-xyz");
@@ -416,7 +417,7 @@ test("external oauth collects the client id and continues without a browser flow
   });
   fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
-  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith("notion", "google-client"));
+  await waitFor(() => expect(setPluginOauthClientId).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", "google-client"));
   expect(await screen.findByText(/Required fields are marked/)).toBeTruthy();
   expect(beginPluginInstall).toHaveBeenCalledTimes(1);
 });
@@ -463,7 +464,7 @@ test("a failed completion shows an inline error, and paste-code completes via co
   });
   fireEvent.click(screen.getByRole("button", { name: "Finish sign-in" }));
 
-  await waitFor(() => expect(completePluginOauth).toHaveBeenCalledWith("notion", "authcode-1", "state-123"));
+  await waitFor(() => expect(completePluginOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", "authcode-1", "state-123"));
   expect(await screen.findByText("Notion is installed.")).toBeTruthy();
 });
 
@@ -480,8 +481,8 @@ test("a successful paste-code completion cancels the pending loopback listener",
   });
   fireEvent.click(screen.getByRole("button", { name: "Finish sign-in" }));
 
-  await waitFor(() => expect(completePluginOauth).toHaveBeenCalledWith("notion", "authcode-2", "state-123"));
-  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith("notion", "state-123"));
+  await waitFor(() => expect(completePluginOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", "authcode-2", "state-123"));
+  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", "state-123"));
   expect(await screen.findByText("Notion is installed.")).toBeTruthy();
 });
 
@@ -538,7 +539,7 @@ test("a required unset setting disables Continue until typed, then saves on Cont
   expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(false);
 
   fireEvent.click(screen.getByRole("button", { name: "Continue" }));
-  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith("plugin.notion.user", "alice"));
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith(LOCAL_RUNNER, "plugin.notion.user", "alice"));
   expect(await screen.findByText("Notion is installed.")).toBeTruthy();
 });
 
@@ -562,7 +563,7 @@ test("done enables the plugin and reloads the plugins store", async () => {
   await renderWizard();
 
   expect(await screen.findByText("Notion is installed.")).toBeTruthy();
-  await waitFor(() => expect(setPluginEnabled).toHaveBeenCalledWith("notion", true));
+  await waitFor(() => expect(setPluginEnabled).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", true));
   await waitFor(() => expect(listPlugins).toHaveBeenCalled());
   expect(screen.getByText("It's enabled and ready for your agents.")).toBeTruthy();
 });
@@ -593,7 +594,7 @@ test("closing during an oauth flow cancels the pending install with the state to
   await renderWizard();
 
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith("notion", "state-123"));
+  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", "state-123"));
   expect(onClose).toHaveBeenCalled();
 });
 
@@ -603,7 +604,7 @@ test("closing an oauth wizard while begin is still in flight cancels with a null
   await renderWizard();
 
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith("notion", null));
+  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", null));
   expect(onClose).toHaveBeenCalled();
 });
 
@@ -627,7 +628,7 @@ test("unmounting the wizard mid-oauth cancels the pending install", async () => 
   expect(await screen.findByText("Browser opened — finish signing in there.")).toBeTruthy();
 
   unmount();
-  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith("notion", "state-123"));
+  await waitFor(() => expect(cancelPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "notion", "state-123"));
 });
 
 // Phase 2 whole-branch review (fast follow, non-blocking): a failed Retry

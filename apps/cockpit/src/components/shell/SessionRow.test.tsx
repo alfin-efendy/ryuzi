@@ -7,6 +7,7 @@ afterEach(cleanup);
 
 const base = {
   session: {
+    runnerId: "local",
     sessionPk: "s1",
     projectId: "p",
     agentSessionId: null,

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 
-let listDirCalls: Array<[string, string]> = [];
+let listDirCalls: Array<[string, string, string]> = [];
 let listDirResult: { status: "ok"; data: { name: string; dir: boolean }[] } | { status: "error"; error: { message: string } } = {
   status: "ok",
   data: [],
@@ -8,8 +8,8 @@ let listDirResult: { status: "ok"; data: { name: string; dir: boolean }[] } | { 
 
 mock.module("@/bindings", () => ({
   commands: {
-    listDir: async (sessionPk: string, rel: string) => {
-      listDirCalls.push([sessionPk, rel]);
+    listDir: async (runnerId: string, sessionPk: string, rel: string) => {
+      listDirCalls.push([runnerId, sessionPk, rel]);
       return listDirResult;
     },
   },
@@ -32,19 +32,19 @@ test("true when the parent listing contains the file entry", async () => {
       { name: "sub", dir: true },
     ],
   };
-  expect(await workspaceFileExists("s1", "src/app.ts")).toBe(true);
-  expect(listDirCalls).toEqual([["s1", "src"]]);
+  expect(await workspaceFileExists("local", "s1", "src/app.ts")).toBe(true);
+  expect(listDirCalls).toEqual([["local", "s1", "src"]]);
 });
 
 test("false for a directory entry of the same name", async () => {
   listDirResult = { status: "ok", data: [{ name: "app.ts", dir: true }] };
-  expect(await workspaceFileExists("s1", "src/app.ts")).toBe(false);
+  expect(await workspaceFileExists("local", "s1", "src/app.ts")).toBe(false);
 });
 
 test("bare basename probes the workdir root", async () => {
   listDirResult = { status: "ok", data: [{ name: "README.md", dir: false }] };
-  expect(await workspaceFileExists("s1", "README.md")).toBe(true);
-  expect(listDirCalls).toEqual([["s1", ""]]);
+  expect(await workspaceFileExists("local", "s1", "README.md")).toBe(true);
+  expect(listDirCalls).toEqual([["local", "s1", ""]]);
 });
 
 test("cache: sibling files share one listing; concurrent callers dedup in flight", async () => {
@@ -55,25 +55,32 @@ test("cache: sibling files share one listing; concurrent callers dedup in flight
       { name: "b.ts", dir: false },
     ],
   };
-  const [a, b] = await Promise.all([workspaceFileExists("s1", "src/a.ts"), workspaceFileExists("s1", "src/b.ts")]);
+  const [a, b] = await Promise.all([workspaceFileExists("local", "s1", "src/a.ts"), workspaceFileExists("local", "s1", "src/b.ts")]);
   expect(a).toBe(true);
   expect(b).toBe(true);
   expect(listDirCalls.length).toBe(1);
   // Cached within TTL — still one call.
-  expect(await workspaceFileExists("s1", "src/a.ts")).toBe(true);
+  expect(await workspaceFileExists("local", "s1", "src/a.ts")).toBe(true);
   expect(listDirCalls.length).toBe(1);
 });
 
 test("listDir errors cache as an empty listing (path renders plain)", async () => {
   listDirResult = { status: "error", error: { message: "gone" } };
-  expect(await workspaceFileExists("s1", "src/a.ts")).toBe(false);
-  expect(await workspaceFileExists("s1", "src/b.ts")).toBe(false);
+  expect(await workspaceFileExists("local", "s1", "src/a.ts")).toBe(false);
+  expect(await workspaceFileExists("local", "s1", "src/b.ts")).toBe(false);
   expect(listDirCalls.length).toBe(1);
 });
 
 test("different sessions do not share cache entries", async () => {
   listDirResult = { status: "ok", data: [{ name: "a.ts", dir: false }] };
-  await workspaceFileExists("s1", "src/a.ts");
-  await workspaceFileExists("s2", "src/a.ts");
+  await workspaceFileExists("local", "s1", "src/a.ts");
+  await workspaceFileExists("local", "s2", "src/a.ts");
+  expect(listDirCalls.length).toBe(2);
+});
+
+test("different runners with the same session pk do not share cache entries", async () => {
+  listDirResult = { status: "ok", data: [{ name: "a.ts", dir: false }] };
+  await workspaceFileExists("local", "s1", "src/a.ts");
+  await workspaceFileExists("remote-1", "s1", "src/a.ts");
   expect(listDirCalls.length).toBe(2);
 });

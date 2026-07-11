@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useStore, type PendingApproval } from "@/store";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const { ApprovalCard } = await import("./ApprovalCard");
 
@@ -8,6 +9,7 @@ afterEach(cleanup);
 
 function approval(partial: Partial<PendingApproval>): PendingApproval {
   return {
+    runnerId: LOCAL_RUNNER,
     sessionPk: "s1",
     requestId: "r1",
     tool: "bash",
@@ -21,7 +23,7 @@ function approval(partial: Partial<PendingApproval>): PendingApproval {
 function seedResolve() {
   const calls: unknown[] = [];
   useStore.setState({
-    resolveApproval: async (id, resp) => {
+    resolveApproval: async (_runnerId, id, resp) => {
       calls.push([id, resp]);
     },
   });

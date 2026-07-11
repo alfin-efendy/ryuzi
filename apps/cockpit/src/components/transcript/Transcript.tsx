@@ -123,6 +123,7 @@ function WorkingPulse({ color }: { color: string }) {
 }
 
 export function Transcript({
+  runnerId,
   sessionPk,
   rows,
   agentName,
@@ -130,6 +131,7 @@ export function Transcript({
   running,
   children,
 }: {
+  runnerId: string;
   sessionPk: string;
   rows: Row[];
   agentName: string;
@@ -240,7 +242,7 @@ export function Transcript({
                   return (
                     <div key={g.key} className="flex flex-col gap-1.5">
                       <TurnSummary groups={g.groups} durationMs={g.durationMs} />
-                      <FileChangeCards sessionPk={sessionPk} cards={g.editCards} />
+                      <FileChangeCards runnerId={runnerId} sessionPk={sessionPk} cards={g.editCards} />
                     </div>
                   );
                 default:

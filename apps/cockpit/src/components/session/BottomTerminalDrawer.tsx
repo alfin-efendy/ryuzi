@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Copy, Plus, Search, SquareTerminal, X } from "lucide-react";
 import { useNav, clampPanelSize, BOTTOM_HEIGHT } from "@/store-nav";
 import { useTerms } from "@/store-terms";
+import { sessKey } from "@/lib/session-key";
 import { attach, detach, getTerm, refit, type TermInstance } from "@/lib/term-cache";
 import { Button, Input } from "@ryuzi/ui";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
@@ -22,10 +23,11 @@ function TerminalHost({ inst, className }: { inst: TermInstance; className?: str
   return <div ref={ref} className={`min-h-0 px-3 py-2 ${className ?? ""}`} />;
 }
 
-export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: string; projectName: string }) {
+export function BottomTerminalDrawer({ runnerId, sessionPk, projectName }: { runnerId: string; sessionPk: string; projectName: string }) {
   const nav = useNav();
-  const tabs = useTerms((s) => s.tabs[sessionPk] ?? []);
-  const activeId = useTerms((s) => s.active[sessionPk]);
+  const key = sessKey(runnerId, sessionPk);
+  const tabs = useTerms((s) => s.tabs[key] ?? []);
+  const activeId = useTerms((s) => s.active[key]);
   const { open, ensureOne, close, setActive } = useTerms();
   const [query, setQuery] = useState("");
   const copyOnSelect = useTerms((s) => s.copyOnSelect);
@@ -36,8 +38,8 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
   // is StrictMode-safe. Closing the last tab therefore leaves the drawer empty
   // (see the empty state below) instead of instantly respawning a terminal.
   useEffect(() => {
-    void ensureOne(sessionPk);
-  }, [sessionPk, ensureOne]);
+    void ensureOne(runnerId, sessionPk);
+  }, [runnerId, sessionPk, ensureOne]);
 
   const active = tabs.find((t) => t.termId === activeId) ?? tabs[0];
   const inst = active ? getTerm(active.termId) : undefined;
@@ -63,7 +65,7 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
               <Button
                 variant="ghost"
                 size="xs"
-                onClick={() => setActive(sessionPk, t.termId)}
+                onClick={() => setActive(runnerId, sessionPk, t.termId)}
                 className={`h-auto p-0 text-inherit hover:bg-transparent hover:text-inherit dark:hover:bg-transparent ${
                   t.exited ? "line-through opacity-60" : ""
                 }`}
@@ -74,7 +76,7 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
                 variant="ghost"
                 size="icon-xs"
                 title={`Close ${t.title}`}
-                onClick={() => close(sessionPk, t.termId)}
+                onClick={() => close(runnerId, sessionPk, t.termId)}
                 className="size-5 text-muted-foreground"
               >
                 <X aria-hidden size={10} strokeWidth={2} className="size-2.5" />
@@ -82,7 +84,13 @@ export function BottomTerminalDrawer({ sessionPk, projectName }: { sessionPk: st
             </div>
           ))}
         </div>
-        <Button variant="ghost" size="icon-sm" title="New terminal" onClick={() => void open(sessionPk)} className="text-muted-foreground">
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          title="New terminal"
+          onClick={() => void open(runnerId, sessionPk)}
+          className="text-muted-foreground"
+        >
           <Plus aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
         </Button>
         <form

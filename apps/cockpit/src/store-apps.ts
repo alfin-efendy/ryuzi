@@ -34,33 +34,33 @@ export const useApps = create<AppsState>((set, get) => ({
   probing: null,
 
   hydrate: async () => {
-    applyResult(set, await commands.listApps(), "App list");
+    applyResult(set, await commands.listApps("local"), "App list");
   },
 
-  add: async (input) => applyResult(set, await commands.addApp(input), "Add app"),
+  add: async (input) => applyResult(set, await commands.addApp("local", input), "Add app"),
 
   remove: async (id) => {
-    applyResult(set, await commands.removeApp(id), "Remove app");
+    applyResult(set, await commands.removeApp("local", id), "Remove app");
   },
 
   probe: async (id) => {
     set({ probing: id });
     try {
-      applyResult(set, await commands.probeApp(id), "Probe");
+      applyResult(set, await commands.probeApp("local", id), "Probe");
     } finally {
       set({ probing: null });
     }
   },
 
   setScope: async (id, scope, scopeGateways) => {
-    applyResult(set, await commands.updateAppScope(id, scope, scopeGateways), "Scope update");
+    applyResult(set, await commands.updateAppScope("local", id, scope, scopeGateways), "Scope update");
   },
 
   setToolPerm: async (id, tool, perm) => {
     set({
       apps: get().apps.map((a) => (a.id === id ? { ...a, tools: a.tools.map((t) => (t.name === tool ? { ...t, perm } : t)) } : a)),
     });
-    applyResult(set, await commands.setAppToolPerm(id, tool, perm), "Tool permission");
+    applyResult(set, await commands.setAppToolPerm("local", id, tool, perm), "Tool permission");
   },
 
   toggleAgent: async (id, allowed) => {
@@ -69,7 +69,7 @@ export const useApps = create<AppsState>((set, get) => ({
         a.id === id ? { ...a, agentAccess: a.agentAccess.map((x) => (x.agentId === "native" ? { ...x, allowed } : x)) } : a,
       ),
     });
-    applyResult(set, await commands.toggleAppAgent(id, "native", allowed), "Agent access");
+    applyResult(set, await commands.toggleAppAgent("local", id, "native", allowed), "Agent access");
   },
 }));
 

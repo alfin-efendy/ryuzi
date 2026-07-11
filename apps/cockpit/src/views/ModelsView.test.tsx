@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { CatalogEntry, ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, ModelRouteInfo, UsageSeries } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const status: EndpointStatusInfo = {
   running: true,
@@ -159,9 +160,9 @@ const usage: UsageSeries = {
   todayOutputTokens: 210,
 };
 
-const saveModelRoute = mock((_route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
+const saveModelRoute = mock((_runnerId: string, _route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
 
-const refreshProviderModels = mock((_family: string) =>
+const refreshProviderModels = mock((_runnerId: string, _family: string) =>
   Promise.resolve({
     status: "ok" as const,
     data: [
@@ -172,6 +173,7 @@ const refreshProviderModels = mock((_family: string) =>
 
 const updateConnection = mock(
   (
+    _runnerId: string,
     _id: string,
     _label: string,
     _enabled: boolean,
@@ -406,7 +408,7 @@ test("Refresh models surfaces per-connection failures inline", async () => {
 
   fireEvent.click(await screen.findByRole("button", { name: "Refresh models" }));
 
-  await waitFor(() => expect(refreshProviderModels).toHaveBeenCalledWith("openai"));
+  await waitFor(() => expect(refreshProviderModels).toHaveBeenCalledWith(LOCAL_RUNNER, "openai"));
   expect(await screen.findByText("Work OpenAI: model list request for openai failed with status 401")).toBeTruthy();
 });
 
@@ -495,7 +497,7 @@ test("route form saves targets as {provider, model} scoped to the family, not th
   fireEvent.click(screen.getByRole("button", { name: "Save route" }));
 
   await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
-  const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
+  const [, savedRoute] = saveModelRoute.mock.calls[0] as [string, ModelRouteInfo];
   expect(savedRoute.targets).toEqual([{ provider: "openai", model: "gpt-4.1" }]);
 });
 
@@ -522,7 +524,7 @@ test("connection detail saves the Claude cloaking toggle", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
   await waitFor(() =>
-    expect(updateConnection).toHaveBeenCalledWith("c3", "Claude subscription", true, null, null, ["claude-opus-4-8"], false),
+    expect(updateConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "c3", "Claude subscription", true, null, null, ["claude-opus-4-8"], false),
   );
 });
 
@@ -619,6 +621,6 @@ test("route target adapter round-trips a slash-containing model id (cloudflare-a
   fireEvent.click(screen.getByRole("button", { name: "Save route" }));
 
   await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
-  const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
+  const [, savedRoute] = saveModelRoute.mock.calls[0] as [string, ModelRouteInfo];
   expect(savedRoute.targets).toEqual([{ provider: "cloudflare-ai", model: "@cf/meta/llama-3.1-8b-instruct" }]);
 });

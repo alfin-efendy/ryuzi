@@ -1,6 +1,7 @@
 import type { CmdError, Project, Result } from "@/bindings";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const clonedProject: Project = {
   projectId: "p9",
@@ -20,9 +21,12 @@ const cloneProject = mock((): Promise<Result<Project, CmdError>> => Promise.reso
 const getSetting = mock((): Promise<Result<string | null, CmdError>> => Promise.resolve({ status: "ok", data: "C:\\proj" }));
 const listProjects = mock((): Promise<Result<Project[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const listSessions = mock(() => Promise.resolve({ status: "ok", data: [] }));
+// refresh() (awaited directly by addProject()/cloneProject() on success) always
+// fans out to listGateways too — unmocked it rejects and refresh() never resolves.
+const listGateways = mock(() => Promise.resolve({ status: "ok", data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { pickDirectory, connectProject, cloneProject, getSetting, listProjects, listSessions },
+  commands: { pickDirectory, connectProject, cloneProject, getSetting, listProjects, listSessions, listGateways },
   events: { coreEventMsg: { listen: mock(() => Promise.resolve(() => {})) } },
 }));
 
@@ -35,6 +39,7 @@ beforeEach(() => {
   getSetting.mockClear();
   listProjects.mockClear();
   listSessions.mockClear();
+  listGateways.mockClear();
 });
 
 afterEach(cleanup);
@@ -52,7 +57,7 @@ test("open-folder mode connects the picked directory under its basename", async 
 
   await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   expect(pickDirectory).toHaveBeenCalledTimes(1);
-  expect(connectProject).toHaveBeenCalledWith("C:\\code\\demo", "demo");
+  expect(connectProject).toHaveBeenCalledWith(LOCAL_RUNNER, "C:\\code\\demo", "demo");
 });
 
 test("clone mode defaults the destination from the projects_root setting and submits", async () => {
@@ -72,7 +77,7 @@ test("clone mode defaults the destination from the projects_root setting and sub
 
   fireEvent.click(clone);
   await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-  expect(cloneProject).toHaveBeenCalledWith("https://github.com/user/repo.git", "C:\\proj");
+  expect(cloneProject).toHaveBeenCalledWith(LOCAL_RUNNER, "https://github.com/user/repo.git", "C:\\proj");
 });
 
 test("Browse overrides the clone destination for this clone only", async () => {

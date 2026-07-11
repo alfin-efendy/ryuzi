@@ -3,6 +3,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useGateways } from "@/store-gateways";
+import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const { Sidebar } = await import("./Sidebar");
 
@@ -15,8 +16,12 @@ function seedGateways() {
 
 afterEach(cleanup);
 
+const k1 = sessKey(LOCAL_RUNNER, "s1");
+const k2 = sessKey(LOCAL_RUNNER, "s2");
+
 function sess(pk: string, lastActive: number) {
   return {
+    runnerId: LOCAL_RUNNER,
     sessionPk: pk,
     projectId: "p",
     agentSessionId: null,
@@ -53,11 +58,11 @@ function project() {
 
 test("renders an unread dot for an unread, non-focused session", () => {
   seedGateways();
-  useUi.setState({ readAt: { s1: 100, s2: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.setState({ readAt: { [k1]: 100, [k2]: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
   useStore.setState({
     projects: [project()],
     sessions: [sess("s1", 500), sess("s2", 50)], // s1 unread (500>100), s2 read (50<100)
-    focusedSessionPk: null,
+    focusedSession: null,
     pendingApprovals: [],
   });
   render(<Sidebar />);
@@ -68,11 +73,11 @@ test("renders an unread dot for an unread, non-focused session", () => {
 
 test("does not show an unread dot for the focused session even if unseen", () => {
   seedGateways();
-  useUi.setState({ readAt: { s1: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.setState({ readAt: { [k1]: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
   useStore.setState({
     projects: [project()],
     sessions: [sess("s1", 500)],
-    focusedSessionPk: "s1",
+    focusedSession: { runnerId: LOCAL_RUNNER, pk: "s1" },
     pendingApprovals: [],
   });
   render(<Sidebar />);

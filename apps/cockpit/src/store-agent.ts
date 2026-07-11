@@ -43,7 +43,7 @@ export const useAgent = create<AgentState>((set, get) => ({
   loaded: false,
 
   load: async () => {
-    const [settings, models] = await Promise.all([commands.getAgentSettings(), commands.listSelectableModels()]);
+    const [settings, models] = await Promise.all([commands.getAgentSettings("local"), commands.listSelectableModels("local")]);
     if (settings.status === "ok") {
       set({ model: settings.data.model, permMode: (settings.data.permMode as AgentPermMode | null) ?? null, loaded: true });
     } else {
@@ -59,7 +59,7 @@ export const useAgent = create<AgentState>((set, get) => ({
     const prev = get().model;
     // Optimistic paint; roll back on a rejected write.
     set({ model });
-    const res = await commands.setAgentSettings(model, get().permMode);
+    const res = await commands.setAgentSettings("local", model, get().permMode);
     if (res.status === "error") {
       set({ model: prev });
       toast.error(`Default model failed: ${res.error.message}`);

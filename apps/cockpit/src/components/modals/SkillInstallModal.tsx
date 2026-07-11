@@ -5,6 +5,7 @@ import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
 import { commands, type TrustPromptDto } from "@/bindings";
 import { StatusDot } from "@/components/common/bits";
 import { usePlugins } from "@/store-plugins";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const WARN = "#F59E0B";
 
@@ -41,7 +42,7 @@ export function SkillInstallModal({
   const begin = useCallback(
     async (target: string) => {
       setBusy(true);
-      const res = await commands.beginSkillInstall(target);
+      const res = await commands.beginSkillInstall(LOCAL_RUNNER, target);
       setBusy(false);
       if (res.status === "error") {
         toast.error(`Skill install failed: ${res.error.message}`);
@@ -79,7 +80,7 @@ export function SkillInstallModal({
   const confirm = async () => {
     if (!trust || busy) return;
     setBusy(true);
-    const res = await commands.confirmSkillInstall(trust.token);
+    const res = await commands.confirmSkillInstall(LOCAL_RUNNER, trust.token);
     setBusy(false);
     if (res.status === "error") {
       toast.error(`Skill install failed: ${res.error.message}`);

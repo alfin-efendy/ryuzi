@@ -4,7 +4,6 @@ import {
   commands,
   events,
   type Project,
-  type Session,
   type CoreEvent,
   type Message,
   type ChatRequestOptions,
@@ -20,8 +19,10 @@ import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 import { notifier, notifyIntentForEvent, isWindowFocused } from "@/lib/notify";
 import { enqueue, dequeue, removeById, type QueuedMessage } from "@/lib/queue";
+import { LOCAL_RUNNER, sessKey, refKey, isSession, sameRef, refOf, type SessionRef, type UiSession } from "@/lib/session-key";
 
 export type PendingApproval = {
+  runnerId: string;
   sessionPk: string;
   requestId: string;
   tool: string;
@@ -43,10 +44,13 @@ export type ChatOptions = {
 
 type State = {
   projects: Project[];
-  sessions: Session[];
+  sessions: UiSession[];
+  /** Per-session state, keyed by `sessKey(runnerId, session_pk)` — session pks
+   *  collide across runners (each its own DB), so the runner MUST be part of
+   *  the key. */
   transcripts: Record<string, Row[]>;
   pendingApprovals: PendingApproval[];
-  focusedSessionPk: string | null;
+  focusedSession: SessionRef | null;
   selectedProjectId: string | null;
   lastSeq: Record<string, number>;
   loaded: Record<string, boolean>;
@@ -66,13 +70,15 @@ type State = {
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
   /** Per-session in-memory type-ahead queue (messages typed while running). */
   queued: Record<string, QueuedMessage[]>;
-  enqueueMessage: (sessionPk: string, msg: QueuedMessage) => void;
-  removeQueued: (sessionPk: string, id: string) => void;
+  enqueueMessage: (runnerId: string, sessionPk: string, msg: QueuedMessage) => void;
+  removeQueued: (runnerId: string, sessionPk: string, id: string) => void;
   /** Send the head of a session's queue; on send-failure re-queue it at the front. */
-  sendNextQueued: (sessionPk: string) => Promise<void>;
-  applyCoreEvent: (e: CoreEvent) => void;
+  sendNextQueued: (runnerId: string, sessionPk: string) => Promise<void>;
+  /** `runnerId` is the runner that produced the event (from the CoreEventMsg
+   *  wrapper). */
+  applyCoreEvent: (e: CoreEvent, runnerId: string) => void;
   clearApproval: (requestId: string) => void;
-  setFocused: (pk: string | null) => void;
+  setFocused: (ref: SessionRef | null) => void;
   selectProject: (id: string | null) => void;
   refresh: () => Promise<void>;
   /** Native folder picker → connect_project. True when a project was added. */
@@ -82,26 +88,27 @@ type State = {
   /** Pin (or clear, with null) the model future turns of this project use. */
   setProjectModel: (projectId: string, model: string | null) => Promise<void>;
   /** Change the permission mode this session (only this session) runs under. */
-  setSessionPermMode: (sessionPk: string, permMode: PermMode) => Promise<void>;
+  setSessionPermMode: (runnerId: string, sessionPk: string, permMode: PermMode) => Promise<void>;
   /** Resolves true as soon as the backend accepts — navigate immediately;
-   *  the session list refresh completes in the background. */
-  start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
+   *  the session list refresh completes in the background. `runnerId` is the
+   *  runner the session is created on (defaults to the local engine). */
+  start: (runnerId: string, projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
   /** Same shape as `start`, but for a chat-first session with no project
    *  (`start_chat_session`) — Home's default when no project is attached. */
-  startChat: (prompt: string, options?: ChatOptions | null) => Promise<boolean>;
+  startChat: (runnerId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
   /** Resolves true when the backend accepted the prompt — false lets the
    *  composer restore its optimistically-cleared draft. */
-  send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
-  stop: (sessionPk: string) => Promise<void>;
+  send: (runnerId: string, sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
+  stop: (runnerId: string, sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
-  end: (sessionPk: string) => Promise<boolean>;
-  resolveApproval: (requestId: string, response: ApprovalResponse) => Promise<void>;
-  hydrateTranscript: (pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
+  end: (runnerId: string, sessionPk: string) => Promise<boolean>;
+  resolveApproval: (runnerId: string, requestId: string, response: ApprovalResponse) => Promise<void>;
+  hydrateTranscript: (runnerId: string, pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
   init: () => Promise<void>;
 };
 
-function append(map: Record<string, Row[]>, pk: string, row: Row): Record<string, Row[]> {
-  return { ...map, [pk]: [...(map[pk] ?? []), row] };
+function append(map: Record<string, Row[]>, key: string, row: Row): Record<string, Row[]> {
+  return { ...map, [key]: [...(map[key] ?? []), row] };
 }
 
 function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions | null {
@@ -127,23 +134,26 @@ export const useStore = create<State>((set, get) => ({
   transcripts: {},
   pendingApprovals: [],
   queued: {},
-  focusedSessionPk: null,
+  focusedSession: null,
   selectedProjectId: null,
   lastSeq: {},
   loaded: {},
   contextUsage: {},
   sessionCost: {},
 
-  applyCoreEvent: (e) =>
+  applyCoreEvent: (e, runnerId) =>
     set((st) => {
+      // The single composite key used for EVERY per-session map touched below.
+      // Non-session events (jobRunChanged/oauth/…) fall through the switch's
+      // default before this is meaningfully used.
+      const key = "session_pk" in e ? sessKey(runnerId, e.session_pk) : "";
       switch (e.kind) {
         case "sessionCreated":
           return {
-            transcripts: { ...st.transcripts, [e.session_pk]: st.transcripts[e.session_pk] ?? [] },
-            loaded: { ...st.loaded, [e.session_pk]: true },
+            transcripts: { ...st.transcripts, [key]: st.transcripts[key] ?? [] },
+            loaded: { ...st.loaded, [key]: true },
           };
         case "message": {
-          const pk = e.session_pk;
           // A COMPLETED `todowrite` means this session's todo list just changed
           // in the DB — refetch so the plan widget updates mid-run instead of
           // waiting for the run to settle. (The initial in_progress emit fires
@@ -151,25 +161,30 @@ export const useStore = create<State>((set, get) => ({
           // Fire-and-forget: loadTodos' fetch token drops out-of-order replies.
           const payload = (e.payload ?? {}) as Record<string, unknown>;
           if (e.block_type === "tool_call" && payload.name === "todowrite" && e.status === "completed") {
-            void useNative.getState().loadTodos(pk);
+            void useNative.getState().loadTodos(runnerId, e.session_pk);
           }
+          // CORRUPTION-CRITICAL: the tool-upsert lookup, the high-water
+          // read/write, the append, and hydrateTranscript ALL use `key`
+          // (the composite runner+pk). If any diverged, tool updates would
+          // land in one bucket while appends land in another — silent
+          // transcript corruption.
           // Tool updates re-use the original row's seq — upsert by identity
           // BEFORE the seq high-water guard would drop them as stale.
           if (e.tool_call_id) {
-            const rows = st.transcripts[pk] ?? [];
+            const rows = st.transcripts[key] ?? [];
             const idx = rows.findIndex((r) => r.toolCallId === e.tool_call_id);
             if (idx >= 0) {
               const next = rows.slice();
               next[idx] = mergeToolRow(rows[idx], e.payload, e.status, e.tool_kind);
-              return { transcripts: { ...st.transcripts, [pk]: next } };
+              return { transcripts: { ...st.transcripts, [key]: next } };
             }
           }
-          const prev = st.lastSeq[pk] ?? 0;
+          const prev = st.lastSeq[key] ?? 0;
           if (e.seq <= prev) return {}; // stale/duplicate (covers reload/replay races)
           const row = messageToRow(e.seq, e.role, e.block_type, e.payload, e.tool_call_id, e.status, e.tool_kind, Date.now());
           return {
-            transcripts: append(st.transcripts, pk, row),
-            lastSeq: { ...st.lastSeq, [pk]: e.seq },
+            transcripts: append(st.transcripts, key, row),
+            lastSeq: { ...st.lastSeq, [key]: e.seq },
           };
         }
         case "error":
@@ -181,12 +196,15 @@ export const useStore = create<State>((set, get) => ({
           // leaves Stop mode, the "Working…" pulse stops) and refresh so the
           // DB-side Running→Idle demotion lands in the UI.
           void get().refresh();
-          return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
+          return {
+            sessions: st.sessions.map((s) => (isSession(s, { runnerId, pk: e.session_pk }) ? { ...s, status: "idle" as const } : s)),
+          };
         case "approvalRequested":
           return {
             pendingApprovals: [
               ...st.pendingApprovals,
               {
+                runnerId,
                 sessionPk: e.session_pk,
                 requestId: e.request_id,
                 tool: e.tool,
@@ -203,14 +221,18 @@ export const useStore = create<State>((set, get) => ({
           // has already backfilled the DB row — refresh now so the UI picks it up instead
           // of waiting for some unrelated action to call refresh().
           void get().refresh();
-          return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "idle" as const } : s)) };
+          return {
+            sessions: st.sessions.map((s) => (isSession(s, { runnerId, pk: e.session_pk }) ? { ...s, status: "idle" as const } : s)),
+          };
         case "sessionEnded":
-          return { sessions: st.sessions.map((s) => (s.sessionPk === e.session_pk ? { ...s, status: "ended" as const } : s)) };
+          return {
+            sessions: st.sessions.map((s) => (isSession(s, { runnerId, pk: e.session_pk }) ? { ...s, status: "ended" as const } : s)),
+          };
         case "contextUsage":
           return {
             contextUsage: {
               ...st.contextUsage,
-              [e.session_pk]: {
+              [key]: {
                 activeTokens: e.active_tokens,
                 usableWindow: e.usable_window,
                 percentLeft: e.percent_left,
@@ -224,7 +246,7 @@ export const useStore = create<State>((set, get) => ({
           return {
             sessionCost: {
               ...st.sessionCost,
-              [e.session_pk]: { totalUsd: e.total_usd, models: e.models },
+              [key]: { totalUsd: e.total_usd, models: e.models },
             },
           };
         case "contextCompacted":
@@ -238,23 +260,24 @@ export const useStore = create<State>((set, get) => ({
 
   clearApproval: (requestId) => set((st) => ({ pendingApprovals: st.pendingApprovals.filter((a) => a.requestId !== requestId) })),
 
-  setFocused: (pk) => {
-    const prev = get().focusedSessionPk;
-    if (prev && prev !== pk) {
-      const prevSession = get().sessions.find((s) => s.sessionPk === prev);
-      if (prevSession) useUi.getState().markRead(prev, prevSession.lastActive ?? 0);
+  setFocused: (ref) => {
+    const prev = get().focusedSession;
+    if (prev && !sameRef(prev, ref)) {
+      const prevSession = get().sessions.find((s) => isSession(s, prev));
+      if (prevSession) useUi.getState().markRead(refKey(prev), prevSession.lastActive ?? 0);
     }
-    set({ focusedSessionPk: pk });
-    if (pk) notifier.cancelSettle(pk);
-    if (pk && !get().loaded[pk]) void get().hydrateTranscript(pk);
+    set({ focusedSession: ref });
+    if (ref) notifier.cancelSettle(ref.runnerId, ref.pk);
+    if (ref && !get().loaded[refKey(ref)]) void get().hydrateTranscript(ref.runnerId, ref.pk);
   },
 
-  hydrateTranscript: async (pk, fetcher) => {
-    if (get().loaded[pk]) return;
+  hydrateTranscript: async (runnerId, pk, fetcher) => {
+    const key = sessKey(runnerId, pk);
+    if (get().loaded[key]) return;
     const rows = fetcher
       ? await fetcher(pk)
       : await (async () => {
-          const res = await commands.listMessages(pk);
+          const res = await commands.listMessages(runnerId, pk);
           return res.status === "ok" ? res.data : [];
         })();
     const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind, m.createdAt));
@@ -262,34 +285,55 @@ export const useStore = create<State>((set, get) => ({
     set((st) => {
       // Rows appended by applyCoreEvent while listMessages was in flight
       // (fresher than the snapshot) must survive the replace. seq-0 rows are
-      // kept defensively — no reducer currently produces them.
-      const liveTail = (st.transcripts[pk] ?? []).filter((r) => r.seq > maxSeq || r.seq === 0);
+      // kept defensively — no reducer currently produces them. Same composite
+      // `key` as the message reducer — see the CORRUPTION-CRITICAL note there.
+      const liveTail = (st.transcripts[key] ?? []).filter((r) => r.seq > maxSeq || r.seq === 0);
       return {
-        transcripts: { ...st.transcripts, [pk]: [...hydrated, ...liveTail] },
-        lastSeq: { ...st.lastSeq, [pk]: Math.max(st.lastSeq[pk] ?? 0, maxSeq) },
-        loaded: { ...st.loaded, [pk]: true },
+        transcripts: { ...st.transcripts, [key]: [...hydrated, ...liveTail] },
+        lastSeq: { ...st.lastSeq, [key]: Math.max(st.lastSeq[key] ?? 0, maxSeq) },
+        loaded: { ...st.loaded, [key]: true },
       };
     });
   },
 
   // Selecting a project clears the focused session so the center shows the "start a new session" composer.
-  selectProject: (id) => set({ selectedProjectId: id, focusedSessionPk: null }),
+  selectProject: (id) => set({ selectedProjectId: id, focusedSession: null }),
 
   refresh: async () => {
-    const projects = await commands.listProjects();
-    const sessions = await commands.listSessions(null);
+    // Fan out across every reachable runner: the local engine (always present)
+    // plus any connected remote gateways. Each runner is its own DB, so its
+    // sessions are stamped with the runner id that produced them and merged
+    // into one flat list. Projects come from the local engine.
+    const projects = await commands.listProjects(LOCAL_RUNNER);
     if (projects.status === "ok") set({ projects: projects.data });
-    if (sessions.status === "ok") {
-      set({ sessions: sessions.data });
-      useUi.getState().seedReadState(sessions.data);
+
+    const runnerIds = new Set<string>([LOCAL_RUNNER]);
+    const gateways = await commands.listGateways(LOCAL_RUNNER);
+    if (gateways.status === "ok") {
+      for (const g of gateways.data) {
+        // The local gateway is already covered by LOCAL_RUNNER; only pull in
+        // remote runners we can actually reach.
+        if (g.kind !== "local" && g.status === "connected") runnerIds.add(g.id);
+      }
     }
+
+    const perRunner = await Promise.all(
+      [...runnerIds].map(async (runnerId): Promise<UiSession[]> => {
+        const res = await commands.listSessions(runnerId, null);
+        return res.status === "ok" ? res.data.map((s) => ({ ...s, runnerId })) : [];
+      }),
+    );
+    const sessions = perRunner.flat();
+    set({ sessions });
+    useUi.getState().seedReadState(sessions);
   },
 
   addProject: async () => {
     const dir = await commands.pickDirectory();
     if (!dir) return false;
     const name = basename(dir) || "project";
-    const res = await commands.connectProject(dir, name);
+    // Projects are managed on the local engine.
+    const res = await commands.connectProject(LOCAL_RUNNER, dir, name);
     if (res.status === "ok") {
       await get().refresh();
       return true;
@@ -299,7 +343,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   cloneProject: async (url, destParent) => {
-    const res = await commands.cloneProject(url, destParent);
+    const res = await commands.cloneProject(LOCAL_RUNNER, url, destParent);
     if (res.status === "ok") {
       await get().refresh();
       return true;
@@ -315,94 +359,105 @@ export const useStore = create<State>((set, get) => ({
     if ((project.model ?? null) === next) return;
     // Optimistic paint so the composer label updates immediately.
     set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, model: next } : p)) });
-    const res = await commands.updateProject(projectId, next, project.permMode);
+    const res = await commands.updateProject(LOCAL_RUNNER, projectId, next, project.permMode);
     if (res.status === "error") {
       toast.error("Couldn't set model: " + res.error.message);
       await get().refresh();
     }
   },
-  setSessionPermMode: async (sessionPk, permMode) => {
-    const session = get().sessions.find((s) => s.sessionPk === sessionPk);
+  setSessionPermMode: async (runnerId, sessionPk, permMode) => {
+    const session = get().sessions.find((s) => isSession(s, { runnerId, pk: sessionPk }));
     if (!session || session.permMode === permMode) return;
-    set({ sessions: get().sessions.map((s) => (s.sessionPk === sessionPk ? { ...s, permMode } : s)) });
-    const res = await commands.updateSessionPermMode(sessionPk, permMode);
+    set({ sessions: get().sessions.map((s) => (isSession(s, { runnerId, pk: sessionPk }) ? { ...s, permMode } : s)) });
+    const res = await commands.updateSessionPermMode(runnerId, sessionPk, permMode);
     if (res.status === "error") {
       toast.error("Couldn't set permission mode: " + res.error.message);
       await get().refresh();
     }
   },
 
-  start: async (projectId, prompt, options) => {
-    const res = await commands.startSession(projectId, prompt, toChatRequestOptions(options));
+  start: async (runnerId, projectId, prompt, options) => {
+    const res = await commands.startSession(runnerId, projectId, prompt, toChatRequestOptions(options));
     if (res.status === "error") {
       toast.error("Couldn't start session: " + res.error.message);
       return false;
     }
     // Optimistic navigation: the backend returns the session row before its
-    // git/harness startup finishes. Seed and focus it now; the full refresh
-    // catches up in the background.
-    set({ focusedSessionPk: res.data.sessionPk, sessions: [...get().sessions, res.data] });
+    // git/harness startup finishes. Seed (stamped with its runner) and focus
+    // it now; the full refresh catches up in the background.
+    const seeded: UiSession = { ...res.data, runnerId };
+    set({ focusedSession: refOf(seeded), sessions: [...get().sessions, seeded] });
     void get().refresh();
     return true;
   },
-  startChat: async (prompt, options) => {
-    const res = await commands.startChatSession(prompt, toChatRequestOptions(options));
+  startChat: async (runnerId, prompt, options) => {
+    const res = await commands.startChatSession(runnerId, prompt, toChatRequestOptions(options));
     if (res.status === "error") {
       toast.error("Couldn't start chat: " + res.error.message);
       return false;
     }
     // Same optimistic-navigation seed as start(): focus the returned row
     // immediately, then let the background refresh catch up.
-    set({ focusedSessionPk: res.data.sessionPk, sessions: [...get().sessions, res.data] });
+    const seeded: UiSession = { ...res.data, runnerId };
+    set({ focusedSession: refOf(seeded), sessions: [...get().sessions, seeded] });
     void get().refresh();
     return true;
   },
-  send: async (sessionPk, prompt, options) => {
+  send: async (runnerId, sessionPk, prompt, options) => {
     // A session already RUNNING a turn gets steered — the message is
     // injected into that turn's next tool-result batch instead of racing a
     // whole new turn onto the session. Any other status (idle, interrupted,
-    // ended) starts a normal continue.
-    const isRunning = get().sessions.find((s) => s.sessionPk === sessionPk)?.status === "running";
+    // ended) starts a normal continue. Matched within the correct runner.
+    const isRunning = get().sessions.find((s) => isSession(s, { runnerId, pk: sessionPk }))?.status === "running";
     const res = isRunning
-      ? await commands.steerSession(sessionPk, prompt)
-      : await commands.continueSession(sessionPk, prompt, toChatRequestOptions(options));
+      ? await commands.steerSession(runnerId, sessionPk, prompt)
+      : await commands.continueSession(runnerId, sessionPk, prompt, toChatRequestOptions(options));
     if (res.status === "error") {
       toast.error("Couldn't send message: " + res.error.message);
     }
     await get().refresh();
     return res.status === "ok";
   },
-  enqueueMessage: (sessionPk, msg) => set((st) => ({ queued: { ...st.queued, [sessionPk]: enqueue(st.queued[sessionPk], msg) } })),
-  removeQueued: (sessionPk, id) => set((st) => ({ queued: { ...st.queued, [sessionPk]: removeById(st.queued[sessionPk], id) } })),
-  sendNextQueued: async (sessionPk) => {
-    const { head, rest } = dequeue(get().queued[sessionPk]);
+  enqueueMessage: (runnerId, sessionPk, msg) =>
+    set((st) => {
+      const key = sessKey(runnerId, sessionPk);
+      return { queued: { ...st.queued, [key]: enqueue(st.queued[key], msg) } };
+    }),
+  removeQueued: (runnerId, sessionPk, id) =>
+    set((st) => {
+      const key = sessKey(runnerId, sessionPk);
+      return { queued: { ...st.queued, [key]: removeById(st.queued[key], id) } };
+    }),
+  sendNextQueued: async (runnerId, sessionPk) => {
+    const key = sessKey(runnerId, sessionPk);
+    const { head, rest } = dequeue(get().queued[key]);
     if (!head) return;
     // Remove the head BEFORE awaiting so a second `result` can't re-send it.
-    set((st) => ({ queued: { ...st.queued, [sessionPk]: rest } }));
-    const ok = await get().send(sessionPk, head.text, head.options);
+    set((st) => ({ queued: { ...st.queued, [key]: rest } }));
+    const ok = await get().send(runnerId, sessionPk, head.text, head.options);
     if (!ok) {
       // Command-level rejection: put it back at the front so it stays visible.
-      set((st) => ({ queued: { ...st.queued, [sessionPk]: [head, ...(st.queued[sessionPk] ?? [])] } }));
+      set((st) => ({ queued: { ...st.queued, [key]: [head, ...(st.queued[key] ?? [])] } }));
     }
   },
-  stop: async (sessionPk) => {
-    const res = await commands.stopSession(sessionPk);
+  stop: async (runnerId, sessionPk) => {
+    const res = await commands.stopSession(runnerId, sessionPk);
     if (res.status === "error") {
       toast.error("Couldn't stop session: " + res.error.message);
     }
     await get().refresh();
   },
-  end: async (sessionPk) => {
-    const res = await commands.endSession(sessionPk);
+  end: async (runnerId, sessionPk) => {
+    const res = await commands.endSession(runnerId, sessionPk);
     if (res.status === "error") {
       toast.error("Couldn't end session: " + res.error.message);
     }
     await get().refresh();
     return res.status === "ok";
   },
-  resolveApproval: async (requestId, response) => {
+  resolveApproval: async (runnerId, requestId, response) => {
     try {
-      await commands.resolveApproval(requestId, response);
+      await commands.resolveApproval(runnerId, requestId, response);
       get().clearApproval(requestId);
     } catch (e) {
       console.error("resolveApproval failed", e);
@@ -413,20 +468,20 @@ export const useStore = create<State>((set, get) => ({
   init: async () => {
     await get().refresh();
     await events.coreEventMsg.listen((e) => {
-      const event = e.payload.event;
-      get().applyCoreEvent(event);
+      const { runnerId, event } = e.payload;
+      get().applyCoreEvent(event, runnerId);
       // Keep the actively-viewed session marked read as its activity streams in.
-      markFocusedSessionReadOnEvent(event, get().focusedSessionPk);
+      markFocusedSessionReadOnEvent(event, runnerId, get().focusedSession);
       // OS notification for attention events (suppressed while focused).
-      const intent = notifyIntentForEvent(event, get().focusedSessionPk, isWindowFocused());
+      const intent = notifyIntentForEvent(event, runnerId, isWindowFocused());
       const evtPk = (event as { session_pk?: string }).session_pk;
-      if (evtPk) notifier.cancelSettle(evtPk); // any activity supersedes a pending settle
+      if (evtPk) notifier.cancelSettle(runnerId, evtPk); // any activity supersedes a pending settle
       if (intent)
         notifier.handle(
           intent,
-          get().sessions.find((s) => s.sessionPk === intent.sessionPk),
+          get().sessions.find((s) => isSession(s, { runnerId: intent.runnerId, pk: intent.sessionPk })),
         );
-      drainQueueOnEvent(event);
+      drainQueueOnEvent(event, runnerId);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
@@ -441,10 +496,10 @@ export const useStore = create<State>((set, get) => ({
  * `init()` listener so the decision is testable without driving a real Tauri
  * event subscription.
  */
-export function markFocusedSessionReadOnEvent(event: CoreEvent, focusedSessionPk: string | null): void {
+export function markFocusedSessionReadOnEvent(event: CoreEvent, runnerId: string, focusedSession: SessionRef | null): void {
   const activePk = (event as { session_pk?: string }).session_pk;
-  if (activePk && activePk === focusedSessionPk) {
-    useUi.getState().markRead(activePk, Date.now());
+  if (activePk && focusedSession && sameRef({ runnerId, pk: activePk }, focusedSession)) {
+    useUi.getState().markRead(sessKey(runnerId, activePk), Date.now());
   }
 }
 
@@ -454,8 +509,8 @@ export function markFocusedSessionReadOnEvent(event: CoreEvent, focusedSessionPk
  * stays put (structural pause). Extracted so the decision is testable without
  * a real Tauri event subscription.
  */
-export function drainQueueOnEvent(event: CoreEvent): void {
+export function drainQueueOnEvent(event: CoreEvent, runnerId: string): void {
   if (event.kind !== "result") return;
   const pk = (event as { session_pk?: string }).session_pk;
-  if (pk) void useStore.getState().sendNextQueued(pk);
+  if (pk) void useStore.getState().sendNextQueued(runnerId, pk);
 }

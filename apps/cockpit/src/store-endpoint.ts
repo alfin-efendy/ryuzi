@@ -32,14 +32,14 @@ export const useEndpoint = create<EndpointState>((set) => ({
   loaded: false,
 
   hydrate: async () => {
-    const [st, ks] = await Promise.all([commands.endpointStatus(), commands.listEndpointKeys()]);
+    const [st, ks] = await Promise.all([commands.endpointStatus("local"), commands.listEndpointKeys("local")]);
     if (st.status === "ok") set({ status: st.data });
     if (ks.status === "ok") set({ keys: ks.data });
     set({ loaded: true });
   },
-  start: async () => applyStatus(set, await commands.startEndpoint(), "Start endpoint"),
-  stop: async () => applyStatus(set, await commands.stopEndpoint(), "Stop endpoint"),
-  setConfig: async (port, autostart) => applyStatus(set, await commands.setEndpointConfig(port, autostart), "Endpoint config"),
-  createKey: async (name) => applyKeys(set, await commands.createEndpointKey(name), "Create key"),
-  revokeKey: async (id) => applyKeys(set, await commands.revokeEndpointKey(id), "Revoke key"),
+  start: async () => applyStatus(set, await commands.startEndpoint("local"), "Start endpoint"),
+  stop: async () => applyStatus(set, await commands.stopEndpoint("local"), "Stop endpoint"),
+  setConfig: async (port, autostart) => applyStatus(set, await commands.setEndpointConfig("local", port, autostart), "Endpoint config"),
+  createKey: async (name) => applyKeys(set, await commands.createEndpointKey("local", name), "Create key"),
+  revokeKey: async (id) => applyKeys(set, await commands.revokeEndpointKey("local", id), "Revoke key"),
 }));

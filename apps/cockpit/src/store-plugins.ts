@@ -44,18 +44,18 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   doctorLoaded: false,
 
   load: async () => {
-    const res = await commands.listPlugins();
+    const res = await commands.listPlugins("local");
     if (res.status === "ok") set({ plugins: res.data, loaded: true });
     else toast.error(`Plugin list failed: ${res.error.message}`);
 
     // Best-effort: a failure here shouldn't block the plugin list itself, so
     // it's silently skipped (the restart banner just stays as it was).
-    const restartRes = await commands.pluginsRestartRequired();
+    const restartRes = await commands.pluginsRestartRequired("local");
     if (restartRes.status === "ok") set({ restartRequired: restartRes.data });
   },
 
   loadDoctor: async () => {
-    const res = await commands.pluginDoctor();
+    const res = await commands.pluginDoctor("local");
     if (res.status === "ok") set({ doctorFindings: res.data, doctorLoaded: true });
     else toast.error(`Doctor check failed: ${res.error.message}`);
   },
@@ -65,13 +65,13 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     // returns no list (unlike most toggle commands), so reload afterwards
     // to reconcile with the engine's authoritative state either way.
     set({ plugins: get().plugins.map((p) => (p.id === id ? { ...p, enabled: on } : p)) });
-    const res = await commands.setPluginEnabled(id, on);
+    const res = await commands.setPluginEnabled("local", id, on);
     if (res.status === "error") toast.error(`Plugin update failed: ${res.error.message}`);
     await get().load();
   },
 
   uninstall: async (id) => {
-    const res = await commands.uninstallPlugin(id);
+    const res = await commands.uninstallPlugin("local", id);
     if (res.status === "error") {
       toast.error(`Uninstall failed: ${res.error.message}`);
       return false;
@@ -81,7 +81,7 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   },
 
   update: async (id, force) => {
-    const res = await commands.updatePlugin(id, force);
+    const res = await commands.updatePlugin("local", id, force);
     if (res.status === "error") {
       toast.error(`Update failed: ${res.error.message}`);
     } else {
@@ -116,7 +116,7 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     // `plugin_installs.pinned` ledger flag either way — success or error —
     // so a failed write never leaves a stale optimistic pin behind.
     set({ plugins: get().plugins.map((p) => (p.id === id ? { ...p, pinned } : p)) });
-    const res = await commands.setPluginPin(id, pinned, reason ?? null);
+    const res = await commands.setPluginPin("local", id, pinned, reason ?? null);
     if (res.status === "error") toast.error(`Pin update failed: ${res.error.message}`);
     else toast.success(pinned ? "Pinned" : "Unpinned");
     await get().load();

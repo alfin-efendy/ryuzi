@@ -5,7 +5,7 @@ import { workspaceFileExists } from "@/lib/file-probe";
 import { useUi } from "@/store-ui";
 import { useNav } from "@/store-nav";
 
-export type TranscriptFileCtx = { sessionPk: string; workdir: string };
+export type TranscriptFileCtx = { runnerId: string; sessionPk: string; workdir: string };
 
 /** Session file context for transcript markdown: present only under a
  *  session's Transcript, so shared Markdown consumers (FileViewer, …) render
@@ -57,7 +57,7 @@ export function WorkspacePathCode({ text, className }: { text: string; className
     setExists(false);
     if (!ctx || candidate === null) return;
     let alive = true;
-    void workspaceFileExists(ctx.sessionPk, candidate).then((ok) => {
+    void workspaceFileExists(ctx.runnerId, ctx.sessionPk, candidate).then((ok) => {
       if (alive) setExists(ok);
     });
     return () => {

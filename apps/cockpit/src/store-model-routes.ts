@@ -29,13 +29,13 @@ export const useModelRoutes = create<ModelRoutesState>((set) => ({
   loaded: false,
 
   hydrate: async () => {
-    const res = await commands.listModelRoutes();
+    const res = await commands.listModelRoutes("local");
     if (res.status === "ok") set({ routes: res.data, loaded: true });
     else {
       set({ loaded: true });
       toast.error(`Routes failed: ${res.error.message}`);
     }
   },
-  save: async (route) => apply(set, await commands.saveModelRoute(route), "Save route"),
-  remove: async (id) => apply(set, await commands.deleteModelRoute(id), "Delete route"),
+  save: async (route) => apply(set, await commands.saveModelRoute("local", route), "Save route"),
+  remove: async (id) => apply(set, await commands.deleteModelRoute("local", id), "Delete route"),
 }));

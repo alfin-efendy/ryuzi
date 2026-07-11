@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { attentionCount, notifyIntentForEvent } from "./notify";
 import type { Session, CoreEvent } from "../bindings";
+import { LOCAL_RUNNER, sessKey, type UiSession } from "./session-key";
 
-function sess(pk: string, lastActive: number | null): Session {
-  return {
+function sess(pk: string, lastActive: number | null): UiSession {
+  const s: Session = {
     sessionPk: pk,
     projectId: "p",
     agentSessionId: null,
@@ -22,30 +23,36 @@ function sess(pk: string, lastActive: number | null): Session {
     agent: null,
     parentSessionPk: null,
   };
+  return { ...s, runnerId: LOCAL_RUNNER };
 }
+
+const KA = sessKey(LOCAL_RUNNER, "a");
+const KB = sessKey(LOCAL_RUNNER, "b");
+const KC = sessKey(LOCAL_RUNNER, "c");
 
 test("attentionCount = unread sessions + pending approvals; focused excluded", () => {
   const sessions = [sess("a", 500), sess("b", 50), sess("c", 900)];
-  const readAt = { a: 100, b: 100, c: 100 }; // a,c unread; b read
+  const readAt = { [KA]: 100, [KB]: 100, [KC]: 100 }; // a,c unread; b read
   // focused = c → c not counted; +2 pending
-  expect(attentionCount(sessions, readAt, "c", 2)).toBe(1 + 2); // only a unread + 2
+  expect(attentionCount(sessions, readAt, { runnerId: LOCAL_RUNNER, pk: "c" }, 2)).toBe(1 + 2); // only a unread + 2
   // no focus → a,c unread + 0 pending
   expect(attentionCount(sessions, readAt, null, 0)).toBe(2);
 });
 
 test("attentionCount zero when all read and none pending", () => {
-  expect(attentionCount([sess("a", 100)], { a: 100 }, null, 0)).toBe(0);
+  expect(attentionCount([sess("a", 100)], { [KA]: 100 }, null, 0)).toBe(0);
 });
 
 const ev = (o: Record<string, unknown>) => o as unknown as CoreEvent;
 
 test("windowFocused suppresses every intent", () => {
-  expect(notifyIntentForEvent(ev({ kind: "result", session_pk: "a" }), null, true)).toBeNull();
-  expect(notifyIntentForEvent(ev({ kind: "approvalRequested", session_pk: "a", tool: "bash" }), null, true)).toBeNull();
+  expect(notifyIntentForEvent(ev({ kind: "result", session_pk: "a" }), LOCAL_RUNNER, true)).toBeNull();
+  expect(notifyIntentForEvent(ev({ kind: "approvalRequested", session_pk: "a", tool: "bash" }), LOCAL_RUNNER, true)).toBeNull();
 });
 
 test("result → finished + settle", () => {
-  expect(notifyIntentForEvent(ev({ kind: "result", session_pk: "a" }), null, false)).toEqual({
+  expect(notifyIntentForEvent(ev({ kind: "result", session_pk: "a" }), LOCAL_RUNNER, false)).toEqual({
+    runnerId: LOCAL_RUNNER,
     sessionPk: "a",
     kind: "finished",
     settle: true,
@@ -53,7 +60,8 @@ test("result → finished + settle", () => {
 });
 
 test("approvalRequested → approval immediate with tool detail", () => {
-  expect(notifyIntentForEvent(ev({ kind: "approvalRequested", session_pk: "a", tool: "bash" }), null, false)).toEqual({
+  expect(notifyIntentForEvent(ev({ kind: "approvalRequested", session_pk: "a", tool: "bash" }), LOCAL_RUNNER, false)).toEqual({
+    runnerId: LOCAL_RUNNER,
     sessionPk: "a",
     kind: "approval",
     settle: false,
@@ -62,7 +70,8 @@ test("approvalRequested → approval immediate with tool detail", () => {
 });
 
 test("error → error immediate", () => {
-  expect(notifyIntentForEvent(ev({ kind: "error", session_pk: "a", message: "boom" }), null, false)).toEqual({
+  expect(notifyIntentForEvent(ev({ kind: "error", session_pk: "a", message: "boom" }), LOCAL_RUNNER, false)).toEqual({
+    runnerId: LOCAL_RUNNER,
     sessionPk: "a",
     kind: "error",
     settle: false,
@@ -70,8 +79,8 @@ test("error → error immediate", () => {
 });
 
 test("unrelated events → null", () => {
-  expect(notifyIntentForEvent(ev({ kind: "message", session_pk: "a" }), null, false)).toBeNull();
-  expect(notifyIntentForEvent(ev({ kind: "sessionCreated", session_pk: "a" }), null, false)).toBeNull();
+  expect(notifyIntentForEvent(ev({ kind: "message", session_pk: "a" }), LOCAL_RUNNER, false)).toBeNull();
+  expect(notifyIntentForEvent(ev({ kind: "sessionCreated", session_pk: "a" }), LOCAL_RUNNER, false)).toBeNull();
 });
 
 import { createNotifier, notificationText, SETTLE_MS, type NotifierDeps } from "./notify";
@@ -105,7 +114,7 @@ function fakeDeps(over: Partial<NotifierDeps> = {}) {
 test("settle intent schedules, fires after the settle window", async () => {
   const f = fakeDeps();
   const n = createNotifier(f.deps);
-  n.handle({ sessionPk: "a", kind: "finished", settle: true }, undefined);
+  n.handle({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "finished", settle: true }, undefined);
   expect(f.timers[0].ms).toBe(SETTLE_MS);
   expect(f.sent.length).toBe(0);
   f.runTimers();
@@ -116,8 +125,8 @@ test("settle intent schedules, fires after the settle window", async () => {
 test("a second event for the same session cancels the pending settle", () => {
   const f = fakeDeps();
   const n = createNotifier(f.deps);
-  n.handle({ sessionPk: "a", kind: "finished", settle: true }, undefined);
-  n.cancelSettle("a"); // new activity arrives
+  n.handle({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "finished", settle: true }, undefined);
+  n.cancelSettle(LOCAL_RUNNER, "a"); // new activity arrives
   f.runTimers();
   expect(f.sent.length).toBe(0);
 });
@@ -125,8 +134,8 @@ test("a second event for the same session cancels the pending settle", () => {
 test("immediate intent sends now and cancels any pending settle", async () => {
   const f = fakeDeps();
   const n = createNotifier(f.deps);
-  n.handle({ sessionPk: "a", kind: "finished", settle: true }, undefined);
-  n.handle({ sessionPk: "a", kind: "approval", settle: false, detail: "bash" }, undefined);
+  n.handle({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "finished", settle: true }, undefined);
+  n.handle({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "approval", settle: false, detail: "bash" }, undefined);
   await Promise.resolve();
   expect(f.sent.length).toBe(1);
   expect(f.sent[0].body).toContain("bash");
@@ -138,7 +147,7 @@ test("immediate intent sends now and cancels any pending settle", async () => {
 test("disabled → no send, but updateBadge still works", async () => {
   const f = fakeDeps({ isEnabled: () => false });
   const n = createNotifier(f.deps);
-  n.handle({ sessionPk: "a", kind: "approval", settle: false, detail: "x" }, undefined);
+  n.handle({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "approval", settle: false, detail: "x" }, undefined);
   await Promise.resolve();
   expect(f.sent.length).toBe(0);
   n.updateBadge(3);
@@ -156,7 +165,7 @@ test("updateBadge maps 0 to undefined (clears)", () => {
 test("permission denied → no send", async () => {
   const f = fakeDeps({ ensurePermission: async () => false });
   const n = createNotifier(f.deps);
-  n.handle({ sessionPk: "a", kind: "error", settle: false }, undefined);
+  n.handle({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "error", settle: false }, undefined);
   await Promise.resolve();
   await Promise.resolve();
   expect(f.sent.length).toBe(0);
@@ -164,12 +173,18 @@ test("permission denied → no send", async () => {
 
 test("notificationText formats per kind", () => {
   const s = { title: "My session" } as never;
-  expect(notificationText({ sessionPk: "a", kind: "finished", settle: true }, s)).toEqual({ title: "My session", body: "Turn finished" });
-  expect(notificationText({ sessionPk: "a", kind: "approval", settle: false, detail: "bash" }, s)).toEqual({
+  expect(notificationText({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "finished", settle: true }, s)).toEqual({
+    title: "My session",
+    body: "Turn finished",
+  });
+  expect(notificationText({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "approval", settle: false, detail: "bash" }, s)).toEqual({
     title: "My session",
     body: "Needs approval: bash",
   });
-  expect(notificationText({ sessionPk: "a", kind: "error", settle: false }, s)).toEqual({ title: "My session", body: "Turn errored" });
+  expect(notificationText({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "error", settle: false }, s)).toEqual({
+    title: "My session",
+    body: "Turn errored",
+  });
 });
 
 import { badgeCountFor } from "./notify";
@@ -177,14 +192,14 @@ import { badgeCountFor } from "./notify";
 test("badgeCountFor composes attentionCount from store slices", () => {
   const sessions = [sess("a", 500), sess("b", 50)];
   // a unread (500>100), b read; +1 pending → 2
-  expect(badgeCountFor(sessions, { a: 100, b: 100 }, null, 1)).toBe(2);
+  expect(badgeCountFor(sessions, { [KA]: 100, [KB]: 100 }, null, 1)).toBe(2);
 });
 
 test("cancelAllSettles cancels every pending settle (focus-gain path)", () => {
   const f = fakeDeps();
   const n = createNotifier(f.deps);
-  n.handle({ sessionPk: "a", kind: "finished", settle: true }, undefined);
-  n.handle({ sessionPk: "b", kind: "finished", settle: true }, undefined);
+  n.handle({ runnerId: LOCAL_RUNNER, sessionPk: "a", kind: "finished", settle: true }, undefined);
+  n.handle({ runnerId: LOCAL_RUNNER, sessionPk: "b", kind: "finished", settle: true }, undefined);
   n.cancelAllSettles();
   f.runTimers();
   expect(f.sent.length).toBe(0);

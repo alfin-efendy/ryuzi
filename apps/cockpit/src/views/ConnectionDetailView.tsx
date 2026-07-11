@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { commands, type ProviderQuotaInfo } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useConnections } from "@/store-connections";
 import { useNav } from "@/store-nav";
 import { usesDeviceSignin } from "@/components/modals/deviceSignin";
@@ -47,7 +48,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
       return;
     }
     setQuotaLoading(true);
-    const result = await commands.connectionProviderQuota(conn.id);
+    const result = await commands.connectionProviderQuota(LOCAL_RUNNER, conn.id);
     setQuotaLoading(false);
     if (result.status === "ok") {
       setProviderQuota(result.data);
@@ -137,7 +138,7 @@ export function ConnectionDetailView({ id }: { id: string }) {
   const resetCodexCredit = async () => {
     if (!window.confirm("Spend one Codex reset credit now? This cannot be undone.")) return;
     setResettingCredit(true);
-    const result = await commands.resetCodexCredit(conn.id);
+    const result = await commands.resetCodexCredit(LOCAL_RUNNER, conn.id);
     setResettingCredit(false);
     if (result.status === "ok") {
       if (result.data.reset) toast.success("Codex reset credit applied.");

@@ -39,7 +39,7 @@ export const useGateways = create<GatewaysState>((set, get) => ({
   probing: false,
 
   hydrate: async () => {
-    applyResult(set, await commands.listGateways(), "Gateway list");
+    applyResult(set, await commands.listGateways("local"), "Gateway list");
     void get().probe();
   },
 
@@ -47,30 +47,30 @@ export const useGateways = create<GatewaysState>((set, get) => ({
     if (get().probing) return;
     set({ probing: true });
     try {
-      applyResult(set, await commands.probeGateways(), "Gateway probe");
+      applyResult(set, await commands.probeGateways("local"), "Gateway probe");
     } finally {
       set({ probing: false });
     }
   },
 
   add: async (name, host, port, username) => {
-    const ok = applyResult(set, await commands.addGateway(name, host, port, username), "Add gateway");
+    const ok = applyResult(set, await commands.addGateway("local", name, host, port, username), "Add gateway");
     return ok;
   },
 
   remove: async (id) => {
-    applyResult(set, await commands.removeGateway(id), "Remove gateway");
+    applyResult(set, await commands.removeGateway("local", id), "Remove gateway");
   },
 
   updateFs: async (id, fsMode, paths) => {
     set({
       gateways: get().gateways.map((g) => (g.id === id ? { ...g, fsMode, paths } : g)),
     });
-    applyResult(set, await commands.updateGateway(id, fsMode, paths), "Gateway update");
+    applyResult(set, await commands.updateGateway("local", id, fsMode, paths), "Gateway update");
   },
 
   loadEvents: async (id) => {
-    const res = await commands.gatewayEvents(id);
+    const res = await commands.gatewayEvents("local", id);
     if (res.status === "ok") set({ eventsById: { ...get().eventsById, [id]: res.data } });
   },
 

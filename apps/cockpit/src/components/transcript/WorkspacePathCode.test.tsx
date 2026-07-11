@@ -16,7 +16,7 @@ beforeEach(() => {
   existsResult = true;
 });
 
-const ctx = { sessionPk: "s1", workdir: "/home/u/proj" };
+const ctx = { runnerId: "local", sessionPk: "s1", workdir: "/home/u/proj" };
 
 function renderInCtx(text: string) {
   return render(

@@ -16,7 +16,7 @@ const targetIcon: Record<string, LucideIcon> = {
 };
 
 /** Header dropdown: open the session workdir in a detected external app. */
-export function OpenInMenu({ sessionPk }: { sessionPk: string }) {
+export function OpenInMenu({ runnerId, sessionPk }: { runnerId: string; sessionPk: string }) {
   const [targets, setTargets] = useState<OpenTarget[]>([]);
   const [open, setOpen] = useState(false);
 
@@ -32,7 +32,7 @@ export function OpenInMenu({ sessionPk }: { sessionPk: string }) {
 
   const openIn = async (targetId: string) => {
     setOpen(false);
-    const res = await commands.openIn(sessionPk, targetId);
+    const res = await commands.openIn(runnerId, sessionPk, targetId);
     if (res.status === "error") toast.error("Couldn't open: " + res.error.message);
   };
 
