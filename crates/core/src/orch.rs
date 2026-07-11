@@ -450,6 +450,21 @@ pub async fn finish_task(
         .await
 }
 
+/// Flag a task as having exhausted retries, without touching its other
+/// outcome fields. A worker that fails without ever entering the
+/// [`Store::record_child_failure`] retry loop (namely a START failure —
+/// the session never got created, so there is nothing to retry) still needs
+/// to read as `gave_up` for [`roots_with_failed_children`] to sweep its root.
+async fn mark_gave_up(store: &Store, id: &str) -> anyhow::Result<()> {
+    let id = id.to_string();
+    store
+        .with_conn(move |c| {
+            c.execute("UPDATE orch_tasks SET gave_up=1 WHERE id=?1", params![id])
+                .map(|_| ())
+        })
+        .await
+}
+
 /// Cancel a task and (for roots) every unfinished child. Running sessions are
 /// not killed — their results are discarded by the `finish_task` guard.
 /// Returns how many rows were cancelled.
@@ -568,6 +583,9 @@ pub async fn roots_ready_to_judge(store: &Store) -> anyhow::Result<Vec<OrchTask>
 }
 
 /// `waiting` roots with terminally-failed children, plus a failure digest.
+/// A child only counts once it has `gave_up` — merely `failed` (retrying
+/// behind the circuit breaker, transiently `failed`→`todo`) must not fail
+/// the root out from under a retry in flight.
 pub async fn roots_with_failed_children(store: &Store) -> anyhow::Result<Vec<(OrchTask, String)>> {
     let roots: Vec<OrchTask> = store
         .with_conn(|c| {
@@ -575,7 +593,7 @@ pub async fn roots_with_failed_children(store: &Store) -> anyhow::Result<Vec<(Or
                 "SELECT {ORCH_COLS} FROM orch_tasks r WHERE r.root_id IS NULL \
                  AND r.status='waiting' \
                  AND EXISTS (SELECT 1 FROM orch_tasks ch WHERE ch.root_id = r.id \
-                    AND ch.status IN ('failed','cancelled'))"
+                    AND ((ch.status='failed' AND ch.gave_up=1) OR ch.status='cancelled'))"
             ))?;
             let rows = stmt.query_map([], task_from)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -865,6 +883,11 @@ pub async fn decompose_goal(
 /// How long one worker/judge session may run before the watcher gives up.
 const SESSION_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// How many times a worker child may re-run after a RUN failure (a failed
+/// session, not a failed start) before the circuit breaker trips and the
+/// child — and eventually its root — fails for real.
+pub const MAX_TASK_RETRIES: i64 = 2;
+
 /// The `max_concurrent_runs` setting (default 3, floor 1).
 async fn max_concurrent(store: &Store) -> usize {
     crate::settings::usize_setting(store, "max_concurrent_runs", 3).await
@@ -906,10 +929,8 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
     }
     if let Ok(failed) = roots_with_failed_children(store).await {
         for (root, digest) in failed {
-            if fail_root(store, &root.id, &format!("subtasks failed: {digest}"))
-                .await
-                .unwrap_or(false)
-            {
+            let verdict = format!("subtasks failed: {digest}");
+            if fail_root(store, &root.id, &verdict).await.unwrap_or(false) {
                 emit_changed(cp, &root.id, None, "failed");
                 // Park the dead goal's queued siblings (the live-root guards
                 // in promote/claim also stop them; this records the outcome).
@@ -920,6 +941,10 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
                     Ok(_) => {}
                     Err(e) => tracing::warn!("orch: sibling cancel failed: {e}"),
                 }
+                // Re-enter the failure into the home chat too (spec §8), same
+                // as the judge's `done` path — a failed root is still an
+                // outcome the originating chat should see.
+                deliver_outcome(cp, &root, &verdict).await;
             }
         }
     }
@@ -956,7 +981,12 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
     {
         Ok(s) => s,
         Err(e) => {
+            // A START failure (the session itself couldn't be created) never
+            // enters the run-failure retry loop below — it fails for good on
+            // the spot, so it's flagged `gave_up` immediately rather than
+            // going through `record_child_failure`.
             let _ = finish_task(store, &t.id, "running", "failed", None, Some(e.to_string())).await;
+            let _ = mark_gave_up(store, &t.id).await;
             emit_changed(cp, &t.id, t.root_id.clone(), "failed");
             return;
         }
@@ -981,28 +1011,57 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
     );
     tokio::spawn(async move {
         let outcome = watch_session(cp2.store(), rx, &session_pk).await;
-        let (status, result, error) = match outcome {
+        match outcome {
             Ok(()) => {
                 let report = crate::scheduler::final_assistant_text(cp2.store(), &session_pk).await;
-                ("done", report, None)
+                // Report bubble: the worker's final assistant text, posted
+                // into the home chat BEFORE `finish_task` settles the row —
+                // mirrors the start bubble's best-effort/home-chat gating
+                // above.
+                if let (Ok(Some(home)), Some(report)) =
+                    (home_session(cp2.store(), &task).await, report.clone())
+                {
+                    let _ = cp2
+                        .post_speaker_bubble(&home, &task.agent, "text", &report)
+                        .await;
+                }
+                match finish_task(cp2.store(), &task_id, "running", "done", report, None).await {
+                    Ok(true) => emit_changed(&cp2, &task_id, root_id, "done"),
+                    _ => tracing::debug!("orch: task {task_id} outcome discarded (cancelled?)"),
+                }
             }
-            Err(e) => ("failed", None, Some(e)),
-        };
-        // Report bubble: the worker's final assistant text, posted into the
-        // home chat BEFORE `finish_task` settles the row — mirrors the start
-        // bubble's best-effort/home-chat gating above. Only fires on success:
-        // `result` is `None` on the failed arm, so the tuple match below
-        // naturally skips a failed run.
-        if let (Ok(Some(home)), Some(report)) =
-            (home_session(cp2.store(), &task).await, result.clone())
-        {
-            let _ = cp2
-                .post_speaker_bubble(&home, &task.agent, "text", &report)
-                .await;
-        }
-        match finish_task(cp2.store(), &task_id, "running", status, result, error).await {
-            Ok(true) => emit_changed(&cp2, &task_id, root_id, status),
-            _ => tracing::debug!("orch: task {task_id} outcome discarded (cancelled?)"),
+            Err(e) => {
+                // Retry behind the circuit breaker instead of failing the
+                // root on the first stumble: a RUN failure (unlike a START
+                // failure above, which fails immediately) re-queues the
+                // child (`todo`) for another attempt, up to
+                // MAX_TASK_RETRIES, before the breaker trips and the child —
+                // and eventually its root, via `roots_with_failed_children`
+                // — fails for real.
+                match cp2
+                    .store()
+                    .record_child_failure(&task_id, MAX_TASK_RETRIES)
+                    .await
+                {
+                    Ok(f) if f.requeued => {
+                        // Re-queued; the existing `claim_ready` dispatcher
+                        // re-promotes it on a later tick like any other
+                        // `todo` task — no separate retry scheduling needed.
+                        emit_changed(&cp2, &task_id, root_id, "todo")
+                    }
+                    Ok(_) => emit_changed(&cp2, &task_id, root_id, "failed"), // gave_up recorded already
+                    Err(_) => {
+                        match finish_task(cp2.store(), &task_id, "running", "failed", None, Some(e))
+                            .await
+                        {
+                            Ok(true) => emit_changed(&cp2, &task_id, root_id, "failed"),
+                            _ => tracing::debug!(
+                                "orch: task {task_id} outcome discarded (cancelled?)"
+                            ),
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -1333,6 +1392,11 @@ mod tests {
         finish_task(&s, &ids[1], "running", "failed", None, Some("boom".into()))
             .await
             .unwrap();
+        // `roots_with_failed_children` only sweeps a root once a child has
+        // `gave_up` — a bare `failed` status alone could still be mid-retry
+        // behind the circuit breaker. This test drives a permanent failure
+        // directly (bypassing the retry loop), so flag it explicitly.
+        mark_gave_up(&s, &ids[1]).await.unwrap();
 
         let failed = roots_with_failed_children(&s).await.unwrap();
         assert_eq!(failed.len(), 1);

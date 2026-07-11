@@ -3557,6 +3557,51 @@ impl Store {
         })
         .await
     }
+
+    /// Record a worker child's failure and decide retry vs. give-up. Increments
+    /// `consecutive_failures`; if it stays `<= max_retries` the child re-queues
+    /// (`todo`, cleared outcome) for another attempt; otherwise the breaker
+    /// trips (`gave_up=1`, `failed`). Only affects a `running` child.
+    pub async fn record_child_failure(
+        &self,
+        id: &str,
+        max_retries: i64,
+    ) -> anyhow::Result<crate::domain::ChildFailure> {
+        let id = id.to_string();
+        let now = crate::paths::now_ms();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let n: i64 = tx
+                .query_row(
+                    "SELECT consecutive_failures FROM orch_tasks WHERE id=?1 AND status='running'",
+                    params![id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+                + 1;
+            let gave_up = n > max_retries;
+            if gave_up {
+                tx.execute(
+                    "UPDATE orch_tasks SET status='failed', gave_up=1, \
+                     consecutive_failures=?2, finished_at=?3 WHERE id=?1",
+                    params![id, n, now],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE orch_tasks SET status='todo', consecutive_failures=?2, \
+                     session_pk=NULL, error=NULL, result=NULL, finished_at=NULL WHERE id=?1",
+                    params![id, n],
+                )?;
+            }
+            tx.commit()?;
+            Ok(crate::domain::ChildFailure {
+                requeued: !gave_up,
+                gave_up,
+            })
+        })
+        .await
+    }
 }
 
 const SESSION_COLS: &str =
@@ -4215,6 +4260,58 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// A store with one `waiting` root and one `running` child (`ot-child`) —
+    /// just enough orch-task graph for the circuit-breaker test below. Raw
+    /// SQL rather than `orch::insert_root`/`insert_children`: those mint
+    /// random ids, and this test needs a stable id to fail repeatedly.
+    async fn orch_test_store() -> Store {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        std::mem::forget(tmp);
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, agent, status, created_at) \
+                     VALUES ('ot-root', NULL, 'p1', 'goal', 'do it', '', 'waiting', 1)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, agent, status, created_at) \
+                     VALUES ('ot-child', 'ot-root', 'p1', 'child', 'do child', '', 'running', 2)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn record_child_failure_requeues_then_trips_the_breaker() {
+        let store = orch_test_store().await;
+        let child = "ot-child";
+        // First two failures re-queue for retry.
+        let a = store.record_child_failure(child, 2).await.unwrap();
+        assert!(a.requeued && !a.gave_up);
+        // Re-mark running to model the retry attempt, then fail again.
+        crate::orch::set_status(&store, child, "todo", "running")
+            .await
+            .unwrap();
+        let b = store.record_child_failure(child, 2).await.unwrap();
+        assert!(b.requeued && !b.gave_up);
+        crate::orch::set_status(&store, child, "todo", "running")
+            .await
+            .unwrap();
+        // Third failure trips the breaker.
+        let c = store.record_child_failure(child, 2).await.unwrap();
+        assert!(!c.requeued && c.gave_up);
+        let t = crate::orch::get_task(&store, child).await.unwrap().unwrap();
+        assert_eq!(t.status, "failed");
+        assert!(t.gave_up);
+        assert_eq!(t.consecutive_failures, 3);
     }
 
     #[tokio::test]

@@ -153,6 +153,14 @@ impl BackgroundKind {
     }
 }
 
+/// Outcome of `Store::record_child_failure`: whether the child re-queued for
+/// another attempt, or the circuit breaker tripped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildFailure {
+    pub requeued: bool,
+    pub gave_up: bool,
+}
+
 /// Which actor initiated a write — a general-purpose provenance marker
 /// carried on `ToolCtx` (Phase 4 §7) and reused by Phase 6's app-control
 /// negative-space guard. Deliberately NOT skill-usage-specific: any tool or
