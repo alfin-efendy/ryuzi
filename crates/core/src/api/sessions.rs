@@ -324,6 +324,7 @@ async fn start_session(
             &attachments,
             git,
             options.perm_mode,
+            None,
         )
         .await?)
 }
