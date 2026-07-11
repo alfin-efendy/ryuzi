@@ -57,7 +57,11 @@ pub fn assemble_system(
     extra_skill_dirs: &[std::path::PathBuf],
     memory: Option<&str>,
 ) -> String {
-    let mut sections: Vec<String> = vec![BASE_PROMPT.to_string(), steer_channel_note()];
+    let mut sections: Vec<String> = vec![
+        BASE_PROMPT.to_string(),
+        steer_channel_note(),
+        super::tools::session_search::SESSION_SEARCH_GUIDANCE.to_string(),
+    ];
 
     // Environment facts.
     sections.push(format!(
@@ -155,6 +159,15 @@ mod tests {
         assert!(sys.contains(STEER_MARKER_OPEN));
         assert!(sys.contains(STEER_MARKER_CLOSE));
         assert!(sys.contains("ONLY that marker pair"));
+    }
+
+    #[test]
+    fn assembled_system_teaches_session_search_discovery_then_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = assemble_system(dir.path(), &[], None);
+        assert!(sys.contains(super::super::tools::session_search::SESSION_SEARCH_GUIDANCE));
+        assert!(sys.contains("action=discovery"));
+        assert!(sys.contains("action=read"));
     }
 
     #[test]

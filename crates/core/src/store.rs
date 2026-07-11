@@ -1003,6 +1003,18 @@ pub struct SessionRuntimeSettings {
     pub effort: Option<String>,
 }
 
+/// One `messages_fts` match, joined against its owning session — the unit
+/// the `session_search` native tool's DISCOVERY action returns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FtsHit {
+    pub session_pk: String,
+    pub seq: i64,
+    pub snippet: String,
+    pub title: Option<String>,
+    pub kind: String,
+    pub created_at: i64,
+}
+
 /// One durable compaction checkpoint: the replacement history that stands in
 /// for every provider turn with `seq <= boundary_seq`.
 #[derive(Debug, Clone)]
@@ -2053,6 +2065,124 @@ impl Store {
             Ok(items)
         })
         .await
+    }
+
+    /// Resolve `pk`'s lineage root: walk `parent_session_pk` up to the
+    /// session with no parent. Used to exclude the CALLING session's own
+    /// lineage from `session_search` recall — a session should never
+    /// "discover" the very conversation it's part of. Empty when `pk` is
+    /// unknown (nothing to exclude).
+    pub async fn lineage_of(&self, pk: &str) -> anyhow::Result<Vec<String>> {
+        let pk = pk.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Vec<String>> {
+            let root: Option<String> = c
+                .query_row(
+                    "WITH RECURSIVE up(pk, parent) AS ( \
+                       SELECT session_pk, parent_session_pk FROM sessions WHERE session_pk=?1 \
+                       UNION ALL \
+                       SELECT s.session_pk, s.parent_session_pk FROM sessions s \
+                       JOIN up ON s.session_pk = up.parent) \
+                     SELECT pk FROM up WHERE parent IS NULL LIMIT 1",
+                    [&pk],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(root.into_iter().collect())
+        })
+        .await
+    }
+
+    /// DISCOVERY over `messages_fts` for the `session_search` native tool
+    /// (spec §7.4): match `query`, join `sessions` for title/kind, exclude
+    /// worker/review sessions (internal delegation noise) and any hit whose
+    /// lineage root is in `exclude_lineage` (the caller's own conversation),
+    /// dedup remaining hits by lineage root (one hit per past conversation),
+    /// and rank interactive-origin sessions above scheduler/orch-started
+    /// ones.
+    ///
+    /// `query` is always passed as a bound parameter — never interpolated
+    /// into the SQL — so it cannot inject outer-SQL syntax. It IS still
+    /// parsed as an FTS5 query expression by SQLite itself; a malformed
+    /// expression (e.g. an unterminated quote) surfaces as an `Err` here,
+    /// which the `session_search` tool turns into a clean tool-result error
+    /// instead of panicking.
+    pub async fn search_messages_fts(
+        &self,
+        query: &str,
+        exclude_lineage: &[String],
+        limit: i64,
+    ) -> anyhow::Result<Vec<FtsHit>> {
+        let query = query.to_string();
+        let exclude: std::collections::HashSet<String> = exclude_lineage.iter().cloned().collect();
+        self.with_conn(move |c| -> rusqlite::Result<Vec<FtsHit>> {
+            let mut stmt = c.prepare(
+                "SELECT f.session_pk, f.seq, \
+                        snippet(messages_fts, 0, '[', ']', ' … ', 12) AS snip, \
+                        s.title, s.kind, s.started_by, m.created_at \
+                 FROM messages_fts f \
+                 JOIN sessions s ON s.session_pk = f.session_pk \
+                 JOIN messages m ON m.session_pk = f.session_pk AND m.seq = f.seq \
+                 WHERE messages_fts MATCH ?1 \
+                   AND s.kind NOT IN ('worker','review') \
+                 ORDER BY (s.started_by IN ('scheduler','orch')) ASC, \
+                          m.created_at DESC \
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![query, limit], |r| {
+                Ok(FtsHit {
+                    session_pk: r.get(0)?,
+                    seq: r.get(1)?,
+                    snippet: r.get(2)?,
+                    title: r.get(3)?,
+                    kind: r.get(4)?,
+                    created_at: r.get(6)?,
+                })
+            })?;
+            // Lineage-dedup: collapse each lineage to its single best (most
+            // recent) hit and drop anything in the caller's own lineage.
+            let mut seen_roots = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for hit in rows {
+                let hit = hit?;
+                let root: String = c
+                    .query_row(
+                        "WITH RECURSIVE up(pk, parent) AS ( \
+                           SELECT session_pk, parent_session_pk FROM sessions WHERE session_pk=?1 \
+                           UNION ALL \
+                           SELECT s.session_pk, s.parent_session_pk FROM sessions s \
+                           JOIN up ON s.session_pk = up.parent) \
+                         SELECT pk FROM up WHERE parent IS NULL LIMIT 1",
+                        [&hit.session_pk],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| hit.session_pk.clone());
+                if exclude.contains(&root) || !seen_roots.insert(root) {
+                    continue;
+                }
+                out.push(hit);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// A `±radius`-message window around `seq` in session `pk`'s ledger, for
+    /// the `session_search` tool's `read` action. Reuses `list_messages`
+    /// (already ordered by seq) and slices in memory — recall windows are
+    /// small and infrequent, so a second indexed query isn't worth it.
+    pub async fn messages_window(
+        &self,
+        pk: &str,
+        seq: i64,
+        radius: i64,
+    ) -> anyhow::Result<Vec<Message>> {
+        let all = self.list_messages(pk).await?;
+        let lo = seq.saturating_sub(radius);
+        let hi = seq.saturating_add(radius);
+        Ok(all
+            .into_iter()
+            .filter(|m| m.seq >= lo && m.seq <= hi)
+            .collect())
     }
 
     /// Append one message to the native runtime's provider-turn ledger,
@@ -5220,6 +5350,230 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits, 1, "only the user text row is indexed and matches");
+    }
+
+    /// Builds a minimal `Session` row for `search_messages_fts`/lineage tests.
+    fn mk_session(pk: &str, kind: crate::domain::SessionKind, now: i64) -> crate::domain::Session {
+        mk_session_with_parent(pk, kind, now, None)
+    }
+
+    fn mk_session_with_parent(
+        pk: &str,
+        kind: crate::domain::SessionKind,
+        now: i64,
+        parent: Option<&str>,
+    ) -> crate::domain::Session {
+        crate::domain::Session {
+            session_pk: pk.into(),
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: Some(format!("t-{pk}")),
+            status: crate::domain::SessionStatus::Idle,
+            perm_mode: crate::domain::PermMode::Default,
+            started_by: None,
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind,
+            speaker: None,
+            agent: None,
+            parent_session_pk: parent.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_messages_fts_finds_and_excludes_worker_sessions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(mk_session("chat-1", crate::domain::SessionKind::Chat, now))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk_session("wrk-1", crate::domain::SessionKind::Worker, now))
+            .await
+            .unwrap();
+        for pk in ["chat-1", "wrk-1"] {
+            store
+                .insert_message(crate::domain::NewMessage::block(
+                    pk,
+                    "user",
+                    "text",
+                    serde_json::json!({ "text": "kubernetes ingress routing" }),
+                ))
+                .await
+                .unwrap();
+        }
+        let hits = store.search_messages_fts("ingress", &[], 20).await.unwrap();
+        assert!(hits.iter().any(|h| h.session_pk == "chat-1"));
+        assert!(
+            !hits.iter().any(|h| h.session_pk == "wrk-1"),
+            "worker sessions excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_messages_fts_non_matching_query_returns_empty() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(mk_session("chat-1", crate::domain::SessionKind::Chat, now))
+            .await
+            .unwrap();
+        store
+            .insert_message(crate::domain::NewMessage::block(
+                "chat-1",
+                "user",
+                "text",
+                serde_json::json!({ "text": "kubernetes ingress routing" }),
+            ))
+            .await
+            .unwrap();
+        let hits = store
+            .search_messages_fts("nonexistentzzz", &[], 20)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_messages_fts_malformed_query_errors_cleanly_not_panics() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // An unterminated quote is invalid FTS5 query syntax; SQLite surfaces
+        // it as a runtime error on the bound MATCH parameter, not a panic.
+        let result = store.search_messages_fts("\"unterminated", &[], 20).await;
+        assert!(
+            result.is_err(),
+            "malformed FTS5 query must error, not panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_messages_fts_dedups_by_lineage_root_and_excludes_caller_lineage() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        // Two chat sessions in the SAME lineage (root "chat-root"): only the
+        // best (most recent) hit should survive the dedup.
+        store
+            .insert_session(mk_session(
+                "chat-root",
+                crate::domain::SessionKind::Chat,
+                now,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk_session_with_parent(
+                "chat-child",
+                crate::domain::SessionKind::Chat,
+                now + 1,
+                Some("chat-root"),
+            ))
+            .await
+            .unwrap();
+        // A separate, unrelated lineage that the caller wants excluded
+        // (its own current conversation).
+        store
+            .insert_session(mk_session(
+                "own-lineage",
+                crate::domain::SessionKind::Chat,
+                now,
+            ))
+            .await
+            .unwrap();
+        for pk in ["chat-root", "chat-child", "own-lineage"] {
+            store
+                .insert_message(crate::domain::NewMessage::block(
+                    pk,
+                    "user",
+                    "text",
+                    serde_json::json!({ "text": "kubernetes ingress routing" }),
+                ))
+                .await
+                .unwrap();
+        }
+        let hits = store
+            .search_messages_fts("ingress", &["own-lineage".to_string()], 20)
+            .await
+            .unwrap();
+        assert!(
+            !hits.iter().any(|h| h.session_pk == "own-lineage"),
+            "caller's own lineage excluded"
+        );
+        let lineage_hits: Vec<_> = hits
+            .iter()
+            .filter(|h| h.session_pk == "chat-root" || h.session_pk == "chat-child")
+            .collect();
+        assert_eq!(
+            lineage_hits.len(),
+            1,
+            "same-lineage hits dedup to a single entry, got {lineage_hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_of_walks_to_the_root_and_is_empty_for_unknown_session() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(mk_session(
+                "chat-root",
+                crate::domain::SessionKind::Chat,
+                now,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk_session_with_parent(
+                "chat-child",
+                crate::domain::SessionKind::Chat,
+                now + 1,
+                Some("chat-root"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.lineage_of("chat-child").await.unwrap(),
+            vec!["chat-root".to_string()]
+        );
+        assert_eq!(
+            store.lineage_of("chat-root").await.unwrap(),
+            vec!["chat-root".to_string()]
+        );
+        assert!(store
+            .lineage_of("no-such-session")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn messages_window_returns_the_radius_slice() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        for i in 0..12 {
+            store
+                .insert_message(crate::domain::NewMessage::block(
+                    "s1",
+                    "user",
+                    "text",
+                    serde_json::json!({ "text": format!("msg {i}") }),
+                ))
+                .await
+                .unwrap();
+        }
+        // seqs run 1..=12; a ±5 window around seq 6 is [1,11].
+        let window = store.messages_window("s1", 6, 5).await.unwrap();
+        let seqs: Vec<i64> = window.iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, (1..=11).collect::<Vec<_>>());
     }
 
     #[tokio::test]

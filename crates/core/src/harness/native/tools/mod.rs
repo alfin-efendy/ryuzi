@@ -28,6 +28,7 @@ pub mod plan;
 pub mod question;
 pub mod read;
 pub mod revert;
+pub mod session_search;
 pub mod skill;
 pub mod task;
 pub mod todo;
@@ -319,6 +320,7 @@ impl ToolRegistry {
             Arc::new(revert::Revert),
             Arc::new(lsp::Lsp),
             Arc::new(task::Task),
+            Arc::new(session_search::SessionSearch),
             Arc::new(plan::ExitPlanMode),
             Arc::new(question::AskUserQuestion),
         ];
@@ -677,13 +679,14 @@ mod tests {
             "revert",
             "lsp",
             "task",
+            "session_search",
             "exitplanmode",
             "askuserquestion",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 18);
+        assert_eq!(defs.len(), 19);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));
