@@ -9,7 +9,9 @@
 //! loop that spawns it.
 
 use crate::control::ControlPlane;
-use crate::domain::{ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Surface};
+use crate::domain::{
+    ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Principal, Surface,
+};
 use crate::gateway::{Gateway, GatewayFactory};
 use crate::harness::native::native_plugin;
 use crate::harness::HarnessFactory;
@@ -388,6 +390,7 @@ fn spawn_approval_fanout(
                     summary,
                     approval_kind,
                     input: _,
+                    principal,
                 }) => {
                     // Gateways only render binary tool prompts. Plan/Question
                     // prompts are Cockpit/CLI-only surfaces — a headless
@@ -419,6 +422,7 @@ fn spawn_approval_fanout(
                             &request_id,
                             &tool,
                             &summary,
+                            principal,
                         )
                         .await;
                     });
@@ -478,6 +482,7 @@ pub(crate) async fn schedule_non_tool_approval_cancel(
 ///   futures keep racing; only once every future has errored does the race
 ///   resolve to a deny. The whole race is wrapped in `tokio::time::timeout`;
 ///   elapsing also denies.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_approval(
     cp: &Arc<ControlPlane>,
     store: &Arc<Store>,
@@ -486,6 +491,7 @@ pub(crate) async fn handle_approval(
     request_id: &str,
     tool: &str,
     summary: &str,
+    principal: Option<Principal>,
 ) {
     let settings = SettingsStore::new(Arc::clone(store));
 
@@ -539,6 +545,7 @@ pub(crate) async fn handle_approval(
         approver_role_ids,
         started_by,
         timeout_ms: Some(timeout_ms),
+        principal,
     };
 
     let futs: Vec<_> = known_surfaces
@@ -916,7 +923,21 @@ mod tests {
         let last_req = gw.last_req.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-1", "Bash", "ls -la").await;
+        let principal = Principal {
+            plugin_id: "acme-connector".into(),
+            plugin_name: "Acme Connector".into(),
+        };
+        handle_approval(
+            &cp,
+            &store,
+            &gateways,
+            "s1",
+            "req-1",
+            "Bash",
+            "ls -la",
+            Some(principal.clone()),
+        )
+        .await;
 
         let parsed = parse_telemetry_lines(&lines);
         assert!(
@@ -939,6 +960,12 @@ mod tests {
         assert_eq!(captured.timeout_ms, Some(300_000)); // default
         assert_eq!(captured.tool, "Bash");
         assert_eq!(captured.summary, "ls -la");
+        assert_eq!(
+            captured.principal,
+            Some(principal),
+            "the principal handle_approval was called with must survive into the ApprovalRequest \
+             handed to the gateway — the spec→event→request round trip"
+        );
     }
 
     #[tokio::test]
@@ -956,7 +983,7 @@ mod tests {
         let gw = FakeGateway::new("discord", GwBehavior::SleepThenAllow(2_000));
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-2", "Bash", "sleep").await;
+        handle_approval(&cp, &store, &gateways, "s1", "req-2", "Bash", "sleep", None).await;
 
         let parsed = parse_telemetry_lines(&lines);
         assert!(
@@ -979,7 +1006,7 @@ mod tests {
         let calls = gw.calls.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-3", "Bash", "ls").await;
+        handle_approval(&cp, &store, &gateways, "s1", "req-3", "Bash", "ls", None).await;
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1012,7 +1039,17 @@ mod tests {
         let allow_gw = FakeGateway::new("allow-gw", GwBehavior::SleepThenAllow(50));
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(err_gw), Arc::new(allow_gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-race-1", "Bash", "ls").await;
+        handle_approval(
+            &cp,
+            &store,
+            &gateways,
+            "s1",
+            "req-race-1",
+            "Bash",
+            "ls",
+            None,
+        )
+        .await;
 
         let parsed = parse_telemetry_lines(&lines);
         assert!(
@@ -1037,7 +1074,17 @@ mod tests {
         let gw2 = FakeGateway::new("err-gw-2", GwBehavior::ErrImmediately);
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw1), Arc::new(gw2)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-race-2", "Bash", "ls").await;
+        handle_approval(
+            &cp,
+            &store,
+            &gateways,
+            "s1",
+            "req-race-2",
+            "Bash",
+            "ls",
+            None,
+        )
+        .await;
 
         let parsed = parse_telemetry_lines(&lines);
         assert!(
@@ -1184,6 +1231,7 @@ mod tests {
                 summary: "ls -la".into(),
                 approval_kind: crate::domain::ApprovalKind::Tool,
                 input: serde_json::json!({}),
+                principal: None,
             });
             let rx = self.approvals.register(request_id);
             let allow = rx.await.map(|r| r.allowed()).unwrap_or(false);
@@ -1280,6 +1328,7 @@ mod tests {
                         &request_id,
                         &tool,
                         &summary,
+                        None,
                     )
                     .await;
                 }
@@ -1332,6 +1381,7 @@ mod tests {
                 summary: "review the proposed plan".into(),
                 approval_kind: crate::domain::ApprovalKind::Plan,
                 input: serde_json::json!({ "plan": "do X" }),
+                principal: None,
             });
             let decision = rx
                 .await

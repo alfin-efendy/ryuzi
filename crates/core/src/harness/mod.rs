@@ -1,9 +1,10 @@
 use crate::approval::ApprovalHub;
-use crate::domain::{CoreEvent, McpServerSpec, PermMode, SessionKind};
+use crate::domain::{CoreEvent, McpServerSpec, PermMode, Principal, SessionKind};
 use crate::store::Store;
 use async_trait::async_trait;
 
 pub mod native;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -36,6 +37,14 @@ pub struct SessionCtx {
     pub resume: Option<String>,
     /// MCP servers to attach (from the connector axis).
     pub mcp_servers: Vec<McpServerSpec>,
+    /// `McpServerSpec.name` → the plugin that attached that server, for
+    /// every server in `mcp_servers` sourced from a connector plugin (built
+    /// in `ControlPlane::attach_plugin_mcp_servers`, keyed at the same
+    /// binding site the servers themselves are resolved). A DB-configured
+    /// server (no plugin) simply has no entry here. The native runtime looks
+    /// this up per `mcp__<server>__<tool>` tool so approvals can attribute
+    /// the call to its plugin (see [`crate::domain::Principal`]).
+    pub mcp_principals: HashMap<String, Principal>,
     /// Extra skill directories contributed by enabled user plugins (see
     /// `crate::plugins::PluginHost::enabled_skill_dirs`), on top of the
     /// native runtime's usual worktree/global skill dirs.
@@ -175,6 +184,7 @@ mod tests {
             effort: None,
             resume: None,
             mcp_servers: vec![],
+            mcp_principals: HashMap::new(),
             extra_skill_dirs: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),

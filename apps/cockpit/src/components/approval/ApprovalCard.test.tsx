@@ -14,6 +14,7 @@ function approval(partial: Partial<PendingApproval>): PendingApproval {
     summary: "Bash: rm -rf ./x",
     kind: "tool",
     input: { command: "rm -rf ./x" },
+    principal: null,
     ...partial,
   };
 }
@@ -179,6 +180,24 @@ test("without hotkey, Cmd/Ctrl+Enter does nothing", async () => {
   render(<ApprovalCard approval={approval({})} />);
   fireEvent.keyDown(window, { key: "Enter", metaKey: true });
   expect(calls.length).toBe(0);
+});
+
+test("shows a 'via <plugin>' chip when the approval carries a principal", () => {
+  render(
+    <ApprovalCard
+      approval={approval({
+        tool: "mcp__github__search_issues",
+        summary: "run mcp__github__search_issues",
+        principal: { pluginId: "github-connector", pluginName: "GitHub" },
+      })}
+    />,
+  );
+  expect(screen.getByText("via GitHub")).toBeTruthy();
+});
+
+test("hides the principal chip when the approval has no principal", () => {
+  render(<ApprovalCard approval={approval({})} />);
+  expect(screen.queryByText(/^via /)).toBeNull();
 });
 
 test("plan card hotkey submits the rejection instead of approving while feedback is open", async () => {

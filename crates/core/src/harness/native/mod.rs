@@ -73,8 +73,14 @@ impl Default for NativeHarness {
 /// each stdio handshake is independent), so total startup latency is the
 /// slowest server, not the sum. Failures are logged and skipped; `join_all`
 /// preserves input order, so tool order stays deterministic.
+///
+/// `principals` is the `SessionCtx.mcp_principals` binding map
+/// (`McpServerSpec.name` → owning plugin); a server absent from it (a
+/// DB-configured, non-plugin server) resolves every one of its tools to
+/// `principal = None`.
 async fn connect_mcp_tools(
     mcp_servers: &[crate::domain::McpServerSpec],
+    principals: &std::collections::HashMap<String, crate::domain::Principal>,
 ) -> Vec<Arc<dyn tools::Tool>> {
     let connections = futures::future::join_all(mcp_servers.iter().map(|spec| async move {
         if !matches!(spec.transport, crate::domain::McpTransport::Stdio { .. }) {
@@ -91,6 +97,7 @@ async fn connect_mcp_tools(
     .await;
     let mut extra: Vec<Arc<dyn tools::Tool>> = Vec::new();
     for conn in connections.into_iter().flatten() {
+        let principal = principals.get(&conn.server_name).cloned();
         for t in &conn.tools {
             extra.push(Arc::new(tools::mcp::McpTool::new(
                 &conn.server_name,
@@ -98,6 +105,7 @@ async fn connect_mcp_tools(
                 &t.description,
                 t.input_schema.clone(),
                 conn.clone(),
+                principal.clone(),
             )));
         }
     }
@@ -153,7 +161,7 @@ impl Harness for NativeHarness {
         .await;
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
-        let mcp_tools = connect_mcp_tools(&ctx.mcp_servers).await;
+        let mcp_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
         let tools = Arc::new(tools::ToolRegistry::with_extra(mcp_tools));
         let project_id = ctx.project_id.clone();
         let model_name = model.as_deref().unwrap_or("");
@@ -398,6 +406,7 @@ mod tests {
             effort: None,
             resume: None,
             mcp_servers: vec![],
+            mcp_principals: std::collections::HashMap::new(),
             extra_skill_dirs: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
@@ -1016,7 +1025,7 @@ mod tests {
                 },
             },
         ];
-        let tools = connect_mcp_tools(&specs).await;
+        let tools = connect_mcp_tools(&specs, &std::collections::HashMap::new()).await;
         assert!(tools.is_empty());
     }
 }

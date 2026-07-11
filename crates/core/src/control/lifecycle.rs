@@ -861,7 +861,8 @@ impl ControlPlane {
         // `ConnectorCtx.project_id` isn't read by any connector today, so the
         // session id is a harmless, uniquely-scoped stand-in.
         let scope_id = project.map(|p| p.project_id.as_str()).unwrap_or(session_pk);
-        self.attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
+        let mcp_principals = self
+            .attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
             .await;
         let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
         // `kind`/`agent` come from the session row rather than a caller
@@ -900,6 +901,7 @@ impl ControlPlane {
             effort,
             resume,
             mcp_servers,
+            mcp_principals,
             extra_skill_dirs,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
@@ -935,15 +937,27 @@ impl ControlPlane {
     /// failure) is also recorded via [`Self::record_attach`] for
     /// `plugin_doctor` to surface later — recording is best-effort and never
     /// changes this loop's control flow or its warn-and-continue discipline.
+    ///
+    /// Returns the `McpServerSpec.name` → owning-plugin [`Principal`] binding
+    /// for every server this call actually attached — resolved HERE, at the
+    /// only place a server name is definitively known to belong to a given
+    /// `CorePlugin`, rather than reconstructed later from a substring match
+    /// on the server/tool name. A server that lost the `names.insert` race
+    /// (a DB-configured or earlier plugin's same-named server won) gets no
+    /// entry, mirroring its exclusion from `mcp_servers` itself.
+    ///
+    /// [`Principal`]: crate::domain::Principal
     async fn attach_plugin_mcp_servers(
         &self,
         project_id: &str,
         work_dir: &Path,
         settings: &SettingsStore,
         mcp_servers: &mut Vec<crate::domain::McpServerSpec>,
-    ) {
+    ) -> std::collections::HashMap<String, crate::domain::Principal> {
         let mut names: std::collections::HashSet<String> =
             mcp_servers.iter().map(|s| s.name.clone()).collect();
+        let mut principals: std::collections::HashMap<String, crate::domain::Principal> =
+            std::collections::HashMap::new();
         for plugin in self.registries.plugins.list() {
             let Some(connector) = &plugin.connector else {
                 continue;
@@ -976,6 +990,13 @@ impl ControlPlane {
                         if !names.insert(spec.name.clone()) {
                             continue; // a DB-configured (or earlier plugin's) server wins
                         }
+                        principals.insert(
+                            spec.name.clone(),
+                            crate::domain::Principal {
+                                plugin_id: id.clone(),
+                                plugin_name: plugin.manifest.name.clone(),
+                            },
+                        );
                         mcp_servers.push(spec);
                     }
                     self.record_attach(id, "ok", None).await;
@@ -987,6 +1008,7 @@ impl ControlPlane {
                 }
             }
         }
+        principals
     }
 
     /// Best-effort record of a plugin's session-attach outcome into

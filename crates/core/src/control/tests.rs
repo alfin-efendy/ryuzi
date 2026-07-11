@@ -155,6 +155,10 @@ struct Counters {
     /// built with — lets plugin-connector tests assert on exactly what
     /// `start_harness_session` attached, without a bespoke fake per test.
     mcp_servers: Arc<Mutex<Option<Vec<crate::domain::McpServerSpec>>>>,
+    /// The `SessionCtx.mcp_principals` binding map the most recent
+    /// `start_session` call was built with — lets plugin-connector tests
+    /// assert on the resolved plugin identity, not just the server list.
+    mcp_principals: Arc<Mutex<Option<std::collections::HashMap<String, crate::domain::Principal>>>>,
 }
 
 struct FakeHarness {
@@ -167,6 +171,7 @@ impl Harness for FakeHarness {
     async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
         self.counters.starts.fetch_add(1, Ordering::SeqCst);
         *self.counters.mcp_servers.lock().unwrap() = Some(ctx.mcp_servers.clone());
+        *self.counters.mcp_principals.lock().unwrap() = Some(ctx.mcp_principals.clone());
         Ok(Box::new(FakeSession {
             store: ctx.store.clone(),
             events: ctx.events.clone(),
@@ -703,6 +708,20 @@ async fn wait_for_session_ctx(counters: &Counters) -> Vec<crate::domain::McpServ
     for _ in 0..400 {
         if let Some(servers) = counters.mcp_servers.lock().unwrap().clone() {
             return servers;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for the harness SessionCtx");
+}
+
+/// Same wait as [`wait_for_session_ctx`], but for the mcp-server→plugin
+/// `Principal` binding map instead of the server list itself.
+async fn wait_for_session_ctx_principals(
+    counters: &Counters,
+) -> std::collections::HashMap<String, crate::domain::Principal> {
+    for _ in 0..400 {
+        if let Some(principals) = counters.mcp_principals.lock().unwrap().clone() {
+            return principals;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -3060,6 +3079,45 @@ async fn enabled_declarative_plugins_mcp_server_attaches_to_the_session() {
 
 #[tokio::test]
 #[serial]
+async fn enabled_declarative_plugins_mcp_server_resolves_its_principal_from_the_binding() {
+    // The principal must come from the mcp_server_name → plugin binding built
+    // in `attach_plugin_mcp_servers` — not from parsing the server/tool name
+    // string (which happens to also contain "acme" here, precisely so a
+    // string-parsing implementation would still get lucky and pass; the
+    // manifest id/name below are deliberately different from the server name
+    // to catch that).
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) =
+        fake_control_plane_with_plugin(declarative_test_plugin("task7-lc-principal", "acme")).await;
+    store
+        .set_setting_raw("plugin.task7-lc-principal.token", "sekret")
+        .await
+        .unwrap();
+    store
+        .set_setting_raw("plugin.task7-lc-principal.enabled", "true")
+        .await
+        .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+    cp.start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+
+    let principals = wait_for_session_ctx_principals(&counters).await;
+    assert_eq!(
+        principals.get("acme"),
+        Some(&crate::domain::Principal {
+            plugin_id: "task7-lc-principal".to_string(),
+            plugin_name: "Test Plugin task7-lc-principal".to_string(),
+        }),
+        "expected the \"acme\" server to resolve to its owning plugin's identity, got: {principals:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn disabled_declarative_plugins_mcp_server_does_not_attach() {
     let _guard = StateDirGuard::new();
     let (cp, store, counters, _db_guard) =
@@ -3177,6 +3235,15 @@ async fn db_configured_server_wins_over_a_same_named_plugin_server() {
         }
         other => panic!("expected a stdio transport, got: {other:?}"),
     }
+
+    // The plugin's losing entry must not leave a stray principal binding for
+    // "acme" — a DB-configured server (no plugin) resolves to `principal =
+    // None` for every one of its tools.
+    let principals = wait_for_session_ctx_principals(&counters).await;
+    assert!(
+        !principals.contains_key("acme"),
+        "the DB-configured server must not resolve to a plugin principal, got: {principals:?}"
+    );
 }
 
 fn git_opts(

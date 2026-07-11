@@ -4,6 +4,7 @@ import { Check, ChevronDown, ShieldAlert } from "lucide-react";
 import { useStore, type PendingApproval } from "@/store";
 import type { ApprovalResponse } from "@/bindings";
 import { Markdown } from "@/components/transcript/Markdown";
+import { Pill } from "@/components/common/bits";
 
 type Question = {
   question: string;
@@ -183,7 +184,14 @@ export function ApprovalCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[13px] font-semibold">{title}</div>
-          <div className="truncate text-[11.5px] text-muted-foreground">{approval.tool}</div>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate text-[11.5px] text-muted-foreground">{approval.tool}</span>
+            {approval.principal && (
+              <Pill variant="secondary" className="shrink-0">
+                via {approval.principal.pluginName}
+              </Pill>
+            )}
+          </div>
         </div>
         {showSession && session && (
           <Badge variant="secondary" className="max-w-[180px] truncate">

@@ -1426,7 +1426,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -1761,6 +1761,19 @@ export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string;
  * failure — the flow entry survives failures so manual paste still works.
  */
 export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
+/**
+ * Identifies the plugin an approvable action originates from — attribution
+ * only, so an operator can see "this MCP tool belongs to plugin X" instead
+ * of guessing from a substring match between the MCP server name and a
+ * manifest id. `None` (everywhere this is optional) means the action is the
+ * core agent itself (a built-in tool), not a plugin. Resolved at the
+ * mcp-server→plugin binding (`ControlPlane::attach_plugin_mcp_servers`),
+ * never by parsing the tool/server name string.
+ * 
+ * Carries no gating semantics: this is visibility/attribution metadata for
+ * the approval prompt, not an input to the permission DECISION.
+ */
+export type Principal = { pluginId: string; pluginName: string }
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —

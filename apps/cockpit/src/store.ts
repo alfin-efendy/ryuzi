@@ -16,6 +16,7 @@ import {
   type ProjectRuntimeInfo,
   type SessionRuntimeInfo,
   type ModelCost,
+  type Principal,
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useNative } from "./store-native";
@@ -32,6 +33,9 @@ export type PendingApproval = {
   summary: string;
   kind: ApprovalKind;
   input: unknown;
+  /** Which plugin's MCP tool this approval is for; `null` for built-in tools
+   *  and Plan/Question prompts. Attribution only — never gates the decision. */
+  principal: Principal | null;
 };
 export type ChatOptions = {
   model?: string | null;
@@ -231,6 +235,7 @@ export const useStore = create<State>((set, get) => ({
                 summary: e.summary,
                 kind: e.approval_kind,
                 input: e.input,
+                principal: e.principal ?? null,
               },
             ],
           };

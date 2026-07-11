@@ -128,6 +128,7 @@ pub async fn evaluate(
         summary: spec.summary.clone(),
         approval_kind: ApprovalKind::Tool,
         input: input.clone(),
+        principal: spec.principal.clone(),
     });
     tokio::select! {
         biased;
@@ -518,6 +519,73 @@ mod tests {
         let d = evaluate(
             &spec("bash"),
             &serde_json::json!({"command": "rm -rf ./x"}),
+            &f.gate(PermMode::Default, None),
+        )
+        .await;
+        waiter.await.unwrap();
+        assert_eq!(d, PermDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn evaluate_forwards_the_specs_principal_into_the_approval_requested_event() {
+        // Round-trip: a `PermissionSpec.principal` (as `McpTool::permission`
+        // would attach for a plugin-owned MCP tool) must survive into the
+        // `CoreEvent::ApprovalRequested` `evaluate` emits, unchanged.
+        let f = Fixture::new().await;
+        let approvals = f.approvals.clone();
+        let mut rx = f.events.subscribe();
+        let principal = crate::domain::Principal {
+            plugin_id: "acme-connector".into(),
+            plugin_name: "Acme Connector".into(),
+        };
+        let expected = principal.clone();
+        let waiter = tokio::spawn(async move {
+            match rx.recv().await.unwrap() {
+                CoreEvent::ApprovalRequested {
+                    request_id,
+                    principal,
+                    ..
+                } => {
+                    assert_eq!(principal, Some(expected));
+                    approvals.resolve_bool(&request_id, true);
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        });
+        let mcp_spec = spec("mcp__acme__search").with_principal(Some(principal));
+        let d = evaluate(
+            &mcp_spec,
+            &serde_json::json!({}),
+            &f.gate(PermMode::Default, None),
+        )
+        .await;
+        waiter.await.unwrap();
+        assert_eq!(d, PermDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn evaluate_leaves_the_event_principal_none_for_a_built_in_tool() {
+        let f = Fixture::new().await;
+        let approvals = f.approvals.clone();
+        let mut rx = f.events.subscribe();
+        let waiter = tokio::spawn(async move {
+            match rx.recv().await.unwrap() {
+                CoreEvent::ApprovalRequested {
+                    request_id,
+                    principal,
+                    ..
+                } => {
+                    assert_eq!(principal, None);
+                    approvals.resolve_bool(&request_id, true);
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        });
+        // `spec("bash")` is `PermissionSpec::new(..)` — never given a
+        // principal, exactly like every built-in tool's `permission()`.
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({}),
             &f.gate(PermMode::Default, None),
         )
         .await;
