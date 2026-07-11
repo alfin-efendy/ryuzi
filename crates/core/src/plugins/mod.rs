@@ -21,11 +21,13 @@
 
 pub mod builtin;
 pub mod catalog;
+pub mod catalog_feed_key;
 pub mod declarative;
 pub mod doctor;
 pub mod host;
 pub mod oauth;
 pub mod providers;
+pub mod remote_catalog;
 
 use crate::settings::{csv, SettingsStore};
 
