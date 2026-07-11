@@ -1,7 +1,7 @@
 //! Self-update machinery: version/check/asset/install-method (deciding
 //! whether and what to download) and manager/stage/canary/applier/handoff
 //! (driving the staged, canary-verified binary swap).
-//! Logic lives here behind injectable traits; `crates/cli/src/daemon_cmd.rs`
+//! Logic lives here behind injectable traits; `crates/runner/src/daemon_cmd.rs`
 //! provides the production impls (real HTTP, real tar, real spawn/renames).
 pub mod applier;
 pub mod asset;

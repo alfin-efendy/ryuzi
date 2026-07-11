@@ -5,19 +5,18 @@ fn deps_for(
     db: &Path,
     out: Arc<std::sync::Mutex<Vec<String>>>,
     errs: Arc<std::sync::Mutex<Vec<String>>>,
-) -> ryuzi_cli::dispatch::Deps {
+) -> ryuzi_runner::dispatch::Deps {
     let o = out.clone();
     let e = errs.clone();
-    ryuzi_cli::dispatch::Deps {
+    ryuzi_runner::dispatch::Deps {
         db_path: db.to_path_buf(),
         out: Box::new(move |s| o.lock().unwrap().push(s.to_string())),
         err: Box::new(move |s| e.lock().unwrap().push(s.to_string())),
         prompt: Box::new(|_| String::new()),
-        detect_git: || ryuzi_cli::detect::Detected {
+        detect_git: || ryuzi_runner::detect::Detected {
             found: true,
             version: None,
         },
-        build_registries: Box::new(|| Ok(ryuzi_core::Registries::new())),
     }
 }
 
@@ -26,7 +25,7 @@ fn run(db: &Path, args: &[&str]) -> (u8, Vec<String>, Vec<String>) {
     let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut deps = deps_for(db, out.clone(), errs.clone());
     let code =
-        ryuzi_cli::dispatch::run_cli(args.iter().map(|s| s.to_string()).collect(), &mut deps);
+        ryuzi_runner::dispatch::run_cli(args.iter().map(|s| s.to_string()).collect(), &mut deps);
     let o = out.lock().unwrap().clone();
     let e = errs.lock().unwrap().clone();
     (code, o, e)
@@ -90,7 +89,8 @@ fn list_shows_redaction_defaults_and_unset() {
 /// Regression test: `cmd_config` used to run settings get/set/list without
 /// ever populating the process-wide `plugin.*` fields registry (that table
 /// is normally populated as a side effect of `Registries::add_plugin`, which
-/// only `deps.build_registries` calls — and `ryuzi config` never calls it).
+/// `ryuzi config` never calls — it opens the settings store directly instead
+/// of building a full `Registries`).
 /// So `config set plugin.<id>.<key> ...` failed "unknown setting" for every
 /// real plugin field, and `config get` would report a registered secret as
 /// non-secret (empty table → `is_secret` false) and print it unredacted.

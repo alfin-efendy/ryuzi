@@ -1,9 +1,9 @@
 //! `__daemon` [`--canary`]: the hidden background-process entry points.
-//! Spawned detached by the TUI's `s` key (`AppController::start_daemon`,
-//! `crates/cli/src/tui/controller.rs`) as `[current_exe, "__daemon"]`, and by
-//! the self-updater's `ProdApplierHost::spawn_canary` as
-//! `[canary_path, "__daemon", "--canary"]` — never invoked directly by a
-//! user, and deliberately absent from `--help`.
+//! Spawned by the self-updater's `ProdApplierHost::spawn_canary` as
+//! `[canary_path, "__daemon", "--canary"]` and respawned after a swap as
+//! `[install_path, "__daemon"]` — never invoked directly by a user, and
+//! deliberately absent from `--help`. The user-facing foreground entry
+//! point is `ryuzi start` (same code path, see `dispatch.rs`).
 //!
 //! Owns the daemon process lifecycle: timed connect, reentrancy-guarded
 //! shutdown on SIGTERM/SIGINT, the canary probe/promote flow, and the
@@ -99,10 +99,10 @@ fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
         // `factory_entries()` is gated INSIDE `ryuzi-core` on ITS OWN
         // `discord` feature (see `gateway::discord::mod`'s doc on why the
         // gate can't live here: `#[cfg(feature = "discord")]` in THIS crate
-        // would check a feature `ryuzi-cli` doesn't declare, since its
+        // would check a feature `ryuzi-runner` doesn't declare, since its
         // `Cargo.toml` requests `ryuzi-core`'s `discord` feature directly
         // rather than exposing its own toggle). Empty under
-        // `not(feature = "discord")`; populated for every real `ryuzi-cli`
+        // `not(feature = "discord")`; populated for every real `ryuzi-runner`
         // build (its `Cargo.toml` always requests `ryuzi-core/discord`).
         extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
         harness_factory: None,

@@ -49,21 +49,22 @@
 //!
 //! **Delegated decision — where the `discord` feature gate lives:** the
 //! brief's daemon-wiring sketch reads `#[cfg(feature = "discord")]` in
-//! `daemon_cmd.rs` (the `ryuzi-cli` crate). `#[cfg(feature = "...")]` always
+//! `daemon_cmd.rs` (the `ryuzi-runner` crate). `#[cfg(feature = "...")]` always
 //! checks the COMPILING crate's own declared features, never a dependency's
-//! — and `ryuzi-cli`'s `Cargo.toml` change for this task is a hardcoded
+//! — and `ryuzi-runner`'s `Cargo.toml` change for this task is a hardcoded
 //! feature request on its `ryuzi-core` path dependency (`features = ["otel",
-//! "discord"]`), not a new `[features]` toggle on `ryuzi-cli` itself (`cli`
-//! has none today; `otel` isn't cli-toggleable either — see `daemon.rs`'s
-//! `#[cfg(feature = "otel")]` gates, all of which live in `ryuzi-core`). So a
-//! literal `#[cfg(feature = "discord")]` inside `daemon_cmd.rs` would just
-//! always be `false` (unknown feature on that crate), silently registering
-//! nothing. Instead, [`factory_entries`] below lives HERE, in
-//! `ryuzi-core`, gated on `ryuzi-core`'s own real `discord` feature; `cli`
-//! calls it unconditionally. This keeps the "empty vec under `not(feature)`"
-//! behavior meaningful and testable from `ryuzi-core`'s own two-feature-state
-//! test suite, while `ryuzi-cli`'s build (which always requests
-//! `ryuzi-core/discord`) always gets a populated one.
+//! "discord"]`), not a new `[features]` toggle on `ryuzi-runner` itself (the
+//! runner has none today; `otel` isn't runner-toggleable either — see
+//! `daemon.rs`'s `#[cfg(feature = "otel")]` gates, all of which live in
+//! `ryuzi-core`). So a literal `#[cfg(feature = "discord")]` inside
+//! `daemon_cmd.rs` would just always be `false` (unknown feature on that
+//! crate), silently registering nothing. Instead, [`factory_entries`] below
+//! lives HERE, in `ryuzi-core`, gated on `ryuzi-core`'s own real `discord`
+//! feature; the runner calls it unconditionally. This keeps the "empty vec
+//! under `not(feature)`" behavior meaningful and testable from
+//! `ryuzi-core`'s own two-feature-state test suite, while `ryuzi-runner`'s
+//! build (which always requests `ryuzi-core/discord`) always gets a
+//! populated one.
 
 use crate::domain::{ApprovalDecision, ApprovalRequest, AttachmentRef, PermMode, Surface};
 use crate::gateway::{Gateway, GatewayFactory, MessageRef};

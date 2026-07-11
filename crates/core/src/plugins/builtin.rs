@@ -36,7 +36,7 @@ fn fields_to_sdk(fields: &[ConfigField]) -> Vec<SettingField> {
 /// `gateway::discord::factory_entries()` — empty under `not(feature =
 /// "discord")`, populated with the real `serenity`-backed factory when the
 /// feature is on (see that function's doc for why the feature gate lives in
-/// `ryuzi-core` rather than `ryuzi-cli`).
+/// `ryuzi-core` rather than `ryuzi-runner`).
 pub fn discord_plugin() -> CorePlugin {
     let gateway = discord::factory_entries()
         .into_iter()

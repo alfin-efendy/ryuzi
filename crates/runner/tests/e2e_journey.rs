@@ -40,7 +40,7 @@ fn config_survives_a_full_daemon_lifecycle() {
         .stdout(predicate::str::contains("high"));
 
     // 2. Seed zero-gateway settings so the daemon never touches the network
-    //    (same seeding as crates/cli/tests/daemon.rs).
+    //    (same seeding as crates/runner/tests/daemon.rs).
     std::env::set_var("XDG_DATA_HOME", &data_home);
     std::env::set_var("HOME", &home);
     let db_path = ryuzi_core::paths::db_path();
