@@ -260,11 +260,17 @@ fn conn_data_needs_encryption(d: &crate::llm_router::connections::ConnectionData
 /// plaintext secret field. See [`init_and_sweep`] for the atomicity/idempotency
 /// contract.
 async fn sweep_connections(store: &Store) {
-    let rows: Vec<(String, String)> = match store
-        .with_conn(|c| -> rusqlite::Result<Vec<(String, String)>> {
-            let mut stmt = c.prepare("SELECT id, data FROM provider_connections")?;
+    let rows: Vec<(String, String, String)> = match store
+        .with_conn(|c| -> rusqlite::Result<Vec<(String, String, String)>> {
+            let mut stmt = c.prepare("SELECT id, provider, data FROM provider_connections")?;
             let items = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })
@@ -277,7 +283,7 @@ async fn sweep_connections(store: &Store) {
         }
     };
 
-    for (id, raw) in rows {
+    for (id, provider, raw) in rows {
         let mut data: crate::llm_router::connections::ConnectionData =
             match serde_json::from_str(&raw) {
                 Ok(d) => d,
@@ -288,7 +294,64 @@ async fn sweep_connections(store: &Store) {
                     continue;
                 }
             };
-        if !conn_data_needs_encryption(&data) {
+
+        let mut provider_specific_changed = false;
+        if provider == "anthropic-oauth" {
+            match &mut data.provider_specific {
+                Some(serde_json::Value::String(ciphertext)) if ciphertext.starts_with("enc:") => {
+                    let plain = match decrypt_field(ciphertext) {
+                        Ok(plain) => plain,
+                        Err(err) => {
+                            tracing::warn!(
+                                "secret sweep: skipping connection {id}, failed to decrypt \
+                                 provider_specific: {err}"
+                            );
+                            continue;
+                        }
+                    };
+                    let mut object = match serde_json::from_str::<
+                        serde_json::Map<String, serde_json::Value>,
+                    >(&plain)
+                    {
+                        Ok(object) => object,
+                        Err(err) => {
+                            tracing::warn!(
+                                "secret sweep: skipping connection {id}, decrypted \
+                                 provider_specific is not a json object: {err}"
+                            );
+                            continue;
+                        }
+                    };
+                    if object
+                        .remove(crate::llm_router::claude_cloak::LEGACY_CLAUDE_CLOAKING_KEY)
+                        .is_some()
+                    {
+                        provider_specific_changed = true;
+                        if object.is_empty() {
+                            data.provider_specific = None;
+                        } else {
+                            let cleaned = serde_json::Value::Object(object).to_string();
+                            data.provider_specific =
+                                Some(serde_json::Value::String(encrypt_field(&cleaned)));
+                        }
+                    }
+                }
+                Some(serde_json::Value::Object(object)) => {
+                    if object
+                        .remove(crate::llm_router::claude_cloak::LEGACY_CLAUDE_CLOAKING_KEY)
+                        .is_some()
+                    {
+                        provider_specific_changed = true;
+                        if object.is_empty() {
+                            data.provider_specific = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !provider_specific_changed && !conn_data_needs_encryption(&data) {
             continue; // already fully encrypted — leave untouched
         }
         encrypt_conn_data(&mut data);
@@ -640,20 +703,30 @@ mod tests {
         Store::open(&path).await.unwrap()
     }
 
-    async fn insert_raw_connection(store: &Store, id: &str, raw_data_json: &str) {
+    async fn insert_raw_connection_for_provider(
+        store: &Store,
+        id: &str,
+        provider: &str,
+        raw_data_json: &str,
+    ) {
         let id = id.to_string();
+        let provider = provider.to_string();
         let raw = raw_data_json.to_string();
         store
             .with_conn(move |c| {
                 c.execute(
                     "INSERT INTO provider_connections(id,provider,auth_type,label,priority,enabled,data,created_at,updated_at) \
-                     VALUES (?1,'openai','api_key','L',0,1,?2,1,1)",
-                    params![id, raw],
+                     VALUES (?1,?2,'api_key','L',0,1,?3,1,1)",
+                    params![id, provider, raw],
                 )
                 .map(|_| ())
             })
             .await
             .unwrap();
+    }
+
+    async fn insert_raw_connection(store: &Store, id: &str, raw_data_json: &str) {
+        insert_raw_connection_for_provider(store, id, "openai", raw_data_json).await;
     }
 
     async fn insert_raw_endpoint_key(store: &Store, id: &str, raw_key: &str) {
@@ -791,6 +864,218 @@ mod tests {
             raw_endpoint_key(&store, "k1").await,
             "already-encrypted endpoint key row must not be touched"
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_legacy_claude_cloaking_from_encrypted_anthropic_oauth() {
+        use_test_key_file();
+        let store = mem_store().await;
+        let api_key = encrypt_field("unrelated-secret");
+        let provider_specific = encrypt_field(
+            &serde_json::json!({
+                crate::llm_router::claude_cloak::LEGACY_CLAUDE_CLOAKING_KEY: true,
+                "accountId": "acct-1"
+            })
+            .to_string(),
+        );
+        let raw = serde_json::json!({
+            "apiKey": api_key,
+            "providerSpecific": provider_specific
+        })
+        .to_string();
+        insert_raw_connection_for_provider(&store, "mixed", "anthropic-oauth", &raw).await;
+
+        sweep_connections(&store).await;
+
+        let first = raw_connection_data(&store, "mixed").await;
+        let first_data: crate::llm_router::connections::ConnectionData =
+            serde_json::from_str(&first).unwrap();
+        assert_eq!(first_data.api_key.as_deref(), Some(api_key.as_str()));
+        let cleaned_ciphertext = first_data
+            .provider_specific
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert_ne!(cleaned_ciphertext, provider_specific);
+        let cleaned: serde_json::Value =
+            serde_json::from_str(&decrypt_field(cleaned_ciphertext).unwrap()).unwrap();
+        assert_eq!(cleaned, serde_json::json!({"accountId": "acct-1"}));
+
+        sweep_connections(&store).await;
+        assert_eq!(raw_connection_data(&store, "mixed").await, first);
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_legacy_claude_cloaking_only_payload_entirely() {
+        use_test_key_file();
+        let store = mem_store().await;
+        let provider_specific = encrypt_field(
+            &serde_json::json!({
+                crate::llm_router::claude_cloak::LEGACY_CLAUDE_CLOAKING_KEY: false
+            })
+            .to_string(),
+        );
+        let raw = serde_json::json!({"providerSpecific": provider_specific}).to_string();
+        insert_raw_connection_for_provider(&store, "only", "anthropic-oauth", &raw).await;
+
+        sweep_connections(&store).await;
+
+        let cleaned: crate::llm_router::connections::ConnectionData =
+            serde_json::from_str(&raw_connection_data(&store, "only").await).unwrap();
+        assert_eq!(cleaned.provider_specific, None);
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_legacy_claude_cloaking_without_churning_unaffected_rows() {
+        use_test_key_file();
+        let store = mem_store().await;
+        let anthropic_payload =
+            encrypt_field(&serde_json::json!({"accountId": "acct-2"}).to_string());
+        let anthropic_raw = serde_json::json!({"providerSpecific": anthropic_payload}).to_string();
+        insert_raw_connection_for_provider(
+            &store,
+            "anthropic-clean",
+            "anthropic-oauth",
+            &anthropic_raw,
+        )
+        .await;
+
+        let other_payload = encrypt_field(
+            &serde_json::json!({
+                crate::llm_router::claude_cloak::LEGACY_CLAUDE_CLOAKING_KEY: true,
+                "accountId": "other"
+            })
+            .to_string(),
+        );
+        let other_raw = serde_json::json!({"providerSpecific": other_payload}).to_string();
+        insert_raw_connection_for_provider(&store, "other", "openai-oauth", &other_raw).await;
+
+        sweep_connections(&store).await;
+
+        assert_eq!(
+            raw_connection_data(&store, "anthropic-clean").await,
+            anthropic_raw
+        );
+        assert_eq!(raw_connection_data(&store, "other").await, other_raw);
+        let retained: serde_json::Value =
+            serde_json::from_str(&decrypt_field(&other_payload).unwrap()).unwrap();
+        assert_eq!(
+            retained.get(crate::llm_router::claude_cloak::LEGACY_CLAUDE_CLOAKING_KEY),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_legacy_claude_cloaking_before_encrypting_plaintext_row() {
+        use_test_key_file();
+        let store = mem_store().await;
+        let raw = serde_json::json!({
+            "apiKey": "sk-legacy",
+            "providerSpecific": {
+                crate::llm_router::claude_cloak::LEGACY_CLAUDE_CLOAKING_KEY: true,
+                "accountId": "acct-3"
+            }
+        })
+        .to_string();
+        insert_raw_connection_for_provider(&store, "plaintext", "anthropic-oauth", &raw).await;
+
+        sweep_connections(&store).await;
+
+        let encrypted: crate::llm_router::connections::ConnectionData =
+            serde_json::from_str(&raw_connection_data(&store, "plaintext").await).unwrap();
+        assert!(encrypted
+            .api_key
+            .as_deref()
+            .unwrap()
+            .starts_with(ENC_PREFIX));
+        let provider_specific = encrypted.provider_specific.unwrap();
+        let ciphertext = provider_specific.as_str().unwrap();
+        let cleaned: serde_json::Value =
+            serde_json::from_str(&decrypt_field(ciphertext).unwrap()).unwrap();
+        assert_eq!(cleaned, serde_json::json!({"accountId": "acct-3"}));
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_legacy_claude_cloaking_leaves_failed_rows_for_retry() {
+        use_test_key_file();
+        let store = mem_store().await;
+        let undecryptable = SecretCipher::from_key([42u8; 32]).encrypt(
+            &serde_json::json!({
+                crate::llm_router::claude_cloak::LEGACY_CLAUDE_CLOAKING_KEY: true
+            })
+            .to_string(),
+        );
+        let undecryptable_raw = serde_json::json!({
+            "apiKey": "must-remain-plaintext",
+            "providerSpecific": undecryptable
+        })
+        .to_string();
+        insert_raw_connection_for_provider(
+            &store,
+            "undecryptable",
+            "anthropic-oauth",
+            &undecryptable_raw,
+        )
+        .await;
+
+        let invalid_json = encrypt_field("not-json");
+        let invalid_json_raw = serde_json::json!({
+            "apiKey": "also-must-remain-plaintext",
+            "providerSpecific": invalid_json
+        })
+        .to_string();
+        insert_raw_connection_for_provider(
+            &store,
+            "invalid-json",
+            "anthropic-oauth",
+            &invalid_json_raw,
+        )
+        .await;
+
+        sweep_connections(&store).await;
+
+        assert_eq!(
+            raw_connection_data(&store, "undecryptable").await,
+            undecryptable_raw
+        );
+        assert_eq!(
+            raw_connection_data(&store, "invalid-json").await,
+            invalid_json_raw
+        );
+
+        let repaired = encrypt_field(
+            &serde_json::json!({
+                crate::llm_router::claude_cloak::LEGACY_CLAUDE_CLOAKING_KEY: true,
+                "accountId": "recovered"
+            })
+            .to_string(),
+        );
+        let repaired_raw = serde_json::json!({
+            "apiKey": "must-remain-plaintext",
+            "providerSpecific": repaired
+        })
+        .to_string();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE provider_connections SET data=?2 WHERE id=?1",
+                    params!["undecryptable", repaired_raw],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        sweep_connections(&store).await;
+
+        let retried: crate::llm_router::connections::ConnectionData =
+            serde_json::from_str(&raw_connection_data(&store, "undecryptable").await).unwrap();
+        assert!(retried.api_key.as_deref().unwrap().starts_with(ENC_PREFIX));
+        let retried_payload = retried.provider_specific.unwrap();
+        let retried_ciphertext = retried_payload.as_str().unwrap();
+        let retried_json: serde_json::Value =
+            serde_json::from_str(&decrypt_field(retried_ciphertext).unwrap()).unwrap();
+        assert_eq!(retried_json, serde_json::json!({"accountId": "recovered"}));
     }
 
     #[test]
