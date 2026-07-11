@@ -71,3 +71,13 @@ fn doctor_prints_three_report_lines() {
         assert_eq!(code, 1);
     }
 }
+
+#[test]
+fn help_lists_the_start_command() {
+    Command::cargo_bin("ryuzi")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("start"));
+}

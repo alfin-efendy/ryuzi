@@ -1,7 +1,8 @@
-//! Process-level test for the hidden `__daemon` entry point
-//! (`crates/cli/src/daemon_cmd.rs`): spawns the real compiled `ryuzi` binary,
-//! waits for it to reach `daemon.json` state `"running"`, then verifies a
-//! clean SIGTERM shutdown. Unix-only (SIGTERM/`libc::kill` via
+//! Process-level test for the daemon entry points (hidden `__daemon` and the
+//! user-facing `start` alias, both dispatching to
+//! `crates/runner/src/daemon_cmd.rs`): spawns the real compiled `ryuzi`
+//! binary, waits for it to reach `daemon.json` state `"running"`, then
+//! verifies a clean SIGTERM shutdown. Unix-only (SIGTERM/`libc::kill` via
 //! `ryuzi_core::daemon_status::send_sigterm`).
 
 #![cfg(unix)]
@@ -15,9 +16,7 @@ use ryuzi_core::settings::SettingsStore;
 use ryuzi_core::Store;
 use serial_test::serial;
 
-#[test]
-#[serial]
-fn daemon_process_reaches_running_then_exits_cleanly_on_sigterm() {
+fn lifecycle(entry: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let data_home = tmp.path().join("data");
     let home = tmp.path().to_path_buf();
@@ -48,12 +47,12 @@ fn daemon_process_reaches_running_then_exits_cleanly_on_sigterm() {
     }
 
     let mut child = Command::new(assert_cmd::cargo::cargo_bin("ryuzi"))
-        .arg("__daemon")
+        .arg(entry)
         .env("XDG_DATA_HOME", &data_home)
         .env("HOME", &home)
         .stdin(Stdio::null())
         .spawn()
-        .expect("failed to spawn `ryuzi __daemon`");
+        .unwrap_or_else(|e| panic!("failed to spawn `ryuzi {entry}`: {e}"));
 
     // Poll daemon.json until it reaches state "running" (≤10s).
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -112,4 +111,16 @@ fn daemon_process_reaches_running_then_exits_cleanly_on_sigterm() {
         read_status(&data_dir).is_none(),
         "daemon.json must be removed after a clean SIGTERM shutdown"
     );
+}
+
+#[test]
+#[serial]
+fn daemon_entry_point_reaches_running_then_exits_cleanly_on_sigterm() {
+    lifecycle("__daemon");
+}
+
+#[test]
+#[serial]
+fn start_entry_point_reaches_running_then_exits_cleanly_on_sigterm() {
+    lifecycle("start");
 }

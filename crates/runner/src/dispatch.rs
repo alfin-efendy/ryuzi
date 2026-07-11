@@ -23,6 +23,7 @@ pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {
             0
         }
         Some("doctor") => crate::doctor::cmd_doctor(deps),
+        Some("start") => crate::daemon_cmd::cmd_daemon(&args[1..], deps),
         Some("config") => crate::config_cmd::cmd_config(&args[1..], deps), // hidden: headless automation
         Some("__daemon") => crate::daemon_cmd::cmd_daemon(&args[1..], deps), // hidden: updater/canary respawn target
         Some(other) => {
