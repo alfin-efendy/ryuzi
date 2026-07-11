@@ -343,7 +343,6 @@ mod tests {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         }
     }
 

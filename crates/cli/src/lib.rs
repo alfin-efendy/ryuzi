@@ -10,5 +10,4 @@ pub mod paint;
 pub mod plugins_cmd;
 pub mod run_cmd;
 pub mod serve_cmd;
-pub mod sidecar_host;
 pub mod tui;

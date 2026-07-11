@@ -1,4 +1,4 @@
-//! Data-only provider catalog: gateway/runtime descriptors and their
+//! Data-only provider catalog: gateway descriptors and their
 //! provider-specific `ConfigField`s. Field keys are user-visible contracts —
 //! settings stored under these keys must keep resolving across releases.
 
@@ -11,25 +11,13 @@ pub struct GatewayDescriptor {
     pub fields: &'static [ConfigField],
 }
 
-pub struct RuntimeDescriptor {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub description: &'static str,
-    pub fields: &'static [ConfigField],
-}
-
 pub struct ProviderCatalog {
     pub gateways: &'static [GatewayDescriptor],
-    pub runtimes: &'static [RuntimeDescriptor],
 }
 
 impl ProviderCatalog {
     pub fn gateway(&self, id: &str) -> Option<&'static GatewayDescriptor> {
         self.gateways.iter().find(|g| g.id == id)
-    }
-
-    pub fn runtime(&self, id: &str) -> Option<&'static RuntimeDescriptor> {
-        self.runtimes.iter().find(|r| r.id == id)
     }
 }
 
@@ -68,29 +56,13 @@ pub static CATALOG: ProviderCatalog = ProviderCatalog {
         description: "Drive sessions from a Discord server",
         fields: DISCORD_FIELDS,
     }],
-    runtimes: &[
-        RuntimeDescriptor {
-            id: "claude-code",
-            label: "Claude Code",
-            description: "Anthropic's Claude Code CLI (uses your host login)",
-            fields: &[],
-        },
-        RuntimeDescriptor {
-            id: "native",
-            label: "Ryuzi",
-            description: "Ryuzi's built-in agent runtime — runs the loop and tools in-process, using your configured model providers",
-            fields: &[],
-        },
-    ],
 };
 
-/// All fields in schema order: globals, then each gateway's fields, then
-/// each runtime's fields.
+/// All fields in schema order: globals, then each gateway's fields.
 pub fn all_fields() -> Vec<&'static ConfigField> {
     GLOBAL_FIELDS
         .iter()
         .chain(CATALOG.gateways.iter().flat_map(|g| g.fields.iter()))
-        .chain(CATALOG.runtimes.iter().flat_map(|r| r.fields.iter()))
         .collect()
 }
 
@@ -143,7 +115,6 @@ mod tests {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {

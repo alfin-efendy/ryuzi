@@ -4,7 +4,6 @@
 //! Recipe) — bindings-stable, so every serde/specta attribute here must stay
 //! byte-identical to the source it was moved from.
 
-use super::ApiError;
 use crate::domain::SessionGitOptions;
 use crate::llm_router::secrets::KeychainStatus;
 use serde::{Deserialize, Serialize};
@@ -45,21 +44,15 @@ impl From<GitOptions> for SessionGitOptions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatRequestOptions {
-    pub runtime_id: Option<String>,
     pub model: Option<String>,
     pub context: Option<ChatContextArg>,
     #[serde(default)]
     pub attachments: Vec<String>,
     /// None => engine default (worktree ON, new engine-named branch from HEAD).
     pub git: Option<GitOptions>,
-}
-
-/// Ryuzi-only sessions: every runtime id resolves to the native harness.
-/// Legacy ids ("claude", "native") and anything else are accepted so old
-/// frontends or queued payloads can never error here; the Result shape is
-/// kept so call sites stay `?`-compatible.
-pub(crate) fn harness_for_runtime(_runtime_id: &str) -> Result<&'static str, ApiError> {
-    Ok("native")
+    /// Initial permission mode for the session being started (new-chat
+    /// picker). `None` ⇒ inherit the project default.
+    pub perm_mode: Option<crate::domain::PermMode>,
 }
 
 pub(crate) fn chat_agent_prompt(prompt: &str, context: Option<&ChatContextArg>) -> String {
@@ -167,7 +160,6 @@ pub struct JobInfo {
     pub project_id: String,
     pub project_name: String,
     pub branch: String,
-    pub agent: String,
     pub gateway: String,
     pub enabled: bool,
     pub prompt: String,
@@ -186,7 +178,6 @@ pub struct JobInput {
     pub cron: String,
     pub project_id: String,
     pub branch: String,
-    pub agent: String,
     pub gateway: String,
     pub prompt: String,
     pub notify_success: bool,
@@ -320,58 +311,14 @@ pub struct TodoItem {
     pub status: String,
 }
 
-// --- runtimes_api (moved verbatim from apps/cockpit/src-tauri/src/runtimes_cmd.rs) ---
+// --- agent_api (moved verbatim from apps/cockpit/src-tauri/src/agent_cmd.rs) ---
 
-#[derive(Serialize, Deserialize, Type, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
-pub struct TierInfo {
-    pub id: String,
-    pub label: String,
-    pub value: Option<String>,
-    pub combo: bool,
-}
-
-#[derive(Serialize, Deserialize, Type, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeInfo {
-    pub id: String,
-    pub name: String,
-    pub color: String,
-    pub initial: String,
-    pub connection: String,
-    pub binary_path: Option<String>,
-    pub installed_version: Option<String>,
-    pub latest_version: Option<String>,
-    pub npm_package: Option<String>,
-    pub models: Vec<String>,
-    pub enabled: bool,
-    pub model: String,
-    pub perm_mode: String,
-    pub flags: String,
-    pub tiers: Vec<TierInfo>,
-    pub is_default: bool,
-    /// Whether Cockpit has a session harness for this agent today.
-    pub runnable: bool,
-}
-
-#[derive(Serialize, Deserialize, Type, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeConfigStatusInfo {
-    pub config_path: String,
-    pub exists: bool,
-    pub configured: bool,
-    /// False for runtimes without an F1 handler (gemini, ollama).
-    pub supported: bool,
-}
-
-#[derive(Serialize, Deserialize, Type, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeMappingArg {
-    pub model: String,
-    pub opus: Option<String>,
-    pub sonnet: Option<String>,
-    pub haiku: Option<String>,
-    pub models: Vec<String>,
+pub struct AgentSettingsInfo {
+    pub model: Option<String>,
+    /// "plan" | "ask" | "edit" | "full"; None = engine default ("ask").
+    pub perm_mode: Option<String>,
 }
 
 // --- endpoint_api (moved verbatim from apps/cockpit/src-tauri/src/endpoint_cmd.rs) ---
@@ -533,8 +480,9 @@ pub struct PluginInfo {
     pub source: String,
     /// Any of `provider` | `runtime` | `gateway` | `connector`.
     pub capabilities: Vec<String>,
-    /// `integration` | `provider` | `gateway` | `skill-pack`. Runtime-kind
-    /// plugins are excluded from the list — the Runtime page owns them.
+    /// `integration` | `provider` | `gateway` | `skill-pack`. There is no
+    /// `runtime` kind: the native agent is built-in engine behavior, not an
+    /// installable/listed plugin, so it never appears in this payload.
     pub kind: String,
     /// Kind-specific "already set up" flag: integration = configured ||
     /// enabled; provider = ≥1 connection in the provider's family; gateway =
@@ -635,16 +583,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn harness_for_runtime_always_resolves_native() {
-        // Ryuzi-only sessions: any id — current, legacy, or unknown —
-        // resolves to the native harness instead of erroring.
-        assert_eq!(harness_for_runtime("native").unwrap(), "native");
-        assert_eq!(harness_for_runtime("claude").unwrap(), "native");
-        assert_eq!(harness_for_runtime("codex").unwrap(), "native");
-        assert_eq!(harness_for_runtime("anything-legacy").unwrap(), "native");
-    }
-
-    #[test]
     fn chat_agent_prompt_appends_context_without_changing_display_text() {
         let out = chat_agent_prompt(
             "/review auth",
@@ -673,11 +611,11 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_options_deserializes_model() {
+    fn chat_request_options_deserializes_model_and_ignores_legacy_runtime_id() {
+        // Native-only: a legacy `runtimeId` key is accepted but ignored.
         let opts: ChatRequestOptions =
             serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
                 .unwrap();
-        assert_eq!(opts.runtime_id.as_deref(), Some("native"));
         assert_eq!(opts.model.as_deref(), Some("fable"));
     }
 
@@ -685,8 +623,7 @@ mod tests {
     fn chat_request_options_git_defaults_to_none_and_deserializes() {
         // Old payloads (no `git` key) keep parsing.
         let opts: ChatRequestOptions =
-            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
-                .unwrap();
+            serde_json::from_value(serde_json::json!({"model": "fable"})).unwrap();
         assert!(opts.git.is_none());
 
         let opts: ChatRequestOptions = serde_json::from_value(serde_json::json!({

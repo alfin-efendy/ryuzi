@@ -38,12 +38,11 @@ pub(crate) fn basename_of(path: &str) -> String {
 
 pub struct ControlPlane {
     store: Arc<Store>,
-    /// Extension registries (harness/gateway/connector). `Project.harness` is
-    /// resolved against `registries.harness`.
+    /// Extension registries (harness slot/gateway/connector/plugins).
     registries: Registries,
     events: broadcast::Sender<CoreEvent>,
-    /// Shared approval hub — handed to each `SessionCtx` so the ACP permission
-    /// bridge can route tool-permission prompts back to the UI.
+    /// Shared approval hub — handed to each `SessionCtx` so the permission
+    /// gate can route tool-permission prompts back to the UI.
     approvals: Arc<ApprovalHub>,
     /// Live sessions keyed by `session_pk`. Each value is the harness session
     /// handle returned by `Harness::start_session`, used to drive prompts and to

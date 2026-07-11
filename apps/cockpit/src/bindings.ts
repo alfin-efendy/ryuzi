@@ -53,9 +53,25 @@ async startSession(projectId: string, prompt: string, options: ChatRequestOption
     else return { status: "error", error: e  as any };
 }
 },
+async startChatSession(prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_chat_session", { prompt, options }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async continueSession(sessionPk: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("continue_session", { sessionPk, prompt, options }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async steerSession(sessionPk: string, text: string) : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("steer_session", { sessionPk, text }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -154,9 +170,17 @@ async setSetting(key: string, value: string) : Promise<Result<null, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async updateProject(projectId: string, model: string | null, permMode: PermMode, harness: string) : Promise<Result<Project, CmdError>> {
+async updateProject(projectId: string, model: string | null, permMode: PermMode) : Promise<Result<Project, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_project", { projectId, model, permMode, harness }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_project", { projectId, model, permMode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateSessionPermMode(sessionPk: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_session_perm_mode", { sessionPk, permMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -170,86 +194,25 @@ async listBranches(projectId: string) : Promise<Result<BranchList, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async listRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
+async getAgentSettings() : Promise<Result<AgentSettingsInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_runtimes") };
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_settings") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-/**
- * Re-probe every catalog agent (PATH + --version + npm latest + local model
- * list for ollama), persist the snapshot, and return the fresh assembly.
- */
-async refreshRuntimes() : Promise<Result<RuntimeInfo[], CmdError>> {
+async setAgentSettings(model: string | null, permMode: string | null) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("refresh_runtimes") };
+    return { status: "ok", data: await TAURI_INVOKE("set_agent_settings", { model, permMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateRuntimeConfig(id: string, enabled: boolean, model: string | null, permMode: string, flags: string) : Promise<Result<RuntimeInfo[], CmdError>> {
+async listSelectableModels() : Promise<Result<string[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_runtime_config", { id, enabled, model, permMode, flags }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Fire-and-forget npm update; progress streams via CoreEvent
- * RuntimeUpdateLog / RuntimeUpdateDone, then a refreshed snapshot matters —
- * the UI calls refreshRuntimes() on Done.
- */
-async updateRuntime(id: string) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("update_runtime", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setRuntimeTier(id: string, tierId: string, value: string | null, combo: boolean) : Promise<Result<RuntimeInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_runtime_tier", { id, tierId, value, combo }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setDefaultRuntime(id: string) : Promise<Result<RuntimeInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_default_runtime", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async runtimeConfigStatus(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("runtime_config_status", { id }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Guard (spec §5): refuse to write configs that point at a dead endpoint —
- * the server must be running and at least one endpoint key must exist.
- */
-async applyRuntimeConfig(id: string, mapping: RuntimeMappingArg) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("apply_runtime_config", { id, mapping }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async resetRuntimeConfig(id: string) : Promise<Result<RuntimeConfigStatusInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reset_runtime_config", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("list_selectable_models") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1197,9 +1160,15 @@ transport: string; command: string | null; args: string[];
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
+export type AgentSettingsInfo = { model: string | null; 
+/**
+ * "plan" | "ask" | "edit" | "full"; None = engine default ("ask").
+ */
+permMode: string | null }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 /**
- * The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+ * The user's decision on a tool-approval request from the native runtime's
+ * permission gate.
  */
 export type ApprovalDecision = "allowOnce" | "allowAlways" | "rejectOnce" | "rejectAlways" | "cancel"
 /**
@@ -1255,11 +1224,16 @@ export type CatalogEntry = { id: string; name: string;
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
-export type ChatRequestOptions = { runtimeId: string | null; model: string | null; context: ChatContextArg | null; attachments?: string[]; 
+export type ChatRequestOptions = { model: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**
  * None => engine default (worktree ON, new engine-named branch from HEAD).
  */
-git: GitOptions | null }
+git: GitOptions | null; 
+/**
+ * Initial permission mode for the session being started (new-chat
+ * picker). `None` ⇒ inherit the project default.
+ */
+permMode: PermMode | null }
 export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
@@ -1282,7 +1256,7 @@ claudeCloaking: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -1297,14 +1271,6 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * cancelled; roots also decomposing|waiting|judging).
  */
 { kind: "orchTaskChanged"; task_id: string; root_id: string | null; status: string } | 
-/**
- * A runtime npm install/update produced an output line.
- */
-{ kind: "runtimeUpdateLog"; runtime_id: string; line: string } | 
-/**
- * A runtime npm install/update finished (ok=false → message has detail).
- */
-{ kind: "runtimeUpdateDone"; runtime_id: string; ok: boolean; message: string | null } | 
 /**
  * Per-response context usage for a native session (drives the
  * "% context left" indicator).
@@ -1365,8 +1331,8 @@ export type GitOptions = { useWorktree: boolean; createBranch: boolean; branchNa
 export type InstalledSkillEntry = { id: string; name: string }
 export type InstalledSkillInfo = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skillCount: number }
 export type InstalledSkillPack = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skills: InstalledSkillEntry[] }
-export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; agent: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
-export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; agent: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
+export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
+export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Where the process's master key actually came from. Surfaced to the UI
@@ -1393,7 +1359,7 @@ export type KeychainStatus =
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
- * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
+ * A persisted transcript entry, one row per native-runtime event block.
  */
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
 /**
@@ -1458,8 +1424,9 @@ source: string;
  */
 capabilities: string[]; 
 /**
- * `integration` | `provider` | `gateway` | `skill-pack`. Runtime-kind
- * plugins are excluded from the list — the Runtime page owns them.
+ * `integration` | `provider` | `gateway` | `skill-pack`. There is no
+ * `runtime` kind: the native agent is built-in engine behavior, not an
+ * installable/listed plugin, so it never appears in this payload.
  */
 kind: string; 
 /**
@@ -1527,7 +1494,7 @@ export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string;
  * failure — the flow entry survives failures so manual paste still works.
  */
 export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
-export type Project = { projectId: string; name: string; workdir: string; source: string | null; harness: string; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
+export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —
  * NOT a DB column. Self-corrects if the user later runs `git init`.
@@ -1538,24 +1505,45 @@ export type ProviderQuotaInfo = { provider: string; plan: string | null; message
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
-export type RuntimeConfigStatusInfo = { configPath: string; exists: boolean; configured: boolean; 
+export type Session = { sessionPk: string; 
 /**
- * False for runtimes without an F1 handler (gemini, ollama).
+ * `None` for chat-first sessions (`kind != Project`); a project-bound
+ * session always has this set.
  */
-supported: boolean }
-export type RuntimeInfo = { id: string; name: string; color: string; initial: string; connection: string; binaryPath: string | null; installedVersion: string | null; latestVersion: string | null; npmPackage: string | null; models: string[]; enabled: boolean; model: string; permMode: string; flags: string; tiers: TierInfo[]; isDefault: boolean; 
+projectId: string | null; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; 
 /**
- * Whether Cockpit has a session harness for this agent today.
+ * Per-session permission mode. Copied from the project (or the new-chat
+ * picker) at creation; changing it affects THIS session only.
  */
-runnable: boolean }
-export type RuntimeMappingArg = { model: string; opus: string | null; sonnet: string | null; haiku: string | null; models: string[] }
-export type Session = { sessionPk: string; projectId: string; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
+permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
 /**
  * True when the engine auto-generated the branch name (`harness/{short}`).
  * `end_session` deletes the branch ONLY when this is set; user-named and
  * pre-existing branches survive teardown.
  */
-branchOwned: boolean }
+branchOwned: boolean; kind: SessionKind; 
+/**
+ * Who is speaking in this session (chat-first; e.g. a Discord user id
+ * or `"cockpit"`). Unused for `Project` sessions.
+ */
+speaker: string | null; 
+/**
+ * Which agent persona/config is driving this session. Unused for
+ * `Project` sessions.
+ */
+agent: string | null; 
+/**
+ * The session this one was spawned from (`Worker`/`Review` lineage).
+ */
+parentSessionPk: string | null }
+/**
+ * What a session represents. `Project` is the pre-Phase-2 default (bound to
+ * a project workdir); `Chat`, `Worker`, and `Review` are chat-first kinds
+ * added in Phase 2 — `project_id` is `None` for all three, and `Worker`/
+ * `Review` additionally carry `parent_session_pk` lineage back to the chat
+ * or project session that spawned them.
+ */
+export type SessionKind = "project" | "chat" | "worker" | "review"
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 
@@ -1573,7 +1561,6 @@ ok: boolean;
  * Tri-state probe verdict: "valid" | "invalid" | "unknown".
  */
 status: string; message: string }
-export type TierInfo = { id: string; label: string; value: string | null; combo: boolean }
 export type TodoItem = { content: string; status: string }
 export type ToolInfo = { name: string; desc: string; perm: string }
 /**

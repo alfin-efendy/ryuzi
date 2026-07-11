@@ -115,6 +115,22 @@ impl ContextManager {
         self.ledger.append_assistant(content).await
     }
 
+    /// Append a plain-text user turn (a single text block). Thin wrapper for
+    /// aux flows that have no image/tool blocks to carry — e.g. the
+    /// budget-exhausted nudge (spec Task B2).
+    pub async fn append_user_text(&mut self, text: &str) -> anyhow::Result<()> {
+        self.append_user(serde_json::json!([{ "type": "text", "text": text }]))
+            .await
+    }
+
+    /// Append a plain-text assistant turn (a single text block). Thin
+    /// wrapper for aux one-shot calls whose response is never a tool_use —
+    /// e.g. the post-exhaustion summary call (spec Task B2).
+    pub async fn append_assistant_text(&mut self, text: &str) -> anyhow::Result<()> {
+        self.append_assistant(serde_json::json!([{ "type": "text", "text": text }]))
+            .await
+    }
+
     /// Append tool_result blocks as one user turn, truncating each result's
     /// string content to the ingestion budget first (spec §6.2). The ledger
     /// stores the truncated form — exactly what the model sees.

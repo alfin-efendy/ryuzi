@@ -239,7 +239,8 @@ pub fn upgrade_hint(install: &InstallInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CoreEvent, Session, SessionStatus};
+    use crate::domain::PermMode;
+    use crate::domain::{CoreEvent, Session, SessionKind, SessionStatus};
     use crate::settings::SettingsStore;
     use crate::store::Store;
     use crate::update::check::{HttpResponse, UpdateHttp};
@@ -290,17 +291,22 @@ mod tests {
     fn sess(pk: &str, status: SessionStatus) -> Session {
         Session {
             session_pk: pk.into(),
-            project_id: "p1".into(),
+            project_id: Some("p1".into()),
             agent_session_id: None,
             worktree_path: None,
             branch: None,
             title: None,
             status,
+            perm_mode: PermMode::Default,
             started_by: None,
             created_at: None,
             last_active: None,
             resume_attempts: 0,
             branch_owned: true,
+            kind: SessionKind::Project,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         }
     }
 

@@ -7,8 +7,8 @@ import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
-import { HOME_SUGGESTIONS, PERM_MODES } from "@/constants";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { HOME_SUGGESTIONS, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
+import { useAgent } from "@/store-agent";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
@@ -19,8 +19,13 @@ import { AttachmentChips } from "@/components/composer/AttachmentChips";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
 import { BranchNameModal } from "@/components/modals/BranchNameModal";
 
+// Sentinel Combobox value for "no project attached" — Base UI's Combobox
+// value type is a plain string, so a real project id can't share the slot
+// with null. Detaching (picking this) clears selectProject back to null.
+const NO_PROJECT = "__none__";
+
 export function HomeView() {
-  const { projects, selectedProjectId, selectProject, start, setProjectModel } = useStore();
+  const { projects, selectedProjectId, selectProject, start, startChat, setProjectModel } = useStore();
   const nav = useNav();
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
@@ -28,8 +33,13 @@ export function HomeView() {
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
+  // Permission mode for the session about to be created. null = project default.
+  const [composerPerm, setComposerPerm] = useState<UiPermMode | null>(null);
 
-  const project = projects.find((p) => p.projectId === selectedProjectId) ?? projects[0];
+  // Chat is the default: no project is auto-selected. A project is attached
+  // only when the user explicitly picks one (sidebar "+" or the composer's
+  // project Combobox) — see selectedProjectId in the store.
+  const project = projects.find((p) => p.projectId === selectedProjectId);
   const projectId = project?.projectId;
   const draftKey = `home:${projectId ?? ""}`;
   const draft = nav.drafts[draftKey] ?? "";
@@ -41,11 +51,10 @@ export function HomeView() {
     [draftKey],
   );
   const isGit = project?.isGit ?? false;
-  const runtimes = useRuntimes((s) => s.runtimes);
-  // Ryuzi-only: every session runs the native runtime; the user picks a model.
-  const native = runtimeById(runtimes, "native");
-  const modelOptions = native?.models ?? [];
-  const selectedModel = nav.composerModel ?? project?.model ?? native?.model ?? "";
+  // Ryuzi-only: every session runs the native agent; the user picks a model.
+  const modelOptions = useAgent((s) => s.models);
+  const agentModel = useAgent((s) => s.model);
+  const selectedModel = nav.composerModel ?? project?.model ?? agentModel ?? "";
   const setComposerModel = useNav((s) => s.setComposerModel);
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
@@ -65,6 +74,12 @@ export function HomeView() {
   useEffect(() => {
     setComposerModel(null);
   }, [projectId, setComposerModel]);
+
+  // A permission mode picked for one project's new-chat composer must not leak into the next one.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
+  useEffect(() => {
+    setComposerPerm(null);
+  }, [projectId]);
 
   const [branchList, setBranchList] = useState<BranchList | null>(null);
   const [branchModalOpen, setBranchModalOpen] = useState(false);
@@ -154,19 +169,21 @@ export function HomeView() {
 
   const send = async () => {
     const t = draft.trim();
-    if ((!t && composerFiles.attachments.length === 0) || !project) return;
+    if (!t && composerFiles.attachments.length === 0) return;
     const opts = {
-      runtimeId: "native",
       model: nav.composerModel ?? null,
       context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
       git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
+      permMode: composerPerm ? uiPermToCore(composerPerm) : null,
     };
     const typed = draft;
     useNav.getState().clearDraft(draftKey);
     composerFiles.clear();
     setContextRefs([]);
-    const ok = await start(project.projectId, t, opts);
+    // No project attached → a chat-first session (the Home default);
+    // a picked project starts a normal project session, unchanged.
+    const ok = project ? await start(project.projectId, t, opts) : await startChat(t, opts);
     if (ok) nav.navigate({ kind: "session" });
     else useNav.getState().restoreDraft(draftKey, typed);
   };
@@ -225,15 +242,27 @@ export function HomeView() {
             >
               <Paperclip aria-hidden size={16} strokeWidth={2} />
             </Button>
-            <Button
-              variant="ghost"
-              className="font-medium"
-              title="Permission mode is set on the runtime"
-              style={{ color: native?.permMode === "full" ? "#E8703A" : undefined }}
-            >
-              <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-              {PERM_MODES.find((m) => m.id === native?.permMode)?.label ?? "Ask"}
-            </Button>
+            <Combobox
+              aria-label="Permission mode"
+              options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
+              value={composerPerm ?? corePermToUi(project?.permMode ?? "default")}
+              onValueChange={(mode) => setComposerPerm(mode as UiPermMode)}
+              trigger={
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  title="Permission mode for the new session"
+                  className="font-medium"
+                  style={{
+                    color: (composerPerm ?? corePermToUi(project?.permMode ?? "default")) === "full" ? "#E8703A" : undefined,
+                  }}
+                >
+                  <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                  {PERM_MODES.find((m) => m.id === (composerPerm ?? corePermToUi(project?.permMode ?? "default")))?.label ?? "Ask"}
+                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                </Button>
+              }
+            />
             <div className="flex-1" />
             <ModelPicker
               ariaLabel="Model"
@@ -284,9 +313,12 @@ export function HomeView() {
           <div className="relative flex items-center gap-1.5 border-t border-border px-3 py-2">
             <Combobox
               aria-label="Project"
-              options={projects.map((p) => ({ value: p.projectId, label: projectLabel(p) }))}
-              value={project?.projectId ?? null}
-              onValueChange={(id) => selectProject(id)}
+              options={[
+                { value: NO_PROJECT, label: "No project" },
+                ...projects.map((p) => ({ value: p.projectId, label: projectLabel(p) })),
+              ]}
+              value={project?.projectId ?? NO_PROJECT}
+              onValueChange={(id) => selectProject(id === NO_PROJECT ? null : id)}
               placeholder="No project"
               trigger={
                 <Button variant="ghost" size="sm" className="gap-[7px] font-semibold">

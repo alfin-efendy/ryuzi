@@ -1,7 +1,6 @@
 //! First-party plugins that don't have a more natural home beside their own
-//! implementation module. `native` and `claude-code` live beside their
-//! harness code (`harness::native::native_plugin`,
-//! `harness::acp::claude_code_plugin`); `discord` — the only built-in gateway
+//! implementation module. `native` lives beside its harness code
+//! (`harness::native::native_plugin`); `discord` — the only built-in gateway
 //! today — lives here since `gateway::discord` is data/protocol-only.
 
 use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
@@ -62,7 +61,6 @@ pub fn discord_plugin() -> CorePlugin {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         },
         harness: None,
         gateway,

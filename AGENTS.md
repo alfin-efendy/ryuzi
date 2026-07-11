@@ -273,8 +273,8 @@ frontend/backend mismatches.
   `Cargo.toml` first.
 - Do not assume planned apps (`apps/mission-control`, `apps/mobile`) are
   implemented just because their workspace folders exist.
-- Do not assume Discord, Claude Code, Tauri sidecars, or update flows work
-  without checking the relevant tests and docs.
+- Do not assume Discord or update flows work without checking the relevant
+  tests and docs.
 - Do not hand-edit lockfiles unless dependency changes require it.
 - Do not rewrite generated assets, icons, or brand files unless the task is
   explicitly about those assets.

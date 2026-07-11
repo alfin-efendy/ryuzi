@@ -40,9 +40,18 @@ pub(crate) async fn session_root(cp: &ControlPlane, session_pk: &str) -> anyhow:
             return Ok(PathBuf::from(wt));
         }
     }
+    if session.project_id.is_none() {
+        let dir = crate::paths::chat_scratch_dir(session_pk);
+        std::fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
+    let project_id = session
+        .project_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("session {session_pk} has no bound project"))?;
     let project = cp
         .store()
-        .get_project(&session.project_id)
+        .get_project(project_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("unknown project"))?;
     Ok(PathBuf::from(project.workdir))
@@ -221,8 +230,25 @@ mod tests {
     use super::*;
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
+    use serial_test::serial;
     use std::path::Path;
     use std::process::Command;
+
+    /// Redirect dirs::data_dir() into a tempdir for the duration of a test so
+    /// scratch-dir creation never touches the real ~/.local/share.
+    /// Process-global env — every test using it must be #[serial].
+    struct StateDirGuard {
+        _dir: tempfile::TempDir,
+    }
+
+    impl StateDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            StateDirGuard { _dir: dir }
+        }
+    }
 
     /// Empty, unique scratch directory (recreated on reruns of the same pid).
     fn fresh_dir(name: &str) -> PathBuf {
@@ -245,6 +271,39 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn session_root_resolves_chat_scratch_dir() {
+        let _guard = StateDirGuard::new();
+        let s = crate::api::tests_support::state().await;
+        let now = crate::paths::now_ms();
+        s.cp.store()
+            .insert_session(crate::domain::Session {
+                session_pk: "chat-x".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: crate::domain::SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                perm_mode: crate::domain::PermMode::Default,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        let root = super::session_root(&s.cp, "chat-x").await.unwrap();
+        assert_eq!(root, crate::paths::chat_scratch_dir("chat-x"));
+        assert!(root.exists(), "scratch dir should be created on resolve");
     }
 
     #[tokio::test]

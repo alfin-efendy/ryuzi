@@ -50,7 +50,6 @@ function makeJob(overrides: Partial<JobInfo> = {}): JobInfo {
     projectId: "proj-1",
     projectName: "ryuzi",
     branch: "main",
-    agent: "claude",
     gateway: "local",
     enabled: true,
     prompt: "Triage new issues and open a summary PR.",

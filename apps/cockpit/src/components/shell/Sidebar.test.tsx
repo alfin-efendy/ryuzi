@@ -29,6 +29,11 @@ function sess(pk: string, lastActive: number) {
     lastActive,
     resumeAttempts: 0,
     branchOwned: false,
+    permMode: "default" as const,
+    kind: "project" as const,
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   };
 }
 
@@ -38,7 +43,6 @@ function project() {
     name: "proj",
     workdir: "/w",
     source: null,
-    harness: "native",
     model: null,
     effort: null,
     permMode: "default" as const,

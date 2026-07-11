@@ -23,7 +23,6 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     name: "ryuzi",
     workdir: "/tmp/ryuzi",
     source: null,
-    harness: "claude",
     model: null,
     effort: null,
     permMode: "default",

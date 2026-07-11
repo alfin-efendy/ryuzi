@@ -19,5 +19,5 @@ pub mod subst;
 
 pub use manifest::{
     AuthKind, AuthSpec, FieldKind, ManifestError, McpServerDef, McpTransportDef, ModelDef,
-    PluginManifest, ProviderMeta, RuntimeMeta, SettingField, SkillDef, CONTRACT_VERSION,
+    PluginManifest, ProviderMeta, SettingField, SkillDef, CONTRACT_VERSION,
 };

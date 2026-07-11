@@ -44,7 +44,7 @@ pub struct UiTerms(Mutex<HashMap<String, TermHandle>>);
 fn default_shell() -> (String, Vec<String>) {
     if cfg!(windows) {
         // Prefer PowerShell 7 when present.
-        if ryuzi_core::runtimes::find_on_path("pwsh").is_some() {
+        if ryuzi_core::process_util::find_on_path("pwsh").is_some() {
             ("pwsh".into(), vec!["-NoLogo".into()])
         } else {
             ("powershell".into(), vec!["-NoLogo".into()])

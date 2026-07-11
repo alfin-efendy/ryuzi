@@ -112,8 +112,8 @@ impl SettingsStore {
 
     /// Keys of required fields with no persisted value, in a stable order:
     /// required globals first (declaration order), then required fields of
-    /// each enabled gateway (declaration order), then required fields of
-    /// each enabled runtime — the order the wizard prompts in.
+    /// each enabled gateway (declaration order) — the order the wizard
+    /// prompts in.
     pub async fn missing_required(&self) -> anyhow::Result<Vec<&'static str>> {
         use crate::settings::catalog::CATALOG;
         use crate::settings::fields::GLOBAL_FIELDS;
@@ -133,26 +133,13 @@ impl SettingsStore {
                 }
             }
         }
-        for id in csv(self.get("enabled_runtimes").await?.as_deref()) {
-            if let Some(rt) = CATALOG.runtime(&id) {
-                for f in rt.fields {
-                    if f.required && self.get(f.key).await?.is_none() {
-                        out.push(f.key);
-                    }
-                }
-            }
-        }
         Ok(out)
     }
 
-    /// At least one gateway and one runtime enabled, and no required
-    /// setting is missing.
+    /// At least one gateway enabled, and no required setting is missing.
     pub async fn is_configured(&self) -> anyhow::Result<bool> {
         let gateways = csv(self.get("enabled_gateways").await?.as_deref());
-        let runtimes = csv(self.get("enabled_runtimes").await?.as_deref());
-        Ok(!gateways.is_empty()
-            && !runtimes.is_empty()
-            && self.missing_required().await?.is_empty())
+        Ok(!gateways.is_empty() && self.missing_required().await?.is_empty())
     }
 }
 
@@ -227,7 +214,6 @@ mod tests {
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         };
         let mut host = PluginHost::new();
         host.add(CorePlugin {

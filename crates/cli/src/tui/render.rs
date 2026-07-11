@@ -30,11 +30,10 @@ pub struct RenderCtx {
     pub daemon: DaemonState,
     /// Last 8 non-empty `daemon.log` lines.
     pub logs_tail: Vec<String>,
-    /// Environment probe results: `(git, claude)` binaries.
-    pub env: (Detected, Detected),
+    /// Environment probe result: the `git` binary.
+    pub git: Detected,
     pub missing: Vec<&'static str>,
     pub enabled_gateways: Vec<String>,
-    pub enabled_runtimes: Vec<String>,
     /// Every schema field's current value (persisted or schema default; ""
     /// when truly unset) — the Config tab's field rows.
     pub field_values: HashMap<&'static str, String>,
@@ -46,10 +45,9 @@ impl RenderCtx {
         let logs = controller.logs();
         let start = logs.len().saturating_sub(8);
         let logs_tail = logs[start..].to_vec();
-        let env = controller.check_env();
+        let git = controller.check_env();
         let missing = controller.missing_required().await;
         let enabled_gateways = controller.enabled_gateways().await;
-        let enabled_runtimes = controller.enabled_runtimes().await;
         let mut field_values = HashMap::new();
         for f in all_fields() {
             let value = controller.get(f.key).await.unwrap_or_default();
@@ -58,10 +56,9 @@ impl RenderCtx {
         Self {
             daemon,
             logs_tail,
-            env,
+            git,
             missing,
             enabled_gateways,
-            enabled_runtimes,
             field_values,
         }
     }
@@ -96,32 +93,13 @@ pub fn draw_wizard(frame: &mut Frame, state: &WizardState, _ctx: &RenderCtx) {
                 &items,
                 &state.gw_sel,
                 state.cursor,
-                None,
-            );
-        }
-        WizardPhase::Runtimes => {
-            let items: Vec<(&str, &str, &str)> = CATALOG
-                .runtimes
-                .iter()
-                .map(|r| (r.id, r.label, r.description))
-                .collect();
-            draw_wizard_list(
-                frame,
-                chunks[1],
-                "Choose runtimes",
-                &items,
-                &state.rt_sel,
-                state.cursor,
-                Some(&state.detected),
             );
         }
         WizardPhase::Fields => draw_wizard_fields(frame, chunks[1], state),
     }
 }
 
-/// Multi-select list: `{caret|"  "}[x] {label} — {description}  {right}`
-/// per row; `right` (runtime detect string) only on the runtimes list.
-#[allow(clippy::too_many_arguments)]
+/// Multi-select list: `{caret|"  "}[x] {label} — {description}` per row.
 fn draw_wizard_list(
     frame: &mut Frame,
     area: Rect,
@@ -129,7 +107,6 @@ fn draw_wizard_list(
     items: &[(&str, &str, &str)],
     selected: &[String],
     cursor: usize,
-    detected: Option<&HashMap<String, String>>,
 ) {
     let block = widgets::panel(title, false);
     let inner = block.inner(area);
@@ -158,10 +135,6 @@ fn draw_wizard_list(
         let mut text = format!("{prefix}[{checked}] {label}");
         if !description.is_empty() {
             text.push_str(&format!(" — {description}"));
-        }
-        if let Some(map) = detected {
-            let right = map.get(*id).cloned().unwrap_or_else(|| "…".to_string());
-            text.push_str(&format!("  {right}"));
         }
         let style = if is_cursor {
             theme::tone(Tone::Signature)
@@ -245,7 +218,7 @@ pub fn draw_dashboard(frame: &mut Frame, state: &DashboardState, ctx: &RenderCtx
 }
 
 /// `SERVICES` (daemon/discord dots) + `SESSIONS` (active/total) +
-/// `ENVIRONMENT` (git/claude) + conditional `ACTION NEEDED`.
+/// `ENVIRONMENT` (git) + conditional `ACTION NEEDED`.
 fn draw_status_tab(frame: &mut Frame, area: Rect, state: &DashboardState, ctx: &RenderCtx) {
     let has_action = !ctx.missing.is_empty();
     let mut constraints = vec![
@@ -297,18 +270,13 @@ fn draw_status_tab(frame: &mut Frame, area: Rect, state: &DashboardState, ctx: &
     let block = widgets::panel("Environment", false);
     let inner = block.inner(chunks[2]);
     frame.render_widget(block, chunks[2]);
-    let (git, claude) = &ctx.env;
+    let git = &ctx.git;
     let sym = theme::symbols();
     let line = Line::from(vec![
         Span::raw("git "),
         Span::styled(
             if git.found { sym.ok } else { "…" },
             theme::tone(if git.found { Tone::Ok } else { Tone::Dim }),
-        ),
-        Span::raw("   claude "),
-        Span::styled(
-            if claude.found { sym.ok } else { "…" },
-            theme::tone(if claude.found { Tone::Ok } else { Tone::Dim }),
         ),
     ]);
     frame.render_widget(Paragraph::new(line), inner);
@@ -559,10 +527,6 @@ fn draw_config_tab(frame: &mut Frame, area: Rect, state: &DashboardState, ctx: &
             }
             ConfigRow::ToggleGateway { id, label } => {
                 let enabled = ctx.enabled_gateways.iter().any(|e| e == id);
-                lines.push(toggle_line(is_selected, enabled, label, sym));
-            }
-            ConfigRow::ToggleRuntime { id, label } => {
-                let enabled = ctx.enabled_runtimes.iter().any(|e| e == id);
                 lines.push(toggle_line(is_selected, enabled, label, sym));
             }
         }

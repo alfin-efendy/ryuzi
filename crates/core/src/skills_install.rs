@@ -689,7 +689,6 @@ fn generated_plugin_manifest(
         mcp: vec![],
         skills,
         provider: None,
-        runtime: None,
     };
     manifest.validate()?;
     Ok(manifest)

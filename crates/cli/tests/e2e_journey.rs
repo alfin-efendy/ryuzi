@@ -39,8 +39,8 @@ fn config_survives_a_full_daemon_lifecycle() {
         .success()
         .stdout(predicate::str::contains("high"));
 
-    // 2. Seed zero-gateway/zero-runtime settings so the daemon never touches
-    //    the network (same seeding as crates/cli/tests/daemon.rs).
+    // 2. Seed zero-gateway settings so the daemon never touches the network
+    //    (same seeding as crates/cli/tests/daemon.rs).
     std::env::set_var("XDG_DATA_HOME", &data_home);
     std::env::set_var("HOME", &home);
     let db_path = ryuzi_core::paths::db_path();
@@ -51,7 +51,6 @@ fn config_survives_a_full_daemon_lifecycle() {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
             settings.set("enabled_gateways", "").await.unwrap();
-            settings.set("enabled_runtimes", "").await.unwrap();
             settings.set("auto_update", "off").await.unwrap();
         });
     }

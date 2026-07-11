@@ -19,6 +19,7 @@
 use crate::control::{ControlPlane, ProvisionProjectRequest, ProvisionSettings};
 use crate::domain::{AttachmentRef, CoreEvent, PermMode, Project};
 use crate::gateway::{Gateway, MessageRef};
+use crate::harness::TurnPrompt;
 use crate::store::Store;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -237,6 +238,44 @@ impl Router {
             .await
     }
 
+    /// Route an inbound 1:1 DM (Discord DM today; gateway-agnostic in
+    /// principle): no `/connect` binding required. Continues the
+    /// project-less `chat` session already bound to `conversation_id`, or
+    /// starts a new one via `start_chat_session` and binds it with
+    /// `add_surface` — mirroring `on_start`'s post-hoc surface bind (see its
+    /// doc) but for a chat session, which needs no project/workspace at
+    /// all.
+    pub async fn on_dm(
+        &self,
+        gateway_id: &str,
+        conversation_id: &str,
+        user_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(session) = self
+            .store
+            .resolve_by_conversation(gateway_id, conversation_id)
+            .await?
+        {
+            return self
+                .cp
+                .continue_session(&session.session_pk, text, &[])
+                .await;
+        }
+        let session = self
+            .cp
+            .start_chat_session(
+                TurnPrompt::text(text, text),
+                &format!("{gateway_id}:{user_id}"),
+                &[],
+            )
+            .await?;
+        self.store
+            .add_surface(gateway_id, conversation_id, &session.session_pk)
+            .await?;
+        Ok(())
+    }
+
     /// End the session bound to `conversation_id`; no-op if none is bound.
     pub async fn on_end(&self, gateway_id: &str, conversation_id: &str) -> anyhow::Result<()> {
         if let Some(session) = self
@@ -315,8 +354,6 @@ impl Router {
             | CoreEvent::ApprovalRequested { .. }
             | CoreEvent::JobRunChanged { .. }
             | CoreEvent::OrchTaskChanged { .. }
-            | CoreEvent::RuntimeUpdateLog { .. }
-            | CoreEvent::RuntimeUpdateDone { .. }
             // Context telemetry has no Discord rendering (yet) — the
             // compaction notice arrives as a persisted Message row instead.
             | CoreEvent::ContextUsage { .. }
@@ -885,9 +922,8 @@ mod tests {
         }
     }
 
-    /// A `ControlPlane` wired with `harness` under `"native"` (the default
-    /// runtime `connect_project`/`harness_for_runtime` resolve to since Plan
-    /// C) and `workdir_root` pointed at `root` (needed by `on_connect` ->
+    /// A `ControlPlane` wired with `harness` as the single native slot
+    /// and `workdir_root` pointed at `root` (needed by `on_connect` ->
     /// `provision_project`'s name-flow). Returns the sqlite temp-file guard
     /// the caller must keep alive.
     async fn wired_control_plane_with_harness(
@@ -897,7 +933,7 @@ mod tests {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(db_guard.path()).await.unwrap();
         let mut regs = crate::plugins::Registries::new();
-        regs.harness.register("native", harness);
+        regs.harness = harness;
         let cp = ControlPlane::new(store, regs).await;
         let store_ref = cp.store().clone();
         crate::settings::SettingsStore::new(store_ref.clone())
@@ -1332,5 +1368,61 @@ mod tests {
         let router = Router::new(Arc::clone(&cp), vec![]);
         router.on_end("fake", "no-such-conv").await.unwrap();
         router.on_stop("fake", "no-such-conv").await.unwrap();
+    }
+
+    // ---------- Task A7: on_dm (project-less chat sessions, no /connect) ----------
+
+    /// A DM inbound with no workspace/project binding still starts a
+    /// (project-less) `chat` session, bound to the DM conversation via
+    /// `add_surface` — proving `on_dm` never consults
+    /// `resolve_project_by_workspace` (unlike `on_start`).
+    #[tokio::test]
+    #[serial]
+    async fn discord_dm_starts_a_chat_session() {
+        let _guard = StateDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let (cp, store, _db_guard) = wired_control_plane(root.path()).await;
+        let gateways: Vec<Arc<dyn Gateway>> = vec![];
+        let router = Router::new(Arc::clone(&cp), gateways);
+
+        router
+            .on_dm("discord", "dm-conv-1", "user-9", "hello there")
+            .await
+            .unwrap();
+
+        let s = store
+            .resolve_by_conversation("discord", "dm-conv-1")
+            .await
+            .unwrap();
+        assert!(s.is_some(), "expected a chat session bound to the DM");
+        assert_eq!(s.unwrap().kind, crate::domain::SessionKind::Chat);
+    }
+
+    /// A second DM in the same conversation continues the already-bound
+    /// chat session instead of starting a new one.
+    #[tokio::test]
+    #[serial]
+    async fn discord_dm_second_message_continues_the_same_chat_session() {
+        let _guard = StateDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let (cp, store, _db_guard) = wired_control_plane(root.path()).await;
+        let router = Router::new(Arc::clone(&cp), vec![]);
+
+        router
+            .on_dm("discord", "dm-conv-1", "user-9", "hello there")
+            .await
+            .unwrap();
+        let sessions = wait_for_sessions(&store, 1).await;
+        let session_pk = sessions[0].session_pk.clone();
+        wait_for_status(&store, &session_pk, crate::domain::SessionStatus::Idle).await;
+
+        router
+            .on_dm("discord", "dm-conv-1", "user-9", "second message")
+            .await
+            .unwrap();
+
+        // Still exactly one session — the second on_dm continued it.
+        assert_eq!(store.list_sessions(None).await.unwrap().len(), 1);
+        wait_for_status(&store, &session_pk, crate::domain::SessionStatus::Idle).await;
     }
 }

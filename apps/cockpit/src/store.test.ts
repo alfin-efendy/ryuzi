@@ -289,11 +289,16 @@ const runningSession = (pk: string) => ({
   branch: null,
   title: null,
   status: "running" as const,
+  permMode: "default" as const,
   createdAt: null,
   lastActive: null,
   startedBy: null,
   resumeAttempts: 0,
   branchOwned: true,
+  kind: "project" as const,
+  speaker: null,
+  agent: null,
+  parentSessionPk: null,
 });
 
 test("result event flips the session status back to idle (so the composer leaves Stop mode)", () => {
@@ -418,7 +423,7 @@ test("error event appends no transient row — the durable error row arrives via
   listSessions.mockRestore();
 });
 
-test("start forwards chat options so composer runtime, context, and attachments reach IPC", async () => {
+test("start forwards chat options so composer model, context, and attachments reach IPC", async () => {
   reset();
   const start = spyOn(commands, "startSession").mockResolvedValue({
     status: "ok",
@@ -430,29 +435,33 @@ test("start forwards chat options so composer runtime, context, and attachments 
       branch: "harness/s1",
       title: "/review",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: true,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
 
   await useStore.getState().start("p1", "/review", {
-    runtimeId: "native",
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
   });
 
   expect(start).toHaveBeenCalledWith("p1", "/review", {
-    runtimeId: "native",
     model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
     git: null,
+    permMode: null,
   });
   expect(useStore.getState().focusedSessionPk).toBe("s1");
 
@@ -473,11 +482,16 @@ test("start forwards composer git options to IPC", async () => {
       branch: "feat/login",
       title: "go",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: false,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
@@ -488,11 +502,11 @@ test("start forwards composer git options to IPC", async () => {
   });
 
   expect(start).toHaveBeenCalledWith("p1", "go", {
-    runtimeId: null,
     model: null,
     context: null,
     attachments: [],
     git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
+    permMode: null,
   });
 
   start.mockRestore();
@@ -512,11 +526,16 @@ test("start resolves and focuses the session without waiting for refresh", async
       branch: null,
       title: "go",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: true,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   // refresh() must not gate start(): these never resolve during the test.
@@ -547,6 +566,64 @@ test("start returns false and does not focus on backend error", async () => {
   start.mockRestore();
 });
 
+test("startChat calls start_chat_session (no projectId) and seeds/focuses the returned session", async () => {
+  reset();
+  const startChat = spyOn(commands, "startChatSession").mockResolvedValue({
+    status: "ok",
+    data: {
+      sessionPk: "c1",
+      projectId: null,
+      agentSessionId: null,
+      worktreePath: null,
+      branch: null,
+      title: "hey",
+      status: "running",
+      startedBy: "cockpit",
+      createdAt: 1,
+      lastActive: 1,
+      resumeAttempts: 0,
+      branchOwned: false,
+      permMode: "default",
+      kind: "chat",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
+    },
+  });
+  // refresh() must not gate startChat(): these never resolve during the test.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
+
+  const ok = await useStore.getState().startChat("hey", { model: "fable" });
+
+  expect(startChat).toHaveBeenCalledWith("hey", {
+    model: "fable",
+    permMode: null,
+    context: null,
+    attachments: [],
+    git: null,
+  });
+  expect(ok).toBe(true);
+  expect(useStore.getState().focusedSessionPk).toBe("c1");
+  expect(useStore.getState().sessions.map((s) => s.sessionPk)).toContain("c1");
+
+  startChat.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("startChat returns false and does not focus on backend error", async () => {
+  reset();
+  const startChat = spyOn(commands, "startChatSession").mockResolvedValue({
+    status: "error",
+    error: { message: "boom" },
+  });
+  const ok = await useStore.getState().startChat("hey", null);
+  expect(ok).toBe(false);
+  expect(useStore.getState().focusedSessionPk).toBeNull();
+  startChat.mockRestore();
+});
+
 test("cloneProject clones via IPC and refreshes on success", async () => {
   reset();
   const clone = spyOn(commands, "cloneProject").mockResolvedValue({
@@ -556,7 +633,6 @@ test("cloneProject clones via IPC and refreshes on success", async () => {
       name: "repo",
       workdir: "C:\\proj\\repo",
       source: "https://github.com/user/repo.git",
-      harness: "native",
       model: null,
       effort: null,
       permMode: "default",
@@ -643,6 +719,42 @@ test("send resolves true on success and false on backend error (drives composer 
   listSessions.mockRestore();
 });
 
+test("send steers a RUNNING session instead of starting a new turn via continue", async () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const steer = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "hold on", null)).resolves.toBe(true);
+  expect(steer).toHaveBeenCalledWith("s1", "hold on");
+  expect(cont).not.toHaveBeenCalled();
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("send falls back to continue for a session that is not running", async () => {
+  reset();
+  useStore.setState({ sessions: [{ ...runningSession("s1"), status: "idle" as const }] });
+  const steer = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "go", null)).resolves.toBe(true);
+  expect(cont).toHaveBeenCalled();
+  expect(steer).not.toHaveBeenCalled();
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
 test("setFocused marks the previously-focused session read up to its lastActive", () => {
   useUi.setState({ readAt: {} });
   useStore.setState({
@@ -661,6 +773,11 @@ test("setFocused marks the previously-focused session read up to its lastActive"
         lastActive: 4200,
         resumeAttempts: 0,
         branchOwned: false,
+        permMode: "default",
+        kind: "project",
+        speaker: null,
+        agent: null,
+        parentSessionPk: null,
       },
     ],
     loaded: { s1: true, s2: true },

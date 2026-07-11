@@ -64,7 +64,6 @@ pub struct Project {
     pub name: String,
     pub workdir: String,
     pub source: Option<String>,
-    pub harness: String,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub perm_mode: PermMode,
@@ -74,16 +73,54 @@ pub struct Project {
     pub is_git: bool,
 }
 
+/// What a session represents. `Project` is the pre-Phase-2 default (bound to
+/// a project workdir); `Chat`, `Worker`, and `Review` are chat-first kinds
+/// added in Phase 2 — `project_id` is `None` for all three, and `Worker`/
+/// `Review` additionally carry `parent_session_pk` lineage back to the chat
+/// or project session that spawned them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionKind {
+    Project,
+    Chat,
+    Worker,
+    Review,
+}
+
+impl SessionKind {
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "chat" => SessionKind::Chat,
+            "worker" => SessionKind::Worker,
+            "review" => SessionKind::Review,
+            _ => SessionKind::Project,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionKind::Project => "project",
+            SessionKind::Chat => "chat",
+            SessionKind::Worker => "worker",
+            SessionKind::Review => "review",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub session_pk: String,
-    pub project_id: String,
+    /// `None` for chat-first sessions (`kind != Project`); a project-bound
+    /// session always has this set.
+    pub project_id: Option<String>,
     pub agent_session_id: Option<String>,
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
     pub title: Option<String>,
     pub status: SessionStatus,
+    /// Per-session permission mode. Copied from the project (or the new-chat
+    /// picker) at creation; changing it affects THIS session only.
+    pub perm_mode: PermMode,
     pub started_by: Option<String>,
     pub created_at: Option<i64>,
     pub last_active: Option<i64>,
@@ -92,6 +129,15 @@ pub struct Session {
     /// `end_session` deletes the branch ONLY when this is set; user-named and
     /// pre-existing branches survive teardown.
     pub branch_owned: bool,
+    pub kind: SessionKind,
+    /// Who is speaking in this session (chat-first; e.g. a Discord user id
+    /// or `"cockpit"`). Unused for `Project` sessions.
+    pub speaker: Option<String>,
+    /// Which agent persona/config is driving this session. Unused for
+    /// `Project` sessions.
+    pub agent: Option<String>,
+    /// The session this one was spawned from (`Worker`/`Review` lineage).
+    pub parent_session_pk: Option<String>,
 }
 
 /// How a new session's git workspace is prepared (branch controls).
@@ -120,7 +166,7 @@ impl Default for SessionGitOptions {
     }
 }
 
-/// An MCP server the agent can use as tools (attached to an ACP session in Spec 3).
+/// An MCP server the native agent can use as tools (attached to a harness session).
 ///
 /// After plugin `${auth}`/setting substitution, a resolved `McpServerSpec`'s
 /// `transport` carries RESOLVED SECRETS in `Stdio::env`/`Http::headers` (API
@@ -198,7 +244,8 @@ pub struct ApprovalRequest {
     pub timeout_ms: Option<u64>,
 }
 
-/// The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+/// The user's decision on a tool-approval request from the native runtime's
+/// permission gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub enum ApprovalDecision {
@@ -275,7 +322,7 @@ pub struct ToolPolicyRow {
     pub decision: String,
 }
 
-/// A persisted transcript entry. Forward-compatible with ACP session/update blocks.
+/// A persisted transcript entry, one row per native-runtime event block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -379,7 +426,8 @@ pub struct ModelCost {
 pub enum CoreEvent {
     SessionCreated {
         session_pk: String,
-        project_id: String,
+        /// `None` for a project-less (chat-first) session.
+        project_id: Option<String>,
     },
     Message {
         session_pk: String,
@@ -432,17 +480,6 @@ pub enum CoreEvent {
         task_id: String,
         root_id: Option<String>,
         status: String,
-    },
-    /// A runtime npm install/update produced an output line.
-    RuntimeUpdateLog {
-        runtime_id: String,
-        line: String,
-    },
-    /// A runtime npm install/update finished (ok=false → message has detail).
-    RuntimeUpdateDone {
-        runtime_id: String,
-        ok: bool,
-        message: Option<String>,
     },
     /// Per-response context usage for a native session (drives the
     /// "% context left" indicator).
@@ -541,12 +578,20 @@ mod tests {
     fn core_event_serializes_with_camel_tag_and_snake_fields() {
         let e = CoreEvent::SessionCreated {
             session_pk: "s1".into(),
-            project_id: "p1".into(),
+            project_id: Some("p1".into()),
         };
         let j = serde_json::to_value(&e).unwrap();
         assert_eq!(j["kind"], "sessionCreated");
         assert_eq!(j["session_pk"], "s1");
         assert_eq!(j["project_id"], "p1");
+
+        // A chat (project-less) session serializes project_id as null.
+        let e = CoreEvent::SessionCreated {
+            session_pk: "s2".into(),
+            project_id: None,
+        };
+        let j = serde_json::to_value(&e).unwrap();
+        assert_eq!(j["project_id"], serde_json::Value::Null);
     }
 
     #[test]

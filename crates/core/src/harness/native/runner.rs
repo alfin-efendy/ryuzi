@@ -1,14 +1,16 @@
 //! The native turn drain: one `run_turn` runs a prompt to completion, calling
 //! the model, executing tools, and persisting + streaming everything through
-//! the same [`CoreEvent`] surface the ACP harness uses.
+//! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
 use super::commands::CommandRegistry;
 use super::context_manager::{
     compaction::CompactionOutcome, is_context_overflow, ContextConfig, ContextManager,
 };
+use super::iteration_budget::{IterationBudget, PARENT_MAX_ITERS, SUBAGENT_MAX_ITERS};
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
+use super::steer::SteerBuffer;
 use super::tools::{
     OutputCaps, SubagentSpawner, SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
 };
@@ -26,8 +28,12 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-/// Upper bound on provider turns per drain, to bound runaway tool loops.
-const MAX_PROVIDER_TURNS: usize = 50;
+/// Default upper bound on provider turns per drain, to bound runaway tool
+/// loops. Overridable via the `agent.max_provider_turns` setting (floor 1).
+/// Used as the default for the auto-continue window size / notice text inside
+/// `drive()`; the parent budget itself is seeded in `run_turn` (defaulting to
+/// [`PARENT_MAX_ITERS`], Phase 2's raised ceiling).
+const DEFAULT_MAX_PROVIDER_TURNS: usize = 50;
 /// Flush the streaming-text buffer into a persisted row at this size or on a
 /// newline, whichever comes first (keeps rows delta-shaped without spamming).
 const TEXT_FLUSH_BYTES: usize = 120;
@@ -39,6 +45,8 @@ const TEXT_FLUSH_BYTES: usize = 120;
 pub struct RunnerDeps {
     pub session_pk: String,
     pub work_dir: PathBuf,
+    /// Session attachments folder (second read root for the `read` tool).
+    pub attachments_dir: Option<PathBuf>,
     /// Plugin-bundled skill directories folded in beside the worktree/global
     /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
     pub extra_skill_dirs: Vec<PathBuf>,
@@ -73,6 +81,12 @@ pub struct RunnerDeps {
     pub memory: Option<Arc<super::memory::MemoryStore>>,
     /// Worktree snapshot stack for the `revert` tool (most recent last).
     pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Mid-turn steering buffer (Task B3). Cloned from `NativeSession::steer`
+    /// at session start — the SAME buffer, not a fresh one — so a `steer()`
+    /// call reaches whichever turn is currently draining it. Survives across
+    /// turns: `refresh_turn_model` clones the whole `RunnerDeps` per turn, but
+    /// `SteerBuffer`'s clone shares the underlying `Arc<Mutex<Vec<_>>>`.
+    pub steer: SteerBuffer,
 }
 
 impl RunnerDeps {
@@ -194,6 +208,16 @@ pub async fn run_turn(
         cancel: cancel.clone(),
         depth: 0,
     });
+    // Seed the parent turn-cap from the `agent.max_provider_turns` setting,
+    // defaulting to Phase 2's raised ceiling (PARENT_MAX_ITERS). This is what
+    // makes the setting meaningful under the IterationBudget model: drive()'s
+    // `while budget.try_consume()` loop caps at exactly this many provider
+    // turns per window, and each auto-continue re-grants a fresh window of the
+    // same size (drive() re-reads the setting for that grant).
+    let max_provider_turns =
+        crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
+            .await;
+    let budget = IterationBudget::new(max_provider_turns);
     drive(
         deps,
         &agent,
@@ -201,6 +225,7 @@ pub async fn run_turn(
         &cancel,
         Some(spawn),
         DisplayMode::Full,
+        &budget,
     )
     .await?;
 
@@ -246,7 +271,8 @@ async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::R
         return Ok(());
     }
     let model = deps.model.clone().unwrap_or_default();
-    match cm.compact(&deps.llm, &model, "manual").await {
+    let cmodel = super::llm::aux_model(&deps.store, "compaction", &model).await;
+    match cm.compact(&deps.llm, &cmodel, "manual").await {
         Ok(outcome) => {
             emit_compaction(deps, "manual", &outcome, true).await;
             // Display-only: `compact()` never calls `commit_response()`, so
@@ -343,7 +369,8 @@ async fn refresh_turn_model(deps: &RunnerDeps) -> RunnerDeps {
 
 /// `Some(project.model)` when the session's project row is reachable — the
 /// inner Option is the pin itself, which may legitimately be unset. `None`
-/// when there is no session/project row to read.
+/// when there is no session/project row to read, or the session has no
+/// bound project (chat-first sessions).
 async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
     let session = deps
         .store
@@ -353,7 +380,7 @@ async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
         .flatten()?;
     let project = deps
         .store
-        .get_project(&session.project_id)
+        .get_project(&session.project_id?)
         .await
         .ok()
         .flatten()?;
@@ -368,7 +395,12 @@ async fn maybe_generate_title(deps: &RunnerDeps, first_prompt: &str) {
         Ok(Some(session)) if session.title.is_none() => {}
         _ => return, // no session row, or already titled
     }
-    let model = deps.model.clone().unwrap_or_default();
+    let model = super::llm::aux_model(
+        &deps.store,
+        "title",
+        &deps.model.clone().unwrap_or_default(),
+    )
+    .await;
     if model.is_empty() {
         return;
     }
@@ -415,6 +447,13 @@ impl DisplayMode {
     }
 }
 
+/// Hermes' verbatim nudge for the post-exhaustion summary call: asks for a
+/// final answer without inviting another round of tool calls.
+const BUDGET_EXHAUSTED_PROMPT: &str = "You've reached the maximum number of \
+    tool-calling iterations allowed. Please provide a final response \
+    summarizing what you've found and accomplished so far, without calling \
+    any more tools.";
+
 /// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
 /// `display` gates persistence of display rows: sub-agents stream only their
 /// tool rows (tagged with their label) so their text/thinking stay internal.
@@ -426,6 +465,7 @@ async fn drive(
     cancel: &CancellationToken,
     spawn: Option<Arc<dyn SubagentSpawner>>,
     display: DisplayMode,
+    budget: &IterationBudget,
 ) -> anyhow::Result<String> {
     let system = match &agent.prompt {
         Some(p) => p.clone(),
@@ -460,246 +500,398 @@ async fn drive(
     };
     let thinking_budget = thinking_budget(deps.effort.as_deref(), &deps.meta, max_tokens);
 
-    for provider_turn in 0..MAX_PROVIDER_TURNS {
-        if cancel.is_cancelled() {
-            return Ok(final_text);
-        }
-        // Pre-turn (iteration 0) / mid-turn compaction check (spec §7.1).
-        if cm.status().needs_compaction {
-            let trigger = if provider_turn == 0 {
-                "pre_turn"
-            } else {
-                "mid_turn"
-            };
-            match cm.compact(&deps.llm, &model, trigger).await {
-                Ok(outcome) => emit_compaction(deps, trigger, &outcome, display.text()).await,
-                Err(e) => {
-                    tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
-                    if display.text() {
-                        emit_row(
-                            deps,
-                            "system",
-                            "notice",
-                            json!({ "text": format!(
-                                "Compaction failed ({e}); continuing with full history."
-                            ) }),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-        let system_value: Value = if deps.meta.supports_prompt_cache {
-            json!([{ "type": "text", "text": system, "cache_control": {"type": "ephemeral"} }])
-        } else {
-            json!(system)
-        };
-        let mut body = json!({
-            "model": model,
-            "system": system_value,
-            // `cm.messages_for_request()` applies the sanitized projection:
-            // dangling tool_use ids from an interrupted prior turn get
-            // synthesized error tool_results, or Anthropic 400s the whole
-            // request (and the session stays poisoned).
-            "messages": cm.messages_for_request(),
-            "tools": tool_defs,
-            "max_tokens": max_tokens,
-            "stream": true,
-        });
-        if let Some(budget) = thinking_budget {
-            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
-        }
+    // Window size for the auto-continue notice text and the fresh grant made on
+    // each auto-continue (`agent.max_provider_turns`). The parent budget itself
+    // is seeded from the same setting in `run_turn` (defaulting to
+    // PARENT_MAX_ITERS); this read defaults to DEFAULT_MAX_PROVIDER_TURNS and is
+    // only consulted on the top-level auto-continue path.
+    let max_turns = crate::settings::usize_setting(
+        &deps.store,
+        "agent.max_provider_turns",
+        DEFAULT_MAX_PROVIDER_TURNS,
+    )
+    .await;
+    // Auto-continue is a top-level convenience only; sub-agents keep the hard
+    // stop. Read without usize_setting's floor so "0" can disable it.
+    let auto_budget = if display.text() {
+        deps.store
+            .get_setting("agent.auto_continue_budget")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+    } else {
+        0
+    };
 
-        let mut rx = match deps.llm.stream(body).await {
-            Ok(rx) => rx,
-            Err(e) if is_context_overflow(&e.to_string()) => {
-                cm.mark_full();
-                // Display-only: `mark_full` does not reset `cm.last_*`, so
-                // they still hold the PREVIOUS committed response's buckets
-                // — accumulating here would double-count it.
-                emit_context_display(deps, cm, display.text()).await;
-                anyhow::bail!(
-                    "context window exceeded — send another message and the session \
-                     will compact before retrying: {e}"
-                );
-            }
-            Err(e) => return Err(e),
-        };
-        let mut turn = TurnAccum::default();
-        let mut text_buf = String::new();
-
-        while let Some(item) = rx.recv().await {
+    // Composition of two loop-control features:
+    //   * The consumable `IterationBudget` (Phase 2) is THE turn cap — the
+    //     caller seeds it from `agent.max_provider_turns`; `try_consume()`
+    //     bounds one window and housekeeping turns can `refund()`.
+    //   * Auto-continue (#100) layers on top: when a window is spent without an
+    //     end_turn, the top-level loop re-grants a fresh window (up to
+    //     `auto_budget` times) so long runs finish without a user nudge.
+    // The outer `loop` exists solely to let a refunded budget resume the
+    // `while budget.try_consume()` window after an auto-continue.
+    let mut auto_continue = 0usize;
+    let mut provider_turn = 0usize;
+    loop {
+        while budget.try_consume() {
             if cancel.is_cancelled() {
-                // Mid-stream cancel: the assistant turn was not appended, so the
-                // ledger still ends at the user turn — valid for a later resume.
                 return Ok(final_text);
             }
-            let ev = match item {
-                Ok(ev) => ev,
-                Err(e) => {
-                    flush_text(deps, &mut text_buf, display.text()).await;
-                    if is_context_overflow(&e.to_string()) {
-                        cm.mark_full();
-                        // Display-only — see the comment on the `deps.llm.stream` overflow arm above.
-                        emit_context_display(deps, cm, display.text()).await;
-                        anyhow::bail!(
-                            "context window exceeded — send another message and the session \
-                             will compact before retrying: {e}"
-                        );
+            // Pre-turn (iteration 0) / mid-turn compaction check (spec §7.1).
+            if cm.status().needs_compaction {
+                let trigger = if provider_turn == 0 {
+                    "pre_turn"
+                } else {
+                    "mid_turn"
+                };
+                let cmodel = super::llm::aux_model(&deps.store, "compaction", &model).await;
+                match cm.compact(&deps.llm, &cmodel, trigger).await {
+                    Ok(outcome) => emit_compaction(deps, trigger, &outcome, display.text()).await,
+                    Err(e) => {
+                        tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
+                        if display.text() {
+                            emit_row(
+                                deps,
+                                "system",
+                                "notice",
+                                json!({ "text": format!(
+                                "Compaction failed ({e}); continuing with full history."
+                            ) }),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
                     }
-                    return Err(e);
                 }
+            }
+            let system_value: Value = if deps.meta.supports_prompt_cache {
+                json!([{ "type": "text", "text": system, "cache_control": {"type": "ephemeral"} }])
+            } else {
+                json!(system)
             };
-            let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
-                continue;
+            let mut body = json!({
+                "model": model,
+                "system": system_value,
+                // `cm.messages_for_request()` applies the sanitized projection:
+                // dangling tool_use ids from an interrupted prior turn get
+                // synthesized error tool_results, or Anthropic 400s the whole
+                // request (and the session stays poisoned).
+                "messages": cm.messages_for_request(),
+                "tools": tool_defs,
+                "max_tokens": max_tokens,
+                "stream": true,
+            });
+            if let Some(budget) = thinking_budget {
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+            }
+
+            let mut rx = match deps.llm.stream(body).await {
+                Ok(rx) => rx,
+                Err(e) if is_context_overflow(&e.to_string()) => {
+                    cm.mark_full();
+                    // Display-only: `mark_full` does not reset `cm.last_*`, so
+                    // they still hold the PREVIOUS committed response's buckets
+                    // — accumulating here would double-count it.
+                    emit_context_display(deps, cm, display.text()).await;
+                    anyhow::bail!(
+                        "context window exceeded — send another message and the session \
+                     will compact before retrying: {e}"
+                    );
+                }
+                Err(e) => return Err(e),
             };
-            match decoded {
-                MessageStreamEvent::TextDelta { text, .. } => {
-                    turn.text.push_str(&text);
-                    text_buf.push_str(&text);
-                    if text_buf.len() >= TEXT_FLUSH_BYTES || text_buf.contains('\n') {
+            let mut turn = TurnAccum::default();
+            let mut text_buf = String::new();
+
+            while let Some(item) = rx.recv().await {
+                if cancel.is_cancelled() {
+                    // Mid-stream cancel: the assistant turn was not appended, so the
+                    // ledger still ends at the user turn — valid for a later resume.
+                    return Ok(final_text);
+                }
+                let ev = match item {
+                    Ok(ev) => ev,
+                    Err(e) => {
                         flush_text(deps, &mut text_buf, display.text()).await;
+                        if is_context_overflow(&e.to_string()) {
+                            cm.mark_full();
+                            // Display-only — see the comment on the `deps.llm.stream` overflow arm above.
+                            emit_context_display(deps, cm, display.text()).await;
+                            anyhow::bail!(
+                                "context window exceeded — send another message and the session \
+                             will compact before retrying: {e}"
+                            );
+                        }
+                        return Err(e);
                     }
-                }
-                MessageStreamEvent::ThinkingDelta { text, .. } => {
-                    if display.text() {
-                        emit_row(
-                            deps,
-                            "assistant",
-                            "thought",
-                            json!({ "text": text }),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+                };
+                let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
+                    continue;
+                };
+                match decoded {
+                    MessageStreamEvent::TextDelta { text, .. } => {
+                        turn.text.push_str(&text);
+                        text_buf.push_str(&text);
+                        if text_buf.len() >= TEXT_FLUSH_BYTES || text_buf.contains('\n') {
+                            flush_text(deps, &mut text_buf, display.text()).await;
+                        }
                     }
-                }
-                MessageStreamEvent::ContentBlockStart { index, block } => {
-                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                        turn.tools.insert(
-                            index,
-                            ToolAccum {
-                                id: block
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                name: block
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                start_input: block.get("input").cloned().unwrap_or(json!({})),
-                                input_json: String::new(),
-                            },
-                        );
+                    MessageStreamEvent::ThinkingDelta { text, .. } => {
+                        if display.text() {
+                            emit_row(
+                                deps,
+                                "assistant",
+                                "thought",
+                                json!({ "text": text }),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
                     }
-                }
-                MessageStreamEvent::InputJsonDelta {
-                    index,
-                    partial_json,
-                } => {
-                    if let Some(t) = turn.tools.get_mut(&index) {
-                        t.input_json.push_str(&partial_json);
+                    MessageStreamEvent::ContentBlockStart { index, block } => {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                            turn.tools.insert(
+                                index,
+                                ToolAccum {
+                                    id: block
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    name: block
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    start_input: block.get("input").cloned().unwrap_or(json!({})),
+                                    input_json: String::new(),
+                                },
+                            );
+                        }
                     }
-                }
-                MessageStreamEvent::MessageDelta {
-                    stop_reason,
-                    output_tokens,
-                    input_tokens,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                } => {
-                    turn.stop_reason = stop_reason;
-                    cm.observe_message_delta(
+                    MessageStreamEvent::InputJsonDelta {
+                        index,
+                        partial_json,
+                    } => {
+                        if let Some(t) = turn.tools.get_mut(&index) {
+                            t.input_json.push_str(&partial_json);
+                        }
+                    }
+                    MessageStreamEvent::MessageDelta {
+                        stop_reason,
                         output_tokens,
                         input_tokens,
                         cache_read_tokens,
                         cache_creation_tokens,
-                    );
-                }
-                MessageStreamEvent::Error(msg) => {
-                    flush_text(deps, &mut text_buf, display.text()).await;
-                    if is_context_overflow(&msg) {
-                        cm.mark_full();
-                        // Display-only — see the comment on the `deps.llm.stream` overflow arm above.
-                        emit_context_display(deps, cm, display.text()).await;
-                        anyhow::bail!(
-                            "context window exceeded — send another message and the session \
-                             will compact before retrying: {msg}"
+                    } => {
+                        turn.stop_reason = stop_reason;
+                        cm.observe_message_delta(
+                            output_tokens,
+                            input_tokens,
+                            cache_read_tokens,
+                            cache_creation_tokens,
                         );
                     }
-                    anyhow::bail!("{msg}");
+                    MessageStreamEvent::Error(msg) => {
+                        flush_text(deps, &mut text_buf, display.text()).await;
+                        if is_context_overflow(&msg) {
+                            cm.mark_full();
+                            // Display-only — see the comment on the `deps.llm.stream` overflow arm above.
+                            emit_context_display(deps, cm, display.text()).await;
+                            anyhow::bail!(
+                                "context window exceeded — send another message and the session \
+                             will compact before retrying: {msg}"
+                            );
+                        }
+                        anyhow::bail!("{msg}");
+                    }
+                    MessageStreamEvent::MessageStop => break,
+                    MessageStreamEvent::MessageStart(msg) => {
+                        cm.observe_message_start(&msg);
+                    }
+                    MessageStreamEvent::ContentBlockStop { .. } => {}
                 }
-                MessageStreamEvent::MessageStop => break,
-                MessageStreamEvent::MessageStart(msg) => {
-                    cm.observe_message_start(&msg);
-                }
-                MessageStreamEvent::ContentBlockStop { .. } => {}
             }
-        }
-        flush_text(deps, &mut text_buf, display.text()).await;
-        cm.commit_response();
-        emit_context_usage(deps, cm, display.text()).await;
-        if !turn.text.is_empty() {
-            final_text = turn.text.clone();
-        }
+            flush_text(deps, &mut text_buf, display.text()).await;
+            cm.commit_response();
+            emit_context_usage(deps, cm, display.text()).await;
+            if !turn.text.is_empty() {
+                final_text = turn.text.clone();
+            }
 
-        // Assemble the assistant turn's content for the ledger.
-        let mut content: Vec<Value> = Vec::new();
-        if !turn.text.is_empty() {
-            content.push(json!({ "type": "text", "text": turn.text }));
-        }
-        let tool_calls: Vec<ToolAccum> = turn.tools.into_values().collect();
-        for t in &tool_calls {
-            content.push(json!({
-                "type": "tool_use",
-                "id": t.id,
-                "name": t.name,
-                "input": t.parsed_input(),
-            }));
-        }
-        if content.is_empty() {
-            // An assistant turn must exist for valid role alternation, but an
-            // EMPTY text block ({"text":""}) makes Anthropic 400 the NEXT
-            // request ("text content blocks must be non-empty") — which
-            // poisons the whole session. Use a non-empty sentinel instead.
-            content.push(json!({ "type": "text", "text": "(no output)" }));
-        }
-        cm.append_assistant(json!(content)).await?;
+            // Assemble the assistant turn's content for the ledger.
+            let mut content: Vec<Value> = Vec::new();
+            if !turn.text.is_empty() {
+                content.push(json!({ "type": "text", "text": turn.text }));
+            }
+            let tool_calls: Vec<ToolAccum> = turn.tools.into_values().collect();
+            for t in &tool_calls {
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": t.id,
+                    "name": t.name,
+                    "input": t.parsed_input(),
+                }));
+            }
+            if content.is_empty() {
+                // An assistant turn must exist for valid role alternation, but an
+                // EMPTY text block ({"text":""}) makes Anthropic 400 the NEXT
+                // request ("text content blocks must be non-empty") — which
+                // poisons the whole session. Use a non-empty sentinel instead.
+                content.push(json!({ "type": "text", "text": "(no output)" }));
+            }
+            cm.append_assistant(json!(content)).await?;
 
-        if tool_calls.is_empty() {
-            return Ok(final_text); // end_turn
-        }
+            if tool_calls.is_empty() {
+                // The model answered in plain text with no tool call — normally
+                // end_turn. But a steer that landed during this round must not be
+                // dropped: the only other drain site rides the tool-result batch
+                // below, which this branch never reaches. Drain it as a user
+                // message and loop once more so the model actually responds to the
+                // steer, instead of losing it — or leaking it, stale, into a later
+                // unrelated turn's tool-result batch.
+                if let Some(block) = deps.steer.take_block() {
+                    cm.append_user_text(&block).await?;
+                    provider_turn += 1;
+                    continue;
+                }
+                return Ok(final_text); // end_turn
+            }
 
-        // Execute each tool call, collecting tool_result blocks.
-        let mut results: Vec<Value> = Vec::new();
-        for (i, t) in tool_calls.iter().enumerate() {
+            // Execute each tool call, collecting tool_result blocks.
+            let mut results: Vec<Value> = Vec::new();
+            for (i, t) in tool_calls.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    for rest in &tool_calls[i..] {
+                        results.push(tool_result(&rest.id, "Interrupted by user", true));
+                    }
+                    break;
+                }
+                results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
+            }
+            cm.append_tool_results(results).await?;
+
+            // Mid-turn steering (Task B3): a message sent while this turn was
+            // running is queued in `deps.steer`, not raced into the ledger
+            // directly. Drain it now — right after the tool-result batch it rides
+            // alongside — so the model sees it on the NEXT iteration's request,
+            // wrapped in the verbatim marker the system prompt teaches it to
+            // trust as a direct user instruction.
+            if let Some(block) = deps.steer.take_block() {
+                cm.append_user_text(&block).await?;
+            }
+
             if cancel.is_cancelled() {
-                for rest in &tool_calls[i..] {
-                    results.push(tool_result(&rest.id, "Interrupted by user", true));
-                }
-                break;
+                return Ok(final_text);
             }
-            results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
+            provider_turn += 1;
         }
-        cm.append_tool_results(results).await?;
-
-        if cancel.is_cancelled() {
-            return Ok(final_text);
+        // Budget window exhausted without an end_turn. Auto-continue (#100) is a
+        // top-level convenience only (sub-agents have auto_budget == 0, so this
+        // never fires for them): tell the user, append a synthetic "continue"
+        // user turn to the ledger (ledger-only — NOT a display row, so the
+        // transcript shows the notice, not a fake user message), re-grant a
+        // fresh budget window, and loop back into `while budget.try_consume()`.
+        // Guarded by `!cancel.is_cancelled()`: if the user stopped the run right
+        // as the window exhausted, we must not announce an auto-continue or
+        // append a synthetic turn the run will never act on.
+        if auto_continue < auto_budget && !cancel.is_cancelled() {
+            if display.text() {
+                emit_row(
+                    deps,
+                    "system",
+                    "notice",
+                    json!({ "text": format!(
+                        "Turn limit reached ({max_turns} provider turns) — continuing automatically ({}/{auto_budget})…",
+                        auto_continue + 1
+                    ) }),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            cm.append_user(json!([{ "type": "text", "text": "continue" }]))
+                .await?;
+            // Re-grant a fresh window so the budget loop resumes; refund()
+            // restores one iteration at a time, so grant a full window's worth.
+            for _ in 0..max_turns {
+                budget.refund();
+            }
+            auto_continue += 1;
+            continue;
+        }
+        // Auto-continue spent (or disabled): fall through to the budget-exhausted
+        // summary tail below.
+        break;
+    }
+    // A steer that landed after the loop's last drain — or while the final
+    // tool round was still pending when the budget ran out — is still buffered.
+    // Fold it into `cm` so the terminal summary call (and, when no model is
+    // configured, the ledger the next turn resumes from) sees it rather than
+    // dropping it silently.
+    if let Some(block) = deps.steer.take_block() {
+        cm.append_user_text(&block).await?;
+    }
+    // Budget exhausted with tool calls still pending: make one tool-less
+    // call asking the model for a final summary instead of leaving the user
+    // with a bare notice (Hermes' pattern). The nudge + summary are only
+    // committed to `cm` once the call actually succeeds — a failed or empty
+    // call leaves history exactly as the loop left it and falls through to
+    // the notice below, so a botched aux call can't poison the session with
+    // an unanswered nudge.
+    if !model.is_empty() {
+        let mut messages = cm.messages_for_request();
+        messages.push(json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": BUDGET_EXHAUSTED_PROMPT }],
+        }));
+        let body = json!({
+            "model": model,
+            "system": system,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+        if let Ok(text) = super::llm::collect_text(&deps.llm, body).await {
+            let text = text.trim();
+            if !text.is_empty() {
+                let text = text.to_string();
+                cm.append_user_text(BUDGET_EXHAUSTED_PROMPT).await?;
+                cm.append_assistant_text(&text).await?;
+                if display.text() {
+                    emit_row(
+                        deps,
+                        "assistant",
+                        "text",
+                        json!({ "text": text }),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+                return Ok(text);
+            }
         }
     }
+    // Fallback: no model configured, the summary call errored, or it
+    // returned nothing — keep the original bare notice.
     if display.text() {
         emit_row(
             deps,
             "system",
             "notice",
             json!({ "text": format!(
-                "Turn limit reached ({MAX_PROVIDER_TURNS} provider turns) — send a message to continue."
+                "Turn limit reached ({provider_turn} provider turns) — send a message to continue."
             ) }),
             None,
             None,
@@ -890,7 +1082,18 @@ impl RunnerSpawner {
         let display = DisplayMode::ToolsOnly {
             label: spec.agent_type.clone(),
         };
-        match drive(&child_deps, &child, &mut cm, &cancel, child_spawn, display).await {
+        let child_budget = IterationBudget::new(SUBAGENT_MAX_ITERS);
+        match drive(
+            &child_deps,
+            &child,
+            &mut cm,
+            &cancel,
+            child_spawn,
+            display,
+            &child_budget,
+        )
+        .await
+        {
             Ok(text) if cancel.is_cancelled() => {
                 result(SubtaskStatus::Interrupted, cap_report(&text))
             }
@@ -1026,6 +1229,7 @@ async fn run_tool_call(
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
         work_dir: deps.work_dir.clone(),
+        attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
         store: deps.store.clone(),
         cancel: cancel.clone(),
@@ -1042,11 +1246,22 @@ async fn run_tool_call(
         })),
     };
     match tool.execute(&ctx, input).await {
-        Ok(out) => {
-            let extras = merge_display_duration(out.display, elapsed_ms(started));
+        Ok(mut out) => {
+            let extras = merge_display_duration(out.display.take(), elapsed_ms(started));
             finish_tool_row_with_display(deps, &t.id, &out.for_model, out.is_error, Some(extras))
                 .await;
-            tool_result(&t.id, &out.for_model, out.is_error)
+            match out.model_blocks.take() {
+                Some(mut blocks) => {
+                    blocks.push(json!({ "type": "text", "text": out.for_model }));
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": t.id,
+                        "content": blocks,
+                        "is_error": out.is_error,
+                    })
+                }
+                None => tool_result(&t.id, &out.for_model, out.is_error),
+            }
         }
         Err(e) => {
             let msg = format!("{}: {e}", t.name);
@@ -1598,6 +1813,7 @@ mod tests {
         RunnerDeps {
             session_pk: "s1".into(),
             work_dir: dir.to_path_buf(),
+            attachments_dir: None,
             extra_skill_dirs: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
@@ -1616,6 +1832,7 @@ mod tests {
             commands: Arc::new(CommandRegistry::builtin()),
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            steer: SteerBuffer::new(),
         }
     }
 
@@ -1623,14 +1840,13 @@ mod tests {
     /// per-turn snapshot has rows to read while title generation stays off
     /// (an untitled session row would consume an extra scripted LLM turn).
     async fn seed_pinned_project(store: &Store, model: Option<&str>) {
-        use crate::domain::{Project, Session, SessionStatus};
+        use crate::domain::{Project, Session, SessionKind, SessionStatus};
         store
             .insert_project(Project {
                 project_id: "p".into(),
                 name: "p".into(),
                 workdir: "/w".into(),
                 source: None,
-                harness: "native".into(),
                 model: model.map(str::to_string),
                 effort: None,
                 perm_mode: PermMode::BypassPermissions,
@@ -1642,17 +1858,22 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
-                project_id: "p".into(),
+                project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
                 title: Some("titled".into()),
                 status: SessionStatus::Running,
+                perm_mode: PermMode::BypassPermissions,
                 started_by: None,
                 created_at: Some(0),
                 last_active: Some(0),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
@@ -1712,7 +1933,6 @@ mod tests {
                 "p",
                 Some("anthropic/model-b".into()),
                 PermMode::BypassPermissions,
-                "native",
             )
             .await
             .unwrap();
@@ -2400,6 +2620,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mid_turn_steer_is_injected_into_the_next_tool_result_batch() {
+        use super::super::steer::{STEER_MARKER_CLOSE, STEER_MARKER_OPEN};
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1: one tool call (bash), no tool-less text.
+        let turn1 = vec![
+            tool_use_start(1, "call-1", "bash"),
+            input_json_delta(1, "{\"command\":\"echo hi\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // Turn 2: acknowledges and ends.
+        let turn2 = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+
+        // A `steer()` call landing while the tool call above is executing
+        // pushes onto the SAME buffer `drive()` drains — exactly what
+        // `NativeSession::steer` does from a concurrent `steer` RPC. Pushed
+        // here (before the turn starts) is equivalent: `take_block()` picks
+        // up whatever is queued the instant `drive()` reaches the drain
+        // point, regardless of exactly when the push landed.
+        deps.steer.push("stop and check the tests first".into());
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("run the tests", "run the tests"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "the tool round, then the follow-up call");
+        // The follow-up request's LAST message is the drained steer block —
+        // appended right after the tool-result user turn, so the model sees
+        // it on this, the NEXT, iteration.
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let last = messages.last().expect("at least one message");
+        assert_eq!(last["role"], "user");
+        let rendered = serde_json::to_string(last).unwrap();
+        assert!(rendered.contains(STEER_MARKER_OPEN));
+        assert!(rendered.contains(STEER_MARKER_CLOSE));
+        assert!(rendered.contains("stop and check the tests first"));
+
+        // Drained: a later turn would not see it again.
+        assert!(deps.steer.take_block().is_none());
+    }
+
+    #[tokio::test]
+    async fn steer_on_a_tool_less_turn_forces_a_delivery_round() {
+        use super::super::steer::{STEER_MARKER_CLOSE, STEER_MARKER_OPEN};
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1: plain-text answer, no tool call — the model would end here.
+        let turn1 = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        // Turn 2: the steer forced one more round; the model acknowledges + ends.
+        let turn2 = vec![
+            text_delta("ok, stopping"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+
+        deps.steer.push("actually, stop".into());
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "the tool-less turn, then the forced steer-delivery round"
+        );
+        // The second request carries the drained steer block as its last
+        // message — the model gets to answer the steer, not drop it.
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let last = messages.last().expect("at least one message");
+        assert_eq!(last["role"], "user");
+        let rendered = serde_json::to_string(last).unwrap();
+        assert!(rendered.contains(STEER_MARKER_OPEN));
+        assert!(rendered.contains(STEER_MARKER_CLOSE));
+        assert!(rendered.contains("actually, stop"));
+        // Drained exactly once — a later turn will not see it again.
+        assert!(deps.steer.take_block().is_none());
+    }
+
+    #[tokio::test]
     async fn stream_error_propagates() {
         let dir = tempfile::tempdir().unwrap();
         let turn = vec![(
@@ -2938,7 +3257,7 @@ mod tests {
 
     #[tokio::test]
     async fn generates_a_title_for_a_fresh_session() {
-        use crate::domain::{Project, Session, SessionStatus};
+        use crate::domain::{Project, Session, SessionKind, SessionStatus};
         let dir = tempfile::tempdir().unwrap();
         // Turn 0: the actual reply. Turn 1: the title generation.
         let main = vec![
@@ -2961,7 +3280,6 @@ mod tests {
                 name: "p".into(),
                 workdir: dir.path().to_string_lossy().into(),
                 source: None,
-                harness: "native".into(),
                 model: None,
                 effort: None,
                 perm_mode: PermMode::Default,
@@ -2973,17 +3291,22 @@ mod tests {
         deps.store
             .insert_session(Session {
                 session_pk: "s1".into(),
-                project_id: "p".into(),
+                project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
                 title: None,
                 status: SessionStatus::Running,
+                perm_mode: PermMode::Default,
                 started_by: None,
                 created_at: Some(0),
                 last_active: Some(0),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
@@ -3196,5 +3519,208 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Interrupted"));
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_emits_a_summary_not_a_bare_notice() {
+        // A tiny budget of 2: two scripted turns ALWAYS return a tool_use (so
+        // neither hits the `tool_calls.is_empty()` end_turn return), which
+        // drives `try_consume()` to genuine exhaustion on the loop's third
+        // attempt — this also closes the B1 gap of never having exercised
+        // that path end-to-end. A THIRD scripted, tool-less turn is the
+        // post-exhaustion summary call.
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        let tool_turn = |call_id: &str| {
+            vec![
+                tool_use_start(0, call_id, "bash"),
+                input_json_delta(0, "{\"command\":\"echo hi\"}"),
+                message_delta("tool_use"),
+                message_stop(),
+            ]
+        };
+        let summary_turn = vec![
+            text_delta("Summary: explored the repo and made no changes."),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![
+            tool_turn("call-1"),
+            tool_turn("call-2"),
+            summary_turn,
+        ]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        // drive() runs here at DisplayMode::Full (top-level), where budget
+        // exhaustion would now trigger auto-continue; disable it so the run
+        // still reaches the summary tail this test asserts on.
+        deps.store
+            .set_setting("agent.auto_continue_budget", "0")
+            .await
+            .unwrap();
+        let agent = deps.agent.clone();
+        let mut cm =
+            ContextManager::ephemeral(&deps.session_pk, ContextConfig::with_meta(deps.meta));
+        cm.append_user(json!([{ "type": "text", "text": "keep going forever" }]))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let budget = IterationBudget::new(2);
+
+        let text = drive(
+            &deps,
+            &agent,
+            &mut cm,
+            &cancel,
+            None,
+            DisplayMode::Full,
+            &budget,
+        )
+        .await
+        .unwrap();
+
+        // The bare "Turn limit reached" sentinel is gone; drive() returns the
+        // model's actual summary text instead.
+        assert_eq!(text, "Summary: explored the repo and made no changes.");
+        assert!(!text.contains("Turn limit reached"));
+
+        // Exactly 3 requests went out: 2 tool-calling turns + 1 summary call.
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "2 budgeted turns + 1 summary call");
+        // The summary call must be tool-less (no tools offered).
+        let summary_body = &bodies[2];
+        let tools_empty = summary_body
+            .get("tools")
+            .map(|t| t.as_array().is_none_or(|a| a.is_empty()))
+            .unwrap_or(true);
+        assert!(
+            tools_empty,
+            "summary call must not offer tools: {summary_body}"
+        );
+        // ... and it carries the budget-exhausted nudge as its final user turn.
+        let messages = summary_body["messages"].as_array().unwrap();
+        let last_text = messages.last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(last_text.contains("maximum number of tool-calling iterations"));
+    }
+
+    /// With max_provider_turns=1 and auto_continue_budget=1: turn 1 is a tool
+    /// call (exhausts the 1-turn budget window), the loop auto-continues once
+    /// with a notice + synthetic "continue" user turn, and turn 2 ends normally.
+    #[tokio::test]
+    async fn turn_limit_auto_continues_with_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![
+            tool_use_start(0, "t1", "ls"),
+            input_json_delta(0, r#"{"path":"."}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+        add_anthropic_conn(&deps.store, &["model-a"]).await;
+        deps.store
+            .set_setting("agent.max_provider_turns", "1")
+            .await
+            .unwrap();
+        deps.store
+            .set_setting("agent.auto_continue_budget", "1")
+            .await
+            .unwrap();
+
+        let mut rx = deps.events.subscribe();
+        run_turn(
+            &deps,
+            TurnPrompt::text("list files", "list files"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut notices: Vec<String> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::Message {
+                block_type,
+                payload,
+                ..
+            } = ev
+            {
+                if block_type == "notice" {
+                    notices.push(payload["text"].as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("continuing automatically (1/1)")),
+            "expected auto-continue notice, got: {notices:?}"
+        );
+        // The synthetic continue turn must NOT be a display row — no user
+        // "continue" message row is persisted (only the ledger grows).
+        assert!(
+            !notices.iter().any(|n| n.contains("send a message")),
+            "budget was not exhausted, final stop notice must not appear: {notices:?}"
+        );
+    }
+
+    /// Budget 0 disables auto-continue: exhausting the window emits ONLY the
+    /// final "send a message" notice (legacy behavior).
+    #[tokio::test]
+    async fn turn_limit_stops_when_budget_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![
+            tool_use_start(0, "t1", "ls"),
+            input_json_delta(0, r#"{"path":"."}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn1]));
+        let deps = deps_at(dir.path(), llm).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+        add_anthropic_conn(&deps.store, &["model-a"]).await;
+        deps.store
+            .set_setting("agent.max_provider_turns", "1")
+            .await
+            .unwrap();
+        deps.store
+            .set_setting("agent.auto_continue_budget", "0")
+            .await
+            .unwrap();
+
+        let mut rx = deps.events.subscribe();
+        run_turn(
+            &deps,
+            TurnPrompt::text("list files", "list files"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut notices: Vec<String> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::Message {
+                block_type,
+                payload,
+                ..
+            } = ev
+            {
+                if block_type == "notice" {
+                    notices.push(payload["text"].as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+        assert!(notices
+            .iter()
+            .any(|n| n.contains("send a message to continue")));
+        assert!(!notices
+            .iter()
+            .any(|n| n.contains("continuing automatically")));
     }
 }

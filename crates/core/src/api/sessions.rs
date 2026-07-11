@@ -18,13 +18,16 @@ pub(crate) const HANDLES: &[&str] = &[
     "get_setting",
     "set_setting",
     "update_project",
+    "update_session_perm_mode",
     "list_projects",
     "list_sessions",
     "connect_project",
     "clone_project",
     "list_branches",
     "start_session",
+    "start_chat_session",
     "continue_session",
+    "steer",
     "stop_session",
     "end_session",
     "list_messages",
@@ -51,7 +54,11 @@ struct UpdateProjectP {
     project_id: String,
     model: Option<String>,
     perm_mode: crate::domain::PermMode,
-    harness: String,
+}
+#[derive(Deserialize)]
+struct UpdateSessionPermModeP {
+    session_pk: String,
+    perm_mode: crate::domain::PermMode,
 }
 #[derive(Deserialize)]
 struct ProjectIdOpt {
@@ -78,6 +85,11 @@ struct StartP {
     options: Option<ChatRequestOptions>,
 }
 #[derive(Deserialize)]
+struct StartChatP {
+    prompt: String,
+    options: Option<ChatRequestOptions>,
+}
+#[derive(Deserialize)]
 struct ContinueP {
     session_pk: String,
     prompt: String,
@@ -86,6 +98,11 @@ struct ContinueP {
 #[derive(Deserialize)]
 struct SessionPkP {
     session_pk: String,
+}
+#[derive(Deserialize)]
+struct SteerP {
+    session_pk: String,
+    text: String,
 }
 #[derive(Deserialize)]
 struct StageP {
@@ -113,9 +130,16 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: UpdateProjectP = params(p)?;
             ok(cp
                 .store()
-                .update_project(&a.project_id, a.model, a.perm_mode, &a.harness)
+                .update_project(&a.project_id, a.model, a.perm_mode)
                 .await?
                 .ok_or_else(|| ApiError::not_found(format!("unknown project: {}", a.project_id)))?)
+        }
+        "update_session_perm_mode" => {
+            let a: UpdateSessionPermModeP = params(p)?;
+            ok(cp
+                .store()
+                .update_session_perm_mode(&a.session_pk, a.perm_mode)
+                .await?)
         }
         "list_projects" => ok(cp.list_projects().await?),
         "list_sessions" => {
@@ -142,9 +166,35 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: StartP = params(p)?;
             ok(start_session(state, &a.project_id, &a.prompt, a.options).await?)
         }
+        "start_chat_session" => {
+            let a: StartChatP = params(p)?;
+            let attachments = attachment_refs_from_paths(
+                &a.options
+                    .as_ref()
+                    .map(|o| o.attachments.clone())
+                    .unwrap_or_default(),
+            )
+            .await?;
+            let agent_prompt = chat_agent_prompt(
+                &a.prompt,
+                a.options.as_ref().and_then(|o| o.context.as_ref()),
+            );
+            ok(state
+                .cp
+                .start_chat_session(
+                    TurnPrompt::text(agent_prompt, a.prompt),
+                    "cockpit",
+                    &attachments,
+                )
+                .await?)
+        }
         "continue_session" => {
             let a: ContinueP = params(p)?;
             ok(continue_session(state, &a.session_pk, &a.prompt, a.options).await?)
+        }
+        "steer" => {
+            let a: SteerP = params(p)?;
+            ok(cp.steer_session(&a.session_pk, &a.text).await?)
         }
         "stop_session" => {
             let a: SessionPkP = params(p)?;
@@ -177,42 +227,27 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
     }
 }
 
-async fn apply_runtime_choice(
+/// Persist the composer's model choice on the project row. `model: None`
+/// keeps the project's pinned model instead of clearing it — the composer
+/// sends null when the user didn't touch the picker.
+async fn apply_model_choice(
     cp: &ControlPlane,
     project_id: &str,
-    runtime_id: Option<&str>,
     model: Option<&str>,
 ) -> Result<(), ApiError> {
-    let runtime_id = runtime_id.filter(|v| !v.trim().is_empty());
     let model = model
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string);
-    if runtime_id.is_none() && model.is_none() {
-        return Ok(());
-    };
-    let harness = match runtime_id {
-        Some(runtime_id) => harness_for_runtime(runtime_id)?,
-        None => "",
-    };
     let Some(project) = cp.store().get_project(project_id).await? else {
         return Err(ApiError::not_found(format!(
             "unknown project: {project_id}"
         )));
     };
-    let next_harness = if harness.is_empty() {
-        project.harness.as_str()
-    } else {
-        harness
-    };
-    let current_model = project.model.clone();
-    // Ryuzi-only: a runtime choice no longer implies a model reset — the
-    // composer always sends runtimeId "native", so `model: null` must keep
-    // the project's pinned model instead of clearing it.
-    let next_model = model.or_else(|| current_model.clone());
-    if project.harness != next_harness || current_model != next_model {
+    let next_model = model.or_else(|| project.model.clone());
+    if project.model != next_model {
         cp.store()
-            .update_project(project_id, next_model, project.perm_mode, next_harness)
+            .update_project(project_id, next_model, project.perm_mode)
             .await?;
     }
     Ok(())
@@ -277,13 +312,7 @@ async fn start_session(
 ) -> Result<Session, ApiError> {
     let cp = &state.cp;
     let options = options.unwrap_or_default();
-    apply_runtime_choice(
-        cp,
-        project_id,
-        options.runtime_id.as_deref(),
-        options.model.as_deref(),
-    )
-    .await?;
+    apply_model_choice(cp, project_id, options.model.as_deref()).await?;
     let git: Option<SessionGitOptions> = options.git.clone().map(Into::into);
     let attachments = attachment_refs_from_paths(&options.attachments).await?;
     let agent_prompt = chat_agent_prompt(prompt, options.context.as_ref());
@@ -294,6 +323,7 @@ async fn start_session(
             "cockpit",
             &attachments,
             git,
+            options.perm_mode,
         )
         .await?)
 }
@@ -356,6 +386,43 @@ async fn stage_attachment(
 mod tests {
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn start_chat_session_dispatches() {
+        let s = crate::api::tests_support::state_with_fake_native().await;
+        let out = dispatch(
+            &s,
+            "start_chat_session",
+            json!({"prompt": "hi", "options": null}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["projectId"], serde_json::Value::Null);
+        assert_eq!(out["kind"], "chat");
+    }
+
+    #[tokio::test]
+    async fn steer_on_an_unknown_session_errors_like_continue_session() {
+        // No live handle AND no session row at all: `steer` dispatches through
+        // to `ControlPlane::steer_session`'s fallback, which — like
+        // `continue_session` — must fail cleanly on an unknown session_pk
+        // rather than panic or silently succeed. (The "live handle received
+        // it" / "fell back to a new turn" branching itself is covered by
+        // `control::tests::steer_session_*`, which can synchronize on the
+        // background-started live handle that this dispatch-only layer
+        // cannot.)
+        let s = state().await;
+        let err = dispatch(
+            &s,
+            "steer",
+            json!({"session_pk": "no-such-session", "text": "hi"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 500);
+    }
 
     #[tokio::test]
     async fn settings_round_trip_via_rpc() {
@@ -373,18 +440,19 @@ mod tests {
     async fn start_session_decodes_camel_case_options() {
         // Params come from the Tauri proxy as the SAME camelCase JSON the
         // frontend already sends — the DTOs' serde attrs must accept it.
+        // Native-only: a legacy `runtimeId` is ignored, never deserialized.
         let opts: crate::api::types::ChatRequestOptions = serde_json::from_value(json!({
             "runtimeId": "native",
             "model": "fable",
             "git": {"useWorktree": false, "createBranch": false, "branchName": null, "baseBranch": null}
         }))
         .unwrap();
-        assert_eq!(opts.runtime_id.as_deref(), Some("native"));
+        assert_eq!(opts.model.as_deref(), Some("fable"));
         assert!(!opts.git.unwrap().use_worktree);
     }
 
     #[tokio::test]
-    async fn apply_runtime_choice_keeps_the_pinned_model_when_none_is_sent() {
+    async fn apply_model_choice_keeps_the_pinned_model_when_none_is_sent() {
         use crate::domain::{PermMode, Project};
 
         let s = state().await;
@@ -394,7 +462,6 @@ mod tests {
                 name: "demo".into(),
                 workdir: "/tmp/demo".into(),
                 source: None,
-                harness: "claude-code".into(),
                 model: Some("openrouter/qwen3:free".into()),
                 effort: None,
                 perm_mode: PermMode::Default,
@@ -404,16 +471,10 @@ mod tests {
             .await
             .unwrap();
 
-        // The composer always sends runtimeId "native"; model may be null.
-        super::apply_runtime_choice(&s.cp, "p1", Some("native"), None)
-            .await
-            .unwrap();
+        // The composer may send model: null; the pinned model must survive.
+        super::apply_model_choice(&s.cp, "p1", None).await.unwrap();
 
         let got = s.cp.store().get_project("p1").await.unwrap().unwrap();
-        assert_eq!(
-            got.harness, "native",
-            "legacy harness migrates on next start"
-        );
         assert_eq!(
             got.model.as_deref(),
             Some("openrouter/qwen3:free"),

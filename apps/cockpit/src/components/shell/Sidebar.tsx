@@ -2,7 +2,6 @@
 import { useEffect, useState } from "react";
 import {
   Archive,
-  Bot,
   CalendarClock,
   ChevronRight,
   ChevronsUpDown,
@@ -14,6 +13,7 @@ import {
   LayoutGrid,
   ListFilter,
   Pencil,
+  Pin,
   Plus,
   Server,
   Settings,
@@ -39,6 +39,7 @@ import { useTerms } from "@/store-terms";
 import { commands, type Session } from "@/bindings";
 import {
   archivedCount,
+  chatSessions,
   isUnreadVisible,
   orderProjects,
   projectLabel,
@@ -46,6 +47,7 @@ import {
   sessionsForProject,
   type Ordering,
 } from "@/lib/sidebar";
+import { statusMeta } from "@/lib/status";
 import { StatusDot, TreeGuide } from "@/components/common/bits";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
 import { SessionRow } from "@/components/shell/SessionRow";
@@ -55,7 +57,6 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
   { label: "Inbox", icon: Inbox, view: { kind: "inbox" }, group: ["inbox"] },
   { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail", "connectionDetail"] },
-  { label: "Runtime", icon: Bot, view: { kind: "runtime" }, group: ["runtime", "runtimeDetail"] },
   { label: "Scheduler", icon: CalendarClock, view: { kind: "scheduler" }, group: ["scheduler", "jobDetail", "jobNew"] },
   { label: "Plugins", icon: LayoutGrid, view: { kind: "plugins" }, group: ["plugins", "appDetail", "pluginDetail"] },
   { label: "Settings", icon: Settings, view: { kind: "settings" }, group: ["settings"] },
@@ -161,6 +162,18 @@ export function Sidebar() {
   const q = nav.searchQuery;
   const ws = gateways.find((w) => w.id === activeGateway) ?? gateways[0];
   const projList = orderProjects(projects, ordering);
+  // Chat-first sessions (no project) get their own bucket above the project
+  // tree — same query/archived/pin treatment as a project's session list,
+  // just flat (no project to nest under).
+  const qLower = q.trim().toLowerCase();
+  const chatList = chatSessions(sessions)
+    .filter((s) => !qLower || sessionTitle(s).toLowerCase().includes(qLower))
+    .filter((s) => archivedGlobal || !archived[s.sessionPk])
+    .sort((a, b) => {
+      const pin = (pinned[b.sessionPk] ? 1 : 0) - (pinned[a.sessionPk] ? 1 : 0);
+      if (pin !== 0) return pin;
+      return (b.lastActive ?? 0) - (a.lastActive ?? 0);
+    });
   const filter = { statuses: sessionFilter.statuses, unreadOnly: sessionFilter.unreadOnly, readAt, focusedSessionPk };
   const filterActive = Object.keys(sessionFilter.statuses).length > 0 || sessionFilter.unreadOnly;
 
@@ -198,6 +211,63 @@ export function Sidebar() {
           );
         })}
       </div>
+
+      {/* Chat sessions — chat-first sessions with no project, bucketed apart
+          from the project tree below so they never look like they belong to
+          whichever project happens to be first. */}
+      {chatList.length > 0 && (
+        <div className="box-border flex w-[260px] flex-col gap-px px-2.5">
+          <div className="flex items-center gap-[2px] py-2 pl-2.5 pr-1.5">
+            <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Chat</span>
+          </div>
+          {chatList.map((s) => {
+            const m = statusMeta(s.status);
+            const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
+            const isPinned = !!pinned[s.sessionPk];
+            return (
+              <div
+                key={s.sessionPk}
+                className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[s.sessionPk] ? "opacity-55" : ""}`}
+              >
+                <span
+                  className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-2 pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
+                >
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    onClick={() => openSession(s.sessionPk)}
+                    className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
+                  >
+                    <StatusDot color={m.color} pulse={m.pulse} />
+                    <span className="min-w-0 flex-1 truncate">{sessionTitle(s)}</span>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    title={isPinned ? "Unpin" : "Pin"}
+                    className={`size-[22px] shrink-0 rounded-sm ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
+                    onClick={() => togglePin(s.sessionPk)}
+                  >
+                    <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    title={archived[s.sessionPk] ? "Restore" : "Archive — ends the session and removes its scratch dir"}
+                    disabled={archivingPk === s.sessionPk}
+                    className="hidden size-[22px] shrink-0 rounded-sm text-muted-foreground disabled:opacity-40 group-hover:flex"
+                    onClick={() => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s))}
+                  >
+                    <Archive aria-hidden size={12} strokeWidth={2} />
+                  </Button>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* Projects header */}
       <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-5 pr-3">

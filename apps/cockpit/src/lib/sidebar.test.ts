@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import type { Project, Session, SessionStatus } from "../bindings";
-import { archivedCount, isUnreadVisible, orderProjects, reorder, sessionTitle, sessionsForProject, type SessionFilterCtx } from "./sidebar";
+import {
+  archivedCount,
+  chatSessions,
+  isUnreadVisible,
+  orderProjects,
+  reorder,
+  sessionsForProject,
+  sessionTitle,
+  type SessionFilterCtx,
+} from "./sidebar";
 
 function sess(pk: string, projectId: string, title: string | null, lastActive = 0): Session {
   return {
@@ -11,11 +20,16 @@ function sess(pk: string, projectId: string, title: string | null, lastActive = 
     branch: null,
     title,
     status: "idle",
+    permMode: "default",
     startedBy: null,
     createdAt: null,
     lastActive,
     resumeAttempts: 0,
     branchOwned: true,
+    kind: "project",
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   };
 }
 
@@ -60,6 +74,15 @@ describe("sidebar sessions", () => {
     expect(orderProjects(projects, "updated").map((p) => p.projectId)).toEqual(["z", "a"]);
     expect(orderProjects(projects, "name").map((p) => p.projectId)).toEqual(["a", "z"]);
   });
+
+  test("chat sessions bucket separately from project sessions", () => {
+    const sessions = [
+      { sessionPk: "c1", projectId: null, kind: "chat" },
+      { sessionPk: "p1", projectId: "proj", kind: "project" },
+    ] as any;
+    expect(chatSessions(sessions).map((s) => s.sessionPk)).toEqual(["c1"]);
+    expect(sessionsForProject(sessions, "proj", "", false, {}, {}, noFilter).map((s) => s.sessionPk)).toEqual(["p1"]);
+  });
 });
 
 // Distinct from the `sess` helper above (different field defaults); named to
@@ -78,6 +101,11 @@ function unreadSess(pk: string, lastActive: number | null): Session {
     lastActive,
     resumeAttempts: 0,
     branchOwned: false,
+    kind: "project",
+    permMode: "default",
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   };
 }
 
@@ -181,6 +209,11 @@ test("sessionsForProject orders pinned by pinnedOrder index; unordered pinned fa
     lastActive,
     resumeAttempts: 0,
     branchOwned: false,
+    permMode: "default" as const,
+    kind: "project" as const,
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   });
   const sessions = [mk("a", 100), mk("b", 200), mk("c", 300)];
   const noFilter = { statuses: {}, unreadOnly: false, readAt: {}, focusedSessionPk: null };
@@ -203,6 +236,11 @@ test("sessionsForProject with empty pinnedOrder keeps legacy pinned-first-then-r
     lastActive,
     resumeAttempts: 0,
     branchOwned: false,
+    permMode: "default" as const,
+    kind: "project" as const,
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
   });
   const sessions = [mk("a", 100), mk("b", 300)];
   const noFilter = { statuses: {}, unreadOnly: false, readAt: {}, focusedSessionPk: null };

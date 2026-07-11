@@ -46,15 +46,29 @@ pub async fn update_project(
     project_id: String,
     model: Option<String>,
     perm_mode: PermMode,
-    harness: String,
 ) -> R<Project> {
     engine
         .rpc(
             "update_project",
             serde_json::json!({
                 "project_id": project_id, "model": model,
-                "perm_mode": perm_mode, "harness": harness,
+                "perm_mode": perm_mode,
             }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_session_perm_mode(
+    engine: Engine<'_>,
+    session_pk: String,
+    perm_mode: PermMode,
+) -> R<()> {
+    engine
+        .rpc(
+            "update_session_perm_mode",
+            serde_json::json!({ "session_pk": session_pk, "perm_mode": perm_mode }),
         )
         .await
 }
@@ -129,6 +143,21 @@ pub async fn start_session(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn start_chat_session(
+    engine: Engine<'_>,
+    prompt: String,
+    options: Option<ChatRequestOptions>,
+) -> R<Session> {
+    engine
+        .rpc(
+            "start_chat_session",
+            serde_json::json!({ "prompt": prompt, "options": options }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn continue_session(
     engine: Engine<'_>,
     session_pk: String,
@@ -141,6 +170,17 @@ pub async fn continue_session(
             serde_json::json!({
                 "session_pk": session_pk, "prompt": prompt, "options": options,
             }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn steer_session(engine: Engine<'_>, session_pk: String, text: String) -> R<bool> {
+    engine
+        .rpc(
+            "steer",
+            serde_json::json!({ "session_pk": session_pk, "text": text }),
         )
         .await
 }

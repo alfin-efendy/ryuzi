@@ -1,8 +1,5 @@
 import { create } from "zustand";
 
-// Agent ids come from the engine's agent catalog (see store-runtimes).
-export type AgentId = string;
-
 // View router for the Relay v3 shell. Session focus itself stays in the main
 // store (focusedSessionPk); this store only decides which screen is showing.
 export type View =
@@ -12,8 +9,6 @@ export type View =
   | { kind: "models" }
   | { kind: "providerDetail"; provider: string }
   | { kind: "connectionDetail"; id: string }
-  | { kind: "runtime" }
-  | { kind: "runtimeDetail"; id: AgentId }
   | { kind: "scheduler" }
   | { kind: "jobDetail"; id: string }
   | { kind: "jobNew" }
@@ -136,7 +131,8 @@ type NavState = {
   composerBranch: string | null;
   /** Run the session in an isolated git worktree (matrix column 1). */
   composerUseWorktree: boolean;
-  /** Model the next composed session should run on; null = project/runtime default. */
+  /** Model the next composed session should run on; null = fall back to the
+   *  project's pinned model, then the agent's default model (see HomeView). */
   composerModel: string | null;
   /** Unsent composer text keyed by composer identity: a sessionPk (SessionView)
    *  or `home:{projectId}` (HomeView). Persisted so drafts survive restarts. */

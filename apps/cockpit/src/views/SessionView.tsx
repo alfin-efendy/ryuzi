@@ -8,12 +8,12 @@ import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { useAgent } from "@/store-agent";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { headerAgentLine } from "@/lib/session-header";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
-import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
+import { NATIVE_AGENT, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
@@ -32,7 +32,7 @@ import { AttachmentChips } from "@/components/composer/AttachmentChips";
 import { HISTORY_IDLE, historyEntries, shouldNavigateHistory, stepHistory, type HistoryState } from "@/components/composer/inputHistory";
 
 export function SessionView() {
-  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setProjectPermMode } =
+  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setSessionPermMode } =
     useStore();
   const enqueueMessage = useStore((s) => s.enqueueMessage);
   const nav = useNav();
@@ -58,13 +58,13 @@ export function SessionView() {
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
   const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
-  const runtimes = useRuntimes((s) => s.runtimes);
-  const project = projects.find((p) => p.projectId === session?.projectId);
-  const projectId = project?.projectId;
-  // Ryuzi-only: every session runs the native runtime. Tolerant by
+  // Ryuzi-only: every session runs the native agent. Tolerant by
   // construction — legacy rows still saying "claude-code" (restored DBs)
   // are simply treated as native.
-  const agent = runtimeById(runtimes, "native");
+  const agentModel = useAgent((s) => s.model);
+  const agentModels = useAgent((s) => s.models);
+  const project = projects.find((p) => p.projectId === session?.projectId);
+  const projectId = project?.projectId;
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
@@ -172,10 +172,10 @@ export function SessionView() {
   const meta = statusMeta(session.status);
   const running = session.status === "running";
   const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
-  const permUi = corePermToUi(project?.permMode ?? "default");
+  const permUi = corePermToUi(session.permMode);
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
-  const selectedModel = project?.model || agent?.model || "";
-  const modelOptions = agent?.models ?? [];
+  const selectedModel = project?.model || agentModel || "";
+  const modelOptions = agentModels;
 
   const submit = () => {
     const t = draft.trim();
@@ -239,7 +239,7 @@ export function SessionView() {
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
             <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-              <span>{headerAgentLine(agent, project)}</span>
+              <span>{headerAgentLine(project, agentModel)}</span>
               {session.branch && (
                 <span className="inline-flex items-center gap-1">
                   <GitBranch aria-hidden size={11} strokeWidth={2} />
@@ -271,25 +271,26 @@ export function SessionView() {
           </Button>
         </div>
 
-        {/* Native runtime plan (todowrite) */}
-        <TodoPanel sessionPk={session.sessionPk} running={running} />
-
-        {/* Transcript */}
-        <TranscriptFileContext.Provider value={transcriptFileCtx}>
-          <Transcript
-            sessionPk={session.sessionPk}
-            rows={rows}
-            agentName={agent?.name ?? "Agent"}
-            agentColor={agent?.color ?? "var(--muted-foreground)"}
-            running={running}
-          >
-            {pendingForSession.map((a, i) => (
-              <div key={a.requestId} className="px-4 pb-2">
-                <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
-              </div>
-            ))}
-          </Transcript>
-        </TranscriptFileContext.Provider>
+        {/* Transcript, with the floating plan panel overlaying it */}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <TranscriptFileContext.Provider value={transcriptFileCtx}>
+            <Transcript
+              sessionPk={session.sessionPk}
+              rows={rows}
+              agentName={NATIVE_AGENT.name}
+              agentColor={NATIVE_AGENT.color}
+              running={running}
+            >
+              {pendingForSession.map((a, i) => (
+                <div key={a.requestId} className="px-4 pb-2">
+                  <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
+                </div>
+              ))}
+            </Transcript>
+          </TranscriptFileContext.Provider>
+          {/* Agent plan (todowrite) — floating rounded panel */}
+          <TodoPanel sessionPk={session.sessionPk} running={running} />
+        </div>
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
@@ -363,7 +364,7 @@ export function SessionView() {
                 options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
                 value={permUi}
                 onValueChange={(mode) => {
-                  if (projectId) void setProjectPermMode(projectId, uiPermToCore(mode as UiPermMode));
+                  void setSessionPermMode(session.sessionPk, uiPermToCore(mode as UiPermMode));
                 }}
                 trigger={
                   <Button
@@ -446,7 +447,7 @@ export function SessionView() {
           sessionPk={session.sessionPk}
           branch={session.branch ?? null}
           running={running}
-          isGit={project?.isGit ?? true}
+          isGit={project?.isGit ?? false}
         />
       )}
     </div>
