@@ -7,6 +7,7 @@ pub mod branches;
 pub mod connector;
 pub mod control;
 pub mod control_token;
+pub mod curator;
 pub mod daemon;
 pub mod daemon_lock;
 pub mod daemon_status;

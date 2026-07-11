@@ -217,6 +217,27 @@ pub struct SkillUsage {
     pub created_at: Option<i64>,
 }
 
+/// One `curator_runs` row (Task 10/Task 1 migration #28): a single curator
+/// sweep's bookkeeping, read back by the Cockpit Learning panel's (Task 11)
+/// history view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CuratorRun {
+    pub id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    /// `running` | `ok` | `error`.
+    pub status: String,
+    /// How many skills the deterministic planner transitioned this run.
+    pub transitioned: i64,
+    /// Whether the opt-in LLM consolidation pass ran this run.
+    pub consolidated: bool,
+    /// Pre-mutation tar.gz snapshot path, set only when `consolidated`.
+    pub snapshot_path: Option<String>,
+    pub error: Option<String>,
+    pub log: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {

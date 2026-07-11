@@ -93,6 +93,12 @@ pub struct Daemon {
     /// and drives a review fork per row — a separate daemon-hosted loop, not
     /// a delivery path the rail drainer itself takes.
     learning_handle: JoinHandle<()>,
+    /// The curator's weekly skill-lifecycle loop (`curator::spawn_runner`,
+    /// Task 10), tracked for the same reason as `learning_handle`. Unlike
+    /// every other loop here it is store-only (no harness/LLM dispatch for
+    /// the deterministic sweep), so it is spawned directly off `store`
+    /// rather than `cp` — see `build_daemon`'s doc.
+    curator_handle: JoinHandle<()>,
 }
 
 impl Daemon {
@@ -102,8 +108,8 @@ impl Daemon {
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
-    /// same as `stop()`), the router/fan-out/scheduler/orch/rail/learning
-    /// handles are aborted, and the daemon is marked stopped (reusing the same
+    /// same as `stop()`), the router/fan-out/scheduler/orch/rail/learning/
+    /// curator handles are aborted, and the daemon is marked stopped (reusing the same
     /// idempotency flag `stop()` checks) before the error is returned.
     /// Marking it stopped here means a caller's own best-effort `stop()` on
     /// a `start()` error (e.g. `daemon_cmd::build_and_start`) is a safe
@@ -138,6 +144,7 @@ impl Daemon {
                     self.orch_handle.abort();
                     self.rail_handle.abort();
                     self.learning_handle.abort();
+                    self.curator_handle.abort();
                 }
                 return Err(e);
             }
@@ -175,9 +182,9 @@ impl Daemon {
     /// failing gateway can't block the rest of the shutdown),
     /// abort the router and approval fan-out broadcast-consumer loops (which
     /// also aborts any in-flight per-approval races the fan-out spawned —
-    /// see `spawn_approval_fanout`), abort the scheduler, orch, rail, and
-    /// learning loops, stop the endpoint server, then flush telemetry. A
-    /// second call is a no-op.
+    /// see `spawn_approval_fanout`), abort the scheduler, orch, rail,
+    /// learning, and curator loops, stop the endpoint server, then flush
+    /// telemetry. A second call is a no-op.
     pub async fn stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
@@ -191,6 +198,7 @@ impl Daemon {
         self.orch_handle.abort();
         self.rail_handle.abort();
         self.learning_handle.abort();
+        self.curator_handle.abort();
         self.router_server.stop().await;
         self.telemetry.shutdown();
     }
@@ -251,8 +259,10 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// instances) → the approval fan-out spawned on another `cp.subscribe()`
 /// → the cron scheduler (`scheduler::spawn_runner`), orch dispatcher
 /// (`orch::spawn_runner`), background-rail drainer
-/// (`background_rail::spawn_runner`), and learning worker
-/// (`learning::spawn_runner`) loops, spawned here because the daemon
+/// (`background_rail::spawn_runner`), learning worker
+/// (`learning::spawn_runner`), and curator (`curator::spawn_runner`, Task
+/// 10 — store-only, spawned off `store` directly rather than `cp` since it
+/// never dispatches an LLM turn) loops, spawned here because the daemon
 /// is the single always-on engine host for them (see `Daemon`'s
 /// `scheduler_handle` doc) → the local endpoint server (`RouterServer::new`),
 /// constructed but not started — `Daemon::start()` starts it only if
@@ -346,6 +356,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let orch_handle = crate::orch::spawn_runner(Arc::clone(&cp));
     let rail_handle = crate::background_rail::spawn_runner(Arc::clone(&cp));
     let learning_handle = crate::learning::spawn_runner(Arc::clone(&cp));
+    let curator_handle = crate::curator::spawn_runner(Arc::clone(&store));
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
 
     Ok(Daemon {
@@ -361,6 +372,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         orch_handle,
         rail_handle,
         learning_handle,
+        curator_handle,
     })
 }
 
@@ -1060,6 +1072,11 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         });
+        let curator_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
 
         let daemon = Daemon {
             cp,
@@ -1074,6 +1091,7 @@ mod tests {
             orch_handle,
             rail_handle,
             learning_handle,
+            curator_handle,
         };
 
         let err = daemon.start().await.unwrap_err();
@@ -1112,6 +1130,10 @@ mod tests {
         assert!(
             daemon.learning_handle.is_finished(),
             "start()'s rollback must abort the learning loop"
+        );
+        assert!(
+            daemon.curator_handle.is_finished(),
+            "start()'s rollback must abort the curator loop"
         );
 
         // A later explicit stop() (as `build_and_start` performs on a start
@@ -1515,6 +1537,7 @@ mod tests {
             orch_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
         };
 
         daemon.start().await.unwrap();
@@ -1583,6 +1606,11 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         });
+        let curator_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
 
         let daemon = Daemon {
             cp,
@@ -1597,6 +1625,7 @@ mod tests {
             orch_handle,
             rail_handle,
             learning_handle,
+            curator_handle,
         };
 
         daemon.stop().await;
@@ -1607,7 +1636,7 @@ mod tests {
             1,
             "a second stop() must not re-invoke gateway.stop()"
         );
-        // Give the abort a moment to actually land, then assert all six
+        // Give the abort a moment to actually land, then assert all seven
         // tracked loops are gone — stop() must not leave them running.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -1633,6 +1662,10 @@ mod tests {
         assert!(
             daemon.learning_handle.is_finished(),
             "stop() must abort the learning loop"
+        );
+        assert!(
+            daemon.curator_handle.is_finished(),
+            "stop() must abort the curator loop"
         );
     }
 
@@ -1899,10 +1932,10 @@ mod tests {
         );
     }
 
-    // ---------- (j) daemon hosts scheduler + orch + rail + learning loops (Tasks 10, 9, 8) ----------
+    // ---------- (j) daemon hosts scheduler + orch + rail + learning + curator loops (Tasks 10, 9, 8, 10) ----------
 
     #[tokio::test]
-    async fn daemon_hosts_and_stop_aborts_scheduler_orch_rail_and_learning_loops() {
+    async fn daemon_hosts_and_stop_aborts_scheduler_orch_rail_learning_and_curator_loops() {
         let (_guard, db_path) = temp_db_path();
         let daemon = build_daemon(BuildDaemonOpts {
             db_path,
@@ -1923,6 +1956,10 @@ mod tests {
             !daemon.learning_handle.is_finished(),
             "learning loop must be live"
         );
+        assert!(
+            !daemon.curator_handle.is_finished(),
+            "curator loop must be live"
+        );
 
         daemon.stop().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1941,6 +1978,10 @@ mod tests {
         assert!(
             daemon.learning_handle.is_finished(),
             "stop() must abort the learning loop"
+        );
+        assert!(
+            daemon.curator_handle.is_finished(),
+            "stop() must abort the curator loop"
         );
     }
 }

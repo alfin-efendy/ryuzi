@@ -1,6 +1,6 @@
 use crate::domain::{
-    Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionKind,
-    SessionStatus, SkillUsage, Surface, ToolPolicyRow,
+    CuratorRun, Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session,
+    SessionKind, SessionStatus, SkillUsage, Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -1148,6 +1148,20 @@ fn map_skill_usage_row(r: &Row) -> rusqlite::Result<SkillUsage> {
         pinned: r.get::<_, i64>(9)? != 0,
         archived_at: r.get(10)?,
         created_at: r.get(11)?,
+    })
+}
+
+fn map_curator_run_row(r: &Row) -> rusqlite::Result<CuratorRun> {
+    Ok(CuratorRun {
+        id: r.get(0)?,
+        started_at: r.get(1)?,
+        finished_at: r.get(2)?,
+        status: r.get(3)?,
+        transitioned: r.get(4)?,
+        consolidated: r.get::<_, i64>(5)? != 0,
+        snapshot_path: r.get(6)?,
+        error: r.get(7)?,
+        log: r.get(8)?,
     })
 }
 
@@ -3384,6 +3398,102 @@ impl Store {
             ))?;
             let rows = stmt
                 .query_map([], map_skill_usage_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// The curator's (Task 10) last completed-or-started run timestamp, or
+    /// `None` if it has never run. `curator_state` is a singleton row
+    /// (`id=1`); `curator::tick`'s weekly-cadence gate reads this before
+    /// deciding whether a sweep is due.
+    pub async fn curator_last_run(&self) -> anyhow::Result<Option<i64>> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT last_run_at FROM curator_state WHERE id=1",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(|v| v.flatten())
+        })
+        .await
+    }
+
+    /// Open a new `curator_runs` row (`status='running'`) and stamp
+    /// `curator_state.last_run_at`/`last_run_id` to it in the same call —
+    /// the write `curator_last_run` observes, so a second daemon boot within
+    /// the same interval can't double-start a sweep.
+    pub async fn insert_curator_run(&self, id: &str, started_at: i64) -> anyhow::Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO curator_runs(id, started_at, status) VALUES (?1, ?2, 'running')",
+                params![id, started_at],
+            )?;
+            c.execute(
+                "INSERT INTO curator_state(id, last_run_at, last_run_id) VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                     last_run_at=excluded.last_run_at, last_run_id=excluded.last_run_id",
+                params![started_at, id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Close out a `curator_runs` row: final `status` (`"ok"`/`"error"`), how
+    /// many skills the deterministic planner transitioned, whether the
+    /// opt-in consolidation pass ran, its pre-mutation snapshot path (if it
+    /// did), and an error message on failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_curator_run(
+        &self,
+        id: &str,
+        finished_at: i64,
+        status: &str,
+        transitioned: i64,
+        consolidated: bool,
+        snapshot_path: Option<&str>,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let (id, status, snapshot_path, error) = (
+            id.to_string(),
+            status.to_string(),
+            snapshot_path.map(str::to_string),
+            error.map(str::to_string),
+        );
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE curator_runs SET finished_at=?1, status=?2, transitioned=?3, \
+                     consolidated=?4, snapshot_path=?5, error=?6 WHERE id=?7",
+                params![
+                    finished_at,
+                    status,
+                    transitioned,
+                    consolidated as i64,
+                    snapshot_path,
+                    error,
+                    id,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Most recent `curator_runs` rows, newest first — the Cockpit Learning
+    /// panel's (Task 11) history view.
+    pub async fn list_curator_runs(&self, limit: i64) -> anyhow::Result<Vec<CuratorRun>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, started_at, finished_at, status, transitioned, consolidated, \
+                     snapshot_path, error, log \
+                 FROM curator_runs ORDER BY started_at DESC LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![limit], map_curator_run_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -6450,5 +6560,83 @@ mod tests {
             all.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
             vec!["alpha", "zeta"]
         );
+    }
+
+    // ---------- curator_state / curator_runs (Task 10) ----------
+
+    #[tokio::test]
+    async fn curator_last_run_is_none_until_a_run_is_inserted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store.curator_last_run().await.unwrap().is_none());
+
+        store.insert_curator_run("run-1", 1_000).await.unwrap();
+        assert_eq!(store.curator_last_run().await.unwrap(), Some(1_000));
+
+        // A later run overwrites the singleton `curator_state` anchor.
+        store.insert_curator_run("run-2", 2_000).await.unwrap();
+        assert_eq!(store.curator_last_run().await.unwrap(), Some(2_000));
+    }
+
+    #[tokio::test]
+    async fn finish_curator_run_updates_the_row_and_list_curator_runs_orders_newest_first() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_curator_run("run-1", 1_000).await.unwrap();
+        store.insert_curator_run("run-2", 2_000).await.unwrap();
+
+        store
+            .finish_curator_run("run-1", 1_500, "ok", 3, false, None, None)
+            .await
+            .unwrap();
+        store
+            .finish_curator_run(
+                "run-2",
+                2_500,
+                "error",
+                0,
+                true,
+                Some("/tmp/snap.tar.gz"),
+                Some("boom"),
+            )
+            .await
+            .unwrap();
+
+        let runs = store.list_curator_runs(10).await.unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run-2", "run-1"],
+            "newest (highest started_at) first"
+        );
+
+        let run1 = runs.iter().find(|r| r.id == "run-1").unwrap();
+        assert_eq!(run1.finished_at, Some(1_500));
+        assert_eq!(run1.status, "ok");
+        assert_eq!(run1.transitioned, 3);
+        assert!(!run1.consolidated);
+        assert_eq!(run1.snapshot_path, None);
+        assert_eq!(run1.error, None);
+
+        let run2 = runs.iter().find(|r| r.id == "run-2").unwrap();
+        assert_eq!(run2.finished_at, Some(2_500));
+        assert_eq!(run2.status, "error");
+        assert_eq!(run2.transitioned, 0);
+        assert!(run2.consolidated);
+        assert_eq!(run2.snapshot_path.as_deref(), Some("/tmp/snap.tar.gz"));
+        assert_eq!(run2.error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn list_curator_runs_respects_limit() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        for (i, id) in ["run-a", "run-b", "run-c"].into_iter().enumerate() {
+            store
+                .insert_curator_run(id, 1_000 + i as i64)
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.list_curator_runs(2).await.unwrap().len(), 2);
+        assert_eq!(store.list_curator_runs(100).await.unwrap().len(), 3);
     }
 }
