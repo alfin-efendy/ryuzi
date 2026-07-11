@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronRight, FileText, Maximize2, Minimize2, RotateCw, Search, SquareCheck, X } from "lucide-react";
+import { Bot, ChevronRight, FileText, Maximize2, Minimize2, RotateCw, Search, SquareCheck, X } from "lucide-react";
 import { useUi } from "@/store-ui";
 import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav";
 import { useDiff, reviewFileIndex, EMPTY } from "@/store-diff";
@@ -10,6 +10,7 @@ import { Button, Input, Segmented } from "@ryuzi/ui";
 import { FileViewer } from "@/components/FileViewer";
 import { defaultModeForPath, previewKindForPath, type ViewMode } from "@/lib/preview";
 import { FileTreePane } from "@/components/FileTreePane";
+import { SubagentList } from "@/components/session/SubagentList";
 import { DiffStat } from "@/components/common/bits";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
 
@@ -78,6 +79,7 @@ export function RightPanel({
   const rightTabs: { id: RightTab; label: string; icon: typeof SquareCheck }[] = [
     { id: "review", label: "Review", icon: SquareCheck },
     { id: "file", label: activeFileTab ? activeFileTab.title : "Files", icon: FileText },
+    { id: "agents", label: "Agents", icon: Bot },
   ];
 
   const review = diff.files.length > 0 ? diff.files[Math.min(reviewFile, diff.files.length - 1)] : null;
@@ -344,6 +346,8 @@ export function RightPanel({
           </div>
         </>
       )}
+
+      {nav.rightTab === "agents" && <SubagentList sessionPk={sessionPk} />}
     </div>
   );
 }

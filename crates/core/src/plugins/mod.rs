@@ -22,12 +22,14 @@
 pub mod builtin;
 pub mod catalog;
 pub mod declarative;
+pub mod doctor;
 pub mod host;
 pub mod oauth;
 pub mod providers;
 
 use crate::settings::{csv, SettingsStore};
 
+pub use doctor::{plugin_doctor, DoctorFinding};
 pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Add every generated manifest-only builtin — every model provider

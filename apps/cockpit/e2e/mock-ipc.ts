@@ -58,6 +58,15 @@ const FIXTURES: Record<string, unknown> = {
   probe_gateways: [],
   list_jobs: [],
   list_apps: [],
+  // Plugin-distribution commands invoked on the Plugins view mount. Without
+  // these, the fallback returns `null` for the non-`list_`-prefixed ones
+  // (`plugin_doctor`, `plugins_restart_required`), and the store then renders
+  // `doctorFindings`/`restartRequired` from `null` — crashing the view and
+  // wedging sidebar navigation.
+  list_plugins: [],
+  list_skills: [],
+  plugin_doctor: [],
+  plugins_restart_required: false,
   get_setting: null,
   backdrop_capability: "none",
   system_accent_color: null,

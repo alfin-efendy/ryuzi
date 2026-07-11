@@ -60,6 +60,13 @@ pub(crate) const HANDLES: &[&str] = &[
     "begin_plugin_install",
     "set_plugin_oauth_client_id",
     "cancel_plugin_install",
+    "begin_skill_install",
+    "confirm_skill_install",
+    "update_plugin",
+    "update_all_plugins",
+    "set_plugin_pin",
+    "plugin_doctor",
+    "plugins_restart_required",
 ];
 
 #[derive(Clone)]
@@ -118,6 +125,25 @@ struct CancelPluginInstallP {
     plugin_id: String,
     state_token: Option<String>,
 }
+#[derive(Deserialize)]
+struct SourceP {
+    source: String,
+}
+#[derive(Deserialize)]
+struct TokenP {
+    token: String,
+}
+#[derive(Deserialize)]
+struct UpdatePluginP {
+    id: String,
+    force: bool,
+}
+#[derive(Deserialize)]
+struct SetPluginPinP {
+    id: String,
+    pinned: bool,
+    reason: Option<String>,
+}
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     let cp = &state.cp;
@@ -156,6 +182,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "uninstall_plugin" => {
             let a: IdP = params(p)?;
             uninstall(cp, &a.id).await?;
+            cp.mark_plugins_restart_required();
             ok(assemble_list(cp).await?)
         }
         "begin_plugin_install" => {
@@ -172,8 +199,97 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             cancel_plugin_install(cp, a.plugin_id, a.state_token).await?;
             ok(())
         }
+        "begin_skill_install" => {
+            let a: SourceP = params(p)?;
+            ok(begin_skill_install(cp, &a.source).await?)
+        }
+        "confirm_skill_install" => {
+            let a: TokenP = params(p)?;
+            ok(confirm_skill_install(cp, &a.token).await?)
+        }
+        "update_plugin" => {
+            let a: UpdatePluginP = params(p)?;
+            ok(update_plugin(cp, &a.id, a.force).await?)
+        }
+        "update_all_plugins" => ok(update_all_plugins(cp).await?),
+        "set_plugin_pin" => {
+            let a: SetPluginPinP = params(p)?;
+            crate::skills_install::set_pack_pin(&a.id, a.pinned, a.reason.as_deref(), cp.store())
+                .await?;
+            ok(())
+        }
+        "plugin_doctor" => {
+            let findings = crate::plugins::doctor::plugin_doctor(cp).await?;
+            ok(findings
+                .into_iter()
+                .map(DoctorFinding::from)
+                .collect::<Vec<_>>())
+        }
+        "plugins_restart_required" => ok(cp.plugins_restart_required()),
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
+}
+
+/// Phase 1 of the two-phase tiered trust gate (see
+/// [`crate::skills_install::begin_install`]): curated sources install
+/// immediately (`completed: true`); arbitrary sources stop at a trust prompt
+/// the wizard must show before `confirm_skill_install` can proceed. Marks the
+/// daemon dirty (`plugins_restart_required`) only when the install actually
+/// completed — a `NeedsConfirmation` trust prompt hasn't touched disk yet.
+async fn begin_skill_install(cp: &ControlPlane, source: &str) -> anyhow::Result<SkillInstallBegin> {
+    let result = crate::skills_install::begin_install(source, cp.store()).await?;
+    if matches!(result, crate::skills_install::BeginInstall::Completed(_)) {
+        cp.mark_plugins_restart_required();
+    }
+    Ok(SkillInstallBegin::from(result))
+}
+
+/// Phase 2: complete a staged install (or update) after the user has
+/// acknowledged its trust prompt. The token is single-use. Always marks
+/// `plugins_restart_required`: reaching this point always means an install (or
+/// reack-triggered update) just completed.
+async fn confirm_skill_install(
+    cp: &ControlPlane,
+    token: &str,
+) -> anyhow::Result<crate::skills_install::InstalledSkillPack> {
+    let pack = crate::skills_install::confirm_install(token, cp.store()).await?;
+    cp.mark_plugins_restart_required();
+    Ok(pack)
+}
+
+/// Update one installed pack. `force` overrides the local-edits guard but
+/// never the pinned guard or the hook-script re-ack gate. Marks a restart only
+/// on an actual `Updated` outcome — the other outcomes are no-ops on disk.
+async fn update_plugin(
+    cp: &ControlPlane,
+    id: &str,
+    force: bool,
+) -> anyhow::Result<UpdateOutcomeDto> {
+    let outcome = crate::skills_install::update_installed_pack(id, force, cp.store()).await?;
+    if matches!(outcome, crate::skills_install::UpdateOutcome::Updated) {
+        cp.mark_plugins_restart_required();
+    }
+    Ok(UpdateOutcomeDto::from(outcome))
+}
+
+/// Update every installed pack (skipping pinned ones); never fails as a whole
+/// — a single pack's error surfaces as that pack's `Failed` entry. Marks a
+/// restart if at least one pack actually reinstalled.
+async fn update_all_plugins(cp: &ControlPlane) -> anyhow::Result<Vec<UpdateOutcomeEntry>> {
+    let results = crate::skills_install::update_all_packs(cp.store()).await?;
+    if results
+        .iter()
+        .any(|(_, o)| matches!(o, crate::skills_install::UpdateOutcome::Updated))
+    {
+        cp.mark_plugins_restart_required();
+    }
+    Ok(results
+        .into_iter()
+        .map(|(id, outcome)| UpdateOutcomeEntry {
+            id,
+            outcome: UpdateOutcomeDto::from(outcome),
+        })
+        .collect())
 }
 
 fn source_label(source: &PluginSource) -> &'static str {
@@ -233,14 +349,57 @@ fn installed_flag(
     }
 }
 
+/// Ledger-derived `PluginInfo` fields (`pinned`, `sourceSpec`,
+/// `resolvedCommit`, `installedAt`, `updatedAt`, `trustTier`) drawn from an
+/// optional `plugin_installs` row — `None` leaves them at their "no ledger
+/// row" defaults (`pinned: false`, the rest `None`).
+struct InstallLedgerFields {
+    pinned: bool,
+    source_spec: Option<String>,
+    resolved_commit: Option<String>,
+    installed_at: Option<i64>,
+    updated_at: Option<i64>,
+    trust_tier: Option<String>,
+}
+
+impl InstallLedgerFields {
+    fn absent() -> Self {
+        Self {
+            pinned: false,
+            source_spec: None,
+            resolved_commit: None,
+            installed_at: None,
+            updated_at: None,
+            trust_tier: None,
+        }
+    }
+
+    fn from_record(rec: &crate::store::PluginInstallRecord) -> Self {
+        Self {
+            pinned: rec.pinned,
+            source_spec: Some(rec.source_spec.clone()),
+            resolved_commit: rec.resolved_commit.clone(),
+            installed_at: Some(rec.installed_at),
+            updated_at: Some(rec.updated_at),
+            trust_tier: Some(rec.trust_tier.clone()),
+        }
+    }
+
+    fn from_option(rec: Option<&crate::store::PluginInstallRecord>) -> Self {
+        rec.map(Self::from_record).unwrap_or_else(Self::absent)
+    }
+}
+
 fn plugin_info(
     plugin: &CorePlugin,
     enabled: bool,
     configured: bool,
     kind: &str,
     installed: bool,
+    install: Option<&crate::store::PluginInstallRecord>,
 ) -> PluginInfo {
     let m = &plugin.manifest;
+    let ledger = InstallLedgerFields::from_option(install);
     PluginInfo {
         id: m.id.clone(),
         name: m.name.clone(),
@@ -260,6 +419,12 @@ fn plugin_info(
         kind: kind.to_string(),
         installed,
         family: (kind == "provider").then(|| provider_family(&m.id)),
+        pinned: ledger.pinned,
+        source_spec: ledger.source_spec,
+        resolved_commit: ledger.resolved_commit,
+        installed_at: ledger.installed_at,
+        updated_at: ledger.updated_at,
+        trust_tier: ledger.trust_tier,
     }
 }
 
@@ -946,9 +1111,24 @@ async fn compute_installed(
     ))
 }
 
+/// Fetch every `plugin_installs` ledger row ONCE and index it by plugin id so
+/// list assembly stays O(1) round-trips regardless of the plugin count (never
+/// a per-plugin `get_plugin_install` inside the loop below).
+async fn install_ledger_index(
+    store: &Store,
+) -> anyhow::Result<HashMap<String, crate::store::PluginInstallRecord>> {
+    Ok(store
+        .list_plugin_installs()
+        .await?
+        .into_iter()
+        .map(|r| (r.plugin_id.clone(), r))
+        .collect())
+}
+
 async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let settings = SettingsStore::new(cp.store().clone());
     let ctx = installed_ctx(cp.store()).await?;
+    let installs = install_ledger_index(cp.store()).await?;
     let mut out = Vec::new();
     for plugin in cp.plugins().list() {
         let Some(kind) = derive_kind(&plugin) else {
@@ -966,7 +1146,10 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
         .await?;
         let installed =
             compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
-        out.push(plugin_info(&plugin, enabled, configured, kind, installed));
+        let record = installs.get(&plugin.manifest.id);
+        out.push(plugin_info(
+            &plugin, enabled, configured, kind, installed, record,
+        ));
     }
     for pack in crate::skills_install::curated_skill_packs() {
         if cp.plugins().get(pack.id).is_some() || out.iter().any(|p| p.id == pack.id) {
@@ -976,6 +1159,7 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             .installed_skills
             .iter()
             .any(|s| s.id == pack.id || s.source == pack.id || s.source == pack.repo);
+        let ledger = InstallLedgerFields::from_option(installs.get(pack.id));
         out.push(PluginInfo {
             id: pack.id.to_string(),
             name: pack.name.to_string(),
@@ -994,6 +1178,12 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             kind: "skill-pack".to_string(),
             installed,
             family: None,
+            pinned: ledger.pinned,
+            source_spec: ledger.source_spec,
+            resolved_commit: ledger.resolved_commit,
+            installed_at: ledger.installed_at,
+            updated_at: ledger.updated_at,
+            trust_tier: ledger.trust_tier,
         });
     }
     Ok(out)
@@ -1018,9 +1208,19 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
     let kind = derive_kind(&plugin).unwrap_or("integration");
     let ctx = installed_ctx(cp.store()).await?;
     let installed = compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
+    // Single-plugin lookup is fine here — unlike `assemble_list`, there is
+    // only ever one id to resolve for a detail view.
+    let record = cp.store().get_plugin_install(id).await?;
 
     Ok(PluginDetail {
-        info: plugin_info(&plugin, enabled, configured, kind, installed),
+        info: plugin_info(
+            &plugin,
+            enabled,
+            configured,
+            kind,
+            installed,
+            record.as_ref(),
+        ),
         auth,
         settings: settings_info,
         mcp,
@@ -1061,7 +1261,12 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
         else {
             anyhow::bail!("unknown plugin: {id}");
         };
-        return crate::skills_install::remove_installed_skill(&pack.id);
+        // Recorded variant: also drop the pack's `plugin_installs` +
+        // `plugin_attach_status` rows, so an uninstalled pack doesn't leave a
+        // ghost ledger row (which would make every future `update_all_packs`
+        // report `Failed("unknown installed skill: <id>")` for it and bleed
+        // stale trust/pin/attach metadata into the reappeared Browse card).
+        return crate::skills_install::remove_installed_skill_recorded(&pack.id, cp.store()).await;
     };
     match derive_kind(&plugin) {
         Some("provider") => {
@@ -1087,7 +1292,9 @@ async fn uninstall(cp: &ControlPlane, id: &str) -> anyhow::Result<()> {
             else {
                 anyhow::bail!("skill pack not installed: {id}");
             };
-            crate::skills_install::remove_installed_skill(&pack.id)
+            // Recorded variant — drops the ledger row too (see the
+            // not-in-host fallback above for why a ghost row is harmful).
+            crate::skills_install::remove_installed_skill_recorded(&pack.id, cp.store()).await
         }
         _ => {
             if let Some(auth) = &plugin.manifest.auth {
@@ -1604,7 +1811,7 @@ mod tests {
     #[test]
     fn plugin_info_maps_identity_and_enabled_flag_through() {
         let plugin = harness_only("native");
-        let info = plugin_info(&plugin, true, false, "integration", false);
+        let info = plugin_info(&plugin, true, false, "integration", false, None);
         assert_eq!(info.id, "native");
         assert_eq!(info.name, "Plugin native");
         assert!(info.enabled);
@@ -1614,8 +1821,11 @@ mod tests {
         assert_eq!(info.kind, "integration");
         assert!(!info.installed);
         assert!(info.family.is_none());
+        // No `plugin_installs` ledger row → ledger fields carry their defaults.
+        assert!(!info.pinned);
+        assert!(info.source_spec.is_none());
 
-        let info_disabled = plugin_info(&plugin, false, false, "integration", false);
+        let info_disabled = plugin_info(&plugin, false, false, "integration", false, None);
         assert!(!info_disabled.enabled);
     }
 

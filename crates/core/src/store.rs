@@ -412,7 +412,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_21_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_23_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -654,11 +654,45 @@ fn migrations() -> Migrations<'static> {
             ALTER TABLE sessions_new RENAME TO sessions;
             "#,
         ),
-        // Migration 23 — Phase 3 background rail (spec §4/§6): durable
+        // Migration 23 — Plugin install ledger. `plugin_installs` is the
+        // authoritative record of every installed skill pack / single skill
+        // (source, resolved commit, content fingerprint, pin, trust
+        // acknowledgment); the on-disk .ryuzi-skill.json stamp remains the
+        // loader's trust gate but is no longer the record of record.
+        // `plugin_attach_status` holds the last session-attach outcome per
+        // plugin for the doctor surface. Renumbered to slot 23 across merges
+        // with main (20 perm_mode, 21 native-only, 22 chat-first sessions); it
+        // is now the tail. IF NOT EXISTS: the rewind-and-replay migration tests
+        // re-run this on an already-migrated DB, so it must be a no-op on replay.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_installs (\
+                plugin_id TEXT PRIMARY KEY NOT NULL,\
+                kind TEXT NOT NULL,\
+                source_spec TEXT NOT NULL,\
+                resolved_commit TEXT,\
+                fingerprint TEXT NOT NULL,\
+                installed_at INTEGER NOT NULL,\
+                updated_at INTEGER NOT NULL,\
+                pinned INTEGER NOT NULL DEFAULT 0,\
+                pin_reason TEXT,\
+                trust_tier TEXT NOT NULL,\
+                trust_ack_at INTEGER,\
+                trust_ack_summary TEXT\
+            );\
+            CREATE TABLE IF NOT EXISTS plugin_attach_status (\
+                plugin_id TEXT PRIMARY KEY NOT NULL,\
+                last_attach_at INTEGER NOT NULL,\
+                outcome TEXT NOT NULL,\
+                reason TEXT\
+            );",
+        ),
+        // Migration 24 — Phase 3 background rail (spec §4/§6): durable
         // re-entry channel + jobs.model_override (#105 dropped jobs.agent in
-        // migration 21). One migration step (single vec element → user_version
-        // 23). Every statement is existence-guarded so the rewind-and-replay
-        // migration test's replay on an already-migrated DB is a no-op.
+        // migration 21). Appended as the tail across merges with main (23 =
+        // plugin install ledger, which adds only new tables — no session/job
+        // column interaction). Every statement is existence-guarded so the
+        // rewind-and-replay migration test's replay on an already-migrated DB
+        // is a no-op.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS background_events (\
@@ -778,6 +812,32 @@ fn to_sql_json_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -
     rusqlite::Error::ToSqlConversionFailure(err.into())
 }
 
+fn map_plugin_install_row(r: &Row) -> rusqlite::Result<PluginInstallRecord> {
+    Ok(PluginInstallRecord {
+        plugin_id: r.get(0)?,
+        kind: r.get(1)?,
+        source_spec: r.get(2)?,
+        resolved_commit: r.get(3)?,
+        fingerprint: r.get(4)?,
+        installed_at: r.get(5)?,
+        updated_at: r.get(6)?,
+        pinned: r.get::<_, i64>(7)? != 0,
+        pin_reason: r.get(8)?,
+        trust_tier: r.get(9)?,
+        trust_ack_at: r.get(10)?,
+        trust_ack_summary: r.get(11)?,
+    })
+}
+
+fn map_plugin_attach_row(r: &Row) -> rusqlite::Result<PluginAttachStatus> {
+    Ok(PluginAttachStatus {
+        plugin_id: r.get(0)?,
+        last_attach_at: r.get(1)?,
+        outcome: r.get(2)?,
+        reason: r.get(3)?,
+    })
+}
+
 fn parse_plugin_oauth_token_json(raw: &str) -> anyhow::Result<Map<String, Value>> {
     let value: Value = serde_json::from_str(raw)?;
     let object = value
@@ -886,6 +946,39 @@ pub struct PluginOauthClient {
     pub authorize_url: Option<String>,
     pub token_url: Option<String>,
     pub client_id: Option<String>,
+}
+
+/// One row of `plugin_installs`: the authoritative record of an installed
+/// skill pack or single skill. `kind` is `"plugin_pack"` or `"single_skill"`.
+/// `resolved_commit` is the git HEAD captured at install/update (`None` for
+/// backfilled rows). `fingerprint` is a content hash of the installed tree
+/// (excludes `.git` and the `.ryuzi-skill.json` stamp). `trust_tier` is
+/// `"curated"` | `"acknowledged"` (`"blocked"` reserved for the future feed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInstallRecord {
+    pub plugin_id: String,
+    pub kind: String,
+    pub source_spec: String,
+    pub resolved_commit: Option<String>,
+    pub fingerprint: String,
+    pub installed_at: i64,
+    pub updated_at: i64,
+    pub pinned: bool,
+    pub pin_reason: Option<String>,
+    pub trust_tier: String,
+    pub trust_ack_at: Option<i64>,
+    pub trust_ack_summary: Option<String>,
+}
+
+/// One row of `plugin_attach_status`: the last time a plugin's connector was
+/// attached to a session and whether it succeeded. `reason` is a secret-free
+/// message (e.g. the `ensure_auth` "configure {id}: ..." text).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAttachStatus {
+    pub plugin_id: String,
+    pub last_attach_at: i64,
+    pub outcome: String,
+    pub reason: Option<String>,
 }
 
 /// Check out a pooled connection and run `f` on its dedicated blocking
@@ -2261,6 +2354,156 @@ impl Store {
         })
         .await
     }
+
+    pub async fn upsert_plugin_install(&self, rec: &PluginInstallRecord) -> anyhow::Result<()> {
+        let rec = rec.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO plugin_installs(plugin_id, kind, source_spec, resolved_commit, \
+                     fingerprint, installed_at, updated_at, pinned, pin_reason, trust_tier, \
+                     trust_ack_at, trust_ack_summary) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                 ON CONFLICT(plugin_id) DO UPDATE SET \
+                   kind=excluded.kind, source_spec=excluded.source_spec, \
+                   resolved_commit=excluded.resolved_commit, fingerprint=excluded.fingerprint, \
+                   installed_at=excluded.installed_at, updated_at=excluded.updated_at, \
+                   pinned=excluded.pinned, pin_reason=excluded.pin_reason, \
+                   trust_tier=excluded.trust_tier, trust_ack_at=excluded.trust_ack_at, \
+                   trust_ack_summary=excluded.trust_ack_summary",
+                params![
+                    rec.plugin_id,
+                    rec.kind,
+                    rec.source_spec,
+                    rec.resolved_commit,
+                    rec.fingerprint,
+                    rec.installed_at,
+                    rec.updated_at,
+                    rec.pinned as i64,
+                    rec.pin_reason,
+                    rec.trust_tier,
+                    rec.trust_ack_at,
+                    rec.trust_ack_summary,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_plugin_install(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<PluginInstallRecord>> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT plugin_id, kind, source_spec, resolved_commit, fingerprint, \
+                     installed_at, updated_at, pinned, pin_reason, trust_tier, trust_ack_at, \
+                     trust_ack_summary FROM plugin_installs WHERE plugin_id=?1",
+                params![plugin_id],
+                map_plugin_install_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_plugin_installs(&self) -> anyhow::Result<Vec<PluginInstallRecord>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT plugin_id, kind, source_spec, resolved_commit, fingerprint, \
+                     installed_at, updated_at, pinned, pin_reason, trust_tier, trust_ack_at, \
+                     trust_ack_summary FROM plugin_installs ORDER BY plugin_id",
+            )?;
+            let rows = stmt
+                .query_map([], map_plugin_install_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn delete_plugin_install(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM plugin_installs WHERE plugin_id=?1",
+                params![plugin_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn set_plugin_install_pin(
+        &self,
+        plugin_id: &str,
+        pinned: bool,
+        reason: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let reason = reason.map(str::to_string);
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE plugin_installs SET pinned=?2, pin_reason=?3 WHERE plugin_id=?1",
+                params![plugin_id, pinned as i64, reason],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn record_plugin_attach(&self, status: &PluginAttachStatus) -> anyhow::Result<()> {
+        let status = status.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO plugin_attach_status(plugin_id, last_attach_at, outcome, reason) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(plugin_id) DO UPDATE SET \
+                   last_attach_at=excluded.last_attach_at, outcome=excluded.outcome, \
+                   reason=excluded.reason",
+                params![
+                    status.plugin_id,
+                    status.last_attach_at,
+                    status.outcome,
+                    status.reason
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_plugin_attach(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<PluginAttachStatus>> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT plugin_id, last_attach_at, outcome, reason FROM plugin_attach_status \
+                 WHERE plugin_id=?1",
+                params![plugin_id],
+                map_plugin_attach_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_plugin_attach(&self) -> anyhow::Result<Vec<PluginAttachStatus>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT plugin_id, last_attach_at, outcome, reason FROM plugin_attach_status \
+                 ORDER BY plugin_id",
+            )?;
+            let rows = stmt
+                .query_map([], map_plugin_attach_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
 }
 
 const SESSION_COLS: &str =
@@ -3209,7 +3452,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 23, "forward migration must land at v23");
+        assert_eq!(user_version, 24, "forward migration must land at v24");
     }
 
     #[tokio::test]
@@ -3350,7 +3593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_21_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_23_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then wind user_version back eleven so the
         // rewrite migration (13) AND every migration appended after it
@@ -3363,7 +3606,8 @@ mod tests {
         // branch_owned; 21 native-only cleanup — fully existence-guarded;
         // 22 sessions rebuild — nullable project_id + kind/speaker/agent/
         // parent_session_pk, copies every existing column forward including
-        // perm_mode; 23 background_events + jobs.model_override — fully
+        // perm_mode; 23 plugin_installs + plugin_attach_status — CREATE TABLE
+        // IF NOT EXISTS; 24 background_events + jobs.model_override — fully
         // existence-guarded; all no-ops on replay) re-run on the next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
@@ -3374,7 +3618,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 11)
+            c.pragma_update(None, "user_version", v - 12)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -3432,11 +3676,14 @@ mod tests {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
         // wind user_version back three, and reopen so 21 (and the tail
-        // migrations 22 + 23) replay against it.
+        // migrations 22 sessions rebuild + 23 plugin-install ledger + 24
+        // background rail) replay against it. Back FOUR: the fully migrated
+        // tail is now v24, so rewinding to v20 is what makes migration 21
+        // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 3)
+            c.pragma_update(None, "user_version", v - 4)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -3546,7 +3793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_23_adds_background_events_and_job_model_override() {
+    async fn migration_24_adds_background_events_and_job_model_override() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         let (uv, has_bg, has_override) = store
@@ -3564,7 +3811,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 23, "forward migration must land at v23");
+        assert_eq!(uv, 24, "forward migration must land at v24");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -4010,5 +4257,92 @@ mod tests {
             1
         );
         assert_eq!(store.pending_background_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_20_creates_plugin_install_tables() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let counts = store
+            .with_conn(|c| {
+                let installs: i64 =
+                    c.query_row("SELECT count(*) FROM plugin_installs", [], |r| r.get(0))?;
+                let attach: i64 =
+                    c.query_row("SELECT count(*) FROM plugin_attach_status", [], |r| {
+                        r.get(0)
+                    })?;
+                Ok((installs, attach))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn plugin_install_upsert_roundtrips_and_pins() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let rec = PluginInstallRecord {
+            plugin_id: "acme".into(),
+            kind: "plugin_pack".into(),
+            source_spec: "https://github.com/acme/pack".into(),
+            resolved_commit: Some("abc123".into()),
+            fingerprint: "fp-1".into(),
+            installed_at: 1000,
+            updated_at: 1000,
+            pinned: false,
+            pin_reason: None,
+            trust_tier: "acknowledged".into(),
+            trust_ack_at: Some(1000),
+            trust_ack_summary: Some("{\"hooks\":[]}".into()),
+        };
+        store.upsert_plugin_install(&rec).await.unwrap();
+        let got = store.get_plugin_install("acme").await.unwrap().unwrap();
+        assert_eq!(got.resolved_commit.as_deref(), Some("abc123"));
+        assert_eq!(got.trust_tier, "acknowledged");
+
+        store
+            .set_plugin_install_pin("acme", true, Some("frozen for demo"))
+            .await
+            .unwrap();
+        let pinned = store.get_plugin_install("acme").await.unwrap().unwrap();
+        assert!(pinned.pinned);
+        assert_eq!(pinned.pin_reason.as_deref(), Some("frozen for demo"));
+        // upsert preserves pin (COALESCE on pinned/pin_reason left out — upsert
+        // overwrites all columns, so the recorder must read-modify-write; assert
+        // that a re-upsert of the ORIGINAL rec would clear the pin, documenting
+        // that pin is managed only via set_plugin_install_pin).
+        assert_eq!(store.list_plugin_installs().await.unwrap().len(), 1);
+
+        store.delete_plugin_install("acme").await.unwrap();
+        assert!(store.get_plugin_install("acme").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn plugin_attach_status_records_latest() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .record_plugin_attach(&PluginAttachStatus {
+                plugin_id: "acme".into(),
+                last_attach_at: 5,
+                outcome: "failed".into(),
+                reason: Some("configure acme: missing credentials".into()),
+            })
+            .await
+            .unwrap();
+        store
+            .record_plugin_attach(&PluginAttachStatus {
+                plugin_id: "acme".into(),
+                last_attach_at: 9,
+                outcome: "ok".into(),
+                reason: None,
+            })
+            .await
+            .unwrap();
+        let got = store.get_plugin_attach("acme").await.unwrap().unwrap();
+        assert_eq!(got.outcome, "ok");
+        assert_eq!(got.last_attach_at, 9);
+        assert_eq!(store.list_plugin_attach().await.unwrap().len(), 1);
     }
 }

@@ -3,9 +3,12 @@
 //! a single plugin's full detail (`plugin_detail`), enable/disable
 //! (`set_plugin_enabled`), a validated settings write
 //! (`set_plugin_setting`), plugin OAuth sign-in, a provider's effective
-//! model list (`plugin_models`), kind-symmetric `uninstall_plugin`, and the
+//! model list (`plugin_models`), kind-symmetric `uninstall_plugin`, the
 //! install wizard (`begin_plugin_install` / `set_plugin_oauth_client_id` /
-//! `cancel_plugin_install`).
+//! `cancel_plugin_install`), and the skill/plugin distribution surface
+//! (`begin_skill_install` / `confirm_skill_install` / `update_plugin` /
+//! `update_all_plugins` / `set_plugin_pin` / `plugin_doctor` /
+//! `plugins_restart_required`).
 //!
 //! Behavior change from the pre-daemon version: `begin_plugin_oauth` and
 //! `begin_plugin_install` no longer open the system browser directly — the
@@ -24,20 +27,23 @@ use crate::engine::EngineClient;
 use crate::error::CmdError;
 use crate::events::PluginOauthCompletedMsg;
 use ryuzi_core::oauth_loopback;
+use ryuzi_core::skills_install::InstalledSkillPack;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, State};
 use tauri_specta::Event as _;
 use tokio::sync::oneshot;
 
-// `PluginFieldInfo`/`PluginMcpInfo` are only reachable transitively (as
-// fields of `PluginDetail`) but are re-exported by name anyway for a
-// complete, documented DTO surface; specta still emits them via the type
-// graph either way.
+// `PluginFieldInfo`/`PluginMcpInfo`/`TrustPromptDto` are only reachable
+// transitively (as fields of `PluginDetail`/`SkillInstallBegin`/
+// `UpdateOutcomeDto`) but are re-exported by name anyway for a complete,
+// documented DTO surface; specta still emits them via the type graph either
+// way.
 #[allow(unused_imports)]
 pub use ryuzi_core::api::types::{
-    PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo, PluginInstallBeginResult,
-    PluginMcpInfo, PluginOauthBeginResult,
+    DoctorFinding, PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo,
+    PluginInstallBeginResult, PluginMcpInfo, PluginOauthBeginResult, SkillInstallBegin,
+    TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -404,5 +410,103 @@ pub async fn cancel_plugin_install(
             "cancel_plugin_install",
             serde_json::json!({ "plugin_id": plugin_id, "state_token": state_token }),
         )
+        .await
+}
+
+// ---------- Skill/plugin distribution: trust prompt, update, pin, doctor ----------
+//
+// All thin proxies to the daemon's plugins RPC family. The daemon owns the
+// two-phase tiered trust gate, the deterministic update/pin logic, the ledger
+// writes, and the `plugins_restart_required` latch (it is the host, so it is
+// the only process whose in-memory plugin set a restart would refresh). The
+// mirror DTOs (`SkillInstallBegin`/`UpdateOutcomeDto`/`UpdateOutcomeEntry`/
+// `DoctorFinding`/`TrustPromptDto`) live in `ryuzi_core::api::types`.
+
+/// Phase 1 of the two-phase tiered trust gate: curated sources install
+/// immediately (`completed: true`); arbitrary sources stop at a
+/// `TrustPromptDto` the wizard must show before `confirm_skill_install` can
+/// proceed.
+#[tauri::command]
+#[specta::specta]
+pub async fn begin_skill_install(engine: Engine<'_>, source: String) -> R<SkillInstallBegin> {
+    engine
+        .rpc(
+            "begin_skill_install",
+            serde_json::json!({ "source": source }),
+        )
+        .await
+}
+
+/// Phase 2: complete a staged install (or update) after the user has
+/// acknowledged its `TrustPromptDto`. The token is single-use.
+#[tauri::command]
+#[specta::specta]
+pub async fn confirm_skill_install(engine: Engine<'_>, token: String) -> R<InstalledSkillPack> {
+    engine
+        .rpc(
+            "confirm_skill_install",
+            serde_json::json!({ "token": token }),
+        )
+        .await
+}
+
+/// Update one installed pack. `force` overrides the local-edits guard but
+/// never the pinned guard or the hook-script re-ack gate.
+#[tauri::command]
+#[specta::specta]
+pub async fn update_plugin(engine: Engine<'_>, id: String, force: bool) -> R<UpdateOutcomeDto> {
+    engine
+        .rpc(
+            "update_plugin",
+            serde_json::json!({ "id": id, "force": force }),
+        )
+        .await
+}
+
+/// Update every installed pack (skipping pinned ones); never fails as a whole
+/// — a single pack's error surfaces as that pack's `UpdateOutcomeDto::Failed`
+/// entry.
+#[tauri::command]
+#[specta::specta]
+pub async fn update_all_plugins(engine: Engine<'_>) -> R<Vec<UpdateOutcomeEntry>> {
+    engine
+        .rpc("update_all_plugins", serde_json::json!({}))
+        .await
+}
+
+/// Pin (or unpin) an installed pack against future updates.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_plugin_pin(
+    engine: Engine<'_>,
+    id: String,
+    pinned: bool,
+    reason: Option<String>,
+) -> R<()> {
+    engine
+        .rpc(
+            "set_plugin_pin",
+            serde_json::json!({ "id": id, "pinned": pinned, "reason": reason }),
+        )
+        .await
+}
+
+/// Read-only plugin health aggregation — see the daemon's
+/// `plugins::doctor::plugin_doctor` for the full list of checks. Never mutates
+/// state.
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_doctor(engine: Engine<'_>) -> R<Vec<DoctorFinding>> {
+    engine.rpc("plugin_doctor", serde_json::json!({})).await
+}
+
+/// Whether a plugin install/update since the daemon's last start requires a
+/// restart to take effect (in-memory flag on the daemon's `ControlPlane`,
+/// cleared only by a daemon restart).
+#[tauri::command]
+#[specta::specta]
+pub async fn plugins_restart_required(engine: Engine<'_>) -> R<bool> {
+    engine
+        .rpc("plugins_restart_required", serde_json::json!({}))
         .await
 }

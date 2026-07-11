@@ -2741,6 +2741,16 @@ async fn provision_project_explicit_settings_override_defaults() {
 }
 
 #[tokio::test]
+async fn restart_required_flag_defaults_false_and_latches_true() {
+    let (_db, path) = temp_db_path();
+    let store = Store::open(&path).await.unwrap();
+    let cp = ControlPlane::new(store, Registries::new()).await;
+    assert!(!cp.plugins_restart_required());
+    cp.mark_plugins_restart_required();
+    assert!(cp.plugins_restart_required());
+}
+
+#[tokio::test]
 async fn drain_resolves_immediately_when_nothing_is_running() {
     let (_db, path) = temp_db_path();
     let store = Store::open(&path).await.unwrap();
@@ -3204,4 +3214,46 @@ async fn control_plane_exposes_a_shared_background_registry() {
     assert_eq!(cp.background().active(), 0);
     let _r = cp.background().try_reserve(1, "s1").unwrap();
     assert_eq!(cp.background().active(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn worktree_dir_setting_overrides_the_default_worktree_root() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _db) = fake_control_plane_any_harness().await;
+
+    let custom_root = tempfile::tempdir().unwrap();
+    store
+        .set_setting("worktree_dir", custom_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+    wait_for_message(&store, &session.session_pk, |m| {
+        m.block_type == "status"
+            && m.payload["summary"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("Created and checked out branch "))
+    })
+    .await;
+
+    let wt = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .worktree_path
+        .expect("git prep backfilled the worktree path");
+    assert!(
+        std::path::Path::new(&wt).starts_with(custom_root.path()),
+        "worktree {wt} must live under the configured worktree_dir {}",
+        custom_root.path().display()
+    );
 }

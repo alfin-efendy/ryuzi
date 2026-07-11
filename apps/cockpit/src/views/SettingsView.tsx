@@ -6,10 +6,12 @@ import { toast } from "sonner";
 import { commands } from "@/bindings";
 import { ModelPicker } from "@/components/ModelPicker";
 import { PermissionsCard } from "@/components/PermissionsCard";
-import { PROJECTS_ROOT_KEY } from "@/constants";
+import { PROJECTS_ROOT_KEY, WORKTREE_DIR_KEY } from "@/constants";
 import { useAgent } from "@/store-agent";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
 import { normalizeLoopSetting } from "@/lib/loop-settings";
+import { ensurePermission } from "@/lib/notify";
+import { useUi } from "@/store-ui";
 // Canonical brand assets (assets/brand/README.md). Explicit light/dark variants:
 // the app theme is class-driven, so the prefers-color-scheme adaptive SVG can't follow it.
 import wordmarkDark from "../../../../assets/brand/wordmark-dark.svg";
@@ -308,6 +310,9 @@ export function SettingsView() {
   const transparency = useTheme((s) => s.transparency);
   const setTransparency = useTheme((s) => s.setTransparency);
 
+  const notificationsEnabled = useUi((s) => s.notificationsEnabled);
+  const toggleNotifications = useUi((s) => s.toggleNotifications);
+
   const [version, setVersion] = useState<string | null>(null);
   useEffect(() => {
     getVersion()
@@ -355,6 +360,21 @@ export function SettingsView() {
     if (res.status === "error") toast.error("Couldn't save projects folder: " + res.error.message);
   };
 
+  const [worktreeDir, setWorktreeDir] = useState("");
+  useEffect(() => {
+    void commands.getSetting(WORKTREE_DIR_KEY).then((res) => {
+      if (res.status === "ok") setWorktreeDir(res.data ?? "");
+    });
+  }, []);
+
+  const pickWorktreeDir = async () => {
+    const dir = await commands.pickDirectory();
+    if (!dir) return;
+    setWorktreeDir(dir);
+    const res = await commands.setSetting(WORKTREE_DIR_KEY, dir);
+    if (res.status === "error") toast.error("Couldn't save worktree folder: " + res.error.message);
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
       <div className="mx-auto max-w-[640px]">
@@ -397,6 +417,26 @@ export function SettingsView() {
 
         <Card className="mt-3">
           <div className="flex items-center gap-3.5 px-[18px] py-4">
+            <div className="flex-1">
+              <div className="text-[13.5px] font-semibold">Desktop notifications</div>
+              <div className="mt-0.5 text-[12.5px] text-muted-foreground">
+                Notify me when an agent finishes, needs approval, or errors while Cockpit is in the background.
+              </div>
+            </div>
+            <Switch
+              on={notificationsEnabled}
+              onToggle={() => {
+                const turningOn = !notificationsEnabled;
+                toggleNotifications();
+                if (turningOn) void ensurePermission();
+              }}
+              label="Desktop notifications"
+            />
+          </div>
+        </Card>
+
+        <Card className="mt-3">
+          <div className="flex items-center gap-3.5 px-[18px] py-4">
             <div className="min-w-0 flex-1">
               <div className="text-[13.5px] font-semibold">Projects folder</div>
               <div className="mt-0.5 truncate text-[12.5px] text-muted-foreground">
@@ -404,6 +444,20 @@ export function SettingsView() {
               </div>
             </div>
             <Button variant="outline" onClick={() => void pickProjectsRoot()}>
+              Browse
+            </Button>
+          </div>
+        </Card>
+
+        <Card className="mt-3">
+          <div className="flex items-center gap-3.5 px-[18px] py-4">
+            <div className="min-w-0 flex-1">
+              <div className="text-[13.5px] font-semibold">Worktree folder</div>
+              <div className="mt-0.5 truncate text-[12.5px] text-muted-foreground">
+                {worktreeDir || "Default location for isolated git worktrees (app data folder)."}
+              </div>
+            </div>
+            <Button variant="outline" onClick={() => void pickWorktreeDir()}>
               Browse
             </Button>
           </div>

@@ -501,6 +501,19 @@ pub struct PluginInfo {
     /// Provider family head id (providers only) — the Models `providerDetail`
     /// navigation target. `None` for other kinds.
     pub family: Option<String>,
+    /// Mirrors `crate::store::PluginInstallRecord.pinned` — `false` when the
+    /// plugin has no `plugin_installs` ledger row (never installed via the
+    /// tracked git-clone path, e.g. builtins/catalog integrations with no
+    /// skill-pack install).
+    pub pinned: bool,
+    /// The ledger row's git origin (`PluginInstallRecord.source_spec`).
+    /// Distinct from `source` (the stable builtin/catalog/skill-pack enum
+    /// label) — the Provenance card in Cockpit renders it only when present.
+    pub source_spec: Option<String>,
+    pub resolved_commit: Option<String>,
+    pub installed_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub trust_tier: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -586,6 +599,146 @@ pub struct PluginDetail {
     pub models: Vec<String>,
     pub homepage: Option<String>,
     pub publisher: String,
+}
+
+// --- Skill/plugin distribution DTOs (trust prompt, update, doctor) ---
+//
+// The DTOs below are thin camelCase mirrors of
+// `crate::skills_install`'s `TrustPrompt`/`UpdateOutcome`/`BeginInstall` and
+// `crate::plugins::doctor::DoctorFinding` — those core types derive
+// `Serialize`/`Deserialize` but not specta's `Type`, so they cannot cross the
+// Tauri IPC boundary directly (same rationale as `PluginInfo` mirroring
+// `ryuzi_plugin_sdk::PluginManifest`). None of these add or drop any field
+// relative to the core type, and `TrustPrompt` is already secret-free by
+// construction (repo path, skill names, hook-script paths, byte count — no
+// credential material).
+
+/// Mirror of `crate::skills_install::TrustPrompt`. `total_bytes` stays a
+/// `u64` (not narrowed to `u32`) to avoid silently truncating a large pack's
+/// byte count — `export_bindings`'s `BigIntExportBehavior::Number` already
+/// renders any bigint-sized field as a plain TS `number`, so there's no
+/// bindings-shape cost to keeping the wider type.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustPromptDto {
+    pub token: String,
+    pub source_spec: String,
+    pub owner_repo: String,
+    pub resolved_commit: Option<String>,
+    pub skills: Vec<String>,
+    pub hook_scripts: Vec<String>,
+    pub total_bytes: u64,
+}
+
+impl From<crate::skills_install::TrustPrompt> for TrustPromptDto {
+    fn from(p: crate::skills_install::TrustPrompt) -> Self {
+        TrustPromptDto {
+            token: p.token,
+            source_spec: p.source_spec,
+            owner_repo: p.owner_repo,
+            resolved_commit: p.resolved_commit,
+            skills: p.skills,
+            hook_scripts: p.hook_scripts,
+            total_bytes: p.total_bytes,
+        }
+    }
+}
+
+/// Mirror of `crate::skills_install::BeginInstall`, flattened into a single
+/// `{completed, trust?, plugin?}` shape the wizard can branch on without a
+/// tagged-union match in TS. `trust` is set for `NeedsConfirmation`, `plugin`
+/// for `Completed` — exactly one is ever `Some`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInstallBegin {
+    pub completed: bool,
+    pub trust: Option<TrustPromptDto>,
+    pub plugin: Option<crate::skills_install::InstalledSkillPack>,
+}
+
+impl From<crate::skills_install::BeginInstall> for SkillInstallBegin {
+    fn from(result: crate::skills_install::BeginInstall) -> Self {
+        match result {
+            crate::skills_install::BeginInstall::Completed(pack) => SkillInstallBegin {
+                completed: true,
+                trust: None,
+                plugin: Some(pack),
+            },
+            crate::skills_install::BeginInstall::NeedsConfirmation(prompt) => SkillInstallBegin {
+                completed: false,
+                trust: Some(TrustPromptDto::from(prompt)),
+                plugin: None,
+            },
+        }
+    }
+}
+
+/// Mirror of `crate::skills_install::UpdateOutcome`. Keeps the same
+/// `#[serde(tag = "kind", content = "detail")]` shape so the discriminated
+/// union round-trips identically to the core enum.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "detail")]
+pub enum UpdateOutcomeDto {
+    Updated,
+    AlreadyCurrent,
+    SkippedPinned,
+    LocalEdits,
+    Failed(String),
+    NeedsReack(TrustPromptDto),
+}
+
+impl From<crate::skills_install::UpdateOutcome> for UpdateOutcomeDto {
+    fn from(outcome: crate::skills_install::UpdateOutcome) -> Self {
+        use crate::skills_install::UpdateOutcome;
+        match outcome {
+            UpdateOutcome::Updated => UpdateOutcomeDto::Updated,
+            UpdateOutcome::AlreadyCurrent => UpdateOutcomeDto::AlreadyCurrent,
+            UpdateOutcome::SkippedPinned => UpdateOutcomeDto::SkippedPinned,
+            UpdateOutcome::LocalEdits => UpdateOutcomeDto::LocalEdits,
+            UpdateOutcome::Failed(message) => UpdateOutcomeDto::Failed(message),
+            UpdateOutcome::NeedsReack(prompt) => {
+                UpdateOutcomeDto::NeedsReack(TrustPromptDto::from(prompt))
+            }
+        }
+    }
+}
+
+/// One pack's outcome from `update_all_plugins` —
+/// `crate::skills_install::update_all_packs` returns
+/// `Vec<(String, UpdateOutcome)>`; specta can't name a bare tuple usefully in
+/// the generated TS, so this wraps it in a named struct.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateOutcomeEntry {
+    pub id: String,
+    pub outcome: UpdateOutcomeDto,
+}
+
+/// Mirror of `crate::plugins::doctor::DoctorFinding`. Already secret-free at
+/// the source (see that module's doc comment) — this DTO adds no new fields,
+/// just the specta `Type` the core struct doesn't derive.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DoctorFinding {
+    pub plugin_id: String,
+    /// `warn` | `error`.
+    pub severity: String,
+    /// `reconnect-required` | `missing-binary` | `attach-failed`.
+    pub kind: String,
+    pub message: String,
+    pub suggested_action: String,
+}
+
+impl From<crate::plugins::doctor::DoctorFinding> for DoctorFinding {
+    fn from(f: crate::plugins::doctor::DoctorFinding) -> Self {
+        DoctorFinding {
+            plugin_id: f.plugin_id,
+            severity: f.severity,
+            kind: f.kind,
+            message: f.message,
+            suggested_action: f.suggested_action,
+        }
+    }
 }
 
 #[cfg(test)]

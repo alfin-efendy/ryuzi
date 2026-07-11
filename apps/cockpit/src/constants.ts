@@ -5,6 +5,12 @@
 // (SettingsView "Projects folder"). Same storage mechanism as workdir_root.
 export const PROJECTS_ROOT_KEY = "projects_root";
 
+// Backend settings-table key: base directory git session worktrees are
+// created under (SettingsView "Worktree folder"). Same raw-setting
+// mechanism as PROJECTS_ROOT_KEY — empty/unset falls back to the engine's
+// default app-data location.
+export const WORKTREE_DIR_KEY = "worktree_dir";
+
 export type UiPermMode = "plan" | "ask" | "edit" | "full";
 
 export const PERM_MODES: { id: UiPermMode; label: string; desc: string }[] = [
