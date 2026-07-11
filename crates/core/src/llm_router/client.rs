@@ -1015,7 +1015,7 @@ fn inject_claude_system_prompt(body: &mut Value) {
 }
 
 fn claude_cloak_map_for(target: &RouteTarget, body: &Value) -> claude_cloak::ToolNameMap {
-    claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body)
+    claude_cloak::tool_name_map_for(&target.conn.provider, body)
 }
 
 /// Remove the `thinking` key before a request reaches an Anthropic-native
@@ -1286,7 +1286,7 @@ fn oauth_upstream_request(
             let mut anthropic_body = body.clone();
             inject_claude_system_prompt(&mut anthropic_body);
             let session_id = uuid::Uuid::new_v4().to_string();
-            let cloaked = claude_cloak::enabled(&target.conn.data);
+            let cloaked = claude_cloak::required_for_provider(&target.conn.provider);
             if cloaked {
                 claude_cloak::apply_request_cloak(&mut anthropic_body, &access_token, &session_id);
             }
@@ -4079,12 +4079,16 @@ mod tests {
             "2023-06-01"
         );
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
-        assert_eq!(sent["system"][0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
-        assert_eq!(sent["system"][1]["text"], "be helpful");
+        assert!(sent["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.92."));
+        assert_eq!(sent["system"][1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(sent["system"][2]["text"], "be helpful");
     }
 
     #[tokio::test]
-    async fn oauth_request_for_anthropic_applies_full_cloak_when_enabled() {
+    async fn anthropic_oauth_without_config_cloaks_request_and_headers() {
         let ctx = test_ctx().await;
         let desc = registry::descriptor("anthropic-oauth").unwrap();
         let conn = mk_conn(
@@ -4093,7 +4097,6 @@ mod tests {
             "oauth",
             ConnectionData {
                 access_token: Some("sk-ant-oat-test".into()),
-                provider_specific: Some(json!({"claudeCloaking": true})),
                 ..Default::default()
             },
         );

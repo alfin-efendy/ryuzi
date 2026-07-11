@@ -1119,23 +1119,50 @@ async fn oauth_anthropic_upstream_receives_bearer_beta_header_and_system_prompt(
     assert!(beta.contains("claude-code-20250219"));
     assert!(beta.contains("oauth-2025-04-20"));
     assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+    assert!(body["system"][0]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("x-anthropic-billing-header: cc_version=2.1.92."));
     assert_eq!(
-        body["system"][0]["text"],
+        body["system"][1]["text"],
         "You are Claude Code, Anthropic's official CLI for Claude."
     );
-    assert_eq!(body["system"][1]["text"], "be terse");
+    assert_eq!(body["system"][2]["text"], "be terse");
 
     srv.stop().await;
 }
 
 #[tokio::test]
-async fn oauth_anthropic_cloaking_decloaks_tool_names_for_openai_clients() {
+async fn anthropic_oauth_streaming_and_json_responses_decloak_tools() {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::{IntoResponse, Response};
     use axum::{routing::post, Json, Router};
 
     let app = Router::new().route(
         "/v1/messages",
         post(|Json(body): Json<serde_json::Value>| async move {
             assert_eq!(body["tools"][0]["name"], "lookup_ide");
+            if body["stream"].as_bool().unwrap_or(false) {
+                let sse = concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tool_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"mock-claude\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                    "event: content_block_start\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_stream\",\"name\":\"lookup_ide\",\"input\":{}}}\n\n",
+                    "event: content_block_stop\n",
+                    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                    "event: message_delta\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                );
+                return Response::builder()
+                    .status(200)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+                    .into_response();
+            }
             Json(json!({
                 "id": "msg_tool", "type": "message", "role": "assistant",
                 "model": "mock-claude",
@@ -1143,6 +1170,7 @@ async fn oauth_anthropic_cloaking_decloaks_tool_names_for_openai_clients() {
                 "stop_reason": "tool_use",
                 "usage": {"input_tokens": 3, "output_tokens": 2}
             }))
+            .into_response()
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1168,7 +1196,6 @@ async fn oauth_anthropic_cloaking_decloaks_tool_names_for_openai_clients() {
                 last_refresh_at: Some(now),
                 base_url_override: Some(format!("http://127.0.0.1:{up_port}/v1")),
                 models_override: Some(vec!["mock-claude".into()]),
-                provider_specific: Some(json!({"claudeCloaking": true})),
                 ..Default::default()
             },
             created_at: now,
@@ -1200,6 +1227,23 @@ async fn oauth_anthropic_cloaking_decloaks_tool_names_for_openai_clients() {
         response_body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
         "lookup"
     );
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .header("x-api-key", &key.key)
+        .json(&json!({"model": "anthropic/mock-claude", "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {
+            "name": "lookup", "description": "Lookup data",
+            "parameters": {"type": "object"}
+        }}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let stream_body = resp.text().await.unwrap();
+    assert!(stream_body.contains("lookup"), "body: {stream_body}");
+    assert!(!stream_body.contains("lookup_ide"), "body: {stream_body}");
 
     srv.stop().await;
 }

@@ -842,7 +842,7 @@ async fn send_json(
     target: &mut RouteTarget,
     body: &Value,
 ) -> Result<Value, AttemptError> {
-    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, body);
     let resp = send_upstream(&state.ctx(), target, body)
         .await
         .map_err(|e| {
@@ -892,7 +892,7 @@ async fn proxy_passthrough(
     target: &mut RouteTarget,
     body: &Value,
 ) -> Result<Response, AttemptError> {
-    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, body);
     let resp = connect_upstream(state, target, body).await?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ct = resp
@@ -1132,8 +1132,7 @@ async fn stream_anthropic_upstream_to_openai(
     upstream_body: &Value,
     ctx: RecordCtx,
 ) -> Result<Response, AttemptError> {
-    let tool_map =
-        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, upstream_body);
     let resp = connect_upstream(state, target, upstream_body).await?;
     Ok(sse_response(spawn_anthropic_to_openai_pump(
         resp,
@@ -1154,8 +1153,7 @@ async fn stream_responses(
 ) -> Result<Response, AttemptError> {
     let resp = connect_upstream(state, target, upstream_body).await?;
     let anthropic_upstream = matches!(target.desc.format, ApiFormat::Anthropic);
-    let tool_map =
-        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, upstream_body);
     let store = state.store.clone();
     let ctx = RecordCtx {
         conn_id: target.conn.id.clone(),

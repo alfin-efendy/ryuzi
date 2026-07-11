@@ -896,15 +896,19 @@ mod tests {
             crate::llm_router::models::ANTHROPIC_OAUTH_BETA
         );
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(sent["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.92."));
         assert_eq!(
-            sent["system"][0]["text"],
+            sent["system"][1]["text"],
             crate::llm_router::models::CLAUDE_CODE_SYSTEM_PROMPT
         );
         assert_eq!(sent["max_tokens"], 1);
     }
 
     #[tokio::test]
-    async fn anthropic_oauth_probe_applies_cloak_when_enabled() {
+    async fn anthropic_oauth_model_probe_uses_required_cloak() {
         let ctx = test_ctx().await;
         let desc = registry::descriptor("anthropic-oauth").unwrap();
         let target = RouteTarget {
@@ -914,7 +918,6 @@ mod tests {
                 "oauth",
                 ConnectionData {
                     access_token: Some("sk-ant-oat-test".into()),
-                    provider_specific: Some(json!({"claudeCloaking": true})),
                     ..Default::default()
                 },
             ),
