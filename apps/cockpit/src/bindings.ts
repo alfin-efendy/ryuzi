@@ -1608,7 +1608,26 @@ export type PluginFieldInfo = { key: string; label: string; help: string; secret
 /**
  * A persisted (non-empty) row exists for `key`. Never the value itself.
  */
-valueSet: boolean }
+valueSet: boolean; 
+/**
+ * `string` | `int` | `bool` — the value shape Cockpit renders (see
+ * `ryuzi_plugin_sdk::FieldKind`). A plain camelCase-friendly `String`
+ * mirror rather than the SDK enum itself, matching this module's
+ * existing convention (`auth_kind_label`/`mcp_transport_label`) of
+ * never crossing specta's `Type` boundary with an SDK type directly.
+ */
+kind: string; 
+/**
+ * Non-empty makes this field an enum/choice — the value must be one of
+ * these members (see `ryuzi_plugin_sdk::SettingField::options`).
+ */
+options: string[]; 
+/**
+ * Pre-filled/effective value to show when `value_set` is `false`. Safe
+ * to return even for a `secret` field: it comes from the manifest, not
+ * a persisted credential.
+ */
+default: string | null }
 export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[]; verified: boolean; experimental: boolean; enabled: boolean; 
 /**
  * Same semantics as `PluginAuthInfo.configured` (oauth: token stored &&

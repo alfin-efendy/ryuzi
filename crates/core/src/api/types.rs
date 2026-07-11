@@ -600,6 +600,19 @@ pub struct PluginFieldInfo {
     pub required: bool,
     /// A persisted (non-empty) row exists for `key`. Never the value itself.
     pub value_set: bool,
+    /// `string` | `int` | `bool` — the value shape Cockpit renders (see
+    /// `ryuzi_plugin_sdk::FieldKind`). A plain camelCase-friendly `String`
+    /// mirror rather than the SDK enum itself, matching this module's
+    /// existing convention (`auth_kind_label`/`mcp_transport_label`) of
+    /// never crossing specta's `Type` boundary with an SDK type directly.
+    pub kind: String,
+    /// Non-empty makes this field an enum/choice — the value must be one of
+    /// these members (see `ryuzi_plugin_sdk::SettingField::options`).
+    pub options: Vec<String>,
+    /// Pre-filled/effective value to show when `value_set` is `false`. Safe
+    /// to return even for a `secret` field: it comes from the manifest, not
+    /// a persisted credential.
+    pub default: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]

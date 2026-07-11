@@ -86,6 +86,9 @@ const ollamaDetail: PluginDetail = {
       secret: false,
       required: false,
       valueSet: false,
+      kind: "string",
+      options: [],
+      default: null,
     },
   ],
   mcp: [],
@@ -213,6 +216,78 @@ const oauthDetail: PluginDetail = {
   publisher: "Acme",
 };
 
+// A plugin exercising every `SettingField.kind` shape (Feature C3):
+// `verbose` is a Bool (renders a Switch), `tier` is an enum (`options`
+// non-empty, renders a Combobox), `retries` is a plain Int (renders a
+// numeric Input).
+const richFieldsDetail: PluginDetail = {
+  info: {
+    id: "acme-rich",
+    name: "Acme Rich",
+    description: "Exercises every settings field kind.",
+    icon: "sparkles",
+    categories: [],
+    verified: false,
+    experimental: false,
+    enabled: true,
+    source: "catalog",
+    capabilities: [],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
+  },
+  auth: null,
+  settings: [
+    {
+      key: "plugin.acme-rich.verbose",
+      label: "Verbose logging",
+      help: "Log extra diagnostic detail.",
+      secret: false,
+      required: false,
+      valueSet: false,
+      kind: "bool",
+      options: [],
+      default: null,
+    },
+    {
+      key: "plugin.acme-rich.tier",
+      label: "Tier",
+      help: "Pricing tier to target.",
+      secret: false,
+      required: false,
+      valueSet: false,
+      kind: "string",
+      options: ["free", "pro", "enterprise"],
+      default: "free",
+    },
+    {
+      key: "plugin.acme-rich.retries",
+      label: "Retries",
+      help: "",
+      secret: false,
+      required: false,
+      valueSet: false,
+      kind: "int",
+      options: [],
+      default: null,
+    },
+  ],
+  mcp: [],
+  models: [],
+  homepage: null,
+  publisher: "Acme",
+};
+
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 const err = (message: string) => Promise.resolve({ status: "error" as const, error: { message } });
 
@@ -226,6 +301,7 @@ const pluginDetail = mock((id: string) => {
   if (id === "github") return ok(githubDetail);
   if (id === "ollama") return ok(ollamaDetail);
   if (id === "acme-oauth") return ok(oauthDetail);
+  if (id === "acme-rich") return ok(richFieldsDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
   if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
   return err("unknown plugin");
@@ -384,6 +460,48 @@ test("oauth plugins start Cockpit sign-in through beginPluginOauth", async () =>
 
   fireEvent.click(screen.getByRole("button", { name: "Connect" }));
   await waitFor(() => expect(beginPluginOauth).toHaveBeenCalledWith("acme-oauth"));
+});
+
+// ---------- Settings field render-by-kind (Feature C3) ----------
+
+test("a Bool settings field renders as a Switch and saves immediately on toggle", async () => {
+  render(<PluginDetailView id="acme-rich" />);
+  await screen.findByText("Acme Rich");
+
+  const sw = screen.getByRole("switch", { name: "Verbose logging" });
+  expect(sw.getAttribute("aria-checked")).toBe("false");
+
+  fireEvent.click(sw);
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith("plugin.acme-rich.verbose", "true"));
+  // pluginDetail() never re-persists a value back, so the toggle stays a
+  // pending client-side flip rather than reflecting a re-fetched "true" —
+  // still, the reload must have happened (mount + post-save reload).
+  await waitFor(() => expect(pluginDetail).toHaveBeenCalledTimes(2));
+});
+
+test("an enum settings field (non-empty options) renders as a Combobox and saves the picked option", async () => {
+  render(<PluginDetailView id="acme-rich" />);
+  await screen.findByText("Acme Rich");
+
+  const combo = screen.getByRole("combobox", { name: "Tier" });
+  // Shows the manifest-declared default as an affordance when unset.
+  expect(combo.textContent).toContain("Default: free");
+
+  fireEvent.click(combo);
+  fireEvent.click(await screen.findByRole("option", { name: "pro" }));
+
+  const save = screen.getAllByRole("button", { name: "Save" })[0] as HTMLButtonElement;
+  expect(save.disabled).toBe(false);
+  fireEvent.click(save);
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith("plugin.acme-rich.tier", "pro"));
+});
+
+test("a plain Int settings field renders as a numeric Input", async () => {
+  render(<PluginDetailView id="acme-rich" />);
+  await screen.findByText("Acme Rich");
+
+  const retries = screen.getByPlaceholderText("Optional — not set") as HTMLInputElement;
+  expect(retries.type).toBe("number");
 });
 
 test("lists MCP servers with their transport and endpoint", async () => {

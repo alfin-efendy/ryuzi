@@ -27,6 +27,8 @@ fn fields_to_sdk(fields: &[ConfigField]) -> Vec<SettingField> {
                 FieldType::Int => FieldKind::Int,
                 FieldType::String | FieldType::Enum => FieldKind::String,
             },
+            options: f.one_of.iter().map(|s| s.to_string()).collect(),
+            default: f.default.map(str::to_string),
         })
         .collect()
 }

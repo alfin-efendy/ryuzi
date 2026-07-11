@@ -46,8 +46,15 @@ pub fn validate_setting(key: &str, value: &str) -> Option<String> {
     }
 }
 
-/// Validate a value against a plugin-declared [`SettingField`]'s `kind`.
+/// Validate a value against a plugin-declared [`SettingField`]'s `kind` and,
+/// when the field is an enum (`options` non-empty), against its members.
 fn validate_plugin_field(key: &str, value: &str, field: &SettingField) -> Option<String> {
+    if !field.options.is_empty() && !field.options.iter().any(|o| o == value) {
+        return Some(format!(
+            "{key} must be one of: {}",
+            field.options.join(", ")
+        ));
+    }
     match field.kind {
         FieldKind::Bool if value != "true" && value != "false" => {
             Some(format!("{key} must be true or false"))
@@ -113,24 +120,58 @@ impl SettingsStore {
     /// Keys of required fields with no persisted value, in a stable order:
     /// required globals first (declaration order), then required fields of
     /// each enabled gateway (declaration order) — the order the wizard
-    /// prompts in.
-    pub async fn missing_required(&self) -> anyhow::Result<Vec<&'static str>> {
+    /// prompts in — then required plugin-declared `manifest.settings[]`
+    /// fields of every *enabled* plugin (sorted, since the backing registry
+    /// is a `HashMap`).
+    ///
+    /// Plugin fields return owned `String`s (unlike the `&'static str` global
+    /// and gateway keys) because they come from a runtime manifest, not a
+    /// compile-time schema.
+    pub async fn missing_required(&self) -> anyhow::Result<Vec<String>> {
         use crate::settings::catalog::CATALOG;
         use crate::settings::fields::GLOBAL_FIELDS;
 
         let mut out = Vec::new();
         for f in GLOBAL_FIELDS {
             if f.required && self.get(f.key).await?.is_none() {
-                out.push(f.key);
+                out.push(f.key.to_string());
             }
         }
         for id in csv(self.get("enabled_gateways").await?.as_deref()) {
             if let Some(gw) = CATALOG.gateway(&id) {
                 for f in gw.fields {
                     if f.required && self.get(f.key).await?.is_none() {
-                        out.push(f.key);
+                        out.push(f.key.to_string());
                     }
                 }
+            }
+        }
+        // Gated on the raw `plugin.<id>.enabled` setting — the same key
+        // `PluginHost::is_enabled`'s connector-only branch reads (mirrored
+        // rather than called: this facade never holds a
+        // `PluginHost`/`Registries` handle), so a disabled connector
+        // plugin's required fields don't block onboarding/`is_configured()`
+        // forever. This key is never set for gateway-capable plugins (their
+        // `is_enabled` reads `enabled_gateways` instead), so their fields —
+        // already covered by the gateway loop above — are correctly skipped
+        // here rather than double-counted. Harness-capable and manifest-only
+        // plugins (always-enabled regardless of this key) declare no
+        // required custom settings fields today; if one ever does, it would
+        // need `plugin.<id>.enabled=true` set explicitly for this loop to
+        // see it as enabled — a known simplification.
+        let mut plugin_required: Vec<(String, String)> = crate::plugins::plugin_fields_all()
+            .into_iter()
+            .filter(|(_, f)| f.required)
+            .map(|(plugin_id, f)| (plugin_id, f.key))
+            .collect();
+        plugin_required.sort();
+        for (plugin_id, key) in plugin_required {
+            let enabled_key = format!("plugin.{plugin_id}.enabled");
+            if self.get(&enabled_key).await?.as_deref() != Some("true") {
+                continue;
+            }
+            if self.get(&key).await?.is_none() {
+                out.push(key);
             }
         }
         Ok(out)
@@ -210,6 +251,8 @@ mod tests {
                 secret: false,
                 required: false,
                 kind: FieldKind::String,
+                options: Vec::new(),
+                default: None,
             }],
             mcp: vec![],
             skills: vec![],
@@ -266,6 +309,104 @@ mod tests {
             validate_setting("plugin.totally-unregistered-plugin.enabled", "true").as_deref(),
             Some("unknown setting: plugin.totally-unregistered-plugin.enabled")
         );
+    }
+
+    /// Register a plugin with one enum settings field (`options` non-empty)
+    /// — the `required` flag is parameterized so the same helper backs both
+    /// the enum-rejection test and the required-plugin-field enforcement
+    /// test.
+    fn register_enum_plugin(id: &str, required: bool) {
+        use crate::plugins::{CorePlugin, PluginHost, PluginSource};
+        use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
+
+        let manifest = PluginManifest {
+            contract: 1,
+            id: id.to_string(),
+            name: format!("Test Enum Plugin {id}"),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![SettingField {
+                key: format!("plugin.{id}.tier"),
+                label: "Tier".to_string(),
+                help: String::new(),
+                secret: false,
+                required,
+                kind: FieldKind::String,
+                options: vec!["free".to_string(), "pro".to_string()],
+                default: None,
+            }],
+            mcp: vec![],
+            skills: vec![],
+            provider: None,
+        };
+        let mut host = PluginHost::new();
+        host.add(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            source: PluginSource::Builtin,
+        });
+    }
+
+    #[test]
+    fn validate_setting_rejects_a_value_outside_a_registered_plugin_enum_options() {
+        let id = "task-c3-storetest-enum-plugin";
+        register_enum_plugin(id, false);
+
+        assert_eq!(validate_setting(&format!("plugin.{id}.tier"), "free"), None);
+        assert_eq!(validate_setting(&format!("plugin.{id}.tier"), "pro"), None);
+        assert_eq!(
+            validate_setting(&format!("plugin.{id}.tier"), "ultra").as_deref(),
+            Some(format!("plugin.{id}.tier must be one of: free, pro").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_required_includes_a_required_plugin_field_only_once_the_plugin_is_enabled() {
+        let id = "task-c3-storetest-required-plugin";
+        register_enum_plugin(id, true);
+        let key = format!("plugin.{id}.tier");
+
+        let (store, _tmp) = open_test_store().await;
+        let settings = SettingsStore::new(std::sync::Arc::new(store));
+
+        // Disabled by default: the required field must not block onboarding
+        // even though it's unset.
+        assert!(!settings
+            .missing_required()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k == &key));
+
+        // Enabling the plugin surfaces its unset required field as missing.
+        settings
+            .set(&format!("plugin.{id}.enabled"), "true")
+            .await
+            .unwrap();
+        assert!(settings
+            .missing_required()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k == &key));
+
+        // Setting a valid member value clears it.
+        settings.set(&key, "free").await.unwrap();
+        assert!(!settings
+            .missing_required()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k == &key));
     }
 
     #[test]
@@ -330,7 +471,8 @@ mod tests {
             .missing_required()
             .await
             .unwrap()
-            .contains(&"workdir_root"));
+            .iter()
+            .any(|k| k == "workdir_root"));
         assert!(!settings.is_configured().await.unwrap());
         for (k, v) in [
             ("discord.token", "t"),

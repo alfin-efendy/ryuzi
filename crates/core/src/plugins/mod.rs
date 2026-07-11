@@ -33,7 +33,7 @@ use crate::settings::{csv, SettingsStore};
 use crate::store::Store;
 
 pub use doctor::{plugin_doctor, DoctorFinding};
-pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
+pub use host::{plugin_field, plugin_fields_all, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) — to `regs`. Factored out of

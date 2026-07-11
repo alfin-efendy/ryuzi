@@ -94,6 +94,18 @@ pub struct SettingField {
     pub required: bool,
     #[serde(default)]
     pub kind: FieldKind,
+    /// When non-empty, this field is an enum/choice: the persisted value
+    /// must be one of these members (enforced by
+    /// `ryuzi_core::settings::store::validate_plugin_field`). Expressed as
+    /// `kind = "string"` + non-empty `options` — `validate()` rejects any
+    /// other `kind` paired with non-empty `options`.
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Pre-filled/effective value to show when no row is persisted yet. When
+    /// `options` is non-empty, `default` (if set) must be one of its
+    /// members.
+    #[serde(default)]
+    pub default: Option<String>,
 }
 
 /// The value shape a `SettingField` renders and stores. Defaults to
@@ -177,6 +189,12 @@ pub enum ManifestError {
     MissingUrl(String),
     #[error("mcp server \"{0}\" references ${{auth}} but the manifest has no [auth] block")]
     AuthPlaceholderWithoutAuth(String),
+    #[error("duplicate settings field key: {0}")]
+    DuplicateSettingKey(String),
+    #[error("settings field \"{0}\" declares non-empty `options` but `kind` is not `string`")]
+    SettingOptionsRequireStringKind(String),
+    #[error("settings field \"{0}\"'s `default` is not a member of its `options`")]
+    SettingDefaultNotInOptions(String),
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -221,6 +239,25 @@ impl PluginManifest {
         }
         if self.name.is_empty() {
             return Err(ManifestError::EmptyName);
+        }
+
+        let mut seen_setting_keys: HashSet<&str> = HashSet::new();
+        for field in &self.settings {
+            if !seen_setting_keys.insert(field.key.as_str()) {
+                return Err(ManifestError::DuplicateSettingKey(field.key.clone()));
+            }
+            if !field.options.is_empty() {
+                if field.kind != FieldKind::String {
+                    return Err(ManifestError::SettingOptionsRequireStringKind(
+                        field.key.clone(),
+                    ));
+                }
+                if let Some(default) = &field.default {
+                    if !field.options.iter().any(|o| o == default) {
+                        return Err(ManifestError::SettingDefaultNotInOptions(field.key.clone()));
+                    }
+                }
+            }
         }
 
         let mut seen_mcp_names: HashSet<&str> = HashSet::new();
@@ -333,6 +370,8 @@ path = "skills/github-triage"
         assert!(!setting.required);
         assert!(!setting.secret);
         assert_eq!(setting.kind, FieldKind::String);
+        assert!(setting.options.is_empty());
+        assert_eq!(setting.default, None);
 
         assert_eq!(manifest.mcp.len(), 1);
         let mcp = &manifest.mcp[0];
@@ -631,5 +670,89 @@ transport = "http"
         let toml_str = minimal_manifest(r#"categories = ["vcs", "issues"]"#);
         let manifest = PluginManifest::from_toml(&toml_str).expect("known categories should parse");
         assert!(manifest.warnings().is_empty());
+    }
+
+    // ---------- SettingField: options/default (Feature C3) ----------
+
+    #[test]
+    fn settings_field_with_valid_enum_options_and_default_parses() {
+        let toml_str = minimal_manifest(
+            r#"
+[[settings]]
+key = "plugin.acme.tier"
+label = "Tier"
+kind = "string"
+options = ["free", "pro", "enterprise"]
+default = "free"
+"#,
+        );
+        let manifest =
+            PluginManifest::from_toml(&toml_str).expect("valid enum settings field should parse");
+        let field = &manifest.settings[0];
+        assert_eq!(field.kind, FieldKind::String);
+        assert_eq!(
+            field.options,
+            vec![
+                "free".to_string(),
+                "pro".to_string(),
+                "enterprise".to_string()
+            ]
+        );
+        assert_eq!(field.default.as_deref(), Some("free"));
+    }
+
+    #[test]
+    fn rejects_duplicate_setting_keys() {
+        let toml_str = minimal_manifest(
+            r#"
+[[settings]]
+key = "plugin.acme.dup"
+label = "Dup One"
+
+[[settings]]
+key = "plugin.acme.dup"
+label = "Dup Two"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("duplicate settings field keys should fail validation");
+        assert!(matches!(err, ManifestError::DuplicateSettingKey(key) if key == "plugin.acme.dup"));
+    }
+
+    #[test]
+    fn rejects_default_not_a_member_of_options() {
+        let toml_str = minimal_manifest(
+            r#"
+[[settings]]
+key = "plugin.acme.tier"
+label = "Tier"
+kind = "string"
+options = ["free", "pro"]
+default = "enterprise"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("default outside options should fail validation");
+        assert!(
+            matches!(err, ManifestError::SettingDefaultNotInOptions(key) if key == "plugin.acme.tier")
+        );
+    }
+
+    #[test]
+    fn rejects_options_paired_with_non_string_kind() {
+        let toml_str = minimal_manifest(
+            r#"
+[[settings]]
+key = "plugin.acme.retries"
+label = "Retries"
+kind = "int"
+options = ["1", "2", "3"]
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("options with a non-string kind should fail validation");
+        assert!(
+            matches!(err, ManifestError::SettingOptionsRequireStringKind(key) if key == "plugin.acme.retries")
+        );
     }
 }

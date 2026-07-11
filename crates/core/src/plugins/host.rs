@@ -46,9 +46,9 @@ use crate::settings::{csv, SettingsStore};
 /// `Registries` handle. Registration is add-only and idempotent — the same
 /// key registered twice (e.g. across two `PluginHost`s in different tests)
 /// simply overwrites; tests that care about isolation use unique plugin ids.
-static PLUGIN_FIELDS: OnceLock<RwLock<HashMap<String, SettingField>>> = OnceLock::new();
+static PLUGIN_FIELDS: OnceLock<RwLock<HashMap<String, (String, SettingField)>>> = OnceLock::new();
 
-fn plugin_fields() -> &'static RwLock<HashMap<String, SettingField>> {
+fn plugin_fields() -> &'static RwLock<HashMap<String, (String, SettingField)>> {
     PLUGIN_FIELDS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -59,7 +59,23 @@ pub fn plugin_field(key: &str) -> Option<SettingField> {
         .read()
         .expect("PLUGIN_FIELDS lock poisoned")
         .get(key)
+        .map(|(_, field)| field.clone())
+}
+
+/// Every `plugin.*` settings field registered by an installed plugin,
+/// paired with the id of the plugin that declared it. Used by
+/// `crate::settings::store::SettingsStore::missing_required` to fold
+/// plugin-declared `required` fields into the same required-field
+/// aggregation used for global/gateway fields, gated on the owning plugin
+/// actually being enabled (a disabled plugin's required fields must not
+/// block onboarding).
+pub fn plugin_fields_all() -> Vec<(String, SettingField)> {
+    plugin_fields()
+        .read()
+        .expect("PLUGIN_FIELDS lock poisoned")
+        .values()
         .cloned()
+        .collect()
 }
 
 /// Register every `plugin.*` settings key `manifest` declares:
@@ -76,34 +92,44 @@ fn register_plugin_fields(manifest: &PluginManifest) {
         .write()
         .expect("PLUGIN_FIELDS lock poisoned");
     for f in &manifest.settings {
-        fields.insert(f.key.clone(), f.clone());
+        fields.insert(f.key.clone(), (manifest.id.clone(), f.clone()));
     }
     if let Some(auth) = &manifest.auth {
         if let Some(key) = &auth.setting {
             fields.insert(
                 key.clone(),
-                SettingField {
-                    key: key.clone(),
-                    label: format!("{} auth", manifest.name),
-                    help: String::new(),
-                    secret: true,
-                    required: false,
-                    kind: FieldKind::String,
-                },
+                (
+                    manifest.id.clone(),
+                    SettingField {
+                        key: key.clone(),
+                        label: format!("{} auth", manifest.name),
+                        help: String::new(),
+                        secret: true,
+                        required: false,
+                        kind: FieldKind::String,
+                        options: Vec::new(),
+                        default: None,
+                    },
+                ),
             );
         }
     }
     let enabled_key = format!("plugin.{}.enabled", manifest.id);
     fields.insert(
         enabled_key.clone(),
-        SettingField {
-            key: enabled_key,
-            label: format!("Enable {}", manifest.name),
-            help: String::new(),
-            secret: false,
-            required: false,
-            kind: FieldKind::Bool,
-        },
+        (
+            manifest.id.clone(),
+            SettingField {
+                key: enabled_key,
+                label: format!("Enable {}", manifest.name),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::Bool,
+                options: Vec::new(),
+                default: None,
+            },
+        ),
     );
 }
 

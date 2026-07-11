@@ -41,7 +41,9 @@ use crate::serve::ApiState;
 use crate::settings::SettingsStore;
 use crate::store::{PluginOauthClient, RemoteCatalogRow, Store};
 use reqwest::Url;
-use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, SettingField};
+use ryuzi_plugin_sdk::{
+    AuthKind, AuthSpec, FieldKind, McpServerDef, McpTransportDef, SettingField,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -450,6 +452,16 @@ fn auth_kind_label(kind: AuthKind) -> &'static str {
         AuthKind::ApiKey => "api-key",
         AuthKind::Token => "token",
         AuthKind::Oauth => "oauth",
+    }
+}
+
+/// `ryuzi_plugin_sdk::FieldKind` -> the camelCase-friendly label
+/// `PluginFieldInfo.kind` carries across the Tauri IPC boundary.
+fn field_kind_label(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::String => "string",
+        FieldKind::Int => "int",
+        FieldKind::Bool => "bool",
     }
 }
 
@@ -933,6 +945,9 @@ async fn build_settings_info(
             secret: f.secret,
             required: f.required,
             value_set: field_value_set(persisted.as_deref()),
+            kind: field_kind_label(f.kind).to_string(),
+            options: f.options.clone(),
+            default: f.default.clone(),
         });
     }
     Ok(out)
@@ -1964,6 +1979,68 @@ mod tests {
         assert_eq!(auth_kind_label(AuthKind::ApiKey), "api-key");
         assert_eq!(auth_kind_label(AuthKind::Token), "token");
         assert_eq!(auth_kind_label(AuthKind::Oauth), "oauth");
+    }
+
+    #[test]
+    fn field_kind_label_maps_every_variant() {
+        assert_eq!(field_kind_label(FieldKind::String), "string");
+        assert_eq!(field_kind_label(FieldKind::Int), "int");
+        assert_eq!(field_kind_label(FieldKind::Bool), "bool");
+    }
+
+    // ---------- build_settings_info (Feature C3: kind/options/default) ----------
+
+    #[tokio::test]
+    async fn build_settings_info_carries_kind_options_and_default() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let fields = vec![
+            SettingField {
+                key: "plugin.acme.tier".to_string(),
+                label: "Tier".to_string(),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::String,
+                options: vec!["free".to_string(), "pro".to_string()],
+                default: Some("free".to_string()),
+            },
+            SettingField {
+                key: "plugin.acme.retries".to_string(),
+                label: "Retries".to_string(),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::Int,
+                options: vec![],
+                default: Some("3".to_string()),
+            },
+            SettingField {
+                key: "plugin.acme.verbose".to_string(),
+                label: "Verbose".to_string(),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::Bool,
+                options: vec![],
+                default: None,
+            },
+        ];
+
+        let out = build_settings_info(&store, &fields).await.unwrap();
+        assert_eq!(out.len(), 3);
+
+        assert_eq!(out[0].kind, "string");
+        assert_eq!(out[0].options, vec!["free".to_string(), "pro".to_string()]);
+        assert_eq!(out[0].default.as_deref(), Some("free"));
+
+        assert_eq!(out[1].kind, "int");
+        assert!(out[1].options.is_empty());
+        assert_eq!(out[1].default.as_deref(), Some("3"));
+
+        assert_eq!(out[2].kind, "bool");
+        assert!(out[2].options.is_empty());
+        assert_eq!(out[2].default, None);
     }
 
     #[test]
