@@ -3138,3 +3138,45 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
         .unwrap();
     assert_eq!(stored.status, SessionStatus::Ended);
 }
+
+#[tokio::test]
+#[serial]
+async fn worktree_dir_setting_overrides_the_default_worktree_root() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _db) = fake_control_plane_any_harness().await;
+
+    let custom_root = tempfile::tempdir().unwrap();
+    store
+        .set_setting("worktree_dir", custom_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+    wait_for_message(&store, &session.session_pk, |m| {
+        m.block_type == "status"
+            && m.payload["summary"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("Created and checked out branch "))
+    })
+    .await;
+
+    let wt = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .worktree_path
+        .expect("git prep backfilled the worktree path");
+    assert!(
+        std::path::Path::new(&wt).starts_with(custom_root.path()),
+        "worktree {wt} must live under the configured worktree_dir {}",
+        custom_root.path().display()
+    );
+}
