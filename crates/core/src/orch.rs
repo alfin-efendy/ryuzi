@@ -716,6 +716,36 @@ fn emit_changed(cp: &Arc<ControlPlane>, task_id: &str, root_id: Option<String>, 
     });
 }
 
+/// What a typed home-chat message did to a live orchestration (spec §8:
+/// steer-the-orchestrator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    NoOrchestration,
+    Noted,
+    Cancelled,
+}
+
+/// Route a message typed into a home chat while an orchestration is running:
+/// a cancel directive cancels the tree; anything else is recorded as guidance
+/// the judge will see. Returns `NoOrchestration` when no live root is bound.
+pub async fn note_steer(
+    cp: &Arc<ControlPlane>,
+    home_session_pk: &str,
+    text: &str,
+) -> anyhow::Result<SteerOutcome> {
+    let Some(root) = cp.store().live_root_for_home(home_session_pk).await? else {
+        return Ok(SteerOutcome::NoOrchestration);
+    };
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("cancel") || t.eq_ignore_ascii_case("/cancel") {
+        cancel_tree(cp.store(), &root.id).await?;
+        emit_changed(cp, &root.id, None, "cancelled");
+        return Ok(SteerOutcome::Cancelled);
+    }
+    cp.store().append_steer_note(&root.id, t).await?;
+    Ok(SteerOutcome::Noted)
+}
+
 /// Submit a goal for orchestrated execution. With `decompose`, an LLM plans
 /// the subtasks in the background (the root sits in `decomposing` meanwhile);
 /// otherwise the goal itself becomes the root's single subtask. `home_session_pk`
@@ -1236,6 +1266,11 @@ fn judge_prompt(root: &OrchTask, children: &[OrchTask]) -> String {
             .take(2000)
             .collect();
         s.push_str(&format!("- {}: {report}\n", c.title));
+    }
+    if let Some(note) = root.steer_note.as_deref().filter(|n| !n.trim().is_empty()) {
+        s.push_str(&format!(
+            "\nThe user added guidance mid-run — honor it:\n{note}\n"
+        ));
     }
     s.push_str(
         "\nVerify the goal is satisfied by these outcomes; fix small gaps yourself \
@@ -1776,6 +1811,58 @@ mod tests {
         assert!(rows
             .iter()
             .any(|m| m.speaker.as_deref() == Some("build") && m.block_type == "text"));
+    }
+
+    #[tokio::test]
+    async fn typing_into_the_home_chat_steers_or_cancels_the_orchestration() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            Some("home-9"),
+        )
+        .await
+        .unwrap();
+        // A note accumulates on the live root.
+        assert_eq!(
+            note_steer(&cp, "home-9", "prefer TypeScript")
+                .await
+                .unwrap(),
+            SteerOutcome::Noted
+        );
+        let t = get_task(cp.store(), &root).await.unwrap().unwrap();
+        assert!(t
+            .steer_note
+            .as_deref()
+            .unwrap()
+            .contains("prefer TypeScript"));
+        // The judge prompt surfaces it.
+        let children = list_tasks(cp.store(), Some(&root)).await.unwrap();
+        assert!(judge_prompt(&t, &children).contains("prefer TypeScript"));
+        // A cancel directive cancels the tree.
+        assert_eq!(
+            note_steer(&cp, "home-9", "/cancel").await.unwrap(),
+            SteerOutcome::Cancelled
+        );
+        assert_eq!(
+            get_task(cp.store(), &root).await.unwrap().unwrap().status,
+            "cancelled"
+        );
+        // No live orchestration for an unrelated chat.
+        assert_eq!(
+            note_steer(&cp, "home-nope", "hi").await.unwrap(),
+            SteerOutcome::NoOrchestration
+        );
     }
 
     #[tokio::test]

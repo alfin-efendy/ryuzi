@@ -3625,6 +3625,44 @@ impl Store {
         })
         .await
     }
+
+    /// A non-terminal root bound to `home_session_pk` (the live orchestration a
+    /// typed steer targets), if any.
+    pub async fn live_root_for_home(
+        &self,
+        home_session_pk: &str,
+    ) -> anyhow::Result<Option<crate::orch::OrchTask>> {
+        let home = home_session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM orch_tasks WHERE root_id IS NULL AND home_session_pk=?1 \
+                     AND status IN ('decomposing','waiting','judging') ORDER BY created_at DESC LIMIT 1",
+                    crate::orch::ORCH_COLS
+                ),
+                params![home],
+                crate::orch::task_from,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Append a mid-run user directive to a root's steer note (newline-joined).
+    pub async fn append_steer_note(&self, root_id: &str, text: &str) -> anyhow::Result<()> {
+        let (root_id, text) = (root_id.to_string(), text.to_string());
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE orch_tasks SET steer_note = \
+                   CASE WHEN steer_note IS NULL OR steer_note='' THEN ?2 \
+                        ELSE steer_note || char(10) || ?2 END \
+                 WHERE id=?1 AND root_id IS NULL",
+                params![root_id, text],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
 }
 
 const SESSION_COLS: &str =
