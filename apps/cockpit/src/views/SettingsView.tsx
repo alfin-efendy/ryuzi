@@ -1,5 +1,5 @@
 import { ACCENTS, Button, Input, type Mode, SettingsCard as Card, SettingsCardRow as CardRow, Switch, useTheme } from "@ryuzi/ui";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
@@ -7,7 +7,7 @@ import { commands } from "@/bindings";
 import { ModelPicker } from "@/components/ModelPicker";
 import { PermissionsCard } from "@/components/PermissionsCard";
 import { PROJECTS_ROOT_KEY, WORKTREE_DIR_KEY } from "@/constants";
-import { useAgent } from "@/store-agent";
+import { agentModelValues, useAgent } from "@/store-agent";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
 import { normalizeLoopSetting } from "@/lib/loop-settings";
 import { ensurePermission } from "@/lib/notify";
@@ -185,7 +185,8 @@ function AccentRow() {
 // persisted settings.
 
 function AgentSection() {
-  const models = useAgent((s) => s.models);
+  const selectableModels = useAgent((s) => s.models);
+  const models = useMemo(() => agentModelValues(selectableModels), [selectableModels]);
   const model = useAgent((s) => s.model);
   const loaded = useAgent((s) => s.loaded);
   const setModel = useAgent((s) => s.setModel);

@@ -1,5 +1,5 @@
 // apps/cockpit/src/components/shell/Sidebar.tsx
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Archive,
   CalendarClock,
@@ -26,7 +26,9 @@ import {
   MenuPanelSection as MenuSectionLabel,
   MenuPanelSeparator as MenuSeparator,
   Modal,
+  ModalBody,
   ModalFooter,
+  ModalHeader,
 } from "@ryuzi/ui";
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
@@ -56,7 +58,7 @@ import { SortableSessionRow } from "@/components/shell/SortableSessionRow";
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
   { label: "Inbox", icon: Inbox, view: { kind: "inbox" }, group: ["inbox"] },
-  { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail", "connectionDetail"] },
+  { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail"] },
   { label: "Scheduler", icon: CalendarClock, view: { kind: "scheduler" }, group: ["scheduler", "jobDetail", "jobNew"] },
   { label: "Plugins", icon: LayoutGrid, view: { kind: "plugins" }, group: ["plugins", "appDetail", "pluginDetail"] },
   { label: "Settings", icon: Settings, view: { kind: "settings" }, group: ["settings"] },
@@ -82,6 +84,7 @@ export function Sidebar() {
     reorderPinned,
   } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
+  const archiveCancelRef = useRef<HTMLButtonElement>(null);
   const [archivingPk, setArchivingPk] = useState<string | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -539,19 +542,28 @@ export function Sidebar() {
       <AddProjectModal open={addProjectOpen} onClose={() => setAddProjectOpen(false)} />
 
       {confirmArchive && (
-        <Modal onClose={() => setConfirmArchive(null)} width={440}>
-          <div className="mb-1 flex items-center gap-2.5">
-            <Archive aria-hidden size={16} strokeWidth={2} className="text-muted-foreground" />
-            <span className="text-[15px] font-semibold tracking-[-0.01em]">Archive session?</span>
-          </div>
-          <p className="mb-1 mt-2 text-[13px] leading-[1.55] text-foreground">“{sessionTitle(confirmArchive.session)}”</p>
-          <p className="mb-[18px] mt-1 text-[12.5px] leading-[1.55] text-muted-foreground">
-            {confirmArchive.reason} Archiving ends the session and deletes the worktree and its{" "}
-            <span className="font-mono text-xs">{confirmArchive.session.branch ?? "harness"}</span> branch — that work is discarded and
-            unrecoverable. The transcript stays available.
-          </p>
-          <ModalFooter className="mt-0">
-            <Button type="button" variant="outline" onClick={() => setConfirmArchive(null)}>
+        <Modal onClose={() => setConfirmArchive(null)} width={440} busy={archivingPk !== null} initialFocus={archiveCancelRef}>
+          <ModalHeader
+            leading={<Archive aria-hidden className="mt-0.5 size-4 text-muted-foreground" strokeWidth={2} />}
+            title="Archive session?"
+            description={confirmArchive.reason}
+          />
+          <ModalBody>
+            <p className="text-[13px] leading-[1.55] text-foreground">“{sessionTitle(confirmArchive.session)}”</p>
+            <p className="mt-1 text-[12.5px] leading-[1.55] text-muted-foreground">
+              Archiving ends the session and deletes the worktree and its{" "}
+              <span className="font-mono text-xs">{confirmArchive.session.branch ?? "harness"}</span> branch — that work is discarded and
+              unrecoverable. The transcript stays available.
+            </p>
+          </ModalBody>
+          <ModalFooter>
+            <Button
+              ref={archiveCancelRef}
+              type="button"
+              variant="outline"
+              disabled={archivingPk !== null}
+              onClick={() => setConfirmArchive(null)}
+            >
               Cancel
             </Button>
             <Button

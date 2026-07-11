@@ -1254,6 +1254,25 @@ async fn start_chat_session_runs_without_a_project() {
 
 #[tokio::test]
 #[serial]
+async fn chat_startup_marker_is_registered_before_start_returns() {
+    let _guard = StateDirGuard::new();
+    let (cp, _store, _prompts, _db_guard) = fake_control_plane().await;
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    assert!(
+        cp.starting
+            .lock()
+            .unwrap()
+            .contains_key(&session.session_pk),
+        "an immediate lifecycle action must observe startup in progress"
+    );
+    cp.stop_session(&session.session_pk).await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
 async fn end_chat_session_removes_the_scratch_dir() {
     let _guard = StateDirGuard::new();
     let (cp, _store, _prompts, _db_guard) = fake_control_plane().await;
@@ -2637,7 +2656,7 @@ async fn provision_project_admin_keeps_bypass_permissions() {
 
 #[tokio::test]
 #[serial]
-async fn provision_project_uses_settings_defaults_when_none_given() {
+async fn provision_project_drops_unsupported_legacy_default_effort() {
     let _guard = StateDirGuard::new();
     let (cp, store, _db_guard) = provisioning_control_plane().await;
     let root = tempfile::tempdir().unwrap();
@@ -2654,7 +2673,122 @@ async fn provision_project_uses_settings_defaults_when_none_given() {
     let project = cp.provision_project(req).await.unwrap();
 
     assert_eq!(project.model.as_deref(), Some("opus"));
+    assert_eq!(project.effort, None);
+}
+
+#[tokio::test]
+#[serial]
+async fn provision_project_keeps_supported_legacy_default_effort() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _db_guard) = provisioning_control_plane().await;
+    let root = tempfile::tempdir().unwrap();
+    let settings = SettingsStore::new(store.clone());
+    settings
+        .set("workdir_root", root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    settings
+        .set("default_model", "openai/gpt-5.5")
+        .await
+        .unwrap();
+    settings.set("default_effort", "high").await.unwrap();
+    crate::llm_router::connections::add_connection(
+        &store,
+        crate::llm_router::connections::ConnectionRow {
+            id: "codex".into(),
+            provider: "openai-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "Codex".into(),
+            priority: 0,
+            enabled: true,
+            data: crate::llm_router::connections::ConnectionData {
+                models_override: Some(vec!["gpt-5.5".into()]),
+                ..Default::default()
+            },
+            created_at: 1,
+            updated_at: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut req = provision_req("fake", "ws-supported", "u1");
+    req.name = Some("supported-default".to_string());
+    let project = cp.provision_project(req).await.unwrap();
     assert_eq!(project.effort.as_deref(), Some("high"));
+}
+
+#[tokio::test]
+#[serial]
+async fn provision_project_named_route_legacy_effort_requires_no_target_preference() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _db_guard) = provisioning_control_plane().await;
+    let root = tempfile::tempdir().unwrap();
+    let settings = SettingsStore::new(store.clone());
+    settings
+        .set("workdir_root", root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    settings.set("default_model", "smart").await.unwrap();
+    settings.set("default_effort", "high").await.unwrap();
+    crate::llm_router::connections::add_connection(
+        &store,
+        crate::llm_router::connections::ConnectionRow {
+            id: "codex-route".into(),
+            provider: "openai-oauth".into(),
+            auth_type: "oauth".into(),
+            label: "Codex Route".into(),
+            priority: 0,
+            enabled: true,
+            data: crate::llm_router::connections::ConnectionData {
+                models_override: Some(vec!["gpt-5.5".into()]),
+                ..Default::default()
+            },
+            created_at: 1,
+            updated_at: 1,
+        },
+    )
+    .await
+    .unwrap();
+    crate::llm_router::routes::save_model_route(
+        &store,
+        crate::llm_router::routes::ModelRouteInfo {
+            id: "smart-route".into(),
+            name: "smart".into(),
+            enabled: true,
+            strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+            targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                effort: None,
+            }],
+            created_at: 1,
+            updated_at: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut first = provision_req("fake", "ws-route-1", "u1");
+    first.name = Some("route-default".to_string());
+    assert_eq!(
+        cp.provision_project(first).await.unwrap().effort.as_deref(),
+        Some("high")
+    );
+
+    store
+        .set_model_effort_preference(
+            &crate::llm_router::model_effort::ModelPreferenceKey {
+                family: "openai".into(),
+                model: "gpt-5.5".into(),
+            },
+            "low",
+        )
+        .await
+        .unwrap();
+    let mut second = provision_req("fake", "ws-route-2", "u1");
+    second.name = Some("route-configured".to_string());
+    assert_eq!(cp.provision_project(second).await.unwrap().effort, None);
 }
 
 #[tokio::test]

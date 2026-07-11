@@ -1,9 +1,12 @@
 import type { CatalogEntry, CmdError, ConnectionInfo, Result } from "@/bindings";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 
 const addConnection = mock((): Promise<Result<ConnectionInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const connectOauth = mock((): Promise<Result<ConnectionInfo[], CmdError>> => new Promise(() => {}));
+const listRuntimes = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+const getAgentSettings = mock(() => Promise.resolve({ status: "ok" as const, data: { model: null, permMode: null } }));
+const listSelectableModels = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 let oauthAuthorizeUrlListener: ((event: { payload: { provider: string; authorizeUrl: string } }) => void) | null = null;
 const listenOauthAuthorizeUrl = mock((cb: (event: { payload: { provider: string; authorizeUrl: string } }) => void) => {
   oauthAuthorizeUrlListener = cb;
@@ -13,20 +16,14 @@ const listenOauthAuthorizeUrl = mock((cb: (event: { payload: { provider: string;
 });
 
 mock.module("@/bindings", () => ({
-  commands: { addConnection, connectOauth },
-  events: {
-    oauthAuthorizeUrlMsg: {
-      listen: listenOauthAuthorizeUrl,
-    },
-  },
+  commands: { addConnection, connectOauth, listRuntimes, getAgentSettings, listSelectableModels },
+  events: { oauthAuthorizeUrlMsg: { listen: listenOauthAuthorizeUrl } },
 }));
 
 const { AddConnectionModal } = await import("./AddConnectionModal");
 const { useConnections } = await import("@/store-connections");
 const { PROVIDER_RISK_NOTICE } = await import("@/constants");
 
-// `anthropic` and `anthropic-oauth` share the "anthropic" family — the
-// modal offers a chooser between them (API key vs Claude subscription).
 const anthropic: CatalogEntry = {
   id: "anthropic",
   name: "Anthropic",
@@ -41,7 +38,6 @@ const anthropic: CatalogEntry = {
   riskNotice: false,
   usesDeviceGrant: false,
 };
-
 const claudeOauth: CatalogEntry = {
   id: "anthropic-oauth",
   name: "Claude Code",
@@ -56,9 +52,6 @@ const claudeOauth: CatalogEntry = {
   riskNotice: false,
   usesDeviceGrant: false,
 };
-
-// A single-member family (custom-openai) — used to confirm the base-URL
-// requirement still gates submission when there's no chooser step.
 const customOpenAi: CatalogEntry = {
   id: "custom-openai",
   name: "Custom (OpenAI-compatible)",
@@ -73,11 +66,6 @@ const customOpenAi: CatalogEntry = {
   riskNotice: false,
   usesDeviceGrant: false,
 };
-
-// `kiro` is the one catalog entry with a "device" category — a free provider
-// that signs in via AWS SSO-OIDC device-code flow (or an import from an
-// already-logged-in Kiro IDE) instead of the plain API-key form. It's the
-// only member of its family, so no chooser step should render for it.
 const kiroProvider: CatalogEntry = {
   id: "kiro",
   name: "Kiro",
@@ -94,10 +82,7 @@ const kiroProvider: CatalogEntry = {
 };
 
 beforeEach(() => {
-  useConnections.setState({
-    catalog: [anthropic, claudeOauth, customOpenAi, kiroProvider],
-    connections: [],
-  });
+  useConnections.setState({ catalog: [anthropic, claudeOauth, customOpenAi, kiroProvider], connections: [] });
   addConnection.mockClear();
   connectOauth.mockClear();
   listenOauthAuthorizeUrl.mockClear();
@@ -122,7 +107,6 @@ test("Cancel closes without adding a connection", () => {
 
 test("single-member family (kiro) goes straight to its device form, no chooser step", () => {
   render(<AddConnectionModal open onClose={() => {}} family="kiro" />);
-
   expect(screen.getByText("Add account")).toBeTruthy();
   expect(screen.queryByRole("radiogroup", { name: /sign-in method/i })).toBeNull();
   expect(screen.getByLabelText("Label")).toBeTruthy();
@@ -133,15 +117,10 @@ test("single-member family (kiro) goes straight to its device form, no chooser s
 
 test("anthropic family offers API key vs Claude subscription, then the chosen form", () => {
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
-
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
   expect(within(group).getByRole("radio", { name: /api key/i })).toBeTruthy();
   expect(within(group).getByRole("radio", { name: /claude subscription/i })).toBeTruthy();
-
-  // default selection = the api_key member → API key form visible.
   expect(screen.getByLabelText("API key", { selector: "input" })).toBeTruthy();
-
-  // switch to subscription → oauth connect button.
   fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
   expect(screen.getByRole("button", { name: /connect with browser/i })).toBeTruthy();
   expect(screen.queryByLabelText("API key", { selector: "input" })).toBeNull();
@@ -150,10 +129,8 @@ test("anthropic family offers API key vs Claude subscription, then the chosen fo
 test("submitting api key for anthropic family calls addConnection with the member id", async () => {
   const onClose = mock(() => {});
   render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-
   fireEvent.change(screen.getByLabelText("API key", { selector: "input" }), { target: { value: "sk-ant-test" } });
   fireEvent.click(screen.getByRole("button", { name: "Add account" }));
-
   await screen.findByText("Add account");
   expect(addConnection).toHaveBeenCalledWith("anthropic", "Anthropic", "sk-ant-test", null);
   expect(onClose).toHaveBeenCalledTimes(1);
@@ -163,84 +140,177 @@ test("connecting subscription calls connectOauth with the oauth member id and tr
   const writeText = mock(() => Promise.resolve());
   Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
-
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
   fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
-
   fireEvent.click(screen.getByRole("button", { name: /connect with browser/i }));
   expect(connectOauth).toHaveBeenCalledWith("anthropic-oauth", "Claude Code");
-
   const authorizeUrl = "https://claude.ai/oauth/authorize?client_id=test";
   await act(async () => {
     oauthAuthorizeUrlListener?.({ payload: { provider: "anthropic-oauth", authorizeUrl } });
   });
-
   expect(screen.getByDisplayValue(authorizeUrl)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Copy login URL" }));
   expect(writeText).toHaveBeenCalledWith(authorizeUrl);
 });
 
-test("switching auth method mid-flight clears the latched OAuth waiting state", async () => {
+test("switching auth method mid-flight clears the latched OAuth waiting state", () => {
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
-
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
-
-  // Pick the subscription (oauth) member and start a connect that never
-  // resolves (connectOauth is mocked as a never-resolving promise), latching
-  // `saving` + `oauthWaiting`.
   fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
   fireEvent.click(screen.getByRole("button", { name: /connect with browser/i }));
   expect(connectOauth).toHaveBeenCalledTimes(1);
-  // The waiting UI has replaced the connect button.
   expect(screen.queryByRole("button", { name: /connect with browser/i })).toBeNull();
-
-  // Switch back to the API-key member mid-flight — this must reset the
-  // in-flight state so the form isn't dead.
   fireEvent.click(within(group).getByRole("radio", { name: /api key/i }));
-
-  const submit = screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement;
-  expect(submit.disabled).toBe(false);
+  expect((screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
 test("single-member custom-openai family requires a base URL before it can be submitted", async () => {
   const onClose = mock(() => {});
   render(<AddConnectionModal open onClose={onClose} family="custom-openai" />);
-
   expect(screen.queryByRole("radiogroup", { name: /sign-in method/i })).toBeNull();
-
   const submit = screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement;
   expect(submit.disabled).toBe(true);
-
   fireEvent.change(screen.getByLabelText("Label"), { target: { value: "Local router" } });
   fireEvent.change(screen.getByLabelText("API key"), { target: { value: "sk-test-123" } });
   fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://127.0.0.1:4000/v1" } });
   expect(submit.disabled).toBe(false);
-
   fireEvent.click(submit);
   await screen.findByText("Add account");
   expect(addConnection).toHaveBeenCalledWith("custom-openai", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
-test("auth-method options carry category badges", () => {
-  useConnections.setState({ catalog: [anthropic, claudeOauth], connections: [], loaded: true });
+test("account methods are Choice Cards without category chips", () => {
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
-
+  expect(screen.getAllByRole("radio").length).toBeGreaterThan(1);
   const chooser = screen.getByRole("radiogroup", { name: "Sign-in method" });
-  expect(within(chooser).getByText("OAuth")).toBeTruthy();
-  expect(within(chooser).getAllByText("API key").length).toBeGreaterThan(0);
+  expect(within(chooser).queryByText(/^OAuth$/)).toBeNull();
+  expect(within(chooser).getAllByText(/^API key$/)).toHaveLength(1);
+  const connect = screen.getByRole("button", { name: /Add account|Connect with browser/ });
+  expect(connect.closest('[data-slot="modal-footer"]')).not.toBeNull();
+  expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+});
+
+test("closing a pending OAuth flow ignores its late completion", async () => {
+  let resolveConnect: ((value: Result<ConnectionInfo[], CmdError>) => void) | undefined;
+  connectOauth.mockImplementationOnce(
+    () =>
+      new Promise<Result<ConnectionInfo[], CmdError>>((resolve) => {
+        resolveConnect = resolve;
+      }),
+  );
+  const onClose = mock(() => {});
+  render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
+  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  await act(async () => {
+    resolveConnect?.({ status: "ok", data: [] });
+  });
+  await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+});
+
+test("external close and reopen invalidates a pending OAuth completion", async () => {
+  let resolveConnect: ((value: Result<ConnectionInfo[], CmdError>) => void) | undefined;
+  connectOauth.mockImplementationOnce(
+    () =>
+      new Promise<Result<ConnectionInfo[], CmdError>>((resolve) => {
+        resolveConnect = resolve;
+      }),
+  );
+  const onClose = mock(() => {});
+  const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
+  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
+
+  view.rerender(<AddConnectionModal open={false} onClose={onClose} family="anthropic" />);
+  view.rerender(<AddConnectionModal open onClose={onClose} family="anthropic" />);
+  const currentApiKey = screen.getByLabelText("API key", { selector: "input" });
+  fireEvent.change(currentApiKey, { target: { value: "current-session-key" } });
+
+  await act(async () => {
+    resolveConnect?.({ status: "ok", data: [] });
+  });
+
+  await waitFor(() => expect(onClose).toHaveBeenCalledTimes(0));
+  expect((currentApiKey as HTMLInputElement).value).toBe("current-session-key");
+});
+
+test("family transition invalidates a pending OAuth completion", async () => {
+  let resolveConnect: ((value: Result<ConnectionInfo[], CmdError>) => void) | undefined;
+  connectOauth.mockImplementationOnce(
+    () =>
+      new Promise<Result<ConnectionInfo[], CmdError>>((resolve) => {
+        resolveConnect = resolve;
+      }),
+  );
+  const onClose = mock(() => {});
+  const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
+  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
+
+  view.rerender(<AddConnectionModal open onClose={onClose} family="custom-openai" />);
+  const currentLabel = screen.getByLabelText("Label");
+  fireEvent.change(currentLabel, { target: { value: "Current family" } });
+
+  await act(async () => {
+    resolveConnect?.({ status: "ok", data: [] });
+  });
+
+  await waitFor(() => expect(onClose).toHaveBeenCalledTimes(0));
+  expect((currentLabel as HTMLInputElement).value).toBe("Current family");
+});
+
+test("unmount invalidates a pending OAuth completion", async () => {
+  let resolveConnect: ((value: Result<ConnectionInfo[], CmdError>) => void) | undefined;
+  connectOauth.mockImplementationOnce(
+    () =>
+      new Promise<Result<ConnectionInfo[], CmdError>>((resolve) => {
+        resolveConnect = resolve;
+      }),
+  );
+  const onClose = mock(() => {});
+  const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
+  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
+  view.unmount();
+
+  await act(async () => {
+    resolveConnect?.({ status: "ok", data: [] });
+  });
+
+  expect(onClose).toHaveBeenCalledTimes(0);
+});
+
+test("short credential commit locks every dismissal and method switch", async () => {
+  let resolveAdd: ((value: Result<ConnectionInfo[], CmdError>) => void) | undefined;
+  addConnection.mockImplementationOnce(
+    () =>
+      new Promise<Result<ConnectionInfo[], CmdError>>((resolve) => {
+        resolveAdd = resolve;
+      }),
+  );
+  render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
+  fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+  expect((screen.getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+  for (const radio of screen.getAllByRole("radio")) {
+    expect(radio.getAttribute("aria-disabled") === "true" || (radio as HTMLButtonElement).disabled).toBe(true);
+  }
+  await act(async () => {
+    resolveAdd?.({ status: "error", error: { message: "rejected" } });
+  });
+  await waitFor(() => expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false));
 });
 
 test("risk-notice providers show the account-suspension warning", () => {
   useConnections.setState({ catalog: [kiroProvider], connections: [], loaded: true });
   render(<AddConnectionModal open onClose={() => {}} family="kiro" />);
-
   expect(screen.getByText(PROVIDER_RISK_NOTICE)).toBeTruthy();
 });
 
 test("no risk notice for ordinary providers", () => {
   useConnections.setState({ catalog: [customOpenAi], connections: [], loaded: true });
   render(<AddConnectionModal open onClose={() => {}} family="custom-openai" />);
-
   expect(screen.queryByText(PROVIDER_RISK_NOTICE)).toBeNull();
 });

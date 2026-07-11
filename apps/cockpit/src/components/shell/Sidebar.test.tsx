@@ -1,77 +1,157 @@
-import { afterEach, expect, test } from "bun:test";
-import { cleanup, render, screen } from "@testing-library/react";
-import { useStore } from "@/store";
-import { useUi } from "@/store-ui";
-import { useGateways } from "@/store-gateways";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { Project, Session } from "@/bindings";
+
+const worktreeDirty = mock(async () => ({ status: "ok" as const, data: { dirty: true, unmergedCommits: 0 } }));
+const termCloseSession = mock(async () => ({ status: "ok" as const, data: null }));
+
+mock.module("@/bindings", () => ({
+  commands: { worktreeDirty, termCloseSession },
+  events: {},
+}));
 
 const { Sidebar } = await import("./Sidebar");
+const { useStore } = await import("@/store");
+const { useUi } = await import("@/store-ui");
+const { useNav } = await import("@/store-nav");
+const { useGateways } = await import("@/store-gateways");
 
-// Sidebar's mount effect hydrates gateways when `loaded` is false, which would
-// otherwise reach the unmocked Tauri IPC boundary. Seed `loaded: true` so the
-// effect is a no-op — the sidebar's own gateway switcher isn't under test here.
-function seedGateways() {
-  useGateways.setState({ gateways: [], loaded: true, probing: false });
-}
+const project: Project = {
+  projectId: "p1",
+  name: "Ryuzi",
+  workdir: "C:\\code\\ryuzi",
+  source: null,
+  model: null,
+  effort: null,
+  permMode: "default",
+  createdAt: 1,
+  isGit: true,
+};
+
+const session: Session = {
+  sessionPk: "s1",
+  projectId: "p1",
+  agentSessionId: null,
+  worktreePath: "C:\\code\\ryuzi-worktree",
+  branch: "feat/modal-safety",
+  title: "Preserve modal safety",
+  status: "idle",
+  startedBy: null,
+  createdAt: 1,
+  lastActive: 2,
+  resumeAttempts: 0,
+  branchOwned: true,
+  permMode: "default",
+  kind: "project",
+  speaker: null,
+  agent: null,
+  parentSessionPk: null,
+};
+
+const endSession = mock((_sessionPk: string): Promise<boolean> => Promise.resolve(true));
+
+beforeEach(() => {
+  worktreeDirty.mockClear();
+  termCloseSession.mockClear();
+  endSession.mockClear();
+  useStore.setState({
+    projects: [project],
+    sessions: [session],
+    transcripts: {},
+    pendingApprovals: [],
+    focusedSessionPk: null,
+    selectedProjectId: null,
+    end: endSession,
+  });
+  useUi.setState({ pinned: {}, archived: {}, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useNav.setState({
+    history: { back: [], current: { kind: "home" }, forward: [] },
+    sidebarOpen: true,
+    searchQuery: "",
+  });
+  useGateways.setState({ gateways: [], eventsById: {}, activeGateway: "local", loaded: true, probing: false });
+});
 
 afterEach(cleanup);
 
-function sess(pk: string, lastActive: number) {
-  return {
-    sessionPk: pk,
-    projectId: "p",
-    agentSessionId: null,
-    worktreePath: null,
-    branch: null,
-    title: pk,
-    status: "idle" as const,
-    startedBy: null,
-    createdAt: 0,
-    lastActive,
-    resumeAttempts: 0,
-    branchOwned: false,
-    permMode: "default" as const,
-    kind: "project" as const,
-    speaker: null,
-    agent: null,
-    parentSessionPk: null,
-  };
+async function openArchiveConfirmation() {
+  render(<Sidebar />);
+  fireEvent.click(screen.getByTitle("Archive — ends the session and removes its worktree"));
+  return await screen.findByRole("dialog", { name: "Archive session?" });
 }
 
-function project() {
+test("archive confirmation preserves the consequences and initially focuses Cancel", async () => {
+  const dialog = await openArchiveConfirmation();
+  const cancel = screen.getByRole("button", { name: "Cancel" });
+
+  await waitFor(() => expect(document.activeElement).toBe(cancel));
+  expect(dialog.textContent).toContain("Archiving ends the session and deletes the worktree and its");
+  expect(dialog.textContent).toContain("branch — that work is discarded and unrecoverable. The transcript stays available.");
+});
+
+test("busy archive locks every dismissal path until teardown settles", async () => {
+  let resolveClose: ((result: { status: "ok"; data: null }) => void) | undefined;
+  termCloseSession.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveClose = resolve;
+      }),
+  );
+  await openArchiveConfirmation();
+  fireEvent.click(screen.getByRole("button", { name: "Archive & discard work" }));
+
+  const close = screen.getByRole("button", { name: "Close" }) as HTMLButtonElement;
+  const cancel = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+  const archive = screen.getByRole("button", { name: "Archiving…" }) as HTMLButtonElement;
+  await waitFor(() => expect(screen.getByRole("dialog", { name: "Archive session?" }).getAttribute("aria-busy")).toBe("true"));
+  expect(close.disabled).toBe(true);
+  expect(cancel.disabled).toBe(true);
+  expect(archive.disabled).toBe(true);
+
+  fireEvent.click(close);
+  fireEvent.click(cancel);
+  fireEvent.click(archive);
+  fireEvent.keyDown(document, { key: "Escape" });
+  fireEvent.click(document.querySelector('[data-slot="modal-backdrop"]') as HTMLElement);
+  expect(screen.getByRole("dialog", { name: "Archive session?" })).toBeTruthy();
+  expect(termCloseSession).toHaveBeenCalledTimes(1);
+
+  await act(async () => resolveClose?.({ status: "ok", data: null }));
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "Archive session?" })).toBeNull());
+  expect(endSession).toHaveBeenCalledWith("s1");
+});
+
+function sessionFixture(pk: string, lastActive: number): Session {
   return {
-    projectId: "p",
-    name: "proj",
-    workdir: "/w",
-    source: null,
-    model: null,
-    effort: null,
-    permMode: "default" as const,
-    createdAt: 0,
-    isGit: true,
+    ...session,
+    sessionPk: pk,
+    projectId: "p1",
+    title: pk,
+    lastActive,
+    worktreePath: null,
+    branch: null,
+    branchOwned: false,
   };
 }
 
 test("renders an unread dot for an unread, non-focused session", () => {
-  seedGateways();
   useUi.setState({ readAt: { s1: 100, s2: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
   useStore.setState({
-    projects: [project()],
-    sessions: [sess("s1", 500), sess("s2", 50)], // s1 unread (500>100), s2 read (50<100)
+    projects: [project],
+    sessions: [sessionFixture("s1", 500), sessionFixture("s2", 50)],
     focusedSessionPk: null,
     pendingApprovals: [],
   });
   render(<Sidebar />);
-  // The unread session's title carries the unread affordance; the read one does not.
   expect(screen.getByTestId("unread-dot-s1")).toBeTruthy();
   expect(screen.queryByTestId("unread-dot-s2")).toBeNull();
 });
 
 test("does not show an unread dot for the focused session even if unseen", () => {
-  seedGateways();
   useUi.setState({ readAt: { s1: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
   useStore.setState({
-    projects: [project()],
-    sessions: [sess("s1", 500)],
+    projects: [project],
+    sessions: [sessionFixture("s1", 500)],
     focusedSessionPk: "s1",
     pendingApprovals: [],
   });

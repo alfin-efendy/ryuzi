@@ -597,7 +597,12 @@ async fn handle_responses(
         // same-format.
         if target.conn.provider == "openai-oauth" {
             let mut passthrough_body = body.clone();
-            normalize_codex_responses_body(&mut passthrough_body, &target.upstream_model, None);
+            normalize_codex_responses_body(
+                &mut passthrough_body,
+                &target.upstream_model,
+                target.request_compatibility_effort.as_deref(),
+                None,
+            );
             let started = crate::paths::now_ms();
             match proxy_passthrough(&state, &mut target, &passthrough_body).await {
                 Ok(resp) => {
@@ -837,7 +842,7 @@ async fn send_json(
     target: &mut RouteTarget,
     body: &Value,
 ) -> Result<Value, AttemptError> {
-    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, body);
     let resp = send_upstream(&state.ctx(), target, body)
         .await
         .map_err(|e| {
@@ -857,7 +862,11 @@ async fn send_json(
                 provider: target.conn.provider.clone(),
                 message: msg.to_string(),
                 status: Some(status.as_u16()),
-                transport: false,
+                category: crate::llm_router::provenance::classify_failure(
+                    Some(status.as_u16()),
+                    false,
+                    msg,
+                ),
             },
         ));
     }
@@ -883,7 +892,7 @@ async fn proxy_passthrough(
     target: &mut RouteTarget,
     body: &Value,
 ) -> Result<Response, AttemptError> {
-    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body);
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, body);
     let resp = connect_upstream(state, target, body).await?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ct = resp
@@ -1123,8 +1132,7 @@ async fn stream_anthropic_upstream_to_openai(
     upstream_body: &Value,
     ctx: RecordCtx,
 ) -> Result<Response, AttemptError> {
-    let tool_map =
-        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, upstream_body);
     let resp = connect_upstream(state, target, upstream_body).await?;
     Ok(sse_response(spawn_anthropic_to_openai_pump(
         resp,
@@ -1145,8 +1153,7 @@ async fn stream_responses(
 ) -> Result<Response, AttemptError> {
     let resp = connect_upstream(state, target, upstream_body).await?;
     let anthropic_upstream = matches!(target.desc.format, ApiFormat::Anthropic);
-    let tool_map =
-        claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, upstream_body);
+    let tool_map = claude_cloak::tool_name_map_for(&target.conn.provider, upstream_body);
     let store = state.store.clone();
     let ctx = RecordCtx {
         conn_id: target.conn.id.clone(),
@@ -1856,10 +1863,12 @@ mod tests {
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-first".into(),
+                        effort: None,
                     },
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-fallback".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -1907,10 +1916,12 @@ mod tests {
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-one".into(),
+                        effort: None,
                     },
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-two".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -2005,10 +2016,12 @@ mod tests {
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "text-only".into(),
+                        effort: None,
                     },
                     crate::llm_router::routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-4o".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -2055,6 +2068,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let kiro_body = json!({"conversationState": {}});
         let req = kiro_upstream_request(&state, &target, &kiro_body)
@@ -2136,6 +2151,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2168,6 +2185,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2195,6 +2214,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()

@@ -5,6 +5,10 @@
 //! byte-identical to the source it was moved from.
 
 use crate::domain::SessionGitOptions;
+use crate::llm_router::model_effort::{
+    EffectiveEffortSource, SelectableModelInfo, StoredEffortStatus,
+};
+use crate::llm_router::quota::ProviderQuotaCapability;
 use crate::llm_router::secrets::KeychainStatus;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -45,6 +49,7 @@ impl From<GitOptions> for SessionGitOptions {
 #[serde(rename_all = "camelCase")]
 pub struct ChatRequestOptions {
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub context: Option<ChatContextArg>,
     #[serde(default)]
     pub attachments: Vec<String>,
@@ -375,15 +380,24 @@ pub struct ConnectionInfo {
     pub label: String,
     pub priority: i32,
     pub enabled: bool,
-    pub base_url: Option<String>,
+    pub quota_capability: Option<ProviderQuotaCapability>,
     pub models: Vec<String>,
-    /// e.g. "sk-…3fk9" — full key never leaves the backend after creation.
-    pub key_masked: Option<String>,
     /// OAuth connections only: true once refresh has failed terminally and
     /// the user needs to reconnect via the browser/paste flow again.
     pub needs_relogin: bool,
-    /// Anthropic OAuth only: enable full Claude Code-style request cloaking.
-    pub claude_cloaking: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRuntimeInfo {
+    pub session_pk: String,
+    pub model: Option<String>,
+    pub stored_effort: Option<String>,
+    pub effective_effort: Option<String>,
+    pub effective_effort_label: Option<String>,
+    pub effective_source: EffectiveEffortSource,
+    pub stored_effort_status: StoredEffortStatus,
+    pub model_info: Option<SelectableModelInfo>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]

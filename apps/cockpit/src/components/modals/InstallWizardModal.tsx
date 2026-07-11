@@ -2,7 +2,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { Check, CircleAlert, ExternalLink } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
+import { Button, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 import { commands, events, type PluginDetail, type PluginInstallBeginResult } from "@/bindings";
 import { IconChip, StatusDot } from "@/components/common/bits";
 import { pluginIcon as iconFor } from "@/lib/plugin-icons";
@@ -283,72 +283,82 @@ export function InstallWizardModal({
   }, [step, pluginId, detail, loadPlugins]);
 
   return (
-    <Modal onClose={close} width={480}>
-      <div className="mb-1 flex items-center gap-2.5">
-        <IconChip icon={Icon} size={28} />
-        <span className="text-[15px] font-semibold tracking-[-0.01em]">Install {pluginName}</span>
-      </div>
+    <Modal onClose={close} width={480} busy={busy}>
+      <ModalHeader
+        leading={<IconChip icon={Icon} size={28} />}
+        title={`Install ${pluginName}`}
+        description={step === "done" ? "Installation complete" : "Install and configure this plugin."}
+      />
 
       {step === "checking" && (
         <>
-          {checkError ? (
-            <div
-              className="mt-2 flex items-start gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]"
-              style={{ color: "#F59E0B" }}
-            >
-              <CircleAlert aria-hidden size={14} strokeWidth={2} className="mt-0.5 shrink-0" />
-              {checkError}
-            </div>
-          ) : (
-            <div className="flex items-center gap-2 py-6 text-[13px] text-muted-foreground">
-              <StatusDot color="#3B82F6" size={8} pulse />
-              {detail?.auth?.kind === "oauth" ? "Preparing sign-in…" : "Checking configuration…"}
-            </div>
-          )}
+          <ModalBody>
+            {checkError ? (
+              <div
+                className="mt-2 flex items-start gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]"
+                style={{ color: "#F59E0B" }}
+              >
+                <CircleAlert aria-hidden size={14} strokeWidth={2} className="mt-0.5 shrink-0" />
+                {checkError}
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 py-6 text-[13px] text-muted-foreground">
+                <StatusDot color="#3B82F6" size={8} pulse />
+                {detail?.auth?.kind === "oauth" ? "Preparing sign-in…" : "Checking configuration…"}
+              </div>
+            )}
+          </ModalBody>
           <ModalFooter>
-            <Button variant="outline" onClick={close}>
+            <Button variant="outline" disabled={busy} onClick={close}>
               Cancel
             </Button>
-            {checkError && <Button onClick={() => void runBegin(detail)}>Retry</Button>}
+            {checkError && (
+              <Button disabled={busy} onClick={() => void runBegin(detail)}>
+                Retry
+              </Button>
+            )}
           </ModalFooter>
         </>
       )}
 
       {step === "tokenInput" && (
         <>
-          <p className="mb-[18px] mt-0 text-[12.5px] text-muted-foreground">
-            {pluginName} authenticates with {begin?.authKind === "api-key" ? "an API key" : "a token"}. Paste it below — Cockpit stores it
-            locally and never shows it again.
-          </p>
-          {detail?.auth?.setting ? (
-            <FormField label={begin?.authKind === "api-key" ? "API key" : "Token"}>
-              <Input
-                type="password"
-                value={tokenValue}
-                onChange={(e) => setTokenValue(e.target.value)}
-                placeholder={detail?.auth?.configured ? "●●●● saved" : "Required — not set"}
-              />
-            </FormField>
-          ) : (
-            <p className="m-0 text-[12.5px] text-muted-foreground">
-              This plugin reads its credential from the{" "}
-              <span className="font-mono text-xs">{detail?.auth?.env ?? begin?.envVarName ?? "required"}</span> environment variable. Set
-              it, restart Cockpit, and install again.
+          <ModalBody>
+            <p className="mb-[18px] mt-0 text-[12.5px] text-muted-foreground">
+              {pluginName} authenticates with {begin?.authKind === "api-key" ? "an API key" : "a token"}. Paste it below — Cockpit stores it
+              locally and never shows it again.
             </p>
-          )}
-          {detail?.auth?.helpUrl && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => void openUrl(detail.auth?.helpUrl as string)}
-              className="mt-2 px-0 text-[12px] text-muted-foreground"
-            >
-              <ExternalLink aria-hidden size={12} strokeWidth={2} className="size-3" />
-              Get a token at {detail.auth.helpUrl}
-            </Button>
-          )}
+            {detail?.auth?.setting ? (
+              <FormField label={begin?.authKind === "api-key" ? "API key" : "Token"}>
+                <Input
+                  type="password"
+                  value={tokenValue}
+                  onChange={(e) => setTokenValue(e.target.value)}
+                  placeholder={detail?.auth?.configured ? "●●●● saved" : "Required — not set"}
+                />
+              </FormField>
+            ) : (
+              <p className="m-0 text-[12.5px] text-muted-foreground">
+                This plugin reads its credential from the{" "}
+                <span className="font-mono text-xs">{detail?.auth?.env ?? begin?.envVarName ?? "required"}</span> environment variable. Set
+                it, restart Cockpit, and install again.
+              </p>
+            )}
+          </ModalBody>
           <ModalFooter>
-            <Button variant="outline" onClick={close}>
+            {detail?.auth?.helpUrl && (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                className="mr-auto"
+                onClick={() => void openUrl(detail.auth?.helpUrl as string)}
+              >
+                <ExternalLink aria-hidden data-icon="inline-start" />
+                Get a token at {detail.auth.helpUrl}
+              </Button>
+            )}
+            <Button variant="outline" disabled={busy} onClick={close}>
               Cancel
             </Button>
             <Button disabled={busy || !detail?.auth?.setting || tokenValue.trim().length === 0} onClick={() => void submitToken()}>
@@ -360,40 +370,43 @@ export function InstallWizardModal({
 
       {step === "manualClientId" && (
         <>
-          <p className="mb-3 mt-0 text-[12.5px] text-muted-foreground">
-            {begin?.oauthExternal
-              ? `${pluginName} brokers its own sign-in the first time it runs. Create an OAuth client with the vendor and paste its client ID here.`
-              : `${pluginName} doesn't support automatic app registration. Create an OAuth app with the vendor and paste its client ID here.`}
-          </p>
-          {begin?.dcrError && (
-            <div
-              className="mb-3 flex items-start gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]"
-              style={{ color: "#F59E0B" }}
-            >
-              <CircleAlert aria-hidden size={14} strokeWidth={2} className="mt-0.5 shrink-0" />
-              {begin.dcrError}
-            </div>
-          )}
-          <FormField label="OAuth client ID">
-            <Input
-              value={clientId}
-              onChange={(e) => setClientId(e.target.value)}
-              placeholder="Paste the client ID from the vendor's console"
-            />
-          </FormField>
-          {detail?.auth?.helpUrl && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => void openUrl(detail.auth?.helpUrl as string)}
-              className="mt-2 px-0 text-[12px] text-muted-foreground"
-            >
-              <ExternalLink aria-hidden size={12} strokeWidth={2} className="size-3" />
-              Where do I find this?
-            </Button>
-          )}
+          <ModalBody>
+            <p className="mb-3 mt-0 text-[12.5px] text-muted-foreground">
+              {begin?.oauthExternal
+                ? `${pluginName} brokers its own sign-in the first time it runs. Create an OAuth client with the vendor and paste its client ID here.`
+                : `${pluginName} doesn't support automatic app registration. Create an OAuth app with the vendor and paste its client ID here.`}
+            </p>
+            {begin?.dcrError && (
+              <div
+                className="mb-3 flex items-start gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]"
+                style={{ color: "#F59E0B" }}
+              >
+                <CircleAlert aria-hidden size={14} strokeWidth={2} className="mt-0.5 shrink-0" />
+                {begin.dcrError}
+              </div>
+            )}
+            <FormField label="OAuth client ID">
+              <Input
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                placeholder="Paste the client ID from the vendor's console"
+              />
+            </FormField>
+          </ModalBody>
           <ModalFooter>
-            <Button variant="outline" onClick={close}>
+            {detail?.auth?.helpUrl && (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                className="mr-auto"
+                onClick={() => void openUrl(detail.auth?.helpUrl as string)}
+              >
+                <ExternalLink aria-hidden data-icon="inline-start" />
+                Where do I find this?
+              </Button>
+            )}
+            <Button variant="outline" disabled={busy} onClick={close}>
               Cancel
             </Button>
             <Button disabled={busy || clientId.trim().length === 0} onClick={() => void submitClientId()}>
@@ -405,61 +418,55 @@ export function InstallWizardModal({
 
       {step === "waitingOauth" && (
         <>
-          <p className="mb-2 mt-0 text-[13px] font-medium">Browser opened — finish signing in there.</p>
-          <p className="m-0 text-[12.5px] text-muted-foreground">Cockpit is listening for the redirect and will finish automatically.</p>
-          {oauthError && (
-            <div className="mt-3 flex flex-col gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]" style={{ color: "#F59E0B" }}>
-              <span className="flex items-start gap-2">
+          <ModalBody>
+            <p className="mb-2 mt-0 text-[13px] font-medium">Browser opened — finish signing in there.</p>
+            <p className="m-0 text-[12.5px] text-muted-foreground">Cockpit is listening for the redirect and will finish automatically.</p>
+            {oauthError && (
+              <div
+                className="mt-3 flex items-start gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]"
+                style={{ color: "#F59E0B" }}
+              >
                 <CircleAlert aria-hidden size={14} strokeWidth={2} className="mt-0.5 shrink-0" />
                 {oauthError}
-              </span>
-              <span className="flex gap-2">
-                <Button variant="outline" size="sm" onClick={() => void retryOauth()} disabled={busy}>
-                  Retry
-                </Button>
-                {!pasteOpen && begin?.callbackMode !== "manual" && (
-                  <Button variant="outline" size="sm" onClick={() => setPasteOpen(true)}>
-                    Paste code instead
-                  </Button>
-                )}
-              </span>
-            </div>
-          )}
-          {(pasteOpen || begin?.callbackMode === "manual") && (
-            <div className="mt-3">
-              {begin?.callbackMode === "manual" && (
-                <p className="mb-2 mt-0 text-xs text-muted-foreground">
-                  Another sign-in is holding the callback port, so Cockpit can't catch the redirect. After signing in, copy the{" "}
-                  <span className="font-mono">code</span> value from the browser's address bar and paste it here.
-                </p>
-              )}
-              <FormField label="Authorization code">
-                <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="Paste the code value from the callback URL" />
-              </FormField>
-              <div className="mt-2 flex justify-end">
-                <Button
-                  size="sm"
-                  disabled={busy || code.trim().length === 0 || !begin?.oauthBegin?.stateToken}
-                  onClick={() => void submitCode()}
-                >
-                  {busy ? "Connecting…" : "Finish sign-in"}
-                </Button>
               </div>
-            </div>
-          )}
-          {!pasteOpen && begin?.callbackMode !== "manual" && !oauthError && (
-            <Button variant="ghost" size="sm" onClick={() => setPasteOpen(true)} className="mt-3 px-0 text-[12px] text-muted-foreground">
-              Having trouble? Paste the code manually
-            </Button>
-          )}
+            )}
+            {(pasteOpen || begin?.callbackMode === "manual") && (
+              <div className="mt-3">
+                {begin?.callbackMode === "manual" && (
+                  <p className="mb-2 mt-0 text-xs text-muted-foreground">
+                    Another sign-in is holding the callback port, so Cockpit can't catch the redirect. After signing in, copy the{" "}
+                    <span className="font-mono">code</span> value from the browser's address bar and paste it here.
+                  </p>
+                )}
+                <FormField label="Authorization code">
+                  <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="Paste the code value from the callback URL" />
+                </FormField>
+              </div>
+            )}
+          </ModalBody>
           <ModalFooter>
-            <Button variant="outline" onClick={close}>
+            {oauthError && (
+              <Button variant="outline" disabled={busy} onClick={() => void retryOauth()}>
+                Retry
+              </Button>
+            )}
+            {!pasteOpen && begin?.callbackMode !== "manual" && (
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => setPasteOpen(true)}>
+                {oauthError ? "Paste code instead" : "Having trouble? Paste the code manually"}
+              </Button>
+            )}
+            {(pasteOpen || begin?.callbackMode === "manual") && (
+              <Button disabled={busy || code.trim().length === 0 || !begin?.oauthBegin?.stateToken} onClick={() => void submitCode()}>
+                {busy ? "Connecting…" : "Finish sign-in"}
+              </Button>
+            )}
+            <Button variant="outline" disabled={busy} onClick={close}>
               Cancel
             </Button>
             <Button
               variant="outline"
+              disabled={busy || !begin?.oauthBegin?.authorizeUrl}
               onClick={() => void openUrl(begin?.oauthBegin?.authorizeUrl ?? "")}
-              disabled={!begin?.oauthBegin?.authorizeUrl}
             >
               Reopen browser
             </Button>
@@ -469,23 +476,25 @@ export function InstallWizardModal({
 
       {step === "settings" && (
         <>
-          <p className="mb-[18px] mt-0 text-[12.5px] text-muted-foreground">
-            Configure {pluginName}. Required fields are marked with * — saved values stay hidden and never display.
-          </p>
-          <div className="flex flex-col gap-3">
-            {settingsFields.map((f) => (
-              <FormField key={f.key} label={f.required ? `${f.label} *` : f.label} hint={f.help || undefined}>
-                <Input
-                  type={f.secret ? "password" : "text"}
-                  value={fieldValues[f.key] ?? ""}
-                  onChange={(e) => setFieldValues((m) => ({ ...m, [f.key]: e.target.value }))}
-                  placeholder={f.valueSet ? "●●●● saved" : f.required ? "Required — not set" : "Optional — not set"}
-                />
-              </FormField>
-            ))}
-          </div>
+          <ModalBody>
+            <p className="mb-[18px] mt-0 text-[12.5px] text-muted-foreground">
+              Configure {pluginName}. Required fields are marked with * — saved values stay hidden and never display.
+            </p>
+            <div className="flex flex-col gap-3">
+              {settingsFields.map((f) => (
+                <FormField key={f.key} label={f.required ? `${f.label} *` : f.label} hint={f.help || undefined}>
+                  <Input
+                    type={f.secret ? "password" : "text"}
+                    value={fieldValues[f.key] ?? ""}
+                    onChange={(e) => setFieldValues((m) => ({ ...m, [f.key]: e.target.value }))}
+                    placeholder={f.valueSet ? "●●●● saved" : f.required ? "Required — not set" : "Optional — not set"}
+                  />
+                </FormField>
+              ))}
+            </div>
+          </ModalBody>
           <ModalFooter>
-            <Button variant="outline" onClick={close}>
+            <Button variant="outline" disabled={busy} onClick={close}>
               Cancel
             </Button>
             <Button disabled={busy || !requiredSatisfied} onClick={() => void submitSettings()}>
@@ -497,17 +506,19 @@ export function InstallWizardModal({
 
       {step === "done" && (
         <>
-          <div className="flex items-center gap-2 py-4 text-[13px] font-medium">
-            <Check aria-hidden size={16} strokeWidth={2.5} style={{ color: "#22C55E" }} />
-            {pluginName} is installed.
-          </div>
-          <p className="m-0 text-[12.5px] text-muted-foreground">
-            {detail == null
-              ? "You can enable it from the card."
-              : detail.info.experimental
-                ? "It's experimental, so it stays off — enable it from the card when ready."
-                : "It's enabled and ready for your agents."}
-          </p>
+          <ModalBody>
+            <div className="flex items-center gap-2 py-4 text-[13px] font-medium">
+              <Check aria-hidden size={16} strokeWidth={2.5} style={{ color: "#22C55E" }} />
+              {pluginName} is installed.
+            </div>
+            <p className="m-0 text-[12.5px] text-muted-foreground">
+              {detail == null
+                ? "You can enable it from the card."
+                : detail.info.experimental
+                  ? "It's experimental, so it stays off — enable it from the card when ready."
+                  : "It's enabled and ready for your agents."}
+            </p>
+          </ModalBody>
           <ModalFooter>
             <Button onClick={close}>Close</Button>
           </ModalFooter>

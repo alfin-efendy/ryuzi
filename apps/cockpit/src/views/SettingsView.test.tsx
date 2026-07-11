@@ -17,7 +17,17 @@ let getAgentSettingsImpl: () => Promise<Result<AgentSettings, CmdError>> = () =>
 
 const getAgentSettings = mock(() => getAgentSettingsImpl());
 const setAgentSettings = mock(async (_model: string | null, _permMode: string | null) => ok(null));
-const listSelectableModels = mock(async () => ok(["smart", "anthropic/claude-opus-4"]));
+const selectable = (requestValue: string) => ({
+  kind: "concrete" as const,
+  requestValue,
+  displayName: requestValue,
+  preferenceKey: null,
+  supported: [],
+  configuredDefault: null,
+  resolvedDefault: null,
+  defaultSource: "none" as const,
+});
+const listSelectableModels = mock(async () => ok([selectable("smart"), selectable("anthropic/claude-opus-4")]));
 
 // AgentLoopCard: a failed save must roll the input back to the last CONFIRMED
 // value — not to whatever the user just typed (the bug this guards: `onChange`

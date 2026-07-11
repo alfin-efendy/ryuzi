@@ -99,29 +99,6 @@ export function Pill({
   return <span className={cn(base, "bg-secondary text-secondary-foreground", className)}>{children}</span>;
 }
 
-const CATEGORY_BADGES: Record<string, { label: string; color: string; outline?: boolean }> = {
-  free: { label: "Free", color: "#22C55E" },
-  free_tier: { label: "Free tier", color: "#22C55E", outline: true },
-  oauth: { label: "OAuth", color: "#3B82F6" },
-  api_key: { label: "API key", color: "#F59E0B" },
-};
-
-// Provider auth-category badge. `device` is an auth mechanism, not a pricing
-// category — today's only device-flow provider (kiro) is free, so it renders
-// as Free; the Add-account modal still says "Device sign-in".
-export function CategoryBadge({ category, className }: { category: string; className?: string }) {
-  const badge = CATEGORY_BADGES[category === "device" ? "free" : category];
-  if (!badge) return null;
-  const style: CSSProperties = badge.outline
-    ? { color: badge.color, boxShadow: `inset 0 0 0 1px color-mix(in oklab, ${badge.color} 45%, transparent)` }
-    : { background: `color-mix(in oklab, ${badge.color} 16%, transparent)`, color: badge.color };
-  return (
-    <span className={cn("rounded-full px-2 py-[2px] text-[10.5px] font-semibold tracking-[0.02em]", className)} style={style}>
-      {badge.label}
-    </span>
-  );
-}
-
 export function StatusDot({
   color,
   size = 7,

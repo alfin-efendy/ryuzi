@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { CmdError, PluginDetail, PluginFieldInfo, PluginInstallBeginResult, Result } from "@/bindings";
 
 // The wizard talks only to the Tauri IPC boundary (`@/bindings`) and the
@@ -153,6 +153,22 @@ async function renderWizard() {
   return result;
 }
 
+function expectSharedWizardShell() {
+  const dialog = screen.getByRole("dialog", { name: "Install Notion" });
+  expect(dialog.querySelector('[data-slot="modal-header"]')).not.toBeNull();
+  expect(dialog.querySelector('[data-slot="modal-body"]')).not.toBeNull();
+  const footer = dialog.querySelector('[data-slot="modal-footer"]');
+  expect(footer).not.toBeNull();
+  expect(dialog.querySelector('[data-slot="modal-header"] button[aria-label="Close"]')).not.toBeNull();
+
+  const workflowButtons = within(dialog)
+    .getAllByRole("button")
+    .filter((button) => button.getAttribute("aria-label") !== "Close");
+  for (const button of workflowButtons) {
+    expect(footer?.contains(button)).toBe(true);
+  }
+}
+
 beforeEach(() => {
   detailData = detailFixture();
   beginData = beginResult();
@@ -196,6 +212,7 @@ test("calls beginPluginInstall on mount and shows the checking spinner", async (
 
   expect(beginPluginInstall).toHaveBeenCalledWith("notion");
   expect(screen.getByText("Checking configuration…")).toBeTruthy();
+  expectSharedWizardShell();
 });
 
 test("checking shows the oauth spinner copy while sign-in is being prepared", async () => {
@@ -222,6 +239,7 @@ test("envVarPresent with no settings routes straight to done", async () => {
   await renderWizard();
 
   expect(await screen.findByText("Notion is installed.")).toBeTruthy();
+  expectSharedWizardShell();
 });
 
 test("token auth routes to tokenInput", async () => {
@@ -230,6 +248,7 @@ test("token auth routes to tokenInput", async () => {
   await renderWizard();
 
   expect(await screen.findByText(/authenticates with a token/)).toBeTruthy();
+  expectSharedWizardShell();
 });
 
 test("api-key auth routes to tokenInput with API-key wording", async () => {
@@ -246,6 +265,7 @@ test("authKind none routes through settings when declared", async () => {
   await renderWizard();
 
   expect(await screen.findByText(/Required fields are marked/)).toBeTruthy();
+  expectSharedWizardShell();
 });
 
 test("available oauth routes to waitingOauth", async () => {
@@ -253,6 +273,7 @@ test("available oauth routes to waitingOauth", async () => {
   await renderWizard();
 
   expect(await screen.findByText("Browser opened — finish signing in there.")).toBeTruthy();
+  expectSharedWizardShell();
 });
 
 test("needsClientId routes to manualClientId", async () => {
@@ -260,6 +281,7 @@ test("needsClientId routes to manualClientId", async () => {
   await renderWizard();
 
   expect(await screen.findByText(/paste its client ID here/)).toBeTruthy();
+  expectSharedWizardShell();
 });
 
 test("oauthExternal routes to manualClientId", async () => {

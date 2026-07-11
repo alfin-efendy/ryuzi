@@ -125,6 +125,7 @@ mod tests {
             cost_output: output,
             cost_cache_read: 0.0,
             cost_cache_write: 0.0,
+            ..crate::llm_router::model_meta::FALLBACK.clone()
         }
     }
 

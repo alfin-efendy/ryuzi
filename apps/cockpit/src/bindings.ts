@@ -178,6 +178,54 @@ async updateProject(projectId: string, model: string | null, permMode: PermMode)
     else return { status: "error", error: e  as any };
 }
 },
+async updateProjectPermMode(projectId: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project_perm_mode", { projectId, permMode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async projectRuntimeInfo(projectId: string) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("project_runtime_info", { projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProjectRuntime(projectId: string, model: string | null, effort: string | null) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project_runtime", { projectId, model, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setModelEffortPreference(key: ModelPreferenceKey, effort: string | null) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_model_effort_preference", { key, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async sessionRuntimeInfo(sessionPk: string) : Promise<Result<SessionRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("session_runtime_info", { sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateSessionRuntime(sessionPk: string, model: string | null, effort: string | null) : Promise<Result<SessionRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_session_runtime", { sessionPk, model, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async updateSessionPermMode(sessionPk: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("update_session_perm_mode", { sessionPk, permMode }) };
@@ -210,7 +258,7 @@ async setAgentSettings(model: string | null, permMode: string | null) : Promise<
     else return { status: "error", error: e  as any };
 }
 },
-async listSelectableModels() : Promise<Result<string[], CmdError>> {
+async listSelectableModels() : Promise<Result<SelectableModelInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_selectable_models") };
 } catch (e) {
@@ -615,9 +663,17 @@ async addConnection(provider: string, label: string, apiKey: string, baseUrl: st
     else return { status: "error", error: e  as any };
 }
 },
-async updateConnection(id: string, label: string, enabled: boolean, apiKey: string | null, baseUrl: string | null, models: string[], claudeCloaking: boolean | null) : Promise<Result<ConnectionInfo[], CmdError>> {
+async renameConnection(id: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_connection", { id, label, enabled, apiKey, baseUrl, models, claudeCloaking }) };
+    return { status: "ok", data: await TAURI_INVOKE("rename_connection", { id, label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setConnectionEnabled(id: string, enabled: boolean) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_connection_enabled", { id, enabled }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1248,7 +1304,7 @@ transport: string; command: string | null; args: string[];
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
-export type AgentSettingsInfo = { model: string | null; 
+export type AgentSettingsInfo = { model: string | null;
 /**
  * "plan" | "ask" | "edit" | "full"; None = engine default ("ask").
  */
@@ -1312,11 +1368,11 @@ export type CatalogEntry = { id: string; name: string;
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
-export type ChatRequestOptions = { model: string | null; context: ChatContextArg | null; attachments?: string[]; 
+export type ChatRequestOptions = { model: string | null; effort: string | null; context: ChatContextArg | null; attachments?: string[];
 /**
  * None => engine default (worktree ON, new engine-named branch from HEAD).
  */
-git: GitOptions | null; 
+git: GitOptions | null;
 /**
  * Initial permission mode for the session being started (new-chat
  * picker). `None` ⇒ inherit the project default.
@@ -1327,24 +1383,16 @@ export type CodexResetCreditInfo = { status: string; grantedAt: string | null; e
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
 export type CommandInfo = { name: string; description: string; agent: string | null }
-export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; baseUrl: string | null; models: string[]; 
-/**
- * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
- */
-keyMasked: string | null; 
+export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[];
 /**
  * OAuth connections only: true once refresh has failed terminally and
  * the user needs to reconnect via the browser/paste flow again.
  */
-needsRelogin: boolean; 
-/**
- * Anthropic OAuth only: enable full Claude Code-style request cloaking.
- */
-claudeCloaking: boolean }
+needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } |
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -1368,20 +1416,20 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).
  */
-{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number } | 
+{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number } |
 /**
  * A provider OAuth flow produced its authorize URL. Surfaces open it
  * (Cockpit maps this onto the legacy OauthAuthorizeUrlMsg Tauri event).
  */
-{ kind: "oauthAuthorizeUrl"; provider: string; authorize_url: string } | 
+{ kind: "oauthAuthorizeUrl"; provider: string; authorize_url: string } |
 /**
  * Same for a plugin OAuth flow.
  */
-{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } | 
+{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } |
 /**
  * Per-session accumulated cost: total USD and a per-model token+dollar
  * breakdown. Emitted alongside `ContextUsage`.
- * 
+ *
  * Like its sibling context-telemetry variants above, this variant's own
  * fields stay snake_case (`session_pk`, `total_usd`): the enum-level
  * `rename_all = "camelCase"` on `CoreEvent` only renames the `kind` tag
@@ -1398,17 +1446,18 @@ export type CoreEventMsg = { event: CoreEvent }
  * cadence the frontend's `await_kiro_device_flow` call will honor.
  */
 export type DeviceFlowInfo = { flowId: string; userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number; interval: number }
+export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
 export type DirEntryInfo = { name: string; dir: boolean }
 /**
  * Mirror of `crate::plugins::doctor::DoctorFinding`. Already secret-free at
  * the source (see that module's doc comment) — this DTO adds no new fields,
  * just the specta `Type` the core struct doesn't derive.
  */
-export type DoctorFinding = { pluginId: string; 
+export type DoctorFinding = { pluginId: string;
 /**
  * `warn` | `error`.
  */
-severity: string; 
+severity: string;
 /**
  * `reconnect-required` | `missing-binary` | `attach-failed`.
  */
@@ -1470,6 +1519,8 @@ export type Message = { sessionPk: string; seq: number; role: string; blockType:
  * current price table at emit time.
  */
 export type ModelCost = { model: string; input: number; output: number; cacheRead: number; cacheCreation: number; usd: number }
+export type ModelDefaultSource = "configured" | "provider" | "variesByTarget" | "none"
+export type ModelPreferenceKey = { family: string; model: string }
 export type ModelRouteInfo = { id: string; name: string; enabled: boolean; strategy: ModelRouteStrategy; targets: ModelRouteTarget[]; createdAt: number; updatedAt: number }
 export type ModelRouteStrategy = "fallback" | "round-robin"
 export type ModelRouteTarget = { 
@@ -1478,7 +1529,12 @@ export type ModelRouteTarget = {
  * connection id. The router expands this to every enabled account in
  * the family serving `model`, at request time.
  */
-provider: string; model: string }
+provider: string; model: string; 
+/**
+ * Compatibility-only storage for legacy Codex virtual model suffixes.
+ * New route writes cannot edit this value directly.
+ */
+effort: string | null }
 /**
  * One persisted probe verdict row across ALL families — hydrates the
  * app-wide model-status store consumed by every model picker.
@@ -1524,31 +1580,31 @@ source: string;
 /**
  * Any of `provider` | `runtime` | `gateway` | `connector`.
  */
-capabilities: string[]; 
+capabilities: string[];
 /**
  * `integration` | `provider` | `gateway` | `skill-pack`. There is no
  * `runtime` kind: the native agent is built-in engine behavior, not an
  * installable/listed plugin, so it never appears in this payload.
  */
-kind: string; 
+kind: string;
 /**
  * Kind-specific "already set up" flag: integration = configured ||
  * enabled; provider = ≥1 connection in the provider's family; gateway =
  * all manifest settings present; skill-pack = installed on disk.
  */
-installed: boolean; 
+installed: boolean;
 /**
  * Provider family head id (providers only) — the Models `providerDetail`
  * navigation target. `None` for other kinds.
  */
-family: string | null; 
+family: string | null;
 /**
  * Mirrors `crate::store::PluginInstallRecord.pinned` — `false` when the
  * plugin has no `plugin_installs` ledger row (never installed via the
  * tracked git-clone path, e.g. builtins/catalog integrations with no
  * skill-pack install).
  */
-pinned: boolean; 
+pinned: boolean;
 /**
  * The ledger row's git origin (`PluginInstallRecord.source_spec`).
  * Distinct from `source` (the stable builtin/catalog/skill-pack enum
@@ -1609,44 +1665,49 @@ export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string;
  * failure — the flow entry survives failures so manual paste still works.
  */
 export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
-export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
+export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null;
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —
  * NOT a DB column. Self-corrects if the user later runs `git init`.
  */
 isGit: boolean }
+export type ProjectRuntimeInfo = { projectId: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
+export type ProviderQuotaCapability = "claude" | "codex"
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
+export type ReasoningEffortOption = { value: string; label: string; description: string | null }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
-export type Session = { sessionPk: string; 
+export type SelectableModelInfo = { kind: SelectableModelKind; requestValue: string; displayName: string; preferenceKey: ModelPreferenceKey | null; supported: ReasoningEffortOption[]; configuredDefault: string | null; resolvedDefault: string | null; defaultSource: ModelDefaultSource }
+export type SelectableModelKind = "concrete" | "namedRoute"
+export type Session = { sessionPk: string;
 /**
  * `None` for chat-first sessions (`kind != Project`); a project-bound
  * session always has this set.
  */
-projectId: string | null; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; 
+projectId: string | null; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus;
 /**
  * Per-session permission mode. Copied from the project (or the new-chat
  * picker) at creation; changing it affects THIS session only.
  */
-permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
+permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number;
 /**
  * True when the engine auto-generated the branch name (`harness/{short}`).
  * `end_session` deletes the branch ONLY when this is set; user-named and
  * pre-existing branches survive teardown.
  */
-branchOwned: boolean; kind: SessionKind; 
+branchOwned: boolean; kind: SessionKind;
 /**
  * Who is speaking in this session (chat-first; e.g. a Discord user id
  * or `"cockpit"`). Unused for `Project` sessions.
  */
-speaker: string | null; 
+speaker: string | null;
 /**
  * Which agent persona/config is driving this session. Unused for
  * `Project` sessions.
  */
-agent: string | null; 
+agent: string | null;
 /**
  * The session this one was spawned from (`Worker`/`Review` lineage).
  */
@@ -1660,6 +1721,8 @@ parentSessionPk: string | null }
  */
 export type SessionKind = "project" | "chat" | "worker" | "review"
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
+export type SessionRuntimeInfo = { sessionPk: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
+export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
 /**
  * Mirror of `crate::skills_install::BeginInstall`, flattened into a single
  * `{completed, trust?, plugin?}` shape the wizard can branch on without a

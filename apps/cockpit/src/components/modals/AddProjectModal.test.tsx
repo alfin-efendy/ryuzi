@@ -59,7 +59,7 @@ test("clone mode defaults the destination from the projects_root setting and sub
   const onClose = mock(() => {});
   render(<AddProjectModal open onClose={onClose} />);
 
-  fireEvent.click(screen.getByRole("radio", { name: "Clone from URL" }));
+  fireEvent.click(screen.getByRole("radio", { name: /Clone from URL/ }));
   await waitFor(() => expect((screen.getByPlaceholderText("Projects folder") as HTMLInputElement).value).toBe("C:\\proj"));
 
   const clone = screen.getByRole("button", { name: "Clone" }) as HTMLButtonElement;
@@ -78,10 +78,25 @@ test("clone mode defaults the destination from the projects_root setting and sub
 test("Browse overrides the clone destination for this clone only", async () => {
   render(<AddProjectModal open onClose={() => {}} />);
 
-  fireEvent.click(screen.getByRole("radio", { name: "Clone from URL" }));
+  fireEvent.click(screen.getByRole("radio", { name: /Clone from URL/ }));
   await waitFor(() => expect((screen.getByPlaceholderText("Projects folder") as HTMLInputElement).value).toBe("C:\\proj"));
 
   pickDirectory.mockResolvedValueOnce("D:\\elsewhere");
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  fireEvent.click(screen.getByRole("button", { name: "Browse destination" }));
   await waitFor(() => expect((screen.getByPlaceholderText("Projects folder") as HTMLInputElement).value).toBe("D:\\elsewhere"));
+});
+
+test("uses Choice Cards and keeps workflow actions in the footer", async () => {
+  render(<AddProjectModal open onClose={() => {}} />);
+  expect(screen.getByRole("dialog", { name: "New project" })).toBeTruthy();
+  expect(screen.getByRole("radio", { name: /Open folder/ })).toBeTruthy();
+  expect(screen.getByRole("radio", { name: /Clone from URL/ })).toBeTruthy();
+  const choose = screen.getByRole("button", { name: "Choose folder" });
+  expect(choose.closest('[data-slot="modal-footer"]')).not.toBeNull();
+
+  fireEvent.click(screen.getByText("Clone a Git repository into the Projects folder."));
+  const browse = await screen.findByRole("button", { name: "Browse destination" });
+  const clone = screen.getByRole("button", { name: "Clone" });
+  expect(browse.closest('[data-slot="modal-footer"]')).not.toBeNull();
+  expect(clone.closest('[data-slot="modal-footer"]')).not.toBeNull();
 });
