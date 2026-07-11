@@ -1054,7 +1054,18 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
                         match finish_task(cp2.store(), &task_id, "running", "failed", None, Some(e))
                             .await
                         {
-                            Ok(true) => emit_changed(&cp2, &task_id, root_id, "failed"),
+                            Ok(true) => {
+                                // Symmetry with the START-failure path (see
+                                // `mark_gave_up` above): a child failed via this
+                                // fallback must be `gave_up`-visible to the
+                                // `roots_with_failed_children` sweep, or its root
+                                // would wait forever — there is no waiting-root
+                                // reaper. Only reachable under a genuine transient
+                                // DB fault (the common `QueryReturnedNoRows` race
+                                // no-ops via the `expected="running"` guard).
+                                let _ = mark_gave_up(cp2.store(), &task_id).await;
+                                emit_changed(&cp2, &task_id, root_id, "failed");
+                            }
                             _ => tracing::debug!(
                                 "orch: task {task_id} outcome discarded (cancelled?)"
                             ),
