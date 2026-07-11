@@ -5,6 +5,7 @@ use crate::error::CmdError;
 use futures::Stream;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::sync::Arc;
 
 pub struct EngineClient {
     base_url: String,
@@ -19,6 +20,20 @@ impl EngineClient {
             token,
             // No global timeout: OAuth flows legitimately block for minutes.
             http: reqwest::Client::new(),
+        }
+    }
+
+    /// Like [`EngineClient::new`], but for a remote runner reached over TLS
+    /// where the leaf certificate is pinned by fingerprint (TOFU — paired
+    /// once via `/pair`, no CA chain) rather than validated against a root
+    /// store. `fingerprint` is the SHA-256 (base64) of the runner's cert, as
+    /// returned by the daemon's `tls::load_or_generate` and captured during
+    /// pairing. Same no-global-timeout property as `new`.
+    pub fn new_pinned(base_url: String, device_token: String, fingerprint: String) -> Self {
+        EngineClient {
+            base_url,
+            token: device_token,
+            http: pinned_client(&fingerprint),
         }
     }
 
@@ -234,6 +249,117 @@ fn spawn_engine_daemon(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---- P3-2: pinned-TLS client for remote runners ----
+//
+// Ported verbatim from `crates/core/tests/control_api.rs`'s
+// `remote_pair_then_authed_rpc_and_sse_over_pinned_tls` test support code
+// (FingerprintPin + pinned_client), which is exercised end-to-end there
+// against a real ring `ServerConfig` (`tls::load_or_generate` +
+// `tls::server_config`). Reuses `ryuzi_core::tls::fingerprint_cert_der` —
+// never reimplement the hash, or client and server pins drift and nothing
+// connects.
+
+/// A `rustls::client::danger::ServerCertVerifier` that trusts ONE
+/// certificate: the one whose SHA-256 fingerprint (base64, standard
+/// alphabet — computed via the real `tls::fingerprint_cert_der`, not a
+/// reimplementation, so the two can never drift) matches
+/// `expected_fingerprint`. This is TOFU certificate pinning, not
+/// `danger_accept_invalid_certs` — a presented cert with the WRONG
+/// fingerprint is rejected, `danger_accept_invalid_certs` would accept it.
+///
+/// Signature verification is NOT skipped: `verify_tls12_signature` /
+/// `verify_tls13_signature` delegate to the ring provider's own algorithms
+/// (`rustls::crypto::verify_tls12_signature` / `verify_tls13_signature`), so
+/// this verifier only relaxes the CA-chain-of-trust check (there is no CA —
+/// see `tls.rs`'s module docs), not cryptographic signature validation.
+#[derive(Debug)]
+struct FingerprintPin {
+    expected_fingerprint: String,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for FingerprintPin {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let presented = ryuzi_core::tls::fingerprint_cert_der(end_entity.as_ref());
+        if presented == self.expected_fingerprint {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "fingerprint pin mismatch: expected {}, got {presented}",
+                self.expected_fingerprint
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A `reqwest::Client` wired to a ring-provider `rustls::ClientConfig` whose
+/// only trust decision is [`FingerprintPin`] — built via
+/// `ClientBuilder::use_preconfigured_tls`, the supported way to hand reqwest
+/// a fully custom rustls config (confirmed against the vendored reqwest
+/// 0.12.28 / rustls 0.23.41 sources: `use_preconfigured_tls` downcasts to
+/// `rustls::ClientConfig` and, when it matches, routes straight to
+/// `Connector::new_rustls_tls`, bypassing reqwest's own root-store/verifier
+/// setup entirely).
+fn pinned_client(fingerprint: &str) -> reqwest::Client {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(FingerprintPin {
+        expected_fingerprint: fingerprint.to_string(),
+        provider: provider.clone(),
+    });
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+
+    reqwest::Client::builder()
+        .use_preconfigured_tls(client_config)
+        .build()
+        .expect("reqwest client builds over the preconfigured pinned rustls config")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +453,36 @@ mod tests {
             !events[0]["text"].as_str().unwrap().contains('\u{FFFD}'),
             "multi-byte char must not be corrupted into U+FFFD"
         );
+    }
+
+    /// Construction-only smoke test: `pinned_client` builds a `reqwest::Client`
+    /// over a preconfigured, ring-provider rustls `ClientConfig` without
+    /// panicking (the `.expect()`s inside `pinned_client` would panic on a
+    /// bad provider/config or a `use_preconfigured_tls` downcast mismatch —
+    /// see the rustls-unification note on the Cargo.toml dependency). A full
+    /// handshake test (correct fingerprint accepted, wrong one rejected) is
+    /// already covered end-to-end against a real ring `ServerConfig` in
+    /// `crates/core/tests/control_api.rs`'s
+    /// `remote_pair_then_authed_rpc_and_sse_over_pinned_tls` — this is the
+    /// SAME `FingerprintPin`/`pinned_client` code, ported verbatim, so that
+    /// coverage applies here too. Standing up a second TLS server in this
+    /// crate's unit tests would be redundant; `EngineClient::new_pinned`
+    /// itself is a plain field-assignment wrapper with no branching logic to
+    /// cover beyond "it constructs".
+    ///
+    /// Note: on this Windows dev box, `cargo test -p ryuzi-cockpit` can crash
+    /// the test binary for unrelated reasons (tauri#13419); `cargo check
+    /// --tests -p ryuzi-cockpit` compiling this test is acceptable evidence
+    /// when the binary itself cannot be run locally.
+    #[test]
+    fn pinned_client_and_new_pinned_construct_without_panicking() {
+        let _client = pinned_client("somefp");
+        let engine = EngineClient::new_pinned(
+            "https://127.0.0.1:9999".into(),
+            "device-token".into(),
+            "somefp".into(),
+        );
+        assert_eq!(engine.base_url, "https://127.0.0.1:9999");
+        assert_eq!(engine.token, "device-token");
     }
 }
