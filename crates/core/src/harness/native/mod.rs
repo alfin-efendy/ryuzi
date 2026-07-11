@@ -259,16 +259,20 @@ impl Harness for NativeHarness {
                 // triggers — is the AGENT deciding to call a tool, not a
                 // direct human action, so a top-level Project/Chat session is
                 // `Agent` origin (tightening skill_manage's autonomous-write
-                // guard there too); Worker/Review keep the prior blanket
-                // `User` default the review fork's own separate `RunnerDeps`
-                // build overrides to `BackgroundReview` regardless.
+                // Every autonomous agent session (Project/Chat/Worker) runs as
+                // `Agent` so the negative-space storage guard + the skill_manage
+                // guard engage; the human acts as `User` through Cockpit/TUI. A
+                // Worker is an UNATTENDED orchestration agent — it must be at
+                // least as guarded as an attended chat, never less (avoiding the
+                // "unattended-with-more-power" inversion). Review never routes
+                // through here: its fork builds `RunnerDeps` directly with
+                // `BackgroundReview`, so the `Review` arm below is defensively
+                // dead.
                 write_origin: match ctx.kind {
-                    crate::domain::SessionKind::Project | crate::domain::SessionKind::Chat => {
-                        crate::domain::WriteOrigin::Agent
-                    }
-                    crate::domain::SessionKind::Worker | crate::domain::SessionKind::Review => {
-                        crate::domain::WriteOrigin::User
-                    }
+                    crate::domain::SessionKind::Project
+                    | crate::domain::SessionKind::Chat
+                    | crate::domain::SessionKind::Worker => crate::domain::WriteOrigin::Agent,
+                    crate::domain::SessionKind::Review => crate::domain::WriteOrigin::User,
                 },
             },
             live_cancel: Mutex::new(None),
