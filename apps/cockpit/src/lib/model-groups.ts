@@ -48,15 +48,15 @@ export function modelStatusKey(value: string, catalog: CatalogEntry[]): { family
   return { family: entry.family, model: entry.family === "openai" ? stripCodexVariant(rawModel) : rawModel };
 }
 
-/** Group the composer's runtime model ids by provider family (PR #70 data).
- *  Runtime ids may be prefixed ("anthropic/claude-fable-5", or a catalog
+/** Group the composer's selectable model ids by provider family (PR #70
+ *  data). Ids may be prefixed ("anthropic/claude-fable-5", or a catalog
  *  entry id like "anthropic-oauth/…" which resolves to its family): a known
  *  prefix wins and the label is trimmed to the part after it. Bare ids fall
  *  back to connection/catalog model lists, where only families with an
  *  ENABLED connection contribute. Unmatched BARE ids are route aliases (the
  *  backend emits routes as the only bare ids) and land in "Route", pinned
  *  first; unmatched PREFIXED ids land in "Other", pinned last. No usable
- *  data → flat list unchanged. Values are always the raw runtime ids.
+ *  data → flat list unchanged. Values are always the raw model ids.
  *  With `opts`, persisted probe verdicts (`statuses`, keyed via `statusKey`)
  *  flag invalid options; `hideInvalid` drops them — except `selectedValue`,
  *  which stays visible and flagged so the picker warns instead of silently
@@ -128,12 +128,12 @@ export function groupModelOptions(
     // auto-switching of the selected model).
     if (opts?.hideInvalid === true && invalid && m !== opts.selectedValue) continue;
     flat.push(opt(m, m, invalid));
-    // Prefixed runtime id ("anthropic/claude-fable-5"): the prefix path
-    // trusts the runtime list (it only contains connected providers' models
-    // by construction), so the connected-families gate applies only to the
-    // bare-id fallback below. A prefix that is a catalog ENTRY id rather
-    // than a family ("anthropic-oauth/…", as built by the runtime detail
-    // view's endpoint card) resolves to that entry's family. The value
+    // Prefixed model id ("anthropic/claude-fable-5"): the prefix path
+    // trusts the selectable-model list (it only contains connected
+    // providers' models by construction), so the connected-families gate
+    // applies only to the bare-id fallback below. A prefix that is a catalog
+    // ENTRY id rather than a family ("anthropic-oauth/…", as built by a
+    // connection-scoped picker) resolves to that entry's family. The value
     // stays the full raw id — only the label is trimmed.
     const slash = m.indexOf("/");
     const prefix = slash > 0 ? m.slice(0, slash) : null;

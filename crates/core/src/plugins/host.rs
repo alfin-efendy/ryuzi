@@ -110,7 +110,7 @@ fn register_plugin_fields(manifest: &PluginManifest) {
 /// Where a plugin's manifest/behavior came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginSource {
-    /// Shipped inside the `ryuzi` binary (native, claude-code, discord).
+    /// Shipped inside the `ryuzi` binary (the native harness, the discord gateway).
     Builtin,
     /// Bundled in the embedded plugin catalog.
     Catalog,

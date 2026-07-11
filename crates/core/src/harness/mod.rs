@@ -37,7 +37,9 @@ pub struct SessionCtx {
     pub store: Arc<Store>,
 }
 
-/// A registered agent runtime (e.g. Claude Code via ACP in Spec 3).
+/// A registered agent runtime. `NativeHarness` (see `harness::native`) is the
+/// only production implementation; the trait boundary otherwise exists so
+/// tests can substitute fakes.
 #[async_trait]
 pub trait Harness: Send + Sync {
     /// Begin (or resume) a session; returns a live handle for its lifetime.

@@ -131,7 +131,8 @@ type NavState = {
   composerBranch: string | null;
   /** Run the session in an isolated git worktree (matrix column 1). */
   composerUseWorktree: boolean;
-  /** Model the next composed session should run on; null = project/runtime default. */
+  /** Model the next composed session should run on; null = fall back to the
+   *  project's pinned model, then the agent's default model (see HomeView). */
   composerModel: string | null;
   /** Unsent composer text keyed by composer identity: a sessionPk (SessionView)
    *  or `home:{projectId}` (HomeView). Persisted so drafts survive restarts. */

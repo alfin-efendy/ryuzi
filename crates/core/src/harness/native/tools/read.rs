@@ -4,7 +4,7 @@ use super::{jail, truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-/// 2 MiB read cap, matching the ACP fs handler and Cockpit's `read_file`.
+/// 2 MiB read cap, matching Cockpit's `read_file` command.
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Images at or under this size come back as a vision block; larger ones get

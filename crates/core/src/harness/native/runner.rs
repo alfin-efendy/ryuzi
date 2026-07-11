@@ -1,6 +1,6 @@
 //! The native turn drain: one `run_turn` runs a prompt to completion, calling
 //! the model, executing tools, and persisting + streaming everything through
-//! the same [`CoreEvent`] surface the ACP harness uses.
+//! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
 use super::commands::CommandRegistry;

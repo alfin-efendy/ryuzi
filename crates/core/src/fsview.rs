@@ -9,14 +9,7 @@ pub struct DirEntry {
     pub dir: bool,
 }
 
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    ".sidecar-build",
-    "dist",
-    ".next",
-];
+const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "dist", ".next"];
 
 /// Resolve `rel` under `root`, rejecting absolute paths and `..` escapes.
 pub fn jail(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {

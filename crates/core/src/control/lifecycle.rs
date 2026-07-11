@@ -178,16 +178,18 @@ impl ControlPlane {
             self.wait_for_startup(session_pk).await;
         }
 
-        // Fast path: reuse the live ACP session if its handle is still in the
-        // `running` map. The live adapter already holds context, so no new
-        // adapter is spawned and no `session/load` replay happens.
+        // Fast path: reuse the live native session if its handle is still in
+        // the `running` map. The live harness already holds context, so no
+        // new session is spawned and no transcript replay happens.
         let existing = self.running.lock().unwrap().get(session_pk).cloned();
         let handle = match existing {
             Some(handle) => handle,
             None => {
                 // Cold-resume path: the in-memory handle is gone (e.g. after an
-                // app restart). Start a FRESH session that resumes the prior
-                // conversation via `session/load` using the persisted agent id.
+                // app restart). Start a FRESH native session; it reconstructs
+                // conversation context from the persisted transcript keyed by
+                // `session_pk` (the `resume` id passed through is currently
+                // unused by `NativeHarness`, which resumes from the Store).
                 let resume = async {
                     let project = self
                         .store
@@ -793,8 +795,9 @@ impl ControlPlane {
     }
 
     /// Tear down a session. This is the ONLY place the persistent live-session
-    /// handle is removed from `running` and `end()`ed (graceful ACP teardown),
-    /// after which the worktree is cleaned up and the session marked `Ended`.
+    /// handle is removed from `running` and `end()`ed (graceful native-harness
+    /// teardown), after which the worktree is cleaned up and the session
+    /// marked `Ended`.
     pub async fn end_session(&self, session_pk: &str) -> anyhow::Result<()> {
         // Abort any in-flight background startup and WAIT for it to unwind
         // before tearing down: the teardown below must read the FINAL

@@ -480,8 +480,9 @@ pub struct PluginInfo {
     pub source: String,
     /// Any of `provider` | `runtime` | `gateway` | `connector`.
     pub capabilities: Vec<String>,
-    /// `integration` | `provider` | `gateway` | `skill-pack`. Runtime-kind
-    /// plugins are excluded from the list — the Runtime page owns them.
+    /// `integration` | `provider` | `gateway` | `skill-pack`. There is no
+    /// `runtime` kind: the native agent is built-in engine behavior, not an
+    /// installable/listed plugin, so it never appears in this payload.
     pub kind: String,
     /// Kind-specific "already set up" flag: integration = configured ||
     /// enabled; provider = ≥1 connection in the provider's family; gateway =

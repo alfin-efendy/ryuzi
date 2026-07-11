@@ -1151,7 +1151,8 @@ export type AgentSettingsInfo = { model: string | null;
 permMode: string | null }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 /**
- * The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+ * The user's decision on a tool-approval request from the native runtime's
+ * permission gate.
  */
 export type ApprovalDecision = "allowOnce" | "allowAlways" | "rejectOnce" | "rejectAlways" | "cancel"
 /**
@@ -1342,7 +1343,7 @@ export type KeychainStatus =
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
- * A persisted transcript entry. Forward-compatible with ACP session/update blocks.
+ * A persisted transcript entry, one row per native-runtime event block.
  */
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
 /**
@@ -1407,8 +1408,9 @@ source: string;
  */
 capabilities: string[]; 
 /**
- * `integration` | `provider` | `gateway` | `skill-pack`. Runtime-kind
- * plugins are excluded from the list — the Runtime page owns them.
+ * `integration` | `provider` | `gateway` | `skill-pack`. There is no
+ * `runtime` kind: the native agent is built-in engine behavior, not an
+ * installable/listed plugin, so it never appears in this payload.
  */
 kind: string; 
 /**
