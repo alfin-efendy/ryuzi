@@ -149,6 +149,7 @@ mock.module("@/bindings", () => ({
     listRuntimes: () => ok([claudeRuntime]),
     refreshRuntimes: () => ok([claudeRuntime]),
   },
+  events: {},
 }));
 
 const { RuntimeDetailView } = await import("./RuntimeDetailView");

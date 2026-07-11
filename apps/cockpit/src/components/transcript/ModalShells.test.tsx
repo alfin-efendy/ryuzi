@@ -1,5 +1,5 @@
 import { expect, mock, test } from "bun:test";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import type { Row } from "@/lib/transcript";
 
 mock.module("@tauri-apps/api/core", () => ({
@@ -17,8 +17,9 @@ mock.module("@/bindings", () => ({
 const { FileChangeCards } = await import("./FileChangeCards");
 const { Transcript } = await import("./Transcript");
 
-test("file revert confirmation uses the shared shell and footer", () => {
+test("file revert confirmation uses the shared shell and footer", async () => {
   render(<FileChangeCards sessionPk="s1" cards={[{ path: "/repo/file.txt", kind: "edit" }]} />);
+  await act(async () => {});
   fireEvent.click(screen.getByRole("button", { name: "Undo" }));
   const dialog = screen.getByRole("dialog", { name: "Revert file.txt?" });
   expect(dialog.querySelector('[data-slot="modal-footer"]')).toBeTruthy();
