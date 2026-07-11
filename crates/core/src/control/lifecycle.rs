@@ -528,7 +528,7 @@ impl ControlPlane {
                 },
             )
             .await;
-            let worktree_candidate = worktree_path_for(&project.project_id, session_pk);
+            let worktree_candidate = worktree_path_for(None, &project.project_id, session_pk);
             let repo_dir = std::path::PathBuf::from(&project.workdir);
             let prep_pk = session_pk.to_string();
             let prep_git = git;
