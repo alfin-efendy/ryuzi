@@ -330,6 +330,25 @@ export function formatToolDuration(ms: number | null): string {
 }
 
 /**
+ * Live-turn startup can stream backend status rows (worktree/tool setup)
+ * before the durable user-message row is persisted, producing a leading
+ * `activity` group ahead of the turn's `user` group. Moves that leading run
+ * of `activity` groups to sit right after the `user` group so the user's own
+ * message always renders first. No-op when the shape doesn't match (e.g. the
+ * user group is already first, or something other than `activity` precedes
+ * it).
+ */
+function placeLeadingLiveActivityAfterUser(groups: Group[]): Group[] {
+  const firstUser = groups.findIndex((group) => group.type === "user");
+  if (firstUser <= 0) return groups;
+  const leading = groups.slice(0, firstUser);
+  if (!leading.every((group) => group.type === "activity")) return groups;
+  const user = groups[firstUser];
+  if (!user || user.type !== "user") return groups;
+  return [user, ...leading, ...groups.slice(firstUser + 1)];
+}
+
+/**
  * Splits rows into user turns and collapses each COMPLETED turn's activity
  * (thought/tool/status groups) into one summary block placed where the first
  * collapsed group appeared. Agent text and errors stay inline; the last agent
@@ -348,6 +367,17 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
   }
   if (cur.length > 0) turns.push(cur);
 
+  // Startup can persist backend status rows (worktree/tool setup) before the
+  // durable first user message lands, so the very first "turn" may have no
+  // leading user row (every later turn always starts at the user row that
+  // split it). When that orphaned turn directly precedes the live final
+  // turn, fold it into the live turn so grouping/placement below treats them
+  // as one live turn instead of an already-"completed" turn.
+  if (running && turns.length === 2 && !turns[0].some((r) => r.role === "user")) {
+    turns[1] = [...turns[0], ...turns[1]];
+    turns.shift();
+  }
+
   const out: TurnBlock[] = [];
   let rowOffset = 0;
   turns.forEach((turnRows, t) => {
@@ -357,7 +387,7 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
     rowOffset += turnRows.length;
     const live = running && t === turns.length - 1;
     if (live) {
-      out.push(...groups);
+      out.push(...placeLeadingLiveActivityAfterUser(groups));
       return;
     }
     const agentGroups = groups.filter((g) => g.type === "agent");
