@@ -191,6 +191,7 @@ mod tests {
         let mut ctx = ctx_at(dir).await;
         ctx.memory = Some(Arc::new(MemoryStore::new(
             dir.join("mem/MEMORY.md"),
+            dir.join("mem/USER.md"),
             Some(dir.join("mem/projects/p1.md")),
         )));
         ctx

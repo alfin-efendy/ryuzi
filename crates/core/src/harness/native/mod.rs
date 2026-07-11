@@ -156,14 +156,15 @@ impl Harness for NativeHarness {
             effort_policy.project_override = ctx.effort;
         }
         // Persistent memory is unconditional: a chat (project-less) session
-        // still gets GLOBAL memory, while a project session gets global +
-        // project scope. `at_default(None)` sets the global path and leaves
-        // the project path unset — global memory works, project-scope ops
-        // error cleanly — so previously skipping `MemoryStore` entirely for
-        // `project_id: None` needlessly denied chat sessions memory. Tool-
-        // policy lookups (below, via `RunnerDeps::project_id`) stay
-        // project-scoped and off without a project — chat sessions have no
-        // project to scope a `tool_policies` row to.
+        // still gets GLOBAL + USER memory, while a project session gets
+        // global + user + project scope. `at_default(None)` sets the global
+        // and user paths unconditionally and leaves the project path unset —
+        // global/user memory work, project-scope ops error cleanly — so
+        // previously skipping `MemoryStore` entirely for `project_id: None`
+        // needlessly denied chat sessions memory. Tool-policy lookups
+        // (below, via `RunnerDeps::project_id`) stay project-scoped and off
+        // without a project — chat sessions have no project to scope a
+        // `tool_policies` row to.
         let project_id = ctx.project_id.clone();
         let memory_store = Some(Arc::new(memory::MemoryStore::at_default(
             project_id.as_deref(),
@@ -465,22 +466,25 @@ mod tests {
     /// previously skipped `MemoryStore` construction entirely (`project_id:
     /// None` short-circuited it in `NativeHarness::start_session`), so a
     /// fact saved by one chat session was invisible to the next. Seed the
-    /// GLOBAL memory file `at_default(None)` resolves to, start a session
-    /// through the real `Harness` trait with `ctx.project_id: None` (as
-    /// `ctx_for` now sets), and confirm the seeded entry reaches the first
-    /// request's system prompt exactly like `memory_snapshot_reaches_
+    /// GLOBAL and USER memory files `at_default(None)` resolves to, start a
+    /// session through the real `Harness` trait with `ctx.project_id: None`
+    /// (as `ctx_for` now sets), and confirm both seeded entries reach the
+    /// first request's system prompt exactly like `memory_snapshot_reaches_
     /// primary_system_but_not_subagents` proves it does for a project
-    /// session in `runner.rs`.
+    /// session in `runner.rs`. A chat session has no project, so `user` is
+    /// the only per-person scope it ever sees.
     #[tokio::test]
     #[serial_test::serial]
-    async fn chat_session_without_a_project_still_gets_global_memory() {
+    async fn chat_session_without_a_project_still_gets_global_and_user_memory() {
         use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
         let _guard = StateDirGuard::new();
-        memory::MemoryStore::at_default(None)
-            .add(
-                memory::MemoryScope::Global,
-                "the deploy key lives in 1Password",
-            )
+        let mem = memory::MemoryStore::at_default(None);
+        mem.add(
+            memory::MemoryScope::Global,
+            "the deploy key lives in 1Password",
+        )
+        .unwrap();
+        mem.add(memory::MemoryScope::User, "prefers terse answers")
             .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
@@ -517,6 +521,13 @@ mod tests {
             "{system}"
         );
         assert!(system.contains("# Persistent memory (global)"), "{system}");
+        assert!(system.contains("prefers terse answers"), "{system}");
+        assert!(system.contains("# Persistent memory (user)"), "{system}");
+        // No project in a chat session, so no project section.
+        assert!(
+            !system.contains("# Persistent memory (project)"),
+            "{system}"
+        );
     }
 
     #[tokio::test]

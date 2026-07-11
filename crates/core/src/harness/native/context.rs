@@ -86,11 +86,14 @@ pub fn assemble_system(
     }
 
     // Persistent memory snapshot (before skills so remembered conventions
-    // precede tooling hints).
+    // precede tooling hints), followed immediately by the "don't hoard"
+    // guidance so the model reads the contract right where it reads the
+    // scopes it applies to.
     if let Some(mem) = memory {
         let mem = mem.trim();
         if !mem.is_empty() {
             sections.push(mem.to_string());
+            sections.push(super::memory::MEMORY_GUIDANCE.to_string());
         }
     }
 
@@ -176,5 +179,24 @@ mod tests {
         // Empty snapshots add nothing.
         let sys = assemble_system(dir.path(), &[], Some("   "));
         assert!(!sys.contains("Persistent memory"));
+    }
+
+    #[test]
+    fn memory_guidance_follows_a_present_snapshot_but_not_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = assemble_system(
+            dir.path(),
+            &[],
+            Some("# Persistent memory (global) [1% full — 11/6000 chars]\nglobal fact"),
+        );
+        assert!(sys.contains(super::super::memory::MEMORY_GUIDANCE));
+        let mem_pos = sys.find("# Persistent memory").unwrap();
+        let guidance_pos = sys.find(super::super::memory::MEMORY_GUIDANCE).unwrap();
+        assert!(mem_pos < guidance_pos, "guidance must follow the snapshot");
+        // No snapshot -> no guidance either (nothing to explain).
+        let sys = assemble_system(dir.path(), &[], None);
+        assert!(!sys.contains(super::super::memory::MEMORY_GUIDANCE));
+        let sys = assemble_system(dir.path(), &[], Some("   "));
+        assert!(!sys.contains(super::super::memory::MEMORY_GUIDANCE));
     }
 }

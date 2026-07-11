@@ -3931,7 +3931,11 @@ mod tests {
         let llm = Arc::new(RecordingLlm::new(vec![parent, sub, parent_end]));
         let mut deps = deps_at(dir.path(), llm.clone()).await;
         let memdir = tempfile::tempdir().unwrap();
-        let mem = MemoryStore::new(memdir.path().join("MEMORY.md"), None);
+        let mem = MemoryStore::new(
+            memdir.path().join("MEMORY.md"),
+            memdir.path().join("USER.md"),
+            None,
+        );
         mem.add(MemoryScope::Global, "remember: the repo uses bun")
             .unwrap();
         deps.memory = Some(Arc::new(mem));
