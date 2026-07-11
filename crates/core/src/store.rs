@@ -1,6 +1,6 @@
 use crate::domain::{
     Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionKind,
-    SessionStatus, Surface, ToolPolicyRow,
+    SessionStatus, SkillUsage, Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -1128,6 +1128,26 @@ fn map_plugin_attach_row(r: &Row) -> rusqlite::Result<PluginAttachStatus> {
         last_attach_at: r.get(1)?,
         outcome: r.get(2)?,
         reason: r.get(3)?,
+    })
+}
+
+const SKILL_USAGE_COLS: &str = "name, created_by, use_count, view_count, patch_count, \
+     last_used_at, last_viewed_at, last_patched_at, state, pinned, archived_at, created_at";
+
+fn map_skill_usage_row(r: &Row) -> rusqlite::Result<SkillUsage> {
+    Ok(SkillUsage {
+        name: r.get(0)?,
+        created_by: r.get(1)?,
+        use_count: r.get(2)?,
+        view_count: r.get(3)?,
+        patch_count: r.get(4)?,
+        last_used_at: r.get(5)?,
+        last_viewed_at: r.get(6)?,
+        last_patched_at: r.get(7)?,
+        state: r.get(8)?,
+        pinned: r.get::<_, i64>(9)? != 0,
+        archived_at: r.get(10)?,
+        created_at: r.get(11)?,
     })
 }
 
@@ -3179,6 +3199,130 @@ impl Store {
             )?;
             let rows = stmt
                 .query_map([], map_plugin_attach_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Bump `deploy`'s use counter and `last_used_at` — recorded on every
+    /// successful `skill_manage` USE action (Task 6).
+    pub async fn record_skill_use(&self, name: &str) -> anyhow::Result<()> {
+        self.bump_skill_counter(name, "use_count", "last_used_at")
+            .await
+    }
+
+    /// Bump the view counter — recorded when a skill's body is read (e.g. the
+    /// `skill` discovery tool), independent of whether it is later used.
+    pub async fn record_skill_view(&self, name: &str) -> anyhow::Result<()> {
+        self.bump_skill_counter(name, "view_count", "last_viewed_at")
+            .await
+    }
+
+    /// Bump the patch counter — recorded on every `skill_manage` PATCH
+    /// action, feeding the curator's (Task 10) edit-frequency heuristics.
+    pub async fn record_skill_patch(&self, name: &str) -> anyhow::Result<()> {
+        self.bump_skill_counter(name, "patch_count", "last_patched_at")
+            .await
+    }
+
+    /// Upsert-increment one `skill_usage` counter column and stamp its
+    /// paired timestamp column. `count_col`/`ts_col` are internal constants
+    /// supplied only by the three `record_skill_*` wrappers above, never
+    /// user input — safe to interpolate into the SQL text.
+    async fn bump_skill_counter(
+        &self,
+        name: &str,
+        count_col: &str,
+        ts_col: &str,
+    ) -> anyhow::Result<()> {
+        let (name, now) = (name.to_string(), now_ms());
+        let sql = format!(
+            "INSERT INTO skill_usage(name, {count_col}, {ts_col}, created_at) \
+                 VALUES (?1, 1, ?2, ?2) \
+             ON CONFLICT(name) DO UPDATE SET \
+                 {count_col} = {count_col} + 1, {ts_col} = ?2",
+        );
+        self.with_conn(move |c| c.execute(&sql, params![name, now]).map(|_| ()))
+            .await
+    }
+
+    /// Transition a skill's lifecycle state (e.g. `active` → `stale` →
+    /// `archived`), driven by the curator (Task 10). `archived_at` is
+    /// typically `Some(now)` only for the `archived` transition.
+    pub async fn set_skill_state(
+        &self,
+        name: &str,
+        state: &str,
+        archived_at: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let (name, state, now) = (name.to_string(), state.to_string(), now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO skill_usage(name, state, archived_at, created_at) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(name) DO UPDATE SET \
+                     state=excluded.state, archived_at=excluded.archived_at",
+                params![name, state, archived_at, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Pin/unpin a skill — a pinned skill is exempt from curator archival
+    /// regardless of staleness.
+    pub async fn set_skill_pinned(&self, name: &str, pinned: bool) -> anyhow::Result<()> {
+        let (name, now) = (name.to_string(), now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO skill_usage(name, pinned, created_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(name) DO UPDATE SET pinned=excluded.pinned",
+                params![name, pinned as i64, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Record that a skill was authored by an autonomous agent turn rather
+    /// than a human (Tasks 8/9 review-fork provenance).
+    pub async fn mark_skill_created_by_agent(&self, name: &str) -> anyhow::Result<()> {
+        let (name, now) = (name.to_string(), now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO skill_usage(name, created_by, created_at) \
+                     VALUES (?1, 'agent', ?2) \
+                 ON CONFLICT(name) DO UPDATE SET created_by='agent'",
+                params![name, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_skill_usage(&self, name: &str) -> anyhow::Result<Option<SkillUsage>> {
+        let name = name.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!("SELECT {SKILL_USAGE_COLS} FROM skill_usage WHERE name=?1"),
+                params![name],
+                map_skill_usage_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// All tracked skills, ordered by name — the curator's (Task 10) and the
+    /// Cockpit Learning panel's (Task 11) full-sweep read.
+    pub async fn list_skill_usage(&self) -> anyhow::Result<Vec<SkillUsage>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SKILL_USAGE_COLS} FROM skill_usage ORDER BY name"
+            ))?;
+            let rows = stmt
+                .query_map([], map_skill_usage_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -6104,5 +6248,73 @@ mod tests {
         assert_eq!(got.outcome, "ok");
         assert_eq!(got.last_attach_at, 9);
         assert_eq!(store.list_plugin_attach().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn skill_usage_records_and_transitions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.record_skill_view("deploy").await.unwrap();
+        store.record_skill_use("deploy").await.unwrap();
+        store.record_skill_use("deploy").await.unwrap();
+        let u = store.get_skill_usage("deploy").await.unwrap().unwrap();
+        assert_eq!(u.use_count, 2);
+        assert_eq!(u.view_count, 1);
+        assert_eq!(u.state, "active");
+        store
+            .set_skill_state("deploy", "stale", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_skill_usage("deploy")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_usage_patch_created_by_and_pinned_round_trip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.record_skill_patch("deploy").await.unwrap();
+        store.record_skill_patch("deploy").await.unwrap();
+        store.mark_skill_created_by_agent("deploy").await.unwrap();
+        store.set_skill_pinned("deploy", true).await.unwrap();
+        let u = store.get_skill_usage("deploy").await.unwrap().unwrap();
+        assert_eq!(u.patch_count, 2);
+        assert_eq!(u.created_by.as_deref(), Some("agent"));
+        assert!(u.pinned);
+        assert!(u.last_patched_at.is_some());
+
+        store
+            .set_skill_state("deploy", "archived", Some(42))
+            .await
+            .unwrap();
+        let u = store.get_skill_usage("deploy").await.unwrap().unwrap();
+        assert_eq!(u.state, "archived");
+        assert_eq!(u.archived_at, Some(42));
+        // set_skill_state/pinned/mark_skill_created_by_agent must not clobber
+        // counters recorded by earlier upserts on the same row.
+        assert_eq!(u.patch_count, 2);
+        assert!(u.pinned);
+    }
+
+    #[tokio::test]
+    async fn get_skill_usage_missing_returns_none_list_skill_usage_orders_by_name() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store.get_skill_usage("nope").await.unwrap().is_none());
+
+        store.record_skill_use("zeta").await.unwrap();
+        store.record_skill_use("alpha").await.unwrap();
+        let all = store.list_skill_usage().await.unwrap();
+        assert_eq!(
+            all.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
     }
 }

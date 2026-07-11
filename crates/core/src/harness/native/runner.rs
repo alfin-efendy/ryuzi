@@ -1376,6 +1376,8 @@ async fn run_tool_call(
             perm_mode: deps.perm_mode.clone(),
             project_id: deps.project_id.clone(),
         })),
+        write_origin: crate::domain::WriteOrigin::User,
+        viewed_skills: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
     };
     match tool.execute(&ctx, input).await {
         Ok(mut out) => {

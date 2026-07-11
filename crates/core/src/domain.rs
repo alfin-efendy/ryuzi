@@ -153,6 +153,70 @@ impl BackgroundKind {
     }
 }
 
+/// Which actor initiated a write — a general-purpose provenance marker
+/// carried on `ToolCtx` (Phase 4 §7) and reused by Phase 6's app-control
+/// negative-space guard. Deliberately NOT skill-usage-specific: any tool or
+/// subsystem that needs to know "who is asking" (a human in an interactive
+/// session, an autonomous agent turn, or the strictest background
+/// self-review fork) can gate on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteOrigin {
+    /// An interactive human-driven session.
+    #[default]
+    User,
+    /// An autonomous agent turn (primary or sub-agent).
+    Agent,
+    /// The background self-improvement review fork (Phase 4 §7.2) — the
+    /// strictest origin.
+    BackgroundReview,
+}
+
+impl WriteOrigin {
+    /// True for every origin except an interactive user turn.
+    pub fn is_autonomous(self) -> bool {
+        !matches!(self, WriteOrigin::User)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WriteOrigin::User => "user",
+            WriteOrigin::Agent => "agent",
+            WriteOrigin::BackgroundReview => "background_review",
+        }
+    }
+
+    /// Total: an unrecognized db string falls back to the safest default,
+    /// `User`, rather than panicking.
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "agent" => WriteOrigin::Agent,
+            "background_review" => WriteOrigin::BackgroundReview,
+            _ => WriteOrigin::User,
+        }
+    }
+}
+
+/// Per-skill telemetry (Phase 4 §4/§7): use/view/patch counters and
+/// lifecycle state, read by the `skill_manage` native tool (Task 6) and the
+/// curator (Task 10) to decide when a skill should transition between
+/// `active`, `stale`, and `archived`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillUsage {
+    pub name: String,
+    pub created_by: Option<String>,
+    pub use_count: i64,
+    pub view_count: i64,
+    pub patch_count: i64,
+    pub last_used_at: Option<i64>,
+    pub last_viewed_at: Option<i64>,
+    pub last_patched_at: Option<i64>,
+    pub state: String,
+    pub pinned: bool,
+    pub archived_at: Option<i64>,
+    pub created_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
@@ -604,6 +668,26 @@ mod tests {
             assert_eq!(SessionStatus::from_db(s.as_str()), s);
         }
         assert_eq!(SessionStatus::from_db("nonsense"), SessionStatus::Idle);
+    }
+
+    #[test]
+    fn write_origin_roundtrips_through_db_string() {
+        for o in [
+            WriteOrigin::User,
+            WriteOrigin::Agent,
+            WriteOrigin::BackgroundReview,
+        ] {
+            assert_eq!(WriteOrigin::from_db(o.as_str()), o);
+        }
+        assert_eq!(WriteOrigin::from_db("nonsense"), WriteOrigin::User);
+    }
+
+    #[test]
+    fn write_origin_default_is_user_and_autonomy() {
+        assert_eq!(WriteOrigin::default(), WriteOrigin::User);
+        assert!(!WriteOrigin::User.is_autonomous());
+        assert!(WriteOrigin::Agent.is_autonomous());
+        assert!(WriteOrigin::BackgroundReview.is_autonomous());
     }
 
     #[test]

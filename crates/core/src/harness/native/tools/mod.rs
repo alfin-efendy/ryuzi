@@ -213,6 +213,18 @@ pub struct ToolCtx {
     /// Present when the session has interactive surfaces; `None` disables
     /// `exitplanmode`/`askuserquestion` (they return a tool error).
     pub interaction: Option<Arc<Interaction>>,
+    /// Which actor is driving this tool call (Phase 4 §7). Defaults to
+    /// `User` for interactive turns; the background review fork
+    /// (`WriteOrigin::BackgroundReview`) and sub-agent turns
+    /// (`WriteOrigin::Agent`) set it explicitly at their own `ToolCtx` build
+    /// sites. Consulted by `skill_manage` and the app-control negative-space
+    /// guard (Phase 6) to gate autonomous writes more strictly than
+    /// human-driven ones.
+    pub write_origin: crate::domain::WriteOrigin,
+    /// Skill names viewed so far this tool-call turn — the `skill` tool
+    /// records into this set so a same-turn `skill_manage` USE can tell
+    /// "viewed-then-used" apart from "used blind", without a DB round trip.
+    pub viewed_skills: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// The result of a tool call.
@@ -533,6 +545,8 @@ pub(crate) mod testutil {
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             tool_call_id: "test-call".into(),
             interaction: None,
+            write_origin: crate::domain::WriteOrigin::User,
+            viewed_skills: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
