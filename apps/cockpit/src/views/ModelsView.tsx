@@ -23,6 +23,7 @@ import { ModelPicker } from "@/components/ModelPicker";
 import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
+import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
 
 type Tab = "providers" | "route" | "endpoint";
 
@@ -122,6 +123,7 @@ function EndpointTab() {
   const [savingConfig, setSavingConfig] = useState(false);
   const [keyName, setKeyName] = useState("");
   const [creatingKey, setCreatingKey] = useState(false);
+  const [revokeTarget, setRevokeTarget] = useState<{ id: string; name: string; trigger: HTMLButtonElement } | null>(null);
 
   // Seed the settings form from the first status load only — later refreshes
   // (e.g. after Start/Stop) shouldn't clobber an in-progress edit.
@@ -169,9 +171,9 @@ function EndpointTab() {
     setKeyName("");
   };
 
-  const doRevoke = async (id: string, name: string) => {
-    if (!window.confirm(`Revoke key "${name}"? Apps using it will lose access immediately.`)) return;
+  const doRevoke = async (id: string) => {
     await revokeKey(id);
+    return true;
   };
 
   const keychainStatus = status?.keychainStatus;
@@ -260,7 +262,11 @@ function EndpointTab() {
                 {k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleDateString() : "never"}
               </div>
             </div>
-            <Button variant="destructive" size="sm" onClick={() => void doRevoke(k.id, k.name)}>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={(event) => setRevokeTarget({ id: k.id, name: k.name, trigger: event.currentTarget })}
+            >
               Revoke
             </Button>
           </div>
@@ -275,6 +281,16 @@ function EndpointTab() {
           </Button>
         </div>
       </Card>
+      <ConfirmActionModal
+        open={revokeTarget !== null}
+        title="Revoke API key?"
+        description={revokeTarget ? `Revoke key "${revokeTarget.name}"? Apps using it will lose access immediately.` : ""}
+        confirmLabel="Revoke"
+        busyLabel="Revoking…"
+        trigger={revokeTarget?.trigger ?? null}
+        onClose={() => setRevokeTarget(null)}
+        onConfirm={() => (revokeTarget ? doRevoke(revokeTarget.id) : Promise.resolve(false))}
+      />
     </div>
   );
 }
@@ -542,7 +558,7 @@ function RouteCard({
   route: ModelRouteInfo;
   catalog: CatalogEntry[];
   onEdit: () => void;
-  onDelete: () => void;
+  onDelete: (trigger: HTMLButtonElement) => void;
 }) {
   const copyName = () => {
     void navigator.clipboard.writeText(route.name);
@@ -571,7 +587,13 @@ function RouteCard({
         <Button variant="outline" size="sm" onClick={onEdit}>
           Edit
         </Button>
-        <Button variant="ghost" size="icon-sm" title="Delete route" onClick={onDelete} className="text-destructive hover:text-destructive">
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          title="Delete route"
+          onClick={(event) => onDelete(event.currentTarget)}
+          className="text-destructive hover:text-destructive"
+        >
           <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
         </Button>
       </div>
@@ -585,6 +607,7 @@ function RouteTab() {
   const connections = useConnections((s) => s.connections);
   const [editing, setEditing] = useState<ModelRouteInfo | null>(null);
   const [saving, setSaving] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<{ route: ModelRouteInfo; trigger: HTMLButtonElement } | null>(null);
   const targets = useMemo(() => routeTargetOptions(catalog, connections), [catalog, connections]);
 
   useEffect(() => {
@@ -599,8 +622,8 @@ function RouteTab() {
     if (ok) setEditing(null);
   };
   const deleteRoute = async (route: ModelRouteInfo) => {
-    if (!window.confirm(`Delete route "${route.name}"?`)) return;
     await remove(route.id);
+    return true;
   };
 
   return (
@@ -627,7 +650,7 @@ function RouteTab() {
           route={route}
           catalog={catalog}
           onEdit={() => setEditing(route)}
-          onDelete={() => void deleteRoute(route)}
+          onDelete={(trigger) => setDeleteTarget({ route, trigger })}
         />
       ))}
       {loaded && routes.length === 0 && !editing && (
@@ -635,6 +658,16 @@ function RouteTab() {
           No routes yet. Create a route alias to expose a combo-style model.
         </div>
       )}
+      <ConfirmActionModal
+        open={deleteTarget !== null}
+        title="Delete route?"
+        description={deleteTarget ? `Delete route "${deleteTarget.route.name}"?` : ""}
+        confirmLabel="Delete route"
+        busyLabel="Deleting…"
+        trigger={deleteTarget?.trigger ?? null}
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={() => (deleteTarget ? deleteRoute(deleteTarget.route) : Promise.resolve(false))}
+      />
     </div>
   );
 }

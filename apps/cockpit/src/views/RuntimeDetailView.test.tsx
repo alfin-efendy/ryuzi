@@ -128,6 +128,7 @@ const catalogEntries: CatalogEntry[] = [
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 
 const runtimeConfigStatus = mock((_id: string) => ok(configStatus));
+const resetRuntimeConfig = mock((_id: string) => ok({ ...configStatus, configured: false }));
 const updateRuntimeConfig = mock((_id: string, enabled: boolean, model: string | null, permMode: string, flags: string) =>
   ok([{ ...claudeRuntime, enabled, model: model ?? "", permMode, flags }]),
 );
@@ -137,6 +138,7 @@ const updateRuntimeConfig = mock((_id: string, enabled: boolean, model: string |
 mock.module("@/bindings", () => ({
   commands: {
     runtimeConfigStatus,
+    resetRuntimeConfig,
     updateRuntimeConfig,
     endpointStatus: () => ok(endpointUp),
     listEndpointKeys: () => ok([endpointKey]),
@@ -158,6 +160,7 @@ const { useModelRoutes } = await import("@/store-model-routes");
 
 beforeEach(() => {
   runtimeConfigStatus.mockClear();
+  resetRuntimeConfig.mockClear();
   updateRuntimeConfig.mockClear();
   useRuntimes.setState({ runtimes: [claudeRuntime], loaded: true, refreshing: false, updating: {}, updateLog: {} });
   useApps.setState({ apps: [githubApp], loaded: true, probing: null });
@@ -289,4 +292,21 @@ test("tier model picker always shows the search input", async () => {
 
   fireEvent.click(screen.getByRole("combobox", { name: "Smart model" }));
   expect(await screen.findByPlaceholderText("Search…")).toBeTruthy();
+});
+
+test("reset config uses the shared confirmation modal and restores focus", async () => {
+  runtimeConfigStatus.mockImplementationOnce((_id: string) => ok({ ...configStatus, configured: true }));
+  await renderView();
+  const trigger = await screen.findByRole("button", { name: "Reset" });
+  fireEvent.click(trigger);
+  const dialog = screen.getByRole("dialog", { name: "Reset runtime config?" });
+  expect(dialog.querySelector('[data-slot="modal-footer"]')).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(document.activeElement).toBe(trigger));
+  expect(resetRuntimeConfig).not.toHaveBeenCalled();
+
+  fireEvent.click(trigger);
+  fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+  await waitFor(() => expect(resetRuntimeConfig).toHaveBeenCalledWith("claude"));
 });

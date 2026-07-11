@@ -161,6 +161,8 @@ const usage: UsageSeries = {
 };
 
 const saveModelRoute = mock((_route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
+const deleteModelRoute = mock((_id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
+const revokeEndpointKey = mock((_id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
 
 const refreshProviderModels = mock((_family: string) =>
   Promise.resolve({
@@ -212,7 +214,8 @@ mock.module("@/bindings", () => ({
       }),
     saveModelRoute,
     refreshProviderModels,
-    deleteModelRoute: (_id: string) => Promise.resolve({ status: "ok", data: [] }),
+    deleteModelRoute,
+    revokeEndpointKey,
     providerAccountRoute: (provider: string) => Promise.resolve({ status: "ok", data: { provider, strategy: "fallback" } }),
     setProviderAccountRoute: (provider: string, strategy: string) => Promise.resolve({ status: "ok", data: { provider, strategy } }),
     connectionUsage: () => Promise.resolve({ status: "ok", data: usage }),
@@ -266,7 +269,11 @@ function resetStores() {
   useNav.setState({ history: { back: [], current: { kind: "models" }, forward: [] } });
 }
 
-beforeEach(resetStores);
+beforeEach(() => {
+  deleteModelRoute.mockClear();
+  revokeEndpointKey.mockClear();
+  resetStores();
+});
 
 afterEach(() => {
   cleanup();
@@ -391,6 +398,18 @@ test("lists endpoint API keys with revoke and create controls", async () => {
   expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy();
   const newKey = screen.getByRole("button", { name: "New key" }) as HTMLButtonElement;
   expect(newKey.disabled).toBe(true);
+});
+
+test("revoke endpoint key uses the shared confirmation modal", async () => {
+  render(<ModelsView />);
+  fireEvent.click(await screen.findByRole("button", { name: "Endpoint" }));
+  const trigger = await screen.findByRole("button", { name: "Revoke" });
+  fireEvent.click(trigger);
+  const dialog = screen.getByRole("dialog", { name: "Revoke API key?" });
+  expect(dialog.querySelector('[data-slot="modal-footer"]')).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Revoke" }));
+  await waitFor(() => expect(revokeEndpointKey).toHaveBeenCalledWith("k1"));
 });
 
 test("provider detail shows accounts for the selected provider", async () => {
@@ -573,6 +592,18 @@ test("Route tab lists model route aliases and their ordered targets", async () =
   expect(screen.getByText("By order")).toBeTruthy();
   expect(screen.getByText("OpenAI / gpt-4.1")).toBeTruthy();
   expect(screen.getByRole("button", { name: "New route" })).toBeTruthy();
+});
+
+test("delete route uses the shared confirmation modal", async () => {
+  render(<ModelsView />);
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  const trigger = await screen.findByTitle("Delete route");
+  fireEvent.click(trigger);
+  const dialog = screen.getByRole("dialog", { name: "Delete route?" });
+  expect(dialog.querySelector('[data-slot="modal-footer"]')).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Delete route" }));
+  await waitFor(() => expect(deleteModelRoute).toHaveBeenCalledWith("r1"));
 });
 
 test("route form renders strategy and target comboboxes with option lists", async () => {

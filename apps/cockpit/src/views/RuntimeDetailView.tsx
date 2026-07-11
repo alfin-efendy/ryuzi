@@ -23,6 +23,7 @@ import { useConnections } from "@/store-connections";
 import { useEndpoint } from "@/store-endpoint";
 import { useModelRoutes } from "@/store-model-routes";
 import { useNav } from "@/store-nav";
+import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
 
 const WARN = "#F59E0B";
 
@@ -77,6 +78,7 @@ export function RuntimeDetailView({ id }: { id: string }) {
   const [opus, setOpus] = useState("");
   const [sonnet, setSonnet] = useState("");
   const [haiku, setHaiku] = useState("");
+  const [resetTrigger, setResetTrigger] = useState<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (!appsLoaded) void hydrateApps();
@@ -127,7 +129,6 @@ export function RuntimeDetailView({ id }: { id: string }) {
   };
 
   const resetConfig = async () => {
-    if (!window.confirm("Remove Ryuzi settings from this runtime's config?")) return;
     const res = await commands.resetRuntimeConfig(id);
     if (res.status === "ok") {
       setCfg(res.data);
@@ -135,6 +136,7 @@ export function RuntimeDetailView({ id }: { id: string }) {
     } else {
       toast.error(res.error.message);
     }
+    return true;
   };
 
   return (
@@ -348,7 +350,7 @@ export function RuntimeDetailView({ id }: { id: string }) {
                 </div>
                 <div className="flex items-center justify-end gap-2 border-t border-border px-[18px] py-3">
                   {cfg?.configured && (
-                    <Button variant="outline" onClick={() => void resetConfig()}>
+                    <Button variant="outline" onClick={(event) => setResetTrigger(event.currentTarget)}>
                       Reset
                     </Button>
                   )}
@@ -412,6 +414,16 @@ export function RuntimeDetailView({ id }: { id: string }) {
           </div>
         </Card>
       </div>
+      <ConfirmActionModal
+        open={resetTrigger !== null}
+        title="Reset runtime config?"
+        description="Remove Ryuzi settings from this runtime's config?"
+        confirmLabel="Reset"
+        busyLabel="Resetting…"
+        trigger={resetTrigger}
+        onClose={() => setResetTrigger(null)}
+        onConfirm={resetConfig}
+      />
     </div>
   );
 }
