@@ -2015,6 +2015,24 @@ impl Store {
         .await
     }
 
+    /// Bind a session to a project — the persistence half of `app_projects`'s
+    /// "attach" action (Phase 6 spec §9.1). Only the `project_id` column
+    /// changes; workspace/branch/worktree are left as-is (a chat session has
+    /// none, and a live session's already-built `RunnerDeps.project_id` does
+    /// not hot-reload — this only affects a fresh start/resume).
+    pub async fn set_session_project(&self, pk: &str, project_id: &str) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let project_id = project_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET project_id=?2 WHERE session_pk=?1",
+                params![pk, project_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
     pub async fn update_agent_session_id(
         &self,
         pk: &str,

@@ -968,6 +968,17 @@ impl ControlPlane {
             .map(|s| s.perm_mode)
             .unwrap_or(perm_mode);
         let agent = session_row.and_then(|s| s.agent);
+        // The curated app-control facade (spec §9.1) is only for a top-level
+        // interactive session: a worker or review-fork session never gets
+        // the `app_*` tools (mirrors the existing sub-agent blocklist, Task
+        // 6's `child_deps.app_control` reset, and this crate's `Harness`
+        // trait boundary — `SessionCtx` is the one channel from here into
+        // `NativeHarness::start_session`, which cannot reach `ControlPlane`
+        // itself to build one).
+        let app_control = match kind {
+            SessionKind::Project | SessionKind::Chat => Some(self.build_app_control()),
+            SessionKind::Worker | SessionKind::Review => None,
+        };
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
             project_id: project.map(|p| p.project_id.clone()),
@@ -985,6 +996,7 @@ impl ControlPlane {
             approvals: self.approvals.clone(),
             background: self.background.clone(),
             store: self.store.clone(),
+            app_control,
         };
 
         let handle: Arc<dyn HarnessSession> = Arc::from(harness.start_session(ctx).await?);

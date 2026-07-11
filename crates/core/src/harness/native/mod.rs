@@ -249,12 +249,27 @@ impl Harness for NativeHarness {
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
                 background: ctx.background,
-                // Task 7 wires the real facade from the control plane; every
-                // session built here starts without one.
-                app_control: None,
+                // The control plane only populates `ctx.app_control` for a
+                // top-level interactive session (`kind` Project/Chat); worker,
+                // review, and bare test contexts pass `None` through.
+                app_control: ctx.app_control,
                 nudge,
                 review_tool_defs: None,
-                write_origin: crate::domain::WriteOrigin::User,
+                // Every agent tool call — even one an interactive human turn
+                // triggers — is the AGENT deciding to call a tool, not a
+                // direct human action, so a top-level Project/Chat session is
+                // `Agent` origin (tightening skill_manage's autonomous-write
+                // guard there too); Worker/Review keep the prior blanket
+                // `User` default the review fork's own separate `RunnerDeps`
+                // build overrides to `BackgroundReview` regardless.
+                write_origin: match ctx.kind {
+                    crate::domain::SessionKind::Project | crate::domain::SessionKind::Chat => {
+                        crate::domain::WriteOrigin::Agent
+                    }
+                    crate::domain::SessionKind::Worker | crate::domain::SessionKind::Review => {
+                        crate::domain::WriteOrigin::User
+                    }
+                },
             },
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),
@@ -434,6 +449,7 @@ mod tests {
             approvals: Arc::new(ApprovalHub::new()),
             background: super::background::BackgroundRegistry::new(),
             store,
+            app_control: None,
         }
     }
 

@@ -50,6 +50,11 @@ pub struct SessionCtx {
     pub background: Arc<crate::harness::native::background::BackgroundRegistry>,
     /// Persistence handle (transcript rows, agent_session_id updates).
     pub store: Arc<Store>,
+    /// Curated app-control facade (spec §9.1), built by the control plane
+    /// only for a top-level interactive session (`kind` is `Project` or
+    /// `Chat`). `None` for worker/review sessions and any bare test context —
+    /// the native runtime then disables the `app_*` tools on `ToolCtx.app`.
+    pub app_control: Option<Arc<dyn native::tools::AppControl>>,
 }
 
 /// A registered agent runtime. `NativeHarness` (see `harness::native`) is the
@@ -180,6 +185,7 @@ mod tests {
             approvals: Arc::new(ApprovalHub::new()),
             background: crate::harness::native::background::BackgroundRegistry::new(),
             store,
+            app_control: None,
         }
     }
 

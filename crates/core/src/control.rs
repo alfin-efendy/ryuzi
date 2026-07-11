@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
+mod app_control;
 mod attachments;
 mod lifecycle;
 mod provisioning;
@@ -314,6 +315,38 @@ impl ControlPlane {
 
     pub async fn list_sessions(&self, project_id: Option<&str>) -> anyhow::Result<Vec<Session>> {
         self.store.list_sessions(project_id).await
+    }
+
+    /// Bind an existing session to a project (`app_projects`'s "attach"
+    /// action, spec §9.1). Validates both rows exist, then persists the
+    /// association — see [`Store::set_session_project`] for the caveat that a
+    /// currently-live session keeps running under whatever `project_id` its
+    /// `RunnerDeps` was already built with until it is resumed.
+    pub async fn attach_project(&self, session_pk: &str, project_id: &str) -> anyhow::Result<()> {
+        self.store
+            .get_session(session_pk)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown session: {session_pk}"))?;
+        self.store
+            .get_project(project_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
+        self.store.set_session_project(session_pk, project_id).await
+    }
+
+    /// Build the curated app-control facade (spec §9.1) for a top-level
+    /// interactive session: holds a `Weak<ControlPlane>` so a session's
+    /// `ToolCtx` never keeps the plane alive, and tags every write it makes
+    /// with `WriteOrigin::Agent` — the storage-layer negative-space guard
+    /// (spec §9.3) refuses this origin on settings/policy writes, and its
+    /// audit rows are tagged `agent`.
+    pub fn build_app_control(
+        self: &Arc<Self>,
+    ) -> Arc<dyn crate::harness::native::tools::AppControl> {
+        Arc::new(app_control::AppControlImpl::new(
+            Arc::downgrade(self),
+            crate::domain::WriteOrigin::Agent,
+        ))
     }
 
     /// Persist per-project preferences (host-supplied model/effort/perm overrides).
