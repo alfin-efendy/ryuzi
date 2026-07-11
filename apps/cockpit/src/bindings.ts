@@ -1391,7 +1391,14 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * `cacheRead`) are camelCased independently.
  */
 { kind: "sessionCost"; session_pk: string; total_usd: number; models: ModelCost[] }
-export type CoreEventMsg = { event: CoreEvent }
+/**
+ * `runner_id` identifies which engine (`"local"` or a paired remote
+ * runner's id — see `engine_manager::EngineManager`) produced this event.
+ * Stamped by `engine_manager::spawn_bridge`, one instance of which runs per
+ * runner, so the frontend can tell multiple runners' events apart once
+ * P3-4/P3-6 route by runner.
+ */
+export type CoreEventMsg = { runnerId: string; event: CoreEvent }
 /**
  * Device-code flow info shown to the user while they complete the browser
  * step (Kiro): the short code to enter, the URL to visit, and the poll
@@ -1488,7 +1495,7 @@ export type ModelStatusEntry = { family: string; model: string; status: string; 
  * One persisted probe verdict row for the provider Models card.
  */
 export type ModelStatusInfo = { model: string; status: string; message: string; testedAt: number }
-export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
+export type OauthAuthorizeUrlMsg = { runnerId: string; provider: string; authorizeUrl: string }
 export type OpenTarget = { id: string; name: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PluginAuthInfo = { 
@@ -1600,7 +1607,7 @@ transport: string;
  * `${auth}` substitution, matching `ryuzi plugins info`'s output.
  */
 commandOrUrl: string }
-export type PluginOauthAuthorizeUrlMsg = { pluginId: string; authorizeUrl: string }
+export type PluginOauthAuthorizeUrlMsg = { runnerId: string; pluginId: string; authorizeUrl: string }
 export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string; redirectUri: string }
 /**
  * Emitted by `begin_plugin_install`'s background callback task when the

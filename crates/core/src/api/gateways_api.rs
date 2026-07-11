@@ -22,6 +22,10 @@ pub(crate) const HANDLES: &[&str] = &[
     "remove_gateway",
     "update_gateway",
     "gateway_events",
+    // Backend-only: see `list_runner_credentials`'s doc comment. Never wrap
+    // this in a Cockpit `#[tauri::command]` / `collect_commands!` entry —
+    // doing so would hand the decrypted device token to the webview.
+    "list_runner_credentials",
 ];
 
 #[derive(Deserialize)]
@@ -83,6 +87,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                 })
                 .collect::<Vec<_>>())
         }
+        "list_runner_credentials" => ok(list_runner_credentials(cp).await?),
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }
@@ -467,6 +472,59 @@ async fn save_runner(
     Ok(assemble(cp, true).await?)
 }
 
+/// A paired remote runner row with its device token DECRYPTED. This is the
+/// wire shape of the backend-only `list_runner_credentials` RPC method.
+///
+/// SECURITY: this method exists on the local engine's `/rpc/*` surface (the
+/// same bearer-`control_token`-gated loopback HTTP API every other RPC
+/// method uses), but — unlike every other gateways method — is deliberately
+/// NOT also wrapped by a Cockpit `#[tauri::command]` in
+/// `apps/cockpit/src-tauri/src/gateways_cmd.rs`, nor listed in `lib.rs`'s
+/// `collect_commands!`. Tauri only exposes a method to the webview's
+/// `invoke()` if it is a `#[tauri::command]` registered in
+/// `collect_commands!` — a plain RPC method with neither is simply
+/// unreachable from JS. The ONLY caller is
+/// `apps/cockpit/src-tauri/src/engine_manager.rs`'s
+/// `EngineManager::load_remotes`, which calls it directly via
+/// `EngineClient::rpc` from backend Rust code and uses the decrypted
+/// `device_token` solely to build a pinned `EngineClient` (its
+/// `Authorization` bearer header) — the token is never placed on an emitted
+/// Tauri event or returned by a `#[tauri::command]`. Do not add such a
+/// command; that would defeat this invariant.
+#[derive(Debug, Clone, serde::Serialize)]
+struct RunnerCredentialInfo {
+    id: String,
+    name: String,
+    host: String,
+    port: u16,
+    fingerprint: String,
+    device_token: String,
+}
+
+async fn list_runner_credentials(cp: &ControlPlane) -> anyhow::Result<Vec<RunnerCredentialInfo>> {
+    let mut out = Vec::new();
+    for row in gateways::list_rows(cp.store()).await? {
+        if row.kind != "remote" {
+            continue;
+        }
+        let (Some(host), Some(port), Some(fingerprint), Some(enc_token)) =
+            (row.host, row.port, row.fingerprint, row.device_token)
+        else {
+            continue;
+        };
+        let device_token = crate::llm_router::secrets::decrypt_field(&enc_token)?;
+        out.push(RunnerCredentialInfo {
+            id: row.id,
+            name: row.name,
+            host,
+            port,
+            fingerprint,
+            device_token,
+        });
+    }
+    Ok(out)
+}
+
 async fn remove_gateway(state: &ApiState, id: String) -> Result<Vec<GatewayInfo>, ApiError> {
     let cp = &state.cp;
     if id == "local" {
@@ -630,5 +688,35 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// `list_runner_credentials` is the ONLY RPC method that returns a
+    /// decrypted `device_token` — assert it round-trips to plaintext (so
+    /// `EngineManager::load_remotes` can hand it to `new_pinned` as a
+    /// bearer) and that `list_gateways`, the method actually reachable
+    /// through a Cockpit `#[tauri::command]`, never does.
+    #[tokio::test]
+    async fn list_runner_credentials_decrypts_the_device_token() {
+        let s = state().await;
+        save_a_runner(&s).await;
+
+        let creds = dispatch(&s, "list_runner_credentials", json!({}))
+            .await
+            .unwrap();
+        let creds = creds.as_array().unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0]["host"], "10.0.0.9");
+        assert_eq!(creds[0]["port"], 7443);
+        assert_eq!(creds[0]["fingerprint"], "b64ssh256fingerprint==");
+        assert_eq!(creds[0]["device_token"], "plaintext-device-token");
+
+        // `list_gateways` (the method Cockpit's `gateways_cmd::list_gateways`
+        // command proxies to the webview) must never carry the token.
+        let gw = dispatch(&s, "list_gateways", json!({})).await.unwrap();
+        let remote = find_remote(&gw);
+        assert!(
+            remote.get("device_token").is_none(),
+            "list_gateways must not expose device_token: {remote:?}"
+        );
     }
 }
