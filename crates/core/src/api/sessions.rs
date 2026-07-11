@@ -168,23 +168,18 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "start_chat_session" => {
             let a: StartChatP = params(p)?;
-            let attachments = attachment_refs_from_paths(
-                &a.options
-                    .as_ref()
-                    .map(|o| o.attachments.clone())
-                    .unwrap_or_default(),
-            )
-            .await?;
-            let agent_prompt = chat_agent_prompt(
-                &a.prompt,
-                a.options.as_ref().and_then(|o| o.context.as_ref()),
-            );
+            let options = a.options.unwrap_or_default();
+            let attachments = attachment_refs_from_paths(&options.attachments).await?;
+            let agent_prompt = chat_agent_prompt(&a.prompt, options.context.as_ref());
             ok(state
                 .cp
-                .start_chat_session(
+                .start_chat_session_with_runtime(
                     TurnPrompt::text(agent_prompt, a.prompt),
                     "cockpit",
                     &attachments,
+                    options.model,
+                    options.effort,
+                    options.perm_mode,
                 )
                 .await?)
         }
@@ -324,6 +319,7 @@ async fn start_session(
             &attachments,
             git,
             options.perm_mode,
+            None,
         )
         .await?)
 }
@@ -395,12 +391,24 @@ mod tests {
         let out = dispatch(
             &s,
             "start_chat_session",
-            json!({"prompt": "hi", "options": null}),
+            json!({"prompt": "hi", "options": {
+                "model": "openai/gpt-5.5", "effort": "high", "permMode": "plan",
+                "context": null, "attachments": [], "git": null
+            }}),
         )
         .await
         .unwrap();
         assert_eq!(out["projectId"], serde_json::Value::Null);
         assert_eq!(out["kind"], "chat");
+        assert_eq!(out["permMode"], "plan");
+        let runtime =
+            s.cp.store()
+                .get_session_runtime_settings(out["sessionPk"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(runtime.model.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(runtime.effort.as_deref(), Some("high"));
     }
 
     #[tokio::test]

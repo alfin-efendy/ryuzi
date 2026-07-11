@@ -3,13 +3,15 @@
 Ryuzi's extension points — model providers, the Discord gateway, and
 third-party integrations (GitHub, Notion, Slack, memory backends,
 sandboxes, deploy platforms...) — are all **plugins**: one manifest
-each, surfaced identically through `ryuzi plugins`, the daemon's
-`list_plugins` RPC, and Cockpit's Plugins hub.
+each, surfaced identically through the daemon's `list_plugins` RPC and
+Cockpit's Plugins hub. There is no CLI surface for plugin management —
+Cockpit (backed by the daemon's RPCs) is the only management surface.
 
 This guide covers the manifest format, how to author and install your own
 plugin, and how the built-in fleet is organized. It documents what is
 actually implemented on this branch — verify any command shown here still
-matches `ryuzi --help` if you're reading this on a different revision.
+matches the daemon's current RPC surface if you're reading this on a
+different revision.
 
 ---
 
@@ -28,8 +30,9 @@ two different crates:
   harness, gateway, connector, source }` pairs a manifest with the runtime
   capability it actually provides, `PluginHost` tracks every installed
   plugin, and `Registries` (`harness`/`gateway`/`connector`/`plugins`) is the
-  composition root every host (`ryuzi` CLI, Cockpit's Tauri shell) builds at
-  startup.
+  composition root the daemon builds at startup inside
+  `ryuzi_core::daemon::build_daemon` — used by both the runner (`ryuzi
+  start`) and Cockpit's `--engine-daemon` mode.
 
 A manifest **on its own** can only ever produce a *connector* (an MCP-server
 contributor) — that's what `declarative_plugin()`
@@ -54,14 +57,18 @@ for a given `id` wins — see `PluginHost::add`):
    (`crates/core::plugins::load_skill_pack_plugins`), each gated on a
    `.ryuzi-skill.json` provenance stamp.
 
-A real `ryuzi` process wires all of this at startup
-(`crates/cli/src/main.rs`'s `build_registries`, mirrored by
-`apps/cockpit/src-tauri/src/lib.rs`): register `native` unconditionally,
-register `discord`, then call `ryuzi_core::plugins::install_builtins`
-(providers, then the embedded catalog) and finally
-`ryuzi_core::plugins::load_skill_pack_plugins`. Because this all runs once at
-process startup, installing or refreshing a skill pack requires restarting
-`ryuzi` (or the Cockpit app) to pick it up — there is no hot-reload.
+The daemon wires all of this at startup inside `ryuzi_core::daemon::build_daemon`
+— the one composition root used by both the runner's `ryuzi start` (via
+`ryuzi __daemon`) and Cockpit's hidden `--engine-daemon` mode, since Cockpit
+is a thin client that attaches to (or spawns) a daemon rather than building
+its own registries: register `native` unconditionally, then call
+`ryuzi_core::plugins::install_builtins` (providers, then the embedded
+catalog) and finally `ryuzi_core::plugins::load_skill_pack_plugins`. The
+`discord` gateway itself is wired separately in the same function, driven by
+the `enabled_gateways` setting and the caller-supplied
+`extra_gateway_factories`. Because plugin registration runs once at daemon
+startup, installing or refreshing a skill pack requires restarting the
+daemon to pick it up — there is no hot-reload.
 
 ---
 
@@ -153,7 +160,7 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `name` | string | *(required)* | Display name; must be non-empty. |
 | `version` | string | `""` | Free-form; not validated. |
 | `publisher` | string | `""` | `"ryuzi"` for first-party; a vendor or maintainer name otherwise. |
-| `description` | string | `""` | Shown in `ryuzi plugins info`, the `list_plugins` RPC, and the Cockpit catalog card. |
+| `description` | string | `""` | Shown via the `plugin_detail`/`list_plugins` RPCs and the Cockpit catalog card. |
 | `homepage` | string \| null | `None` | |
 | `icon` | string \| null | `None` | A lucide icon name. Cockpit maps a small explicit set (`message-circle`, `terminal`, `cpu`, `globe`, `database`, `search`, `cloud`, `server`, `webhook`, `key`, `mail`, `bot`) and falls back to a generic puzzle icon for everything else — including brand-name icons like `github`, `slack`, or `figma`, since `lucide-react` dropped brand/logo icons (see `apps/cockpit/src/lib/plugin-icons.ts`). |
 | `categories` | string[] | `[]` | See the vocabulary table below. Unknown labels are a non-fatal warning (`PluginManifest::warnings()`), never a validation error. |
@@ -248,22 +255,13 @@ url = "https://api.githubcopilot.com/mcp/"
 headers = { Authorization = "Bearer ${auth}" }
 ```
 
-Validating it:
-
-```sh
-$ cargo run -p ryuzi-cli -- plugins info github
-id: github
-name: GitHub
-version: 0.1.0
-publisher: GitHub (official)
-description: Repos, issues, and pull requests via GitHub's official remote MCP server (api.githubcopilot.com/mcp/). ...
-categories: vcs,issues
-status: verified
-capabilities: connector
-enabled: disabled
-auth: kind=Token setting=plugin.github.token env=GITHUB_PERSONAL_ACCESS_TOKEN help_url=https://github.com/settings/tokens
-mcp: github transport=Http target=https://api.githubcopilot.com/mcp/
-```
+Validating it: there is no CLI surface for this (the runner's command
+surface is `setup`, `start`, `status`, `service`, `config`, `doctor` — no
+`plugins` subcommand). The daemon's `plugin_detail` RPC (`{ id: "github" }`)
+returns the same fields as JSON — `id`, `name`, `version`, `publisher`,
+`description`, `categories`, `status` (`verified`/`experimental`/
+`community`), `capabilities`, `enabled`, `auth`, and `mcp` — and Cockpit's
+plugin detail screen renders them directly.
 
 (`status` is `verified` when `verified = true`; otherwise `experimental` when
 `experimental = true`; otherwise `community`.)
@@ -368,9 +366,9 @@ friendly, secret-free message is logged via `tracing::warn!` and that
 plugin's servers are skipped for the session — a broken or unconfigured
 plugin integration never fails session start, and the log message names
 the plugin and what to configure, not just an unresolved-placeholder
-parse error. Nothing surfaces to the CLI or Cockpit UI mid-session beyond
-that log line, so check `ryuzi plugins info <id>`'s `auth:`/`setting:`
-lines (or the Cockpit plugin detail screen) *before* enabling a plugin,
+parse error. Nothing surfaces to the Cockpit UI mid-session beyond that
+log line, so check the `plugin_detail` RPC's (or the Cockpit plugin
+detail screen's) `auth`/`setting` fields *before* enabling a plugin,
 rather than relying on a session-time warning.
 
 ### Cockpit plugin OAuth sign-in
@@ -519,9 +517,10 @@ arbitrary `owner/repo` — backed by the same core path in
   `~/.config/ryuzi/skills/<plugin-id>--<skill-id>/` with its own
   provenance file.
 
-`load_skill_pack_plugins` (called at startup by the CLI, `ryuzi daemon`,
-and Cockpit) scans `~/.config/ryuzi/plugins/*/ryuzi-plugin.toml` and
-registers a directory only when:
+`load_skill_pack_plugins` (called at startup by `build_daemon`, used by both
+the runner's `ryuzi start` and Cockpit's `--engine-daemon` mode) scans
+`~/.config/ryuzi/plugins/*/ryuzi-plugin.toml` and registers a directory only
+when:
 
 - it contains the `.ryuzi-skill.json` stamp, **or**
 - (legacy packs installed before the stamp existed) the skills root holds
@@ -639,7 +638,7 @@ first:
 
 - **Curated** (today: Superpowers, `obra/superpowers` / its GitHub URL, via
   `CURATED_SKILL_SOURCES`) — installs immediately and records
-  `trust_tier = "curated"`. An explicit `ryuzi`/Cockpit-driven install of a
+  `trust_tier = "curated"`. An explicit Cockpit-driven install of a
   curated pack *is* the trust decision; there's no extra prompt.
 - **Everything else** — clones into a temp directory, discovers what it would
   install (skills, bundled `.ryuzi/hooks/<event>/<script>` files, total byte
@@ -704,7 +703,7 @@ on the detail screen.
 
 ### Daemon RPC methods (`POST /rpc/{method}`)
 
-The engine daemon (`ryuzi serve` / `--engine-daemon`) exposes plugin
+The engine daemon (`ryuzi start` / `--engine-daemon`) exposes plugin
 management as RPC methods, dispatched by `crate::api::plugins_api::dispatch`
 (routed from `crate::api::dispatch` in `crates/core/src/api/mod.rs`). Cockpit
 calls each through a thin `EngineClient::rpc` proxy in
@@ -768,13 +767,7 @@ enablement by capability, in this priority order:
 6. Otherwise (every catalog/skill-pack integration with a connector) →
    `plugin.<id>.enabled == "true"`, defaulting to `false`.
 
-Three equivalent ways to flip it:
-
-```sh
-# CLI
-ryuzi plugins enable github
-ryuzi plugins disable github
-```
+Two equivalent ways to flip it — there is no CLI surface for either:
 
 - **Cockpit**: the dedicated **Plugins** screen's **Browse** tab lists every
   catalog plugin with a category filter; new installs go through the
@@ -782,23 +775,19 @@ ryuzi plugins disable github
   `Switch` (disabled — greyed out — for `experimental` entries, since
   there's nothing to enable); the plugin detail screen (reached from the
   sidebar's Plugins section or the Browse card's "Configure" button) has
-  the same switch.
+  the same switch. Cockpit's `set_plugin_enabled` Tauri command
+  (`{ id, enabled }`) is what the switch calls.
 - **Settings keys directly**: `enabled_gateways` is a CSV
   string (add/remove `id`, preserving order, no duplicates —
   `toggle_enabled`'s `toggle_csv` helper); everything else is
-  `plugin.<id>.enabled` (`"true"`/`"false"`). Both `ryuzi plugins enable/
-  disable` and Cockpit's `set_plugin_enabled` command delegate to the same
-  `ryuzi_core::plugins::toggle_enabled` function, so the two surfaces can't
-  drift.
+  `plugin.<id>.enabled` (`"true"`/`"false"`). Cockpit's `set_plugin_enabled`
+  command delegates to `ryuzi_core::plugins::toggle_enabled` — the single
+  source of truth both the settings rows and [`PluginHost::is_enabled`]'s
+  read side agree with.
 
-```sh
-$ ryuzi plugins list | grep github
-github  GitHub  vcs,issues      disabled        verified
-$ ryuzi plugins enable github
-enabled github
-$ ryuzi plugins list | grep github
-github  GitHub  vcs,issues      enabled verified
-```
+For example, `set_plugin_enabled({ id: "github", enabled: true })` flips
+`plugin.github.enabled` to `"true"`; the next `list_plugins` RPC call (or
+Cockpit's plugin card) reflects `enabled: true` immediately.
 
 Every settings key a plugin declares — its `[[settings]]` fields, its
 `auth.setting` (registered as a synthetic secret `String` field), and the
@@ -883,8 +872,9 @@ loaded (no installer provenance → skipped). To author a plugin:
    stamp — then materializes the skill to
    `~/.config/ryuzi/skills/my-skills-repo--code-review/`.
 
-Then validate with `ryuzi plugins info <id>`, enable with
-`ryuzi plugins enable <id>`, configure any `[auth]` credential, and start
+Then validate with the `plugin_detail` RPC (or the Cockpit plugin detail
+screen) for `<id>`, enable it from Cockpit's Plugins screen (or the
+`set_plugin_enabled` RPC), configure any `[auth]` credential, and start
 a session — the plugin's `[[mcp]]` servers attach at session start
 (`control::lifecycle::attach_plugin_mcp_servers`), with DB-configured
 Apps servers of the same name winning, and bundled `[[skills]]` surfacing
@@ -904,8 +894,8 @@ Adding an entry to `crates/core/plugins/catalog/*.toml` (and
   has no working MCP surface at all, ship `experimental = true` with **no**
   `[[mcp]]` block — a docs-only entry (see `ngrok`, `vercel-sandbox`, `zep`).
 - **Record research provenance in the description**, not just in a design
-  doc — the description field is what a user sees in `ryuzi plugins info`
-  and the Cockpit catalog card, so name the exact server/binary, any
+  doc — the description field is what a user sees via the `plugin_detail`
+  RPC and the Cockpit catalog card, so name the exact server/binary, any
   required local tooling (`uv`/`docker`/a CLI), and any caveat (e.g.
   "wikis are not covered", "restricted to directory-published apps",
   "the exact launch subcommand is unconfirmed upstream").

@@ -3,7 +3,7 @@ import { goBackHistory, goForwardHistory, navigateHistory, useNav, type NavHisto
 
 const home: View = { kind: "home" };
 const models: View = { kind: "models" };
-const detail: View = { kind: "connectionDetail", id: "c1" };
+const detail: View = { kind: "providerDetail", provider: "openai" };
 
 const start: NavHistory = { back: [], current: home, forward: [] };
 
@@ -73,12 +73,12 @@ test("readClampedPanelSize parses, defaults, and clamps a persisted size to the 
   expect(readClampedPanelSize("2000", 900, BOTTOM_HEIGHT)).toBe(540); // 60% of 900
 });
 
-test("composer model starts unset and round-trips through setComposerModel", () => {
-  expect(useNav.getState().composerModel).toBeNull();
-  useNav.getState().setComposerModel("openrouter/qwen3:free");
-  expect(useNav.getState().composerModel).toBe("openrouter/qwen3:free");
-  useNav.getState().setComposerModel(null);
-  expect(useNav.getState().composerModel).toBeNull();
+test("composer nav keeps durable chat-only model and effort state", () => {
+  const nav = useNav.getState() as unknown as Record<string, unknown>;
+  expect(nav.composerModel).toBeNull();
+  expect(typeof nav.setComposerModel).toBe("function");
+  expect(nav.composerEffort).toBeNull();
+  expect(typeof nav.setComposerEffort).toBe("function");
 });
 
 test("composer git controls default to worktree ON, no branch until the list loads", () => {

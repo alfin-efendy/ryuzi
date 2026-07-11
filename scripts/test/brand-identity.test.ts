@@ -19,7 +19,7 @@ const skippedDirs = new Set([
 
 const skippedSubtrees = new Set(["docs/superpowers"]);
 
-const skippedFiles = new Set(["crates/cli/CHANGELOG.md", "scripts/test/brand-identity.test.ts"]);
+const skippedFiles = new Set(["crates/runner/CHANGELOG.md", "scripts/test/brand-identity.test.ts"]);
 
 const textExtensions = new Set([
   ".css",

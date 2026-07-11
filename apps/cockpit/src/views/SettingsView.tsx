@@ -1,13 +1,13 @@
 import { ACCENTS, Button, Input, type Mode, SettingsCard as Card, SettingsCardRow as CardRow, Switch, useTheme } from "@ryuzi/ui";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
 import { commands } from "@/bindings";
 import { ModelPicker } from "@/components/ModelPicker";
 import { PermissionsCard } from "@/components/PermissionsCard";
-import { PROJECTS_ROOT_KEY } from "@/constants";
-import { useAgent } from "@/store-agent";
+import { PROJECTS_ROOT_KEY, WORKTREE_DIR_KEY } from "@/constants";
+import { agentModelValues, useAgent } from "@/store-agent";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
 import { normalizeLoopSetting } from "@/lib/loop-settings";
 import { ensurePermission } from "@/lib/notify";
@@ -185,7 +185,8 @@ function AccentRow() {
 // persisted settings.
 
 function AgentSection() {
-  const models = useAgent((s) => s.models);
+  const selectableModels = useAgent((s) => s.models);
+  const models = useMemo(() => agentModelValues(selectableModels), [selectableModels]);
   const model = useAgent((s) => s.model);
   const loaded = useAgent((s) => s.loaded);
   const setModel = useAgent((s) => s.setModel);
@@ -360,6 +361,21 @@ export function SettingsView() {
     if (res.status === "error") toast.error("Couldn't save projects folder: " + res.error.message);
   };
 
+  const [worktreeDir, setWorktreeDir] = useState("");
+  useEffect(() => {
+    void commands.getSetting(WORKTREE_DIR_KEY).then((res) => {
+      if (res.status === "ok") setWorktreeDir(res.data ?? "");
+    });
+  }, []);
+
+  const pickWorktreeDir = async () => {
+    const dir = await commands.pickDirectory();
+    if (!dir) return;
+    setWorktreeDir(dir);
+    const res = await commands.setSetting(WORKTREE_DIR_KEY, dir);
+    if (res.status === "error") toast.error("Couldn't save worktree folder: " + res.error.message);
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
       <div className="mx-auto max-w-[640px]">
@@ -429,6 +445,20 @@ export function SettingsView() {
               </div>
             </div>
             <Button variant="outline" onClick={() => void pickProjectsRoot()}>
+              Browse
+            </Button>
+          </div>
+        </Card>
+
+        <Card className="mt-3">
+          <div className="flex items-center gap-3.5 px-[18px] py-4">
+            <div className="min-w-0 flex-1">
+              <div className="text-[13.5px] font-semibold">Worktree folder</div>
+              <div className="mt-0.5 truncate text-[12.5px] text-muted-foreground">
+                {worktreeDir || "Default location for isolated git worktrees (app data folder)."}
+              </div>
+            </div>
+            <Button variant="outline" onClick={() => void pickWorktreeDir()}>
               Browse
             </Button>
           </div>

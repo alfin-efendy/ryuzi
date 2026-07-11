@@ -12,6 +12,178 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::path::{Path, PathBuf};
 
+fn migration_24_codex_models(
+    tx: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut models: std::collections::HashSet<String> =
+        crate::llm_router::registry::descriptor("openai-oauth")
+            .map(|descriptor| {
+                descriptor
+                    .models
+                    .iter()
+                    .map(|model| (*model).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+    let snapshot: Value = serde_json::from_str(include_str!("llm_router/model_meta_snapshot.json"))
+        .map_err(to_sql_json_error)?;
+    if let Some(entries) = snapshot.as_object() {
+        for key in entries.keys() {
+            if let Some(model) = key.strip_prefix("provider::openai-oauth::model::") {
+                models.insert(model.to_string());
+            }
+        }
+    }
+    let mut stmt =
+        tx.prepare("SELECT data FROM provider_connections WHERE provider='openai-oauth'")?;
+    for raw in stmt.query_map([], |row| row.get::<_, String>(0))? {
+        let value: Value = serde_json::from_str(&raw?).unwrap_or(Value::Null);
+        if let Some(stored) = value.get("modelsOverride").and_then(Value::as_array) {
+            models.extend(stored.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+        if let Some(stored) = value.get("modelMetaOverrides").and_then(Value::as_object) {
+            models.extend(stored.keys().cloned());
+        }
+    }
+    Ok(models)
+}
+
+fn migration_24_known_codex_model(known: &std::collections::HashSet<String>, model: &str) -> bool {
+    known.contains(model)
+        || model
+            .strip_suffix("-review")
+            .is_some_and(|base| known.contains(base))
+}
+
+fn migration_24_parse_prefixed(
+    value: &str,
+    known: &std::collections::HashSet<String>,
+) -> Option<(String, String, String)> {
+    let (prefix, original_model) = value.split_once('/')?;
+    if !matches!(prefix, "openai" | "openai-oauth") {
+        return None;
+    }
+    if original_model.contains('/') || migration_24_known_codex_model(known, original_model) {
+        return None;
+    }
+    let (parsed, effort) = crate::llm_router::model_effort::parse_legacy_codex_selection(value)?;
+    let model = parsed.split_once('/')?.1.to_string();
+    let canonical = format!("openai/{model}");
+    migration_24_known_codex_model(known, &model).then_some((canonical, model, effort))
+}
+
+fn migration_24_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration::HookResult {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS model_effort_preferences (\
+            family TEXT NOT NULL,\
+            model TEXT NOT NULL,\
+            effort TEXT NOT NULL,\
+            PRIMARY KEY (family, model)\
+        );",
+    )?;
+    let known = migration_24_codex_models(tx)?;
+
+    let projects = {
+        let mut stmt =
+            tx.prepare("SELECT project_id, model, effort FROM projects WHERE model IS NOT NULL")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (id, model, existing_effort) in projects {
+        if let Some((canonical, _, suffix_effort)) = migration_24_parse_prefixed(&model, &known) {
+            let effort = existing_effort.or(Some(suffix_effort));
+            tx.execute(
+                "UPDATE projects SET model=?2, effort=?3 WHERE project_id=?1",
+                params![id, canonical, effort],
+            )?;
+        }
+    }
+
+    let default_model: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key='default_model'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(default_model) = default_model {
+        if let Some((canonical, model, suffix_effort)) =
+            migration_24_parse_prefixed(&default_model, &known)
+        {
+            tx.execute(
+                "UPDATE settings SET value=?1 WHERE key='default_model'",
+                params![canonical],
+            )?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key='default_effort'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing
+                .as_deref()
+                .is_none_or(|effort| effort.trim().is_empty())
+            {
+                tx.execute(
+                    "INSERT OR IGNORE INTO model_effort_preferences(family,model,effort) VALUES ('openai',?1,?2)",
+                    params![model, suffix_effort],
+                )?;
+            }
+        }
+    }
+
+    let routes_raw: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key='llm_model_routes'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(routes_raw) = routes_raw {
+        let mut routes: Vec<crate::llm_router::routes::ModelRouteInfo> =
+            serde_json::from_str(&routes_raw).map_err(to_sql_json_error)?;
+        let mut changed = false;
+        for route in &mut routes {
+            for target in &mut route.targets {
+                if target.provider != "openai" {
+                    continue;
+                }
+                let prefixed = format!("openai/{}", target.model);
+                if let Some((canonical, _, suffix_effort)) =
+                    migration_24_parse_prefixed(&prefixed, &known)
+                {
+                    target.model = canonical.split_once('/').unwrap().1.to_string();
+                    if target
+                        .effort
+                        .as_deref()
+                        .is_none_or(|effort| effort.trim().is_empty())
+                    {
+                        target.effort = Some(suffix_effort);
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let serialized = serde_json::to_string(&routes).map_err(to_sql_json_error)?;
+            tx.execute(
+                "UPDATE settings SET value=?1 WHERE key='llm_model_routes'",
+                params![serialized],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(
@@ -412,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_24_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_28_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -686,13 +858,68 @@ fn migrations() -> Migrations<'static> {
                 reason TEXT\
             );",
         ),
-        // Migration 24 — Remote catalog cache. `plugin_catalog_cache` holds the
+        // Migration 24 — Typed model-effort preferences and normalization of
+        // legacy Codex virtual model suffixes. Kept after main's migrations
+        // 20–23 so existing released user_version slots retain their meaning.
+        // The hook is transactional and convergent, so rewind/replay is safe.
+        M::up_with_hook("", migration_24_normalize),
+        // Migration 25 — Durable route-selection identity for switch notices.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS session_route_state (\
+                session_pk TEXT PRIMARY KEY NOT NULL,\
+                requested_model TEXT NOT NULL,\
+                resolved_provider TEXT NOT NULL,\
+                resolved_family TEXT NOT NULL,\
+                resolved_model TEXT NOT NULL,\
+                effective_effort TEXT,\
+                connection_id TEXT NOT NULL,\
+                updated_at INTEGER NOT NULL\
+            )",
+        ),
+        // Migration 26 — user-owned runtime selection for project-less chats.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS session_runtime_settings (\
+                session_pk TEXT PRIMARY KEY NOT NULL REFERENCES sessions(session_pk) ON DELETE CASCADE,\
+                model TEXT,\
+                effort TEXT,\
+                updated_at INTEGER NOT NULL\
+            )",
+        ),
+        // Migration 27 — Phase 3 background rail (spec §4/§6): durable re-entry
+        // channel + jobs.model_override. Appended as the tail across merges with
+        // main (24 model-effort normalize, 25 route-state, 26 runtime-settings —
+        // none touch a sessions/jobs column this migration reads). Every
+        // statement is existence-guarded so the rewind-and-replay migration
+        // test's replay on an already-migrated DB is a no-op.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS background_events (\
+                    id TEXT PRIMARY KEY NOT NULL,\
+                    target_session_pk TEXT NOT NULL,\
+                    kind TEXT NOT NULL,\
+                    payload TEXT NOT NULL,\
+                    created_at INTEGER NOT NULL,\
+                    claimed_by TEXT,\
+                    delivered_at INTEGER\
+                );\
+                CREATE INDEX IF NOT EXISTS idx_background_events_target \
+                    ON background_events(target_session_pk, delivered_at);",
+            )?;
+            let has_override = tx
+                .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_override'")?
+                .exists([])?;
+            if !has_override {
+                tx.execute("ALTER TABLE jobs ADD COLUMN model_override TEXT", [])?;
+            }
+            Ok(())
+        }),
+        // Migration 28 — Remote catalog cache. `plugin_catalog_cache` holds the
         // entries of the last verified signed feed (id, manifest TOML, semver,
         // feed sequence, blocked flag+reason); `catalog_feed_state` is a single
         // KV row tracking the last-accepted sequence + fetch outcome for
-        // anti-rollback and status. Appended as the tail after migration 23.
-        // IF NOT EXISTS: the rewind-and-replay test re-runs this on an
-        // already-migrated DB, so it must be a no-op on replay.
+        // anti-rollback and status. Appended as the tail after main's migration
+        // 27 (background rail). IF NOT EXISTS: the rewind-and-replay test re-runs
+        // this on an already-migrated DB, so it must be a no-op on replay.
         M::up(
             "CREATE TABLE IF NOT EXISTS plugin_catalog_cache (\
                 id TEXT PRIMARY KEY NOT NULL,\
@@ -715,6 +942,12 @@ fn migrations() -> Migrations<'static> {
 
 pub struct Store {
     pool: Pool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRuntimeSettings {
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// One durable compaction checkpoint: the replacement history that stands in
@@ -1002,13 +1235,14 @@ where
 {
     let conn = pool.get().await?;
     let out = conn
-        .interact(move |c| {
+        .interact(move |c| -> anyhow::Result<T> {
             // Pooled connections + WAL still return SQLITE_BUSY immediately on
             // write contention (e.g. a request's read racing a detached
             // usage-record / prune write). A busy_timeout makes them wait
             // instead of erroring — otherwise concurrent load surfaces as a 500.
             let _ = c.busy_timeout(std::time::Duration::from_secs(5));
-            f(c)
+            c.pragma_update(None, "foreign_keys", "ON")?;
+            Ok(f(c)?)
         })
         .await
         .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
@@ -1173,6 +1407,24 @@ impl Store {
         self.get_project(id).await
     }
 
+    /// Update only the permission column. Runtime selection and harness
+    /// canonicalization have independent atomic persistence paths.
+    pub async fn update_project_perm_mode(
+        &self,
+        project_id: &str,
+        perm_mode: PermMode,
+    ) -> anyhow::Result<bool> {
+        let project_id = project_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE projects SET perm_mode=?2 WHERE project_id=?1",
+                params![project_id, perm_mode.as_str()],
+            )
+            .map(|changed| changed > 0)
+        })
+        .await
+    }
+
     pub async fn insert_project(&self, p: Project) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
@@ -1229,6 +1481,35 @@ impl Store {
         })
         .await?;
         Ok(())
+    }
+
+    pub async fn insert_chat_session_with_runtime(
+        &self,
+        s: Session,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        let updated_at = now_ms();
+        let session_pk = s.session_pk.clone();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                params![
+                    s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
+                    s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
+                    s.started_by, s.resume_attempts, s.branch_owned, s.perm_mode.as_str(),
+                    s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO session_runtime_settings(session_pk,model,effort,updated_at) VALUES(?1,?2,?3,?4)",
+                params![session_pk, model, effort, updated_at],
+            )?;
+            tx.commit()
+        })
+        .await
     }
 
     pub async fn get_session(&self, pk: &str) -> anyhow::Result<Option<Session>> {
@@ -1376,6 +1657,97 @@ impl Store {
         Ok(())
     }
 
+    /// Replace the project-wide runtime selection. Unlike
+    /// `update_project_prefs`, `None` is an explicit SQL NULL.
+    pub async fn update_project_runtime(
+        &self,
+        project_id: &str,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        let project_id = project_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE projects SET model=?2, effort=?3 WHERE project_id=?1",
+                params![project_id, model, effort],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_model_effort_preference(
+        &self,
+        key: &crate::llm_router::model_effort::ModelPreferenceKey,
+    ) -> anyhow::Result<Option<String>> {
+        let key = key.clone();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT effort FROM model_effort_preferences WHERE family=?1 AND model=?2",
+                params![key.family, key.model],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_model_effort_preferences(
+        &self,
+    ) -> anyhow::Result<Vec<(crate::llm_router::model_effort::ModelPreferenceKey, String)>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT family, model, effort FROM model_effort_preferences ORDER BY family, model",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        crate::llm_router::model_effort::ModelPreferenceKey {
+                            family: row.get(0)?,
+                            model: row.get(1)?,
+                        },
+                        row.get(2)?,
+                    ))
+                })?
+                .collect();
+            rows
+        })
+        .await
+    }
+
+    pub async fn set_model_effort_preference(
+        &self,
+        key: &crate::llm_router::model_effort::ModelPreferenceKey,
+        effort: &str,
+    ) -> anyhow::Result<()> {
+        let key = key.clone();
+        let effort = effort.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO model_effort_preferences(family,model,effort) VALUES (?1,?2,?3) \
+                 ON CONFLICT(family,model) DO UPDATE SET effort=excluded.effort",
+                params![key.family, key.model, effort],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn clear_model_effort_preference(
+        &self,
+        key: &crate::llm_router::model_effort::ModelPreferenceKey,
+    ) -> anyhow::Result<()> {
+        let key = key.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM model_effort_preferences WHERE family=?1 AND model=?2",
+                params![key.family, key.model],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
     /// Atomically demote `Running → Idle` only if the current status is still `Running`.
     /// A session already marked `Interrupted` or `Ended` is left untouched.
     /// Also resets `resume_attempts` to 0 — a turn that reaches a normal (or
@@ -1481,6 +1853,136 @@ impl Store {
                         m.tool_call_id, m.status, m.tool_kind, created],
                 |r| r.get::<_, i64>(0),
             )
+        })
+        .await
+    }
+
+    pub async fn get_session_runtime_settings(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<SessionRuntimeSettings>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT model,effort FROM session_runtime_settings WHERE session_pk=?1",
+                params![session_pk],
+                |r| {
+                    Ok(SessionRuntimeSettings {
+                        model: r.get(0)?,
+                        effort: r.get(1)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn update_session_runtime_settings(
+        &self,
+        session_pk: &str,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        let session_pk = session_pk.to_string();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO session_runtime_settings(session_pk,model,effort,updated_at) VALUES(?1,?2,?3,?4) \
+                 ON CONFLICT(session_pk) DO UPDATE SET model=excluded.model,effort=excluded.effort,updated_at=excluded.updated_at",
+                params![session_pk, model, effort, updated_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn observe_session_route(
+        &self,
+        session_pk: &str,
+        selection: &crate::llm_router::provenance::RouteSelection,
+    ) -> anyhow::Result<Option<Message>> {
+        let session_pk = session_pk.to_string();
+        let selection = selection.clone();
+        self.with_conn(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let previous = tx
+                .query_row(
+                    "SELECT requested_model,resolved_provider,resolved_family,resolved_model,effective_effort,connection_id \
+                     FROM session_route_state WHERE session_pk=?1",
+                    params![session_pk],
+                    |r| {
+                        Ok(crate::llm_router::provenance::RouteSelection {
+                            requested_model: r.get(0)?,
+                            resolved_provider_id: r.get(1)?,
+                            resolved_family: r.get(2)?,
+                            resolved_model: r.get(3)?,
+                            resolved_model_display_name: String::new(),
+                            effective_effort: r.get(4)?,
+                            effective_effort_label: None,
+                            connection_id: r.get(5)?,
+                            connection_label: String::new(),
+                            reason: crate::llm_router::provenance::RouteSelectionReason::Initial,
+                        })
+                    },
+                )
+                .optional()?;
+            let created_at = now_ms();
+            let notice = crate::llm_router::provenance::notice_text(previous.as_ref(), &selection)
+                .map(|copy| -> rusqlite::Result<Message> {
+                    let payload = serde_json::json!({ "text": copy });
+                    let payload_json = serde_json::to_string(&payload).map_err(to_sql_json_error)?;
+                    let seq = tx.query_row(
+                        "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at) \
+                         SELECT ?1, COALESCE(MAX(seq),0)+1, 'system', 'notice', ?2, NULL, NULL, NULL, ?3 \
+                         FROM messages WHERE session_pk=?1 \
+                         RETURNING seq",
+                        params![session_pk, payload_json, created_at],
+                        |r| r.get::<_, i64>(0),
+                    )?;
+                    tx.execute(
+                        "UPDATE sessions SET last_active=?2 WHERE session_pk=?1",
+                        params![session_pk, created_at],
+                    )?;
+                    Ok(Message {
+                        session_pk: session_pk.clone(),
+                        seq,
+                        role: "system".into(),
+                        block_type: "notice".into(),
+                        payload,
+                        tool_call_id: None,
+                        status: None,
+                        tool_kind: None,
+                        created_at,
+                    })
+                })
+                .transpose()?;
+            tx.execute(
+                "INSERT INTO session_route_state(\
+                    session_pk,requested_model,resolved_provider,resolved_family,resolved_model,\
+                    effective_effort,connection_id,updated_at\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+                 ON CONFLICT(session_pk) DO UPDATE SET \
+                    requested_model=excluded.requested_model,\
+                    resolved_provider=excluded.resolved_provider,\
+                    resolved_family=excluded.resolved_family,\
+                    resolved_model=excluded.resolved_model,\
+                    effective_effort=excluded.effective_effort,\
+                    connection_id=excluded.connection_id,\
+                    updated_at=excluded.updated_at",
+                params![
+                    session_pk,
+                    selection.requested_model,
+                    selection.resolved_provider_id,
+                    selection.resolved_family,
+                    selection.resolved_model,
+                    selection.effective_effort,
+                    selection.connection_id,
+                    created_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(notice)
         })
         .await
     }
@@ -1849,6 +2351,140 @@ impl Store {
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
+        })
+        .await
+    }
+
+    /// Enqueue a durable background-rail row (spec §6.1). Returns the new id.
+    pub async fn enqueue_background_event(
+        &self,
+        target_session_pk: &str,
+        kind: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        let id = crate::paths::new_id();
+        let (id2, target, kind, payload, now) = (
+            id.clone(),
+            target_session_pk.to_string(),
+            kind.to_string(),
+            payload.to_string(),
+            crate::paths::now_ms(),
+        );
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO background_events(id, target_session_pk, kind, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id2, target, kind, payload, now],
+            )
+            .map(|_| ())
+        })
+        .await?;
+        Ok(id)
+    }
+
+    /// Atomically claim the OLDEST undelivered, unclaimed rail row whose target
+    /// session is IDLE (the idle-only invariant, spec §6.1). Returns `None`
+    /// when nothing is deliverable. The claim + read run in one transaction so
+    /// two drainers never claim the same row.
+    pub async fn claim_deliverable_background_event(
+        &self,
+        claimer: &str,
+    ) -> anyhow::Result<Option<crate::domain::BackgroundEvent>> {
+        let claimer = claimer.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let picked: Option<String> = tx
+                .query_row(
+                    "SELECT be.id FROM background_events be \
+                     JOIN sessions s ON s.session_pk = be.target_session_pk \
+                     WHERE be.delivered_at IS NULL AND be.claimed_by IS NULL \
+                       AND s.status = 'idle' \
+                     ORDER BY be.created_at ASC LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(id) = picked else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE background_events SET claimed_by = ?2 WHERE id = ?1",
+                params![id, claimer],
+            )?;
+            let row = tx.query_row(
+                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                 FROM background_events WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(crate::domain::BackgroundEvent {
+                        id: r.get(0)?,
+                        target_session_pk: r.get(1)?,
+                        kind: r.get(2)?,
+                        payload: r.get(3)?,
+                        created_at: r.get(4)?,
+                        claimed_by: r.get(5)?,
+                        delivered_at: r.get(6)?,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(Some(row))
+        })
+        .await
+    }
+
+    /// Mark a claimed rail row delivered (its user turn has been injected).
+    pub async fn mark_background_delivered(&self, id: &str) -> anyhow::Result<()> {
+        let (id, now) = (id.to_string(), crate::paths::now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE background_events SET delivered_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Release a claim so the row is retried next tick (target went busy, or
+    /// delivery errored). Never touches `delivered_at`.
+    pub async fn release_background_claim(&self, id: &str) -> anyhow::Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE background_events SET claimed_by = NULL WHERE id = ?1 AND delivered_at IS NULL",
+                params![id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Remove every pending rail row targeting a session (session-end cascade,
+    /// spec §6.1: orphaned background work must not leak into a new chat).
+    /// Delivered rows are kept as an audit trail. Returns the count removed.
+    pub async fn delete_background_events_for_session(
+        &self,
+        target_session_pk: &str,
+    ) -> anyhow::Result<u64> {
+        let target = target_session_pk.to_string();
+        self.with_conn(move |c| {
+            Ok(c.execute(
+                "DELETE FROM background_events WHERE target_session_pk = ?1 AND delivered_at IS NULL",
+                params![target],
+            )? as u64)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn pending_background_count(&self) -> anyhow::Result<i64> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM background_events WHERE delivered_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
         })
         .await
     }
@@ -2551,6 +3187,9 @@ mod tests {
     use super::*;
     use crate::domain::{NewMessage, PermMode, Project};
     use crate::domain::{Session, SessionStatus};
+    use crate::llm_router::provenance::{
+        RouteFailureCategory, RouteSelection, RouteSelectionReason,
+    };
     use crate::llm_router::secrets::use_test_key_file;
     use crate::plugins::oauth::PluginOauthToken;
 
@@ -2566,6 +3205,58 @@ mod tests {
             created_at: Some(123),
             is_git: false,
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_permission_update_preserves_atomic_model_effort() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        store
+            .insert_project(Project {
+                project_id: "p-permission-race".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                model: Some("old-model".into()),
+                effort: Some("low".into()),
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let runtime_store = store.clone();
+        let runtime_barrier = barrier.clone();
+        let runtime = tokio::spawn(async move {
+            runtime_barrier.wait().await;
+            runtime_store
+                .update_project_runtime(
+                    "p-permission-race",
+                    Some("new-model".into()),
+                    Some("high".into()),
+                )
+                .await
+                .unwrap();
+        });
+        let permission_store = store.clone();
+        let permission = tokio::spawn(async move {
+            barrier.wait().await;
+            permission_store
+                .update_project_perm_mode("p-permission-race", PermMode::BypassPermissions)
+                .await
+                .unwrap();
+        });
+        runtime.await.unwrap();
+        permission.await.unwrap();
+        let project = store
+            .get_project("p-permission-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.model.as_deref(), Some("new-model"));
+        assert_eq!(project.effort.as_deref(), Some("high"));
+        assert_eq!(project.perm_mode, PermMode::BypassPermissions);
     }
 
     #[tokio::test]
@@ -2647,6 +3338,386 @@ mod tests {
             agent: None,
             parent_session_pk: None,
         }
+    }
+
+    fn route_selection() -> RouteSelection {
+        RouteSelection {
+            requested_model: "sol".into(),
+            resolved_provider_id: "openai-oauth".into(),
+            resolved_family: "openai".into(),
+            resolved_model: "gpt-5.6-sol".into(),
+            resolved_model_display_name: "5.6 Sol".into(),
+            effective_effort: Some("high".into()),
+            effective_effort_label: Some("High".into()),
+            connection_id: "connection-a".into(),
+            connection_label: "Personal Codex".into(),
+            reason: RouteSelectionReason::Initial,
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_25_creates_session_route_state_idempotently() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            let columns = store
+                .with_conn(|c| {
+                    let mut stmt = c.prepare(
+                        "SELECT name FROM pragma_table_info('session_route_state') ORDER BY cid",
+                    )?;
+                    let columns = stmt
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(columns)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                columns,
+                [
+                    "session_pk",
+                    "requested_model",
+                    "resolved_provider",
+                    "resolved_family",
+                    "resolved_model",
+                    "effective_effort",
+                    "connection_id",
+                    "updated_at",
+                ]
+            );
+            store
+                .with_conn(|c| c.pragma_update(None, "user_version", 24))
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let count: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session_route_state'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn session_runtime_settings_round_trip_independently_from_route_observation() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let mut session = sample_session();
+        session.kind = SessionKind::Chat;
+        session.project_id = None;
+        store.insert_session(session).await.unwrap();
+        store
+            .update_session_runtime_settings(
+                "s1",
+                Some("openai/gpt-5.5".into()),
+                Some("high".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session_runtime_settings("s1").await.unwrap(),
+            Some(SessionRuntimeSettings {
+                model: Some("openai/gpt-5.5".into()),
+                effort: Some("high".into()),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn session_runtime_foreign_key_rejects_orphans_and_cascades() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store
+            .update_session_runtime_settings("missing", Some("m".into()), None)
+            .await
+            .is_err());
+
+        let mut session = sample_session();
+        session.kind = SessionKind::Chat;
+        session.project_id = None;
+        store
+            .insert_chat_session_with_runtime(session, Some("m".into()), Some("high".into()))
+            .await
+            .unwrap();
+        store
+            .with_conn(|c| c.execute("DELETE FROM sessions WHERE session_pk='s1'", []))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session_runtime_settings("s1").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_and_runtime_insert_roll_back_together() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .with_conn(|c| {
+                c.execute_batch(
+                    "CREATE TRIGGER reject_runtime BEFORE INSERT ON session_runtime_settings \
+                     BEGIN SELECT RAISE(ABORT, 'reject runtime'); END;",
+                )
+            })
+            .await
+            .unwrap();
+        let mut session = sample_session();
+        session.kind = SessionKind::Chat;
+        session.project_id = None;
+        assert!(store
+            .insert_chat_session_with_runtime(session, Some("m".into()), None)
+            .await
+            .is_err());
+        assert!(store.get_session("s1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_route_state_first_observation_is_silent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+
+        assert_eq!(
+            store
+                .observe_session_route("s1", &route_selection())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(store.list_messages("s1").await.unwrap().is_empty());
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().last_active,
+            Some(1)
+        );
+        let stored: (String, String, String, String, Option<String>, String) = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT requested_model,resolved_provider,resolved_family,resolved_model,effective_effort,connection_id FROM session_route_state WHERE session_pk='s1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "sol".into(),
+                "openai-oauth".into(),
+                "openai".into(),
+                "gpt-5.6-sol".into(),
+                Some("high".into()),
+                "connection-a".into(),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn session_route_state_equal_identity_deduplicates_mutable_labels_and_reason() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .observe_session_route("s1", &route_selection())
+            .await
+            .unwrap();
+
+        let mut renamed = route_selection();
+        renamed.requested_model = "friendly-alias".into();
+        renamed.resolved_model_display_name = "Renamed Sol".into();
+        renamed.effective_effort_label = Some("Maximum".into());
+        renamed.connection_label = "Renamed account".into();
+        renamed.reason = RouteSelectionReason::Failover(RouteFailureCategory::Quota);
+        assert_eq!(
+            store.observe_session_route("s1", &renamed).await.unwrap(),
+            None
+        );
+        assert!(store.list_messages("s1").await.unwrap().is_empty());
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().last_active,
+            Some(1)
+        );
+        let requested: String = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT requested_model FROM session_route_state WHERE session_pk='s1'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(requested, "friendly-alias");
+    }
+
+    #[tokio::test]
+    async fn session_route_state_change_inserts_notice_and_updates_atomically() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .observe_session_route("s1", &route_selection())
+            .await
+            .unwrap();
+
+        let mut changed = route_selection();
+        changed.connection_id = "connection-b".into();
+        changed.connection_label = "Work Codex".into();
+        changed.reason = RouteSelectionReason::RoundRobin;
+        let notice = store
+            .observe_session_route("s1", &changed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(notice.session_pk, "s1");
+        assert_eq!(notice.seq, 1);
+        assert_eq!(notice.role, "system");
+        assert_eq!(notice.block_type, "notice");
+        assert_eq!(
+            notice.payload,
+            serde_json::json!({"text": "Account switched to Work Codex · round robin"})
+        );
+        assert_eq!(notice.tool_call_id, None);
+        assert_eq!(notice.status, None);
+        assert_eq!(notice.tool_kind, None);
+        assert_eq!(
+            store.list_messages("s1").await.unwrap(),
+            vec![notice.clone()]
+        );
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().last_active,
+            Some(notice.created_at)
+        );
+        let state: (String, i64) = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT connection_id,updated_at FROM session_route_state WHERE session_pk='s1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, ("connection-b".into(), notice.created_at));
+    }
+
+    #[tokio::test]
+    async fn session_route_state_survives_cold_reopen() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store.insert_session(sample_session()).await.unwrap();
+            store
+                .observe_session_route("s1", &route_selection())
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let mut changed = route_selection();
+        changed.resolved_model = "gpt-5.6-sol-plus".into();
+        changed.resolved_model_display_name = "5.6 Sol Plus".into();
+        let notice = store
+            .observe_session_route("s1", &changed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            notice.payload,
+            serde_json::json!({"text": "Switched to 5.6 Sol Plus · High"})
+        );
+    }
+
+    #[tokio::test]
+    async fn session_route_state_message_trigger_failure_rolls_back_state() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .observe_session_route("s1", &route_selection())
+            .await
+            .unwrap();
+        store
+            .with_conn(|c| {
+                c.execute_batch(
+                    "CREATE TEMP TRIGGER abort_route_notice BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'route notice rejected'); END;",
+                )
+            })
+            .await
+            .unwrap();
+
+        let mut changed = route_selection();
+        changed.connection_id = "connection-b".into();
+        changed.connection_label = "Work Codex".into();
+        assert!(store.observe_session_route("s1", &changed).await.is_err());
+        let state: String = store
+            .with_conn(|c| {
+                c.execute_batch("DROP TRIGGER abort_route_notice")?;
+                c.query_row(
+                    "SELECT connection_id FROM session_route_state WHERE session_pk='s1'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "connection-a");
+        assert!(store.list_messages("s1").await.unwrap().is_empty());
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().last_active,
+            Some(1)
+        );
+        assert!(store
+            .observe_session_route("s1", &changed)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn session_route_state_concurrent_store_instances_emit_once() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store_a = Store::open(tmp.path()).await.unwrap();
+        let store_b = Store::open(tmp.path()).await.unwrap();
+        store_a.insert_session(sample_session()).await.unwrap();
+        store_a
+            .observe_session_route("s1", &route_selection())
+            .await
+            .unwrap();
+        let mut changed = route_selection();
+        changed.connection_id = "connection-b".into();
+        changed.connection_label = "Work Codex".into();
+        changed.reason = RouteSelectionReason::RoundRobin;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let changed_b = changed.clone();
+        let barrier_a = barrier.clone();
+        let a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            store_a.observe_session_route("s1", &changed).await.unwrap()
+        });
+        let b = tokio::spawn(async move {
+            barrier.wait().await;
+            store_b
+                .observe_session_route("s1", &changed_b)
+                .await
+                .unwrap()
+        });
+
+        let outcomes = [a.await.unwrap(), b.await.unwrap()];
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_some()).count(),
+            1
+        );
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(store.list_messages("s1").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3289,6 +4360,349 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_effort_preferences_use_structured_keys_and_clear_explicitly() {
+        use crate::llm_router::model_effort::ModelPreferenceKey;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let key = ModelPreferenceKey {
+            family: "openai".into(),
+            model: "org/team/gpt-custom".into(),
+        };
+
+        assert_eq!(store.get_model_effort_preference(&key).await.unwrap(), None);
+        store
+            .set_model_effort_preference(&key, "ultra")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_model_effort_preference(&key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(
+            store.list_model_effort_preferences().await.unwrap(),
+            vec![(key.clone(), "ultra".into())]
+        );
+        store.clear_model_effort_preference(&key).await.unwrap();
+        assert_eq!(store.get_model_effort_preference(&key).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn model_effort_update_project_runtime_assigns_nulls() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .insert_project(Project {
+                project_id: "runtime-prefs".into(),
+                name: "runtime".into(),
+                workdir: "/tmp/runtime".into(),
+                source: None,
+                model: Some("old-model".into()),
+                effort: Some("high".into()),
+                perm_mode: PermMode::Default,
+                created_at: Some(1),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+
+        store
+            .update_project_runtime("runtime-prefs", Some("new/model".into()), None)
+            .await
+            .unwrap();
+        let project = store.get_project("runtime-prefs").await.unwrap().unwrap();
+        assert_eq!(project.model.as_deref(), Some("new/model"));
+        assert_eq!(project.effort, None);
+
+        store
+            .update_project_runtime("runtime-prefs", None, Some("none".into()))
+            .await
+            .unwrap();
+        let project = store.get_project("runtime-prefs").await.unwrap().unwrap();
+        assert_eq!(project.model, None);
+        assert_eq!(project.effort.as_deref(), Some("none"));
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_normalizes_eligible_legacy_storage_and_replays() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(|c| {
+                    c.execute_batch(
+                        r#"DROP TABLE model_effort_preferences;
+                           INSERT INTO projects(project_id,name,workdir,model,effort)
+                             VALUES ('p1','p1','/p1','openai/gpt-5.2-codex-high',NULL),
+                                    ('p2','p2','/p2','openai/gpt-5.2-codex-review-high','ultra'),
+                                    ('oauthprefix','oauthprefix','/oauth','openai-oauth/gpt-5.2-codex-high',NULL),
+                                    ('alias','alias','/alias','fast-high',NULL),
+                                    ('unknown','unknown','/unknown','openai/not-cataloged-high',NULL);
+                           INSERT OR REPLACE INTO settings(key,value) VALUES
+                             ('default_model','openai/gpt-5.2-codex-high-review'),
+                             ('default_effort',''),
+                             ('llm_model_routes','[{"id":"r1","name":"route","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"gpt-5.2-codex-review-high"},{"provider":"anthropic","model":"claude-high"}],"createdAt":1,"updatedAt":1}]');
+                           PRAGMA user_version=23;"#,
+                    )
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let p1 = store.get_project("p1").await.unwrap().unwrap();
+        assert_eq!(p1.model.as_deref(), Some("openai/gpt-5.2-codex"));
+        assert_eq!(p1.effort.as_deref(), Some("high"));
+        let p2 = store.get_project("p2").await.unwrap().unwrap();
+        assert_eq!(p2.model.as_deref(), Some("openai/gpt-5.2-codex-review"));
+        assert_eq!(p2.effort.as_deref(), Some("ultra"), "existing effort wins");
+        assert_eq!(
+            store
+                .get_project("alias")
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("fast-high")
+        );
+        assert_eq!(
+            store
+                .get_project("unknown")
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("openai/not-cataloged-high")
+        );
+        assert_eq!(
+            store
+                .get_project("oauthprefix")
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("openai/gpt-5.2-codex")
+        );
+        assert_eq!(
+            store.get_setting("default_model").await.unwrap().as_deref(),
+            Some("openai/gpt-5.2-codex-review")
+        );
+        let key = crate::llm_router::model_effort::ModelPreferenceKey {
+            family: "openai".into(),
+            model: "gpt-5.2-codex-review".into(),
+        };
+        assert_eq!(
+            store
+                .get_model_effort_preference(&key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("high")
+        );
+        let routes = crate::llm_router::routes::list_model_routes(&store)
+            .await
+            .unwrap();
+        assert_eq!(routes[0].targets[0].model, "gpt-5.2-codex-review");
+        assert_eq!(routes[0].targets[0].effort.as_deref(), Some("high"));
+        assert_eq!(routes[0].targets[1].model, "claude-high");
+
+        let before = store.list_model_effort_preferences().await.unwrap();
+        store
+            .with_conn(|c| c.pragma_update(None, "user_version", 23))
+            .await
+            .unwrap();
+        drop(store);
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(store.list_model_effort_preferences().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_preserves_exact_known_suffix_bearing_models() {
+        let routes = r#"[{"id":"exact-route","name":"exact","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"foo-high"}],"createdAt":1,"updatedAt":1}]"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            let routes = routes.to_string();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        r#"DROP TABLE model_effort_preferences;
+                           INSERT INTO provider_connections(id,provider,auth_type,label,priority,enabled,data,created_at,updated_at)
+                             VALUES ('exact-codex','openai-oauth','oauth','exact',0,1,'{"modelsOverride":["foo","foo-high"]}',1,1);
+                           INSERT INTO projects(project_id,name,workdir,model,effort)
+                             VALUES ('exact-project','exact','/exact','openai/foo-high',NULL);
+                           INSERT OR REPLACE INTO settings(key,value) VALUES
+                             ('default_model','openai/foo-high'),
+                             ('default_effort','');
+                           PRAGMA user_version=23;"#,
+                    )?;
+                    c.execute(
+                        "INSERT OR REPLACE INTO settings(key,value) VALUES ('llm_model_routes',?1)",
+                        params![routes],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let project = store.get_project("exact-project").await.unwrap().unwrap();
+        assert_eq!(project.model.as_deref(), Some("openai/foo-high"));
+        assert_eq!(project.effort, None);
+        assert_eq!(
+            store.get_setting("default_model").await.unwrap().as_deref(),
+            Some("openai/foo-high")
+        );
+        assert_eq!(
+            store
+                .get_setting("llm_model_routes")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(routes)
+        );
+        assert!(store
+            .list_model_effort_preferences()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_preserves_known_nested_model_ids() {
+        let routes = r#"[{"id":"nested-route","name":"nested","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"org/model-high"}],"createdAt":1,"updatedAt":1}]"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            let routes = routes.to_string();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        r#"DROP TABLE model_effort_preferences;
+                           INSERT INTO provider_connections(id,provider,auth_type,label,priority,enabled,data,created_at,updated_at)
+                             VALUES ('nested-codex','openai-oauth','oauth','nested',0,1,'{"modelsOverride":["org/model","org/model-high"]}',1,1);
+                           INSERT INTO projects(project_id,name,workdir,model,effort)
+                             VALUES ('nested-project','nested','/nested','openai/org/model-high',NULL);
+                           INSERT OR REPLACE INTO settings(key,value) VALUES
+                             ('default_model','openai/org/model-high'),
+                             ('default_effort','');
+                           PRAGMA user_version=23;"#,
+                    )?;
+                    c.execute(
+                        "INSERT OR REPLACE INTO settings(key,value) VALUES ('llm_model_routes',?1)",
+                        params![routes],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let project = store.get_project("nested-project").await.unwrap().unwrap();
+        assert_eq!(project.model.as_deref(), Some("openai/org/model-high"));
+        assert_eq!(project.effort, None);
+        assert_eq!(
+            store.get_setting("default_model").await.unwrap().as_deref(),
+            Some("openai/org/model-high")
+        );
+        assert_eq!(
+            store
+                .get_setting("llm_model_routes")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(routes)
+        );
+        assert!(store
+            .list_model_effort_preferences()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_malformed_routes_rolls_back_atomically() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store.with_conn(|c| c.execute_batch(
+                "DROP TABLE model_effort_preferences;
+                 INSERT INTO projects(project_id,name,workdir,model) VALUES ('p','p','/p','openai/gpt-5.2-codex-high');
+                 INSERT OR REPLACE INTO settings(key,value) VALUES ('llm_model_routes','{malformed');
+                 PRAGMA user_version=23;"
+            )).await.unwrap();
+        }
+
+        assert!(Store::open(tmp.path()).await.is_err());
+        let c = rusqlite::Connection::open(tmp.path()).unwrap();
+        let version: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 23);
+        let model: String = c
+            .query_row("SELECT model FROM projects WHERE project_id='p'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(model, "openai/gpt-5.2-codex-high");
+        assert!(c.prepare("SELECT 1 FROM model_effort_preferences").is_err());
+    }
+
+    #[tokio::test]
+    async fn model_effort_migration_non_empty_default_effort_wins_without_seeding() {
+        use crate::llm_router::model_effort::ModelPreferenceKey;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(|c| {
+                    c.execute_batch(
+                        "DROP TABLE model_effort_preferences;
+                 INSERT OR REPLACE INTO settings(key,value) VALUES
+                   ('default_model','openai/gpt-5.5-review-high'),
+                   ('default_effort','ultra');
+                 PRAGMA user_version=23;",
+                    )
+                })
+                .await
+                .unwrap();
+        }
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(
+            store.get_setting("default_model").await.unwrap().as_deref(),
+            Some("openai/gpt-5.5-review")
+        );
+        assert_eq!(
+            store
+                .get_setting("default_effort")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(
+            store
+                .get_model_effort_preference(&ModelPreferenceKey {
+                    family: "openai".into(),
+                    model: "gpt-5.5-review".into(),
+                })
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn quarantine_leaves_rust_schema_and_missing_file_alone() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("ryuzi.sqlite");
@@ -3429,7 +4843,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 24, "forward migration must land at v24");
+        assert_eq!(user_version, 28, "forward migration must land at v28");
     }
 
     #[tokio::test]
@@ -3570,9 +4984,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_24_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_28_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back ten so the
+        // DB, seed the old values, then rewind far enough that migration 13
+        // and every later migration run again.
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
@@ -3583,25 +4998,28 @@ mod tests {
         // branch_owned; 21 native-only cleanup — fully existence-guarded;
         // 22 sessions rebuild — nullable project_id + kind/speaker/agent/
         // parent_session_pk, copies every existing column forward including
-        // perm_mode; 23 plugin_installs + plugin_attach_status — CREATE TABLE
-        // IF NOT EXISTS; 24 plugin_catalog_cache + catalog_feed_state —
-        // CREATE TABLE IF NOT EXISTS; all no-ops on replay) re-run on the
-        // next open. `Migrations` always fast-forwards to the latest defined
-        // version, so there is no way to replay 13 alone once something is
-        // appended after it. Bump this offset by one for every migration
-        // appended after 13 — a stale offset silently skips migration 13 (the
-        // DB opens fine, but this test starts failing its assertions). With
-        // migrations through 24 defined, wind back twelve.
+        // perm_mode; 23 plugin_installs + plugin_attach_status; 24 typed model
+        // effort preferences + legacy normalization; 25 session_route_state;
+        // 26 session_runtime_settings; 27 background_events + jobs.model_override;
+        // 28 plugin_catalog_cache + catalog_feed_state — CREATE TABLE IF NOT
+        // EXISTS; all convergent, existence-guarded, or CREATE TABLE IF NOT
+        // EXISTS) re-run on next open.
+        // `Migrations` always fast-forwards to the latest defined version, so
+        // there is no way to replay 13 alone once something is appended after
+        // it. Bump this offset by one for every migration appended after 13 —
+        // a stale offset silently skips migration 13 (the DB opens fine, but
+        // this test starts failing its assertions). With migrations through 28
+        // defined, wind back sixteen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 12)
+            c.pragma_update(None, "user_version", v - 16)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v24 here, so `harness` was
+                    // The DB is fully migrated to v28 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -3652,15 +5070,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back four, and reopen so 21 (and the tail
-        // migrations 22 sessions rebuild + 23 plugin-install ledger + 24
-        // remote catalog cache) replay against it. Back FOUR: the fully
-        // migrated tail is now v24, so rewinding to v20 is what makes
-        // migration 21 (native-only) replay.
+        // wind user_version back eight, and reopen so 21 (and the tail
+        // migrations 22–28) replay against it. Back EIGHT: the fully migrated
+        // tail is now v28, so rewinding to v20 is what makes migration 21
+        // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 4)
+            c.pragma_update(None, "user_version", v - 8)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -3767,6 +5184,40 @@ mod tests {
             Some("user-chose-this"),
             "replay on an already-migrated DB must be a no-op"
         );
+        let route_state_exists: bool = store
+            .with_conn(|c| {
+                c.prepare(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_route_state'",
+                )?
+                .exists([])
+            })
+            .await
+            .unwrap();
+        assert!(route_state_exists);
+    }
+
+    #[tokio::test]
+    async fn migration_27_adds_background_events_and_job_model_override() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let (uv, has_bg, has_override) = store
+            .with_conn(|c| {
+                let uv: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                let has_bg = c
+                    .prepare(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_events'",
+                    )?
+                    .exists([])?;
+                let has_override = c
+                    .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_override'")?
+                    .exists([])?;
+                Ok((uv, has_bg, has_override))
+            })
+            .await
+            .unwrap();
+        assert_eq!(uv, 28, "forward migration must land at v28");
+        assert!(has_bg, "background_events table must exist");
+        assert!(has_override, "jobs.model_override column must exist");
     }
 
     #[tokio::test]
@@ -4141,7 +5592,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_20_creates_plugin_install_tables() {
+    async fn background_rail_enqueue_claim_deliver_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        // An IDLE target and a RUNNING target.
+        let mk = |pk: &str, status: crate::domain::SessionStatus| crate::domain::Session {
+            session_pk: pk.into(),
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status,
+            perm_mode: crate::domain::PermMode::Default,
+            started_by: None,
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: crate::domain::SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        };
+        store
+            .insert_session(mk("idle-1", crate::domain::SessionStatus::Idle))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk("busy-1", crate::domain::SessionStatus::Running))
+            .await
+            .unwrap();
+
+        store
+            .enqueue_background_event("busy-1", "delegation", "{\"x\":1}")
+            .await
+            .unwrap();
+        let id_idle = store
+            .enqueue_background_event("idle-1", "delegation", "{\"x\":2}")
+            .await
+            .unwrap();
+
+        // Only the idle-target row is claimable.
+        let claimed = store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, id_idle);
+        assert_eq!(claimed.target_session_pk, "idle-1");
+        // A second claim finds nothing (the busy target is skipped, the idle row is now claimed).
+        assert!(store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .is_none());
+
+        store.mark_background_delivered(&claimed.id).await.unwrap();
+        assert_eq!(store.pending_background_count().await.unwrap(), 1); // busy row still pending
+
+        // Session-end cascade removes the busy target's row.
+        assert_eq!(
+            store
+                .delete_background_events_for_session("busy-1")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.pending_background_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_23_creates_plugin_install_tables() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         let counts = store

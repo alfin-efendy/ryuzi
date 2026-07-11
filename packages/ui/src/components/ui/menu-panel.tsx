@@ -31,8 +31,16 @@ type MenuPanelProps = {
 function MenuPanel({ onClose, className, children }: MenuPanelProps) {
   const ref = useClickOutside(onClose);
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: Escape from interactive descendants bubbles here to dismiss the panel.
     <div
       ref={ref}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          onClose();
+        }
+      }}
       className={cn(
         // Cap tall menus and scroll inside instead of overflowing off-screen —
         // a long list (e.g. all provider models) was unscrollable and its tail

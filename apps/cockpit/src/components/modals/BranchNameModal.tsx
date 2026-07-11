@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
+import { useEffect, useRef, useState } from "react";
+import { Button, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 import { newBranchNameError, normalizeBranchName } from "@/lib/composer-git";
 
 /** Names a new branch for the composer. On Create it only hands the name to
@@ -16,6 +16,7 @@ export function BranchNameModal({
   onCreate: (name: string) => void;
 }) {
   const [name, setName] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (open) setName("");
@@ -34,12 +35,12 @@ export function BranchNameModal({
   };
 
   return (
-    <Modal onClose={onClose} width={400}>
-      <div className="text-[15px] font-semibold tracking-[-0.01em]">New Branch</div>
-      <div className="mt-3.5">
+    <Modal onClose={onClose} width={400} initialFocus={inputRef}>
+      <ModalHeader title="New Branch" />
+      <ModalBody>
         <FormField label="Branch name">
           <Input
-            autoFocus
+            ref={inputRef}
             value={name}
             onChange={(e) => setName(normalizeBranchName(e.target.value))}
             onKeyDown={(e) => {
@@ -50,7 +51,7 @@ export function BranchNameModal({
           />
         </FormField>
         {trimmed.length > 0 && error !== null && <p className="mt-1.5 text-[11.5px] text-destructive">{error}</p>}
-      </div>
+      </ModalBody>
       <ModalFooter>
         <Button variant="outline" onClick={onClose}>
           Cancel

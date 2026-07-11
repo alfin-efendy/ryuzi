@@ -5,6 +5,7 @@
 
 use crate::engine::EngineClient;
 use crate::error::CmdError;
+use ryuzi_core::llm_router::model_effort::SelectableModelInfo;
 use std::sync::Arc;
 use tauri::State;
 
@@ -41,7 +42,7 @@ pub async fn set_agent_settings(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_selectable_models(engine: Engine<'_>) -> R<Vec<String>> {
+pub async fn list_selectable_models(engine: Engine<'_>) -> R<Vec<SelectableModelInfo>> {
     engine
         .rpc("list_selectable_models", serde_json::json!({}))
         .await

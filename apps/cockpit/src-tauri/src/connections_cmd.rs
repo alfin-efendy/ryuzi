@@ -114,23 +114,30 @@ pub async fn add_connection(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn update_connection(
+pub async fn rename_connection(
     engine: Engine<'_>,
     id: String,
     label: String,
-    enabled: bool,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    models: Vec<String>,
-    claude_cloaking: Option<bool>,
 ) -> R<Vec<ConnectionInfo>> {
     engine
         .rpc(
-            "update_connection",
-            serde_json::json!({
-                "id": id, "label": label, "enabled": enabled, "api_key": api_key,
-                "base_url": base_url, "models": models, "claude_cloaking": claude_cloaking,
-            }),
+            "rename_connection",
+            serde_json::json!({ "id": id, "label": label }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_connection_enabled(
+    engine: Engine<'_>,
+    id: String,
+    enabled: bool,
+) -> R<Vec<ConnectionInfo>> {
+    engine
+        .rpc(
+            "set_connection_enabled",
+            serde_json::json!({ "id": id, "enabled": enabled }),
         )
         .await
 }

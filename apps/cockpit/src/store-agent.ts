@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands } from "./bindings";
+import { commands, type SelectableModelInfo } from "./bindings";
 
 // Native agent settings store (replacement for the runtimes-domain store):
 // the default model + permission mode persisted in the engine's settings KV,
@@ -12,8 +12,8 @@ import { commands } from "./bindings";
 type AgentPermMode = "plan" | "ask" | "edit" | "full";
 
 type AgentState = {
-  /** Selectable models: enabled route aliases, then provider/model ids. */
-  models: string[];
+  /** Provider-driven selectable models, including dynamic effort metadata. */
+  models: SelectableModelInfo[];
   /** Pinned default model; null = router default (first usable provider). */
   model: string | null;
   /**
@@ -35,6 +35,10 @@ type AgentState = {
   load: () => Promise<void>;
   setModel: (model: string | null) => Promise<void>;
 };
+
+export function agentModelValues(models: SelectableModelInfo[]): string[] {
+  return models.map((entry) => entry.requestValue);
+}
 
 export const useAgent = create<AgentState>((set, get) => ({
   models: [],

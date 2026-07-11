@@ -2,10 +2,10 @@
 
 This guide covers everything needed to build the monorepo from source across all platforms. The repo contains two stacks:
 
-- **Rust** (the `ryuzi` CLI + engine in `crates/`, and the Cockpit desktop shell) — requires **Rust**; Cockpit additionally needs a C++ toolchain + **WebView**
+- **Rust** (the `ryuzi` runner + engine in `crates/`, and the Cockpit desktop shell) — requires **Rust**; Cockpit additionally needs a C++ toolchain + **WebView**
 - **JS/TS** (Cockpit frontend in `apps/cockpit`, shared UI in `packages/ui`) — requires **Bun**
 
-If you only work on the CLI/engine, you only need Rust. If you touch Cockpit (`apps/cockpit`), you need the full stack below.
+If you only work on the runner/engine, you only need Rust. If you touch Cockpit (`apps/cockpit`), you need the full stack below.
 
 ---
 
@@ -200,10 +200,11 @@ make cockpit # start Cockpit in dev mode (HMR)
 The engine (`ryuzi-core`) runs as a single background daemon process that
 every surface talks to — there is no per-surface embedded engine anymore.
 
-- **Single host.** The daemon (`ryuzi __daemon` from the CLI, or Cockpit's
-  hidden `--engine-daemon` mode) is the one process that owns the scheduler,
-  the orchestrator loops, the gateways (Discord, etc.), and the
-  `RouterServer` LLM-proxy endpoint.
+- **Single host.** The daemon (`ryuzi start` from the runner — a
+  user-facing alias for the hidden `ryuzi __daemon` entry point, also used as
+  the updater/canary respawn target — or Cockpit's hidden `--engine-daemon`
+  mode) is the one process that owns the scheduler, the orchestrator loops,
+  the gateways (Discord, etc.), and the `RouterServer` LLM-proxy endpoint.
 - **Thin clients.** Cockpit attaches to an already-running daemon if it finds
   one, or auto-spawns `--engine-daemon` itself when none is running, then
   talks to it exclusively over the control API — it never opens the SQLite
@@ -218,10 +219,6 @@ every surface talks to — there is no per-surface embedded engine anymore.
 - **Singleton lock.** A `daemon.lock` file in the state dir enforces exactly
   one daemon per state dir — a second `__daemon` invocation exits immediately
   with an "already running" error instead of double-binding the store.
-- **`ryuzi serve` is unchanged.** It remains a legacy embedded, read-mostly
-  HTTP surface (`token: None`, no auth) for one-off/local use — it is not the
-  daemon and is not part of this phase. Consolidating it into the control API
-  is slated for a later phase.
 
 ---
 
@@ -245,6 +242,46 @@ phase's async delegation).
   control, not a hard requirement). Chat sessions also get their own bucket
   in the sidebar, above the project tree. A Discord DM starts a chat session
   too — no `/connect` step needed first.
+
+---
+
+## Background rail & async delegation
+
+The daemon owns a durable **background rail** (`background_events` table,
+migration #23) so work that finishes outside a chat's current turn can still
+find its way back into that chat, even across a daemon restart.
+
+- **Rail delivery is idle-only.** A producer (async delegation, a scheduled
+  job, etc.) enqueues a row targeting a `session_pk`. The drainer only
+  delivers a row when that session is actually idle — it injects the payload
+  as a **new user turn** via `continue_session_with_prompt`. It never
+  interrupts a turn in progress. Delivered rows are kept as history; rows are
+  never lost to a daemon restart because the queue lives in SQLite, not
+  memory.
+- **`task` with `background: true`.** The native `task` tool accepts a
+  `background: true` flag: the child subtask runs as a detached in-process
+  worker instead of blocking the parent turn, and the parent gets an
+  immediate "dispatched" acknowledgement. Capacity is the same shared
+  `max_concurrent_runs` setting (`n`, default 3) that already caps
+  orchestrator fan-out and sync task batches — at capacity a background
+  dispatch is **rejected with a fallback-to-sync note**, not queued, so
+  callers never get a delegation stuck waiting behind someone else's slot.
+- **Completion re-entry.** When a background child finishes, its report is
+  summary-budgeted (head/tail-trimmed to a token-derived character cap; an
+  over-cap report spills the full text to a file under
+  `state_dir()/chat/<session_pk>/delegations/` and the summary's footer
+  points at it, so a `read`-paging call recovers the full result), wrapped in
+  Hermes' verbatim `[ASYNC DELEGATION COMPLETE — {id}]` block, and enqueued
+  to the rail (`kind: "delegation"`) targeting the parent session.
+- **Session-end cleanup.** Ending a session cancels any of its still-running
+  background workers and deletes its pending (undelivered) rail rows, so a
+  chat that ends mid-delegation never has an orphaned turn reappear in a
+  later, unrelated session.
+- **Cron via the rail.** Scheduled-job output no longer notifies out of band
+  — it delivers through the same rail (`kind: "job"`) to the job's home
+  session. Jobs also gained an optional per-job `model_override`, letting a
+  job start its session on a specific model instead of the project/agent
+  default.
 
 ---
 

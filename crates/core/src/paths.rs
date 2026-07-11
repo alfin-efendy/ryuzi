@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn state_dir() -> PathBuf {
     dirs::data_dir()
@@ -10,9 +10,16 @@ pub fn db_path() -> PathBuf {
     state_dir().join("ryuzi.sqlite")
 }
 
-pub fn worktree_path_for(project_id: &str, session_pk: &str) -> PathBuf {
+/// Base directory a git session's isolated worktree is created under.
+/// `base` overrides the default `state_dir()/worktrees` root — pass the
+/// resolved `worktree_dir` setting (already `expand_home`-d), or `None` to
+/// fall back to the default.
+pub fn worktree_path_for(base: Option<&Path>, project_id: &str, session_pk: &str) -> PathBuf {
     let short: String = session_pk.chars().take(8).collect();
-    state_dir().join("worktrees").join(project_id).join(short)
+    let root = base
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| state_dir().join("worktrees"));
+    root.join(project_id).join(short)
 }
 
 /// Managed scratch working directory for a project-less `chat` session.
@@ -45,8 +52,15 @@ mod tests {
 
     #[test]
     fn worktree_path_uses_short_session_id() {
-        let p = worktree_path_for("proj1", "abcdef0123456789");
+        let p = worktree_path_for(None, "proj1", "abcdef0123456789");
         assert!(p.ends_with("worktrees/proj1/abcdef01"));
+    }
+
+    #[test]
+    fn worktree_path_honors_custom_base() {
+        let base = PathBuf::from("/custom/wt-root");
+        let p = worktree_path_for(Some(&base), "proj1", "abcdef0123456789");
+        assert_eq!(p, PathBuf::from("/custom/wt-root/proj1/abcdef01"));
     }
 
     #[test]

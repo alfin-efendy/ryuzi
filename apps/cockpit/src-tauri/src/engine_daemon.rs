@@ -12,7 +12,7 @@ use std::time::Duration;
 const DEFAULT_CONTROL_PORT: u16 = 4483;
 
 /// How long the daemon gets to build and start before this process gives up
-/// and reports a "timed out connecting" error — mirrors `ryuzi-cli`'s
+/// and reports a "timed out connecting" error — mirrors `ryuzi-runner`'s
 /// `daemon_cmd::CONNECT_TIMEOUT_MS`.
 const CONNECT_TIMEOUT_MS: u64 = 30_000;
 
@@ -87,7 +87,7 @@ async fn run_inner() -> i32 {
 
     // The daemon has already started (gateways claimed, reconcile() may have
     // fired) by the time we're wiring up the control API below — mirrors
-    // `ryuzi-cli`'s `daemon_cmd::run_daemon`: on any failure from here on,
+    // `ryuzi-runner`'s `daemon_cmd::run_daemon`: on any failure from here on,
     // stop it before reporting Error so a failed control API doesn't leave
     // an orphaned daemon process with no status reflecting the failure.
     let token = match ryuzi_core::control_token::write_token(&dir) {
@@ -180,7 +180,7 @@ fn fail(
 /// Same as [`fail`], but for failures that occur AFTER `daemon.start()`
 /// already succeeded (token write, control-API bind) — stops the daemon
 /// first so no gateway is left running behind an Error status. Mirrors
-/// `ryuzi-cli`'s `daemon_cmd::run_daemon` control-API failure branch.
+/// `ryuzi-runner`'s `daemon_cmd::run_daemon` control-API failure branch.
 async fn fail_after_start(
     dir: &std::path::Path,
     pid: i32,

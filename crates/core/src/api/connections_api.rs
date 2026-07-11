@@ -16,7 +16,6 @@ use super::{ok, params, ApiError};
 use crate::api::types::*;
 use crate::control::ControlPlane;
 use crate::domain::CoreEvent;
-use crate::llm_router::claude_cloak;
 use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
 use crate::llm_router::models;
 use crate::llm_router::oauth;
@@ -35,7 +34,8 @@ use std::time::Duration;
 pub(crate) const HANDLES: &[&str] = &[
     "list_connections",
     "add_connection",
-    "update_connection",
+    "rename_connection",
+    "set_connection_enabled",
     "remove_connection",
     "move_connection",
     "test_connection",
@@ -104,14 +104,14 @@ struct AddConnectionP {
     base_url: Option<String>,
 }
 #[derive(Deserialize)]
-struct UpdateConnectionP {
+struct RenameConnectionP {
     id: String,
     label: String,
+}
+#[derive(Deserialize)]
+struct SetConnectionEnabledP {
+    id: String,
     enabled: bool,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    models: Vec<String>,
-    claude_cloaking: Option<bool>,
 }
 #[derive(Deserialize)]
 struct IdP {
@@ -195,19 +195,15 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: AddConnectionP = params(p)?;
             ok(add_connection(cp, a.provider, a.label, a.api_key, a.base_url).await?)
         }
-        "update_connection" => {
-            let a: UpdateConnectionP = params(p)?;
-            ok(update_connection(
-                cp,
-                a.id,
-                a.label,
-                a.enabled,
-                a.api_key,
-                a.base_url,
-                a.models,
-                a.claude_cloaking,
-            )
-            .await?)
+        "rename_connection" => {
+            let a: RenameConnectionP = params(p)?;
+            connections::rename_connection(cp.store(), &a.id, &a.label).await?;
+            ok(assemble(cp).await?)
+        }
+        "set_connection_enabled" => {
+            let a: SetConnectionEnabledP = params(p)?;
+            connections::set_connection_enabled(cp.store(), &a.id, a.enabled).await?;
+            ok(assemble(cp).await?)
         }
         "remove_connection" => {
             let a: IdP = params(p)?;
@@ -308,24 +304,6 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
 }
 
 /// Mask a secret for display: first 3 + last 4 chars, elided in between.
-/// Defensive for short keys: the brief's naive head(3)/tail(4) slicing
-/// overlaps (and can echo the *entire* key back) once `key.len() < 7`, so
-/// short/empty keys get a fixed placeholder instead of being echoed.
-fn mask(key: &str) -> String {
-    if key.chars().count() < 7 {
-        return "••••".to_string();
-    }
-    let tail: String = key
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    format!("{}…{tail}", key.chars().take(3).collect::<String>())
-}
-
 fn to_info(row: &ConnectionRow) -> ConnectionInfo {
     let desc = registry::descriptor(&row.provider);
     ConnectionInfo {
@@ -344,13 +322,11 @@ fn to_info(row: &ConnectionRow) -> ConnectionInfo {
         label: row.label.clone(),
         priority: row.priority as i32,
         enabled: row.enabled,
-        base_url: desc.and_then(|d| connections::effective_base_url(d, row)),
+        quota_capability: quota::capability(row),
         models: desc
             .map(|d| connections::effective_models(d, row))
             .unwrap_or_default(),
-        key_masked: row.data.api_key.as_deref().map(mask),
         needs_relogin: row.data.needs_relogin.unwrap_or(false),
-        claude_cloaking: row.provider == "anthropic-oauth" && claude_cloak::enabled(&row.data),
     }
 }
 
@@ -524,47 +500,6 @@ async fn add_connection(
     Ok(assemble(cp).await?)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn update_connection(
-    cp: &ControlPlane,
-    id: String,
-    label: String,
-    enabled: bool,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    models: Vec<String>,
-    claude_cloaking: Option<bool>,
-) -> Result<Vec<ConnectionInfo>, ApiError> {
-    let mut row = connections::get_connection(cp.store(), &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("unknown connection: {id}")))?;
-    row.label = label;
-    row.enabled = enabled;
-    if let Some(k) = api_key {
-        // Empty string = keep existing key; UI sends null to keep too.
-        if !k.is_empty() {
-            row.data.api_key = Some(k);
-        }
-    }
-    row.data.base_url_override = base_url.filter(|s| !s.is_empty());
-    row.data.models_override = if models.is_empty() {
-        None
-    } else {
-        Some(models)
-    };
-    if row.provider == "anthropic-oauth" {
-        if let Some(value) = claude_cloaking {
-            claude_cloak::set_enabled(&mut row.data, value);
-        }
-    }
-    row.updated_at = crate::paths::now_ms();
-    connections::update_connection(cp.store(), row.clone()).await?;
-    if row.data.models_override.is_none() {
-        refresh_models_best_effort(cp, &mut row).await;
-    }
-    Ok(assemble(cp).await?)
-}
-
 async fn remove_connection(cp: &ControlPlane, id: String) -> Result<Vec<ConnectionInfo>, ApiError> {
     connections::remove_connection(cp.store(), &id).await?;
     Ok(assemble(cp).await?)
@@ -628,9 +563,10 @@ async fn test_connection(cp: &ControlPlane, id: String) -> Result<TestResult, Ap
             message: e.to_string(),
         })?;
     let result = match models::fetch_connection_models(cp.store(), &client, desc, &mut row).await {
-        Ok((status, discovered)) => {
+        Ok((status, discovered, metadata)) => {
             if status.is_success() && !discovered.is_empty() {
                 row.data.models_override = Some(discovered);
+                row.data.model_meta_overrides = Some(metadata);
                 row.updated_at = crate::paths::now_ms();
                 let _ = connections::update_connection(cp.store(), row).await;
             }
@@ -1363,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_info_exposes_claude_cloaking_for_anthropic_oauth_only() {
+    fn connection_info_exposes_quota_capability_without_credentials_or_cloak_config() {
         let mut row = ConnectionRow {
             id: "c1".into(),
             provider: "anthropic-oauth".into(),
@@ -1371,17 +1307,19 @@ mod tests {
             label: "Claude Code".into(),
             priority: 0,
             enabled: true,
-            data: ConnectionData {
-                provider_specific: Some(serde_json::json!({"claudeCloaking": true})),
-                ..Default::default()
-            },
+            data: ConnectionData::default(),
             created_at: 0,
             updated_at: 0,
         };
-        assert!(to_info(&row).claude_cloaking);
+        let claude = serde_json::to_value(to_info(&row)).unwrap();
+        assert_eq!(claude["quotaCapability"], "claude");
+        assert!(claude.get("baseUrl").is_none());
+        assert!(claude.get("keyMasked").is_none());
+        assert!(claude.get("claudeCloaking").is_none());
 
         row.provider = "openai-oauth".into();
-        assert!(!to_info(&row).claude_cloaking);
+        let codex = serde_json::to_value(to_info(&row)).unwrap();
+        assert_eq!(codex["quotaCapability"], "codex");
     }
 
     #[test]
@@ -1627,5 +1565,26 @@ mod tests {
         .unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
         assert_eq!(list[0]["provider"], "openrouter");
+
+        let id = list[0]["id"].as_str().unwrap();
+        let renamed = dispatch(
+            &s,
+            "rename_connection",
+            json!({"id": id, "label": "Primary"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(renamed[0]["label"], "Primary");
+
+        let disabled = dispatch(
+            &s,
+            "set_connection_enabled",
+            json!({"id": id, "enabled": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(disabled[0]["enabled"], false);
+        assert!(disabled[0].get("keyMasked").is_none());
+        assert!(disabled[0].get("claudeCloaking").is_none());
     }
 }

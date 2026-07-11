@@ -11,6 +11,7 @@ import { ActivityCluster } from "./ToolChip";
 import { TurnSummary } from "./TurnSummary";
 import { FileChangeCards } from "./FileChangeCards";
 import { TurnActions } from "./TurnActions";
+import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 
 function MediaItem({ a, onOpenImage }: { a: RowAttachment; onOpenImage: (src: string) => void }) {
   const [failed, setFailed] = useState(false);
@@ -263,17 +264,17 @@ export function Transcript({
         )}
       </div>
       {lightbox !== null && (
-        <div
-          role="dialog"
-          aria-label="Image preview"
-          tabIndex={-1}
-          ref={(el) => el?.focus()}
-          className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/70"
-          onClick={() => setLightbox(null)}
-          onKeyDown={(e) => e.key === "Escape" && setLightbox(null)}
-        >
-          <img src={lightbox} alt="attachment preview" className="max-h-[90vh] max-w-[90vw] rounded-lg" />
-        </div>
+        <Modal onClose={() => setLightbox(null)} width={960}>
+          <ModalHeader title="Image preview" />
+          <ModalBody className="flex justify-center">
+            <img src={lightbox} alt="attachment preview" className="max-h-[70vh] max-w-full rounded-lg" />
+          </ModalBody>
+          <ModalFooter>
+            <Button variant="outline" onClick={() => setLightbox(null)}>
+              Close
+            </Button>
+          </ModalFooter>
+        </Modal>
       )}
     </>
   );

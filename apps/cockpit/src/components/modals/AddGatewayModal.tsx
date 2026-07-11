@@ -1,7 +1,7 @@
 import { Server } from "lucide-react";
 import { useState } from "react";
 import { useGateways } from "@/store-gateways";
-import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
+import { Button, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 
 // Connect an SSH gateway: persisted config + TCP reachability probe. Remote
 // execution lands with the daemon; until then this is a monitoring entry.
@@ -24,32 +24,32 @@ export function AddGatewayModal({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <Modal onClose={onClose} width={440}>
-      <div className="mb-1 flex items-center gap-2.5">
-        <Server aria-hidden size={16} strokeWidth={2} className="text-muted-foreground" />
-        <span className="text-[15px] font-semibold tracking-[-0.01em]">Connect gateway</span>
-      </div>
-      <p className="mb-[18px] mt-0 text-[12.5px] text-muted-foreground">
-        Add an SSH host. Cockpit records it and probes reachability; running sessions remotely arrives with the gateway daemon.
-      </p>
-      <div className="flex flex-col gap-3">
-        <FormField label="Name">
-          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="prod-sg1" />
-        </FormField>
-        <div className="flex gap-3">
-          <FormField label="Host" className="flex-[2]">
-            <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="128.140.42.7" />
+    <Modal onClose={onClose} width={440} busy={saving}>
+      <ModalHeader
+        leading={<Server aria-hidden className="mt-0.5 size-4 text-muted-foreground" strokeWidth={2} />}
+        title="Connect gateway"
+        description="Add an SSH host. Cockpit records it and probes reachability; running sessions remotely arrives with the gateway daemon."
+      />
+      <ModalBody>
+        <div className="flex flex-col gap-3">
+          <FormField label="Name">
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="prod-sg1" />
           </FormField>
-          <FormField label="Port" className="flex-1">
-            <Input value={port} onChange={(e) => setPort(e.target.value)} placeholder="22" />
+          <div className="flex gap-3">
+            <FormField label="Host" className="flex-[2]">
+              <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="128.140.42.7" />
+            </FormField>
+            <FormField label="Port" className="flex-1">
+              <Input value={port} onChange={(e) => setPort(e.target.value)} placeholder="22" />
+            </FormField>
+          </div>
+          <FormField label="User">
+            <Input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="deploy" />
           </FormField>
         </div>
-        <FormField label="User">
-          <Input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="deploy" />
-        </FormField>
-      </div>
+      </ModalBody>
       <ModalFooter>
-        <Button variant="outline" onClick={onClose}>
+        <Button variant="outline" disabled={saving} onClick={onClose}>
           Cancel
         </Button>
         <Button disabled={!valid || saving} onClick={() => void submit()}>

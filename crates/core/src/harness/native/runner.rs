@@ -12,13 +12,18 @@ use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::steer::SteerBuffer;
 use super::tools::{
-    OutputCaps, SubagentSpawner, SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
+    BackgroundDispatch, OutputCaps, SubagentSpawner, SubtaskResult, SubtaskSpec, SubtaskStatus,
+    ToolCtx, ToolRegistry,
 };
-use super::{context, NATIVE_ID};
+use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
 use crate::domain::{CoreEvent, NewMessage, PermMode};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
+use crate::llm_router::model_effort::TurnEffortPolicy;
+use crate::llm_router::provenance::{
+    LlmRequest, LlmRequestMetadata, RouteObservationContext, RouteSelection, RoutedStream,
+};
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -51,8 +56,8 @@ pub struct RunnerDeps {
     /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
     pub extra_skill_dirs: Vec<PathBuf>,
     pub model: Option<String>,
-    /// Reasoning effort for this session (from project settings; None = default).
-    pub effort: Option<String>,
+    /// Immutable effort/capability snapshot for the current turn.
+    pub turn_effort_policy: Arc<TurnEffortPolicy>,
     /// Resolved per-model metadata (context window, max output, capabilities).
     pub meta: crate::llm_router::model_meta::ModelMeta,
     /// Interior-mutable so a LIVE session can pick up a permission-mode change
@@ -87,6 +92,8 @@ pub struct RunnerDeps {
     /// turns: `refresh_turn_model` clones the whole `RunnerDeps` per turn, but
     /// `SteerBuffer`'s clone shares the underlying `Arc<Mutex<Vec<_>>>`.
     pub steer: SteerBuffer,
+    /// Shared async-delegation capacity gate (spec §6.2), from `SessionCtx`.
+    pub background: Arc<super::background::BackgroundRegistry>,
 }
 
 impl RunnerDeps {
@@ -114,22 +121,22 @@ pub async fn run_turn(
     prompt: TurnPrompt,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    // /compact is an ACTION, not a prompt template: intercept before command
-    // resolution so it never becomes model input.
     let trimmed = prompt.display.trim();
-    if trimmed == "/compact" || trimmed.starts_with("/compact ") {
-        return run_manual_compact(deps, &prompt).await;
-    }
+    let manual_compact = trimmed == "/compact" || trimmed.starts_with("/compact ");
 
     // Slash-command resolution on the raw user text.
-    let (agent_text, agent) = match deps.commands.resolve(&prompt.display) {
-        Some((expanded, override_agent)) => {
-            let agent = override_agent
-                .and_then(|n| deps.agents.get(&n))
-                .unwrap_or_else(|| deps.agent.clone());
-            (merge_agent_prompt_suffix(expanded, &prompt), agent)
+    let (agent_text, agent) = if manual_compact {
+        (prompt.agent.clone(), deps.agent.clone())
+    } else {
+        match deps.commands.resolve(&prompt.display) {
+            Some((expanded, override_agent)) => {
+                let agent = override_agent
+                    .and_then(|n| deps.agents.get(&n))
+                    .unwrap_or_else(|| deps.agent.clone());
+                (merge_agent_prompt_suffix(expanded, &prompt), agent)
+            }
+            None => (prompt.agent.clone(), deps.agent.clone()),
         }
-        None => (prompt.agent.clone(), deps.agent.clone()),
     };
 
     // 1. Persist + broadcast the user's message (raw display text).
@@ -144,19 +151,23 @@ pub async fn run_turn(
     )
     .await;
 
-    // Per-turn model snapshot: re-read the project's pinned model fresh from
-    // the store and resolve it for THIS turn, so a picker change mid-chat
-    // applies on the next turn without restarting the session. Everything
-    // below — request bodies, compaction, title generation, and the sub-agent
-    // spawner — reads the snapshot; the original `deps` is never mutated, so
-    // in-flight turns and running subagents keep the model they started with.
-    // Only `model` is refreshed here; `meta` (context window / output caps /
-    // prompt-cache support) stays at the session-start value.
-    let turn_deps = refresh_turn_model(deps).await;
+    // Complete per-turn configuration snapshot: re-read the project's pinned
+    // model/effort, configured and provider defaults, eligible surfaces, and
+    // ModelMeta. Everything below — request bodies, compaction, title
+    // generation, and the sub-agent spawner — shares this immutable snapshot;
+    // the original `deps` is never mutated, so in-flight turns and running
+    // subagents keep the configuration they started with.
+    let turn_deps = refresh_turn_configuration(deps).await;
     let deps = &turn_deps;
 
+    // /compact is an action, but it still snapshots the same complete turn
+    // configuration as every other turn before making its utility call.
+    if manual_compact {
+        return run_manual_compact(deps).await;
+    }
+
     // 2. Load history + context state and append the user turn.
-    let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+    let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
     let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
     // Seed the indicator immediately on resume, before any model call —
     // prefer the persisted last-known status (server truth) over the
@@ -236,18 +247,8 @@ pub async fn run_turn(
 
 /// Manual /compact: persist the user's row, compact the session history, and
 /// record a notice row. No model turn runs.
-async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::Result<()> {
-    emit_row(
-        deps,
-        "user",
-        "text",
-        user_row_payload(prompt),
-        None,
-        None,
-        None,
-    )
-    .await;
-    let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+async fn run_manual_compact(deps: &RunnerDeps) -> anyhow::Result<()> {
+    let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
     let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
     // Same resume-seed as `run_turn` (spec §12): honor a persisted
     // post-overflow total so a manual /compact right after an overflow
@@ -272,7 +273,15 @@ async fn run_manual_compact(deps: &RunnerDeps, prompt: &TurnPrompt) -> anyhow::R
     }
     let model = deps.model.clone().unwrap_or_default();
     let cmodel = super::llm::aux_model(&deps.store, "compaction", &model).await;
-    match cm.compact(&deps.llm, &cmodel, "manual").await {
+    match cm
+        .compact(
+            &deps.llm,
+            &cmodel,
+            "manual",
+            deps.turn_effort_policy.clone(),
+        )
+        .await
+    {
         Ok(outcome) => {
             emit_compaction(deps, "manual", &outcome, true).await;
             // Display-only: `compact()` never calls `commit_response()`, so
@@ -337,10 +346,16 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
 /// those contexts behave exactly as before. When the pinned model fails
 /// routing and a substitute is resolved, a status row announces the
 /// substitution — no silent swap.
-async fn refresh_turn_model(deps: &RunnerDeps) -> RunnerDeps {
-    let pinned = match project_pinned_model(deps).await {
+async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
+    let project_pin = project_pinned_model(deps).await;
+    let session_pin = if project_pin.is_none() {
+        chat_session_pinned_model(&deps.store, &deps.session_pk).await
+    } else {
+        None
+    };
+    let pinned = match project_pin.clone() {
         Some(pinned) => pinned,
-        None => deps.model.clone(),
+        None => session_pin.clone().or_else(|| deps.model.clone()),
     };
     let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
     if let (Some(pinned), Some(resolved)) = (pinned.as_deref(), resolved.as_deref()) {
@@ -364,6 +379,24 @@ async fn refresh_turn_model(deps: &RunnerDeps) -> RunnerDeps {
     if resolved.is_some() {
         turn.model = resolved;
     }
+    let model = turn.model.as_deref().unwrap_or("");
+    if project_pin.is_some() || session_pin.is_some() {
+        turn.meta = crate::llm_router::model_meta::resolve(&turn.store, model).await;
+    }
+    let policy = if let Some(project_id) = turn.project_id.as_deref() {
+        crate::llm_router::model_effort::build_turn_effort_policy(&turn.store, project_id, model)
+            .await
+    } else {
+        crate::llm_router::model_effort::build_session_effort_policy(
+            &turn.store,
+            &turn.session_pk,
+            model,
+        )
+        .await
+    };
+    if let Ok(policy) = policy {
+        turn.turn_effort_policy = Arc::new(policy);
+    }
     turn
 }
 
@@ -385,6 +418,19 @@ async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
         .ok()
         .flatten()?;
     Some(project.model)
+}
+
+async fn chat_session_pinned_model(store: &Store, session_pk: &str) -> Option<String> {
+    let session = store.get_session(session_pk).await.ok().flatten()?;
+    if session.kind != crate::domain::SessionKind::Chat {
+        return None;
+    }
+    store
+        .get_session_runtime_settings(session_pk)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|runtime| runtime.model)
 }
 
 /// If this session has no title yet, generate a terse one from the first
@@ -413,7 +459,9 @@ async fn maybe_generate_title(deps: &RunnerDeps, first_prompt: &str) {
         "messages": [{"role": "user", "content": [{"type": "text", "text": first_prompt}]}],
         "stream": true,
     });
-    let Ok(title) = super::llm::collect_text(&deps.llm, body).await else {
+    let Ok(title) =
+        super::llm::collect_text(&deps.llm, body, deps.turn_effort_policy.clone()).await
+    else {
         return;
     };
     let title: String = title.trim().trim_matches('"').chars().take(80).collect();
@@ -498,8 +546,6 @@ async fn drive(
     } else {
         deps.meta.max_output_tokens as i64
     };
-    let thinking_budget = thinking_budget(deps.effort.as_deref(), &deps.meta, max_tokens);
-
     // Window size for the auto-continue notice text and the fresh grant made on
     // each auto-continue (`agent.max_provider_turns`). The parent budget itself
     // is seeded from the same setting in `run_turn` (defaulting to
@@ -549,7 +595,10 @@ async fn drive(
                     "mid_turn"
                 };
                 let cmodel = super::llm::aux_model(&deps.store, "compaction", &model).await;
-                match cm.compact(&deps.llm, &cmodel, trigger).await {
+                match cm
+                    .compact(&deps.llm, &cmodel, trigger, deps.turn_effort_policy.clone())
+                    .await
+                {
                     Ok(outcome) => emit_compaction(deps, trigger, &outcome, display.text()).await,
                     Err(e) => {
                         tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
@@ -575,7 +624,7 @@ async fn drive(
             } else {
                 json!(system)
             };
-            let mut body = json!({
+            let body = json!({
                 "model": model,
                 "system": system_value,
                 // `cm.messages_for_request()` applies the sanitized projection:
@@ -587,12 +636,21 @@ async fn drive(
                 "max_tokens": max_tokens,
                 "stream": true,
             });
-            if let Some(budget) = thinking_budget {
-                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
-            }
-
-            let mut rx = match deps.llm.stream(body).await {
-                Ok(rx) => rx,
+            let observation = display.text().then(|| RouteObservationContext {
+                session_pk: deps.session_pk.clone(),
+            });
+            let request = LlmRequest {
+                body,
+                metadata: LlmRequestMetadata {
+                    effort_policy: deps.turn_effort_policy.clone(),
+                    observation: observation.clone(),
+                },
+            };
+            let RoutedStream {
+                selection,
+                events: mut rx,
+            } = match deps.llm.stream(request).await {
+                Ok(routed) => routed,
                 Err(e) if is_context_overflow(&e.to_string()) => {
                     cm.mark_full();
                     // Display-only: `mark_full` does not reset `cm.last_*`, so
@@ -606,6 +664,9 @@ async fn drive(
                 }
                 Err(e) => return Err(e),
             };
+            if let Some(context) = observation.as_ref() {
+                observe_route_selection(deps, context, &selection).await;
+            }
             let mut turn = TurnAccum::default();
             let mut text_buf = String::new();
 
@@ -861,7 +922,9 @@ async fn drive(
             "max_tokens": max_tokens,
             "stream": true,
         });
-        if let Ok(text) = super::llm::collect_text(&deps.llm, body).await {
+        if let Ok(text) =
+            super::llm::collect_text(&deps.llm, body, deps.turn_effort_policy.clone()).await
+        {
             let text = text.trim();
             if !text.is_empty() {
                 let text = text.to_string();
@@ -900,32 +963,6 @@ async fn drive(
         .await;
     }
     Ok(final_text)
-}
-
-/// Effort → extended-thinking budget (spec §8): low/None → off, medium → 8192,
-/// high → 16384, clamped to half of max_tokens; only for reasoning models.
-///
-/// This key currently only takes effect on OpenAI-format upstreams: the
-/// router (`llm_router::client::anthropic_messages_stream`) strips
-/// `thinking` before it reaches an Anthropic-native upstream (passthrough
-/// `/messages` and kiro), since the runner doesn't yet replay signed
-/// thinking blocks in tool-use continuations and newest Anthropic models
-/// reject `budget_tokens` outright. The OpenAI translator maps this key to
-/// `reasoning_effort` instead, so it's unaffected.
-fn thinking_budget(
-    effort: Option<&str>,
-    meta: &crate::llm_router::model_meta::ModelMeta,
-    max_tokens: i64,
-) -> Option<i64> {
-    if !meta.supports_reasoning {
-        return None;
-    }
-    let budget = match effort {
-        Some("medium") => 8_192,
-        Some("high") | Some("xhigh") | Some("max") => 16_384,
-        _ => return None,
-    };
-    Some(budget.min(max_tokens / 2))
 }
 
 /// Tools delegated children may never use regardless of filters. `task` is
@@ -988,6 +1025,24 @@ impl RunnerSpawner {
     /// The `max_concurrent_runs` setting (default 3, floor 1).
     async fn concurrency(&self) -> usize {
         crate::settings::usize_setting(&self.deps.store, "max_concurrent_runs", 3).await
+    }
+
+    /// The parent session's remaining context headroom in tokens (usable
+    /// window − active), read from its persisted context. 0 when unknown.
+    async fn parent_headroom_tokens(&self) -> u64 {
+        match self
+            .deps
+            .store
+            .get_session_context(&self.deps.session_pk)
+            .await
+        {
+            Ok(Some(saved)) => {
+                let usable = saved["usable_window"].as_u64().unwrap_or(0);
+                let active = saved["active_tokens"].as_u64().unwrap_or(0);
+                usable.saturating_sub(active)
+            }
+            _ => 0,
+        }
     }
 
     /// Run one delegated child to completion; failures become the result's
@@ -1071,7 +1126,7 @@ impl RunnerSpawner {
         };
         let mut cm = ContextManager::ephemeral(
             &self.deps.session_pk,
-            ContextConfig::with_meta(self.deps.meta),
+            ContextConfig::with_meta(self.deps.meta.clone()),
         );
         if let Err(e) = cm
             .append_user(json!([{ "type": "text", "text": spec.prompt }]))
@@ -1135,6 +1190,83 @@ impl SubagentSpawner for RunnerSpawner {
             .into_iter()
             .map(|a| a.name)
             .collect()
+    }
+
+    async fn run_background(&self, spec: SubtaskSpec) -> BackgroundDispatch {
+        // Background delegation is a top-level capability only; a nested
+        // (delegated) spawner must not fan out detached workers.
+        if self.depth != 0 {
+            return BackgroundDispatch::Rejected {
+                note: "background delegation is only available at the top level; \
+                       run this task synchronously (background=false)."
+                    .to_string(),
+            };
+        }
+        let cap = self.concurrency().await; // shared max_concurrent_runs (default 3)
+        let Some(reservation) = self.deps.background.try_reserve(cap, &self.deps.session_pk) else {
+            // Hermes' choice (async_delegation.py:196-206): reject with a
+            // fallback-to-sync note, never queue. Wording adapted only where
+            // Ryuzi's mechanism differs from Hermes' (no config.yaml; the
+            // setting is `max_concurrent_runs`, not
+            // `delegation.max_concurrent_children`) — everything else is
+            // byte-for-byte the same sentence structure and wording.
+            return BackgroundDispatch::Rejected {
+                note: format!(
+                    "Async delegation capacity reached ({cap} running). Wait for one to \
+                     finish (its result will re-enter the chat), or run this task \
+                     synchronously (background=false). Raise max_concurrent_runs to allow \
+                     more concurrent background subagents."
+                ),
+            };
+        };
+        let id = crate::paths::new_id();
+        let deps = self.deps.clone();
+        let this_spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: reservation.token(),
+            depth: 0,
+        };
+        let (deleg_id, goal) = (id.clone(), spec.prompt.clone());
+        let parent_pk = deps.session_pk.clone();
+        // Read the parent's persisted headroom on the CALLER's task (a quick
+        // DB read) before detaching — the spawned worker only needs the
+        // resulting number, not a live store round-trip mid-flight.
+        let headroom = self.parent_headroom_tokens().await;
+        tokio::spawn(async move {
+            // Holding the reservation for the task's whole lifetime keeps the
+            // slot taken; its Drop (on completion, panic, or cancellation)
+            // frees the slot and deregisters the cancel token.
+            let _reservation = reservation;
+            let cancel = _reservation.token();
+            let child = this_spawner.run_child(0, spec, cancel.clone()).await;
+            // A cancelled worker (its parent ended, or was interrupted via
+            // `interrupt_for_session`) must not write a stale completion to
+            // the rail — the session that would receive it may already be
+            // gone, or a fresh one may have taken its session_pk.
+            if cancel.is_cancelled() {
+                return;
+            }
+            let cap_chars = summary_budget::budget_cap_chars(headroom, 1);
+            let spill_dir = crate::paths::chat_scratch_dir(&parent_pk).join("delegations");
+            let budgeted =
+                summary_budget::budget_summary(&child.report, cap_chars, &spill_dir, &deleg_id);
+            let block = delegation::format_delegation_block(&delegation::DelegationResult {
+                id: deleg_id.clone(),
+                goal,
+                agent_type: child.agent_type.clone(),
+                model: deps.model.clone().unwrap_or_default(),
+                status: child.status.as_str().to_string(),
+                summary: budgeted.text,
+                error: (child.status == SubtaskStatus::Error).then(|| child.report.clone()),
+            });
+            // Durable re-entry (survives a daemon restart). The drainer
+            // delivers it as a new user turn once the parent is idle.
+            let _ = deps
+                .store
+                .enqueue_background_event(&parent_pk, "delegation", &block)
+                .await;
+        });
+        BackgroundDispatch::Dispatched { id }
     }
 }
 
@@ -1413,6 +1545,36 @@ async fn emit_row(
     }
 }
 
+async fn observe_route_selection(
+    deps: &RunnerDeps,
+    context: &RouteObservationContext,
+    selection: &RouteSelection,
+) {
+    match deps
+        .store
+        .observe_session_route(&context.session_pk, selection)
+        .await
+    {
+        Ok(Some(message)) => {
+            let _ = deps.events.send(CoreEvent::Message {
+                session_pk: message.session_pk,
+                seq: message.seq,
+                role: message.role,
+                block_type: message.block_type,
+                payload: message.payload,
+                tool_call_id: message.tool_call_id,
+                status: message.status,
+                tool_kind: message.tool_kind,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            "native[{NATIVE_ID}]: observe_session_route failed for {}: {error}",
+            context.session_pk
+        ),
+    }
+}
+
 /// Broadcast ContextUsage and persist it for resume seeding. Sub-agent
 /// (ephemeral) loops skip both — their usage must not clobber the session's.
 /// Also folds this response's billed buckets into the per-session, per-model
@@ -1565,8 +1727,8 @@ async fn emit_session_cost(deps: &RunnerDeps, tally: &super::cost::Tally) {
     let (total_usd, models) = tally.to_model_costs(|id| {
         metas
             .get(id)
-            .copied()
-            .unwrap_or(crate::llm_router::model_meta::FALLBACK)
+            .cloned()
+            .unwrap_or_else(|| crate::llm_router::model_meta::FALLBACK.clone())
     });
     let _ = deps.events.send(CoreEvent::SessionCost {
         session_pk: deps.session_pk.clone(),
@@ -1652,32 +1814,63 @@ impl ToolAccum {
 pub(crate) mod testutil {
     use super::super::llm::LlmStream;
     use crate::llm_router::client::AnthropicEvent;
+    use crate::llm_router::model_effort::TurnEffortPolicy;
+    use crate::llm_router::provenance::{
+        LlmRequest, LlmRequestMetadata, RouteSelection, RouteSelectionReason, RoutedStream,
+    };
     use async_trait::async_trait;
     use serde_json::Value;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
     /// An `LlmStream` that replays scripted turns: the first `stream()` call
     /// returns turn 0's events, the next returns turn 1's, and so on.
     pub struct ScriptedLlm {
-        turns: Mutex<std::collections::VecDeque<Vec<AnthropicEvent>>>,
+        turns: Mutex<std::collections::VecDeque<(RouteSelection, Vec<AnthropicEvent>)>>,
+        pub metadata: Mutex<Vec<LlmRequestMetadata>>,
     }
 
     impl ScriptedLlm {
         pub fn new(turns: Vec<Vec<AnthropicEvent>>) -> Self {
             ScriptedLlm {
-                turns: Mutex::new(turns.into_iter().collect()),
+                turns: Mutex::new(
+                    turns
+                        .into_iter()
+                        .map(|events| (test_route_selection(), events))
+                        .collect(),
+                ),
+                metadata: Mutex::new(Vec::new()),
             }
+        }
+
+        pub fn with_selections(turns: Vec<(RouteSelection, Vec<AnthropicEvent>)>) -> Self {
+            Self {
+                turns: Mutex::new(turns.into_iter().collect()),
+                metadata: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    pub fn test_route_selection() -> RouteSelection {
+        RouteSelection {
+            requested_model: "test/model".into(),
+            resolved_provider_id: "test".into(),
+            resolved_family: "test".into(),
+            resolved_model: "model".into(),
+            resolved_model_display_name: "Test Model".into(),
+            effective_effort: None,
+            effective_effort_label: None,
+            connection_id: "ignored".into(),
+            connection_label: "Ignored".into(),
+            reason: RouteSelectionReason::Initial,
         }
     }
 
     #[async_trait]
     impl LlmStream for ScriptedLlm {
-        async fn stream(
-            &self,
-            _body: Value,
-        ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
-            let events = self
+        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            self.metadata.lock().unwrap().push(request.metadata);
+            let (selection, events) = self
                 .turns
                 .lock()
                 .unwrap()
@@ -1691,7 +1884,10 @@ pub(crate) mod testutil {
                     }
                 }
             });
-            Ok(rx)
+            Ok(RoutedStream {
+                selection,
+                events: rx,
+            })
         }
     }
 
@@ -1699,6 +1895,7 @@ pub(crate) mod testutil {
     pub struct RecordingLlm {
         inner: ScriptedLlm,
         pub bodies: Mutex<Vec<Value>>,
+        pub policies: Mutex<Vec<Arc<TurnEffortPolicy>>>,
     }
 
     impl RecordingLlm {
@@ -1706,18 +1903,20 @@ pub(crate) mod testutil {
             RecordingLlm {
                 inner: ScriptedLlm::new(turns),
                 bodies: Mutex::new(Vec::new()),
+                policies: Mutex::new(Vec::new()),
             }
         }
     }
 
     #[async_trait]
     impl LlmStream for RecordingLlm {
-        async fn stream(
-            &self,
-            body: Value,
-        ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
-            self.bodies.lock().unwrap().push(body.clone());
-            self.inner.stream(body).await
+        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            self.bodies.lock().unwrap().push(request.body.clone());
+            self.policies
+                .lock()
+                .unwrap()
+                .push(request.metadata.effort_policy.clone());
+            self.inner.stream(request).await
         }
     }
 
@@ -1791,7 +1990,125 @@ mod tests {
     use super::testutil::*;
     use super::*;
     use crate::domain::CoreEvent;
+
+    #[tokio::test]
+    async fn chat_turn_model_reads_the_durable_session_runtime() {
+        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .insert_session(Session {
+                session_pk: "chat-model".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: None,
+                created_at: None,
+                last_active: None,
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        store
+            .update_session_runtime_settings(
+                "chat-model",
+                Some("openai/gpt-5.5".into()),
+                Some("high".into()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            chat_session_pinned_model(&store, "chat-model").await,
+            Some("openai/gpt-5.5".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_turn_model_change_refreshes_model_metadata() {
+        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        add_anthropic_conn(&deps.store, &["model-b"]).await;
+        deps.store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: None,
+                created_at: None,
+                last_active: None,
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        deps.store
+            .update_session_runtime_settings(
+                "s1",
+                Some("anthropic/model-b".into()),
+                Some("high".into()),
+            )
+            .await
+            .unwrap();
+        deps.store
+            .set_setting_raw(
+                "models.meta.anthropic/model-b",
+                r#"{"context_window":222222}"#,
+            )
+            .await
+            .unwrap();
+
+        let refreshed = refresh_turn_configuration(&deps).await;
+        assert_eq!(refreshed.model.as_deref(), Some("anthropic/model-b"));
+        assert_eq!(refreshed.meta.context_window, 222_222);
+    }
     use crate::store::Store;
+
+    fn route_selection(
+        connection_id: &str,
+        label: &str,
+    ) -> crate::llm_router::provenance::RouteSelection {
+        let mut selection = test_route_selection();
+        selection.connection_id = connection_id.into();
+        selection.connection_label = label.into();
+        selection
+    }
+
+    fn final_turn(text: &str) -> Vec<crate::llm_router::client::AnthropicEvent> {
+        vec![text_delta(text), message_delta("end_turn"), message_stop()]
+    }
+
+    fn tool_turn() -> Vec<crate::llm_router::client::AnthropicEvent> {
+        vec![
+            tool_use_start(0, "call-1", "bash"),
+            input_json_delta(0, "{\"command\":\"echo route\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ]
+    }
 
     #[test]
     fn display_mode_gating() {
@@ -1807,6 +2124,14 @@ mod tests {
     async fn deps_at(dir: &std::path::Path, llm: Arc<dyn LlmStream>) -> RunnerDeps {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        deps_with_store(dir, llm, store).await
+    }
+
+    async fn deps_with_store(
+        dir: &std::path::Path,
+        llm: Arc<dyn LlmStream>,
+        store: Arc<Store>,
+    ) -> RunnerDeps {
         let (events, _rx) = broadcast::channel(256);
         let agents = Arc::new(AgentRegistry::builtin());
         let agent = agents.default_agent();
@@ -1817,7 +2142,13 @@ mod tests {
             extra_skill_dirs: vec![],
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
-            effort: None,
+            turn_effort_policy: Arc::new(TurnEffortPolicy {
+                requested_model: "test/model".into(),
+                project_override: None,
+                route_compatibility: Default::default(),
+                configured: Default::default(),
+                surfaces: Default::default(),
+            }),
             meta: crate::llm_router::model_meta::FALLBACK,
             perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
             project_id: None,
@@ -1833,7 +2164,208 @@ mod tests {
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             steer: SteerBuffer::new(),
+            background: super::super::background::BackgroundRegistry::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn route_notice_first_visible_request_establishes_silent_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![(
+            route_selection("a", "Primary"),
+            final_turn("hello"),
+        )]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        run_turn(
+            &deps,
+            TurnPrompt::text("hi", "hi"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(deps
+            .store
+            .list_messages("s1")
+            .await
+            .unwrap()
+            .iter()
+            .all(|message| message.block_type != "notice"));
+        assert_eq!(llm.metadata.lock().unwrap().len(), 1);
+        assert!(llm.metadata.lock().unwrap()[0].observation.is_some());
+    }
+
+    #[tokio::test]
+    async fn route_notice_changed_visible_request_persists_and_broadcasts_before_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (route_selection("a", "Primary"), final_turn("one")),
+            (route_selection("b", "Backup"), final_turn("two")),
+        ]));
+        let deps = deps_at(dir.path(), llm).await;
+        let mut events = deps.events.subscribe();
+        run_turn(
+            &deps,
+            TurnPrompt::text("one", "one"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        run_turn(
+            &deps,
+            TurnPrompt::text("two", "two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let messages = deps.store.list_messages("s1").await.unwrap();
+        let notice = messages.iter().find(|m| m.block_type == "notice").unwrap();
+        let content = messages
+            .iter()
+            .find(|m| m.role == "assistant" && m.payload["text"] == "two")
+            .unwrap();
+        assert!(notice.seq < content.seq);
+        let broadcasts: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(broadcasts.iter().any(|event| matches!(event,
+            CoreEvent::Message { seq, block_type, payload, .. }
+                if *seq == notice.seq && block_type == "notice" && payload == &notice.payload
+        )));
+    }
+
+    #[tokio::test]
+    async fn route_notice_unchanged_tool_loop_request_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let selection = route_selection("a", "Primary");
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (selection.clone(), tool_turn()),
+            (selection, final_turn("done")),
+        ]));
+        let deps = deps_at(dir.path(), llm).await;
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deps.store
+                .list_messages("s1")
+                .await
+                .unwrap()
+                .iter()
+                .filter(|m| m.block_type == "notice")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn route_notice_changed_tool_loop_account_emits_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (route_selection("a", "Primary"), tool_turn()),
+            (route_selection("b", "Backup"), final_turn("done")),
+        ]));
+        let deps = deps_at(dir.path(), llm).await;
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let messages = deps.store.list_messages("s1").await.unwrap();
+        assert_eq!(
+            messages.iter().filter(|m| m.block_type == "notice").count(),
+            1
+        );
+        assert!(messages
+            .iter()
+            .any(|m| m.payload["text"] == "Account switched to Backup"));
+    }
+
+    #[tokio::test]
+    async fn route_notice_subagent_title_and_compaction_have_no_observation_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            final_turn("subagent"),
+            final_turn("title"),
+            final_turn("summary"),
+        ]));
+        let llm_dyn: Arc<dyn LlmStream> = llm.clone();
+        let deps = deps_at(dir.path(), llm_dyn.clone()).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+        let mut cm = ContextManager::load(deps.store.clone(), "subagent", cfg)
+            .await
+            .unwrap();
+        cm.append_user(json!([{"type": "text", "text": "delegated"}]))
+            .await
+            .unwrap();
+        let budget = IterationBudget::new(SUBAGENT_MAX_ITERS);
+        drive(
+            &deps,
+            &deps.agent,
+            &mut cm,
+            &CancellationToken::new(),
+            None,
+            DisplayMode::ToolsOnly {
+                label: "test".into(),
+            },
+            &budget,
+        )
+        .await
+        .unwrap();
+        for purpose in ["title", "compaction"] {
+            super::super::llm::collect_text(
+                &llm_dyn,
+                json!({"purpose": purpose}),
+                deps.turn_effort_policy.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(llm
+            .metadata
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|metadata| metadata.observation.is_none()));
+    }
+
+    #[tokio::test]
+    async fn route_notice_reload_reads_persisted_system_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (route_selection("a", "Primary"), final_turn("one")),
+            (route_selection("b", "Backup"), final_turn("two")),
+        ]));
+        let deps = deps_with_store(dir.path(), llm, store).await;
+        run_turn(
+            &deps,
+            TurnPrompt::text("one", "one"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        run_turn(
+            &deps,
+            TurnPrompt::text("two", "two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        drop(deps);
+        let reopened = Store::open(db.path()).await.unwrap();
+        let reloaded = reopened.list_messages("s1").await.unwrap();
+        assert!(reloaded.iter().any(|m| {
+            m.role == "system"
+                && m.block_type == "notice"
+                && m.payload["text"] == "Account switched to Backup"
+        }));
     }
 
     /// Seed a project (pinned to `model`) plus a TITLED session "s1" so the
@@ -1968,6 +2500,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_turn_configuration_reloads_model_effort_preferences_defaults_and_meta() {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+        use crate::llm_router::model_effort::{
+            DiscoveredModelMeta, ModelPreferenceKey, ReasoningEffortOption,
+        };
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let turn = || vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn(), turn()]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.model = Some("anthropic/model-a".into());
+        deps.project_id = Some("p".into());
+        let option = |value: &str| ReasoningEffortOption {
+            value: value.into(),
+            label: value.into(),
+            description: None,
+        };
+        connections::add_connection(
+            &deps.store,
+            ConnectionRow {
+                id: "claude".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "claude".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    models_override: Some(vec!["model-a".into(), "model-b".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([
+                        (
+                            "model-a".into(),
+                            DiscoveredModelMeta {
+                                effort_options: Some(vec![option("low"), option("high")]),
+                                default_effort_advertised: true,
+                                default_effort: Some("low".into()),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "model-b".into(),
+                            DiscoveredModelMeta {
+                                effort_options: Some(vec![option("ultra")]),
+                                ..Default::default()
+                            },
+                        ),
+                    ])),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+        deps.store
+            .update_project_runtime("p", Some("anthropic/model-a".into()), Some("high".into()))
+            .await
+            .unwrap();
+        let key_a = ModelPreferenceKey {
+            family: "anthropic".into(),
+            model: "model-a".into(),
+        };
+        deps.store
+            .set_model_effort_preference(&key_a, "low")
+            .await
+            .unwrap();
+        deps.store
+            .set_setting_raw(
+                "models.meta.anthropic/model-a",
+                r#"{"context_window":111111}"#,
+            )
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("one", "one"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        deps.store
+            .update_project_runtime("p", Some("anthropic/model-b".into()), None)
+            .await
+            .unwrap();
+        deps.store
+            .clear_model_effort_preference(&key_a)
+            .await
+            .unwrap();
+        let key_b = ModelPreferenceKey {
+            family: "anthropic".into(),
+            model: "model-b".into(),
+        };
+        deps.store
+            .set_model_effort_preference(&key_b, "ultra")
+            .await
+            .unwrap();
+        deps.store
+            .set_setting_raw(
+                "models.meta.anthropic/model-b",
+                r#"{"context_window":222222}"#,
+            )
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("two", "two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        {
+            let bodies = llm.bodies.lock().unwrap();
+            assert_eq!(bodies[0]["model"], "anthropic/model-a");
+            assert_eq!(bodies[1]["model"], "anthropic/model-b");
+        }
+        {
+            let policies = llm.policies.lock().unwrap();
+            assert_eq!(policies[0].requested_model, "anthropic/model-a");
+            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+            assert_eq!(
+                policies[0].configured.get(&key_a).map(String::as_str),
+                Some("low")
+            );
+            assert_eq!(policies[1].requested_model, "anthropic/model-b");
+            assert_eq!(policies[1].project_override, None);
+            assert!(!policies[1].configured.contains_key(&key_a));
+            assert_eq!(
+                policies[1].configured.get(&key_b).map(String::as_str),
+                Some("ultra")
+            );
+            assert!(policies[1].surfaces.values().any(|surface| {
+                surface.supported.len() == 1 && surface.supported[0].value == "ultra"
+            }));
+        }
+        assert_eq!(
+            refresh_turn_configuration(&deps).await.meta.context_window,
+            222_222
+        );
+    }
+
+    #[tokio::test]
     async fn unroutable_pinned_model_surfaces_a_status_row() {
         use crate::llm_router::routes::{
             self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
@@ -1990,6 +2670,7 @@ mod tests {
                 targets: vec![ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "model-a".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -2031,6 +2712,9 @@ mod tests {
             max_output_tokens: 8_192,
             supports_prompt_cache: false,
             supports_reasoning: false,
+            display_name: None,
+            reasoning_efforts: vec![],
+            default_reasoning_effort: None,
             cost_input: 0.0,
             cost_output: 0.0,
             cost_cache_read: 0.0,
@@ -2177,7 +2861,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![]));
         let deps = deps_at(dir.path(), llm).await;
-        let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
         let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
             .await
             .unwrap();
@@ -2293,7 +2977,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![]));
         let deps = deps_at(dir.path(), llm).await;
-        let cfg = ContextConfig::load(&deps.store, deps.meta).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
         let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
             .await
             .unwrap();
@@ -2471,11 +3155,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_compact_command_compacts_without_a_model_turn() {
+    async fn manual_compact_refreshes_turn_configuration_before_utility_call() {
         let dir = tempfile::tempdir().unwrap();
         let summarize = vec![text_delta("manual summary"), message_stop()];
-        let llm = Arc::new(ScriptedLlm::new(vec![summarize]));
-        let deps = deps_at(dir.path(), llm).await;
+        let llm = Arc::new(RecordingLlm::new(vec![summarize]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.project_id = Some("p".into());
+        add_anthropic_conn(&deps.store, &["model-a"]).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
+        deps.store
+            .update_project_runtime("p", Some("anthropic/model-a".into()), Some("high".into()))
+            .await
+            .unwrap();
         {
             let mut ledger = Ledger::load(deps.store.clone(), "s1").await.unwrap();
             ledger
@@ -2496,6 +3187,12 @@ mod tests {
         .unwrap();
         let ck = deps.store.latest_context_checkpoint("s1").await.unwrap();
         assert!(ck.is_some(), "manual /compact wrote a checkpoint");
+        {
+            let policies = llm.policies.lock().unwrap();
+            assert_eq!(policies.len(), 1, "manual compact makes one utility call");
+            assert_eq!(policies[0].requested_model, "anthropic/model-a");
+            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+        }
         // A notice row records it in the transcript.
         let msgs = deps.store.list_messages("s1").await.unwrap();
         assert!(msgs.iter().any(|m| m.block_type == "notice"));
@@ -2513,12 +3210,14 @@ mod tests {
             max_output_tokens: 64_000,
             supports_prompt_cache: true,
             supports_reasoning: true,
+            display_name: None,
+            reasoning_efforts: vec![],
+            default_reasoning_effort: None,
             cost_input: 0.0,
             cost_output: 0.0,
             cost_cache_read: 0.0,
             cost_cache_write: 0.0,
         };
-        deps.effort = Some("high".into());
         run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
             .await
             .unwrap();
@@ -2534,9 +3233,9 @@ mod tests {
             last_blocks.last().unwrap()["cache_control"]["type"],
             "ephemeral"
         );
-        // Effort high → extended thinking budget.
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["thinking"]["budget_tokens"], 16_384);
+        // Effort is now applied by the router against the immutable turn
+        // policy, never reduced to a synthetic thinking budget in the runner.
+        assert!(body.get("thinking").is_none());
     }
 
     #[tokio::test]
@@ -2556,8 +3255,8 @@ mod tests {
             message_delta("end_turn"),
             message_stop(),
         ];
-        let llm = Arc::new(ScriptedLlm::new(vec![turn1, turn2]));
-        let deps = deps_at(dir.path(), llm).await;
+        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
         let mut rx = deps.events.subscribe();
 
         run_turn(
@@ -2597,6 +3296,12 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.block_type == "text" && m.payload["text"] == "Done."));
+
+        {
+            let policies = llm.policies.lock().unwrap();
+            assert_eq!(policies.len(), 2);
+            assert!(Arc::ptr_eq(&policies[0], &policies[1]));
+        }
 
         // The provider-turn ledger is a valid alternating history:
         // user, assistant(text+tool_use), user(tool_result), assistant(text).
@@ -3558,8 +4263,10 @@ mod tests {
             .await
             .unwrap();
         let agent = deps.agent.clone();
-        let mut cm =
-            ContextManager::ephemeral(&deps.session_pk, ContextConfig::with_meta(deps.meta));
+        let mut cm = ContextManager::ephemeral(
+            &deps.session_pk,
+            ContextConfig::with_meta(deps.meta.clone()),
+        );
         cm.append_user(json!([{ "type": "text", "text": "keep going forever" }]))
             .await
             .unwrap();
@@ -3722,5 +4429,210 @@ mod tests {
         assert!(!notices
             .iter()
             .any(|n| n.contains("continuing automatically")));
+    }
+
+    /// Redirect `dirs::data_dir()` into a tempdir for the duration of a test —
+    /// `run_background`'s spill path (`paths::chat_scratch_dir`) resolves
+    /// under the real state dir otherwise, which a test must never touch.
+    /// Process-global env, so every test using this needs `#[serial]`
+    /// (mirrors `harness::native::tests::StateDirGuard`).
+    struct StateDirGuard {
+        _dir: tempfile::TempDir,
+    }
+    impl StateDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            StateDirGuard { _dir: dir }
+        }
+    }
+
+    /// Insert an IDLE session row for `session_pk` — the rail's
+    /// `claim_deliverable_background_event` only claims rows whose target
+    /// session is idle (spec §6.1's idle-only invariant).
+    async fn seed_idle_session(store: &Store, session_pk: &str) {
+        use crate::domain::{Session, SessionKind, SessionStatus};
+        store
+            .insert_session(Session {
+                session_pk: session_pk.to_string(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("bg-parent".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::BypassPermissions,
+                started_by: None,
+                created_at: Some(0),
+                last_active: Some(0),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Poll the rail (bounded) until the detached worker for `session_pk`
+    /// writes its completion row, claiming (and thus returning) it.
+    async fn wait_for_rail_row(store: &Store, session_pk: &str) -> crate::domain::BackgroundEvent {
+        for _ in 0..200 {
+            if let Some(row) = store
+                .claim_deliverable_background_event("test-poll")
+                .await
+                .unwrap()
+            {
+                assert_eq!(row.target_session_pk, session_pk);
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("no rail row appeared for {session_pk} within the poll window");
+    }
+
+    #[tokio::test]
+    async fn run_background_rejects_at_capacity_with_fallback_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        deps.store
+            .set_setting("max_concurrent_runs", "1")
+            .await
+            .unwrap();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+        };
+        // Fill the one slot with a manual reservation.
+        let _held = deps.background.try_reserve(1, &deps.session_pk).unwrap();
+        let out = spawner
+            .run_background(SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "do it".into(),
+            })
+            .await;
+        match out {
+            BackgroundDispatch::Rejected { note } => {
+                assert!(note.contains("capacity reached"));
+                assert!(
+                    note.contains("background=false"),
+                    "teaches the sync fallback"
+                );
+            }
+            _ => panic!("expected rejection at capacity"),
+        }
+        // Nothing was dispatched — capacity stays exactly as the manual hold left it.
+        assert_eq!(deps.background.active(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_background_at_nonzero_depth_rejects_without_reserving() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 1,
+        };
+        let out = spawner
+            .run_background(SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "do it".into(),
+            })
+            .await;
+        match out {
+            BackgroundDispatch::Rejected { note } => {
+                assert!(note.contains("top level"));
+            }
+            _ => panic!("expected rejection at nonzero depth"),
+        }
+        assert_eq!(deps.background.active(), 0, "no reservation taken");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_background_dispatch_writes_a_rail_row_on_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = StateDirGuard::new();
+        let child_turn = vec![
+            text_delta("all done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![child_turn]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.model = Some("anthropic/model-a".into());
+        // The parent session row must exist + be idle for the rail JOIN later.
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        // Generous headroom so the short child report is not spilled.
+        deps.store
+            .upsert_session_context(
+                &deps.session_pk,
+                &json!({"usable_window": 100_000u64, "active_tokens": 0u64}),
+            )
+            .await
+            .unwrap();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+        };
+        let out = spawner
+            .run_background(SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "audit auth".into(),
+            })
+            .await;
+        let id = match out {
+            BackgroundDispatch::Dispatched { id } => id,
+            _ => panic!("expected dispatch"),
+        };
+        let row = wait_for_rail_row(&deps.store, &deps.session_pk).await;
+        assert_eq!(row.kind, "delegation");
+        assert!(row
+            .payload
+            .contains(&format!("[ASYNC DELEGATION COMPLETE — {id}]")));
+        assert!(row.payload.contains("all done"));
+    }
+
+    #[tokio::test]
+    async fn run_background_cancelled_worker_writes_nothing_to_the_rail() {
+        let dir = tempfile::tempdir().unwrap();
+        // No scripted turns: the cancelled worker must never reach the model.
+        let llm = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+        };
+        let out = spawner
+            .run_background(SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "audit auth".into(),
+            })
+            .await;
+        assert!(matches!(out, BackgroundDispatch::Dispatched { .. }));
+        // Single-threaded test runtime: the detached worker cannot have run
+        // any code yet (no `.await` has yielded since `run_background`
+        // returned), so this cancellation always lands before the worker
+        // observes anything but a cancelled token.
+        deps.background.interrupt_for_session(&deps.session_pk);
+        // Let the detached task run to completion (or early-return).
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            deps.store.pending_background_count().await.unwrap(),
+            0,
+            "a cancelled worker must not write a stale completion to the rail"
+        );
     }
 }

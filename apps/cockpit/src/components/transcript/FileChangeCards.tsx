@@ -8,6 +8,7 @@ import { reviewFileIndex, useDiff } from "@/store-diff";
 import { basename, toRepoRelative } from "@/lib/paths";
 import { DiffStat } from "@/components/common/bits";
 import type { EditCard } from "@/lib/transcript";
+import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
 
 const kindIcon = { edit: Pencil, write: Pencil, delete: Trash2, move: FolderInput } as const;
 
@@ -19,7 +20,7 @@ export function FileChangeCards({ sessionPk, cards }: { sessionPk: string; cards
   const fetchDiff = useDiff((s) => s.fetch);
   const setPendingReview = useDiff((s) => s.setPendingReview);
   const nav = useNav();
-  const [confirming, setConfirming] = useState<EditCard | null>(null);
+  const [confirming, setConfirming] = useState<{ card: EditCard; trigger: HTMLButtonElement } | null>(null);
   const [reverted, setReverted] = useState<Record<string, true>>({});
 
   // Cards render even when the right panel (the usual fetch trigger) is
@@ -35,7 +36,6 @@ export function FileChangeCards({ sessionPk, cards }: { sessionPk: string; cards
   };
 
   const undo = async (card: EditCard) => {
-    setConfirming(null);
     const wd = await commands.sessionWorkdir(sessionPk);
     const rel = toRepoRelative(card.path, wd.status === "ok" ? wd.data : "");
     const res = await commands.revertFile(sessionPk, rel);
@@ -46,6 +46,7 @@ export function FileChangeCards({ sessionPk, cards }: { sessionPk: string; cards
     } else {
       toast.error("Couldn't revert: " + res.error.message);
     }
+    return true;
   };
 
   if (cards.length === 0) return null;
@@ -73,7 +74,7 @@ export function FileChangeCards({ sessionPk, cards }: { sessionPk: string; cards
                 <Button
                   variant="ghost"
                   size="xs"
-                  onClick={() => setConfirming(card)}
+                  onClick={(event) => setConfirming({ card, trigger: event.currentTarget })}
                   className="shrink-0 font-medium text-muted-foreground"
                 >
                   <RotateCcw aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
@@ -84,25 +85,23 @@ export function FileChangeCards({ sessionPk, cards }: { sessionPk: string; cards
           </div>
         );
       })}
-      {confirming !== null && (
-        <div role="dialog" aria-label="Confirm revert" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="bg-popover flex w-[380px] flex-col gap-3 rounded-xl border border-border p-4 shadow-lg">
-            <div className="text-sm font-semibold">Revert {basename(confirming.path)}?</div>
-            <div className="text-[12.5px] leading-relaxed text-muted-foreground">
-              This restores <span className="font-mono">{confirming.path}</span> to its last committed state (new files are deleted).
+      <ConfirmActionModal
+        open={confirming !== null}
+        title={confirming ? `Revert ${basename(confirming.card.path)}?` : "Confirm revert"}
+        description={
+          confirming ? (
+            <>
+              This restores <span className="font-mono">{confirming.card.path}</span> to its last committed state (new files are deleted).
               Sessions without a worktree modify your real checkout.
-            </div>
-            <div className="flex justify-end gap-2">
-              <Button variant="ghost" size="sm" onClick={() => setConfirming(null)}>
-                Cancel
-              </Button>
-              <Button variant="destructive" size="sm" onClick={() => void undo(confirming)}>
-                Revert
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
+            </>
+          ) : null
+        }
+        confirmLabel="Revert"
+        busyLabel="Reverting…"
+        trigger={confirming?.trigger ?? null}
+        onClose={() => setConfirming(null)}
+        onConfirm={() => (confirming ? undo(confirming.card) : Promise.resolve(false))}
+      />
     </div>
   );
 }

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
-import { commands } from "@/bindings";
+import { commands, type SessionRuntimeInfo } from "@/bindings";
 import { useStore, type ChatOptions } from "@/store";
 import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
@@ -12,12 +12,13 @@ import { useAgent } from "@/store-agent";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { headerAgentLine } from "@/lib/session-header";
+import { sessionRuntimeScope } from "@/lib/session-runtime";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { NATIVE_AGENT, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
-import { ModelPicker } from "@/components/ModelPicker";
+import { ComposerModelEffortMenu } from "@/components/ComposerModelEffortMenu";
 import { Transcript } from "@/components/transcript/Transcript";
 import { TranscriptFileContext } from "@/components/transcript/TranscriptFileContext";
 import { RightPanel } from "@/components/session/RightPanel";
@@ -32,8 +33,22 @@ import { AttachmentChips } from "@/components/composer/AttachmentChips";
 import { HISTORY_IDLE, historyEntries, shouldNavigateHistory, stepHistory, type HistoryState } from "@/components/composer/inputHistory";
 
 export function SessionView() {
-  const { sessions, transcripts, focusedSessionPk, send, stop, pendingApprovals, projects, setProjectModel, setSessionPermMode } =
-    useStore();
+  const {
+    sessions,
+    transcripts,
+    focusedSessionPk,
+    send,
+    stop,
+    pendingApprovals,
+    projects,
+    setProjectRuntime,
+    projectRuntimeById,
+    loadProjectRuntime,
+    sessionRuntimeById,
+    loadSessionRuntime,
+    setSessionPermMode,
+    setSessionRuntime,
+  } = useStore();
   const enqueueMessage = useStore((s) => s.enqueueMessage);
   const nav = useNav();
   // Draft text lives in the persisted useNav drafts map keyed by session, so
@@ -65,6 +80,7 @@ export function SessionView() {
   const agentModels = useAgent((s) => s.models);
   const project = projects.find((p) => p.projectId === session?.projectId);
   const projectId = project?.projectId;
+  const runtimeScope = sessionRuntimeScope(session?.kind, projectId ?? null);
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
@@ -74,6 +90,14 @@ export function SessionView() {
   useEffect(() => {
     if (projectId) void loadCommands(projectId);
   }, [projectId, loadCommands]);
+
+  useEffect(() => {
+    if (projectId) void loadProjectRuntime(projectId);
+  }, [projectId, loadProjectRuntime]);
+
+  useEffect(() => {
+    if (session?.sessionPk && runtimeScope === "session") void loadSessionRuntime(session.sessionPk);
+  }, [runtimeScope, session?.sessionPk, loadSessionRuntime]);
 
   useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
@@ -163,6 +187,35 @@ export function SessionView() {
     };
   }, [projectId, contextQueryText]);
 
+  const projectRuntime = projectId ? (projectRuntimeById[projectId] ?? null) : null;
+  const agentModelInfo = agentModels.find((model) => model.requestValue === agentModel) ?? null;
+  const readOnlyRuntime: SessionRuntimeInfo | null = session
+    ? {
+        sessionPk: session.sessionPk,
+        model: agentModel,
+        storedEffort: null,
+        effectiveEffort: agentModelInfo?.resolvedDefault ?? null,
+        effectiveEffortLabel:
+          agentModelInfo?.supported.find((option) => option.value === agentModelInfo.resolvedDefault)?.label ??
+          agentModelInfo?.resolvedDefault ??
+          null,
+        effectiveSource:
+          agentModelInfo?.defaultSource === "configured"
+            ? "configured"
+            : agentModelInfo?.defaultSource === "provider"
+              ? "provider"
+              : "none",
+        storedEffortStatus: "valid",
+        modelInfo: agentModelInfo,
+      }
+    : null;
+  const runtime =
+    runtimeScope === "project"
+      ? projectRuntime
+      : runtimeScope === "session" && session
+        ? (sessionRuntimeById[session.sessionPk] ?? null)
+        : readOnlyRuntime;
+
   if (!session) {
     return (
       <div className="flex flex-1 items-center justify-center text-[13px] text-muted-foreground">Select a session from the sidebar.</div>
@@ -174,8 +227,6 @@ export function SessionView() {
   const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(session.permMode);
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
-  const selectedModel = project?.model || agentModel || "";
-  const modelOptions = agentModels;
 
   const submit = () => {
     const t = draft.trim();
@@ -382,16 +433,15 @@ export function SessionView() {
               />
               <div className="flex-1" />
               <SessionCostPanel sessionPk={session.sessionPk} />
-              <ModelPicker
-                ariaLabel="Model"
-                variant="chip"
-                models={modelOptions}
-                value={selectedModel}
-                onValueChange={(m) => {
-                  if (projectId) void setProjectModel(projectId, m);
+              <ComposerModelEffortMenu
+                models={agentModels}
+                runtime={runtime}
+                onChange={(model, effort) => {
+                  if (runtimeScope === "project" && projectId) void setProjectRuntime(projectId, model, effort);
+                  else if (runtimeScope === "session") void setSessionRuntime(session.sessionPk, model, effort);
                 }}
-                disabled={modelOptions.length === 0}
-                placeholder="Default model"
+                disabled={agentModels.length === 0 || runtimeScope === null}
+                running={running}
               />
               <Button
                 variant="ghost"

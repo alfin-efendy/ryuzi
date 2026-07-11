@@ -12,10 +12,14 @@ import {
   type PermMode,
   type ApprovalKind,
   type ApprovalResponse,
+  type ModelPreferenceKey,
+  type ProjectRuntimeInfo,
+  type SessionRuntimeInfo,
   type ModelCost,
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useNative } from "./store-native";
+import { useAgent } from "./store-agent";
 import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 import { notifier, notifyIntentForEvent, isWindowFocused } from "@/lib/notify";
@@ -31,6 +35,7 @@ export type PendingApproval = {
 };
 export type ChatOptions = {
   model?: string | null;
+  effort?: string | null;
   context?: {
     branch?: string | null;
     voiceTranscript?: string | null;
@@ -62,6 +67,8 @@ type State = {
       outputTokens: number;
     }
   >;
+  projectRuntimeById: Record<string, ProjectRuntimeInfo>;
+  sessionRuntimeById: Record<string, SessionRuntimeInfo>;
   /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
   /** Per-session in-memory type-ahead queue (messages typed while running). */
@@ -79,8 +86,12 @@ type State = {
   addProject: () => Promise<boolean>;
   /** Clone `url` into `<destParent>/<repo-name>` via the backend. */
   cloneProject: (url: string, destParent: string) => Promise<boolean>;
-  /** Pin (or clear, with null) the model future turns of this project use. */
-  setProjectModel: (projectId: string, model: string | null) => Promise<void>;
+  loadProjectRuntime: (projectId: string) => Promise<void>;
+  setProjectRuntime: (projectId: string, model: string | null, effort: string | null) => Promise<boolean>;
+  setModelEffortPreference: (key: ModelPreferenceKey, effort: string | null) => Promise<boolean>;
+  refreshModelConfiguration: () => Promise<void>;
+  loadSessionRuntime: (sessionPk: string) => Promise<void>;
+  setSessionRuntime: (sessionPk: string, model: string | null, effort: string | null) => Promise<boolean>;
   /** Change the permission mode this session (only this session) runs under. */
   setSessionPermMode: (sessionPk: string, permMode: PermMode) => Promise<void>;
   /** Resolves true as soon as the backend accepts — navigate immediately;
@@ -108,6 +119,7 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
   if (!options) return null;
   return {
     model: options.model ?? null,
+    effort: options.effort ?? null,
     context: options.context
       ? {
           branch: options.context.branch ?? null,
@@ -121,6 +133,30 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
   };
 }
 
+let modelConfigurationGeneration = 0;
+const projectRuntimeMutationGeneration = new Map<string, number>();
+const projectRuntimeActiveMutation = new Map<string, number>();
+const projectRuntimeLoadGeneration = new Map<string, number>();
+
+type RuntimeQueue<T> = {
+  tail: Promise<void>;
+  pending: number;
+  latestIntent: number;
+  confirmedModel: string | null;
+  confirmedEffort: string | null;
+  confirmedRuntime: T | undefined;
+};
+
+const projectRuntimeQueues = new Map<string, RuntimeQueue<ProjectRuntimeInfo>>();
+const sessionRuntimeLoadGeneration = new Map<string, number>();
+const sessionRuntimeQueues = new Map<string, RuntimeQueue<SessionRuntimeInfo>>();
+
+function nextGeneration(generations: Map<string, number>, projectId: string): number {
+  const generation = (generations.get(projectId) ?? 0) + 1;
+  generations.set(projectId, generation);
+  return generation;
+}
+
 export const useStore = create<State>((set, get) => ({
   projects: [],
   sessions: [],
@@ -132,6 +168,8 @@ export const useStore = create<State>((set, get) => ({
   lastSeq: {},
   loaded: {},
   contextUsage: {},
+  projectRuntimeById: {},
+  sessionRuntimeById: {},
   sessionCost: {},
 
   applyCoreEvent: (e) =>
@@ -308,18 +346,208 @@ export const useStore = create<State>((set, get) => ({
     return false;
   },
 
-  setProjectModel: async (projectId, model) => {
-    const project = get().projects.find((p) => p.projectId === projectId);
-    if (!project) return;
-    const next = model ?? null;
-    if ((project.model ?? null) === next) return;
-    // Optimistic paint so the composer label updates immediately.
-    set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, model: next } : p)) });
-    const res = await commands.updateProject(projectId, next, project.permMode);
-    if (res.status === "error") {
-      toast.error("Couldn't set model: " + res.error.message);
-      await get().refresh();
+  loadProjectRuntime: async (projectId) => {
+    const mutationGeneration = projectRuntimeMutationGeneration.get(projectId) ?? 0;
+    const startedDuringMutation = projectRuntimeActiveMutation.has(projectId);
+    const loadGeneration = nextGeneration(projectRuntimeLoadGeneration, projectId);
+    const res = await commands.projectRuntimeInfo(projectId);
+    if (
+      res.status === "ok" &&
+      !startedDuringMutation &&
+      !projectRuntimeActiveMutation.has(projectId) &&
+      (projectRuntimeMutationGeneration.get(projectId) ?? 0) === mutationGeneration &&
+      projectRuntimeLoadGeneration.get(projectId) === loadGeneration
+    ) {
+      set((st) => ({ projectRuntimeById: { ...st.projectRuntimeById, [projectId]: res.data } }));
     }
+  },
+  setProjectRuntime: async (projectId, model, effort) => {
+    const project = get().projects.find((p) => p.projectId === projectId);
+    if (!project) return false;
+    const previousRuntime = get().projectRuntimeById[projectId];
+    let queue = projectRuntimeQueues.get(projectId);
+    if (!queue) {
+      queue = {
+        tail: Promise.resolve(),
+        pending: 0,
+        latestIntent: 0,
+        confirmedModel: project.model,
+        confirmedEffort: project.effort,
+        confirmedRuntime: previousRuntime,
+      };
+      projectRuntimeQueues.set(projectId, queue);
+    }
+    const intent = ++queue.latestIntent;
+    queue.pending += 1;
+    const mutationGeneration = nextGeneration(projectRuntimeMutationGeneration, projectId);
+    projectRuntimeActiveMutation.set(projectId, mutationGeneration);
+    const optimisticRuntime: ProjectRuntimeInfo = previousRuntime
+      ? { ...previousRuntime, model, storedEffort: effort }
+      : {
+          projectId,
+          model,
+          storedEffort: effort,
+          effectiveEffort: effort,
+          effectiveEffortLabel: effort,
+          effectiveSource: effort ? "project" : "none",
+          storedEffortStatus: "valid",
+          modelInfo: null,
+        };
+    set((st) => ({
+      projects: st.projects.map((p) => (p.projectId === projectId ? { ...p, model, effort } : p)),
+      projectRuntimeById: { ...st.projectRuntimeById, [projectId]: optimisticRuntime },
+    }));
+    let succeeded = false;
+    const execute = async () => {
+      try {
+        const res = await commands.updateProjectRuntime(projectId, model, effort);
+        succeeded = res.status === "ok";
+        if (res.status === "ok") {
+          queue.confirmedRuntime = res.data;
+          queue.confirmedModel = res.data.model;
+          queue.confirmedEffort = res.data.storedEffort;
+        } else {
+          toast.error("Couldn't set model and effort: " + res.error.message);
+        }
+      } catch (error) {
+        toast.error("Couldn't set model and effort: " + String(error));
+      }
+      queue.pending -= 1;
+      if (intent === queue.latestIntent) {
+        projectRuntimeActiveMutation.delete(projectId);
+        set((st) => {
+          const projectRuntimeById = { ...st.projectRuntimeById };
+          if (queue.confirmedRuntime) projectRuntimeById[projectId] = queue.confirmedRuntime;
+          else delete projectRuntimeById[projectId];
+          return {
+            projects: st.projects.map((candidate) =>
+              candidate.projectId === projectId ? { ...candidate, model: queue.confirmedModel, effort: queue.confirmedEffort } : candidate,
+            ),
+            projectRuntimeById,
+          };
+        });
+      }
+      if (queue.pending === 0) projectRuntimeQueues.delete(projectId);
+    };
+    const task = queue.pending === 1 ? execute() : queue.tail.then(execute);
+    queue.tail = task.catch(() => undefined);
+    await task;
+    return succeeded;
+  },
+  refreshModelConfiguration: async () => {
+    const generation = ++modelConfigurationGeneration;
+    await useAgent.getState().load();
+    const projectIds = Object.keys(get().projectRuntimeById);
+    const projectMutationSnapshots = new Map(
+      projectIds.map((id) => [
+        id,
+        {
+          generation: projectRuntimeMutationGeneration.get(id) ?? 0,
+          active: projectRuntimeActiveMutation.has(id),
+        },
+      ]),
+    );
+    const entries = await Promise.all(projectIds.map(async (id) => [id, await commands.projectRuntimeInfo(id)] as const));
+    if (generation !== modelConfigurationGeneration) return;
+    set((st) => {
+      const next = { ...st.projectRuntimeById };
+      for (const [id, result] of entries) {
+        const snapshot = projectMutationSnapshots.get(id);
+        if (
+          result.status === "ok" &&
+          snapshot &&
+          !snapshot.active &&
+          !projectRuntimeActiveMutation.has(id) &&
+          (projectRuntimeMutationGeneration.get(id) ?? 0) === snapshot.generation
+        ) {
+          next[id] = result.data;
+        }
+      }
+      return { projectRuntimeById: next };
+    });
+  },
+  setModelEffortPreference: async (key, effort) => {
+    const res = await commands.setModelEffortPreference(key, effort);
+    if (res.status === "error") {
+      toast.error("Couldn't set model default: " + res.error.message);
+      return false;
+    }
+    await get().refreshModelConfiguration();
+    return true;
+  },
+  loadSessionRuntime: async (sessionPk) => {
+    const loadGeneration = nextGeneration(sessionRuntimeLoadGeneration, sessionPk);
+    const queue = sessionRuntimeQueues.get(sessionPk);
+    const intent = queue?.latestIntent ?? 0;
+    const res = await commands.sessionRuntimeInfo(sessionPk);
+    if (
+      res.status === "ok" &&
+      sessionRuntimeLoadGeneration.get(sessionPk) === loadGeneration &&
+      (sessionRuntimeQueues.get(sessionPk)?.latestIntent ?? 0) === intent
+    ) {
+      set((st) => ({ sessionRuntimeById: { ...st.sessionRuntimeById, [sessionPk]: res.data } }));
+    }
+  },
+  setSessionRuntime: async (sessionPk, model, effort) => {
+    const previousRuntime = get().sessionRuntimeById[sessionPk];
+    let queue = sessionRuntimeQueues.get(sessionPk);
+    if (!queue) {
+      queue = {
+        tail: Promise.resolve(),
+        pending: 0,
+        latestIntent: 0,
+        confirmedModel: previousRuntime?.model ?? null,
+        confirmedEffort: previousRuntime?.storedEffort ?? null,
+        confirmedRuntime: previousRuntime,
+      };
+      sessionRuntimeQueues.set(sessionPk, queue);
+    }
+    const intent = ++queue.latestIntent;
+    queue.pending += 1;
+    const optimistic: SessionRuntimeInfo = previousRuntime
+      ? { ...previousRuntime, model, storedEffort: effort }
+      : {
+          sessionPk,
+          model,
+          storedEffort: effort,
+          effectiveEffort: effort,
+          effectiveEffortLabel: effort,
+          effectiveSource: effort ? "project" : "none",
+          storedEffortStatus: "valid",
+          modelInfo: null,
+        };
+    set((st) => ({ sessionRuntimeById: { ...st.sessionRuntimeById, [sessionPk]: optimistic } }));
+    let succeeded = false;
+    const execute = async () => {
+      try {
+        const res = await commands.updateSessionRuntime(sessionPk, model, effort);
+        succeeded = res.status === "ok";
+        if (res.status === "ok") {
+          queue.confirmedRuntime = res.data;
+          queue.confirmedModel = res.data.model;
+          queue.confirmedEffort = res.data.storedEffort;
+        } else {
+          toast.error("Couldn't set chat model and effort: " + res.error.message);
+        }
+      } catch (error) {
+        toast.error("Couldn't set chat model and effort: " + String(error));
+      }
+      queue.pending -= 1;
+      if (intent === queue.latestIntent) {
+        const confirmed = queue.confirmedRuntime;
+        set((st) => {
+          const next = { ...st.sessionRuntimeById };
+          if (confirmed) next[sessionPk] = { ...confirmed, sessionPk };
+          else delete next[sessionPk];
+          return { sessionRuntimeById: next };
+        });
+      }
+      if (queue.pending === 0) sessionRuntimeQueues.delete(sessionPk);
+    };
+    const task = queue.pending === 1 ? execute() : queue.tail.then(execute);
+    queue.tail = task.catch(() => undefined);
+    await task;
+    return succeeded;
   },
   setSessionPermMode: async (sessionPk, permMode) => {
     const session = get().sessions.find((s) => s.sessionPk === sessionPk);

@@ -1,7 +1,7 @@
 import { LayoutGrid } from "lucide-react";
 import { useState } from "react";
 import { useApps } from "@/store-apps";
-import { Button, FormField, Input, Modal, ModalFooter, Segmented, Textarea } from "@ryuzi/ui";
+import { Button, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, Segmented, Textarea } from "@ryuzi/ui";
 
 // Add an MCP server by hand (stdio command or HTTP URL). Adding runs a real
 // handshake, so the card lands with a true status and discovered tool list.
@@ -43,64 +43,64 @@ export function AddAppModal({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <Modal onClose={onClose} width={480}>
-      <div className="mb-1 flex items-center gap-2.5">
-        <LayoutGrid aria-hidden size={16} strokeWidth={2} className="text-muted-foreground" />
-        <span className="text-[15px] font-semibold tracking-[-0.01em]">Add MCP server</span>
-      </div>
-      <p className="mb-[18px] mt-0 text-[12.5px] text-muted-foreground">
-        Point Cockpit at an MCP server. It connects immediately to verify and discover the tool list.
-      </p>
-      <div className="flex flex-col gap-3">
-        <div className="flex gap-3">
-          <FormField label="Name" className="flex-1">
-            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="GitHub" />
-          </FormField>
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xs font-semibold">Transport</span>
-            <Segmented
-              options={[
-                { id: "stdio", label: "Stdio" },
-                { id: "http", label: "HTTP" },
-              ]}
-              value={transport}
-              onChange={setTransport}
-            />
+    <Modal onClose={onClose} width={480} busy={saving}>
+      <ModalHeader
+        leading={<LayoutGrid aria-hidden className="mt-0.5 size-4 text-muted-foreground" strokeWidth={2} />}
+        title="Add MCP server"
+        description="Point Cockpit at an MCP server. It connects immediately to verify and discover the tool list."
+      />
+      <ModalBody>
+        <div className="flex flex-col gap-3">
+          <div className="flex gap-3">
+            <FormField label="Name" className="flex-1">
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="GitHub" />
+            </FormField>
+            <div className="flex flex-col gap-1.5">
+              <span className="text-xs font-semibold">Transport</span>
+              <Segmented
+                options={[
+                  { id: "stdio", label: "Stdio" },
+                  { id: "http", label: "HTTP" },
+                ]}
+                value={transport}
+                onChange={setTransport}
+              />
+            </div>
           </div>
+          <FormField label="Description">
+            <Input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="What agents use it for" />
+          </FormField>
+          {transport === "stdio" ? (
+            <FormField label="Command">
+              <Input
+                className="font-mono text-xs"
+                value={command}
+                onChange={(e) => setCommand(e.target.value)}
+                placeholder="npx -y @modelcontextprotocol/server-github"
+              />
+            </FormField>
+          ) : (
+            <FormField label="URL">
+              <Input
+                className="font-mono text-xs"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://mcp.example.com"
+              />
+            </FormField>
+          )}
+          <FormField label="Environment (KEY=value, one per line)">
+            <Textarea
+              className="resize-y font-mono text-xs"
+              value={env}
+              onChange={(e) => setEnv(e.target.value)}
+              placeholder="GITHUB_TOKEN=ghp_…"
+            />
+          </FormField>
         </div>
-        <FormField label="Description">
-          <Input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="What agents use it for" />
-        </FormField>
-        {transport === "stdio" ? (
-          <FormField label="Command">
-            <Input
-              className="font-mono text-xs"
-              value={command}
-              onChange={(e) => setCommand(e.target.value)}
-              placeholder="npx -y @modelcontextprotocol/server-github"
-            />
-          </FormField>
-        ) : (
-          <FormField label="URL">
-            <Input
-              className="font-mono text-xs"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://mcp.example.com"
-            />
-          </FormField>
-        )}
-        <FormField label="Environment (KEY=value, one per line)">
-          <Textarea
-            className="resize-y font-mono text-xs"
-            value={env}
-            onChange={(e) => setEnv(e.target.value)}
-            placeholder="GITHUB_TOKEN=ghp_…"
-          />
-        </FormField>
-      </div>
+      </ModalBody>
       <ModalFooter>
-        <Button variant="outline" onClick={onClose}>
+        <Button variant="outline" disabled={saving} onClick={onClose}>
           Cancel
         </Button>
         <Button disabled={!valid || saving} onClick={() => void submit()}>

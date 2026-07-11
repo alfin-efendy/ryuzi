@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { CmdError, Result } from "@/bindings";
 
 const ok = <T,>(data: T): Result<T, CmdError> => ({ status: "ok", data });
@@ -17,7 +17,17 @@ let getAgentSettingsImpl: () => Promise<Result<AgentSettings, CmdError>> = () =>
 
 const getAgentSettings = mock(() => getAgentSettingsImpl());
 const setAgentSettings = mock(async (_model: string | null, _permMode: string | null) => ok(null));
-const listSelectableModels = mock(async () => ok(["smart", "anthropic/claude-opus-4"]));
+const selectable = (requestValue: string) => ({
+  kind: "concrete" as const,
+  requestValue,
+  displayName: requestValue,
+  preferenceKey: null,
+  supported: [],
+  configuredDefault: null,
+  resolvedDefault: null,
+  defaultSource: "none" as const,
+});
+const listSelectableModels = mock(async () => ok([selectable("smart"), selectable("anthropic/claude-opus-4")]));
 
 // AgentLoopCard: a failed save must roll the input back to the last CONFIRMED
 // value — not to whatever the user just typed (the bug this guards: `onChange`
@@ -26,8 +36,11 @@ const listSelectableModels = mock(async () => ok(["smart", "anthropic/claude-opu
 let setSettingImpl: (key: string, value: string) => Promise<Result<null, CmdError>> = () =>
   Promise.resolve({ status: "error", error: { message: "boom" } });
 
+const WORKTREE_DIR_KEY = "worktree_dir";
+
 const getSetting = mock((key: string): Promise<Result<string | null, CmdError>> => {
   if (key === MAX_TURNS_KEY) return Promise.resolve(ok("50"));
+  if (key === WORKTREE_DIR_KEY) return Promise.resolve(ok("D:\\wt"));
   return Promise.resolve(ok(null));
 });
 const setSetting = mock((key: string, value: string): Promise<Result<null, CmdError>> => setSettingImpl(key, value));
@@ -158,4 +171,17 @@ test("a successful save is kept, and a later failed save rolls back to it", asyn
   // Second save fails — must roll back to "1000" (the last confirmed save),
   // not "50" (stale) and not "2000" (the unsaved typed text).
   await waitFor(() => expect(input.value).toBe("1000"));
+});
+
+test("Worktree folder shows the configured path and Browse saves a new one", async () => {
+  render(<SettingsView />);
+  const label = await screen.findByText("Worktree folder");
+  const card = label.closest("div")?.parentElement?.parentElement as HTMLElement;
+  await waitFor(() => expect(within(card).getByText("D:\\wt")).toBeTruthy());
+
+  pickDirectory.mockResolvedValueOnce("E:\\other-wt");
+  setSettingImpl = () => Promise.resolve({ status: "ok", data: null });
+  fireEvent.click(within(card).getByRole("button", { name: "Browse" }));
+
+  await waitFor(() => expect(setSetting).toHaveBeenCalledWith(WORKTREE_DIR_KEY, "E:\\other-wt"));
 });
