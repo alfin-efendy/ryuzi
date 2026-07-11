@@ -4,10 +4,9 @@ pub fn version() -> &'static str {
 
 pub fn help_text() -> String {
     [
-        "ryuzi - drive coding sessions from chat and terminal",
+        "ryuzi - headless engine daemon for Ryuzi Cockpit",
         "",
         "USAGE",
-        "  ryuzi                 open the dashboard (first run launches setup)",
         "  ryuzi <command> [options]",
         "",
         "OPTIONS",
@@ -16,11 +15,7 @@ pub fn help_text() -> String {
         "",
         "COMMANDS",
         "  doctor             check your environment (git, settings)",
-        "  run                one-shot session:",
-        "                     ryuzi run --dir <repo> --prompt <text> [--model x] [--effort y] [--mode m]",
-        "  serve              run the HTTP surface (GET /health,/sessions,/events; POST /sessions/:pk/prompt) [--port N]",
-        "  orch               orchestrated task graphs: submit --project <id> <goal...> | list | cancel <id> | retry <id>",
-        "  plugins            list/inspect/enable/disable plugins: ryuzi plugins <list|info|enable|disable> [id]",
+        "  config             read/write settings: ryuzi config <get|set|list> ...",
     ]
     .join("\n")
 }

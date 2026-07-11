@@ -17,7 +17,6 @@ fn deps_for(
             found: true,
             version: None,
         },
-        build_registries: Box::new(|| Ok(ryuzi_core::Registries::new())),
     }
 }
 

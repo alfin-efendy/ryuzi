@@ -1,9 +1,9 @@
 //! `__daemon` [`--canary`]: the hidden background-process entry points.
-//! Spawned detached by the TUI's `s` key (`AppController::start_daemon`,
-//! `crates/cli/src/tui/controller.rs`) as `[current_exe, "__daemon"]`, and by
-//! the self-updater's `ProdApplierHost::spawn_canary` as
-//! `[canary_path, "__daemon", "--canary"]` — never invoked directly by a
-//! user, and deliberately absent from `--help`.
+//! Spawned by the self-updater's `ProdApplierHost::spawn_canary` as
+//! `[canary_path, "__daemon", "--canary"]` and respawned after a swap as
+//! `[install_path, "__daemon"]` — never invoked directly by a user, and
+//! deliberately absent from `--help`. The user-facing foreground entry
+//! point is `ryuzi start` (same code path, see `dispatch.rs`).
 //!
 //! Owns the daemon process lifecycle: timed connect, reentrancy-guarded
 //! shutdown on SIGTERM/SIGINT, the canary probe/promote flow, and the

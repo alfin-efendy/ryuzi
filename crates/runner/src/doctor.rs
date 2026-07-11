@@ -101,7 +101,6 @@ mod tests {
                     version: None,
                 }
             },
-            build_registries: Box::new(|| Ok(ryuzi_core::Registries::new())),
         };
         (deps, out)
     }
