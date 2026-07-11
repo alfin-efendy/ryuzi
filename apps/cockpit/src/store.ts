@@ -204,7 +204,7 @@ export const useStore = create<State>((set, get) => ({
           }
           const prev = st.lastSeq[pk] ?? 0;
           if (e.seq <= prev) return {}; // stale/duplicate (covers reload/replay races)
-          const row = messageToRow(e.seq, e.role, e.block_type, e.payload, e.tool_call_id, e.status, e.tool_kind, Date.now());
+          const row = messageToRow(e.seq, e.role, e.block_type, e.payload, e.tool_call_id, e.status, e.tool_kind, Date.now(), e.speaker);
           return {
             transcripts: append(st.transcripts, pk, row),
             lastSeq: { ...st.lastSeq, [pk]: e.seq },
@@ -295,7 +295,9 @@ export const useStore = create<State>((set, get) => ({
           const res = await commands.listMessages(pk);
           return res.status === "ok" ? res.data : [];
         })();
-    const hydrated = rows.map((m) => messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind, m.createdAt));
+    const hydrated = rows.map((m) =>
+      messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind, m.createdAt, m.speaker),
+    );
     const maxSeq = rows.reduce((mx, m) => Math.max(mx, m.seq), 0);
     set((st) => {
       // Rows appended by applyCoreEvent while listMessages was in flight

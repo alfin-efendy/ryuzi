@@ -11,6 +11,7 @@ import { ActivityCluster } from "./ToolChip";
 import { TurnSummary } from "./TurnSummary";
 import { FileChangeCards } from "./FileChangeCards";
 import { TurnActions } from "./TurnActions";
+import { SpeakerBubble } from "./SpeakerBubble";
 import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 
 function MediaItem({ a, onOpenImage }: { a: RowAttachment; onOpenImage: (src: string) => void }) {
@@ -237,6 +238,8 @@ export function Transcript({
                   return <ErrorRow key={g.key} text={g.text} />;
                 case "notice":
                   return <NoticeRow key={g.key} text={g.text} />;
+                case "speaker":
+                  return <SpeakerBubble key={g.key} speaker={g.speaker} markdown={g.markdown} />;
                 case "summary":
                   return (
                     <div key={g.key} className="flex flex-col gap-1.5">

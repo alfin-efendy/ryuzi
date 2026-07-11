@@ -35,6 +35,7 @@ const row = (partial: Partial<Row>): Row => ({
   toolExitCode: null,
   toolSummary: null,
   toolSubagent: null,
+  speaker: null,
   ...partial,
 });
 
@@ -208,6 +209,16 @@ test("route switch copy groups as notices for model, account, failover, and comb
 
   const groups = groupRows(notices.map((text, index) => row({ seq: index + 1, role: "system", blockType: "notice", text })));
   expect(groups).toEqual(notices.map((text, index) => ({ type: "notice", key: `s${index + 1}`, text })));
+});
+
+test("speaker rows group into labeled speaker bubbles", () => {
+  const rows = [
+    messageToRow(1, "assistant", "status", { text: "started: a" }, null, null, null, 0, "build"),
+    messageToRow(2, "assistant", "text", { text: "done a" }, null, null, null, 0, "build"),
+  ];
+  const groups = groupRows(rows);
+  expect(groups.every((g) => g.type === "speaker")).toBe(true);
+  expect(groups.map((g: any) => g.speaker)).toEqual(["build", "build"]);
 });
 
 test("closeDanglingFence closes an odd number of line-start fences and leaves balanced ones alone", () => {

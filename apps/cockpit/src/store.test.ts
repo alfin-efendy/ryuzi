@@ -364,6 +364,7 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   });
   s.applyCoreEvent({
     kind: "message",
@@ -375,6 +376,7 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   });
   s.applyCoreEvent({
     kind: "message",
@@ -386,6 +388,7 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   });
   // A duplicate/stale seq is ignored.
   s.applyCoreEvent({
@@ -398,6 +401,7 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   });
 
   const rows = useStore.getState().transcripts.s1;
@@ -420,6 +424,7 @@ test("durable system notice messages render live once and hydrate identically", 
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   };
 
   useStore.getState().applyCoreEvent(event);
@@ -447,6 +452,7 @@ test("durable system notice messages render live once and hydrate identically", 
       toolCallId: null,
       status: null,
       toolKind: null,
+      speaker: null,
       createdAt,
     },
   ]);
@@ -466,6 +472,7 @@ test("tool_call events append once, then merge in place by toolCallId (same-seq 
     tool_call_id: "tc-1",
     status: "pending",
     tool_kind: "execute",
+    speaker: null,
   });
   // Completion re-emit re-uses seq 1 — must merge, not append, not be dropped.
   s.applyCoreEvent({
@@ -478,6 +485,7 @@ test("tool_call events append once, then merge in place by toolCallId (same-seq 
     tool_call_id: "tc-1",
     status: "completed",
     tool_kind: "execute",
+    speaker: null,
   });
   // lastSeq high-water mark is untouched by the merge: a later fresh row still lands.
   s.applyCoreEvent({
@@ -490,6 +498,7 @@ test("tool_call events append once, then merge in place by toolCallId (same-seq 
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   });
 
   const rows = useStore.getState().transcripts.s1;
@@ -513,6 +522,7 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
       toolCallId: null,
       status: null,
       toolKind: null,
+      speaker: null,
       createdAt: 1,
     },
     {
@@ -524,6 +534,7 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
       toolCallId: "tc-9",
       status: "completed",
       toolKind: "read",
+      speaker: null,
       createdAt: 2,
     },
   ];
@@ -546,6 +557,7 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   });
   st.applyCoreEvent({
     kind: "message",
@@ -557,6 +569,7 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   });
   expect(useStore.getState().transcripts.s1.map((r) => r.seq)).toEqual([1, 2, 3]);
 });
@@ -573,6 +586,7 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
       toolCallId: null,
       status: null,
       toolKind: null,
+      speaker: null,
       createdAt: 1,
     },
     {
@@ -584,6 +598,7 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
       toolCallId: null,
       status: null,
       toolKind: null,
+      speaker: null,
       createdAt: 2,
     },
   ];
@@ -599,6 +614,7 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     });
     return dbRows;
   });
@@ -780,6 +796,7 @@ test("error event appends no transient row — the durable error row arrives via
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   });
   const rows = useStore.getState().transcripts.s1;
   expect(rows).toHaveLength(1);
@@ -1075,6 +1092,7 @@ test("a completed todowrite tool_call triggers a todo refetch for its session", 
     tool_call_id: "tc-todo",
     status: "in_progress",
     tool_kind: "other",
+    speaker: null,
   });
   expect(loadTodos).not.toHaveBeenCalled();
   // Completion re-emit (same seq, merged by toolCallId): the DB changed — refetch.
@@ -1088,6 +1106,7 @@ test("a completed todowrite tool_call triggers a todo refetch for its session", 
     tool_call_id: "tc-todo",
     status: "completed",
     tool_kind: "other",
+    speaker: null,
   });
   expect(loadTodos).toHaveBeenCalledTimes(1);
   expect(loadTodos).toHaveBeenCalledWith("s1");
@@ -1102,6 +1121,7 @@ test("a completed todowrite tool_call triggers a todo refetch for its session", 
     tool_call_id: "tc-bash",
     status: "completed",
     tool_kind: "execute",
+    speaker: null,
   });
   expect(loadTodos).toHaveBeenCalledTimes(1);
   useNative.setState({ loadTodos: original });
@@ -1208,6 +1228,7 @@ test("markFocusedSessionReadOnEvent marks the focused session read as live activ
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     "s1",
   );
@@ -1227,6 +1248,7 @@ test("markFocusedSessionReadOnEvent leaves read state untouched for events on a 
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     "s1",
   );
