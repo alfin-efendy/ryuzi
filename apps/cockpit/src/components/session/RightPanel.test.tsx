@@ -81,8 +81,55 @@ test("pending review target waits for its fresh fetch instead of consuming a sta
   });
 
   await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(gitDiff).toHaveBeenCalledTimes(1);
   expect(screen.getByTitle("src/fresh.ts").className).toContain("bg-accent");
   expect(screen.getByText("const fresh = true;")).toBeTruthy();
+});
+
+test("result-error target fetch clears without selecting a preserved stale match", async () => {
+  gitDiff.mockImplementation(() => Promise.resolve({ status: "error", error: { message: "diff failed" } }));
+  useDiff.setState({
+    bySession: {
+      s1: {
+        loading: false,
+        error: null,
+        files: [
+          { dir: "src/", name: "first.ts", add: 1, del: 0, lines: [["add", 1, "const first = true;"]] },
+          { dir: "src/", name: "second.ts", add: 1, del: 0, lines: [["add", 1, "const second = true;"]] },
+        ],
+      },
+    },
+    pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\second.ts" },
+  });
+
+  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+
+  await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
+  expect(screen.getByTitle("src/first.ts").className).toContain("bg-accent");
+  expect(screen.getByTitle("src/second.ts").className).not.toContain("bg-accent");
+  expect(screen.getByText("diff failed")).toBeTruthy();
+});
+
+test("rejected target fetch clears the pending review target", async () => {
+  gitDiff.mockImplementation(() => Promise.reject(new Error("diff failed")));
+  useDiff.setState({ pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" } });
+
+  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+
+  await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
+});
+
+test("other-session pending review target remains unchanged", async () => {
+  const pending = { sessionPk: "s2", path: "C:\\code\\demo\\src\\app.ts" };
+  useDiff.setState({ pendingReview: pending });
+
+  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith("s1"));
+  expect(useDiff.getState().pendingReview).toEqual(pending);
 });
 
 test("completed diff selects and clears a pending transcript review target", async () => {

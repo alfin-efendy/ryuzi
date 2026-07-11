@@ -14,6 +14,12 @@ import { SubagentList } from "@/components/session/SubagentList";
 import { DiffStat } from "@/components/common/bits";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
 
+type TargetFetch = { target: PendingReview; status: "pending" | "fulfilled" | "rejected" };
+
+function samePendingReview(a: PendingReview | null, b: PendingReview | null): boolean {
+  return a?.sessionPk === b?.sessionPk && a?.path === b?.path;
+}
+
 export function RightPanel({
   sessionPk,
   branch,
@@ -43,8 +49,8 @@ export function RightPanel({
   // Auto-refresh the file tree when a running turn ends — the agent may have
   // created or removed files while it was running.
   const prevRunning = useRef(running);
-  const [pendingFetch, setPendingFetch] = useState<PendingReview | null>(null);
-  const [pendingFetchReady, setPendingFetchReady] = useState<PendingReview | null>(null);
+  const targetFetch = useRef<TargetFetch | null>(null);
+  const [targetFetchSettled, setTargetFetchSettled] = useState<PendingReview | null>(null);
   useEffect(() => {
     if (prevRunning.current && !running) setTreeRefresh((n) => n + 1);
     prevRunning.current = running;
@@ -52,38 +58,58 @@ export function RightPanel({
 
   // Auto-fetch when the tab opens and when a running turn finishes.
   // Non-git projects have no diff to fetch (git_diff would just error).
-  // A transcript target gets its own fetch, recorded before it starts, so it
-  // can never be consumed from a pre-target diff list.
-  const pendingPath = pendingReview?.sessionPk === sessionPk ? pendingReview.path : null;
   useEffect(() => {
     if (!nav.rightOpen || nav.rightTab !== "review" || running || !isGit) return;
-    if (pendingPath === null) {
-      void fetchDiff(sessionPk);
+    if (useDiff.getState().pendingReview?.sessionPk === sessionPk) return;
+    void fetchDiff(sessionPk);
+  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit]);
+
+  // Each same-session transcript target owns exactly one fresh fetch. Record
+  // its settlement independently of the shared diff loading flag: a rejected
+  // fetch may leave the store loading, while a Result error preserves files.
+  useEffect(() => {
+    const target = pendingReview?.sessionPk === sessionPk ? pendingReview : null;
+    if (target === null) {
+      if (targetFetch.current !== null) targetFetch.current = null;
+      if (targetFetchSettled !== null) setTargetFetchSettled(null);
       return;
     }
+    if (samePendingReview(targetFetch.current?.target ?? null, target)) return;
 
-    const target = { sessionPk, path: pendingPath };
-    setPendingFetch(target);
-    setPendingFetchReady(null);
-    void fetchDiff(sessionPk).then(() => {
-      setPendingFetchReady(target);
-    });
-  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit, pendingPath]);
+    targetFetch.current = { target, status: "pending" };
+    setTargetFetchSettled(null);
+    void fetchDiff(sessionPk).then(
+      () => {
+        if (samePendingReview(targetFetch.current?.target ?? null, target)) {
+          targetFetch.current = { target, status: "fulfilled" };
+          setTargetFetchSettled(target);
+        }
+      },
+      () => {
+        if (samePendingReview(targetFetch.current?.target ?? null, target)) {
+          targetFetch.current = { target, status: "rejected" };
+          setTargetFetchSettled(target);
+        }
+      },
+    );
+  }, [pendingReview, fetchDiff, sessionPk]);
 
-  // Consume a pending jump from a transcript edit card: select the file once
-  // the fetch started for that exact target has finished, then clear the
-  // intent either way. A pending jump for another session is left alone —
-  // its own panel consumes it.
+  // Consume a pending jump only after its exact target-scoped fetch has
+  // settled. Result errors deliberately retain old files in the store, so do
+  // not select from them; rejected fetches clear without waiting for loading.
   useEffect(() => {
-    if (pendingReview === null || pendingReview.sessionPk !== sessionPk || diff.loading) return;
-    if (pendingFetch?.sessionPk !== sessionPk || pendingFetch.path !== pendingReview.path) return;
-    if (pendingFetchReady?.sessionPk !== sessionPk || pendingFetchReady.path !== pendingReview.path) return;
-    const idx = reviewFileIndex(diff.files, pendingReview.path);
-    if (idx >= 0) setReviewFile(idx);
-    setPendingFetch(null);
-    setPendingFetchReady(null);
+    if (pendingReview === null || pendingReview.sessionPk !== sessionPk) return;
+    if (!samePendingReview(targetFetchSettled, pendingReview)) return;
+    const status = targetFetch.current?.status;
+    if (status === "pending" || status === undefined) return;
+    if (status === "fulfilled" && !diff.loading && diff.error === null) {
+      const idx = reviewFileIndex(diff.files, pendingReview.path);
+      if (idx >= 0) setReviewFile(idx);
+    }
+    targetFetch.current = null;
+    setTargetFetchSettled(null);
     setPendingReview(null);
-  }, [pendingReview, diff.files, diff.loading, pendingFetch, pendingFetchReady, setPendingReview, sessionPk]);
+  }, [pendingReview, diff.files, diff.loading, diff.error, targetFetchSettled, setPendingReview, sessionPk]);
 
   // A refresh may shrink the file list out from under a stale selected
   // index (e.g. commits amended away) — clamp it back into range.
