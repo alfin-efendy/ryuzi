@@ -1275,6 +1275,14 @@ async setSkillPinned(name: string, pinned: boolean) : Promise<Result<null, CmdEr
     else return { status: "error", error: e  as any };
 }
 },
+async listAudit(limit: number) : Promise<Result<AuditRow[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_audit", { limit }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Export a session as a pretty JSON string.
  */
@@ -1470,6 +1478,18 @@ export type ApprovalScope =
  * Persisted to the project's `tool_policies` row.
  */
 "project"
+/**
+ * One app-control audit entry, surfaced in Cockpit's Settings → Audit feed.
+ */
+export type AuditRow = { id: number; tool: string; action: string; decision: string; 
+/**
+ * The initiating `WriteOrigin` as a string (`user`|`agent`|`background_review`).
+ */
+origin: string; sessionPk: string | null; 
+/**
+ * Unix ms.
+ */
+at: number }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type BranchList = { 
 /**

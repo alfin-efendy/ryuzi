@@ -1,6 +1,7 @@
 mod accent;
 mod agent_cmd;
 mod apps_cmd;
+mod audit_cmd;
 mod backdrop;
 mod commands;
 mod connections_cmd;
@@ -169,6 +170,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             learning_cmd::curator_rollback,
             learning_cmd::list_skill_usage,
             learning_cmd::set_skill_pinned,
+            audit_cmd::list_audit,
             session_io::export_session,
             session_io::import_session,
             session_io::share_session,

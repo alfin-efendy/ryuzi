@@ -4,6 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
 import { commands } from "@/bindings";
+import { AuditCard } from "@/components/AuditCard";
 import { ModelPicker } from "@/components/ModelPicker";
 import { PermissionsCard } from "@/components/PermissionsCard";
 import { PROJECTS_ROOT_KEY, WORKTREE_DIR_KEY } from "@/constants";
@@ -465,6 +466,7 @@ export function SettingsView() {
         </Card>
 
         <PermissionsCard />
+        <AuditCard />
 
         <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">About</div>
 

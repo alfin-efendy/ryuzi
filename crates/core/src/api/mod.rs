@@ -5,6 +5,7 @@
 
 pub mod agent_api;
 pub mod apps_api;
+pub mod audit;
 pub mod connections_api;
 pub mod endpoint_api;
 pub mod fsview_api;
@@ -88,6 +89,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
         m if learning_api::HANDLES.contains(&m) => learning_api::dispatch(state, m, p).await,
         m if orch_api::HANDLES.contains(&m) => orch_api::dispatch(state, m, p).await,
+        m if audit::HANDLES.contains(&m) => audit::dispatch(state, m, p).await,
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }
@@ -290,5 +292,32 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::OK);
         assert!(rx.await.unwrap().allowed());
+    }
+
+    #[tokio::test]
+    async fn list_audit_returns_recorded_rows() {
+        let s = state().await;
+        s.cp.store()
+            .record_audit(
+                crate::domain::WriteOrigin::Agent,
+                Some("s"),
+                "app_jobs",
+                "create",
+                "allow",
+            )
+            .await
+            .unwrap();
+        let port = serve(s, 0).await.unwrap();
+        let resp: serde_json::Value = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/rpc/list_audit"))
+            .bearer_auth("t")
+            .json(&json!({"limit": 10}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp[0]["tool"], "app_jobs");
     }
 }
