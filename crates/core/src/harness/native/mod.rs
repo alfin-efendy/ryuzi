@@ -103,6 +103,47 @@ async fn connect_mcp_tools(
     extra
 }
 
+/// Best-effort seed for a (re)started session's [`runner::NudgeState`]:
+/// `user_turns` resumes from the count of persisted user turns since the
+/// last `💾 Self-improvement review` notice (or since the session's start, if
+/// none has fired yet), so the memory-nudge interval survives a daemon
+/// restart instead of resetting to zero on every resume. `skill_iters`
+/// always restarts at 0 — the "tool iterations since last skill_manage"
+/// counter (§7.2) is a live, in-memory-only signal a resumed session cannot
+/// reconstruct from the transcript alone. Any read failure (bare test
+/// contexts with no session row, a fresh session with no history yet) is
+/// swallowed and treated as zero — hydration is a nice-to-have, not load-
+/// bearing.
+async fn seed_nudge_state(
+    store: &crate::store::Store,
+    session_pk: &str,
+) -> Arc<runner::NudgeState> {
+    let user_turns = match store.list_messages(session_pk).await {
+        Ok(messages) => {
+            let since = messages
+                .iter()
+                .rposition(|m| {
+                    m.role == "system"
+                        && m.block_type == "notice"
+                        && m.payload["text"]
+                            .as_str()
+                            .is_some_and(|t| t.starts_with(runner::SELF_IMPROVEMENT_NOTICE_PREFIX))
+                })
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            messages[since..]
+                .iter()
+                .filter(|m| m.role == "user" && m.block_type == "text")
+                .count()
+        }
+        Err(_) => 0,
+    };
+    Arc::new(runner::NudgeState {
+        user_turns: std::sync::atomic::AtomicUsize::new(user_turns),
+        skill_iters: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
 async fn resolve_native_model(
     store: &crate::store::Store,
     configured: Option<String>,
@@ -173,6 +214,7 @@ impl Harness for NativeHarness {
         // `RunnerDeps` below so `drive()` can drain what `NativeSession::steer`
         // pushes — both sides share the same `Arc<Mutex<_>>` (Task B3).
         let steer = steer::SteerBuffer::new();
+        let nudge = seed_nudge_state(&ctx.store, &ctx.session_pk).await;
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             steer: steer.clone(),
@@ -199,6 +241,7 @@ impl Harness for NativeHarness {
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
                 background: ctx.background,
+                nudge,
             },
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),

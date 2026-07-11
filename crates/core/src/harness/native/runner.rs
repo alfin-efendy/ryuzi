@@ -43,6 +43,46 @@ const DEFAULT_MAX_PROVIDER_TURNS: usize = 50;
 /// newline, whichever comes first (keeps rows delta-shaped without spamming).
 const TEXT_FLUSH_BYTES: usize = 120;
 
+/// Prefix of the `💾 Self-improvement review: …` notice the review fork
+/// (Phase 4 Task 9) persists into the PARENT transcript when a learning row
+/// finishes. Shared here — not owned by the review fork — so
+/// `NativeHarness::start_session`'s best-effort nudge-state hydration
+/// (`native/mod.rs`) can find the most recent review notice and count only
+/// the user turns since it, without duplicating the literal string.
+pub const SELF_IMPROVEMENT_NOTICE_PREFIX: &str = "💾 Self-improvement review";
+
+/// Per-session nudge counters (Phase 4 §7.2), shared via `Arc` across a
+/// session's whole lifetime — including every sub-agent it spawns, since
+/// `RunnerDeps::clone()` copies the `Arc` pointer, not the state (a
+/// delegated child's tool calls still count toward `skill_iters`; only the
+/// TOP-LEVEL end_turn seam reads/resets these, gated on `DisplayMode::text()`
+/// so a sub-agent's own end_turn — or a future review fork's, once Task 9
+/// gives it a fresh `NudgeState` — never fires a nudge).
+#[derive(Default)]
+pub struct NudgeState {
+    /// User turns completed since the last memory-review nudge fired.
+    pub user_turns: std::sync::atomic::AtomicUsize,
+    /// Tool-dispatch iterations since the last `skill_manage` call.
+    pub skill_iters: std::sync::atomic::AtomicUsize,
+}
+
+/// The self-contained review-fork payload captured at finalize time. Byte-
+/// for-byte replayable prefix (§7.2 prompt-cache parity): `system` +
+/// `tool_defs` + `messages` are exactly what the parent's just-finished turn
+/// sent (plus its own committed response), so the fork rides the warm cache.
+/// `model` pins the parent's model — if `auxiliary.review.model` differs the
+/// worker collapses history instead (Task 9).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LearningPayload {
+    pub review_kind: String, // "memory" | "skill" | "combined"
+    pub parent_session_pk: String,
+    pub model: String,
+    pub supports_prompt_cache: bool,
+    pub system: String,
+    pub tool_defs: Vec<Value>,
+    pub messages: Vec<Value>,
+}
+
 /// Everything one native session needs to run turns. Built by
 /// [`super::NativeHarness::start_session`]. Cloneable so a sub-agent spawner
 /// can carry a copy.
@@ -94,6 +134,10 @@ pub struct RunnerDeps {
     pub steer: SteerBuffer,
     /// Shared async-delegation capacity gate (spec §6.2), from `SessionCtx`.
     pub background: Arc<super::background::BackgroundRegistry>,
+    /// Nudge counters for the background learning loop (Phase 4 §7.2).
+    /// Hydrated once in `NativeHarness::start_session`; shared (same `Arc`)
+    /// with every sub-agent this session spawns.
+    pub nudge: Arc<NudgeState>,
 }
 
 impl RunnerDeps {
@@ -824,6 +868,16 @@ async fn drive(
                     provider_turn += 1;
                     continue;
                 }
+                // Nudge trigger (Phase 4 §7.2): only the top-level, display-
+                // visible drive() ever nudges. `display.text()` is false for
+                // sub-agents (`ToolsOnly`) and will be false for Task 9's
+                // review fork (`Silent`) too — both share this `drive()` loop,
+                // so gating here (rather than trusting callers not to spawn a
+                // learning row) is what actually prevents a sub-agent or a
+                // review fork from recursively enqueueing another review.
+                if display.text() {
+                    maybe_enqueue_review(deps, &system, &tool_defs, cm).await;
+                }
                 return Ok(final_text); // end_turn
             }
 
@@ -837,6 +891,18 @@ async fn drive(
                     break;
                 }
                 results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
+                // "Tool iterations since last skill_manage" (§7.2): every
+                // dispatched tool other than `skill_manage` advances the
+                // skill-nudge counter; `skill_manage` itself resets it — the
+                // agent just acted on the skill signal, so the pressure that
+                // built up is spent. Shared across sub-agents (same `Arc`),
+                // mirroring `user_turns` — see `NudgeState`'s doc comment.
+                use std::sync::atomic::Ordering::Relaxed;
+                if t.name == "skill_manage" {
+                    deps.nudge.skill_iters.store(0, Relaxed);
+                } else {
+                    deps.nudge.skill_iters.fetch_add(1, Relaxed);
+                }
             }
             cm.append_tool_results(results).await?;
 
@@ -963,6 +1029,60 @@ async fn drive(
         .await;
     }
     Ok(final_text)
+}
+
+/// The nudge trigger (Phase 4 §7.2): called only from the top-level end_turn
+/// seam (see `drive()`, gated on `display.text()`). Advances `user_turns`;
+/// when either the memory or skill threshold is crossed, captures the exact
+/// `system` / `tool_defs` / `messages_for_request()` prefix this turn just
+/// used — the cache-parity payload Task 9's review fork replays — and
+/// enqueues it as a `kind='learning'` background-rail row targeting this
+/// session. Firing counter(s) reset to 0; a threshold that was NOT due is
+/// left untouched so it keeps accumulating toward its own next nudge.
+async fn maybe_enqueue_review(
+    deps: &RunnerDeps,
+    system: &str,
+    tool_defs: &[Value],
+    cm: &ContextManager,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mem_interval =
+        crate::settings::usize_setting(&deps.store, "memory.nudge_interval", 10).await;
+    let skill_interval =
+        crate::settings::usize_setting(&deps.store, "skills.creation_nudge_interval", 10).await;
+    let turns = deps.nudge.user_turns.fetch_add(1, Relaxed) + 1;
+    let iters = deps.nudge.skill_iters.load(Relaxed);
+    let mem_due = turns >= mem_interval;
+    let skill_due = iters >= skill_interval;
+    if !mem_due && !skill_due {
+        return;
+    }
+    let review_kind = match (mem_due, skill_due) {
+        (true, true) => "combined",
+        (true, false) => "memory",
+        _ => "skill",
+    };
+    let payload = LearningPayload {
+        review_kind: review_kind.into(),
+        parent_session_pk: deps.session_pk.clone(),
+        model: deps.model.clone().unwrap_or_default(),
+        supports_prompt_cache: deps.meta.supports_prompt_cache,
+        system: system.to_string(),
+        tool_defs: tool_defs.to_vec(),
+        messages: cm.messages_for_request(),
+    };
+    if let Ok(json) = serde_json::to_string(&payload) {
+        let _ = deps
+            .store
+            .enqueue_background_event(&deps.session_pk, "learning", &json)
+            .await;
+    }
+    if mem_due {
+        deps.nudge.user_turns.store(0, Relaxed);
+    }
+    if skill_due {
+        deps.nudge.skill_iters.store(0, Relaxed);
+    }
 }
 
 /// Tools delegated children may never use regardless of filters. `task` is
@@ -2170,6 +2290,7 @@ mod tests {
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             steer: SteerBuffer::new(),
             background: super::super::background::BackgroundRegistry::new(),
+            nudge: Arc::new(NudgeState::default()),
         }
     }
 
@@ -2337,6 +2458,200 @@ mod tests {
             .unwrap()
             .iter()
             .all(|metadata| metadata.observation.is_none()));
+    }
+
+    /// Step 1 of Task 7's TDD brief: two end_turn turns with
+    /// `memory.nudge_interval=2` must enqueue exactly one `kind='learning'`
+    /// rail row targeting the parent, carrying a cache-parity payload.
+    #[tokio::test]
+    async fn finalizer_enqueues_a_learning_row_every_nudge_interval() {
+        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![final_turn("one"), final_turn("two")]));
+        let deps = deps_at(dir.path(), llm).await;
+        deps.store
+            .set_setting("memory.nudge_interval", "2")
+            .await
+            .unwrap();
+        deps.store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                // Pre-titled: an untitled session would make `run_turn`'s
+                // trailing `maybe_generate_title` call consume a THIRD
+                // scripted LLM turn (this test scripts exactly two, one per
+                // `run_turn` call).
+                title: Some("titled".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: None,
+                created_at: None,
+                last_active: None,
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("one", "one"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            deps.store
+                .claim_deliverable_background_event("peek")
+                .await
+                .unwrap()
+                .is_none(),
+            "below the nudge_interval threshold — no learning row yet"
+        );
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("two", "two"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let ev = deps
+            .store
+            .claim_deliverable_background_event("learner")
+            .await
+            .unwrap()
+            .expect("threshold crossed on turn 2 — a learning row must be enqueued");
+        assert_eq!(ev.kind, "learning");
+        assert_eq!(ev.target_session_pk, "s1");
+        let payload: LearningPayload = serde_json::from_str(&ev.payload)
+            .expect("learning payload must round-trip through JSON");
+        assert_eq!(payload.review_kind, "memory");
+        assert_eq!(payload.parent_session_pk, "s1");
+        assert!(!payload.system.is_empty(), "system prefix must be captured");
+        assert!(!payload.tool_defs.is_empty(), "tool_defs must be captured");
+        assert!(!payload.messages.is_empty(), "messages must be captured");
+
+        // Firing resets the counter: no second row is left queued.
+        assert!(deps
+            .store
+            .claim_deliverable_background_event("learner2")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// No-recursion guard (global constraint): a sub-agent's own `drive()`
+    /// loop shares the parent's `NudgeState` `Arc`, but its `DisplayMode` is
+    /// `ToolsOnly`, not `Full` — `display.text()` is false, so the end_turn
+    /// seam never calls `maybe_enqueue_review`. `nudge_interval=1` means the
+    /// threshold is already crossable on the very first end_turn; if the
+    /// top-level-only guard were missing this would immediately enqueue.
+    /// (Task 9's review fork gets its own fresh `NudgeState` AND drives with
+    /// a non-`Full` `DisplayMode` too, so the same mechanism will exclude it.)
+    #[tokio::test]
+    async fn subagent_end_turn_never_nudges_even_past_threshold() {
+        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![final_turn("subagent reply")]));
+        let deps = deps_at(dir.path(), llm).await;
+        deps.store
+            .set_setting("memory.nudge_interval", "1")
+            .await
+            .unwrap();
+        deps.store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: None,
+                created_at: None,
+                last_active: None,
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+        let mut cm = ContextManager::load(deps.store.clone(), "subagent", cfg)
+            .await
+            .unwrap();
+        cm.append_user(json!([{"type": "text", "text": "delegated"}]))
+            .await
+            .unwrap();
+        let budget = IterationBudget::new(SUBAGENT_MAX_ITERS);
+        drive(
+            &deps,
+            &deps.agent,
+            &mut cm,
+            &CancellationToken::new(),
+            None,
+            DisplayMode::ToolsOnly {
+                label: "test".into(),
+            },
+            &budget,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            deps.nudge
+                .user_turns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a sub-agent's own end_turn must never touch the shared nudge counter"
+        );
+        assert!(
+            deps.store
+                .claim_deliverable_background_event("peek")
+                .await
+                .unwrap()
+                .is_none(),
+            "sub-agents must never enqueue a learning row (no recursion)"
+        );
+    }
+
+    /// The cache-parity payload must survive a JSON round trip byte-for-byte
+    /// (the review fork — Task 9 — decodes exactly this shape off the rail).
+    #[test]
+    fn learning_payload_round_trips_through_json() {
+        let payload = LearningPayload {
+            review_kind: "combined".into(),
+            parent_session_pk: "parent-1".into(),
+            model: "anthropic/model-a".into(),
+            supports_prompt_cache: true,
+            system: "you are ryuzi".into(),
+            tool_defs: vec![json!({"name": "bash"})],
+            messages: vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})],
+        };
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let decoded: LearningPayload = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.review_kind, payload.review_kind);
+        assert_eq!(decoded.parent_session_pk, payload.parent_session_pk);
+        assert_eq!(decoded.model, payload.model);
+        assert_eq!(decoded.supports_prompt_cache, payload.supports_prompt_cache);
+        assert_eq!(decoded.system, payload.system);
+        assert_eq!(decoded.tool_defs, payload.tool_defs);
+        assert_eq!(decoded.messages, payload.messages);
     }
 
     #[tokio::test]
