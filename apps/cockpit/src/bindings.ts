@@ -195,6 +195,54 @@ async updateProject(runnerId: string | null, projectId: string, model: string | 
     else return { status: "error", error: e  as any };
 }
 },
+async updateProjectPermMode(runnerId: string | null, projectId: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project_perm_mode", { runnerId, projectId, permMode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async projectRuntimeInfo(runnerId: string | null, projectId: string) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("project_runtime_info", { runnerId, projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProjectRuntime(runnerId: string | null, projectId: string, model: string | null, effort: string | null) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project_runtime", { runnerId, projectId, model, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setModelEffortPreference(runnerId: string | null, key: ModelPreferenceKey, effort: string | null) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_model_effort_preference", { runnerId, key, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async sessionRuntimeInfo(runnerId: string | null, sessionPk: string) : Promise<Result<SessionRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("session_runtime_info", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateSessionRuntime(runnerId: string | null, sessionPk: string, model: string | null, effort: string | null) : Promise<Result<SessionRuntimeInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_session_runtime", { runnerId, sessionPk, model, effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async updateSessionPermMode(runnerId: string | null, sessionPk: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("update_session_perm_mode", { runnerId, sessionPk, permMode }) };
@@ -227,7 +275,7 @@ async setAgentSettings(runnerId: string | null, model: string | null, permMode: 
     else return { status: "error", error: e  as any };
 }
 },
-async listSelectableModels(runnerId: string | null) : Promise<Result<string[], CmdError>> {
+async listSelectableModels(runnerId: string | null) : Promise<Result<SelectableModelInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_selectable_models", { runnerId }) };
 } catch (e) {
@@ -698,9 +746,17 @@ async addConnection(runnerId: string | null, provider: string, label: string, ap
     else return { status: "error", error: e  as any };
 }
 },
-async updateConnection(runnerId: string | null, id: string, label: string, enabled: boolean, apiKey: string | null, baseUrl: string | null, models: string[], claudeCloaking: boolean | null) : Promise<Result<ConnectionInfo[], CmdError>> {
+async renameConnection(runnerId: string | null, id: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_connection", { runnerId, id, label, enabled, apiKey, baseUrl, models, claudeCloaking }) };
+    return { status: "ok", data: await TAURI_INVOKE("rename_connection", { runnerId, id, label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setConnectionEnabled(runnerId: string | null, id: string, enabled: boolean) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_connection_enabled", { runnerId, id, enabled }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1186,6 +1242,31 @@ async pluginsRestartRequired(runnerId: string | null) : Promise<Result<boolean, 
 }
 },
 /**
+ * Force an out-of-cadence catalog fetch right now — `RemoteCatalogManager`'s
+ * background timer lives daemon-side and is not otherwise user-triggerable.
+ * Returns the same snapshot shape as `catalog_status`.
+ */
+async refreshCatalog(runnerId: string | null) : Promise<Result<CatalogStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_catalog", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Last accepted feed's sequence/outcome plus cached entry/blocked counts.
+ * Read-only, never mutates state.
+ */
+async catalogStatus(runnerId: string | null) : Promise<Result<CatalogStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("catalog_status", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Export a session as a pretty JSON string.
  */
 async exportSession(runnerId: string | null, sessionPk: string) : Promise<Result<string, CmdError>> {
@@ -1397,8 +1478,17 @@ export type CatalogEntry = { id: string; name: string;
  * provider card; the entry whose id == family is the display head.
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
+/**
+ * `refresh_catalog`/`catalog_status` rpc result — a thin snapshot of the
+ * `catalog_feed_state` row plus counts from the cached
+ * `plugin_catalog_cache` table (`crate::store::RemoteCatalogRow`). `sequence`
+ * stays a `u64` for the same reason `TrustPromptDto.total_bytes` does: no
+ * bindings-shape cost, since `export_bindings`'s `BigIntExportBehavior::Number`
+ * already renders it as a plain TS `number`.
+ */
+export type CatalogStatus = { sequence: number; lastFetchAt: number | null; outcome: string | null; entries: number; blocked: number }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
-export type ChatRequestOptions = { model: string | null; context: ChatContextArg | null; attachments?: string[]; 
+export type ChatRequestOptions = { model: string | null; effort: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**
  * None => engine default (worktree ON, new engine-named branch from HEAD).
  */
@@ -1413,20 +1503,12 @@ export type CodexResetCreditInfo = { status: string; grantedAt: string | null; e
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
 export type CommandInfo = { name: string; description: string; agent: string | null }
-export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; baseUrl: string | null; models: string[]; 
-/**
- * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
- */
-keyMasked: string | null; 
+export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[]; 
 /**
  * OAuth connections only: true once refresh has failed terminally and
  * the user needs to reconnect via the browser/paste flow again.
  */
-needsRelogin: boolean; 
-/**
- * Anthropic OAuth only: enable full Claude Code-style request cloaking.
- */
-claudeCloaking: boolean }
+needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
@@ -1503,9 +1585,10 @@ export type DoctorFinding = { pluginId: string;
  */
 severity: string; 
 /**
- * `reconnect-required` | `missing-binary` | `attach-failed`.
+ * `reconnect-required` | `missing-binary` | `attach-failed` | `blocked`.
  */
 kind: string; message: string; suggestedAction: string }
+export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
 export type GatewayEventInfo = { at: number; level: string; text: string }
@@ -1526,8 +1609,20 @@ export type GitOptions = { useWorktree: boolean; createBranch: boolean; branchNa
 export type InstalledSkillEntry = { id: string; name: string }
 export type InstalledSkillInfo = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skillCount: number }
 export type InstalledSkillPack = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skills: InstalledSkillEntry[] }
-export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[] }
-export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean }
+export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[]; 
+/**
+ * Model id this job's session starts with, overriding the project/agent
+ * default. `None` when the job uses ordinary model resolution. Not yet
+ * editable from the scheduler panel — set programmatically today (e.g.
+ * by a future `app_jobs` tool); surfaced here so a later job editor can
+ * read and round-trip it without another DTO change.
+ */
+modelOverride?: string | null }
+export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean; 
+/**
+ * See `JobInfo::model_override`.
+ */
+modelOverride?: string | null }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Where the process's master key actually came from. Surfaced to the UI
@@ -1563,6 +1658,8 @@ export type Message = { sessionPk: string; seq: number; role: string; blockType:
  * current price table at emit time.
  */
 export type ModelCost = { model: string; input: number; output: number; cacheRead: number; cacheCreation: number; usd: number }
+export type ModelDefaultSource = "configured" | "provider" | "variesByTarget" | "none"
+export type ModelPreferenceKey = { family: string; model: string }
 export type ModelRouteInfo = { id: string; name: string; enabled: boolean; strategy: ModelRouteStrategy; targets: ModelRouteTarget[]; createdAt: number; updatedAt: number }
 export type ModelRouteStrategy = "fallback" | "round-robin"
 export type ModelRouteTarget = { 
@@ -1571,7 +1668,12 @@ export type ModelRouteTarget = {
  * connection id. The router expands this to every enabled account in
  * the family serving `model`, at request time.
  */
-provider: string; model: string }
+provider: string; model: string; 
+/**
+ * Compatibility-only storage for legacy Codex virtual model suffixes.
+ * New route writes cannot edit this value directly.
+ */
+effort?: string | null }
 /**
  * One persisted probe verdict row across ALL families — hydrates the
  * app-wide model-status store consumed by every model picker.
@@ -1647,7 +1749,23 @@ pinned: boolean;
  * Distinct from `source` (the stable builtin/catalog/skill-pack enum
  * label) — the Provenance card in Cockpit renders it only when present.
  */
-sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null }
+sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null; 
+/**
+ * `embedded` | `remote` — which catalog source won for this id.
+ * `None` for builtins and skill packs (never from either catalog).
+ */
+catalogSource: string | null; 
+/**
+ * The remote catalog feed's `version` for this id, when a cached
+ * `plugin_catalog_cache` row matches. `None` when the id was never seen
+ * in a fetched feed.
+ */
+catalogVersion: string | null; 
+/**
+ * Set when the remote catalog's signed feed blocked (revoked) this id —
+ * mirrors `RemoteCatalogRow.blocked_reason`. `None` when not blocked.
+ */
+blockedReason: string | null }
 export type PluginInstallBeginResult = { 
 /**
  * `none` | `api-key` | `token` | `oauth`.
@@ -1708,11 +1826,16 @@ export type Project = { projectId: string; name: string; workdir: string; source
  * NOT a DB column. Self-corrects if the user later runs `git init`.
  */
 isGit: boolean }
+export type ProjectRuntimeInfo = { projectId: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
+export type ProviderQuotaCapability = "claude" | "codex"
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
+export type ReasoningEffortOption = { value: string; label: string; description: string | null }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
+export type SelectableModelInfo = { kind: SelectableModelKind; requestValue: string; displayName: string; preferenceKey: ModelPreferenceKey | null; supported: ReasoningEffortOption[]; configuredDefault: string | null; resolvedDefault: string | null; defaultSource: ModelDefaultSource }
+export type SelectableModelKind = "concrete" | "namedRoute"
 export type Session = { sessionPk: string; 
 /**
  * `None` for chat-first sessions (`kind != Project`); a project-bound
@@ -1752,6 +1875,7 @@ parentSessionPk: string | null }
  * or project session that spawned them.
  */
 export type SessionKind = "project" | "chat" | "worker" | "review"
+export type SessionRuntimeInfo = { sessionPk: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
 /**
  * Mirror of `crate::skills_install::BeginInstall`, flattened into a single
@@ -1760,6 +1884,7 @@ export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
  * for `Completed` — exactly one is ever `Some`.
  */
 export type SkillInstallBegin = { completed: boolean; trust: TrustPromptDto | null; plugin: InstalledSkillPack | null }
+export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 
 /**

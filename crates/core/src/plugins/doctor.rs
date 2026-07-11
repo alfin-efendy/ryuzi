@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct DoctorFinding {
     pub plugin_id: String,
     pub severity: String, // "warn" | "error"
-    pub kind: String,     // "reconnect-required" | "missing-binary" | "attach-failed"
+    pub kind: String,     // "reconnect-required" | "missing-binary" | "attach-failed" | "blocked"
     pub message: String,
     pub suggested_action: String,
 }
@@ -29,6 +29,21 @@ pub async fn plugin_doctor(cp: &ControlPlane) -> anyhow::Result<Vec<DoctorFindin
 
     for plugin in cp.plugins().list() {
         let id = &plugin.manifest.id;
+
+        // 0. Blocked by the remote catalog's signed feed (a revoked
+        // integration) — always an error, regardless of enablement, since
+        // an id can be blocked while `apply_blocked_denylist` hasn't yet run
+        // (or a settings write failed) and it's still installed.
+        let (blocked, reason) = crate::plugins::is_blocked(cp.store(), id).await;
+        if blocked {
+            findings.push(DoctorFinding {
+                plugin_id: id.clone(),
+                severity: "error".into(),
+                kind: "blocked".into(),
+                message: reason.unwrap_or_else(|| format!("{id} was revoked by the catalog")),
+                suggested_action: format!("Uninstall or stop using {id} — it was revoked"),
+            });
+        }
 
         // 1. Enabled connector-only plugin with a missing stdio binary.
         if plugin.connector.is_some()

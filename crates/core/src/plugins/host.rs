@@ -114,6 +114,10 @@ pub enum PluginSource {
     Builtin,
     /// Bundled in the embedded plugin catalog.
     Catalog,
+    /// Delivered by the signed remote catalog feed (see
+    /// `crate::plugins::remote_catalog`). Distinct from `Catalog` only so the
+    /// api layer can report `catalogSource: "remote"`.
+    RemoteCatalog,
     /// Installed as a skill pack by the skills installer
     /// (`crate::skills_install`) — carries the manifest's own on-disk
     /// directory.

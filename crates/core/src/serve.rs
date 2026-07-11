@@ -611,7 +611,7 @@ fn plugin_summary(plugin: &CorePlugin, enabled: bool) -> Value {
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
-        PluginSource::Catalog => "catalog",
+        PluginSource::Catalog | PluginSource::RemoteCatalog => "catalog",
         PluginSource::SkillPack(_) => "skill-pack",
     }
 }

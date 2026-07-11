@@ -198,6 +198,18 @@ test("notice rows (e.g. compaction) get their own group, distinct from errors an
   expect(groups).toEqual([{ type: "notice", key: "s1", text: "Context compacted: ~100k → ~20k tokens" }]);
 });
 
+test("route switch copy groups as notices for model, account, failover, and combined changes", () => {
+  const notices = [
+    "Switched to 5.6 Sol · Ultra",
+    "Account switched to Work Codex · round robin",
+    "Account switched to Backup Codex · quota unavailable",
+    "Switched to Opus 4.1 via Backup Claude · authentication unavailable",
+  ];
+
+  const groups = groupRows(notices.map((text, index) => row({ seq: index + 1, role: "system", blockType: "notice", text })));
+  expect(groups).toEqual(notices.map((text, index) => ({ type: "notice", key: `s${index + 1}`, text })));
+});
+
 test("closeDanglingFence closes an odd number of line-start fences and leaves balanced ones alone", () => {
   expect(closeDanglingFence("```ts\nconst x = 1;")).toBe("```ts\nconst x = 1;\n```");
   expect(closeDanglingFence("```ts\nx\n```")).toBe("```ts\nx\n```");
@@ -302,6 +314,34 @@ test("summary blocks carry the turn's edit cards", () => {
 test("the live last turn stays uncollapsed while running", () => {
   const blocks = buildTranscript(turn, true);
   expect(blocks.map((b) => b.type)).toEqual(["user", "thought", "activity", "agent"]);
+});
+
+test("live startup activity renders after the initial user bubble", () => {
+  const startupRows: Row[] = [
+    row({ seq: 1, role: "system", blockType: "status", text: "Creating worktree…", createdAt: 1 }),
+    row({ seq: 2, role: "system", blockType: "status", text: "Created and checked out branch harness/s1", createdAt: 2 }),
+    row({ seq: 3, role: "system", blockType: "status", text: "Connecting tools…", createdAt: 3 }),
+    row({ seq: 4, role: "user", blockType: "text", text: "Fix the issue", createdAt: 4 }),
+  ];
+
+  const blocks = buildTranscript(startupRows, true);
+
+  expect(blocks.map((block) => block.type)).toEqual(["user", "activity"]);
+  const activity = blocks[1] as Extract<TurnBlock, { type: "activity" }>;
+  expect(activity.items).toEqual([
+    { type: "status", key: "s1", text: "Creating worktree…" },
+    { type: "status", key: "s2", text: "Created and checked out branch harness/s1" },
+    { type: "status", key: "s3", text: "Connecting tools…" },
+  ]);
+});
+
+test("live activity that already follows a user bubble keeps its order", () => {
+  const rows: Row[] = [
+    row({ seq: 1, role: "user", blockType: "text", text: "Fix the issue", createdAt: 1 }),
+    row({ seq: 2, role: "system", blockType: "status", text: "Connecting tools…", createdAt: 2 }),
+  ];
+
+  expect(buildTranscript(rows, true).map((block) => block.type)).toEqual(["user", "activity"]);
 });
 
 test("earlier turns collapse even while a later turn runs", () => {

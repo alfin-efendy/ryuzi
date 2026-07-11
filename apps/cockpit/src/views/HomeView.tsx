@@ -13,7 +13,7 @@ import { useAgent } from "@/store-agent";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
-import { ModelPicker } from "@/components/ModelPicker";
+import { ComposerModelEffortMenu } from "@/components/ComposerModelEffortMenu";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -26,7 +26,8 @@ import { BranchNameModal } from "@/components/modals/BranchNameModal";
 const NO_PROJECT = "__none__";
 
 export function HomeView() {
-  const { projects, selectedProjectId, selectProject, start, startChat, setProjectModel } = useStore();
+  const { projects, selectedProjectId, selectProject, start, startChat, projectRuntimeById, loadProjectRuntime, setProjectRuntime } =
+    useStore();
   const nav = useNav();
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
@@ -53,10 +54,30 @@ export function HomeView() {
   );
   const isGit = project?.isGit ?? false;
   // Ryuzi-only: every session runs the native agent; the user picks a model.
-  const modelOptions = useAgent((s) => s.models);
-  const agentModel = useAgent((s) => s.model);
-  const selectedModel = nav.composerModel ?? project?.model ?? agentModel ?? "";
+  const agentModels = useAgent((s) => s.models);
   const setComposerModel = useNav((s) => s.setComposerModel);
+  const setComposerEffort = useNav((s) => s.setComposerEffort);
+  const previousProjectId = useRef(projectId);
+  const projectRuntime = projectId ? (projectRuntimeById[projectId] ?? null) : null;
+  const chatModelInfo = agentModels.find((entry) => entry.requestValue === nav.composerModel) ?? null;
+  const chatEffectiveEffort = nav.composerEffort ?? chatModelInfo?.resolvedDefault ?? null;
+  const chatRuntime = useMemo(
+    () => ({
+      projectId: "",
+      model: nav.composerModel,
+      storedEffort: nav.composerEffort,
+      effectiveEffort: chatEffectiveEffort,
+      effectiveEffortLabel: chatModelInfo?.supported.find((option) => option.value === chatEffectiveEffort)?.label ?? chatEffectiveEffort,
+      effectiveSource: nav.composerEffort
+        ? ("project" as const)
+        : chatModelInfo?.defaultSource === "provider"
+          ? ("provider" as const)
+          : ("none" as const),
+      storedEffortStatus: "valid" as const,
+      modelInfo: chatModelInfo,
+    }),
+    [chatEffectiveEffort, chatModelInfo, nav.composerEffort, nav.composerModel],
+  );
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
   const connectionsLoaded = useConnections((s) => s.loaded);
@@ -68,21 +89,26 @@ export function HomeView() {
   }, [projectId, loadCommands]);
 
   useEffect(() => {
+    if (projectId) void loadProjectRuntime(projectId);
+  }, [projectId, loadProjectRuntime]);
+
+  useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
   }, [connectionsLoaded, hydrateConnections]);
 
   // A model picked for one project must not leak into the next one.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
   useEffect(() => {
+    if (previousProjectId.current === projectId) return;
+    previousProjectId.current = projectId;
     setComposerModel(null);
-  }, [projectId, setComposerModel]);
+    setComposerEffort(null);
+  }, [projectId, setComposerEffort, setComposerModel]);
 
   // A permission mode picked for one project's new-chat composer must not leak into the next one.
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
   useEffect(() => {
     setComposerPerm(null);
   }, [projectId]);
-
   const [branchList, setBranchList] = useState<BranchList | null>(null);
   const [branchModalOpen, setBranchModalOpen] = useState(false);
   const setComposerBranch = nav.setComposerBranch;
@@ -173,7 +199,8 @@ export function HomeView() {
     const t = draft.trim();
     if (!t && composerFiles.attachments.length === 0) return;
     const opts = {
-      model: nav.composerModel ?? null,
+      model: project ? null : (nav.composerModel ?? null),
+      effort: project ? null : (nav.composerEffort ?? null),
       context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
       git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
@@ -271,17 +298,17 @@ export function HomeView() {
               }
             />
             <div className="flex-1" />
-            <ModelPicker
-              ariaLabel="Model"
-              variant="chip"
-              models={modelOptions}
-              value={selectedModel}
-              onValueChange={(m) => {
-                setComposerModel(m);
-                if (projectId) void setProjectModel(projectId, m);
+            <ComposerModelEffortMenu
+              models={agentModels}
+              runtime={projectId ? projectRuntime : chatRuntime}
+              onChange={(model, effort) => {
+                if (projectId) void setProjectRuntime(projectId, model, effort);
+                else {
+                  setComposerModel(model);
+                  setComposerEffort(effort);
+                }
               }}
-              disabled={modelOptions.length === 0}
-              placeholder="Default model"
+              disabled={agentModels.length === 0}
             />
             <Button
               variant="ghost"

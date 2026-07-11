@@ -3,6 +3,7 @@ use crate::error::CmdError;
 use ryuzi_core::api::fsview_api::{content_type_for_path, MediaFile, MAX_MEDIA_READ_BYTES};
 use ryuzi_core::branches::BranchList;
 use ryuzi_core::domain::{ApprovalResponse, ToolPolicyRow};
+use ryuzi_core::llm_router::model_effort::{ModelPreferenceKey, ProjectRuntimeInfo};
 use ryuzi_core::{Message, PermMode, Project, Session};
 use std::path::Path;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use tauri_plugin_dialog::DialogExt;
 // so `ChatContextArg`/`GitOptions` are still emitted to `bindings.ts` as
 // fields of `ChatRequestOptions` without needing a local import.
 pub use ryuzi_core::api::types::ChatRequestOptions;
+pub use ryuzi_core::api::types::SessionRuntimeInfo;
 
 type R<T> = Result<T, CmdError>;
 // The old in-process `ControlPlane` state extractor is gone: every engine
@@ -71,6 +73,110 @@ pub async fn update_project(
                 "project_id": project_id, "model": model,
                 "perm_mode": perm_mode,
             }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_project_perm_mode(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+    perm_mode: PermMode,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "update_project_perm_mode",
+            serde_json::json!({ "project_id": project_id, "perm_mode": perm_mode }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn project_runtime_info(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+) -> R<ProjectRuntimeInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "project_runtime_info",
+            serde_json::json!({ "project_id": project_id }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_project_runtime(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> R<ProjectRuntimeInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "update_project_runtime",
+            serde_json::json!({
+                "project_id": project_id, "model": model, "effort": effort,
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_model_effort_preference(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    key: ModelPreferenceKey,
+    effort: Option<String>,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "set_model_effort_preference",
+            serde_json::json!({ "key": key, "effort": effort }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn session_runtime_info(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<SessionRuntimeInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "session_runtime_info",
+            serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_session_runtime(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> R<SessionRuntimeInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "update_session_runtime",
+            serde_json::json!({ "session_pk": session_pk, "model": model, "effort": effort }),
         )
         .await
 }

@@ -14,8 +14,15 @@
 //! `(event_name, event_json)` pairs regardless of the upstream provider's
 //! native wire format.
 
+pub use crate::llm_router::provenance::AnthropicEvent;
+use crate::llm_router::provenance::{
+    classify_failure, RouteFailureCategory, RouteSelection, RouteSelectionReason, RoutedStream,
+};
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
-use crate::llm_router::{capabilities, claude_cloak, connections, mimo, oauth, routes, translate};
+use crate::llm_router::{
+    capabilities, claude_cloak, connections, mimo, model_effort, model_meta, oauth, routes,
+    translate,
+};
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -54,11 +61,23 @@ impl UpstreamCtx {
 // Model routing (moved from server.rs — behavior unchanged)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct RouteTarget {
     pub conn: connections::ConnectionRow,
     pub desc: &'static ProviderDescriptor,
     pub upstream_model: String,
+    pub route_target_key: Option<crate::llm_router::model_effort::RouteTargetEffortKey>,
+    pub request_compatibility_effort: Option<String>,
 }
+
+#[derive(Clone)]
+struct AnnotatedRouteTarget {
+    target: RouteTarget,
+    reason: RouteSelectionReason,
+}
+
+type ProviderOrderCache =
+    std::collections::HashMap<(String, String, Vec<String>), (Vec<String>, RouteSelectionReason)>;
 
 pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Option<RouteTarget>> {
     Ok(route_models_for_body(store, requested, None)
@@ -93,14 +112,26 @@ pub async fn route_models_for_body(
     requested: &str,
     body: Option<&Value>,
 ) -> anyhow::Result<Vec<RouteTarget>> {
-    route_models_for_body_matching(store, requested, body, |_, _| true).await
+    Ok(
+        route_models_for_body_matching(store, requested, body, |_, _| true)
+            .await?
+            .into_iter()
+            .map(|annotated| annotated.target)
+            .collect(),
+    )
 }
 
 pub async fn route_models_for_anthropic_messages(
     store: &Store,
     requested: &str,
 ) -> anyhow::Result<Vec<RouteTarget>> {
-    route_models_for_body_matching(store, requested, None, anthropic_messages_target_allowed).await
+    Ok(
+        route_models_for_body_matching(store, requested, None, anthropic_messages_target_allowed)
+            .await?
+            .into_iter()
+            .map(|annotated| annotated.target)
+            .collect(),
+    )
 }
 
 async fn route_models_for_body_matching(
@@ -108,12 +139,73 @@ async fn route_models_for_body_matching(
     requested: &str,
     body: Option<&Value>,
     target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
-) -> anyhow::Result<Vec<RouteTarget>> {
+) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
+    let mut provider_order_cache = ProviderOrderCache::new();
+    route_models_for_body_matching_with_cache(
+        store,
+        requested,
+        body,
+        target_allowed,
+        &mut provider_order_cache,
+    )
+    .await
+}
+
+async fn route_models_for_body_matching_with_cache(
+    store: &Store,
+    requested: &str,
+    body: Option<&Value>,
+    target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
+    provider_order_cache: &mut ProviderOrderCache,
+) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let conns = connections::list_connections(store).await?;
     let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
     let required = body
         .map(capabilities::required_capabilities_from_body)
         .unwrap_or_default();
+    let route_list = routes::list_model_routes(store).await?;
+    if let Some(route) = routes::route_by_name(&route_list, requested) {
+        let targets = prefer_capable_indexed_targets(
+            routes::ordered_indexed_targets(store, route).await?,
+            required,
+        );
+        let mut out = Vec::new();
+        let route_reason = if route.targets.len() <= 1 {
+            RouteSelectionReason::Initial
+        } else if route.strategy == routes::ModelRouteStrategy::RoundRobin {
+            RouteSelectionReason::RoundRobin
+        } else {
+            RouteSelectionReason::Ordered
+        };
+        let mut seen = std::collections::HashSet::<(String, String)>::new();
+        for indexed in targets {
+            for mut annotated in expanded_route_targets(
+                store,
+                &enabled,
+                &indexed.target,
+                target_allowed,
+                route_reason.clone(),
+                provider_order_cache,
+            )
+            .await?
+            {
+                let key = (
+                    annotated.target.conn.id.clone(),
+                    annotated.target.upstream_model.clone(),
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+                annotated.target.route_target_key =
+                    Some(crate::llm_router::model_effort::RouteTargetEffortKey {
+                        route_id: route.id.clone(),
+                        target_index: indexed.original_index,
+                    });
+                out.push(annotated);
+            }
+        }
+        return Ok(normalize_single_reason(out));
+    }
     if let Some((prov, model)) = requested.split_once('/') {
         let candidates: Vec<_> = enabled
             .into_iter()
@@ -123,44 +215,36 @@ async fn route_models_for_body_matching(
                         desc.family == prov
                             && target_allowed(conn, desc)
                             && connection_has_required_credentials(desc, conn)
-                            && connection_serves_model(desc, conn, model, true)
+                            && resolved_requested_model(conn, desc, requested, model, true)
+                                .is_some()
                     })
                     .unwrap_or(false)
             })
             .collect();
         let mut out = Vec::new();
-        for conn in ordered_provider_connections(store, prov, model, candidates).await? {
+        for (conn, reason) in
+            ordered_provider_connections(store, prov, model, candidates, provider_order_cache)
+                .await?
+        {
             if let Some(desc) = registry::descriptor(&conn.provider) {
-                out.push(RouteTarget {
-                    conn,
-                    desc,
-                    upstream_model: model.to_string(),
+                let Some((upstream_model, request_compatibility_effort)) =
+                    resolved_requested_model(&conn, desc, requested, model, true)
+                else {
+                    continue;
+                };
+                out.push(AnnotatedRouteTarget {
+                    target: RouteTarget {
+                        conn,
+                        desc,
+                        upstream_model,
+                        route_target_key: None,
+                        request_compatibility_effort,
+                    },
+                    reason,
                 });
             }
         }
-        return Ok(out);
-    }
-    let route_list = routes::list_model_routes(store).await?;
-    if let Some(route) = routes::route_by_name(&route_list, requested) {
-        let targets =
-            prefer_capable_targets(routes::ordered_targets(store, route).await?, required);
-        let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::<(String, String)>::new();
-        for target in targets {
-            for route_target in
-                expanded_route_targets(store, &enabled, &target, target_allowed).await?
-            {
-                let key = (
-                    route_target.conn.id.clone(),
-                    route_target.upstream_model.clone(),
-                );
-                if !seen.insert(key) {
-                    continue;
-                }
-                out.push(route_target);
-            }
-        }
-        return Ok(out);
+        return Ok(normalize_single_reason(out));
     }
     // Bare model: first (highest-priority) connection listing it.
     let mut provider_order = Vec::<String>::new();
@@ -181,19 +265,60 @@ async fn route_models_for_body_matching(
         }
     }
     let mut out = Vec::new();
+    let cross_provider_ordered = provider_order.len() > 1;
     for provider in provider_order {
         let candidates = grouped.remove(&provider).unwrap_or_default();
-        for conn in ordered_provider_connections(store, &provider, requested, candidates).await? {
+        for (conn, account_reason) in ordered_provider_connections(
+            store,
+            &provider,
+            requested,
+            candidates,
+            provider_order_cache,
+        )
+        .await?
+        {
             if let Some(desc) = registry::descriptor(&conn.provider) {
-                out.push(RouteTarget {
-                    conn,
-                    desc,
-                    upstream_model: requested.to_string(),
+                out.push(AnnotatedRouteTarget {
+                    target: RouteTarget {
+                        conn,
+                        desc,
+                        upstream_model: requested.to_string(),
+                        route_target_key: None,
+                        request_compatibility_effort: None,
+                    },
+                    reason: combine_order_reason(
+                        cross_provider_ordered.then_some(RouteSelectionReason::Ordered),
+                        account_reason,
+                    ),
                 });
             }
         }
     }
-    Ok(out)
+    Ok(normalize_single_reason(out))
+}
+
+fn combine_order_reason(
+    outer: Option<RouteSelectionReason>,
+    inner: RouteSelectionReason,
+) -> RouteSelectionReason {
+    if matches!(outer, Some(RouteSelectionReason::RoundRobin))
+        || matches!(inner, RouteSelectionReason::RoundRobin)
+    {
+        RouteSelectionReason::RoundRobin
+    } else if matches!(outer, Some(RouteSelectionReason::Ordered))
+        || matches!(inner, RouteSelectionReason::Ordered)
+    {
+        RouteSelectionReason::Ordered
+    } else {
+        RouteSelectionReason::Initial
+    }
+}
+
+fn normalize_single_reason(mut targets: Vec<AnnotatedRouteTarget>) -> Vec<AnnotatedRouteTarget> {
+    if targets.len() == 1 {
+        targets[0].reason = RouteSelectionReason::Initial;
+    }
+    targets
 }
 
 /// All providers are now drivable on the Anthropic-Messages / native path
@@ -213,7 +338,9 @@ async fn expanded_route_targets(
     enabled: &[connections::ConnectionRow],
     target: &routes::ModelRouteTarget,
     target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
-) -> anyhow::Result<Vec<RouteTarget>> {
+    route_reason: RouteSelectionReason,
+    provider_order_cache: &mut ProviderOrderCache,
+) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let mut candidates = Vec::new();
     for conn in enabled {
         let Some(desc) = registry::descriptor(&conn.provider) else {
@@ -227,15 +354,26 @@ async fn expanded_route_targets(
             candidates.push(conn.clone());
         }
     }
-    let ordered =
-        ordered_provider_connections(store, &target.provider, &target.model, candidates).await?;
+    let ordered = ordered_provider_connections(
+        store,
+        &target.provider,
+        &target.model,
+        candidates,
+        provider_order_cache,
+    )
+    .await?;
     Ok(ordered
         .into_iter()
-        .filter_map(|conn| {
-            registry::descriptor(&conn.provider).map(|desc| RouteTarget {
-                conn,
-                desc,
-                upstream_model: target.model.clone(),
+        .filter_map(|(conn, account_reason)| {
+            registry::descriptor(&conn.provider).map(|desc| AnnotatedRouteTarget {
+                target: RouteTarget {
+                    conn,
+                    desc,
+                    upstream_model: target.model.clone(),
+                    route_target_key: None,
+                    request_compatibility_effort: None,
+                },
+                reason: combine_order_reason(Some(route_reason.clone()), account_reason),
             })
         })
         .collect())
@@ -259,7 +397,8 @@ async fn route_continuation_targets(
     store: &Store,
     requested: &str,
     attempted: &std::collections::HashSet<(String, String)>,
-) -> anyhow::Result<Vec<RouteTarget>> {
+    provider_order_cache: &mut ProviderOrderCache,
+) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let Some((family, model)) = requested.split_once('/') else {
         return Ok(Vec::new());
     };
@@ -278,18 +417,24 @@ async fn route_continuation_targets(
     let mut seen = attempted.clone();
     let mut out = Vec::new();
     for target in &route.targets {
-        for route_target in
-            expanded_route_targets(store, &enabled, target, anthropic_messages_target_allowed)
-                .await?
+        for annotated in expanded_route_targets(
+            store,
+            &enabled,
+            target,
+            anthropic_messages_target_allowed,
+            RouteSelectionReason::Ordered,
+            provider_order_cache,
+        )
+        .await?
         {
             let key = (
-                route_target.conn.id.clone(),
-                route_target.upstream_model.clone(),
+                annotated.target.conn.id.clone(),
+                annotated.target.upstream_model.clone(),
             );
             if !seen.insert(key) {
                 continue;
             }
-            out.push(route_target);
+            out.push(annotated);
         }
     }
     Ok(out)
@@ -339,14 +484,53 @@ fn connection_serves_model(
     allow_unlisted: bool,
 ) -> bool {
     let models = connections::effective_models(desc, conn);
-    // Codex picker entries carry an effort suffix (`-high`) the connection's
-    // model list doesn't contain; match on the base id.
-    let needle = if conn.provider == "openai-oauth" {
-        crate::llm_router::codex::codex_base_model(model)
-    } else {
-        model
-    };
-    (allow_unlisted && models.is_empty()) || models.iter().any(|m| m == needle)
+    (allow_unlisted && models.is_empty()) || models.iter().any(|served| served == model)
+}
+
+fn resolved_requested_model(
+    conn: &connections::ConnectionRow,
+    desc: &ProviderDescriptor,
+    requested: &str,
+    model: &str,
+    allow_unlisted: bool,
+) -> Option<(String, Option<String>)> {
+    if connection_serves_model(desc, conn, model, allow_unlisted) {
+        return Some((model.to_string(), None));
+    }
+    if conn.provider != "openai-oauth" {
+        return None;
+    }
+    let (canonical, effort) = model_effort::parse_legacy_codex_selection(requested)?;
+    let (family, canonical_model) = canonical
+        .split_once('/')
+        .map_or(("openai", canonical.as_str()), |(family, model)| {
+            (family, model)
+        });
+    if family != "openai" || desc.family != family {
+        return None;
+    }
+    let models = connections::effective_models(desc, conn);
+    let known = models.iter().any(|served| served == canonical_model)
+        || canonical_model
+            .strip_suffix("-review")
+            .is_some_and(|base| models.iter().any(|served| served == base));
+    known.then(|| (canonical_model.to_string(), Some(effort)))
+}
+
+fn resolve_target_effort(
+    policy: &model_effort::TurnEffortPolicy,
+    route_target_key: Option<&model_effort::RouteTargetEffortKey>,
+    request_compatibility_effort: Option<&str>,
+    preference_key: &model_effort::ModelPreferenceKey,
+    surface: &model_effort::ExecutionSurfaceKey,
+) -> model_effort::EffectiveEffort {
+    model_effort::resolve_for_target(
+        policy,
+        route_target_key,
+        request_compatibility_effort,
+        preference_key,
+        surface,
+    )
 }
 
 async fn ordered_provider_connections(
@@ -354,47 +538,61 @@ async fn ordered_provider_connections(
     provider: &str,
     scope: &str,
     candidates: Vec<connections::ConnectionRow>,
-) -> anyhow::Result<Vec<connections::ConnectionRow>> {
+    provider_order_cache: &mut ProviderOrderCache,
+) -> anyhow::Result<Vec<(connections::ConnectionRow, RouteSelectionReason)>> {
     if candidates.len() <= 1 {
-        return Ok(candidates);
+        return Ok(candidates
+            .into_iter()
+            .map(|conn| (conn, RouteSelectionReason::Initial))
+            .collect());
     }
     let ids = candidates
         .iter()
         .map(|conn| conn.id.clone())
         .collect::<Vec<_>>();
-    let ordered_ids = routes::ordered_provider_connection_ids(store, provider, scope, &ids).await?;
+    let cache_key = (provider.to_string(), scope.to_string(), ids.clone());
+    let (ordered_ids, reason) = if let Some(cached) = provider_order_cache.get(&cache_key) {
+        cached.clone()
+    } else {
+        let (ordered_ids, strategy) =
+            routes::ordered_provider_connection_ids_with_strategy(store, provider, scope, &ids)
+                .await?;
+        let reason = if strategy == routes::ModelRouteStrategy::RoundRobin {
+            RouteSelectionReason::RoundRobin
+        } else {
+            RouteSelectionReason::Ordered
+        };
+        provider_order_cache.insert(cache_key, (ordered_ids.clone(), reason.clone()));
+        (ordered_ids, reason)
+    };
     let mut by_id = candidates
         .into_iter()
         .map(|conn| (conn.id.clone(), conn))
         .collect::<std::collections::HashMap<_, _>>();
     Ok(ordered_ids
         .into_iter()
-        .filter_map(|id| by_id.remove(&id))
+        .filter_map(|id| by_id.remove(&id).map(|conn| (conn, reason.clone())))
         .collect())
 }
 
-fn prefer_capable_targets(
-    targets: Vec<routes::ModelRouteTarget>,
+fn prefer_capable_indexed_targets(
+    targets: Vec<routes::IndexedModelRouteTarget>,
     required: capabilities::RequiredCapabilities,
-) -> Vec<routes::ModelRouteTarget> {
+) -> Vec<routes::IndexedModelRouteTarget> {
     if !required.any() || targets.len() <= 1 {
         return targets;
     }
     let mut capable = Vec::new();
     let mut rest = Vec::new();
     for target in targets {
-        if required.satisfied_by(capabilities::model_capabilities(&target.model)) {
+        if required.satisfied_by(capabilities::model_capabilities(&target.target.model)) {
             capable.push(target);
         } else {
             rest.push(target);
         }
     }
-    if capable.is_empty() {
-        rest
-    } else {
-        capable.extend(rest);
-        capable
-    }
+    capable.extend(rest);
+    capable
 }
 
 /// The first model of the highest-priority enabled connection, as a
@@ -490,69 +688,318 @@ fn native_client_can_drive(conn: &connections::ConnectionRow) -> bool {
 /// users could never pin a native model (hence it "always went to the Claude
 /// subscription" default). Only models that will actually run are listed, so
 /// the picker never offers an entry that would error on send. Codex
-/// (`openai-oauth`) connections additionally get `-low/-medium/-high/-xhigh`
-/// effort-suffixed variants of each model, since Codex routes those through
-/// [`crate::llm_router::codex::codex_base_model`].
-pub async fn selectable_native_models(store: &Store) -> Vec<String> {
-    let mut out = Vec::<String>::new();
-    let mut seen = std::collections::HashSet::<String>::new();
-    let push = |m: String, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
-        if seen.insert(m.clone()) {
-            out.push(m);
+/// (`openai-oauth`) effort capabilities are returned as structured metadata
+/// on the canonical model entry rather than as synthetic model IDs.
+pub async fn selectable_native_models(
+    store: &Store,
+) -> anyhow::Result<Vec<model_effort::SelectableModelInfo>> {
+    let enabled = connections::list_connections(store)
+        .await?
+        .into_iter()
+        .filter(|connection| connection.enabled)
+        .collect::<Vec<_>>();
+    let configured = store
+        .list_model_effort_preferences()
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let capability = |connection: &connections::ConnectionRow, family: String, model: String| {
+        let surface = model_effort::ExecutionSurfaceKey {
+            provider_id: connection.provider.clone(),
+            connection_id: Some(connection.id.clone()),
+            model: model.clone(),
+        };
+        async move {
+            let metadata = model_meta::resolve_for_surface(store, &surface).await;
+            (
+                model_effort::ModelPreferenceKey {
+                    family,
+                    model: model.clone(),
+                },
+                model_effort::ExecutionModelEffortCapabilities {
+                    surface,
+                    model_display_name: metadata.display_name.unwrap_or_else(|| model.clone()),
+                    supported: metadata.reasoning_efforts,
+                    provider_default: metadata.default_reasoning_effort,
+                },
+            )
         }
     };
 
-    let enabled: Vec<connections::ConnectionRow> = match connections::list_connections(store).await
-    {
-        Ok(conns) => conns.into_iter().filter(|c| c.enabled).collect(),
-        Err(_) => Vec::new(),
-    };
-
-    // Routes first — but only if at least one target is drivable in-process,
-    // so a Codex-only or keyless route isn't offered as a native model.
-    if let Ok(routes) = routes::list_model_routes(store).await {
-        for route in routes
-            .into_iter()
-            .filter(|r| r.enabled && !r.targets.is_empty())
+    let mut concrete_order = Vec::<model_effort::ModelPreferenceKey>::new();
+    let mut concrete = std::collections::HashMap::<
+        model_effort::ModelPreferenceKey,
+        Vec<model_effort::ExecutionModelEffortCapabilities>,
+    >::new();
+    for connection in &enabled {
+        let Some(descriptor) = registry::descriptor(&connection.provider) else {
+            continue;
+        };
+        if !native_client_can_drive(connection)
+            || !connection_has_required_credentials(descriptor, connection)
         {
-            let usable = route.targets.iter().any(|target| {
-                enabled.iter().any(|c| {
-                    native_client_can_drive(c)
-                        && registry::descriptor(&c.provider).is_some_and(|desc| {
-                            desc.family == target.provider
-                                && connection_has_required_credentials(desc, c)
-                                && connection_serves_model(desc, c, &target.model, false)
-                        })
-                })
-            });
-            if usable {
-                push(route.name, &mut out, &mut seen);
+            continue;
+        }
+        for model in connections::effective_models(descriptor, connection) {
+            let (key, capabilities) =
+                capability(connection, descriptor.family.to_string(), model).await;
+            if !concrete.contains_key(&key) {
+                concrete_order.push(key.clone());
             }
+            concrete.entry(key).or_default().push(capabilities);
         }
     }
 
-    for conn in &enabled {
-        let Some(desc) = registry::descriptor(&conn.provider) else {
-            continue;
+    let make_info =
+        |kind,
+         request_value: String,
+         display_name: String,
+         preference_key: Option<model_effort::ModelPreferenceKey>,
+         configured_override: Option<String>,
+         capabilities: Vec<model_effort::ExecutionModelEffortCapabilities>| {
+            let intersection = model_effort::intersect_capabilities(&capabilities);
+            let configured_default = configured_override
+                .or_else(|| {
+                    preference_key
+                        .as_ref()
+                        .and_then(|key| configured.get(key))
+                        .cloned()
+                })
+                .filter(|value| {
+                    intersection
+                        .supported
+                        .iter()
+                        .any(|option| option.value == value.as_str())
+                });
+            let (resolved_default, default_source) = configured_default.clone().map_or(
+                (intersection.resolved_default, intersection.default_source),
+                |value| (Some(value), model_effort::ModelDefaultSource::Configured),
+            );
+            model_effort::SelectableModelInfo {
+                kind,
+                request_value,
+                display_name,
+                preference_key,
+                supported: intersection.supported,
+                configured_default,
+                resolved_default,
+                default_source,
+            }
         };
-        if !native_client_can_drive(conn) || !connection_has_required_credentials(desc, conn) {
-            continue;
-        }
-        for model in connections::effective_models(desc, conn) {
-            push(format!("{}/{}", desc.family, model), &mut out, &mut seen);
-            if conn.provider == "openai-oauth" {
-                for effort in ["low", "medium", "high", "xhigh"] {
-                    push(
-                        format!("{}/{}-{effort}", desc.family, model),
-                        &mut out,
-                        &mut seen,
-                    );
+
+    let mut out = Vec::new();
+    for route in routes::list_model_routes(store)
+        .await?
+        .into_iter()
+        .filter(|route| route.enabled && !route.targets.is_empty())
+    {
+        let mut route_capabilities = Vec::new();
+        let mut route_effective = Vec::new();
+        for target in routes::peek_ordered_targets(store, &route).await? {
+            for connection in &enabled {
+                let Some(descriptor) = registry::descriptor(&connection.provider) else {
+                    continue;
+                };
+                if descriptor.family == target.provider
+                    && native_client_can_drive(connection)
+                    && connection_has_required_credentials(descriptor, connection)
+                    && connection_serves_model(descriptor, connection, &target.model, false)
+                {
+                    let (key, capability) = capability(
+                        connection,
+                        descriptor.family.to_string(),
+                        target.model.clone(),
+                    )
+                    .await;
+                    let supports = |value: &str| {
+                        capability
+                            .supported
+                            .iter()
+                            .any(|option| option.value == value)
+                    };
+                    let selected = target
+                        .effort
+                        .as_deref()
+                        .filter(|value| supports(value))
+                        .map(|value| {
+                            (
+                                Some(value.to_string()),
+                                model_effort::EffectiveEffortSource::RouteCompatibility,
+                            )
+                        })
+                        .or_else(|| {
+                            configured
+                                .get(&key)
+                                .filter(|value| supports(value))
+                                .map(|value| {
+                                    (
+                                        Some(value.clone()),
+                                        model_effort::EffectiveEffortSource::Configured,
+                                    )
+                                })
+                        })
+                        .or_else(|| {
+                            capability
+                                .provider_default
+                                .as_ref()
+                                .filter(|value| supports(value))
+                                .cloned()
+                                .or_else(|| {
+                                    (capability.supported.len() == 1)
+                                        .then(|| capability.supported[0].value.clone())
+                                })
+                                .map(|value| {
+                                    (Some(value), model_effort::EffectiveEffortSource::Provider)
+                                })
+                        })
+                        .unwrap_or((None, model_effort::EffectiveEffortSource::None));
+                    route_effective.push(selected);
+                    route_capabilities.push(capability);
                 }
             }
         }
+        if !route_capabilities.is_empty() {
+            let configured_values = route_capabilities
+                .iter()
+                .map(|capability| {
+                    let family = registry::descriptor(&capability.surface.provider_id)
+                        .map(|descriptor| descriptor.family)?;
+                    configured
+                        .get(&model_effort::ModelPreferenceKey {
+                            family: family.to_string(),
+                            model: capability.surface.model.clone(),
+                        })
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            let route_configured = configured_values
+                .first()
+                .cloned()
+                .flatten()
+                .filter(|first| {
+                    configured_values
+                        .iter()
+                        .all(|value| value.as_ref() == Some(first))
+                });
+            let mut info = make_info(
+                model_effort::SelectableModelKind::NamedRoute,
+                route.name.clone(),
+                route.name,
+                None,
+                route_configured,
+                route_capabilities,
+            );
+            let first_value = route_effective.first().map(|(value, _)| value.clone());
+            let uniform_value = first_value.is_some()
+                && route_effective
+                    .iter()
+                    .all(|(value, _)| Some(value.clone()) == first_value);
+            if uniform_value {
+                info.resolved_default = first_value.flatten();
+                let first_source = route_effective.first().map(|(_, source)| source);
+                let uniform_source = first_source.is_some()
+                    && route_effective
+                        .iter()
+                        .all(|(_, source)| Some(source) == first_source);
+                info.default_source = if uniform_source {
+                    match first_source {
+                        Some(model_effort::EffectiveEffortSource::Configured) => {
+                            model_effort::ModelDefaultSource::Configured
+                        }
+                        Some(model_effort::EffectiveEffortSource::Provider) => {
+                            model_effort::ModelDefaultSource::Provider
+                        }
+                        Some(model_effort::EffectiveEffortSource::None) => {
+                            model_effort::ModelDefaultSource::None
+                        }
+                        _ => model_effort::ModelDefaultSource::VariesByTarget,
+                    }
+                } else {
+                    model_effort::ModelDefaultSource::VariesByTarget
+                };
+            } else {
+                info.resolved_default = None;
+                info.default_source = model_effort::ModelDefaultSource::VariesByTarget;
+            }
+            out.push(info);
+        }
     }
+    for key in concrete_order {
+        let mut capabilities = concrete.remove(&key).unwrap_or_default();
+        let ids = capabilities
+            .iter()
+            .filter_map(|capability| capability.surface.connection_id.clone())
+            .collect::<Vec<_>>();
+        let ordered_ids =
+            routes::peek_provider_connection_ids(store, &key.family, &key.model, &ids).await?;
+        let order = ordered_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect::<std::collections::HashMap<_, _>>();
+        capabilities.sort_by_key(|capability| {
+            capability
+                .surface
+                .connection_id
+                .as_ref()
+                .and_then(|id| order.get(id))
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        let display_name = if key.model.ends_with("-review") {
+            key.model.clone()
+        } else {
+            capabilities
+                .first()
+                .map(|capability| capability.model_display_name.clone())
+                .unwrap_or_else(|| key.model.clone())
+        };
+        out.push(make_info(
+            model_effort::SelectableModelKind::Concrete,
+            format!("{}/{}", key.family, key.model),
+            display_name,
+            Some(key),
+            None,
+            capabilities,
+        ));
+    }
+    Ok(out)
+}
 
-    out
+pub async fn named_route_compatibility_default(
+    store: &Store,
+    requested: &str,
+    supported: &[model_effort::ReasoningEffortOption],
+) -> anyhow::Result<Option<String>> {
+    let route_list = routes::list_model_routes(store).await?;
+    let Some(route) = routes::route_by_name(&route_list, requested) else {
+        return Ok(None);
+    };
+    let enabled = connections::list_connections(store)
+        .await?
+        .into_iter()
+        .filter(|connection| connection.enabled)
+        .collect::<Vec<_>>();
+    let efforts = route
+        .targets
+        .iter()
+        .filter(|target| {
+            route_target_has_candidate(&enabled, target, anthropic_messages_target_allowed)
+        })
+        .map(|target| target.effort.clone())
+        .collect::<Vec<_>>();
+    let Some(first) = efforts.first().cloned().flatten() else {
+        return Ok(None);
+    };
+    if !efforts
+        .iter()
+        .all(|effort| effort.as_deref() == Some(first.as_str()))
+        || !supported.iter().any(|option| option.value == first)
+    {
+        return Ok(None);
+    }
+    Ok(Some(first))
 }
 
 /// Anthropic's Claude-Code-branded system prefix, required by the
@@ -568,7 +1015,7 @@ fn inject_claude_system_prompt(body: &mut Value) {
 }
 
 fn claude_cloak_map_for(target: &RouteTarget, body: &Value) -> claude_cloak::ToolNameMap {
-    claude_cloak::tool_name_map_for(&target.conn.provider, &target.conn.data, body)
+    claude_cloak::tool_name_map_for(&target.conn.provider, body)
 }
 
 /// Remove the `thinking` key before a request reaches an Anthropic-native
@@ -584,6 +1031,106 @@ fn claude_cloak_map_for(target: &RouteTarget, body: &Value) -> claude_cloak::Too
 fn strip_thinking(body: &mut Value) {
     if let Some(obj) = body.as_object_mut() {
         obj.remove("thinking");
+    }
+}
+
+fn target_effort(
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+) -> model_effort::EffectiveEffort {
+    let preference_key = model_effort::ModelPreferenceKey {
+        family: target.desc.family.to_string(),
+        model: target.upstream_model.clone(),
+    };
+    let surface = model_effort::ExecutionSurfaceKey {
+        provider_id: target.conn.provider.clone(),
+        connection_id: Some(target.conn.id.clone()),
+        model: target.upstream_model.clone(),
+    };
+    resolve_target_effort(
+        policy,
+        target.route_target_key.as_ref(),
+        target.request_compatibility_effort.as_deref(),
+        &preference_key,
+        &surface,
+    )
+}
+
+fn selection_for_accepted_target(
+    target: &RouteTarget,
+    requested_model: &str,
+    policy: &model_effort::TurnEffortPolicy,
+    reason: RouteSelectionReason,
+) -> RouteSelection {
+    let preference_key = model_effort::ModelPreferenceKey {
+        family: target.desc.family.to_string(),
+        model: target.upstream_model.clone(),
+    };
+    let surface = model_effort::ExecutionSurfaceKey {
+        provider_id: target.conn.provider.clone(),
+        connection_id: Some(target.conn.id.clone()),
+        model: target.upstream_model.clone(),
+    };
+    let effective = model_effort::resolve_for_target(
+        policy,
+        target.route_target_key.as_ref(),
+        target.request_compatibility_effort.as_deref(),
+        &preference_key,
+        &surface,
+    );
+    let model_display_name = policy
+        .surfaces
+        .get(&surface)
+        .map(|capability| capability.model_display_name.clone())
+        .unwrap_or_else(|| target.upstream_model.clone());
+    RouteSelection {
+        requested_model: requested_model.to_string(),
+        resolved_provider_id: target.conn.provider.clone(),
+        resolved_family: target.desc.family.to_string(),
+        resolved_model: target.upstream_model.clone(),
+        resolved_model_display_name: model_display_name,
+        effective_effort: effective.value,
+        effective_effort_label: effective.label,
+        connection_id: target.conn.id.clone(),
+        connection_label: target.conn.label.clone(),
+        reason,
+    }
+}
+
+fn accepted_reason(
+    origin: RouteSelectionReason,
+    failures: &[UpstreamAttemptFailure],
+) -> RouteSelectionReason {
+    failures
+        .last()
+        .map(|failure| RouteSelectionReason::Failover(failure.category))
+        .unwrap_or(origin)
+}
+
+fn apply_anthropic_effort(
+    body: &mut Value,
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+) {
+    if let Some(effort) = target_effort(target, policy).value {
+        body["output_config"]["effort"] = json!(effort);
+    } else if let Some(output) = body.get_mut("output_config").and_then(Value::as_object_mut) {
+        output.remove("effort");
+    }
+}
+
+fn apply_openai_effort(
+    body: &mut Value,
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+    caller_supplied_thinking: bool,
+) {
+    if let Some(effort) = target_effort(target, policy).value {
+        body["reasoning_effort"] = json!(effort);
+    } else if !caller_supplied_thinking {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("reasoning_effort");
+        }
     }
 }
 
@@ -739,7 +1286,7 @@ fn oauth_upstream_request(
             let mut anthropic_body = body.clone();
             inject_claude_system_prompt(&mut anthropic_body);
             let session_id = uuid::Uuid::new_v4().to_string();
-            let cloaked = claude_cloak::enabled(&target.conn.data);
+            let cloaked = claude_cloak::required_for_provider(&target.conn.provider);
             if cloaked {
                 claude_cloak::apply_request_cloak(&mut anthropic_body, &access_token, &session_id);
             }
@@ -770,9 +1317,18 @@ fn oauth_upstream_request(
             // the `openai-oauth` catalog entry in registry.rs) — Codex CLI
             // never talks to anything else, so this isn't override-able.
             const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
+            #[cfg(test)]
+            let codex_base = target
+                .conn
+                .data
+                .base_url_override
+                .as_deref()
+                .unwrap_or(CODEX_BASE);
+            #[cfg(not(test))]
+            let codex_base = CODEX_BASE;
             let mut req = ctx
                 .http
-                .post(format!("{CODEX_BASE}/responses"))
+                .post(format!("{codex_base}/responses"))
                 .json(body)
                 .header("authorization", format!("Bearer {access_token}"))
                 .header("originator", "codex_cli_rs")
@@ -917,20 +1473,42 @@ pub(crate) struct UpstreamAttemptFailure {
     pub(crate) provider: String,
     pub(crate) message: String,
     pub(crate) status: Option<u16>,
-    /// Failure below (or without) an HTTP status: DNS/TLS/connect errors,
-    /// resets, and pre-content stream errors. Always worth trying the next
-    /// target — a different account/endpoint may well be reachable.
-    pub(crate) transport: bool,
+    pub(crate) category: RouteFailureCategory,
 }
 
 impl UpstreamAttemptFailure {
     /// Build a transport-class failure (no HTTP status, always retryable).
     pub(crate) fn transport(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             provider: provider.into(),
-            message: message.into(),
+            category: classify_failure(None, true, &message),
+            message,
             status: None,
-            transport: true,
+        }
+    }
+
+    pub(crate) fn http(
+        provider: impl Into<String>,
+        status: u16,
+        message: impl Into<String>,
+    ) -> Self {
+        let message = message.into();
+        Self {
+            provider: provider.into(),
+            category: classify_failure(Some(status), false, &message),
+            message,
+            status: Some(status),
+        }
+    }
+
+    fn upstream(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            provider: provider.into(),
+            category: classify_failure(None, false, &message),
+            message,
+            status: None,
         }
     }
 
@@ -940,7 +1518,13 @@ impl UpstreamAttemptFailure {
 }
 
 pub(crate) fn should_try_next_target(failure: &UpstreamAttemptFailure) -> bool {
-    if failure.transport {
+    if matches!(
+        failure.category,
+        RouteFailureCategory::Transport
+            | RouteFailureCategory::Authentication
+            | RouteFailureCategory::Quota
+            | RouteFailureCategory::RateLimit
+    ) {
         return true;
     }
     let status_retryable = matches!(
@@ -1003,7 +1587,7 @@ pub(crate) async fn ensure_fresh_for_attempt(
                 target.conn.provider
             ),
             status: Some(401),
-            transport: false,
+            category: RouteFailureCategory::Authentication,
         });
     }
     Ok(())
@@ -1020,12 +1604,7 @@ pub(crate) async fn upstream_status_failure(
     // back to a trimmed raw-body snippet.
     let body = resp.text().await.unwrap_or_default();
     let message = extract_upstream_error_message(&body);
-    UpstreamAttemptFailure {
-        provider,
-        message,
-        status: Some(status),
-        transport: false,
-    }
+    UpstreamAttemptFailure::http(provider, status, message)
 }
 
 /// Pull a human-readable error out of an upstream error body across the shapes
@@ -1059,11 +1638,6 @@ fn extract_upstream_error_message(body: &str) -> String {
 // ---------------------------------------------------------------------------
 // In-process streaming seam
 // ---------------------------------------------------------------------------
-
-/// One Anthropic-format SSE event: `(event_name, event_json)`. For example
-/// `("content_block_delta", {"type":"content_block_delta","index":0,
-/// "delta":{"type":"text_delta","text":"hi"}})`.
-pub type AnthropicEvent = (String, Value);
 
 /// A decoded Anthropic streaming event. The native runner matches on this
 /// instead of string-matching event names + poking at `Value`.
@@ -1210,19 +1784,19 @@ async fn probe_stream_head(
             // (empty) completion; deliver whatever arrived.
             return StreamProbe::Deliver { buffered, rest: rx };
         };
-        let error_message = match &item {
-            Err(e) => Some(e.to_string()),
-            Ok((name, data)) if name == "error" => Some(
+        let failure = match &item {
+            Err(e) => Some(UpstreamAttemptFailure::transport(provider, e.to_string())),
+            Ok((name, data)) if name == "error" => Some(UpstreamAttemptFailure::upstream(
+                provider,
                 data.get("error")
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
-                    .unwrap_or("upstream error")
-                    .to_string(),
-            ),
+                    .unwrap_or("upstream error"),
+            )),
             Ok(_) => None,
         };
-        if let Some(message) = error_message {
-            return StreamProbe::Failover(UpstreamAttemptFailure::transport(provider, message));
+        if let Some(failure) = failure {
+            return StreamProbe::Failover(failure);
         }
         let is_content = matches!(
             &item,
@@ -1282,19 +1856,27 @@ fn deliver_probed(
 pub async fn anthropic_messages_stream(
     ctx: &UpstreamCtx,
     body: Value,
-) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
+    effort_policy: &model_effort::TurnEffortPolicy,
+) -> anyhow::Result<RoutedStream> {
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let targets = route_models_for_anthropic_messages(&ctx.store, &requested).await?;
+    let mut provider_order_cache = ProviderOrderCache::new();
+    let targets = route_models_for_body_matching_with_cache(
+        &ctx.store,
+        &requested,
+        None,
+        anthropic_messages_target_allowed,
+        &mut provider_order_cache,
+    )
+    .await?;
     if targets.is_empty() {
         anyhow::bail!("no enabled connection serves model '{requested}'");
     }
-
     let mut failures = Vec::new();
     let mut attempted = std::collections::HashSet::<(String, String)>::new();
     let mut queue = std::collections::VecDeque::from(targets);
     let mut continued = false;
     loop {
-        let Some(mut target) = queue.pop_front() else {
+        let Some(annotated) = queue.pop_front() else {
             // Initial targets exhausted with only retryable failures
             // (non-retryable ones returned early above): continue down the
             // first Model Route containing the pinned (family, model) — once.
@@ -1302,12 +1884,22 @@ pub async fn anthropic_messages_stream(
                 break;
             }
             continued = true;
-            queue.extend(route_continuation_targets(&ctx.store, &requested, &attempted).await?);
+            queue.extend(
+                route_continuation_targets(
+                    &ctx.store,
+                    &requested,
+                    &attempted,
+                    &mut provider_order_cache,
+                )
+                .await?,
+            );
             if queue.is_empty() {
                 break;
             }
             continue;
         };
+        let mut target = annotated.target;
+        let origin = annotated.reason;
         attempted.insert((target.conn.id.clone(), target.upstream_model.clone()));
         if let Err(failure) = ensure_fresh_for_attempt(ctx, &mut target).await {
             let try_next = should_try_next_target(&failure);
@@ -1333,7 +1925,16 @@ pub async fn anthropic_messages_stream(
             match kiro_stream(ctx, &mut target, &attempt_body, started).await {
                 Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
                     StreamProbe::Deliver { buffered, rest } => {
-                        return Ok(deliver_probed(buffered, rest));
+                        let selection = selection_for_accepted_target(
+                            &target,
+                            &requested,
+                            effort_policy,
+                            accepted_reason(origin, &failures),
+                        );
+                        return Ok(RoutedStream {
+                            selection,
+                            events: deliver_probed(buffered, rest),
+                        });
                     }
                     StreamProbe::Failover(failure) => {
                         failures.push(failure);
@@ -1355,10 +1956,19 @@ pub async fn anthropic_messages_stream(
         // completions`, so — like Kiro — it's handled before the format
         // match via its own translation + upstream pipeline.
         if target.conn.provider == "openai-oauth" {
-            match codex_stream(ctx, &mut target, &attempt_body, started).await {
+            match codex_stream(ctx, &mut target, &attempt_body, effort_policy, started).await {
                 Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
                     StreamProbe::Deliver { buffered, rest } => {
-                        return Ok(deliver_probed(buffered, rest));
+                        let selection = selection_for_accepted_target(
+                            &target,
+                            &requested,
+                            effort_policy,
+                            accepted_reason(origin, &failures),
+                        );
+                        return Ok(RoutedStream {
+                            selection,
+                            events: deliver_probed(buffered, rest),
+                        });
                     }
                     StreamProbe::Failover(failure) => {
                         failures.push(failure);
@@ -1384,6 +1994,7 @@ pub async fn anthropic_messages_stream(
         match target.desc.format {
             ApiFormat::Anthropic => {
                 strip_thinking(&mut attempt_body);
+                apply_anthropic_effort(&mut attempt_body, &target, effort_policy);
                 let tool_map = claude_cloak_map_for(&target, &attempt_body);
                 let resp = match send_upstream(ctx, &mut target, &attempt_body).await {
                     Ok(resp) => resp,
@@ -1422,7 +2033,16 @@ pub async fn anthropic_messages_stream(
                 });
                 match probe_stream_head(&target.conn.provider, rx).await {
                     StreamProbe::Deliver { buffered, rest } => {
-                        return Ok(deliver_probed(buffered, rest));
+                        let selection = selection_for_accepted_target(
+                            &target,
+                            &requested,
+                            effort_policy,
+                            accepted_reason(origin, &failures),
+                        );
+                        return Ok(RoutedStream {
+                            selection,
+                            events: deliver_probed(buffered, rest),
+                        });
                     }
                     StreamProbe::Failover(failure) => {
                         failures.push(failure);
@@ -1434,6 +2054,12 @@ pub async fn anthropic_messages_stream(
                 // Not stripped here: `anthropic_to_openai_request` translates
                 // `thinking` into `reasoning_effort` for this wire format.
                 let mut upstream_body = translate::anthropic_to_openai_request(&attempt_body)?;
+                apply_openai_effort(
+                    &mut upstream_body,
+                    &target,
+                    effort_policy,
+                    body.get("thinking").is_some(),
+                );
                 apply_max_completion_tokens(target.desc, &mut upstream_body);
                 let resp = match send_upstream(ctx, &mut target, &upstream_body).await {
                     Ok(resp) => resp,
@@ -1473,7 +2099,16 @@ pub async fn anthropic_messages_stream(
                 });
                 match probe_stream_head(&target.conn.provider, rx).await {
                     StreamProbe::Deliver { buffered, rest } => {
-                        return Ok(deliver_probed(buffered, rest));
+                        let selection = selection_for_accepted_target(
+                            &target,
+                            &requested,
+                            effort_policy,
+                            accepted_reason(origin, &failures),
+                        );
+                        return Ok(RoutedStream {
+                            selection,
+                            events: deliver_probed(buffered, rest),
+                        });
                     }
                     StreamProbe::Failover(failure) => {
                         failures.push(failure);
@@ -1489,7 +2124,18 @@ pub async fn anthropic_messages_stream(
 /// Non-streaming sibling: returns the full Anthropic message `Value`.
 pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Result<Value> {
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let targets = route_models_for_anthropic_messages(&ctx.store, &requested).await?;
+    let mut provider_order_cache = ProviderOrderCache::new();
+    let targets = route_models_for_body_matching_with_cache(
+        &ctx.store,
+        &requested,
+        None,
+        anthropic_messages_target_allowed,
+        &mut provider_order_cache,
+    )
+    .await?
+    .into_iter()
+    .map(|annotated| annotated.target)
+    .collect::<Vec<_>>();
     if targets.is_empty() {
         anyhow::bail!("no enabled connection serves model '{requested}'");
     }
@@ -1507,7 +2153,17 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
                 break;
             }
             continued = true;
-            queue.extend(route_continuation_targets(&ctx.store, &requested, &attempted).await?);
+            queue.extend(
+                route_continuation_targets(
+                    &ctx.store,
+                    &requested,
+                    &attempted,
+                    &mut provider_order_cache,
+                )
+                .await?
+                .into_iter()
+                .map(|annotated| annotated.target),
+            );
             if queue.is_empty() {
                 break;
             }
@@ -1949,6 +2605,7 @@ async fn codex_stream(
     ctx: &UpstreamCtx,
     target: &mut RouteTarget,
     body: &Value,
+    effort_policy: &model_effort::TurnEffortPolicy,
     started: i64,
 ) -> Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>, UpstreamAttemptFailure> {
     // Clone the provider up front rather than borrowing `target` inside the
@@ -1959,9 +2616,29 @@ async fn codex_stream(
     let fail = |e: String| UpstreamAttemptFailure::transport(provider.clone(), e);
     let chat = translate::anthropic_to_openai_request(body).map_err(|e| fail(e.to_string()))?;
     let mut responses = crate::llm_router::codex::openai_chat_to_responses_request(&chat);
+    let preference_key = model_effort::ModelPreferenceKey {
+        family: target.desc.family.to_string(),
+        model: target.upstream_model.clone(),
+    };
+    let surface = model_effort::ExecutionSurfaceKey {
+        provider_id: target.conn.provider.clone(),
+        connection_id: Some(target.conn.id.clone()),
+        model: target.upstream_model.clone(),
+    };
+    let effort = resolve_target_effort(
+        effort_policy,
+        target.route_target_key.as_ref(),
+        target.request_compatibility_effort.as_deref(),
+        &preference_key,
+        &surface,
+    );
+    if let Some(effort) = effort.value.as_deref() {
+        crate::llm_router::codex::apply_native_reasoning_effort(&mut responses, effort);
+    }
     crate::llm_router::codex::normalize_codex_responses_body(
         &mut responses,
         &target.upstream_model,
+        None,
         None,
     );
     let resp = send_upstream(ctx, target, &responses)
@@ -2086,10 +2763,190 @@ mod tests {
         }
     }
 
+    fn single_option_policy(target: &RouteTarget, value: &str) -> model_effort::TurnEffortPolicy {
+        let surface = model_effort::ExecutionSurfaceKey {
+            provider_id: target.conn.provider.clone(),
+            connection_id: Some(target.conn.id.clone()),
+            model: target.upstream_model.clone(),
+        };
+        model_effort::TurnEffortPolicy {
+            requested_model: format!("{}/{}", target.desc.family, target.upstream_model),
+            project_override: None,
+            route_compatibility: Default::default(),
+            configured: Default::default(),
+            surfaces: std::collections::HashMap::from([(
+                surface.clone(),
+                model_effort::ExecutionModelEffortCapabilities {
+                    surface,
+                    model_display_name: target.upstream_model.clone(),
+                    supported: vec![model_effort::ReasoningEffortOption {
+                        value: value.into(),
+                        label: value.into(),
+                        description: None,
+                    }],
+                    provider_default: None,
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn single_option_implicit_default_is_sent_to_wire() {
+        let anthropic = RouteTarget {
+            conn: mk_conn("a1", "anthropic", "api_key", ConnectionData::default()),
+            desc: registry::descriptor("anthropic").unwrap(),
+            upstream_model: "claude-one".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
+        };
+        let policy = single_option_policy(&anthropic, "focused");
+        let mut anthropic_body = json!({"messages": []});
+        apply_anthropic_effort(&mut anthropic_body, &anthropic, &policy);
+        assert_eq!(anthropic_body["output_config"]["effort"], "focused");
+
+        let openai = RouteTarget {
+            conn: mk_conn("o1", "openai", "api_key", ConnectionData::default()),
+            desc: registry::descriptor("openai").unwrap(),
+            upstream_model: "gpt-one".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
+        };
+        let policy = single_option_policy(&openai, "focused");
+        let mut chat_body = json!({"messages": []});
+        apply_openai_effort(&mut chat_body, &openai, &policy, false);
+        assert_eq!(chat_body["reasoning_effort"], "focused");
+
+        let codex = RouteTarget {
+            conn: mk_conn("c1", "openai-oauth", "oauth", ConnectionData::default()),
+            desc: registry::descriptor("openai-oauth").unwrap(),
+            upstream_model: "gpt-codex".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
+        };
+        let policy = single_option_policy(&codex, "ultra");
+        let selected = target_effort(&codex, &policy).value.unwrap();
+        assert_eq!(selected, "ultra", "policy identity stays provider-native");
+        let mut responses = json!({"input": []});
+        crate::llm_router::codex::normalize_codex_responses_body(
+            &mut responses,
+            "gpt-codex",
+            Some(&selected),
+            None,
+        );
+        assert_eq!(responses["reasoning"]["effort"], "max");
+    }
+
+    #[tokio::test]
+    async fn codex_stream_sends_native_policy_effort_and_omits_unsupported_effort() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::Mutex as StdMutex;
+
+        async fn capture(
+            State(captured): State<Arc<StdMutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> ([(&'static str, &'static str); 1], &'static str) {
+            captured.lock().unwrap().push(body);
+            (
+                [("content-type", "text/event-stream")],
+                "event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            )
+        }
+
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/responses", post(capture))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "codex-wire",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("test-token".into()),
+                    expires_at: Some(crate::paths::now_ms() + 100 * 24 * 60 * 60 * 1_000),
+                    last_refresh_at: Some(crate::paths::now_ms()),
+                    needs_relogin: Some(false),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["gpt-wire".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let surface = model_effort::ExecutionSurfaceKey {
+            provider_id: "openai-oauth".into(),
+            connection_id: Some("codex-wire".into()),
+            model: "gpt-wire".into(),
+        };
+        let policy = Arc::new(model_effort::TurnEffortPolicy {
+            requested_model: "openai/gpt-wire".into(),
+            project_override: Some("ultra".into()),
+            route_compatibility: Default::default(),
+            configured: Default::default(),
+            surfaces: std::collections::HashMap::from([(
+                surface.clone(),
+                model_effort::ExecutionModelEffortCapabilities {
+                    surface,
+                    model_display_name: "GPT Wire".into(),
+                    supported: vec![model_effort::ReasoningEffortOption {
+                        value: "ultra".into(),
+                        label: "Ultra".into(),
+                        description: None,
+                    }],
+                    provider_default: None,
+                },
+            )]),
+        });
+        let body = || {
+            json!({
+                "model": "openai/gpt-wire",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+        };
+
+        let rx = anthropic_messages_stream(&ctx, body(), &policy)
+            .await
+            .unwrap();
+        let _ = collect_stream(rx.events).await;
+
+        let unsupported = Arc::new(model_effort::TurnEffortPolicy {
+            requested_model: "openai/gpt-wire".into(),
+            project_override: Some("ultra".into()),
+            route_compatibility: Default::default(),
+            configured: Default::default(),
+            surfaces: Default::default(),
+        });
+        let rx = anthropic_messages_stream(&ctx, body(), &unsupported)
+            .await
+            .unwrap();
+        let _ = collect_stream(rx.events).await;
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0]["reasoning"]["effort"], "max");
+        assert!(captured[1].get("reasoning").is_none());
+    }
+
     async fn test_ctx() -> UpstreamCtx {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         UpstreamCtx::new(store)
+    }
+
+    async fn utility_policy(ctx: &UpstreamCtx, model: &str) -> Arc<model_effort::TurnEffortPolicy> {
+        Arc::new(
+            model_effort::build_utility_effort_policy(&ctx.store, model)
+                .await
+                .unwrap(),
+        )
     }
 
     /// Drain an `anthropic_messages_stream` receiver, panicking on transport
@@ -2102,6 +2959,370 @@ mod tests {
             out.push(item.expect("stream must not carry transport Err items in this test"));
         }
         out
+    }
+
+    async fn provenance_test_server(first: &'static str, second: &'static str) -> u16 {
+        use axum::{routing::post, Router};
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(move || async move { ([("content-type", "text/event-stream")], first) }),
+            )
+            .route(
+                "/second/messages",
+                post(move || async move { ([("content-type", "text/event-stream")], second) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    async fn add_provenance_account(
+        ctx: &UpstreamCtx,
+        id: &str,
+        label: &str,
+        port: u16,
+        path: &str,
+        model: &str,
+    ) {
+        let mut conn = mk_conn(
+            id,
+            "anthropic",
+            "api_key",
+            ConnectionData {
+                api_key: Some(format!("sk-{id}")),
+                base_url_override: Some(format!("http://127.0.0.1:{port}/{path}")),
+                models_override: Some(vec![model.into()]),
+                ..Default::default()
+            },
+        );
+        conn.label = label.into();
+        connections::add_connection(&ctx.store, conn).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_selection_reports_exact_successful_target() {
+        let port = provenance_test_server(SSE_OK_STREAM, SSE_OK_STREAM).await;
+        let ctx = test_ctx().await;
+        add_provenance_account(&ctx, "only", "Only Claude", port, "first", "claude-t").await;
+        let routed = anthropic_messages_stream(
+            &ctx,
+            json!({"model":"anthropic/claude-t","messages":[]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(routed.selection.requested_model, "anthropic/claude-t");
+        assert_eq!(routed.selection.resolved_provider_id, "anthropic");
+        assert_eq!(routed.selection.resolved_family, "anthropic");
+        assert_eq!(routed.selection.resolved_model, "claude-t");
+        assert_eq!(routed.selection.connection_id, "only");
+        assert_eq!(routed.selection.connection_label, "Only Claude");
+        assert_eq!(
+            routed.selection.reason,
+            crate::llm_router::provenance::RouteSelectionReason::Initial
+        );
+        assert_eq!(stream_text(&collect_stream(routed.events).await), "rotated");
+    }
+
+    #[tokio::test]
+    async fn route_selection_reports_named_and_account_round_robin() {
+        let port = provenance_test_server(SSE_OK_STREAM, SSE_OK_STREAM).await;
+        let ctx = test_ctx().await;
+        add_provenance_account(&ctx, "first", "First", port, "first", "claude-t").await;
+        add_provenance_account(&ctx, "second", "Second", port, "second", "claude-t").await;
+        routes::save_provider_account_route(
+            &ctx.store,
+            "anthropic",
+            routes::ModelRouteStrategy::RoundRobin,
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "rr-route".into(),
+                name: "smart".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::RoundRobin,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-t".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-t".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let routed = anthropic_messages_stream(
+            &ctx,
+            json!({"model":"smart","messages":[]}),
+            utility_policy(&ctx, "smart").await.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            routed.selection.reason,
+            crate::llm_router::provenance::RouteSelectionReason::RoundRobin
+        );
+        assert!(matches!(
+            routed.selection.connection_id.as_str(),
+            "first" | "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn route_selection_duplicate_targets_advance_each_round_robin_cursor_once() {
+        let port = provenance_test_server(SSE_OK_STREAM, SSE_OK_STREAM).await;
+        let ctx = test_ctx().await;
+        add_provenance_account(&ctx, "first", "First", port, "first", "claude-t").await;
+        add_provenance_account(&ctx, "second", "Second", port, "second", "claude-t").await;
+        routes::save_provider_account_route(
+            &ctx.store,
+            "anthropic",
+            routes::ModelRouteStrategy::RoundRobin,
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "duplicate-rr".into(),
+                name: "duplicate-smart".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::RoundRobin,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-t".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-t".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let policy = utility_policy(&ctx, "duplicate-smart").await;
+        let request = || json!({"model":"duplicate-smart","messages":[]});
+
+        let first = anthropic_messages_stream(&ctx, request(), &policy)
+            .await
+            .unwrap();
+        assert_eq!(first.selection.connection_id, "first");
+        assert_eq!(
+            ctx.store
+                .get_setting("llm_provider_account_round_robin_cursor.anthropic.claude-t")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            ctx.store
+                .get_setting("llm_model_route_round_robin_cursor.duplicate-rr")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+
+        let second = anthropic_messages_stream(&ctx, request(), &policy)
+            .await
+            .unwrap();
+        assert_eq!(second.selection.connection_id, "second");
+        assert_eq!(
+            ctx.store
+                .get_setting("llm_provider_account_round_robin_cursor.anthropic.claude-t")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ctx.store
+                .get_setting("llm_model_route_round_robin_cursor.duplicate-rr")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn route_selection_failover_classifies_auth_quota_rate_transport_and_unavailable() {
+        let cases = [
+            (
+                UpstreamAttemptFailure::http("p", 401, "auth-secret-sentinel"),
+                RouteFailureCategory::Authentication,
+            ),
+            (
+                UpstreamAttemptFailure::http("p", 429, "quota-secret-sentinel exceeded"),
+                RouteFailureCategory::Quota,
+            ),
+            (
+                UpstreamAttemptFailure::http("p", 429, "rate-secret-sentinel limit"),
+                RouteFailureCategory::RateLimit,
+            ),
+            (
+                UpstreamAttemptFailure::transport("p", "transport-secret-sentinel"),
+                RouteFailureCategory::Transport,
+            ),
+            (
+                UpstreamAttemptFailure::http("p", 503, "unavailable-secret-sentinel"),
+                RouteFailureCategory::Unavailable,
+            ),
+        ];
+        for (failure, expected) in cases {
+            assert_eq!(failure.category, expected);
+            let reason =
+                crate::llm_router::provenance::RouteSelectionReason::Failover(failure.category);
+            assert_eq!(
+                reason,
+                crate::llm_router::provenance::RouteSelectionReason::Failover(expected)
+            );
+            assert!(!format!("{reason:?}").contains("secret-sentinel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selection_never_reports_failed_candidate() {
+        let port = provenance_test_server(SSE_ERROR_BEFORE_CONTENT, SSE_OK_STREAM).await;
+        let ctx = test_ctx().await;
+        add_provenance_account(
+            &ctx,
+            "failed",
+            "Failed secret-sentinel",
+            port,
+            "first",
+            "claude-t",
+        )
+        .await;
+        add_provenance_account(&ctx, "accepted", "Accepted", port, "second", "claude-t").await;
+        let routed = anthropic_messages_stream(
+            &ctx,
+            json!({"model":"anthropic/claude-t","messages":[]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(routed.selection.connection_id, "accepted");
+        assert_eq!(
+            routed.selection.reason,
+            crate::llm_router::provenance::RouteSelectionReason::Failover(
+                RouteFailureCategory::Unavailable
+            )
+        );
+        assert!(!format!("{:?}", routed.selection).contains("secret-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn route_selection_exhaustion_returns_no_stream() {
+        let port = provenance_test_server(SSE_ERROR_BEFORE_CONTENT, SSE_ERROR_BEFORE_CONTENT).await;
+        let ctx = test_ctx().await;
+        add_provenance_account(&ctx, "first", "First", port, "first", "claude-t").await;
+        add_provenance_account(&ctx, "second", "Second", port, "second", "claude-t").await;
+        assert!(anthropic_messages_stream(
+            &ctx,
+            json!({"model":"anthropic/claude-t","messages":[]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref()
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn route_selection_midstream_error_keeps_accepted_selection() {
+        let port = provenance_test_server(SSE_CONTENT_THEN_ERROR, SSE_OK_STREAM).await;
+        let ctx = test_ctx().await;
+        add_provenance_account(&ctx, "accepted", "Accepted", port, "first", "claude-t").await;
+        add_provenance_account(&ctx, "unused", "Unused", port, "second", "claude-t").await;
+        let routed = anthropic_messages_stream(
+            &ctx,
+            json!({"model":"anthropic/claude-t","messages":[]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(routed.selection.connection_id, "accepted");
+        assert_eq!(
+            routed.selection.reason,
+            crate::llm_router::provenance::RouteSelectionReason::Ordered
+        );
+        let events = collect_stream(routed.events).await;
+        assert_eq!(stream_text(&events), "partial");
+        assert!(events.iter().any(|(name, _)| name == "error"));
+    }
+
+    #[tokio::test]
+    async fn route_selection_continuation_carries_order_and_failure_reason() {
+        let port = provenance_test_server(SSE_ERROR_BEFORE_CONTENT, SSE_OK_STREAM).await;
+        let ctx = test_ctx().await;
+        add_provenance_account(&ctx, "failed", "Failed", port, "first", "claude-t").await;
+        add_provenance_account(
+            &ctx,
+            "continued",
+            "Continued",
+            port,
+            "second",
+            "claude-next",
+        )
+        .await;
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "continuation".into(),
+                name: "smart".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-t".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-next".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let routed = anthropic_messages_stream(
+            &ctx,
+            json!({"model":"anthropic/claude-t","messages":[]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(routed.selection.resolved_model, "claude-next");
+        assert_eq!(
+            routed.selection.reason,
+            crate::llm_router::provenance::RouteSelectionReason::Failover(
+                RouteFailureCategory::Unavailable
+            )
+        );
     }
 
     /// Concatenated text of every text_delta in the collected events.
@@ -2139,7 +3360,7 @@ mod tests {
             provider: "anthropic".into(),
             message: "invalid request".into(),
             status: Some(400),
-            transport: false,
+            category: RouteFailureCategory::Unavailable,
         };
         assert!(!should_try_next_target(&bad_request));
     }
@@ -2276,10 +3497,11 @@ mod tests {
                 "model": "anthropic/claude-t",
                 "messages": [{"role": "user", "content": "hi"}],
             }),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
-        let events = collect_stream(rx).await;
+        let events = collect_stream(rx.events).await;
 
         assert_eq!(stream_text(&events), "rotated");
     }
@@ -2328,6 +3550,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_streams_route_accounts_dynamically_with_same_effort_policy() {
+        use axum::{routing::post, Router};
+
+        const FIRST: &str = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        const SECOND: &str = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"second\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let app = Router::new()
+            .route(
+                "/first/messages",
+                post(|| async { ([("content-type", "text/event-stream")], FIRST) }),
+            )
+            .route(
+                "/second/messages",
+                post(|| async { ([("content-type", "text/event-stream")], SECOND) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ctx = test_ctx().await;
+        add_two_anthropic_accounts(&ctx, port).await;
+        routes::save_provider_account_route(
+            &ctx.store,
+            "anthropic",
+            routes::ModelRouteStrategy::RoundRobin,
+        )
+        .await
+        .unwrap();
+        let policy = utility_policy(&ctx, "anthropic/claude-t").await;
+        let body = || json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]});
+
+        let first = anthropic_messages_stream(&ctx, body(), &policy)
+            .await
+            .unwrap();
+        let second = anthropic_messages_stream(&ctx, body(), &policy)
+            .await
+            .unwrap();
+        assert_eq!(stream_text(&collect_stream(first.events).await), "first");
+        assert_eq!(stream_text(&collect_stream(second.events).await), "second");
+        assert_eq!(Arc::strong_count(&policy), 1);
+    }
+
+    #[tokio::test]
     async fn stream_rotates_on_error_event_before_first_content() {
         use axum::{routing::post, Router};
 
@@ -2357,10 +3621,11 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
-        let events = collect_stream(rx).await;
+        let events = collect_stream(rx.events).await;
 
         assert_eq!(stream_text(&events), "rotated");
         assert!(
@@ -2408,10 +3673,11 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
-        let events = collect_stream(rx).await;
+        let events = collect_stream(rx.events).await;
 
         assert_eq!(stream_text(&events), "partial");
         assert!(
@@ -2466,9 +3732,11 @@ mod tests {
         let err = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
-        .unwrap_err();
+        .err()
+        .expect("all attempts must fail");
 
         assert!(
             err.to_string().contains("Overloaded"),
@@ -2532,10 +3800,11 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
-        let events = collect_stream(rx).await;
+        let events = collect_stream(rx.events).await;
 
         // The content that DID arrive is preserved…
         assert_eq!(stream_text(&events), "half");
@@ -2578,10 +3847,11 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
-        let events = collect_stream(rx).await;
+        let events = collect_stream(rx.events).await;
 
         // The empty first stream (no terminal event, no content) triggers the
         // guard's error event, which the pre-content probe converts into a
@@ -2784,6 +4054,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-x".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "claude-x", "system": "be helpful", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -2807,12 +4079,16 @@ mod tests {
             "2023-06-01"
         );
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
-        assert_eq!(sent["system"][0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
-        assert_eq!(sent["system"][1]["text"], "be helpful");
+        assert!(sent["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.92."));
+        assert_eq!(sent["system"][1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(sent["system"][2]["text"], "be helpful");
     }
 
     #[tokio::test]
-    async fn oauth_request_for_anthropic_applies_full_cloak_when_enabled() {
+    async fn anthropic_oauth_without_config_cloaks_request_and_headers() {
         let ctx = test_ctx().await;
         let desc = registry::descriptor("anthropic-oauth").unwrap();
         let conn = mk_conn(
@@ -2821,7 +4097,6 @@ mod tests {
             "oauth",
             ConnectionData {
                 access_token: Some("sk-ant-oat-test".into()),
-                provider_specific: Some(json!({"claudeCloaking": true})),
                 ..Default::default()
             },
         );
@@ -2829,6 +4104,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "claude-x".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({
             "model": "claude-x",
@@ -2885,6 +4162,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "gpt-5.2-codex".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "gpt-5.2-codex", "input": "hi"});
         let req = upstream_request(&ctx, &target, &body)
@@ -2921,6 +4200,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "gpt-5.2-codex".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "gpt-5.2-codex", "input": "hi"});
         let req = upstream_request(&ctx, &target, &body)
@@ -2977,10 +4258,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-5.2-codex".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-sonnet-4-5".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -3046,10 +4329,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "openai".into(),
                         model: "gpt-5.2-codex".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-sonnet-4-5".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -3070,8 +4355,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_is_offered_and_effort_variants_route_to_openai_oauth() {
+    async fn selectable_native_models_returns_one_canonical_codex_model_with_metadata() {
         let ctx = test_ctx().await;
+        let mut model_meta = std::collections::HashMap::new();
+        model_meta.insert(
+            "gpt-5.2-codex".into(),
+            crate::llm_router::model_effort::DiscoveredModelMeta {
+                display_name: Some("GPT-5.2 Codex".into()),
+                effort_options: Some(vec![
+                    crate::llm_router::model_effort::ReasoningEffortOption {
+                        value: "medium".into(),
+                        label: "Medium".into(),
+                        description: Some("Balanced".into()),
+                    },
+                    crate::llm_router::model_effort::ReasoningEffortOption {
+                        value: "high".into(),
+                        label: "High".into(),
+                        description: Some("More reasoning".into()),
+                    },
+                ]),
+                default_effort_advertised: true,
+                default_effort: Some("medium".into()),
+            },
+        );
         connections::add_connection(
             &ctx.store,
             mk_conn(
@@ -3081,6 +4387,7 @@ mod tests {
                 ConnectionData {
                     access_token: Some("at".into()),
                     models_override: Some(vec!["gpt-5.2-codex".into()]),
+                    model_meta_overrides: Some(model_meta),
                     ..Default::default()
                 },
             ),
@@ -3088,24 +4395,565 @@ mod tests {
         .await
         .unwrap();
 
-        let models = selectable_native_models(&ctx.store).await;
-        assert!(
-            models.iter().any(|m| m == "openai/gpt-5.2-codex"),
-            "got {models:?}"
+        let models = selectable_native_models(&ctx.store).await.unwrap();
+        assert_eq!(models.len(), 1, "must not synthesize effort model ids");
+        let model = &models[0];
+        assert_eq!(model.request_value, "openai/gpt-5.2-codex");
+        assert_eq!(model.display_name, "GPT-5.2 Codex");
+        assert_eq!(
+            model
+                .supported
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["medium", "high"]
         );
-        assert!(
-            models.iter().any(|m| m == "openai/gpt-5.2-codex-high"),
-            "effort variant missing: {models:?}"
-        );
+        assert_eq!(model.resolved_default.as_deref(), Some("medium"));
+        assert!(!models.iter().any(|model| {
+            ["-low", "-medium", "-high", "-xhigh"]
+                .iter()
+                .any(|suffix| model.request_value.ends_with(suffix))
+        }));
+    }
 
-        // The family-scoped suffixed id routes to the openai-oauth connection
-        // (the only enabled account in the "openai" family here).
-        let t = route_model_for_anthropic_messages(&ctx.store, "openai/gpt-5.2-codex-high")
+    #[tokio::test]
+    async fn legacy_codex_family_requests_are_canonicalized_per_oauth_candidate() {
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "generic",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk".into()),
+                    models_override: Some(vec!["gpt-5.5-review".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "codex",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at".into()),
+                    models_override: Some(vec!["gpt-5.5".into(), "gpt-5.5-review".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        for request in ["openai/gpt-5.5-high-review", "openai/gpt-5.5-review-high"] {
+            let targets = route_models_for_anthropic_messages(&ctx.store, request)
+                .await
+                .unwrap();
+            assert_eq!(
+                targets.len(),
+                1,
+                "generic OpenAI must not accept compatibility parsing"
+            );
+            assert_eq!(targets[0].conn.provider, "openai-oauth");
+            assert_eq!(targets[0].upstream_model, "gpt-5.5-review");
+            assert_eq!(
+                targets[0].request_compatibility_effort.as_deref(),
+                Some("high")
+            );
+            assert!(targets[0].route_target_key.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn named_route_targets_keep_original_effort_key_after_round_robin_rotation() {
+        let ctx = test_ctx().await;
+        for (id, provider, model) in [
+            ("openai", "openai", "gpt-route"),
+            ("anthropic", "anthropic", "claude-route"),
+        ] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    provider,
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("key".into()),
+                        models_override: Some(vec![model.into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "rotating".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::RoundRobin,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "gpt-route".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-route".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let first = route_models_for_anthropic_messages(&ctx.store, "rotating")
+            .await
+            .unwrap();
+        let second = route_models_for_anthropic_messages(&ctx.store, "rotating")
+            .await
+            .unwrap();
+        assert_eq!(first[0].route_target_key.as_ref().unwrap().target_index, 0);
+        assert_eq!(second[0].route_target_key.as_ref().unwrap().target_index, 1);
+    }
+
+    #[tokio::test]
+    async fn matching_route_alias_ending_in_high_remains_exact() {
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "generic",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk".into()),
+                    models_override: Some(vec!["real-model".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "fast-high".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "real-model".into(),
+                    effort: None,
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let target = route_model(&ctx.store, "fast-high").await.unwrap().unwrap();
+        assert_eq!(target.upstream_model, "real-model");
+        assert_eq!(target.request_compatibility_effort, None);
+        assert!(target.route_target_key.is_some());
+    }
+
+    #[test]
+    fn request_compatibility_effort_reaches_resolved_target_policy() {
+        let surface = model_effort::ExecutionSurfaceKey {
+            provider_id: "openai-oauth".into(),
+            connection_id: Some("codex".into()),
+            model: "gpt-5.5-review".into(),
+        };
+        let preference = model_effort::ModelPreferenceKey {
+            family: "openai".into(),
+            model: "gpt-5.5-review".into(),
+        };
+        let capabilities = model_effort::ExecutionModelEffortCapabilities {
+            surface: surface.clone(),
+            model_display_name: "gpt-5.5-review".into(),
+            supported: vec![
+                model_effort::ReasoningEffortOption {
+                    value: "low".into(),
+                    label: "Low".into(),
+                    description: None,
+                },
+                model_effort::ReasoningEffortOption {
+                    value: "high".into(),
+                    label: "High".into(),
+                    description: None,
+                },
+            ],
+            provider_default: Some("low".into()),
+        };
+        let mut policy = model_effort::TurnEffortPolicy {
+            requested_model: "openai/gpt-5.5-review-high".into(),
+            project_override: None,
+            route_compatibility: Default::default(),
+            configured: Default::default(),
+            surfaces: [(surface.clone(), capabilities)].into(),
+        };
+
+        let resolved = resolve_target_effort(&policy, None, Some("high"), &preference, &surface);
+        assert_eq!(resolved.value.as_deref(), Some("high"));
+        assert_eq!(
+            resolved.source,
+            model_effort::EffectiveEffortSource::RouteCompatibility
+        );
+        policy.project_override = Some("low".into());
+        let project = resolve_target_effort(&policy, None, Some("high"), &preference, &surface);
+        assert_eq!(project.value.as_deref(), Some("low"));
+        assert_eq!(project.source, model_effort::EffectiveEffortSource::Project);
+    }
+
+    #[tokio::test]
+    async fn selectable_models_do_not_advance_round_robin_cursors() {
+        let ctx = test_ctx().await;
+        for id in ["openai-1", "openai-2"] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    "openai",
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("key".into()),
+                        models_override: Some(vec!["gpt-route".into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "anthropic-1",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    models_override: Some(vec!["claude-route".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_provider_account_route(
+            &ctx.store,
+            "openai",
+            routes::ModelRouteStrategy::RoundRobin,
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "r1".into(),
+                name: "rotating".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::RoundRobin,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "gpt-route".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-route".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        selectable_native_models(&ctx.store).await.unwrap();
+        selectable_native_models(&ctx.store).await.unwrap();
+
+        let direct = route_models_for_anthropic_messages(&ctx.store, "openai/gpt-route")
+            .await
+            .unwrap();
+        assert_eq!(direct[0].conn.id, "openai-1");
+        let named = route_models_for_anthropic_messages(&ctx.store, "rotating")
+            .await
+            .unwrap();
+        assert_eq!(named[0].route_target_key.as_ref().unwrap().target_index, 0);
+    }
+
+    #[tokio::test]
+    async fn compatibility_suffixes_are_candidate_local_and_unknown_models_remain_exact() {
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "codex",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at".into()),
+                    models_override: Some(vec!["gpt-known".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "generic-bare",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk".into()),
+                    models_override: Some(vec!["gpt-known-high".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "generic-openai",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk".into()),
+                    models_override: Some(vec!["gpt-unknown-high".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "anthropic",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk".into()),
+                    models_override: Some(vec!["claude-high".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let bare = route_models_for_anthropic_messages(&ctx.store, "gpt-known-high")
+            .await
+            .unwrap();
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].conn.id, "generic-bare");
+        assert_eq!(bare[0].upstream_model, "gpt-known-high");
+        assert_eq!(bare[0].request_compatibility_effort, None);
+
+        let unknown = route_model(&ctx.store, "openai/gpt-unknown-high")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(t.conn.provider, "openai-oauth");
-        assert_eq!(t.upstream_model, "gpt-5.2-codex-high");
+        assert_eq!(unknown.conn.provider, "openai");
+        assert_eq!(unknown.upstream_model, "gpt-unknown-high");
+        assert_eq!(unknown.request_compatibility_effort, None);
+
+        let anthropic = route_model(&ctx.store, "anthropic/claude-high")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(anthropic.upstream_model, "claude-high");
+        assert_eq!(anthropic.request_compatibility_effort, None);
+    }
+
+    #[tokio::test]
+    async fn selectable_native_models_intersects_routes_and_preserves_review_identity_and_defaults()
+    {
+        let ctx = test_ctx().await;
+        let discovered =
+            |values: &[&str], default: &str| crate::llm_router::model_effort::DiscoveredModelMeta {
+                display_name: Some("Friendly base".into()),
+                effort_options: Some(
+                    values
+                        .iter()
+                        .map(|value| model_effort::ReasoningEffortOption {
+                            value: (*value).into(),
+                            label: (*value).into(),
+                            description: None,
+                        })
+                        .collect(),
+                ),
+                default_effort_advertised: true,
+                default_effort: Some(default.into()),
+            };
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "codex",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("at".into()),
+                    models_override: Some(vec!["gpt-x".into(), "gpt-x-review".into()]),
+                    model_meta_overrides: Some(
+                        [
+                            ("gpt-x".into(), discovered(&["medium", "high"], "medium")),
+                            (
+                                "gpt-x-review".into(),
+                                discovered(&["medium", "high"], "medium"),
+                            ),
+                        ]
+                        .into(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "anthropic",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk".into()),
+                    models_override: Some(vec!["claude-x".into()]),
+                    model_meta_overrides: Some(
+                        [("claude-x".into(), discovered(&["high", "ultra"], "high"))].into(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let route_info = routes::ModelRouteInfo {
+            id: "r1".into(),
+            name: "safe".into(),
+            enabled: true,
+            strategy: routes::ModelRouteStrategy::Fallback,
+            targets: vec![
+                routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-x".into(),
+                    effort: Some("high".into()),
+                },
+                routes::ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "claude-x".into(),
+                    effort: None,
+                },
+            ],
+            created_at: 1,
+            updated_at: 1,
+        };
+        ctx.store
+            .set_setting(
+                "llm_model_routes",
+                &serde_json::to_string(&vec![route_info]).unwrap(),
+            )
+            .await
+            .unwrap();
+        let models = selectable_native_models(&ctx.store).await.unwrap();
+        let route = models
+            .iter()
+            .find(|model| model.request_value == "safe")
+            .unwrap();
+        assert_eq!(
+            route
+                .supported
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["high"]
+        );
+        assert_eq!(route.configured_default, None);
+        assert_eq!(route.resolved_default.as_deref(), Some("high"));
+        assert_eq!(
+            route.default_source,
+            model_effort::ModelDefaultSource::VariesByTarget
+        );
+        let policy = model_effort::build_utility_effort_policy(&ctx.store, "safe")
+            .await
+            .unwrap();
+        let routed = route_models_for_anthropic_messages(&ctx.store, "safe")
+            .await
+            .unwrap();
+        let target = routed
+            .iter()
+            .find(|target| target.conn.provider == "openai-oauth")
+            .unwrap();
+        let surface = model_effort::ExecutionSurfaceKey {
+            provider_id: target.conn.provider.clone(),
+            connection_id: Some(target.conn.id.clone()),
+            model: target.upstream_model.clone(),
+        };
+        let preference = model_effort::ModelPreferenceKey {
+            family: target.desc.family.into(),
+            model: target.upstream_model.clone(),
+        };
+        let resolved = resolve_target_effort(
+            &policy,
+            target.route_target_key.as_ref(),
+            None,
+            &preference,
+            &surface,
+        );
+        assert_eq!(resolved.value.as_deref(), Some("high"));
+        assert_eq!(
+            resolved.source,
+            model_effort::EffectiveEffortSource::RouteCompatibility
+        );
+        let mut project_policy = policy.clone();
+        project_policy.project_override = Some("medium".into());
+        let project = resolve_target_effort(
+            &project_policy,
+            target.route_target_key.as_ref(),
+            None,
+            &preference,
+            &surface,
+        );
+        assert_eq!(project.value.as_deref(), Some("medium"));
+        assert_eq!(project.source, model_effort::EffectiveEffortSource::Project);
+        let concrete = models
+            .iter()
+            .find(|model| model.request_value == "openai/gpt-x")
+            .unwrap();
+        assert_eq!(concrete.configured_default, None);
+        assert_eq!(concrete.resolved_default.as_deref(), Some("medium"));
+        assert_eq!(
+            concrete.default_source,
+            model_effort::ModelDefaultSource::Provider
+        );
+        let review = models
+            .iter()
+            .find(|model| model.request_value == "openai/gpt-x-review")
+            .unwrap();
+        assert_eq!(review.display_name, "gpt-x-review");
     }
 
     #[tokio::test]
@@ -3190,6 +5038,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "openrouter".into(),
                     model: "deepseek/deepseek-chat:free".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -3207,6 +5056,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "openai".into(),
                     model: "gpt-5.2-codex".into(),
+                    effort: None,
                 }],
                 created_at: 2,
                 updated_at: 2,
@@ -3215,35 +5065,46 @@ mod tests {
         .await
         .unwrap();
 
-        let models = selectable_native_models(&ctx.store).await;
+        let models = selectable_native_models(&ctx.store).await.unwrap();
 
         // Usable route first; the openrouter provider/model is offered.
-        assert_eq!(models.first().map(String::as_str), Some("usable-combo"));
+        assert_eq!(
+            models.first().map(|model| model.request_value.as_str()),
+            Some("usable-combo")
+        );
         assert!(models
             .iter()
-            .any(|m| m == "openrouter/deepseek/deepseek-chat:free"));
+            .any(|m| m.request_value == "openrouter/deepseek/deepseek-chat:free"));
         // Kiro is drivable natively — its models are offered.
         assert!(
-            models.iter().any(|m| m == "kiro/claude-sonnet-5"),
+            models
+                .iter()
+                .any(|m| m.request_value == "kiro/claude-sonnet-5"),
             "kiro must be offered, got: {models:?}"
         );
         // Codex is drivable natively — its model (plus effort variants) and
         // the Codex-only route are offered.
         assert!(
-            models.iter().any(|m| m == "openai/gpt-5.2-codex"),
+            models
+                .iter()
+                .any(|m| m.request_value == "openai/gpt-5.2-codex"),
             "got: {models:?}"
         );
         assert!(
-            models.iter().any(|m| m == "openai/gpt-5.2-codex-high"),
-            "effort variant missing, got: {models:?}"
+            !models
+                .iter()
+                .any(|m| m.request_value == "openai/gpt-5.2-codex-high"),
+            "selection must not synthesize effort variants: {models:?}"
         );
         assert!(
-            models.iter().any(|m| m == "codex-only"),
+            models.iter().any(|m| m.request_value == "codex-only"),
             "codex-only route must be offered, got: {models:?}"
         );
         // A keyless connection's models are never offered.
         assert!(
-            !models.iter().any(|m| m == "openrouter/keyless/model"),
+            !models
+                .iter()
+                .any(|m| m.request_value == "openrouter/keyless/model"),
             "got: {models:?}"
         );
     }
@@ -3295,6 +5156,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "claude-fable-5".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -3360,10 +5222,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "openrouter".into(),
                         model: "z-ai/glm-5.2".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-sonnet-4-5".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -3427,6 +5291,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "claude-sonnet-4-5".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -3518,10 +5383,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-first".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-second".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -3684,6 +5551,7 @@ mod tests {
                 targets: vec![routes::ModelRouteTarget {
                     provider: "anthropic".into(),
                     model: "claude-fable-5".into(),
+                    effort: None,
                 }],
                 created_at: 1,
                 updated_at: 1,
@@ -3819,6 +5687,8 @@ mod tests {
             conn: mk_conn("m1", "mimo-free", "free", ConnectionData::default()),
             desc,
             upstream_model: "mimo-auto".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({
             "model": "mimo-auto",
@@ -3879,6 +5749,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "grok-code".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "grok-code", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -3909,6 +5781,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "mimo-auto".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "mimo-auto", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -3937,6 +5811,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "qwen3-coder-plus".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({ "model": "qwen3-coder-plus", "messages": [] });
         let req = upstream_request(&ctx, &target, &body)
@@ -3967,6 +5843,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "qwen3-coder-plus".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({ "model": "qwen3-coder-plus", "messages": [] });
         let req = upstream_request(&ctx, &target, &body)
@@ -3996,6 +5874,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "gpt-5.2".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({ "model": "gpt-5.2", "messages": [] });
         let req = upstream_request(&ctx, &target, &body)
@@ -4067,6 +5947,8 @@ mod tests {
             conn,
             desc,
             upstream_model: "gpt-5.2".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let body = json!({"model": "gpt-5.2", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -4234,10 +6116,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-a".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-b".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -4332,10 +6216,12 @@ mod tests {
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-a".into(),
+                        effort: None,
                     },
                     routes::ModelRouteTarget {
                         provider: "anthropic".into(),
                         model: "claude-b".into(),
+                        effort: None,
                     },
                 ],
                 created_at: 1,
@@ -4351,10 +6237,11 @@ mod tests {
                 "model": "anthropic/claude-a",
                 "messages": [{"role": "user", "content": "hi"}],
             }),
+            utility_policy(&ctx, "anthropic/claude-a").await.as_ref(),
         )
         .await
         .unwrap();
-        let events = collect_stream(rx).await;
+        let events = collect_stream(rx.events).await;
 
         assert_eq!(stream_text(&events), "rotated");
     }

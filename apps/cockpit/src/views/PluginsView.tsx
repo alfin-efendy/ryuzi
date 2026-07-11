@@ -2,9 +2,9 @@ import { useEffect, useState } from "react";
 import { CircleAlert, MonitorUp, Pin, PinOff, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge, Button, Combobox, Segmented, SettingsCard as Card } from "@ryuzi/ui";
-import { commands, type AppInfo, type PluginInfo } from "@/bindings";
+import { commands, type AppInfo, type CatalogStatus, type PluginInfo } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
-import { Chip, IconChip, Pill, PluginStatusBadge, StatusDot } from "@/components/common/bits";
+import { BlockedBadge, Chip, IconChip, Pill, PluginStatusBadge, StatusDot } from "@/components/common/bits";
 import { DoctorPanel } from "@/components/DoctorPanel";
 import { useApps } from "@/store-apps";
 import { useGateways } from "@/store-gateways";
@@ -34,8 +34,19 @@ export function filterByCategory(plugins: PluginInfo[], category: string): Plugi
   return plugins.filter((p) => p.categories.includes(category));
 }
 
+/** Subtle Browse-tab status line summarizing the last `catalog_status`/
+ *  `refresh_catalog` snapshot. Pure (and exported) so it stays unit-testable
+ *  without mounting the view. */
+export function catalogStatusLabel(status: CatalogStatus): string {
+  if (!status.lastFetchAt) return "Catalog not yet fetched";
+  const when = new Date(status.lastFetchAt).toLocaleString();
+  const blockedPart = status.blocked > 0 ? `, ${status.blocked} blocked` : "";
+  return `Catalog seq ${status.sequence} · ${status.entries} entries${blockedPart} · fetched ${when}`;
+}
+
 function BrowseCard({ plugin, onInstall }: { plugin: PluginInfo; onInstall: () => void }) {
   const Icon = pluginIcon(plugin.icon);
+  const blocked = plugin.blockedReason !== null;
   return (
     <Card className="flex flex-col gap-3 px-[18px] py-4">
       <div className="flex items-start gap-3">
@@ -46,7 +57,7 @@ function BrowseCard({ plugin, onInstall }: { plugin: PluginInfo; onInstall: () =
             {plugin.description}
           </span>
         </span>
-        <PluginStatusBadge verified={plugin.verified} experimental={plugin.experimental} />
+        {blocked ? <BlockedBadge /> : <PluginStatusBadge verified={plugin.verified} experimental={plugin.experimental} />}
       </div>
       <div className="flex flex-wrap gap-1.5">
         {plugin.categories.map((c) => (
@@ -55,11 +66,14 @@ function BrowseCard({ plugin, onInstall }: { plugin: PluginInfo; onInstall: () =
           </Badge>
         ))}
       </div>
+      {blocked && plugin.blockedReason && <p className="m-0 text-[11.5px] text-destructive">{plugin.blockedReason}</p>}
       <div className="flex items-center gap-2 pt-0.5">
         <span className="flex-1" />
-        <Button size="sm" onClick={onInstall} aria-label={`Install ${plugin.name}`}>
-          Install
-        </Button>
+        {!blocked && (
+          <Button size="sm" onClick={onInstall} aria-label={`Install ${plugin.name}`}>
+            Install
+          </Button>
+        )}
       </div>
     </Card>
   );
@@ -86,6 +100,7 @@ function InstalledPluginCard({
 }) {
   const Icon = pluginIcon(plugin.icon);
   const isSkillPack = plugin.kind === "skill-pack";
+  const blocked = plugin.blockedReason !== null;
   return (
     <Card className="flex flex-col gap-3 px-[18px] py-4">
       <div className="flex items-start gap-3">
@@ -98,7 +113,7 @@ function InstalledPluginCard({
         </span>
         <Badge variant="outline">{plugin.kind}</Badge>
       </div>
-      {(pinned || attachFailed) && (
+      {(pinned || attachFailed || blocked) && (
         <div className="flex flex-wrap items-center gap-1.5">
           {pinned && (
             <Pill variant="mono">
@@ -107,6 +122,7 @@ function InstalledPluginCard({
             </Pill>
           )}
           {attachFailed && <Pill variant="warn">Attach failed</Pill>}
+          {blocked && <BlockedBadge />}
         </div>
       )}
       <div className="flex items-center gap-2 pt-0.5">
@@ -151,6 +167,8 @@ export function PluginsView() {
     doctorFindings,
     doctorLoaded,
     loadDoctor,
+    catalogStatus,
+    refreshCatalog,
   } = usePlugins();
   const skills = useSkills((s) => s.skills);
   const skillsLoading = useSkills((s) => s.loading);
@@ -166,6 +184,7 @@ export function PluginsView() {
   const [updatingIds, setUpdatingIds] = useState<Set<string>>(new Set());
   const [updatingAll, setUpdatingAll] = useState(false);
   const [doctorOpen, setDoctorOpen] = useState(false);
+  const [refreshingCatalog, setRefreshingCatalog] = useState(false);
 
   useEffect(() => {
     void hydrate();
@@ -252,6 +271,13 @@ export function PluginsView() {
     toast.success(`Update all — ${summarizeUpdateAll(res.data)}`);
     await loadPlugins();
     if (doctorLoaded) void loadDoctor();
+  };
+
+  const runRefreshCatalog = async () => {
+    if (refreshingCatalog) return;
+    setRefreshingCatalog(true);
+    await refreshCatalog();
+    setRefreshingCatalog(false);
   };
 
   const scopeLabel = (app: AppInfo): string => {
@@ -409,18 +435,26 @@ export function PluginsView() {
 
         {tab === "browse" && (
           <>
-            {categories.length > 0 && (
-              <div className="mb-4 flex flex-wrap items-center gap-2">
-                <span className="text-[12.5px] font-medium text-muted-foreground">Category</span>
-                <Combobox
-                  aria-label="Category"
-                  options={[{ value: "all", label: "All categories" }, ...categories.map((c) => ({ value: c, label: c }))]}
-                  value={category}
-                  onValueChange={setCategory}
-                  className="w-[200px]"
-                />
-              </div>
-            )}
+            <div className="mb-4 flex flex-wrap items-center gap-2">
+              {categories.length > 0 && (
+                <>
+                  <span className="text-[12.5px] font-medium text-muted-foreground">Category</span>
+                  <Combobox
+                    aria-label="Category"
+                    options={[{ value: "all", label: "All categories" }, ...categories.map((c) => ({ value: c, label: c }))]}
+                    value={category}
+                    onValueChange={setCategory}
+                    className="w-[200px]"
+                  />
+                </>
+              )}
+              <span className="flex-1" />
+              {catalogStatus && <span className="text-[11.5px] text-muted-foreground">{catalogStatusLabel(catalogStatus)}</span>}
+              <Button variant="outline" size="sm" onClick={() => void runRefreshCatalog()} disabled={refreshingCatalog}>
+                <RefreshCw aria-hidden size={13} strokeWidth={2} className={refreshingCatalog ? "animate-spin" : undefined} />
+                {refreshingCatalog ? "Refreshing…" : "Refresh catalog"}
+              </Button>
+            </div>
             {pluginsLoaded && browse.length === 0 && (
               <Card className="mb-3 p-6 text-center text-[13px] text-muted-foreground">
                 {browsePlugins(plugins).length === 0 ? "Everything in the catalog is installed." : "No integrations match this category."}

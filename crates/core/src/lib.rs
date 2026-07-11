@@ -2,6 +2,7 @@ pub mod agent_settings;
 pub mod api;
 pub mod approval;
 pub mod attachments;
+pub mod background_rail;
 pub mod branches;
 pub mod connector;
 pub mod control;

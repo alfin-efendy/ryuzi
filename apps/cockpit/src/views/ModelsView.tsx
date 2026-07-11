@@ -20,9 +20,10 @@ import {
   Switch,
 } from "@ryuzi/ui";
 import { ModelPicker } from "@/components/ModelPicker";
-import { CategoryBadge, Chip, Pill, StatusDot } from "@/components/common/bits";
+import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
+import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
 
 type Tab = "providers" | "route" | "endpoint";
 
@@ -31,7 +32,6 @@ type ProviderRowInfo = {
   name: string;
   color: string;
   initial: string;
-  badges: string[];
   accounts: ConnectionInfo[];
   catalogModels: number;
   modelCount: number;
@@ -53,17 +53,6 @@ function modelLabel(count: number, catalog = false): string {
   return `${count} ${catalog ? "catalog " : ""}model${count === 1 ? "" : "s"}`;
 }
 
-const BADGE_ORDER = ["free", "free_tier", "oauth", "api_key"];
-
-function badgeKeys(entries: CatalogEntry[]): string[] {
-  const keys = new Set<string>();
-  for (const entry of entries) {
-    keys.add(entry.category === "device" ? "free" : entry.category);
-    if (entry.freeTier) keys.add("free_tier");
-  }
-  return Array.from(keys).sort((a, b) => BADGE_ORDER.indexOf(a) - BADGE_ORDER.indexOf(b));
-}
-
 function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[]): ProviderRowInfo[] {
   const rows = new Map<string, ProviderRowInfo>();
   const familyByProvider = new Map(catalog.map((entry) => [entry.id, entry.family]));
@@ -79,15 +68,11 @@ function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[
         name: head.name,
         color: head.color,
         initial: head.initial,
-        badges: [],
         accounts: [],
         catalogModels: 0,
         modelCount: 0,
       });
     }
-  }
-  for (const [family, row] of rows) {
-    row.badges = badgeKeys(catalog.filter((entry) => entry.family === family));
   }
   for (const [family, models] of catalogModelsByFamily) {
     const row = rows.get(family);
@@ -105,7 +90,6 @@ function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[
         name: conn.providerName,
         color: conn.color,
         initial: conn.initial,
-        badges: [conn.authType === "oauth" ? "oauth" : conn.authType === "free" ? "free" : "api_key"],
         accounts: [],
         catalogModels: 0,
         modelCount: 0,
@@ -138,6 +122,7 @@ function EndpointTab() {
   const [savingConfig, setSavingConfig] = useState(false);
   const [keyName, setKeyName] = useState("");
   const [creatingKey, setCreatingKey] = useState(false);
+  const [revokeTarget, setRevokeTarget] = useState<{ id: string; name: string; trigger: HTMLButtonElement } | null>(null);
 
   // Seed the settings form from the first status load only — later refreshes
   // (e.g. after Start/Stop) shouldn't clobber an in-progress edit.
@@ -185,9 +170,9 @@ function EndpointTab() {
     setKeyName("");
   };
 
-  const doRevoke = async (id: string, name: string) => {
-    if (!window.confirm(`Revoke key "${name}"? Apps using it will lose access immediately.`)) return;
+  const doRevoke = async (id: string) => {
     await revokeKey(id);
+    return true;
   };
 
   const keychainStatus = status?.keychainStatus;
@@ -276,7 +261,11 @@ function EndpointTab() {
                 {k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleDateString() : "never"}
               </div>
             </div>
-            <Button variant="destructive" size="sm" onClick={() => void doRevoke(k.id, k.name)}>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={(event) => setRevokeTarget({ id: k.id, name: k.name, trigger: event.currentTarget })}
+            >
               Revoke
             </Button>
           </div>
@@ -291,6 +280,16 @@ function EndpointTab() {
           </Button>
         </div>
       </Card>
+      <ConfirmActionModal
+        open={revokeTarget !== null}
+        title="Revoke API key?"
+        description={revokeTarget ? `Revoke key "${revokeTarget.name}"? Apps using it will lose access immediately.` : ""}
+        confirmLabel="Revoke"
+        busyLabel="Revoking…"
+        trigger={revokeTarget?.trigger ?? null}
+        onClose={() => setRevokeTarget(null)}
+        onConfirm={() => (revokeTarget ? doRevoke(revokeTarget.id) : Promise.resolve(false))}
+      />
     </div>
   );
 }
@@ -298,7 +297,6 @@ function EndpointTab() {
 function ProviderRow({ row }: { row: ProviderRowInfo }) {
   const nav = useNav();
   const open = () => nav.navigate({ kind: "providerDetail", provider: row.id });
-  const activeCount = row.accounts.filter((account) => account.enabled).length;
   const modelText = modelLabel(row.modelCount, row.accounts.length === 0);
 
   return (
@@ -310,13 +308,7 @@ function ProviderRow({ row }: { row: ProviderRowInfo }) {
     >
       <Chip initial={row.initial} color={row.color} size={34} />
       <span className="min-w-0 flex-1">
-        <span className="flex min-w-0 flex-wrap items-center gap-1.5 text-sm font-semibold text-foreground">
-          <span className="truncate">{row.name}</span>
-          {row.badges.map((badge) => (
-            <CategoryBadge key={badge} category={badge} />
-          ))}
-          {activeCount > 0 && <Pill variant="primary">{activeCount} active</Pill>}
-        </span>
+        <span className="block truncate text-sm font-semibold text-foreground">{row.name}</span>
         <span className="block text-xs font-normal text-muted-foreground">
           {accountLabel(row.accounts.length)} · {modelText}
         </span>
@@ -382,7 +374,7 @@ function newRoute(targets: TargetOption[]): ModelRouteInfo {
     name: "",
     enabled: true,
     strategy: "fallback",
-    targets: first ? [{ provider: first.provider, model: first.model }] : [],
+    targets: first ? [{ provider: first.provider, model: first.model, effort: null }] : [],
     createdAt: 0,
     updatedAt: 0,
   };
@@ -420,7 +412,9 @@ function RouteForm({
     if (!option) return;
     setDraft((current) => ({
       ...current,
-      targets: current.targets.map((target, i) => (i === index ? { provider: option.provider, model: option.model } : target)),
+      targets: current.targets.map((target, i) =>
+        i === index ? { provider: option.provider, model: option.model, effort: null } : target,
+      ),
     }));
   };
 
@@ -429,7 +423,7 @@ function RouteForm({
     if (!option) return;
     setDraft((current) => ({
       ...current,
-      targets: [...current.targets, { provider: option.provider, model: option.model }],
+      targets: [...current.targets, { provider: option.provider, model: option.model, effort: null }],
     }));
   };
 
@@ -563,7 +557,7 @@ function RouteCard({
   route: ModelRouteInfo;
   catalog: CatalogEntry[];
   onEdit: () => void;
-  onDelete: () => void;
+  onDelete: (trigger: HTMLButtonElement) => void;
 }) {
   const copyName = () => {
     void navigator.clipboard.writeText(route.name);
@@ -592,7 +586,13 @@ function RouteCard({
         <Button variant="outline" size="sm" onClick={onEdit}>
           Edit
         </Button>
-        <Button variant="ghost" size="icon-sm" title="Delete route" onClick={onDelete} className="text-destructive hover:text-destructive">
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          title="Delete route"
+          onClick={(event) => onDelete(event.currentTarget)}
+          className="text-destructive hover:text-destructive"
+        >
           <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
         </Button>
       </div>
@@ -606,6 +606,7 @@ function RouteTab() {
   const connections = useConnections((s) => s.connections);
   const [editing, setEditing] = useState<ModelRouteInfo | null>(null);
   const [saving, setSaving] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<{ route: ModelRouteInfo; trigger: HTMLButtonElement } | null>(null);
   const targets = useMemo(() => routeTargetOptions(catalog, connections), [catalog, connections]);
 
   useEffect(() => {
@@ -620,8 +621,8 @@ function RouteTab() {
     if (ok) setEditing(null);
   };
   const deleteRoute = async (route: ModelRouteInfo) => {
-    if (!window.confirm(`Delete route "${route.name}"?`)) return;
     await remove(route.id);
+    return true;
   };
 
   return (
@@ -648,7 +649,7 @@ function RouteTab() {
           route={route}
           catalog={catalog}
           onEdit={() => setEditing(route)}
-          onDelete={() => void deleteRoute(route)}
+          onDelete={(trigger) => setDeleteTarget({ route, trigger })}
         />
       ))}
       {loaded && routes.length === 0 && !editing && (
@@ -656,6 +657,16 @@ function RouteTab() {
           No routes yet. Create a route alias to expose a combo-style model.
         </div>
       )}
+      <ConfirmActionModal
+        open={deleteTarget !== null}
+        title="Delete route?"
+        description={deleteTarget ? `Delete route "${deleteTarget.route.name}"?` : ""}
+        confirmLabel="Delete route"
+        busyLabel="Deleting…"
+        trigger={deleteTarget?.trigger ?? null}
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={() => (deleteTarget ? deleteRoute(deleteTarget.route) : Promise.resolve(false))}
+      />
     </div>
   );
 }

@@ -283,6 +283,14 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
     let updater = build_updater(Arc::clone(&daemon), dir.clone());
     updater.start();
 
+    let catalog_mgr = ryuzi_core::plugins::remote_catalog::RemoteCatalogManager::new(
+        daemon.store.clone(),
+        SettingsStore::new(daemon.store.clone()),
+        daemon.cp.clone(),
+        Arc::new(ryuzi_core::plugins::remote_catalog::ReqwestCatalogHttp::new()),
+    );
+    catalog_mgr.start();
+
     // Signal handlers are deliberately installed only AFTER connect succeeds: a signal during
     // the connect window falls back to default kill; the stale "connecting" file is benign — derive_state
     // treats a dead pid as stopped.

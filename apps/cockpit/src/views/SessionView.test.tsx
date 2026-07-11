@@ -16,9 +16,36 @@ const nativeCommands = mock(() => Promise.resolve({ status: "ok" as const, data:
 // TodoPanel (always mounted by SessionView) fires this on mount — stubbed ok:[]
 // so its effect resolves cleanly; TodoPanel itself renders null for an empty list.
 const sessionTodos = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+// loadProjectRuntime (always fired on mount for a project-bound session) fires
+// this too — stubbed with a minimal valid ProjectRuntimeInfo so its effect
+// resolves cleanly; the model/effort UI isn't under test here.
+const projectRuntimeInfo = mock(() =>
+  Promise.resolve({
+    status: "ok" as const,
+    data: {
+      projectId: "p1",
+      model: null,
+      storedEffort: null,
+      effectiveEffort: null,
+      effectiveEffortLabel: null,
+      effectiveSource: "none" as const,
+      storedEffortStatus: "valid" as const,
+      modelInfo: null,
+    },
+  }),
+);
+
+// `commands.fetchAttachment` isn't reachable from any mount path exercised
+// below (no test here renders an image attachment) — it's stubbed anyway
+// because `mock.module("@/bindings", ...)` replaces the module for the whole
+// `bun test` process, not just this file: the real (unmocked) `Transcript`
+// component other test files render (e.g. ModalShells.test.tsx) resolves
+// `commands` through this same live binding, so an absent `fetchAttachment`
+// here would break ITS attachment-preview test instead of ours.
+const fetchAttachment = mock(() => Promise.resolve({ status: "ok" as const, data: { dataBase64: "", contentType: null } }));
 
 mock.module("@/bindings", () => ({
-  commands: { listOpenTargets, openIn, sessionWorkdir, nativeCommands, sessionTodos },
+  commands: { listOpenTargets, openIn, sessionWorkdir, nativeCommands, sessionTodos, projectRuntimeInfo, fetchAttachment },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // useComposerAttachments registers a Tauri drag-drop listener on mount (see HomeView.test.tsx).
@@ -26,15 +53,15 @@ mock.module("@tauri-apps/api/webview", () => ({
   getCurrentWebview: () => ({ onDragDropEvent: () => Promise.resolve(() => {}) }),
 }));
 
-// Transcript is unrelated to the remote-runner gate under test and pulls in
-// markdown rendering — stub it so this test stays focused and fast. Deliberately
-// NOT stubbing RightPanel/TodoPanel here: bun's mock.module() replaces a module
-// for the whole test run (all files share one process), and both of those
-// already have their own dedicated *.test.tsx that import the real component —
-// stubbing them here would silently break those other files. RightPanel is
-// safe to leave real because nav.rightOpen defaults false, so it never mounts
-// in these tests anyway; TodoPanel is handled via the sessionTodos stub above.
-mock.module("@/components/transcript/Transcript", () => ({ Transcript: () => null }));
+// Deliberately NOT stubbing Transcript/RightPanel/TodoPanel here: bun's
+// mock.module() replaces a module for the whole test run (all files share one
+// process), and all three now have their own dedicated *.test.tsx that import
+// the real component (Transcript's is ModalShells.test.tsx) — stubbing them
+// here would silently break those other files. RightPanel is safe to leave
+// real because nav.rightOpen defaults false, so it never mounts in these
+// tests anyway; TodoPanel is handled via the sessionTodos stub above;
+// Transcript never renders any rows in these fixtures (`transcripts: {}`), so
+// its markdown-rendering cost never actually pays off here either.
 
 // Stand-in for the real drawer (which pulls in xterm + store-terms) — a spy so
 // the test can assert whether the PTY drawer mounts at all, which is the

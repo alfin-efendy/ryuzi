@@ -3,13 +3,13 @@ import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { PROJECTS_ROOT_KEY } from "@/constants";
 import { LOCAL_RUNNER } from "@/lib/session-key";
-import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
+import { Button, ChoiceCard, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, RadioGroup } from "@ryuzi/ui";
 
 type Mode = "folder" | "clone";
 
-const MODES: { id: Mode; label: string }[] = [
-  { id: "folder", label: "Open folder" },
-  { id: "clone", label: "Clone from URL" },
+const MODES: { id: Mode; label: string; description: string }[] = [
+  { id: "folder", label: "Open folder", description: "Use an existing local folder, with or without Git." },
+  { id: "clone", label: "Clone from URL", description: "Clone a Git repository into the Projects folder." },
 ];
 
 export function AddProjectModal({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -56,57 +56,44 @@ export function AddProjectModal({ open, onClose }: { open: boolean; onClose: () 
   };
 
   return (
-    <Modal onClose={onClose} width={440}>
-      <div className="text-[15px] font-semibold tracking-[-0.01em]">New project</div>
-
-      <div role="radiogroup" aria-label="Source" className="mt-4 grid grid-cols-2 gap-2">
-        {MODES.map((m) => (
-          <Button
-            key={m.id}
-            role="radio"
-            aria-checked={mode === m.id}
-            variant={mode === m.id ? "secondary" : "outline"}
-            onClick={() => setMode(m.id)}
-          >
-            {m.label}
-          </Button>
-        ))}
-      </div>
-
-      {mode === "folder" ? (
-        <>
-          <p className="mt-3.5 text-[12.5px] text-muted-foreground">
-            Add an existing folder as a project. Folders without a git repository work too — git features are disabled for them.
-          </p>
-          <Button size="lg" onClick={() => void openFolder()} disabled={busy} className="mt-3.5 w-full">
-            {busy ? "Opening..." : "Choose folder"}
-          </Button>
-        </>
-      ) : (
-        <>
-          <div className="mt-3.5 flex flex-col gap-3">
+    <Modal onClose={onClose} width={440} busy={busy}>
+      <ModalHeader title="New project" description="Choose how to add the project to Cockpit." />
+      <ModalBody>
+        <RadioGroup aria-label="Source" value={mode} onValueChange={(value) => setMode(value as Mode)} className="grid-cols-2">
+          {MODES.map((item) => (
+            <ChoiceCard key={item.id} value={item.id} title={item.label} description={item.description} />
+          ))}
+        </RadioGroup>
+        {mode === "clone" && (
+          <div className="mt-4 flex flex-col gap-3">
             <FormField label="Repository URL">
-              <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://github.com/user/repo.git" />
+              <Input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://github.com/user/repo.git" />
             </FormField>
-            <FormField label="Destination" hint="Clones into a folder named after the repository inside this directory.">
-              <div className="flex min-w-0 gap-2">
-                <Input value={dest} onChange={(e) => setDest(e.target.value)} placeholder="Projects folder" className="min-w-0 flex-1" />
-                <Button type="button" variant="outline" aria-label="Browse" onClick={() => void browseDest()} className="shrink-0">
-                  Browse
-                </Button>
-              </div>
+            <FormField label="Destination" hint="The repository is cloned into a folder named after it inside this directory.">
+              <Input value={dest} onChange={(event) => setDest(event.target.value)} placeholder="Projects folder" />
             </FormField>
           </div>
-          <Button size="lg" onClick={() => void clone()} disabled={busy || !url.trim() || !dest.trim()} className="mt-3.5 w-full">
-            {busy ? "Cloning..." : "Clone"}
+        )}
+      </ModalBody>
+      <ModalFooter>
+        {mode === "clone" && (
+          <Button type="button" variant="outline" onClick={() => void browseDest()}>
+            Browse destination
           </Button>
-        </>
-      )}
-
-      <ModalFooter className="mt-4">
-        <Button variant="outline" onClick={onClose}>
+        )}
+        <div className="flex-1" />
+        <Button variant="outline" disabled={busy} onClick={onClose}>
           Cancel
         </Button>
+        {mode === "folder" ? (
+          <Button onClick={() => void openFolder()} disabled={busy}>
+            {busy ? "Opening..." : "Choose folder"}
+          </Button>
+        ) : (
+          <Button onClick={() => void clone()} disabled={busy || !url.trim() || !dest.trim()}>
+            {busy ? "Cloning..." : "Clone"}
+          </Button>
+        )}
       </ModalFooter>
     </Modal>
   );

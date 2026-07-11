@@ -2,6 +2,7 @@ import { test, expect, mock, spyOn } from "bun:test";
 import { useStore, markFocusedSessionReadOnEvent, drainQueueOnEvent } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
+import { useAgent } from "./store-agent";
 import { useUi } from "./store-ui";
 import type { QueuedMessage } from "./lib/queue";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
@@ -29,8 +30,330 @@ function reset() {
     lastSeq: {},
     loaded: {},
     contextUsage: {},
+    projectRuntimeById: {},
+    sessionRuntimeById: {},
+    sessionCost: {},
+    queued: {},
   });
 }
+
+test("composer_model_has_one_project_runtime_source", () => {
+  const state = useStore.getState() as unknown as Record<string, unknown>;
+  expect(state.setProjectModel).toBeUndefined();
+  expect(state.setProjectRuntime).toBeFunction();
+});
+
+const runtimeSnapshot = {
+  projectId: "p1",
+  model: "openai/gpt-5",
+  storedEffort: "high",
+  effectiveEffort: "high",
+  effectiveEffortLabel: "High",
+  effectiveSource: "project" as const,
+  storedEffortStatus: "valid" as const,
+  modelInfo: null,
+};
+
+function projectSnapshot(projectId = "p1") {
+  return {
+    projectId,
+    name: projectId,
+    workdir: `C:/${projectId}`,
+    source: null,
+    harness: "native",
+    model: "old",
+    effort: "low",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+}
+
+function deferredResult() {
+  let resolve!: (value: unknown) => void;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+test("runtime_persistence_is_strictly_queued_while_latest_intent_paints", async () => {
+  reset();
+  useStore.setState({ projects: [projectSnapshot()], projectRuntimeById: { p1: runtimeSnapshot } });
+  const a = deferredResult();
+  const b = deferredResult();
+  let persisted = { model: "old", effort: "low" };
+  const update = spyOn(commands, "updateProjectRuntime")
+    .mockImplementationOnce(async () => {
+      const result = (await a.promise) as { status: "ok"; data: typeof runtimeSnapshot };
+      persisted = { model: result.data.model ?? "", effort: result.data.storedEffort ?? "" };
+      return result;
+    })
+    .mockImplementationOnce(async () => {
+      const result = (await b.promise) as { status: "ok"; data: typeof runtimeSnapshot };
+      persisted = { model: result.data.model ?? "", effort: result.data.storedEffort ?? "" };
+      return result;
+    });
+  const first = useStore.getState().setProjectRuntime("p1", "model-a", "medium");
+  const second = useStore.getState().setProjectRuntime("p1", "model-b", "high");
+  expect(update).toHaveBeenCalledTimes(1);
+  expect(useStore.getState().projects[0].model).toBe("model-b");
+  a.resolve({ status: "ok", data: { ...runtimeSnapshot, model: "model-a", storedEffort: "medium" } });
+  await first;
+  expect(update).toHaveBeenCalledTimes(2);
+  expect(useStore.getState().projects[0].model).toBe("model-b");
+  b.resolve({ status: "ok", data: { ...runtimeSnapshot, model: "model-b", storedEffort: "high" } });
+  await second;
+  expect(persisted).toEqual({ model: "model-b", effort: "high" });
+  update.mockRestore();
+});
+
+test("two_failed_runtime_intents_restore_original_confirmed_baseline", async () => {
+  reset();
+  const project = projectSnapshot();
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  const a = deferredResult();
+  const b = deferredResult();
+  const persisted = { model: "old", effort: "low" };
+  const update = spyOn(commands, "updateProjectRuntime")
+    .mockImplementationOnce(() => a.promise as never)
+    .mockImplementationOnce(() => b.promise as never);
+  const first = useStore.getState().setProjectRuntime("p1", "model-a", "medium");
+  const second = useStore.getState().setProjectRuntime("p1", "model-b", "high");
+  expect(update).toHaveBeenCalledTimes(1);
+  a.resolve({ status: "error", error: { message: "A failed" } });
+  await first;
+  expect(update).toHaveBeenCalledTimes(2);
+  b.resolve({ status: "error", error: { message: "B failed" } });
+  await second;
+  expect(useStore.getState().projects[0]).toEqual(project);
+  expect(useStore.getState().projectRuntimeById.p1).toEqual(runtimeSnapshot);
+  expect(persisted).toEqual({ model: "old", effort: "low" });
+  update.mockRestore();
+});
+
+test("failed_latest_runtime_intent_rolls_back_to_confirmed_prior_success", async () => {
+  reset();
+  useStore.setState({ projects: [projectSnapshot()], projectRuntimeById: { p1: runtimeSnapshot } });
+  const a = deferredResult();
+  const b = deferredResult();
+  const update = spyOn(commands, "updateProjectRuntime")
+    .mockImplementationOnce(() => a.promise as never)
+    .mockImplementationOnce(() => b.promise as never);
+  const first = useStore.getState().setProjectRuntime("p1", "model-a", "medium");
+  const second = useStore.getState().setProjectRuntime("p1", "model-b", "high");
+  a.resolve({ status: "ok", data: { ...runtimeSnapshot, model: "model-a", storedEffort: "medium" } });
+  await first;
+  b.resolve({ status: "error", error: { message: "B failed" } });
+  await second;
+  expect(useStore.getState().projects[0].model).toBe("model-a");
+  expect(useStore.getState().projects[0].effort).toBe("medium");
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("model-a");
+  update.mockRestore();
+});
+
+test("runtime_queues_for_different_projects_proceed_independently", async () => {
+  reset();
+  const p1 = projectSnapshot("p1");
+  const p2 = projectSnapshot("p2");
+  useStore.setState({ projects: [p1, p2], projectRuntimeById: { p1: runtimeSnapshot, p2: { ...runtimeSnapshot, projectId: "p2" } } });
+  const firstDeferred = deferredResult();
+  const secondDeferred = deferredResult();
+  const update = spyOn(commands, "updateProjectRuntime")
+    .mockImplementationOnce(() => firstDeferred.promise as never)
+    .mockImplementationOnce(() => secondDeferred.promise as never);
+  const first = useStore.getState().setProjectRuntime("p1", "one", "low");
+  const second = useStore.getState().setProjectRuntime("p2", "two", "high");
+  expect(update).toHaveBeenCalledTimes(2);
+  firstDeferred.resolve({ status: "ok", data: { ...runtimeSnapshot, model: "one" } });
+  secondDeferred.resolve({ status: "ok", data: { ...runtimeSnapshot, projectId: "p2", model: "two" } });
+  await Promise.all([first, second]);
+  update.mockRestore();
+});
+
+test("failed_runtime_save_rolls_back_both_snapshots", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "openai/gpt-5",
+    effort: "high",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  const update = spyOn(commands, "updateProjectRuntime").mockResolvedValue({ status: "error", error: { message: "boom" } });
+  const ok = await useStore.getState().setProjectRuntime("p1", "openai/gpt-5-mini", "low");
+  expect(ok).toBe(false);
+  expect(useStore.getState().projects[0]).toEqual(project);
+  expect(useStore.getState().projectRuntimeById.p1).toEqual(runtimeSnapshot);
+  update.mockRestore();
+});
+
+test("global_preference_and_metadata_refresh_refetch_loaded_project_runtime_status", async () => {
+  reset();
+  useStore.setState({ projectRuntimeById: { p1: runtimeSnapshot } });
+  const reload = spyOn(useAgent.getState(), "load").mockResolvedValue(undefined);
+  const fresh = { ...runtimeSnapshot, storedEffortStatus: "unsupported" as const, effectiveEffort: "medium" };
+  const info = spyOn(commands, "projectRuntimeInfo").mockResolvedValue({ status: "ok", data: fresh });
+  await useStore.getState().refreshModelConfiguration();
+  expect(reload).toHaveBeenCalledTimes(1);
+  expect(info).toHaveBeenCalledWith(LOCAL_RUNNER, "p1");
+  expect(useStore.getState().projectRuntimeById.p1).toEqual(fresh);
+  reload.mockRestore();
+  info.mockRestore();
+});
+
+test("older_model_configuration_refresh_cannot_overwrite_newer_state", async () => {
+  reset();
+  useStore.setState({ projectRuntimeById: { p1: runtimeSnapshot } });
+  let releaseOlder!: () => void;
+  const olderGate = new Promise<void>((resolve) => {
+    releaseOlder = resolve;
+  });
+  const reload = spyOn(useAgent.getState(), "load")
+    .mockImplementationOnce(async () => {
+      await olderGate;
+      return undefined;
+    })
+    .mockResolvedValueOnce(undefined);
+  const newer = { ...runtimeSnapshot, effectiveEffort: "medium" };
+  const older = { ...runtimeSnapshot, effectiveEffort: "low" };
+  const info = spyOn(commands, "projectRuntimeInfo")
+    .mockResolvedValueOnce({ status: "ok", data: newer })
+    .mockResolvedValueOnce({ status: "ok", data: older });
+  const first = useStore.getState().refreshModelConfiguration();
+  const second = useStore.getState().refreshModelConfiguration();
+  await second;
+  releaseOlder();
+  await first;
+  expect(useStore.getState().projectRuntimeById.p1.effectiveEffort).toBe("medium");
+  reload.mockRestore();
+  info.mockRestore();
+});
+
+test("configuration_refresh_started_before_mutation_cannot_overwrite_mutation", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "old",
+    effort: "low",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  const fetchList = spyOn(useAgent.getState(), "load").mockResolvedValue(undefined);
+  let resolveRefresh!: (value: unknown) => void;
+  const info = spyOn(commands, "projectRuntimeInfo").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveRefresh = resolve;
+      }) as never,
+  );
+  const refresh = useStore.getState().refreshModelConfiguration();
+  await Promise.resolve();
+  const update = spyOn(commands, "updateProjectRuntime").mockResolvedValue({
+    status: "ok",
+    data: { ...runtimeSnapshot, model: "newest", storedEffort: "high" },
+  });
+  await useStore.getState().setProjectRuntime("p1", "newest", "high");
+  resolveRefresh({ status: "ok", data: { ...runtimeSnapshot, model: "stale-refresh" } });
+  await refresh;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  fetchList.mockRestore();
+  info.mockRestore();
+  update.mockRestore();
+});
+
+test("load_resolving_during_or_after_mutation_cannot_overwrite_it", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "old",
+    effort: "low",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  let resolveLoad!: (value: unknown) => void;
+  let resolveMutation!: (value: unknown) => void;
+  const load = spyOn(commands, "projectRuntimeInfo").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveLoad = resolve;
+      }) as never,
+  );
+  const update = spyOn(commands, "updateProjectRuntime").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveMutation = resolve;
+      }) as never,
+  );
+  const loading = useStore.getState().loadProjectRuntime("p1");
+  const mutation = useStore.getState().setProjectRuntime("p1", "newest", "high");
+  resolveMutation({ status: "ok", data: { ...runtimeSnapshot, model: "newest", storedEffort: "high" } });
+  await mutation;
+  resolveLoad({ status: "ok", data: { ...runtimeSnapshot, model: "stale-load", storedEffort: "low" } });
+  await loading;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  load.mockRestore();
+  update.mockRestore();
+});
+
+test("load_started_and_resolved_during_mutation_cannot_replace_optimistic_state", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "old",
+    effort: "low",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  let resolveLoad!: (value: unknown) => void;
+  let resolveMutation!: (value: unknown) => void;
+  const update = spyOn(commands, "updateProjectRuntime").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveMutation = resolve;
+      }) as never,
+  );
+  const load = spyOn(commands, "projectRuntimeInfo").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveLoad = resolve;
+      }) as never,
+  );
+  const mutation = useStore.getState().setProjectRuntime("p1", "newest", "high");
+  const loading = useStore.getState().loadProjectRuntime("p1");
+  resolveLoad({ status: "ok", data: { ...runtimeSnapshot, model: "stale-load" } });
+  await loading;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  resolveMutation({ status: "ok", data: { ...runtimeSnapshot, model: "newest", storedEffort: "high" } });
+  await mutation;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  load.mockRestore();
+  update.mockRestore();
+});
 
 test("selectProject sets the selected project and clears the focused session", () => {
   reset();
@@ -108,6 +431,51 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
     [2, "assistant", "thought", "pondering"],
     [3, "assistant", "text", "hello"],
   ]);
+});
+
+test("durable system notice messages render live once and hydrate identically", async () => {
+  reset();
+  const event = {
+    kind: "message" as const,
+    session_pk: "s1",
+    seq: 1,
+    role: "system",
+    block_type: "notice",
+    payload: { text: "Account switched to Work Codex · round robin" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  };
+
+  useStore.getState().applyCoreEvent(event, LOCAL_RUNNER);
+  useStore.getState().applyCoreEvent(event, LOCAL_RUNNER);
+
+  const live = useStore.getState().transcripts[sessKey(LOCAL_RUNNER, "s1")];
+  expect(live).toHaveLength(1);
+  expect(live[0]).toMatchObject({
+    seq: 1,
+    role: "system",
+    blockType: "notice",
+    text: "Account switched to Work Codex · round robin",
+  });
+  const createdAt = live[0].createdAt;
+  if (createdAt === null) throw new Error("live message events must receive a timestamp");
+
+  reset();
+  await useStore.getState().hydrateTranscript(LOCAL_RUNNER, "s1", async () => [
+    {
+      sessionPk: "s1",
+      seq: 1,
+      role: "system",
+      blockType: "notice",
+      payload: event.payload,
+      toolCallId: null,
+      status: null,
+      toolKind: null,
+      createdAt,
+    },
+  ]);
+  expect(useStore.getState().transcripts[sessKey(LOCAL_RUNNER, "s1")]).toEqual(live);
 });
 
 test("tool_call events append once, then merge in place by toolCallId (same-seq update)", () => {
@@ -525,6 +893,7 @@ test("start forwards chat options so composer model, context, and attachments re
 
   expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "/review", {
     model: "fable",
+    effort: null,
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
     git: null,
@@ -572,6 +941,7 @@ test("start forwards composer git options to IPC", async () => {
 
   expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "go", {
     model: null,
+    effort: null,
     context: null,
     attachments: [],
     git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
@@ -663,10 +1033,11 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "hey", { model: "fable" });
+  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "hey", { model: "fable", effort: "high" });
 
   expect(startChat).toHaveBeenCalledWith(LOCAL_RUNNER, "hey", {
     model: "fable",
+    effort: "high",
     permMode: null,
     context: null,
     attachments: [],
@@ -679,6 +1050,39 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
   startChat.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+});
+
+test("projectless session runtime loads and updates independently", async () => {
+  reset();
+  const initial = {
+    sessionPk: "c1",
+    model: "fixture/model-alpha",
+    storedEffort: "medium",
+    effectiveEffort: "medium",
+    effectiveEffortLabel: "Medium",
+    effectiveSource: "session" as const,
+    storedEffortStatus: "valid" as const,
+    modelInfo: null,
+  };
+  const runtimeCommands = commands as typeof commands & {
+    sessionRuntimeInfo: typeof commands.projectRuntimeInfo;
+    updateSessionRuntime: typeof commands.updateProjectRuntime;
+  };
+  const sessionInfo = mock(async () => ({ status: "ok" as const, data: initial }));
+  const update = mock(async () => ({
+    status: "ok" as const,
+    data: { ...initial, model: "fixture/model-beta", storedEffort: "ultra" },
+  }));
+  Object.assign(runtimeCommands, { sessionRuntimeInfo: sessionInfo, updateSessionRuntime: update });
+
+  await useStore.getState().loadSessionRuntime(LOCAL_RUNNER, "c1");
+  expect(useStore.getState().sessionRuntimeById.c1).toEqual(initial);
+  await useStore.getState().setSessionRuntime(LOCAL_RUNNER, "c1", "fixture/model-beta", "ultra");
+  expect(update).toHaveBeenCalledWith(LOCAL_RUNNER, "c1", "fixture/model-beta", "ultra");
+  expect(useStore.getState().sessionRuntimeById.c1).toMatchObject({ model: "fixture/model-beta", storedEffort: "ultra" });
+
+  delete (runtimeCommands as Partial<typeof runtimeCommands>).sessionRuntimeInfo;
+  delete (runtimeCommands as Partial<typeof runtimeCommands>).updateSessionRuntime;
 });
 
 test("startChat returns false and does not focus on backend error", async () => {

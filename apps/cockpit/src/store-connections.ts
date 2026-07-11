@@ -12,6 +12,7 @@ import {
 } from "./bindings";
 import { KIRO_IMPORT_ACTION, KIRO_SIGNIN_ACTION } from "./constants";
 import { LOCAL_RUNNER } from "./lib/session-key";
+import { useStore } from "./store";
 
 // Providers tab: catalog + credentialed provider connections.
 //
@@ -54,23 +55,15 @@ import { LOCAL_RUNNER } from "./lib/session-key";
 //     `connectOauth`/`reconnectOauth` for them against a remote `runnerId`
 //     without solving that first.
 
-type ConnectionPatch = {
-  label: string;
-  enabled: boolean;
-  apiKey: string | null;
-  baseUrl: string | null;
-  models: string[];
-  claudeCloaking: boolean | null;
-};
-
 type ConnectionsState = {
   catalog: CatalogEntry[];
   connections: ConnectionInfo[];
   loaded: boolean;
   hydrate: () => Promise<void>;
   add: (provider: string, label: string, apiKey: string, baseUrl: string | null) => Promise<boolean>;
-  update: (id: string, patch: ConnectionPatch) => Promise<void>;
-  remove: (id: string) => Promise<void>;
+  rename: (id: string, label: string) => Promise<boolean>;
+  setEnabled: (id: string, enabled: boolean) => Promise<boolean>;
+  remove: (id: string) => Promise<boolean>;
   move: (id: string, dir: number) => Promise<void>;
   test: (id: string) => Promise<TestResult | null>;
   connectOauth: (provider: string, label: string) => Promise<boolean>;
@@ -92,13 +85,31 @@ type ConnectionsState = {
   awaitDeviceFlow: (provider: string, label: string, flowId: string) => Promise<boolean>;
 };
 
-function apply(set: (p: Partial<ConnectionsState>) => void, res: Result<ConnectionInfo[], CmdError>, action: string): boolean {
+async function apply(
+  set: (p: Partial<ConnectionsState>) => void,
+  res: Result<ConnectionInfo[], CmdError>,
+  action: string,
+): Promise<boolean> {
   if (res.status === "ok") {
     set({ connections: res.data });
+    await useStore.getState().refreshModelConfiguration();
     return true;
   }
   toast.error(`${action} failed: ${res.error.message}`);
   return false;
+}
+
+async function runAccountAction(
+  set: (p: Partial<ConnectionsState>) => void,
+  command: Promise<Result<ConnectionInfo[], CmdError>>,
+  action: string,
+): Promise<boolean> {
+  try {
+    return await apply(set, await command, action);
+  } catch (error) {
+    toast.error(`${action} failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
 }
 
 export const useConnections = create<ConnectionsState>((set) => ({
@@ -114,14 +125,12 @@ export const useConnections = create<ConnectionsState>((set) => ({
   },
   add: async (provider, label, apiKey, baseUrl) =>
     apply(set, await commands.addConnection(LOCAL_RUNNER, provider, label, apiKey, baseUrl), "Add connection"),
-  update: async (id, p) =>
-    void apply(
-      set,
-      await commands.updateConnection(LOCAL_RUNNER, id, p.label, p.enabled, p.apiKey, p.baseUrl, p.models, p.claudeCloaking),
-      "Update connection",
-    ),
-  remove: async (id) => void apply(set, await commands.removeConnection(LOCAL_RUNNER, id), "Remove connection"),
-  move: async (id, dir) => void apply(set, await commands.moveConnection(LOCAL_RUNNER, id, dir), "Reorder"),
+  rename: async (id, label) => runAccountAction(set, commands.renameConnection(LOCAL_RUNNER, id, label), "Rename account"),
+  setEnabled: async (id, enabled) => runAccountAction(set, commands.setConnectionEnabled(LOCAL_RUNNER, id, enabled), "Update account"),
+  remove: async (id) => runAccountAction(set, commands.removeConnection(LOCAL_RUNNER, id), "Remove account"),
+  move: async (id, dir) => {
+    await apply(set, await commands.moveConnection(LOCAL_RUNNER, id, dir), "Reorder");
+  },
   test: async (id) => {
     const res = await commands.testConnection(LOCAL_RUNNER, id);
     if (res.status === "ok") return res.data;
@@ -129,7 +138,7 @@ export const useConnections = create<ConnectionsState>((set) => ({
     return null;
   },
   connectOauth: async (provider, label) => apply(set, await commands.connectOauth(LOCAL_RUNNER, provider, label), "Connect"),
-  reconnectOauth: async (connectionId) => apply(set, await commands.reconnectOauth(LOCAL_RUNNER, connectionId), "Reconnect"),
+  reconnectOauth: async (connectionId) => runAccountAction(set, commands.reconnectOauth(LOCAL_RUNNER, connectionId), "Reconnect"),
   beginOauthManual: async (provider) => {
     const res = await commands.beginOauthManual(provider);
     if (res.status === "ok") return res.data;

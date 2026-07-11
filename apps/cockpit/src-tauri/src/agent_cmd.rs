@@ -5,6 +5,7 @@
 
 use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
+use ryuzi_core::llm_router::model_effort::SelectableModelInfo;
 use std::sync::Arc;
 use tauri::State;
 
@@ -50,7 +51,7 @@ pub async fn set_agent_settings(
 pub async fn list_selectable_models(
     engine: Engine<'_>,
     runner_id: Option<String>,
-) -> R<Vec<String>> {
+) -> R<Vec<SelectableModelInfo>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc("list_selectable_models", serde_json::json!({}))
