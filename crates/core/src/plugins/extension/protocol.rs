@@ -45,8 +45,12 @@ pub const METHOD_EVENT_PREFIX: &str = "event/";
 
 /// Build the `extension/initialize` request. `events` is the wire form
 /// (`HookEvent::as_str()`) of every event this extension's manifest
-/// subscribes to.
-pub fn initialize_request(id: i64, events: &[&str]) -> Value {
+/// subscribes to. `provides_tools` mirrors `ExtensionSpec::provides_tools` —
+/// it tells the extension up front whether the host wants tool definitions
+/// back in its response (`result.tools`, captured by
+/// [`parse_initialize_response`]) so a well-behaved extension that does not
+/// provide tools can skip building/sending them.
+pub fn initialize_request(id: i64, events: &[&str], provides_tools: bool) -> Value {
     stdio_jsonrpc::build_request(
         id,
         METHOD_INITIALIZE,
@@ -54,6 +58,7 @@ pub fn initialize_request(id: i64, events: &[&str]) -> Value {
             "protocolVersion": PROTOCOL_VERSION,
             "host": { "name": "ryuzi", "version": env!("CARGO_PKG_VERSION") },
             "events": events,
+            "providesTools": provides_tools,
         })),
     )
 }
@@ -162,7 +167,7 @@ mod tests {
 
     #[test]
     fn initialize_request_shape() {
-        let req = initialize_request(1, &["tool.before", "tool.after"]);
+        let req = initialize_request(1, &["tool.before", "tool.after"], true);
         assert_eq!(req["method"], METHOD_INITIALIZE);
         assert_eq!(req["id"], 1);
         assert_eq!(req["params"]["protocolVersion"], PROTOCOL_VERSION);
@@ -170,6 +175,13 @@ mod tests {
             req["params"]["events"],
             json!(["tool.before", "tool.after"])
         );
+        assert_eq!(req["params"]["providesTools"], true);
+    }
+
+    #[test]
+    fn initialize_request_reports_provides_tools_false_when_the_extension_declares_none() {
+        let req = initialize_request(1, &[], false);
+        assert_eq!(req["params"]["providesTools"], false);
     }
 
     #[test]

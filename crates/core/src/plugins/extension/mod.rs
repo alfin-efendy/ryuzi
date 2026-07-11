@@ -23,8 +23,14 @@
 //! - **DT5 (event dispatch)**: `event/<name>` notifications
 //!   ([`protocol::METHOD_EVENT_PREFIX`]) fanned out to every `ExtensionProc`
 //!   whose `confirmed_events` includes the firing `HookEvent`, using the
-//!   proc's already-open stdin/reader; `ExtensionSpec::timeout` is the
-//!   per-event budget that dispatch enforces.
+//!   proc's already-open, concurrency-safe transport (`proc::ExtensionIo`'s
+//!   private `request(...)` — a demultiplexing JSON-RPC client, NOT raw
+//!   stdin/reader access, so a ping and an event dispatch can safely be in
+//!   flight on the same proc at the same time); `ExtensionSpec::timeout` is
+//!   the per-event budget that dispatch enforces. `ExtensionIo`'s reader
+//!   loop also has a documented seam for routing JSON-RPC notifications
+//!   (lines with no `id`) once this slice needs to push something
+//!   host-ward outside of a request/response — see `proc::reader_loop`.
 //! - **DT6 (tool provision)**: wraps `ExtensionProc::tools` (raw `Value`s
 //!   from `protocol::InitializeAck::tools`) into an `ExtensionTool: Tool`
 //!   dispatching `tool/call` over the same pipe, the same way `McpTool`
