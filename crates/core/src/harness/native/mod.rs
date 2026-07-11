@@ -249,6 +249,9 @@ impl Harness for NativeHarness {
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
                 background: ctx.background,
+                // Task 7 wires the real facade from the control plane; every
+                // session built here starts without one.
+                app_control: None,
                 nudge,
                 review_tool_defs: None,
                 write_origin: crate::domain::WriteOrigin::User,

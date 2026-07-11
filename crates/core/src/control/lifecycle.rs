@@ -1438,6 +1438,9 @@ impl ControlPlane {
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             steer: SteerBuffer::new(),
             background: self.background.clone(),
+            // The review fork is never a top-level interactive session — no
+            // app-control facade, mirroring the primary builder's default.
+            app_control: None,
             // A fresh, unshared `NudgeState`: the review fork's own tool
             // iterations must never feed the PARENT's nudge counters (that
             // would be a feedback loop), and it drives under

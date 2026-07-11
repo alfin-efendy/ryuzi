@@ -138,6 +138,10 @@ pub struct RunnerDeps {
     pub steer: SteerBuffer,
     /// Shared async-delegation capacity gate (spec §6.2), from `SessionCtx`.
     pub background: Arc<super::background::BackgroundRegistry>,
+    /// Curated app-control facade, present only for top-level interactive
+    /// sessions (set by the control plane). Cloned per turn like the rest of
+    /// `RunnerDeps`; the underlying `Arc` is shared.
+    pub app_control: Option<Arc<dyn super::tools::AppControl>>,
     /// Nudge counters for the background learning loop (Phase 4 §7.2).
     /// Hydrated once in `NativeHarness::start_session`; shared (same `Arc`)
     /// with every sub-agent this session spawns.
@@ -1648,6 +1652,7 @@ async fn run_tool_call(
             perm_mode: deps.perm_mode.clone(),
             project_id: deps.project_id.clone(),
         })),
+        app: deps.app_control.clone(),
         write_origin: deps.write_origin,
         viewed_skills: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
     };
@@ -2445,6 +2450,7 @@ mod tests {
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             steer: SteerBuffer::new(),
             background: super::super::background::BackgroundRegistry::new(),
+            app_control: None,
             nudge: Arc::new(NudgeState::default()),
             review_tool_defs: None,
             write_origin: crate::domain::WriteOrigin::User,

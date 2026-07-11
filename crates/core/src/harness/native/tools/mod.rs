@@ -138,6 +138,79 @@ pub trait SubagentSpawner: Send + Sync {
     }
 }
 
+/// A cron job as seen through the curated app surface.
+#[derive(Debug, Clone)]
+pub struct AppJobSummary {
+    pub id: String,
+    pub name: String,
+    pub cron: String,
+    pub enabled: bool,
+}
+
+/// Inputs to create a job through `app_jobs`. `schedule` is natural language
+/// (`crate::scheduler::natural_to_cron`) or a raw cron expression.
+#[derive(Debug, Clone)]
+pub struct AppJobCreate {
+    pub name: String,
+    pub schedule: String,
+    pub prompt: String,
+    pub project_id: Option<String>,
+    pub model_override: Option<String>,
+}
+
+/// One orchestration task as seen through `app_orchestrate`.
+#[derive(Debug, Clone)]
+pub struct AppOrchSummary {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub agent: String,
+}
+
+/// A project as seen through `app_projects`.
+#[derive(Debug, Clone)]
+pub struct AppProjectSummary {
+    pub id: String,
+    pub name: String,
+}
+
+/// The curated surface the agent uses to operate the app itself (spec §9.1).
+///
+/// This is the ENTIRE app-control contract: what is not a method here is not a
+/// capability the agent has. It is deliberately narrow — no settings, model
+/// switching, approval resolution, daemon control, or OAuth (spec §9.3
+/// negative space). Every mutating method records an audit row inside its
+/// implementation, so auditing cannot be forgotten per-tool. `None` on
+/// `ToolCtx` (sub-agents, workers, review forks, bare tests) means "no app
+/// control"; the tool then returns a "not available" error.
+#[async_trait]
+pub trait AppControl: Send + Sync {
+    /// The originating write origin (always `Agent` in production; used for the
+    /// audit rows the impl writes).
+    fn origin(&self) -> crate::domain::WriteOrigin;
+
+    // --- jobs (permission keys jobs.read / jobs.write) ---
+    async fn list_jobs(&self) -> anyhow::Result<Vec<AppJobSummary>>;
+    async fn create_job(&self, spec: AppJobCreate) -> anyhow::Result<String>;
+    async fn set_job_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<bool>;
+    async fn run_job_now(&self, id: &str) -> anyhow::Result<String>;
+
+    // --- orchestration (orch.read / orch.write) ---
+    async fn submit_orchestration(&self, project_id: &str, goal: &str) -> anyhow::Result<String>;
+    async fn list_orchestrations(&self, root: Option<&str>) -> anyhow::Result<Vec<AppOrchSummary>>;
+    async fn cancel_orchestration(&self, id: &str) -> anyhow::Result<u32>;
+    async fn retry_orchestration(&self, id: &str) -> anyhow::Result<bool>;
+
+    // --- projects (projects.read / projects.write) ---
+    async fn list_projects(&self) -> anyhow::Result<Vec<AppProjectSummary>>;
+    async fn create_chat_session(&self, title: Option<String>) -> anyhow::Result<String>;
+    async fn attach_project(&self, session_pk: &str, project_id: &str) -> anyhow::Result<()>;
+}
+
+/// The app-control tool names — added to the sub-agent blocklist and never
+/// advertised to delegated children (spec §9.1).
+pub const APP_TOOLS: &[&str] = &["app_jobs", "app_orchestrate", "app_projects", "clarify"];
+
 /// Channel bundle for tools whose EXECUTION is a user interaction
 /// (`exitplanmode`, `askuserquestion`): they emit their own
 /// `ApprovalRequested` and block on the reply, reusing the approval pipeline.
@@ -215,6 +288,10 @@ pub struct ToolCtx {
     /// Present when the session has interactive surfaces; `None` disables
     /// `exitplanmode`/`askuserquestion` (they return a tool error).
     pub interaction: Option<Arc<Interaction>>,
+    /// Curated app-control facade (spec §9.1). `None` disables the `app_*`
+    /// tools (sub-agents, workers, review forks, bare tests) — they return a
+    /// "not available" error, mirroring `interaction`/`spawn`/`memory`.
+    pub app: Option<Arc<dyn AppControl>>,
     /// Which actor is driving this tool call (Phase 4 §7). Defaults to
     /// `User` for interactive turns; the background review fork
     /// (`WriteOrigin::BackgroundReview`) and sub-agent turns
@@ -552,6 +629,7 @@ pub(crate) mod testutil {
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             tool_call_id: "test-call".into(),
             interaction: None,
+            app: None,
             write_origin: crate::domain::WriteOrigin::User,
             viewed_skills: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
@@ -579,6 +657,75 @@ pub(crate) mod testutil {
             project_id: None,
         }));
         (ctx, hub, rx, perm)
+    }
+
+    /// A recording fake `AppControl` for tool unit tests.
+    #[derive(Default)]
+    pub struct FakeAppControl {
+        pub created: std::sync::Mutex<Vec<AppJobCreate>>,
+        pub submitted: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl AppControl for FakeAppControl {
+        fn origin(&self) -> crate::domain::WriteOrigin {
+            crate::domain::WriteOrigin::Agent
+        }
+        async fn list_jobs(&self) -> anyhow::Result<Vec<AppJobSummary>> {
+            Ok(vec![AppJobSummary {
+                id: "job-1".into(),
+                name: "nightly".into(),
+                cron: "0 9 * * *".into(),
+                enabled: true,
+            }])
+        }
+        async fn create_job(&self, spec: AppJobCreate) -> anyhow::Result<String> {
+            self.created.lock().unwrap().push(spec);
+            Ok("job-new".into())
+        }
+        async fn set_job_enabled(&self, _id: &str, _enabled: bool) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn run_job_now(&self, _id: &str) -> anyhow::Result<String> {
+            Ok("run-1".into())
+        }
+        async fn submit_orchestration(
+            &self,
+            _project_id: &str,
+            goal: &str,
+        ) -> anyhow::Result<String> {
+            self.submitted.lock().unwrap().push(goal.to_string());
+            Ok("orch-root".into())
+        }
+        async fn list_orchestrations(
+            &self,
+            _root: Option<&str>,
+        ) -> anyhow::Result<Vec<AppOrchSummary>> {
+            Ok(vec![AppOrchSummary {
+                id: "orch-root".into(),
+                title: "build it".into(),
+                status: "running".into(),
+                agent: "orchestrator".into(),
+            }])
+        }
+        async fn cancel_orchestration(&self, _id: &str) -> anyhow::Result<u32> {
+            Ok(3)
+        }
+        async fn retry_orchestration(&self, _id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn list_projects(&self) -> anyhow::Result<Vec<AppProjectSummary>> {
+            Ok(vec![AppProjectSummary {
+                id: "p1".into(),
+                name: "Ryuzi".into(),
+            }])
+        }
+        async fn create_chat_session(&self, _title: Option<String>) -> anyhow::Result<String> {
+            Ok("chat-1".into())
+        }
+        async fn attach_project(&self, _session_pk: &str, _project_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -678,6 +825,35 @@ mod tests {
         assert!(out.trim_end().ends_with("100"));
         assert!(out.contains("truncated"));
         assert!(out.contains("99\n100"));
+    }
+
+    #[tokio::test]
+    async fn tool_ctx_carries_app_facade_and_write_origin() {
+        use super::testutil::ctx_at;
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_at(dir.path()).await;
+        // Default (bare test) context: no facade, user origin.
+        assert!(ctx.app.is_none());
+        assert_eq!(ctx.write_origin, crate::domain::WriteOrigin::User);
+        // A fake facade can be attached and called.
+        let fake = std::sync::Arc::new(testutil::FakeAppControl::default());
+        ctx.app = Some(fake.clone());
+        ctx.write_origin = crate::domain::WriteOrigin::Agent;
+        let id = ctx
+            .app
+            .as_ref()
+            .unwrap()
+            .create_job(AppJobCreate {
+                name: "nightly".into(),
+                schedule: "every day at 9am".into(),
+                prompt: "summarize".into(),
+                project_id: Some("p1".into()),
+                model_override: None,
+            })
+            .await
+            .unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(fake.created.lock().unwrap().len(), 1);
     }
 
     #[test]
