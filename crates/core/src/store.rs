@@ -1750,6 +1750,140 @@ impl Store {
         .await
     }
 
+    /// Enqueue a durable background-rail row (spec §6.1). Returns the new id.
+    pub async fn enqueue_background_event(
+        &self,
+        target_session_pk: &str,
+        kind: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        let id = crate::paths::new_id();
+        let (id2, target, kind, payload, now) = (
+            id.clone(),
+            target_session_pk.to_string(),
+            kind.to_string(),
+            payload.to_string(),
+            crate::paths::now_ms(),
+        );
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO background_events(id, target_session_pk, kind, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id2, target, kind, payload, now],
+            )
+            .map(|_| ())
+        })
+        .await?;
+        Ok(id)
+    }
+
+    /// Atomically claim the OLDEST undelivered, unclaimed rail row whose target
+    /// session is IDLE (the idle-only invariant, spec §6.1). Returns `None`
+    /// when nothing is deliverable. The claim + read run in one transaction so
+    /// two drainers never claim the same row.
+    pub async fn claim_deliverable_background_event(
+        &self,
+        claimer: &str,
+    ) -> anyhow::Result<Option<crate::domain::BackgroundEvent>> {
+        let claimer = claimer.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let picked: Option<String> = tx
+                .query_row(
+                    "SELECT be.id FROM background_events be \
+                     JOIN sessions s ON s.session_pk = be.target_session_pk \
+                     WHERE be.delivered_at IS NULL AND be.claimed_by IS NULL \
+                       AND s.status = 'idle' \
+                     ORDER BY be.created_at ASC LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(id) = picked else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE background_events SET claimed_by = ?2 WHERE id = ?1",
+                params![id, claimer],
+            )?;
+            let row = tx.query_row(
+                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                 FROM background_events WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(crate::domain::BackgroundEvent {
+                        id: r.get(0)?,
+                        target_session_pk: r.get(1)?,
+                        kind: r.get(2)?,
+                        payload: r.get(3)?,
+                        created_at: r.get(4)?,
+                        claimed_by: r.get(5)?,
+                        delivered_at: r.get(6)?,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(Some(row))
+        })
+        .await
+    }
+
+    /// Mark a claimed rail row delivered (its user turn has been injected).
+    pub async fn mark_background_delivered(&self, id: &str) -> anyhow::Result<()> {
+        let (id, now) = (id.to_string(), crate::paths::now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE background_events SET delivered_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Release a claim so the row is retried next tick (target went busy, or
+    /// delivery errored). Never touches `delivered_at`.
+    pub async fn release_background_claim(&self, id: &str) -> anyhow::Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE background_events SET claimed_by = NULL WHERE id = ?1 AND delivered_at IS NULL",
+                params![id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Remove every pending rail row targeting a session (session-end cascade,
+    /// spec §6.1: orphaned background work must not leak into a new chat).
+    /// Delivered rows are kept as an audit trail. Returns the count removed.
+    pub async fn delete_background_events_for_session(
+        &self,
+        target_session_pk: &str,
+    ) -> anyhow::Result<u64> {
+        let target = target_session_pk.to_string();
+        self.with_conn(move |c| {
+            Ok(c.execute(
+                "DELETE FROM background_events WHERE target_session_pk = ?1 AND delivered_at IS NULL",
+                params![target],
+            )? as u64)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn pending_background_count(&self) -> anyhow::Result<i64> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM background_events WHERE delivered_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+    }
+
     /// Bind a gateway conversation to a session (upsert on the `(gateway,
     /// conversation_id)` primary key).
     pub async fn add_surface(
@@ -3804,5 +3938,77 @@ mod tests {
             .unwrap();
         let ctx = store.get_session_context("s1").await.unwrap().unwrap();
         assert_eq!(ctx["percent_left"], 17);
+    }
+
+    #[tokio::test]
+    async fn background_rail_enqueue_claim_deliver_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        // An IDLE target and a RUNNING target.
+        let mk = |pk: &str, status: crate::domain::SessionStatus| crate::domain::Session {
+            session_pk: pk.into(),
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status,
+            perm_mode: crate::domain::PermMode::Default,
+            started_by: None,
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: crate::domain::SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        };
+        store
+            .insert_session(mk("idle-1", crate::domain::SessionStatus::Idle))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk("busy-1", crate::domain::SessionStatus::Running))
+            .await
+            .unwrap();
+
+        store
+            .enqueue_background_event("busy-1", "delegation", "{\"x\":1}")
+            .await
+            .unwrap();
+        let id_idle = store
+            .enqueue_background_event("idle-1", "delegation", "{\"x\":2}")
+            .await
+            .unwrap();
+
+        // Only the idle-target row is claimable.
+        let claimed = store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, id_idle);
+        assert_eq!(claimed.target_session_pk, "idle-1");
+        // A second claim finds nothing (the busy target is skipped, the idle row is now claimed).
+        assert!(store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .is_none());
+
+        store.mark_background_delivered(&claimed.id).await.unwrap();
+        assert_eq!(store.pending_background_count().await.unwrap(), 1); // busy row still pending
+
+        // Session-end cascade removes the busy target's row.
+        assert_eq!(
+            store
+                .delete_background_events_for_session("busy-1")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.pending_background_count().await.unwrap(), 0);
     }
 }
