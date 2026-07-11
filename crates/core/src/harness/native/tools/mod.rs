@@ -20,6 +20,7 @@ pub mod app_jobs;
 pub mod app_orchestrate;
 pub mod app_projects;
 pub mod bash;
+pub mod clarify;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -429,6 +430,7 @@ impl ToolRegistry {
             Arc::new(app_jobs::AppJobs),
             Arc::new(app_orchestrate::AppOrchestrate),
             Arc::new(app_projects::AppProjects),
+            Arc::new(clarify::Clarify),
         ];
         let mut tools = BTreeMap::new();
         for t in list {
@@ -894,11 +896,12 @@ mod tests {
             "app_jobs",
             "app_orchestrate",
             "app_projects",
+            "clarify",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 24);
+        assert_eq!(defs.len(), 25);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));
