@@ -18,6 +18,10 @@ use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
 
+/// Wire protocol version reported by `/health` for remote-runner clients to
+/// negotiate compatibility against.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Shared state for the control API router.
 #[derive(Clone)]
 pub struct ApiState {
@@ -91,7 +95,12 @@ pub async fn serve(state: ApiState, port: u16) -> anyhow::Result<u16> {
 }
 
 async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "service": "ryuzi", "version": env!("CARGO_PKG_VERSION") }))
+    Json(json!({
+        "status": "ok",
+        "service": "ryuzi",
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": PROTOCOL_VERSION,
+    }))
 }
 
 async fn list_sessions(State(state): State<ApiState>) -> impl IntoResponse {
@@ -517,6 +526,7 @@ mod tests {
             .unwrap();
         assert_eq!(v["status"], "ok");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["protocol_version"], 1);
     }
 
     #[tokio::test]
