@@ -28,6 +28,9 @@ import {
   Modal,
   ModalFooter,
 } from "@ryuzi/ui";
+import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
+import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
+import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { useStore } from "@/store";
 import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
@@ -46,6 +49,7 @@ import {
 import { StatusDot, TreeGuide } from "@/components/common/bits";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
 import { SessionRow } from "@/components/shell/SessionRow";
+import { SortableSessionRow } from "@/components/shell/SortableSessionRow";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
@@ -63,9 +67,29 @@ const iconBtn = "shrink-0 rounded-sm text-muted-foreground";
 export function Sidebar() {
   const { projects, sessions, setFocused, focusedSessionPk, selectProject, end } = useStore();
   const pendingCount = useStore((s) => s.pendingApprovals.length);
-  const { pinned, archived, togglePin, setArchived, readAt, sessionFilter, toggleStatusFilter, toggleUnreadOnly, markAllRead } = useUi();
+  const {
+    pinned,
+    archived,
+    togglePin,
+    setArchived,
+    readAt,
+    sessionFilter,
+    toggleStatusFilter,
+    toggleUnreadOnly,
+    markAllRead,
+    pinnedOrder,
+    reorderPinned,
+  } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
   const [archivingPk, setArchivingPk] = useState<string | null>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const onPinnedDragEnd = (e: DragEndEvent) => {
+    const { active, over } = e;
+    if (over && active.id !== over.id) reorderPinned(String(active.id), String(over.id));
+  };
 
   // Archive = real teardown: end the session (interrupt + stop the agent,
   // kill its terminals, remove the worktree and its harness/* branch), then
@@ -271,7 +295,7 @@ export function Sidebar() {
       <div className="box-border flex w-[260px] min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2.5">
         {projList.map((p) => {
           const showArch = archivedGlobal || !!showArchived[p.projectId];
-          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, filter);
+          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, filter, pinnedOrder);
           const archCount = archivedCount(sessions, p.projectId, archived);
           const open = q.trim() ? sess.length > 0 : (expanded[p.projectId] ?? true);
           return (
@@ -317,28 +341,42 @@ export function Sidebar() {
               </div>
               {open && (
                 <>
-                  {sess.map((s, i) => {
-                    const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
-                    const isPinned = !!pinned[s.sessionPk];
-                    const unread = isUnreadVisible(s, readAt, focusedSessionPk);
-                    const showArchivedLabel = archCount > 0 && !archivedGlobal;
-                    const hasTail = i < sess.length - 1 || showArchivedLabel;
-                    return (
-                      <SessionRow
-                        key={s.sessionPk}
-                        session={s}
-                        isActive={isActive}
-                        isPinned={isPinned}
-                        unread={unread}
-                        isArchived={!!archived[s.sessionPk]}
-                        hasTail={hasTail}
-                        archiveDisabled={archivingPk === s.sessionPk}
-                        onOpen={() => openSession(s.sessionPk)}
-                        onTogglePin={() => togglePin(s.sessionPk)}
-                        onToggleArchive={() => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s))}
-                      />
-                    );
-                  })}
+                  <DndContext
+                    sensors={sensors}
+                    collisionDetection={closestCenter}
+                    modifiers={[restrictToVerticalAxis]}
+                    onDragEnd={onPinnedDragEnd}
+                  >
+                    <SortableContext
+                      items={sess.filter((s) => pinned[s.sessionPk]).map((s) => s.sessionPk)}
+                      strategy={verticalListSortingStrategy}
+                    >
+                      {sess.map((s, i) => {
+                        const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
+                        const isPinned = !!pinned[s.sessionPk];
+                        const unread = isUnreadVisible(s, readAt, focusedSessionPk);
+                        const showArchivedLabel = archCount > 0 && !archivedGlobal;
+                        const hasTail = i < sess.length - 1 || showArchivedLabel;
+                        const rowProps = {
+                          session: s,
+                          isActive,
+                          isPinned,
+                          unread,
+                          isArchived: !!archived[s.sessionPk],
+                          hasTail,
+                          archiveDisabled: archivingPk === s.sessionPk,
+                          onOpen: () => openSession(s.sessionPk),
+                          onTogglePin: () => togglePin(s.sessionPk),
+                          onToggleArchive: () => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s)),
+                        };
+                        return isPinned ? (
+                          <SortableSessionRow key={s.sessionPk} {...rowProps} />
+                        ) : (
+                          <SessionRow key={s.sessionPk} {...rowProps} />
+                        );
+                      })}
+                    </SortableContext>
+                  </DndContext>
                   {archCount > 0 && !archivedGlobal && (
                     <Button
                       type="button"
