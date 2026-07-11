@@ -18,6 +18,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "list_gateways",
     "probe_gateways",
     "add_gateway",
+    "save_runner",
     "remove_gateway",
     "update_gateway",
     "gateway_events",
@@ -29,6 +30,14 @@ struct AddGatewayP {
     host: String,
     port: u16,
     username: String,
+}
+#[derive(Deserialize)]
+struct SaveRunnerP {
+    name: String,
+    host: String,
+    port: u16,
+    fingerprint: String,
+    device_token: String,
 }
 #[derive(Deserialize)]
 struct IdP {
@@ -49,6 +58,10 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "add_gateway" => {
             let a: AddGatewayP = params(p)?;
             ok(add_gateway(state, a.name, a.host, a.port, a.username).await?)
+        }
+        "save_runner" => {
+            let a: SaveRunnerP = params(p)?;
+            ok(save_runner(state, a.name, a.host, a.port, a.fingerprint, a.device_token).await?)
         }
         "remove_gateway" => {
             let a: IdP = params(p)?;
@@ -126,6 +139,8 @@ async fn ensure_local_row(cp: &ControlPlane) -> anyhow::Result<GatewayRow> {
         username: None,
         fs_mode: "projects".into(),
         paths: vec![],
+        fingerprint: None,
+        device_token: None,
     };
     gateways::upsert_row(cp.store(), row.clone()).await?;
     gateways::add_event(cp.store(), "local", "info", "local gateway registered").await?;
@@ -228,6 +243,8 @@ async fn assemble(cp: &ControlPlane, probe: bool) -> anyhow::Result<Vec<GatewayI
                     username: None,
                     fs_mode: "projects".into(),
                     paths: vec![],
+                    fingerprint: None,
+                    device_token: None,
                 };
                 gateways::upsert_row(cp.store(), r.clone()).await?;
                 r
@@ -322,6 +339,63 @@ async fn assemble(cp: &ControlPlane, probe: bool) -> anyhow::Result<Vec<GatewayI
         });
     }
 
+    // --- Paired remote runners: TCP probe --------------------------------
+    // v1 reachability check. Follow-up: a TLS-handshake probe that also
+    // re-verifies the pinned cert fingerprint (not just plain TCP connect).
+    for row in gateways::list_rows(cp.store()).await? {
+        if row.kind != "remote" {
+            continue;
+        }
+        let host = row.host.clone().unwrap_or_default();
+        let port = row.port.unwrap_or(0);
+        let latency = if probe {
+            let l = gateways::probe_tcp(&host, port).await;
+            match l {
+                Some(ms) => {
+                    set_last_seen(cp, &row.id).await;
+                    let _ = gateways::add_event(
+                        cp.store(),
+                        &row.id,
+                        "info",
+                        &format!("probe ok ({ms}ms)"),
+                    )
+                    .await;
+                }
+                None => {
+                    let _ = gateways::add_event(
+                        cp.store(),
+                        &row.id,
+                        "error",
+                        "probe failed — runner unreachable",
+                    )
+                    .await;
+                }
+            }
+            l
+        } else {
+            None
+        };
+        let seen = last_seen(cp, &row.id).await;
+        let connected = latency.is_some();
+        out.push(GatewayInfo {
+            id: row.id.clone(),
+            name: row.name.clone(),
+            badge: "RMT".into(),
+            kind: "remote".into(),
+            detail: format!("remote · {host}:{port}"),
+            meta_line: format!("remote · {host}:{port} · paired runner"),
+            status: if connected { "connected" } else { "offline" }.into(),
+            latency: latency.map(|ms| format!("{ms}ms")),
+            daemon_version: "—".into(),
+            uptime: None,
+            last_seen_ms: seen,
+            resources: vec![],
+            fingerprint: row.fingerprint.clone(),
+            fs_mode: row.fs_mode,
+            paths: row.paths,
+        });
+    }
+
     Ok(out)
 }
 
@@ -348,10 +422,48 @@ async fn add_gateway(
             username: Some(username),
             fs_mode: "projects".into(),
             paths: vec![],
+            fingerprint: None,
+            device_token: None,
         },
     )
     .await?;
     gateways::add_event(cp.store(), &id, "info", "gateway added").await?;
+    Ok(assemble(cp, true).await?)
+}
+
+/// Persists a paired remote runner. The pairing HTTP call (`POST /pair`
+/// against the host the user typed, over a pinned client) happens in
+/// Cockpit's `add_runner` command — core stays free of outbound HTTP to
+/// arbitrary hosts. This just stores the result: `device_token` is
+/// value-encrypted (recoverable — Cockpit replays it as a bearer on every
+/// call to the runner), never hashed.
+async fn save_runner(
+    state: &ApiState,
+    name: String,
+    host: String,
+    port: u16,
+    fingerprint: String,
+    device_token: String,
+) -> Result<Vec<GatewayInfo>, ApiError> {
+    let cp = &state.cp;
+    let id = format!("remote-{}", crate::paths::new_id());
+    gateways::upsert_row(
+        cp.store(),
+        GatewayRow {
+            id: id.clone(),
+            name,
+            kind: "remote".into(),
+            host: Some(host),
+            port: Some(port),
+            username: None,
+            fs_mode: "projects".into(),
+            paths: vec![],
+            fingerprint: Some(fingerprint),
+            device_token: Some(crate::llm_router::secrets::encrypt_field(&device_token)),
+        },
+    )
+    .await?;
+    gateways::add_event(cp.store(), &id, "info", "runner paired").await?;
     Ok(assemble(cp, true).await?)
 }
 
@@ -434,5 +546,89 @@ mod tests {
         let out = dispatch(&s, "list_gateways", json!({})).await.unwrap();
         assert_eq!(out[0]["id"], "local");
         assert_eq!(out[0]["kind"], "local");
+    }
+
+    async fn save_a_runner(s: &crate::serve::ApiState) -> Value {
+        dispatch(
+            s,
+            "save_runner",
+            json!({
+                "name": "gpu-box",
+                "host": "10.0.0.9",
+                "port": 7443,
+                "fingerprint": "b64ssh256fingerprint==",
+                "device_token": "plaintext-device-token"
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn find_remote(out: &Value) -> &Value {
+        out.as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["kind"] == "remote")
+            .expect("remote row present")
+    }
+
+    /// `save_runner` must persist the device token so Cockpit can REPLAY it
+    /// as a bearer (encrypted, not hashed). Assert the stored column isn't
+    /// the plaintext, and that it round-trips through `decrypt_field` — this
+    /// is robust whether the test keychain yields a real `enc:` blob or
+    /// (headless CI) a pass-through, since `encrypt_field`/`decrypt_field`
+    /// always agree with each other even when the keychain is unavailable.
+    #[tokio::test]
+    async fn save_runner_persists_encrypted_device_token() {
+        let s = state().await;
+        let out = save_a_runner(&s).await;
+        let id = find_remote(&out)["id"].as_str().unwrap().to_string();
+        assert!(id.starts_with("remote-"), "id={id}");
+
+        let row = gateways::get_row(s.cp.store(), &id)
+            .await
+            .unwrap()
+            .expect("row persisted");
+        let stored = row.device_token.clone().expect("device_token stored");
+        assert_ne!(
+            stored, "plaintext-device-token",
+            "device_token column must not hold plaintext"
+        );
+        let decrypted = crate::llm_router::secrets::decrypt_field(&stored).unwrap();
+        assert_eq!(decrypted, "plaintext-device-token");
+    }
+
+    #[tokio::test]
+    async fn assemble_surfaces_remote_row_with_fingerprint_and_badge() {
+        let s = state().await;
+        save_a_runner(&s).await;
+        let out = dispatch(&s, "list_gateways", json!({})).await.unwrap();
+        let remote = find_remote(&out);
+        assert_eq!(remote["badge"], "RMT");
+        assert_eq!(remote["fingerprint"], "b64ssh256fingerprint==");
+        assert_eq!(remote["name"], "gpu-box");
+    }
+
+    #[tokio::test]
+    async fn remove_gateway_removes_remote_row() {
+        let s = state().await;
+        let out = save_a_runner(&s).await;
+        let id = find_remote(&out)["id"].as_str().unwrap().to_string();
+
+        let after = dispatch(&s, "remove_gateway", json!({ "id": id }))
+            .await
+            .unwrap();
+        assert!(
+            after
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|g| g["id"] != id.as_str()),
+            "remote row must be gone after remove_gateway"
+        );
+        assert!(gateways::get_row(s.cp.store(), &id)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

@@ -704,6 +704,32 @@ fn migrations() -> Migrations<'static> {
                 expires_at INTEGER NOT NULL\
             );",
         ),
+        // Migration 25 — Phase 3 runner registry: extend the `gateways` table
+        // (already used for local/wsl/ssh rows) with a `remote` kind that
+        // carries a cert fingerprint (base64-std SHA-256 over the paired
+        // runner's TLS cert DER, verbatim) and an encrypted device token
+        // (`secrets::encrypt_field` — recoverable, NOT hashed, since Cockpit
+        // replays it as a bearer; contrast with the `devices` table from
+        // migration 24, which hashes). Hook-guarded (SQLite has no ADD
+        // COLUMN IF NOT EXISTS) exactly like the jobs.pre_check migration
+        // above: replaying this on a DB that already has the columns (the
+        // rewind-and-replay migration tests) must be a no-op instead of a
+        // "duplicate column" error.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let has_fingerprint = tx
+                .prepare("SELECT 1 FROM pragma_table_info('gateways') WHERE name='fingerprint'")?
+                .exists([])?;
+            if !has_fingerprint {
+                tx.execute("ALTER TABLE gateways ADD COLUMN fingerprint TEXT", [])?;
+            }
+            let has_device_token = tx
+                .prepare("SELECT 1 FROM pragma_table_info('gateways') WHERE name='device_token'")?
+                .exists([])?;
+            if !has_device_token {
+                tx.execute("ALTER TABLE gateways ADD COLUMN device_token TEXT", [])?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -3446,7 +3472,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 24, "forward migration must land at v24");
+        assert_eq!(user_version, 25, "forward migration must land at v25");
     }
 
     #[tokio::test]
@@ -3589,7 +3615,7 @@ mod tests {
     #[tokio::test]
     async fn migrations_13_to_23_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back eleven so the
+        // DB, seed the old values, then wind user_version back twelve so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
@@ -3602,17 +3628,19 @@ mod tests {
         // parent_session_pk, copies every existing column forward including
         // perm_mode; 23 plugin_installs + plugin_attach_status — CREATE TABLE
         // IF NOT EXISTS; 24 devices + pairing_codes — CREATE TABLE IF NOT
-        // EXISTS; all no-ops on replay) re-run on the next open.
+        // EXISTS; 25 gateways.fingerprint + gateways.device_token — hook-
+        // guarded, like branch_owned/pre_check/perm_mode; all no-ops on
+        // replay) re-run on the next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 24
-        // defined, wind back twelve.
+        // this test starts failing its assertions). With migrations through 25
+        // defined, wind back thirteen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 12)
+            c.pragma_update(None, "user_version", v - 13)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -3669,15 +3697,16 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back four, and reopen so 21 (and the tail
+        // wind user_version back five, and reopen so 21 (and the tail
         // migrations 22 sessions rebuild + 23 plugin-install ledger + 24
-        // devices/pairing_codes) replay against it. Back FOUR: the fully
-        // migrated tail is now v24, so rewinding to v20 is what makes
-        // migration 21 (native-only) replay.
+        // devices/pairing_codes + 25 gateways.fingerprint/device_token)
+        // replay against it. Back FIVE: the fully migrated tail is now v25,
+        // so rewinding to v20 is what makes migration 21 (native-only)
+        // replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 4)
+            c.pragma_update(None, "user_version", v - 5)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
