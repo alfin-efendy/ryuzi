@@ -3218,7 +3218,7 @@ mod tests {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v21 here, so `harness` was
+                    // The DB is fully migrated to v22 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
