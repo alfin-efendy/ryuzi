@@ -51,10 +51,16 @@ mod tests {
     use ryuzi_core::daemon_status::{write_status, DaemonStatusFile};
 
     #[allow(clippy::type_complexity)]
-    fn capture() -> (Box<dyn FnMut(&str)>, std::rc::Rc<std::cell::RefCell<Vec<String>>>) {
+    fn capture() -> (
+        Box<dyn FnMut(&str)>,
+        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    ) {
         let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let sink = out.clone();
-        (Box::new(move |s: &str| sink.borrow_mut().push(s.to_string())), out)
+        (
+            Box::new(move |s: &str| sink.borrow_mut().push(s.to_string())),
+            out,
+        )
     }
 
     #[test]

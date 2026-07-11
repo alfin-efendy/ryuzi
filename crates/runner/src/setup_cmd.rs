@@ -122,7 +122,10 @@ mod tests {
         let (mut deps, out) = deps_with_prompts(&db, vec![]);
         let code = cmd_setup(&mut deps);
         assert_eq!(code, 1);
-        assert!(out.borrow().iter().any(|l| l.starts_with("setup: still missing:")));
+        assert!(out
+            .borrow()
+            .iter()
+            .any(|l| l.starts_with("setup: still missing:")));
     }
 
     #[test]
