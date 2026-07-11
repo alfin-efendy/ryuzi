@@ -11,6 +11,7 @@ mod error;
 mod events;
 mod fsview_cmd;
 mod gateways_cmd;
+mod learning_cmd;
 mod native_cmd;
 mod open_cmd;
 mod plugins_cmd;
@@ -153,6 +154,14 @@ fn make_builder() -> Builder<tauri::Wry> {
             plugins_cmd::set_plugin_pin,
             plugins_cmd::plugin_doctor,
             plugins_cmd::plugins_restart_required,
+            learning_cmd::read_memory,
+            learning_cmd::write_memory,
+            learning_cmd::search_sessions,
+            learning_cmd::learning_graph,
+            learning_cmd::curator_status,
+            learning_cmd::curator_rollback,
+            learning_cmd::list_skill_usage,
+            learning_cmd::set_skill_pinned,
             session_io::export_session,
             session_io::import_session,
             session_io::share_session,

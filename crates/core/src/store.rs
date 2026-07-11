@@ -1004,8 +1004,11 @@ pub struct SessionRuntimeSettings {
 }
 
 /// One `messages_fts` match, joined against its owning session — the unit
-/// the `session_search` native tool's DISCOVERY action returns.
-#[derive(Debug, Clone, PartialEq)]
+/// the `session_search` native tool's DISCOVERY action returns, and (Task
+/// 11) the `search_sessions` RPC method's response for the Cockpit Learning
+/// panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct FtsHit {
     pub session_pk: String,
     pub seq: i64,

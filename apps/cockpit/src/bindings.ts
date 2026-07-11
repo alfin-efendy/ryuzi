@@ -1155,6 +1155,70 @@ async pluginsRestartRequired() : Promise<Result<boolean, CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
+async readMemory(scope: string) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_memory", { scope }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async writeMemory(scope: string, action: string, text: string | null, match: string | null) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("write_memory", { scope, action, text, match }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async searchSessions(query: string) : Promise<Result<FtsHit[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("search_sessions", { query }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async learningGraph() : Promise<Result<LearningGraph, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("learning_graph") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async curatorStatus() : Promise<Result<CuratorStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("curator_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async curatorRollback(runId: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("curator_rollback", { runId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listSkillUsage() : Promise<Result<SkillUsage[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_skill_usage") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setSkillPinned(name: string, pinned: boolean) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_skill_pinned", { name, pinned }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Export a session as a pretty JSON string.
  */
@@ -1441,6 +1505,34 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 { kind: "sessionCost"; session_pk: string; total_usd: number; models: ModelCost[] }
 export type CoreEventMsg = { event: CoreEvent }
 /**
+ * One `curator_runs` row (Task 10/Task 1 migration #28): a single curator
+ * sweep's bookkeeping, read back by the Cockpit Learning panel's (Task 11)
+ * history view.
+ */
+export type CuratorRun = { id: string; startedAt: number; finishedAt: number | null; 
+/**
+ * `running` | `ok` | `error`.
+ */
+status: string; 
+/**
+ * How many skills the deterministic planner transitioned this run.
+ */
+transitioned: number; 
+/**
+ * Whether the opt-in LLM consolidation pass ran this run.
+ */
+consolidated: boolean; 
+/**
+ * Pre-mutation tar.gz snapshot path, set only when `consolidated`.
+ */
+snapshotPath: string | null; error: string | null; log: string | null }
+/**
+ * `curator_status`'s response: when the curator last swept (`None` if it
+ * has never run) plus its recent run history for the Learning panel's
+ * curator-activity feed.
+ */
+export type CuratorStatus = { lastRunAt: number | null; recent: CuratorRun[] }
+/**
  * Device-code flow info shown to the user while they complete the browser
  * step (Kiro): the short code to enter, the URL to visit, and the poll
  * cadence the frontend's `await_kiro_device_flow` call will honor.
@@ -1464,6 +1556,13 @@ kind: string; message: string; suggestedAction: string }
 export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
+/**
+ * One `messages_fts` match, joined against its owning session — the unit
+ * the `session_search` native tool's DISCOVERY action returns, and (Task
+ * 11) the `search_sessions` RPC method's response for the Cockpit Learning
+ * panel.
+ */
+export type FtsHit = { sessionPk: string; seq: number; snippet: string; title: string | null; kind: string; createdAt: number }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string; 
 /**
@@ -1519,6 +1618,40 @@ export type KeychainStatus =
  * restart, or a previously stored key was corrupt and was replaced.
  */
 "unavailable"
+export type LearningGraph = { nodes: LearningGraphNode[]; edges: LearningGraphEdge[] }
+/**
+ * One edge in the Learning panel's journey graph: `related_skills` links
+ * two skills whose names share a token (a lexical relatedness signal, since
+ * `skill_usage` carries no free-text description to compare); `lexical`
+ * links a memory entry to a skill its text mentions by name.
+ */
+export type LearningGraphEdge = { source: string; target: string; 
+/**
+ * `"related_skills"` | `"lexical"`.
+ */
+kind: string }
+/**
+ * One node in the Learning panel's journey graph: either a skill
+ * (`kind == "skill"`, `state` set from `skill_usage.state`) or a memory
+ * entry (`kind == "memory"`, `scope` set to which memory file it lives in).
+ * `id` is content-stable (see `learning_api::build_learning_graph`) so a
+ * re-fetch after an unrelated edit doesn't reshuffle node identity —
+ * unlike Hermes' fragile positional memory ids (spec §7.6).
+ */
+export type LearningGraphNode = { id: string; 
+/**
+ * `"skill"` | `"memory"`.
+ */
+kind: string; label: string; 
+/**
+ * Skill lifecycle state (`active`/`stale`/`archived`); `None` for a
+ * memory node.
+ */
+state: string | null; 
+/**
+ * Memory scope (`global`/`user`/`project`); `None` for a skill node.
+ */
+scope: string | null }
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
@@ -1741,6 +1874,13 @@ export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
  * for `Completed` — exactly one is ever `Some`.
  */
 export type SkillInstallBegin = { completed: boolean; trust: TrustPromptDto | null; plugin: InstalledSkillPack | null }
+/**
+ * Per-skill telemetry (Phase 4 §4/§7): use/view/patch counters and
+ * lifecycle state, read by the `skill_manage` native tool (Task 6) and the
+ * curator (Task 10) to decide when a skill should transition between
+ * `active`, `stale`, and `archived`.
+ */
+export type SkillUsage = { name: string; createdBy: string | null; useCount: number; viewCount: number; patchCount: number; lastUsedAt: number | null; lastViewedAt: number | null; lastPatchedAt: number | null; state: string; pinned: boolean; archivedAt: number | null; createdAt: number | null }
 export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 
