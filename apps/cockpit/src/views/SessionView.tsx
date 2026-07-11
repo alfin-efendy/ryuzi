@@ -111,11 +111,20 @@ export function SessionView() {
   // so the home→root mapping is resolved client-side: once per focused
   // session, and again whenever the store's orch task graph grows a root this
   // component hasn't seen yet (a fresh orchTaskChanged for a new goal).
-  const orchRootCount = Object.keys(orchTasks).length;
+  // Re-resolve the home→root mapping whenever any orch task's status changes,
+  // not only when a brand-new root appears. A root finishing is a same-key
+  // in-place status update that leaves the root COUNT unchanged, so keying the
+  // effect on the count alone left the strip mounted (showing a stale "live"
+  // state) after a run completed. This signal changes on every status delta,
+  // so the effect re-runs and the `!live` branch clears `orchRootForHome`.
+  const orchStatusSignal = Object.values(orchTasks)
+    .flat()
+    .map((t) => `${t.id}:${t.status}`)
+    .join("|");
   const [orchRootForHome, setOrchRootForHome] = useState<Record<string, string>>({});
   const homeSessionPk = session?.kind === "chat" ? session.sessionPk : null;
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: orchRootCount is a deliberate re-run trigger (a new root appearing in the store), not read in the body
+  // biome-ignore lint/correctness/useExhaustiveDependencies: orchStatusSignal is a deliberate re-run trigger (any orch status change), not read in the body
   useEffect(() => {
     if (!homeSessionPk) return;
     let alive = true;
@@ -137,7 +146,7 @@ export function SessionView() {
     return () => {
       alive = false;
     };
-  }, [homeSessionPk, orchRootCount]);
+  }, [homeSessionPk, orchStatusSignal]);
 
   const orchRootId = homeSessionPk ? orchRootForHome[homeSessionPk] : undefined;
 
