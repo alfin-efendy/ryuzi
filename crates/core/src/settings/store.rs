@@ -96,12 +96,23 @@ impl SettingsStore {
     }
 
     /// The persisted row, if any (even an empty string); else the field's
-    /// schema default.
+    /// schema default — the static `find_field` catalog's default for a
+    /// global/gateway key, or (for a key not in that compile-time catalog)
+    /// the `default` a plugin declared on its `manifest.settings[]` field via
+    /// `crate::plugins::plugin_field`. Precedence: explicit stored value >
+    /// static catalog default > plugin field default > `None`. This is the
+    /// single read path `${setting:KEY}` substitution and required-field
+    /// checks (`declarative.rs::ensure_auth`, `missing_required` below) go
+    /// through, so a manifest `default` now actually takes effect instead of
+    /// only ever appearing as Cockpit placeholder text.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
         if let Some(v) = self.store.get_setting_raw(key).await? {
             return Ok(Some(v));
         }
-        Ok(find_field(key).and_then(|f| f.default).map(String::from))
+        if let Some(default) = find_field(key).and_then(|f| f.default) {
+            return Ok(Some(default.to_string()));
+        }
+        Ok(crate::plugins::plugin_field(key).and_then(|f| f.default))
     }
 
     /// Validate then persist a setting.
@@ -401,6 +412,116 @@ mod tests {
 
         // Setting a valid member value clears it.
         settings.set(&key, "free").await.unwrap();
+        assert!(!settings
+            .missing_required()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k == &key));
+    }
+
+    /// Register a plugin with two settings fields: one carrying a `default`
+    /// (`required` parameterized) and a sibling with no `default`, to prove
+    /// the read-path fallback (this fix) is conditional on the field
+    /// actually declaring one.
+    fn register_plugin_with_default(id: &str, required: bool) {
+        use crate::plugins::{CorePlugin, PluginHost, PluginSource};
+        use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
+
+        let manifest = PluginManifest {
+            contract: 1,
+            id: id.to_string(),
+            name: format!("Test Default Plugin {id}"),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![
+                SettingField {
+                    key: format!("plugin.{id}.tier"),
+                    label: "Tier".to_string(),
+                    help: String::new(),
+                    secret: false,
+                    required,
+                    kind: FieldKind::String,
+                    options: Vec::new(),
+                    default: Some("free".to_string()),
+                },
+                SettingField {
+                    key: format!("plugin.{id}.nodefault"),
+                    label: "No Default".to_string(),
+                    help: String::new(),
+                    secret: false,
+                    required: false,
+                    kind: FieldKind::String,
+                    options: Vec::new(),
+                    default: None,
+                },
+            ],
+            mcp: vec![],
+            skills: vec![],
+            provider: None,
+        };
+        let mut host = PluginHost::new();
+        host.add(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            source: PluginSource::Builtin,
+        });
+    }
+
+    #[tokio::test]
+    async fn get_falls_back_to_a_registered_plugin_fields_default_when_unset() {
+        // Unique id — `plugin_field` is a process-wide registry, so a shared
+        // id could pick up state from another test's plugin in the same
+        // test binary.
+        let id = "task-c3-storetest-default-plugin";
+        register_plugin_with_default(id, false);
+        let key = format!("plugin.{id}.tier");
+        let no_default_key = format!("plugin.{id}.nodefault");
+
+        let (store, _tmp) = open_test_store().await;
+        let settings = SettingsStore::new(std::sync::Arc::new(store));
+
+        // Unset: falls back to the plugin field's declared default — this
+        // is the fix (previously `get` only consulted the static
+        // `find_field` catalog, which never covers `plugin.*` keys, so a
+        // manifest `default` had no effect on the read path at all).
+        assert_eq!(settings.get(&key).await.unwrap().as_deref(), Some("free"));
+        // A plugin field with no `default` still resolves to `None` when unset.
+        assert_eq!(settings.get(&no_default_key).await.unwrap(), None);
+
+        // An explicit stored value takes precedence over the plugin default.
+        settings.set(&key, "pro").await.unwrap();
+        assert_eq!(settings.get(&key).await.unwrap().as_deref(), Some("pro"));
+    }
+
+    #[tokio::test]
+    async fn missing_required_treats_a_required_plugin_field_with_a_default_as_satisfied() {
+        let id = "task-c3-storetest-required-default-plugin";
+        register_plugin_with_default(id, true);
+        let key = format!("plugin.{id}.tier");
+
+        let (store, _tmp) = open_test_store().await;
+        let settings = SettingsStore::new(std::sync::Arc::new(store));
+        settings
+            .set(&format!("plugin.{id}.enabled"), "true")
+            .await
+            .unwrap();
+
+        // Required, never explicitly set, but the field declares a
+        // `default` — `missing_required` calls the same `get()` used for
+        // substitution, so the default resolves it and it must not be
+        // reported as missing. This mirrors pre-existing behavior for
+        // static/global required fields with a schema default; it was
+        // simply unreachable for plugin fields before this fix.
         assert!(!settings
             .missing_required()
             .await
