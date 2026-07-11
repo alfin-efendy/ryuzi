@@ -852,6 +852,25 @@ impl SupervisedExtension {
     }
 }
 
+impl Drop for SupervisedExtension {
+    /// Best-effort backstop for the drop-without-`shutdown` path: a
+    /// `?`-propagated error or a panic on a daemon-init branch after
+    /// `spawn_all` would otherwise leave the [`supervise`] task detached,
+    /// pinging and restarting forever — and because that task holds a clone of
+    /// `state` (the `Arc<Mutex<ExtensionProc>>` owning the live `Child`), the
+    /// child's `kill_on_drop(true)` would never fire either. Cancelling the
+    /// token and aborting the task drops that clone; together with this
+    /// struct's own `state` drop the `ExtensionProc` (and its `Child`) is
+    /// released and reaped. The async [`Self::shutdown`] is still preferred —
+    /// it stops the child *gracefully*; this only rules out a silent leak.
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(handle) = self.supervisor.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Owns every spawned extension subprocess, keyed by the plugin id that
 /// declared it. Each is independently [`SupervisedExtension`]-supervised
 /// (DT4) — one extension restarting, backing off, or giving up never
@@ -1688,6 +1707,33 @@ mod tests {
             backoff_for_attempt(1_000, &cfg),
             RESTART_BACKOFF_CAP,
             "a huge attempt index must stay capped, never overflow/panic"
+        );
+    }
+
+    /// The [`Drop`] backstop: dropping a `SupervisedExtension` WITHOUT calling
+    /// `shutdown` (the `?`-error / panic-after-`spawn_all` path) must still
+    /// cancel supervision so the detached task can't keep pinging/restarting
+    /// forever. We observe the token the supervise task races on: after drop it
+    /// must be cancelled, which drives that task to exit (and drop its
+    /// `state`/`Child` clone).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_without_shutdown_cancels_supervision() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "").unwrap();
+        let supervised = SupervisedExtension::spawn_with_config(
+            ack_forever_spec("orphan", Some(tmp.path())),
+            fast_test_cfg(),
+        )
+        .await;
+        // Clone the very token the `supervise` task selects on, then drop the
+        // handle without `shutdown`.
+        let token = supervised.cancel.clone();
+        assert!(!token.is_cancelled(), "sanity: live before drop");
+        drop(supervised);
+        assert!(
+            token.is_cancelled(),
+            "Drop must cancel supervision so the task can't run detached"
         );
     }
 
