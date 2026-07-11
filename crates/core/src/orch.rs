@@ -31,8 +31,9 @@ pub struct OrchTask {
     pub project_id: String,
     pub title: String,
     pub body: String,
-    /// Advisory: recorded from the decomposer; worker sessions currently run
-    /// the project's default agent (start_session has no agent selection yet).
+    /// Recorded from the decomposer and resolved by name against
+    /// `AgentRegistry` when the worker session starts (falling back to the
+    /// registry's default agent for an unknown/blank name).
     pub agent: String,
     pub status: String,
     pub session_pk: Option<String>,
@@ -332,6 +333,14 @@ pub async fn get_task(store: &Store, id: &str) -> anyhow::Result<Option<OrchTask
             .optional()
         })
         .await
+}
+
+/// The home chat of a task's root (workers post bubbles + deliver into it).
+pub async fn home_session(store: &Store, task: &OrchTask) -> anyhow::Result<Option<String>> {
+    let root_id = task.root_id.clone().unwrap_or_else(|| task.id.clone());
+    Ok(get_task(store, &root_id)
+        .await?
+        .and_then(|r| r.home_session_pk))
 }
 
 /// Flip `todo` children whose dependencies are all `done` to `ready`.
@@ -651,21 +660,31 @@ fn emit_changed(cp: &Arc<ControlPlane>, task_id: &str, root_id: Option<String>, 
 
 /// Submit a goal for orchestrated execution. With `decompose`, an LLM plans
 /// the subtasks in the background (the root sits in `decomposing` meanwhile);
-/// otherwise the goal itself becomes the root's single subtask. Returns the
-/// root id — the dispatcher loop picks the work up on its next tick.
+/// otherwise the goal itself becomes the root's single subtask. `home_session_pk`
+/// is the originating chat (if any) worker bubbles post into and the aggregate
+/// outcome re-enters over the rail. Returns the root id — the dispatcher loop
+/// picks the work up on its next tick.
 pub async fn submit(
     cp: &Arc<ControlPlane>,
     project_id: &str,
     goal: &str,
     decompose: bool,
+    home_session_pk: Option<&str>,
 ) -> anyhow::Result<String> {
     if cp.store().get_project(project_id).await?.is_none() {
         anyhow::bail!("unknown project: {project_id}");
     }
     if !decompose {
-        return submit_with_plan(cp, project_id, goal, single_task_plan(goal)).await;
+        return submit_with_plan(
+            cp,
+            project_id,
+            goal,
+            single_task_plan(goal),
+            home_session_pk,
+        )
+        .await;
     }
-    let root = insert_root(cp.store(), project_id, goal, "decomposing", None).await?;
+    let root = insert_root(cp.store(), project_id, goal, "decomposing", home_session_pk).await?;
     emit_changed(cp, &root, None, "decomposing");
     let (cp2, root2, project_id, goal) = (
         cp.clone(),
@@ -706,7 +725,8 @@ pub fn single_task_plan(goal: &str) -> Vec<PlannedTask> {
 /// Store-only goal submission (no events, no ControlPlane): validate the
 /// project, insert a `waiting` root plus the single-task plan. Used by the
 /// CLI, whose daemonless process has no event bus; a running daemon host's
-/// dispatcher picks the rows up on its next tick.
+/// dispatcher picks the rows up on its next tick. The CLI has no chat to bind
+/// a home session to, so this always inserts with `home_session_pk: None`.
 pub async fn queue_goal(store: &Store, project_id: &str, goal: &str) -> anyhow::Result<String> {
     if store.get_project(project_id).await?.is_none() {
         anyhow::bail!("unknown project: {project_id}");
@@ -723,8 +743,9 @@ pub async fn submit_with_plan(
     project_id: &str,
     goal: &str,
     plan: Vec<PlannedTask>,
+    home_session_pk: Option<&str>,
 ) -> anyhow::Result<String> {
-    let root = insert_root(cp.store(), project_id, goal, "waiting", None).await?;
+    let root = insert_root(cp.store(), project_id, goal, "waiting", home_session_pk).await?;
     let ids = insert_children(cp.store(), &root, project_id, &plan).await?;
     emit_changed(cp, &root, None, "waiting");
     for id in &ids {
@@ -908,8 +929,21 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
     // Subscribe BEFORE starting so a fast turn can't slip past the watcher.
     let rx = cp.subscribe();
     let prompt = format!("[Orchestrated subtask: {}]\n\n{}", t.title, t.body);
+    let home = home_session(store, &t).await.unwrap_or(None);
     let session = match cp
-        .start_session(&t.project_id, &prompt, "orchestrator", &[])
+        .start_session_with_prompt(
+            &t.project_id,
+            crate::harness::TurnPrompt::text(prompt.clone(), prompt),
+            "orchestrator",
+            &[],
+            None,
+            None,
+            None,
+            Some(crate::control::WorkerBinding {
+                agent: t.agent.clone(),
+                home_session_pk: home,
+            }),
+        )
         .await
     {
         Ok(s) => s,
@@ -1459,6 +1493,7 @@ mod tests {
                     parents: vec![0],
                 },
             ],
+            None,
         )
         .await
         .unwrap();
@@ -1529,6 +1564,7 @@ mod tests {
                 agent: "build".into(),
                 parents: vec![],
             }],
+            None,
         )
         .await
         .unwrap();
@@ -1548,7 +1584,7 @@ mod tests {
     #[tokio::test]
     async fn submit_without_decompose_queues_a_single_child() {
         let (cp, _repo) = cp_with_project().await;
-        let root = submit(&cp, "p1", "just do it", false).await.unwrap();
+        let root = submit(&cp, "p1", "just do it", false, None).await.unwrap();
         let tasks = list_tasks(cp.store(), Some(&root)).await.unwrap();
         let (roots, children): (Vec<_>, Vec<_>) =
             tasks.into_iter().partition(|t| t.root_id.is_none());
@@ -1558,7 +1594,48 @@ mod tests {
         assert_eq!(children[0].status, "todo");
         assert_eq!(children[0].body, "just do it");
         // Unknown projects are rejected up front.
-        assert!(submit(&cp, "nope", "x", false).await.is_err());
+        assert!(submit(&cp, "nope", "x", false, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_session_runs_its_assigned_agent_and_binds_the_home_chat() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        // Two-task plan with distinct assignees.
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "plan".into(),
+                parents: vec![],
+            }],
+            Some("home-42"),
+        )
+        .await
+        .unwrap();
+        tick(&cp).await; // promote + claim + start_worker
+                         // The claimed child now has a worker session with the right shape.
+        let child = list_tasks(cp.store(), Some(&root))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.root_id.is_some())
+            .unwrap();
+        let s = cp
+            .store()
+            .get_session(child.session_pk.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.kind, crate::domain::SessionKind::Worker);
+        assert_eq!(s.agent.as_deref(), Some("plan"));
+        assert_eq!(s.speaker.as_deref(), Some("plan"));
+        assert_eq!(s.parent_session_pk.as_deref(), Some("home-42"));
     }
 
     #[tokio::test]

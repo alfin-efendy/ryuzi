@@ -320,6 +320,7 @@ async fn start_session(
             git,
             options.perm_mode,
             None,
+            None,
         )
         .await?)
 }

@@ -544,6 +544,7 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
             None,
             None,
             job.model_override.clone(),
+            None,
         )
         .await
     {

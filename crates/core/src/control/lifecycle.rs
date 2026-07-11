@@ -14,6 +14,15 @@ use crate::worktree;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Binds a spawned session to an orchestration as a labeled worker (spec §8):
+/// it runs `agent`, its bubbles are attributed to that name, and its
+/// `parent_session_pk` points at the home chat it reports into.
+#[derive(Debug, Clone)]
+pub struct WorkerBinding {
+    pub agent: String,
+    pub home_session_pk: Option<String>,
+}
+
 impl ControlPlane {
     pub async fn start_session(
         self: &Arc<Self>,
@@ -27,6 +36,7 @@ impl ControlPlane {
             TurnPrompt::text(prompt, prompt),
             started_by,
             attachments,
+            None,
             None,
             None,
             None,
@@ -44,6 +54,7 @@ impl ControlPlane {
         git: Option<SessionGitOptions>,
         perm_mode: Option<PermMode>,
         model_override: Option<String>,
+        worker: Option<WorkerBinding>,
     ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
@@ -115,10 +126,14 @@ impl ControlPlane {
             last_active: Some(now),
             resume_attempts: 0,
             branch_owned: project.is_git && git.create_branch && git.branch_name.is_none(),
-            kind: SessionKind::Project,
-            speaker: None,
-            agent: None,
-            parent_session_pk: None,
+            kind: if worker.is_some() {
+                SessionKind::Worker
+            } else {
+                SessionKind::Project
+            },
+            speaker: worker.as_ref().map(|w| w.agent.clone()),
+            agent: worker.as_ref().map(|w| w.agent.clone()),
+            parent_session_pk: worker.as_ref().and_then(|w| w.home_session_pk.clone()),
         };
         self.store.insert_session(session.clone()).await?;
         let _ = self.events.send(CoreEvent::SessionCreated {

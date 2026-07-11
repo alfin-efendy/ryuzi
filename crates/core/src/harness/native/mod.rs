@@ -177,7 +177,14 @@ impl Harness for NativeHarness {
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
-        let agent = agents.default_agent();
+        // Agent-per-task: a worker session carries its assignee in `ctx.agent`
+        // (Phase 2 threaded the column through). Fall back to the default when
+        // unset (ordinary project/chat sessions) or unknown (stale roster).
+        let agent = ctx
+            .agent
+            .as_deref()
+            .and_then(|name| agents.get(name))
+            .unwrap_or_else(|| agents.default_agent());
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
         let mcp_tools = connect_mcp_tools(&ctx.mcp_servers).await;

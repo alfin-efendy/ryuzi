@@ -1487,6 +1487,7 @@ async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
             Some(git_opts(false, true, None, None)),
             None,
             None,
+            None,
         )
         .await
         .expect("start must succeed; git errors surface in the transcript");
@@ -3211,6 +3212,7 @@ async fn user_named_branch_survives_end_session() {
             Some(git_opts(true, true, Some("keep/me"), None)),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3256,6 +3258,7 @@ async fn engine_named_branch_is_deleted_on_end_session() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3297,6 +3300,7 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
             "test",
             &[],
             Some(git_opts(false, false, None, None)),
+            None,
             None,
             None,
         )
