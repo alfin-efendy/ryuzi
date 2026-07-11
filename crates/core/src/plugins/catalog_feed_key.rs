@@ -3,11 +3,14 @@
 //! by `scripts/catalog/build-feed.ts`) and is never committed.
 //!
 //! This is still the all-zero placeholder — a deliberate, one-time HUMAN ops
-//! step, not something this crate can safely invent a key for. Until it's
-//! replaced, `verify_with` (`crates/core/src/plugins/remote_catalog.rs`)
-//! rejects every feed (no real ed25519 signature verifies against an
-//! all-zero key), so the remote catalog is inert but harmless — the engine
-//! still ships and enables the embedded catalog either way.
+//! step, not something this crate can safely invent a key for. The all-zero
+//! key is a valid *low-order* Edwards point, so a non-strict verify could be
+//! tricked into accepting a forged signature against it; `verify_with`
+//! (`crates/core/src/plugins/remote_catalog.rs`) therefore rejects it two
+//! ways — an explicit all-zero guard AND `verify_strict` (which rejects
+//! low-order keys). While this placeholder is in place, EVERY feed is rejected
+//! (the remote catalog is fail-closed), so the engine still ships and enables
+//! the embedded catalog either way.
 //!
 //! To go live:
 //! 1. Run `bun scripts/catalog/keygen.ts` ONCE (a second run makes an

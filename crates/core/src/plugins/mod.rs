@@ -287,6 +287,15 @@ pub async fn is_blocked(store: &Store, id: &str) -> (bool, Option<String>) {
 ///
 /// Best-effort per id: a single plugin's settings write failing is logged
 /// and does not abort the rest of the sweep.
+///
+/// Scope note: the `plugin.<id>.enabled=false` key this writes is the
+/// *connector*-plugin enable flag. It is a deliberate no-op for gateway ids
+/// (which are toggled via the `enabled_gateways` CSV, not per-id settings) and
+/// for harness- or manifest-only ids. That is correct for the real domain
+/// here — remote-catalog entries are always connector plugins, so a blocked id
+/// always maps to this key — but do not repurpose this sweep for
+/// gateway/harness blocks without also handling their distinct enable
+/// mechanisms.
 pub async fn apply_blocked_denylist(
     store: &Store,
     settings: &SettingsStore,

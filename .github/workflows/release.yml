@@ -213,6 +213,11 @@ jobs:
       - name: Build + sign the feed (skipped when CATALOG_FEED_PRIVATE_KEY isn't set)
         env:
           CATALOG_FEED_PRIVATE_KEY: ${{ secrets.CATALOG_FEED_PRIVATE_KEY }}
+          # Monotonic across releases (increments every workflow run) so each
+          # published feed's `sequence` strictly advances — anti-rollback then
+          # rejects equal-sequence replay of an older signed feed. `sequence.txt`
+          # is a local-build fallback only; CI never commits it back.
+          CATALOG_FEED_SEQUENCE: ${{ github.run_number }}
         run: |
           if [ -z "$CATALOG_FEED_PRIVATE_KEY" ]; then
             echo "No CATALOG_FEED_PRIVATE_KEY secret — skipping the remote catalog feed."

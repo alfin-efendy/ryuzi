@@ -967,10 +967,13 @@ never ships anywhere — it lives only as the `CATALOG_FEED_PRIVATE_KEY` CI
 secret, consumed by the publish tooling below.
 
 `CATALOG_FEED_PUBKEY` currently ships as the **all-zero placeholder**
-(`[0u8; 32]`) — no real ed25519 signature verifies against it, so every
-fetch is rejected (`CatalogFeedError::BadSignature`) and the remote catalog
-is inert (harmless: the embedded catalog still loads normally). Going live
-is a one-time human ops step:
+(`[0u8; 32]`). That key is a valid *low-order* ed25519 point — a non-strict
+verify could be tricked into accepting a forged signature against it — so the
+engine rejects it two ways: an explicit all-zero guard **plus** `verify_strict`
+(which rejects low-order keys and non-canonical signatures). While the
+placeholder is in place **every fetch is rejected**
+(`CatalogFeedError::BadSignature`); the remote catalog is fail-closed and the
+embedded catalog still loads normally. Going live is a one-time human ops step:
 
 1. Run `bun scripts/catalog/keygen.ts` **once** (a second run makes an
    unrelated keypair, not a recovery of the first). It prints:

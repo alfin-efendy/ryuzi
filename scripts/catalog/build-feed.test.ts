@@ -9,6 +9,7 @@ import {
   readBlocklist,
   readCatalogEntries,
   readSequence,
+  resolveSequence,
   serializeFeed,
   signFeedBytes,
   writeFeed,
@@ -186,6 +187,26 @@ test("readBlocklist rejects an entry missing a required field", async () => {
   const path = join(dir, "blocklist.json");
   await Bun.write(path, JSON.stringify([{ id: "evil" }]));
   await expect(readBlocklist(path)).rejects.toThrow(/expected \{"id"/);
+});
+
+// Anti-rollback depends on the published `sequence` advancing across releases.
+// CI never commits `sequence.txt` back, so an env-provided monotonic sequence
+// (e.g. `github.run_number`) MUST win over `sequence.txt + 1`; otherwise every
+// release republishes the same sequence and equal-sequence replay of an older
+// signed feed slips past anti-rollback.
+test("resolveSequence prefers CATALOG_FEED_SEQUENCE env over sequence.txt+1, else falls back", () => {
+  // Env set (CI): the env value wins outright, regardless of the local file.
+  expect(resolveSequence("42", 5)).toBe(42);
+  expect(resolveSequence("  42  ", 5)).toBe(42); // surrounding whitespace trimmed
+  expect(resolveSequence("0", 9)).toBe(0);
+  // Env unset/blank (local build): fall back to lastSequence + 1.
+  expect(resolveSequence(undefined, 5)).toBe(6);
+  expect(resolveSequence("", 5)).toBe(6);
+  expect(resolveSequence("   ", 5)).toBe(6);
+  // A malformed env value is a hard error, not a silent fallback.
+  expect(() => resolveSequence("-1", 0)).toThrow(/non-negative integer/);
+  expect(() => resolveSequence("1.5", 0)).toThrow(/non-negative integer/);
+  expect(() => resolveSequence("abc", 0)).toThrow(/non-negative integer/);
 });
 
 test("readSequence/writeSequence round trip, defaulting to 0 when the file is missing", async () => {

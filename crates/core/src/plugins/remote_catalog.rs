@@ -57,12 +57,24 @@ pub enum CatalogFeedError {
     Rollback { got: u64, have: u64 },
 }
 
-pub fn verify_feed_signature(feed_bytes: &[u8], sig_bytes: &[u8]) -> bool {
-    verify_with(feed_bytes, sig_bytes, &CATALOG_FEED_PUBKEY)
-}
-
+/// Verify a detached ed25519 signature over `feed_bytes` against `pubkey` —
+/// the single choke point every production and test verify path funnels
+/// through.
+///
+/// Two hard rejections guard the placeholder key. The compiled-in
+/// `CATALOG_FEED_PUBKEY` is all-zero, which is a valid *low-order* Edwards
+/// point; non-strict ed25519 `verify()` does NOT reject low-order public keys,
+/// so an attacker with no private key could forge a `(feed_bytes, signature)`
+/// pair it accepts. We therefore (1) reject the all-zero key outright — so an
+/// accidental future revert to the placeholder can never reintroduce
+/// forgeability, independent of the strict-verify property — and (2) use
+/// `verify_strict`, which rejects low-order `A` and non-canonical `R`/`S`.
+/// Legitimate full-order signatures still verify.
 fn verify_with(feed_bytes: &[u8], sig_bytes: &[u8], pubkey: &[u8; 32]) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use ed25519_dalek::{Signature, VerifyingKey};
+    if pubkey == &[0u8; 32] {
+        return false;
+    }
     let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
         return false;
     };
@@ -70,19 +82,13 @@ fn verify_with(feed_bytes: &[u8], sig_bytes: &[u8], pubkey: &[u8; 32]) -> bool {
         return false;
     };
     let sig = Signature::from_bytes(&sig_arr);
-    vk.verify(feed_bytes, &sig).is_ok()
+    vk.verify_strict(feed_bytes, &sig).is_ok()
 }
 
 /// Verify the detached signature over `feed_bytes`, then parse, then enforce
 /// schema + anti-rollback. Returns the parsed feed only when fully trusted.
-pub fn parse_and_check(
-    feed_bytes: &[u8],
-    sig_bytes: &[u8],
-    last_sequence: u64,
-) -> Result<CatalogFeed, CatalogFeedError> {
-    parse_and_check_with(feed_bytes, sig_bytes, last_sequence, &CATALOG_FEED_PUBKEY)
-}
-
+/// Takes an explicit `pubkey` so tests can sign with a throwaway keypair;
+/// production threads the compiled-in `CATALOG_FEED_PUBKEY`.
 fn parse_and_check_with(
     feed_bytes: &[u8],
     sig_bytes: &[u8],
@@ -172,42 +178,73 @@ pub async fn fetch_and_cache(
     fetch_and_cache_with(store, http, feed_url, &CATALOG_FEED_PUBKEY).await
 }
 
+/// Persist a non-applied fetch outcome and build the `applied: false` result.
+/// Re-writes `last_sequence` (never 0) so the anti-rollback counter survives a
+/// transient failure, and records `outcome` — `"error"` for transport/HTTP or
+/// cache-write failures, `"rejected"` for a feed that was fetched but not
+/// trusted/valid — so `catalog_status.outcome` reflects the last fetch rather
+/// than a stale earlier success. A persist failure is logged, not swallowed.
+async fn record_failure(
+    store: &Store,
+    last_sequence: u64,
+    outcome: &str,
+    message: String,
+) -> FetchOutcome {
+    if let Err(e) = store.set_catalog_feed_state(last_sequence, outcome).await {
+        tracing::warn!("catalog feed: failed to persist fetch outcome {outcome:?}: {e}");
+    }
+    FetchOutcome {
+        applied: false,
+        sequence: 0,
+        entries: 0,
+        blocked: 0,
+        message,
+    }
+}
+
 /// `fetch_and_cache` with an injectable verify key, so tests can sign with a
 /// throwaway keypair instead of the (placeholder, all-zero) real one.
 ///
 /// Never panics and never propagates fetch/parse/validation failures as an
 /// `Err` — every failure path returns `FetchOutcome { applied: false, .. }`
-/// with a human-readable `message`.
+/// with a human-readable `message` and persists a fetch-outcome label via
+/// [`record_failure`].
 async fn fetch_and_cache_with(
     store: &Store,
     http: &dyn CatalogHttp,
     feed_url: &str,
     pubkey: &[u8; 32],
 ) -> FetchOutcome {
-    let fail = |msg: String| FetchOutcome {
-        applied: false,
-        sequence: 0,
-        entries: 0,
-        blocked: 0,
-        message: msg,
-    };
+    // Last-accepted sequence, read up front so a *failed* fetch can persist an
+    // outcome label without clobbering the anti-rollback counter — the failure
+    // paths re-persist `last` (never 0), so a transient 404/bad-sig can never
+    // reset rollback protection.
+    let last = store.get_catalog_feed_sequence().await.unwrap_or(0);
 
     let sig_url = format!("{feed_url}.sig");
     let feed_bytes = match http.get(feed_url).await {
         Ok((s, b)) if (200..300).contains(&s) => b,
-        Ok((s, _)) => return fail(format!("feed HTTP {s}")),
-        Err(e) => return fail(format!("feed fetch failed: {e}")),
+        Ok((s, _)) => return record_failure(store, last, "error", format!("feed HTTP {s}")).await,
+        Err(e) => {
+            return record_failure(store, last, "error", format!("feed fetch failed: {e}")).await
+        }
     };
     let sig_bytes = match http.get(&sig_url).await {
         Ok((s, b)) if (200..300).contains(&s) => b,
-        Ok((s, _)) => return fail(format!("signature HTTP {s}")),
-        Err(e) => return fail(format!("signature fetch failed: {e}")),
+        Ok((s, _)) => {
+            return record_failure(store, last, "error", format!("signature HTTP {s}")).await
+        }
+        Err(e) => {
+            return record_failure(store, last, "error", format!("signature fetch failed: {e}"))
+                .await
+        }
     };
 
-    let last = store.get_catalog_feed_sequence().await.unwrap_or(0);
     let feed = match parse_and_check_with(&feed_bytes, &sig_bytes, last, pubkey) {
         Ok(f) => f,
-        Err(e) => return fail(format!("feed rejected: {e:?}")),
+        Err(e) => {
+            return record_failure(store, last, "rejected", format!("feed rejected: {e:?}")).await
+        }
     };
 
     // Validate each entry's manifest via the SDK; drop+log invalid ones.
@@ -249,9 +286,14 @@ async fn fetch_and_cache_with(
     let entries = rows.iter().filter(|r| !r.blocked).count();
     let blocked = rows.iter().filter(|r| r.blocked).count();
     if let Err(e) = store.upsert_remote_catalog(&rows).await {
-        return fail(format!("cache write failed: {e}"));
+        return record_failure(store, last, "error", format!("cache write failed: {e}")).await;
     }
-    let _ = store.set_catalog_feed_state(feed.sequence, "ok").await;
+    if let Err(e) = store.set_catalog_feed_state(feed.sequence, "ok").await {
+        tracing::warn!(
+            "catalog feed: failed to persist accepted sequence {}: {e}",
+            feed.sequence
+        );
+    }
     FetchOutcome {
         applied: true,
         sequence: feed.sequence,
@@ -467,6 +509,47 @@ mod tests {
         ));
     }
 
+    // The compiled-in `CATALOG_FEED_PUBKEY` is the all-zero placeholder — a
+    // valid LOW-ORDER Edwards point. Non-strict ed25519 `verify()` does NOT
+    // reject low-order public keys, so before this fix an attacker with no
+    // private key could grind a `(bytes, signature)` pair that `verify_with`
+    // accepted against it. `verify_with` now rejects the all-zero key two ways
+    // (an explicit guard AND `verify_strict`), so verification against it is
+    // deterministically `false` for ANY signature. This locks the fail-closed
+    // property: a silent regression (a revert to the placeholder, or a swap
+    // back to non-strict `verify`) can never reintroduce the forgery.
+    #[test]
+    fn all_zero_placeholder_key_rejects_every_signature() {
+        let bytes = feed_json(5).into_bytes();
+        // A perfectly valid signature under a real full-order key — still
+        // rejected when checked against the all-zero placeholder.
+        let valid_sig = sign(&bytes);
+        assert!(!verify_with(&bytes, &valid_sig, &CATALOG_FEED_PUBKEY));
+        assert!(!verify_with(&bytes, &valid_sig, &[0u8; 32]));
+        // Degenerate / trivially-forged signature shapes are rejected too.
+        assert!(!verify_with(&bytes, &[0u8; 64], &[0u8; 32]));
+        assert!(!verify_with(&bytes, &[0xffu8; 64], &[0u8; 32]));
+        // ...and the parse+check path over the production key must classify it
+        // as a bad signature, never accept the feed.
+        assert!(matches!(
+            parse_and_check_with(&bytes, &valid_sig, 0, &CATALOG_FEED_PUBKEY),
+            Err(CatalogFeedError::BadSignature)
+        ));
+    }
+
+    // Counterpart to the guard test: switching `verify()` -> `verify_strict()`
+    // must NOT break the legitimate path — a full-order key's own signature
+    // still verifies. (The round-trip/`parse_and_check_with` tests above rely
+    // on this too; assert it directly at the choke point so a broken verify
+    // swap fails here, loudly.)
+    #[test]
+    fn full_order_key_signature_still_verifies_under_strict() {
+        let bytes = feed_json(5).into_bytes();
+        let sig = sign(&bytes);
+        let pubkey = test_keypair().verifying_key().to_bytes();
+        assert!(verify_with(&bytes, &sig, &pubkey));
+    }
+
     struct FakeHttp {
         // url suffix -> (status, bytes)
         feed: (u16, Vec<u8>),
@@ -600,11 +683,14 @@ mod tests {
 
     // `refresh` must fetch+apply a changed feed and, because the cached set
     // actually changed, flip `ControlPlane::plugins_restart_required` — the
-    // signal Cockpit/the daemon use to prompt a restart. Verifying against
-    // the real (placeholder, all-zero) `CATALOG_FEED_PUBKEY` can't accept a
-    // test-signed feed, so this drives the manager through the
-    // `#[cfg(test)]`-only `refresh_with_pubkey` seam instead of the public
-    // `refresh`.
+    // signal Cockpit/the daemon use to prompt a restart. The production
+    // `CATALOG_FEED_PUBKEY` is the all-zero placeholder, which `verify_with`
+    // rejects outright (explicit guard + `verify_strict`), so the remote
+    // catalog is fail-closed until a real full-order key ships; this test
+    // therefore drives the manager through the `#[cfg(test)]`-only
+    // `refresh_with_pubkey` seam with a throwaway key. See
+    // `all_zero_placeholder_key_rejects_every_signature` for the fail-closed
+    // guarantee itself.
     #[tokio::test]
     async fn manager_refresh_applies_and_marks_restart_when_changed() {
         let bytes = feed_json(9).into_bytes();

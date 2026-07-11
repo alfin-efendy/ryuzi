@@ -139,6 +139,28 @@ export async function writeSequence(sequencePath: string, sequence: number): Pro
   await Bun.write(sequencePath, `${sequence}\n`);
 }
 
+/**
+ * The sequence this build should publish. An explicit `CATALOG_FEED_SEQUENCE`
+ * (set by CI to a value that is monotonic *across releases* — e.g.
+ * `github.run_number`) wins, because the committed `sequence.txt` isn't
+ * committed back by CI, so relying on `lastSequence + 1` there would republish
+ * the SAME sequence every release and silently weaken anti-rollback (an
+ * equal-sequence replay of an older signed feed would be accepted). When the
+ * env var is unset/blank (local builds), fall back to `lastSequence + 1` off
+ * `sequence.txt`. Throws on a non-integer / negative env value.
+ */
+export function resolveSequence(envSequence: string | undefined, lastSequence: number): number {
+  const trimmed = envSequence?.trim();
+  if (trimmed !== undefined && trimmed !== "") {
+    const n = Number(trimmed);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error(`CATALOG_FEED_SEQUENCE must be a non-negative integer, got ${JSON.stringify(envSequence)}`);
+    }
+    return n;
+  }
+  return lastSequence + 1;
+}
+
 /** Assembles the `CatalogFeed` object — pure, no I/O. `entries`/`blocked` are used as given (already validated/defaulted by the caller). */
 export function buildFeedObject(args: {
   entries: CatalogFeedEntry[];
@@ -221,7 +243,7 @@ async function main() {
 
   const entries = await readCatalogEntries(catalogDir);
   const blocked = await readBlocklist(blocklistPath);
-  const sequence = (await readSequence(sequencePath)) + 1;
+  const sequence = resolveSequence(process.env.CATALOG_FEED_SEQUENCE, await readSequence(sequencePath));
 
   const feed = buildFeedObject({ entries, blocked, sequence, generatedAt: Date.now() });
   const { jsonPath, sigPath } = await writeFeed(feed, privateKeySeedBase64, outJsonPath, outSigPath);
