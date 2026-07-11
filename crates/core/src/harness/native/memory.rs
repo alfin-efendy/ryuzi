@@ -69,7 +69,7 @@ const THREAT_PATTERNS: &[(&str, &str)] = &[
     ("system prompt", "prompt exfiltration"),
     ("you are now", "role hijack"),
     ("exfiltrate", "exfiltration verb"),
-    ("curl http", "network exfiltration"),
+    ("curl http://", "network exfiltration"),
     ("<script", "markup injection"),
 ];
 
