@@ -8,11 +8,12 @@
 //! pipes, or — in tests — an in-memory `tokio::io::duplex` pair) so protocol
 //! logic can be exercised without spawning a process.
 //!
-//! DT3 (this slice) wires `initialize`/`shutdown`. `ping` (DT4 health
-//! supervision) and the `event/<name>` notification family (DT5 dispatch)
-//! are reserved here as method-name constants only — no request/response
-//! shape or dispatch logic for them exists yet, so later slices don't have
-//! to renegotiate the wire vocabulary.
+//! DT3 wired `initialize`/`shutdown`. DT4 adds `ping` (health supervision —
+//! [`ping_request`]/[`parse_ping_response`]). The `event/<name>`
+//! notification family (DT5 dispatch) is still reserved here as a
+//! method-name-prefix constant only — no request/response shape or dispatch
+//! logic for it exists yet, so that later slice doesn't have to renegotiate
+//! the wire vocabulary.
 
 use serde_json::{json, Value};
 
@@ -34,8 +35,8 @@ pub const METHOD_INITIALIZE: &str = "extension/initialize";
 /// `proc::ExtensionProc::shutdown`).
 pub const METHOD_SHUTDOWN: &str = "extension/shutdown";
 
-/// Host -> extension health probe. Reserved for DT4's supervision loop —
-/// not sent by this slice.
+/// Host -> extension health probe, sent periodically by `proc::supervise`
+/// (DT4) while an extension is `Running`.
 pub const METHOD_PING: &str = "extension/ping";
 
 /// Host -> extension event notification method prefix — DT5 dispatch fires
@@ -66,6 +67,22 @@ pub fn initialize_request(id: i64, events: &[&str], provides_tools: bool) -> Val
 /// Build the `extension/shutdown` request (no params).
 pub fn shutdown_request(id: i64) -> Value {
     stdio_jsonrpc::build_request(id, METHOD_SHUTDOWN, None)
+}
+
+/// Build the `extension/ping` health-check request (no params).
+pub fn ping_request(id: i64) -> Value {
+    stdio_jsonrpc::build_request(id, METHOD_PING, None)
+}
+
+/// Whether an `extension/ping` response counts as healthy: anything that
+/// isn't a JSON-RPC `error` object. Deliberately more permissive than
+/// [`parse_initialize_response`] — a ping's only job is proving the
+/// extension is alive and still speaking JSON-RPC on this id, not validating
+/// a payload shape; the exact ping reply body is not part of the negotiated
+/// protocol surface, so a minimal `{"result":{}}` and a chattier one both
+/// count as healthy.
+pub fn parse_ping_response(resp: &Value) -> bool {
+    resp.get("error").is_none()
 }
 
 /// The extension's validated `extension/initialize` response.
@@ -189,6 +206,31 @@ mod tests {
         let req = shutdown_request(2);
         assert_eq!(req["method"], METHOD_SHUTDOWN);
         assert!(req.get("params").is_none());
+    }
+
+    #[test]
+    fn ping_request_has_no_params() {
+        let req = ping_request(3);
+        assert_eq!(req["method"], METHOD_PING);
+        assert_eq!(req["id"], 3);
+        assert!(req.get("params").is_none());
+    }
+
+    #[test]
+    fn parse_ping_response_accepts_any_non_error_result() {
+        assert!(parse_ping_response(
+            &json!({ "jsonrpc": "2.0", "id": 1, "result": {} })
+        ));
+        assert!(parse_ping_response(
+            &json!({ "jsonrpc": "2.0", "id": 1, "result": { "ok": true, "extra": "chatty" } })
+        ));
+    }
+
+    #[test]
+    fn parse_ping_response_rejects_an_error_object() {
+        assert!(!parse_ping_response(
+            &json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -1, "message": "boom" } })
+        ));
     }
 
     #[test]

@@ -57,6 +57,71 @@
 //! process a grace period to exit on its own, then falls back to a hard
 //! kill. `kill_on_drop(true)` (set at spawn) is the unconditional backstop
 //! if `shutdown` is never called at all.
+//!
+//! # Supervision (DT4): health ping, restart-with-backoff, give-up
+//! [`SupervisedExtension`] is what [`ExtensionHost`] actually stores (one per
+//! spawned extension, keyed by owning plugin id): a live [`ExtensionProc`]
+//! behind `Arc<Mutex<..>>` (mutated in place on restart — see below) plus a
+//! background task running [`supervise`].
+//!
+//! **Health.** While the proc is `Running`, `supervise` sleeps
+//! [`PING_INTERVAL`] and then sends `extension/ping`
+//! ([`protocol::ping_request`]) through the SAME concurrency-safe
+//! `ExtensionIo::request` transport DT5's future event dispatch will share —
+//! `ExtensionProc.io` is `Arc<ExtensionIo>` specifically so the supervisor
+//! can clone a handle and issue the ping WITHOUT holding the `ExtensionProc`
+//! mutex for the whole [`PING_TIMEOUT`] round trip (a `status()`/`shutdown`
+//! caller must never stall behind an in-flight ping). A response that isn't
+//! a JSON-RPC error ([`protocol::parse_ping_response`]) is healthy; a
+//! timeout, a transport error, or the process having already exited
+//! (`TransportError::Closed`, since a dead child's stdout EOF fails every
+//! `request()` immediately — see `reader_loop`) is not.
+//!
+//! **Restart-with-backoff.** On unhealthy (or when `supervise` starts and
+//! the proc is *already* not `Running` — an initial spawn/handshake failure
+//! is retried exactly like a later crash, so a transient startup problem
+//! self-heals instead of being a one-shot permanent `Failed`), the proc is
+//! set to [`ExtensionStatus::Restarting`], and `supervise` waits
+//! [`backoff_for_attempt`]'s exponential, [`RESTART_BACKOFF_CAP`]-capped
+//! delay before re-running [`ExtensionProc::spawn_and_handshake`] (DT3's own
+//! spawn+handshake, reused verbatim) against the same [`ExtensionSpec`]. A
+//! successful respawn (`Running`) returns to the ping-health loop; a failed
+//! one loops back into another backoff round.
+//!
+//! **Give-up.** Every restart *attempt* (not detection) is timestamped;
+//! before each attempt, timestamps older than [`RESTART_WINDOW`] are pruned,
+//! and if [`MAX_RESTARTS_IN_WINDOW`] attempts already happened inside the
+//! window, `supervise` gives up permanently: the proc is set to
+//! `ExtensionStatus::Failed("restart-exhausted: ...")` (no extension-supplied
+//! text — safe for `plugin_doctor`/DT8) and the task returns, so a
+//! permanently-broken extension stops respawning instead of looping forever.
+//! The attempt list (and so the backoff exponent) is cleared once the proc
+//! has been continuously `Running` for [`HEALTHY_RESET_AFTER`], so a
+//! long-lived extension that later has one bad crash gets a fresh budget
+//! rather than inheriting exhaustion from restarts long past.
+//!
+//! **Independence.** `supervise` owns exactly one proc's state; a give-up in
+//! one task never touches another extension's `Arc<Mutex<..>>`, another
+//! plugin, or the daemon — see [`ExtensionHost`]'s per-plugin `Vec` of
+//! independently-supervised procs.
+//!
+//! **Shutdown stops supervision, and never races a restart.**
+//! [`SupervisedExtension::shutdown`] cancels a [`tokio_util::sync::CancellationToken`]
+//! FIRST and awaits the supervisor task's `JoinHandle` before ever touching
+//! the proc's `child`/`io` — `supervise` races every wait point (the ping
+//! interval, the backoff delay, and the respawn call itself) against that
+//! same token via `tokio::select!`, so cancellation always wins a race
+//! against "keep waiting" or "restart", never the other way around: once
+//! `shutdown` observes the task has finished, it is structurally impossible
+//! for that task to still decide to respawn afterward. Only once the
+//! supervisor is confirmed stopped does `shutdown` lock the proc and run
+//! [`ExtensionProc::shutdown`] (the DT3 graceful-stop primitive) on whatever
+//! process is currently live (there may be none, mid-backoff).
+//!
+//! **Concurrent `shutdown_all`.** [`ExtensionHost::shutdown_all`] stops every
+//! `SupervisedExtension` across every plugin via `futures::future::join_all`
+//! rather than a sequential loop (DT3's own noted follow-up), so daemon-stop
+//! latency is bounded by the single slowest shutdown, not `N × grace`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -68,12 +133,96 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, BufReader, Lines};
 use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::harness::native::hooks::HookEvent;
 use crate::plugins::host::PluginHost;
 use crate::stdio_jsonrpc;
 
 use super::{protocol, ExtensionCtx, ExtensionSpec, ExtensionStatus};
+
+/// Health check cadence for a `Running` extension's supervisor loop
+/// ([`supervise`]).
+pub const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Bound on a single `extension/ping` round trip. Independent of
+/// [`INIT_HANDSHAKE_TIMEOUT`] — a live extension answering its steady-state
+/// health probe should be fast; a slow/hung response is itself a health
+/// signal.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The first restart's backoff delay ([`backoff_for_attempt`]`(0)`).
+pub const RESTART_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// Backoff never exceeds this, no matter how many consecutive restarts have
+/// happened.
+pub const RESTART_BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// Give up (see this module's "Give-up" doc above) once this many restart
+/// *attempts* have happened inside [`RESTART_WINDOW`].
+pub const MAX_RESTARTS_IN_WINDOW: u32 = 5;
+
+/// Sliding window [`MAX_RESTARTS_IN_WINDOW`] is counted over.
+pub const RESTART_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// How long a proc must be continuously `Running` before its restart-attempt
+/// history (and so its backoff exponent and give-up budget) resets.
+pub const HEALTHY_RESET_AFTER: Duration = Duration::from_secs(60);
+
+/// Tunable timing knobs for [`supervise`]'s health/backoff/give-up policy.
+/// Production code always gets [`SupervisorConfig::default`] (the documented
+/// consts above); tests substitute tiny real durations instead.
+///
+/// This exists specifically so tests do NOT reach for `tokio::time::pause`/
+/// `start_paused`: a supervision test spawns a REAL subprocess (the same
+/// hermetic `sh` one-liner fakes DT3's own tests use), and a real child's
+/// response arrives in genuine wall-clock time no matter what a *paused*
+/// clock claims. Pairing a paused clock with a real subprocess is actively
+/// dangerous, not just unnecessary — tokio's auto-advance-when-idle behavior
+/// (what makes e.g. `spawn_and_handshake_reports_failed_on_timeout`'s 25s
+/// wait resolve instantly) fires as soon as the executor finds nothing
+/// immediately pollable, which can be BEFORE the OS has even scheduled the
+/// freshly-spawned child to run — so it can jump straight to
+/// `INIT_HANDSHAKE_TIMEOUT` and fail a handshake that a real, unpaused clock
+/// would have let succeed in a few milliseconds. Small-but-real durations
+/// sidestep that race entirely: every timer here is real, so a real
+/// process's real response always has time to arrive first.
+#[derive(Debug, Clone, Copy)]
+struct SupervisorConfig {
+    ping_interval: Duration,
+    ping_timeout: Duration,
+    restart_backoff_base: Duration,
+    restart_backoff_cap: Duration,
+    max_restarts_in_window: u32,
+    restart_window: Duration,
+    healthy_reset_after: Duration,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> SupervisorConfig {
+        SupervisorConfig {
+            ping_interval: PING_INTERVAL,
+            ping_timeout: PING_TIMEOUT,
+            restart_backoff_base: RESTART_BACKOFF_BASE,
+            restart_backoff_cap: RESTART_BACKOFF_CAP,
+            max_restarts_in_window: MAX_RESTARTS_IN_WINDOW,
+            restart_window: RESTART_WINDOW,
+            healthy_reset_after: HEALTHY_RESET_AFTER,
+        }
+    }
+}
+
+/// The backoff delay before the restart attempt at `attempt_index` (0-based:
+/// `attempt_index` is how many restart attempts have already happened inside
+/// the current window before this one) — `min(cfg.restart_backoff_base *
+/// 2^attempt_index, cfg.restart_backoff_cap)`. `attempt_index` is clamped
+/// before exponentiation so this never overflows `Duration`'s internal
+/// representation even if called with a very large index.
+fn backoff_for_attempt(attempt_index: usize, cfg: &SupervisorConfig) -> Duration {
+    let exp = attempt_index.min(10) as u32;
+    let scaled = cfg.restart_backoff_base.saturating_mul(1u32 << exp);
+    scaled.min(cfg.restart_backoff_cap)
+}
 
 /// Environment variables copied from the daemon's own process environment
 /// into every extension child, if present there — enough for a
@@ -380,7 +529,12 @@ pub struct ExtensionProc {
     /// `status == Running`. DT6 wraps these into typed tools.
     pub tools: Vec<Value>,
     child: Option<Child>,
-    io: Option<ExtensionIo>,
+    /// `Arc`, not a bare `ExtensionIo`: [`supervise`]'s health ping clones
+    /// this handle and issues `request()` *without* holding the outer
+    /// `Arc<Mutex<ExtensionProc>>` lock for the round trip (see this
+    /// module's "Supervision" doc) — a `status()` reader or `shutdown` must
+    /// never stall behind an in-flight ping.
+    io: Option<Arc<ExtensionIo>>,
 }
 
 impl ExtensionProc {
@@ -428,7 +582,7 @@ impl ExtensionProc {
                 tools: ack.tools,
                 status: ExtensionStatus::Running,
                 child: Some(child),
-                io: Some(io),
+                io: Some(Arc::new(io)),
                 spec,
             },
             Err(e) => {
@@ -459,8 +613,13 @@ impl ExtensionProc {
             let id = io.alloc_id();
             let req = protocol::shutdown_request(id);
             let _ = io.notify(&req).await;
-            // `io` drops at the end of this block — `ExtensionIo`'s `Drop`
-            // impl aborts the background reader task.
+            // This `Arc<ExtensionIo>` drops at the end of this block. In
+            // every real caller this is the last outstanding clone (DT4's
+            // `SupervisedExtension::shutdown` cancels+joins the supervisor
+            // — the only other place that ever clones this `Arc` — before
+            // ever reaching here), so the drop takes the strong count to 0
+            // and `ExtensionIo`'s `Drop` impl aborts the background reader
+            // task.
         }
         if tokio::time::timeout(grace, child.wait()).await.is_err() {
             let _ = child.kill().await;
@@ -469,13 +628,238 @@ impl ExtensionProc {
     }
 }
 
+/// Overwrite `*state` with a placeholder [`ExtensionStatus::Restarting`]
+/// record for `spec`: no live `child`/`io` (the previous ones, if any, are
+/// dropped here — `kill_on_drop`/`ExtensionIo::Drop` reap/abort them), empty
+/// `confirmed_events`/`tools`. Always followed by either another respawn
+/// attempt (replacing this placeholder with a real result) or a give-up
+/// (replacing it with `Failed`) — see [`supervise`].
+async fn mark_restarting(state: &Arc<Mutex<ExtensionProc>>, spec: &ExtensionSpec) {
+    let mut guard = state.lock().await;
+    *guard = ExtensionProc {
+        spec: spec.clone(),
+        status: ExtensionStatus::Restarting,
+        confirmed_events: Vec::new(),
+        tools: Vec::new(),
+        child: None,
+        io: None,
+    };
+}
+
+/// One `extension/ping` health check: clones the current `Arc<ExtensionIo>`
+/// under a brief lock (so the round trip itself never holds the
+/// `ExtensionProc` mutex — see this module's "Supervision" doc), then issues
+/// it. `false` covers every unhealthy case uniformly: not currently
+/// `Running`, no transport, a JSON-RPC error reply, a timeout, or the
+/// transport already closed because the child exited.
+async fn ping_once(state: &Arc<Mutex<ExtensionProc>>, ping_timeout: Duration) -> bool {
+    let io = {
+        let guard = state.lock().await;
+        match (&guard.status, &guard.io) {
+            (ExtensionStatus::Running, Some(io)) => io.clone(),
+            _ => return false,
+        }
+    };
+    let id = io.alloc_id();
+    let req = protocol::ping_request(id);
+    match io.request(id, req, ping_timeout).await {
+        Ok(resp) => protocol::parse_ping_response(&resp),
+        Err(_) => false,
+    }
+}
+
+/// The DT4 supervisor: one instance per [`SupervisedExtension`], spawned by
+/// [`SupervisedExtension::spawn`] and cancelled by
+/// [`SupervisedExtension::shutdown`]. See this module's "Supervision" doc
+/// for the full health/backoff/give-up/shutdown-race design; this is the
+/// state machine that implements it.
+///
+/// `cancel` is raced via `tokio::select!` against every wait point (the ping
+/// interval, the backoff delay, and the respawn call itself), so a shutdown
+/// mid-wait always wins over "keep waiting" or "restart" — see the module
+/// doc's "Shutdown stops supervision" section for why this rules out a
+/// restart-after-shutdown race.
+async fn supervise(
+    spec: ExtensionSpec,
+    state: Arc<Mutex<ExtensionProc>>,
+    cancel: CancellationToken,
+    cfg: SupervisorConfig,
+) {
+    let mut restart_attempts: Vec<tokio::time::Instant> = Vec::new();
+    let mut healthy_since = tokio::time::Instant::now();
+
+    'supervise: loop {
+        let currently_running = matches!(state.lock().await.status, ExtensionStatus::Running);
+        if currently_running {
+            // ---- Health loop: ping on an interval while Running. ----
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(cfg.ping_interval) => {}
+                }
+                if ping_once(&state, cfg.ping_timeout).await {
+                    if tokio::time::Instant::now().duration_since(healthy_since)
+                        >= cfg.healthy_reset_after
+                    {
+                        restart_attempts.clear();
+                    }
+                    continue;
+                }
+                break; // unhealthy -> fall through to restart handling below
+            }
+            if cancel.is_cancelled() {
+                return;
+            }
+        }
+
+        // ---- Restart-with-backoff loop. Reached either from an unhealthy
+        // Running proc above, or directly on this task's first iteration if
+        // the initial spawn/handshake never reached Running at all. ----
+        loop {
+            let now = tokio::time::Instant::now();
+            restart_attempts.retain(|t| now.duration_since(*t) < cfg.restart_window);
+
+            if restart_attempts.len() >= cfg.max_restarts_in_window as usize {
+                let reason = format!(
+                    "restart-exhausted: {} restarts within {:?}",
+                    cfg.max_restarts_in_window, cfg.restart_window
+                );
+                let mut guard = state.lock().await;
+                guard.status = ExtensionStatus::Failed(reason);
+                guard.confirmed_events.clear();
+                guard.tools.clear();
+                guard.child = None;
+                guard.io = None;
+                return; // give up permanently — this task never restarts again
+            }
+
+            mark_restarting(&state, &spec).await;
+
+            let backoff = backoff_for_attempt(restart_attempts.len(), &cfg);
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+
+            restart_attempts.push(tokio::time::Instant::now());
+
+            let new_proc = tokio::select! {
+                _ = cancel.cancelled() => return,
+                proc = ExtensionProc::spawn_and_handshake(spec.clone()) => proc,
+            };
+            let became_running = matches!(new_proc.status, ExtensionStatus::Running);
+            *state.lock().await = new_proc;
+            if became_running {
+                healthy_since = tokio::time::Instant::now();
+                continue 'supervise;
+            }
+            // Respawn itself failed — loop back to prune/give-up/backoff.
+        }
+    }
+}
+
+/// A read-only, cloned-out point-in-time view of one supervised extension —
+/// what [`ExtensionHost::get`] hands back, since the live
+/// `Arc<Mutex<ExtensionProc>>` behind [`SupervisedExtension`] cannot be
+/// exposed by reference (DT4's supervisor mutates it concurrently).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtensionSnapshot {
+    pub name: String,
+    pub status: ExtensionStatus,
+    pub confirmed_events: Vec<String>,
+    pub tools: Vec<Value>,
+}
+
+/// One extension subprocess UNDER SUPERVISION: the live [`ExtensionProc`]
+/// behind a lock (replaced in place by [`supervise`] on every restart
+/// attempt/give-up) plus the machinery to start and, crucially, cleanly stop
+/// that background task. This is what [`ExtensionHost`] stores; a bare
+/// [`ExtensionProc`] (no supervisor) remains the lower-level primitive DT3's
+/// own tests exercise directly.
+pub struct SupervisedExtension {
+    spec: ExtensionSpec,
+    state: Arc<Mutex<ExtensionProc>>,
+    cancel: CancellationToken,
+    supervisor: Option<JoinHandle<()>>,
+}
+
+impl SupervisedExtension {
+    /// Spawn+handshake `spec` and start supervision using the production
+    /// timing (see [`SupervisorConfig::default`]). This is the entry point
+    /// [`ExtensionHost::spawn_all`] uses.
+    async fn spawn(spec: ExtensionSpec) -> SupervisedExtension {
+        SupervisedExtension::spawn_with_config(spec, SupervisorConfig::default()).await
+    }
+
+    /// Spawn+handshake `spec` (via [`ExtensionProc::spawn_and_handshake`] —
+    /// DT3's primitive, reused verbatim, including its "never returns an
+    /// error" contract) and start its background [`supervise`] task with the
+    /// given `cfg`. Whether the initial handshake succeeded or not,
+    /// supervision starts immediately — an initial failure is retried with
+    /// the same restart-with-backoff policy as a later crash (see the module
+    /// doc). Test-only knob: production always goes through [`Self::spawn`]
+    /// (`SupervisorConfig::default()`); this module's tests substitute tiny
+    /// real durations instead — see [`SupervisorConfig`]'s doc for why.
+    async fn spawn_with_config(spec: ExtensionSpec, cfg: SupervisorConfig) -> SupervisedExtension {
+        let proc = ExtensionProc::spawn_and_handshake(spec.clone()).await;
+        let state = Arc::new(Mutex::new(proc));
+        let cancel = CancellationToken::new();
+        let supervisor = tokio::spawn(supervise(spec.clone(), state.clone(), cancel.clone(), cfg));
+        SupervisedExtension {
+            spec,
+            state,
+            cancel,
+            supervisor: Some(supervisor),
+        }
+    }
+
+    /// The manifest-declared name (`ExtensionSpec::name`), stable across
+    /// restarts.
+    pub fn name(&self) -> &str {
+        &self.spec.name
+    }
+
+    /// The current lifecycle status — DT4's required accessor so
+    /// `extension_status`/`plugin_doctor` (DT8) can read supervised state
+    /// without reaching into the lock themselves.
+    pub async fn status(&self) -> ExtensionStatus {
+        self.state.lock().await.status.clone()
+    }
+
+    /// A full point-in-time snapshot — see [`ExtensionSnapshot`].
+    pub async fn snapshot(&self) -> ExtensionSnapshot {
+        let guard = self.state.lock().await;
+        ExtensionSnapshot {
+            name: self.spec.name.clone(),
+            status: guard.status.clone(),
+            confirmed_events: guard.confirmed_events.clone(),
+            tools: guard.tools.clone(),
+        }
+    }
+
+    /// Stop supervision, then gracefully shut down whatever subprocess is
+    /// currently live (there may be none, mid-backoff, or after a give-up).
+    /// Cancels and joins the supervisor task BEFORE touching `child`/`io` —
+    /// see the module doc's "Shutdown stops supervision" section for why
+    /// this ordering is what rules out a restart-after-shutdown race. Safe
+    /// to call more than once (idempotent no-op past the first call).
+    pub async fn shutdown(&mut self, grace: Duration) {
+        self.cancel.cancel();
+        if let Some(handle) = self.supervisor.take() {
+            let _ = handle.await;
+        }
+        self.state.lock().await.shutdown(grace).await;
+    }
+}
+
 /// Owns every spawned extension subprocess, keyed by the plugin id that
-/// declared it. Supervision (health/`extension/ping`, restart-with-backoff —
-/// DT4) and event dispatch (DT5) build on this; this slice provides
-/// spawn-all + shutdown-all only — there is no restart loop yet.
+/// declared it. Each is independently [`SupervisedExtension`]-supervised
+/// (DT4) — one extension restarting, backing off, or giving up never
+/// touches any other entry, any other plugin, or the daemon. Event dispatch
+/// (DT5) builds on this next.
 #[derive(Default)]
 pub struct ExtensionHost {
-    procs: HashMap<String, Vec<ExtensionProc>>,
+    procs: HashMap<String, Vec<SupervisedExtension>>,
 }
 
 impl ExtensionHost {
@@ -485,13 +869,15 @@ impl ExtensionHost {
 
     /// Spawn+handshake every [`ExtensionSpec`] every *enabled*
     /// extension-capable plugin in `host` declares (`PluginHost::is_enabled`
-    /// gates it the same way it gates a connector — see `plugins::host`).
-    /// A plugin whose `ExtensionFactory::extensions` call errors (e.g. a
-    /// missing required setting) is logged and skipped — like any other
-    /// plugin-resolution failure, it never aborts the rest of the sweep. A
-    /// per-extension spawn/handshake failure is recorded as
-    /// `ExtensionStatus::Failed` on that one `ExtensionProc` (see
-    /// [`ExtensionProc::spawn_and_handshake`]) — also never fatal.
+    /// gates it the same way it gates a connector — see `plugins::host`),
+    /// and start supervision (health ping + restart-with-backoff + give-up
+    /// — DT4, see [`SupervisedExtension::spawn`]) for each. A plugin whose
+    /// `ExtensionFactory::extensions` call errors (e.g. a missing required
+    /// setting) is logged and skipped — like any other plugin-resolution
+    /// failure, it never aborts the rest of the sweep. A per-extension
+    /// spawn/handshake failure is recorded as `ExtensionStatus::Failed` on
+    /// that one entry and then retried by its own supervisor — also never
+    /// fatal to this sweep or any other extension.
     ///
     /// Callers: intended for the daemon's entry path only (real subprocess
     /// spawn). `daemon::build_daemon` does NOT call this in this slice, so
@@ -523,26 +909,36 @@ impl ExtensionHost {
             };
             let mut procs = Vec::with_capacity(specs.len());
             for spec in specs {
-                procs.push(ExtensionProc::spawn_and_handshake(spec).await);
+                procs.push(SupervisedExtension::spawn(spec).await);
             }
             self.procs.insert(plugin.manifest.id.clone(), procs);
         }
     }
 
-    /// Every spawned extension for `plugin_id`, or `&[]` if none were
-    /// spawned (unknown plugin, disabled, or no extension capability).
-    pub fn get(&self, plugin_id: &str) -> &[ExtensionProc] {
-        self.procs.get(plugin_id).map(Vec::as_slice).unwrap_or(&[])
+    /// A snapshot of every spawned extension for `plugin_id`, in spawn
+    /// order, or empty if none were spawned (unknown plugin, disabled, or no
+    /// extension capability). Async (unlike DT3's `get`) because status is
+    /// now DT4-supervised state behind a lock — see [`SupervisedExtension::snapshot`].
+    pub async fn get(&self, plugin_id: &str) -> Vec<ExtensionSnapshot> {
+        let Some(procs) = self.procs.get(plugin_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(procs.len());
+        for proc in procs {
+            out.push(proc.snapshot().await);
+        }
+        out
     }
 
-    /// Gracefully stop every spawned extension across every plugin (see
-    /// [`ExtensionProc::shutdown`]).
+    /// Gracefully stop every spawned extension across every plugin,
+    /// CONCURRENTLY (`futures::future::join_all`, not a sequential loop —
+    /// see this module's "Concurrent `shutdown_all`" doc): daemon-stop
+    /// latency is bounded by the single slowest shutdown, not `N × grace`.
+    /// Each [`SupervisedExtension::shutdown`] call stops that entry's
+    /// supervisor before its subprocess, so no restart races this shutdown.
     pub async fn shutdown_all(&mut self, grace: Duration) {
-        for procs in self.procs.values_mut() {
-            for proc in procs.iter_mut() {
-                proc.shutdown(grace).await;
-            }
-        }
+        let all = self.procs.values_mut().flat_map(|procs| procs.iter_mut());
+        futures::future::join_all(all.map(|proc| proc.shutdown(grace))).await;
     }
 }
 
@@ -979,17 +1375,489 @@ mod tests {
         ext_host.spawn_all(&host, &ctx).await;
 
         assert!(
-            ext_host.get("disabled-ext").is_empty(),
+            ext_host.get("disabled-ext").await.is_empty(),
             "a disabled extension-capable plugin must not be spawned"
         );
-        let running = ext_host.get("enabled-ext");
+        let running = ext_host.get("enabled-ext").await;
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].status, ExtensionStatus::Running);
 
         ext_host.shutdown_all(SHUTDOWN_GRACE).await;
         assert_eq!(
-            ext_host.get("enabled-ext")[0].status,
+            ext_host.get("enabled-ext").await[0].status,
             ExtensionStatus::Stopped
+        );
+    }
+
+    // ---------- DT4: supervision (health ping, restart-with-backoff, give-up, shutdown races) ----------
+    // A real, minimal `sh` subprocess plays the fake extension (same
+    // no-committed-script-file, `#[cfg(unix)]` precedent as the DT3 tests
+    // above). Deliberately NOT `start_paused`: a real child's response
+    // arrives in genuine wall-clock time, and racing that against a PAUSED
+    // clock's "jump to the next timer the instant nothing is immediately
+    // pollable" behavior can fire `INIT_HANDSHAKE_TIMEOUT` before the OS has
+    // even scheduled the freshly-spawned child to run (confirmed empirically
+    // — every test below failed with "initialize timed out" under
+    // `start_paused` even for a well-behaved fake). Instead, every test here
+    // uses [`SupervisorConfig`] to shrink `PING_INTERVAL`/backoff to a few
+    // tens of milliseconds of REAL time, and polls for the state transition
+    // it cares about (`wait_for_status`/`wait_for_attempt_count`) rather than
+    // guessing a fixed sleep — fast, deterministic, and immune to the
+    // paused-clock race.
+
+    /// A `sh` loop body: read one line, extract its `"id"`, ack it with
+    /// `{"result":{"ok":true}}`, repeat forever. `result.ok == true` with no
+    /// `events`/`error` is a valid reply to BOTH `extension/initialize`
+    /// (`parse_initialize_response` only requires `ok == true`; absent
+    /// `events` defaults to empty) and `extension/ping`
+    /// (`parse_ping_response` only requires no `error`), so this one loop
+    /// alone is a complete, indefinitely-healthy fake extension — see
+    /// [`ack_forever_spec`].
+    fn ack_forever_body() -> &'static str {
+        "while IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true}}\\n' \"$id\"; done"
+    }
+
+    /// A fake extension that acks its `extension/initialize` handshake with
+    /// a valid ack, then acks every subsequent request (pings, a repeat
+    /// ping, anything) forever — i.e. a well-behaved, indefinitely-healthy
+    /// extension that never exits on its own (including when it receives
+    /// `extension/shutdown` — it acks that too, then keeps waiting for more
+    /// input), so a `shutdown()` against one of these always rides out the
+    /// full grace period before the hard-kill fallback — see [`TEST_GRACE`].
+    /// Optionally appends a byte to `attempt_log` on every invocation so a
+    /// test can prove exactly how many times this command was spawned (each
+    /// restart is a fresh OS process) — see [`attempt_count`].
+    fn ack_forever_spec(name: &str, attempt_log: Option<&std::path::Path>) -> ExtensionSpec {
+        let log_line = attempt_log
+            .map(|p| format!("printf 'x' >> '{}'; ", p.display()))
+            .unwrap_or_default();
+        let body = format!("{log_line}{}", ack_forever_body());
+        spec(name, "sh", &["-c", &body])
+    }
+
+    /// A fake extension that acks its `extension/initialize` handshake once
+    /// and then exits immediately (closing its stdout) — simulates a crash
+    /// right after a successful startup. Appends to `attempt_log` like
+    /// [`ack_forever_spec`].
+    fn dies_after_handshake_spec(name: &str, attempt_log: &std::path::Path) -> ExtensionSpec {
+        let body = format!(
+            "printf 'x' >> '{}'; IFS= read -r line; id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"ok\":true,\"events\":[]}}}}\\n' \"$id\"",
+            attempt_log.display()
+        );
+        spec(name, "sh", &["-c", &body])
+    }
+
+    /// A fake extension that spawns fine, appends one byte to `attempt_log`,
+    /// then exits immediately without ever answering the handshake — so
+    /// `spawn_and_handshake` always resolves `Failed` (`InitError::Closed`),
+    /// never `Running`, on every attempt (initial AND every restart).
+    fn always_fails_after_spawning_spec(
+        name: &str,
+        attempt_log: &std::path::Path,
+    ) -> ExtensionSpec {
+        let body = format!("printf 'x' >> '{}'; exit 1", attempt_log.display());
+        spec(name, "sh", &["-c", &body])
+    }
+
+    /// A fake extension whose command does not exist at all — every
+    /// `spawn_and_handshake` attempt fails at the OS `spawn()` call itself
+    /// (before any subprocess ever runs), simulating a permanently broken
+    /// extension.
+    fn never_spawns_spec(name: &str) -> ExtensionSpec {
+        spec(name, "ryuzi-dt4-test-nonexistent-command-xyz", &[])
+    }
+
+    fn attempt_count(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// A small, entirely-real (non-paused) `grace` for these tests'
+    /// `shutdown()`/`shutdown_all()` calls — [`ack_forever_spec`] never
+    /// exits on its own on receiving `extension/shutdown`, so a shutdown
+    /// against one always rides out the full grace period before the
+    /// `ExtensionProc::shutdown` hard-kill fallback fires; the production
+    /// `SHUTDOWN_GRACE` (5s) would make every such test slow for no
+    /// assertion benefit.
+    const TEST_GRACE: Duration = Duration::from_millis(200);
+
+    /// Timing knobs fast enough to keep a real-subprocess supervision test
+    /// in the tens-to-low-hundreds-of-milliseconds range, while still
+    /// leaving comfortable real-time headroom over how long a trivial `sh`
+    /// spawn+handshake actually takes.
+    fn fast_test_cfg() -> SupervisorConfig {
+        SupervisorConfig {
+            ping_interval: Duration::from_millis(40),
+            ping_timeout: Duration::from_millis(500),
+            restart_backoff_base: Duration::from_millis(40),
+            restart_backoff_cap: Duration::from_secs(2),
+            max_restarts_in_window: MAX_RESTARTS_IN_WINDOW,
+            restart_window: Duration::from_secs(30),
+            healthy_reset_after: Duration::from_millis(500),
+        }
+    }
+
+    /// Poll `supervised.status()` every 5ms (real time) until `pred` matches
+    /// or `timeout` elapses (panicking with the last-observed status on
+    /// timeout) — avoids guessing a fixed sleep for a background task's
+    /// state transition.
+    async fn wait_for_status(
+        supervised: &SupervisedExtension,
+        timeout: Duration,
+        pred: impl Fn(&ExtensionStatus) -> bool,
+    ) -> ExtensionStatus {
+        let start = std::time::Instant::now();
+        loop {
+            let status = supervised.status().await;
+            if pred(&status) {
+                return status;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "timed out after {timeout:?} waiting for a status transition; last observed: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Poll `attempt_count(path)` every 5ms (real time) until it reaches
+    /// `target` or `timeout` elapses (panicking on timeout).
+    async fn wait_for_attempt_count(path: &std::path::Path, target: usize, timeout: Duration) {
+        let start = std::time::Instant::now();
+        loop {
+            let n = attempt_count(path);
+            if n >= target {
+                return;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "timed out after {timeout:?} waiting for attempt_count to reach {target}, currently {n}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_restarts_a_crashed_extension_and_becomes_healthy_again() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "").unwrap();
+
+        // The command behaves differently by attempt count: dies right after
+        // the first handshake, then (from the second invocation on) acks
+        // forever. This is what lets ONE `ExtensionSpec`/command model "the
+        // process crashed, and a respawn of the same command comes back
+        // healthy" without an injectable spawner seam.
+        let body = format!(
+            "printf 'x' >> '{path}'; n=$(wc -c < '{path}'); IFS= read -r line; id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"ok\":true,\"events\":[]}}}}\\n' \"$id\"; if [ \"$n\" -eq 1 ]; then exit 0; fi; {ack}",
+            path = tmp.path().display(),
+            ack = ack_forever_body(),
+        );
+        let spec = spec("flaky", "sh", &["-c", &body]);
+
+        let mut supervised = SupervisedExtension::spawn_with_config(spec, fast_test_cfg()).await;
+        assert_eq!(
+            supervised.status().await,
+            ExtensionStatus::Running,
+            "the first invocation must hand back a healthy ack"
+        );
+        assert_eq!(attempt_count(tmp.path()), 1);
+
+        // The (already-exited) first process's transport is closed, so the
+        // next health ping fails immediately -> Restarting -> a short
+        // backoff -> a fresh spawn_and_handshake of the SAME command, whose
+        // second invocation is the "ack forever" branch.
+        wait_for_status(&supervised, Duration::from_secs(5), |s| {
+            matches!(s, ExtensionStatus::Restarting)
+        })
+        .await;
+        wait_for_status(&supervised, Duration::from_secs(5), |s| {
+            matches!(s, ExtensionStatus::Running)
+        })
+        .await;
+
+        assert_eq!(
+            attempt_count(tmp.path()),
+            2,
+            "the supervisor must have spawned a NEW process (a second handshake), not reused the dead one"
+        );
+
+        supervised.shutdown(TEST_GRACE).await;
+        assert_eq!(supervised.status().await, ExtensionStatus::Stopped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_backoff_grows_exponentially_before_giving_up() {
+        // A command that spawns and marks its own attempt, but never
+        // completes the handshake — every attempt (the initial one AND
+        // every restart) fails, forcing exactly MAX_RESTARTS_IN_WINDOW
+        // restart attempts before give-up, with an observable marker per
+        // attempt to pin down exactly WHEN each one happened.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "").unwrap();
+        let cfg = SupervisorConfig {
+            // Big enough that none of the 5 steps below (40*2^4=640ms) get
+            // clamped — capping is covered separately by the pure formula
+            // test.
+            restart_backoff_cap: Duration::from_secs(5),
+            ..fast_test_cfg()
+        };
+        let spec = always_fails_after_spawning_spec("broken", tmp.path());
+
+        let supervised = SupervisedExtension::spawn_with_config(spec, cfg).await;
+        assert!(
+            matches!(supervised.status().await, ExtensionStatus::Failed(_)),
+            "a handshake that's never answered must start out Failed"
+        );
+        assert_eq!(
+            attempt_count(tmp.path()),
+            1,
+            "the initial spawn is attempt #1"
+        );
+
+        // Each step below waits for the NEXT restart attempt's marker and
+        // measures the real elapsed time since the previous one — proving
+        // the delay before each successive attempt actually grows
+        // (1x, 2x, 4x, 8x, 16x the base), not just that 5 restarts
+        // eventually happen somewhere within a generous window.
+        let mut checkpoint = std::time::Instant::now();
+        for attempt_index in 0..cfg.max_restarts_in_window {
+            let expected_backoff = backoff_for_attempt(attempt_index as usize, &cfg);
+            let target = 2 + attempt_index as usize;
+            wait_for_attempt_count(
+                tmp.path(),
+                target,
+                expected_backoff + Duration::from_secs(2),
+            )
+            .await;
+            let elapsed = checkpoint.elapsed();
+            assert!(
+                elapsed >= expected_backoff.saturating_sub(Duration::from_millis(20)),
+                "restart attempt #{} arrived after only {elapsed:?}, before its {expected_backoff:?} backoff could have elapsed",
+                attempt_index + 1
+            );
+            checkpoint = std::time::Instant::now();
+        }
+
+        // The 6th would-be attempt is refused: MAX_RESTARTS_IN_WINDOW (5)
+        // restarts already happened inside RESTART_WINDOW, so the give-up
+        // check fires instead of another backoff+respawn.
+        let status = wait_for_status(&supervised, Duration::from_secs(2), |s| {
+            matches!(s, ExtensionStatus::Failed(_))
+        })
+        .await;
+        match &status {
+            ExtensionStatus::Failed(reason) => {
+                assert!(
+                    reason.starts_with("restart-exhausted:"),
+                    "give-up reason should be the sanitized restart-exhausted marker: {reason}"
+                );
+            }
+            other => panic!("expected Failed(restart-exhausted) after give-up, got {other:?}"),
+        }
+        assert_eq!(
+            attempt_count(tmp.path()),
+            6,
+            "give-up must happen instead of a 6th respawn attempt"
+        );
+
+        // No further restarts after give-up: neither the status nor the
+        // attempt count budges even after waiting comfortably longer than
+        // another backoff round would have taken (the supervisor task
+        // returned for good on give-up).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(supervised.status().await, status);
+        assert_eq!(attempt_count(tmp.path()), 6);
+    }
+
+    #[test]
+    fn backoff_for_attempt_matches_the_documented_exponential_capped_formula() {
+        let cfg = SupervisorConfig::default();
+        assert_eq!(backoff_for_attempt(0, &cfg), RESTART_BACKOFF_BASE);
+        assert_eq!(backoff_for_attempt(1, &cfg), Duration::from_secs(2));
+        assert_eq!(backoff_for_attempt(2, &cfg), Duration::from_secs(4));
+        assert_eq!(backoff_for_attempt(3, &cfg), Duration::from_secs(8));
+        assert_eq!(backoff_for_attempt(4, &cfg), Duration::from_secs(16));
+        assert_eq!(backoff_for_attempt(5, &cfg), Duration::from_secs(32));
+        assert_eq!(
+            backoff_for_attempt(6, &cfg),
+            RESTART_BACKOFF_CAP,
+            "64s uncapped must clamp to the 60s cap"
+        );
+        assert_eq!(
+            backoff_for_attempt(1_000, &cfg),
+            RESTART_BACKOFF_CAP,
+            "a huge attempt index must stay capped, never overflow/panic"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_while_running_stops_cleanly_with_no_restart() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "").unwrap();
+        let mut supervised = SupervisedExtension::spawn_with_config(
+            ack_forever_spec("healthy", Some(tmp.path())),
+            fast_test_cfg(),
+        )
+        .await;
+        assert_eq!(supervised.status().await, ExtensionStatus::Running);
+        assert_eq!(attempt_count(tmp.path()), 1);
+
+        supervised.shutdown(TEST_GRACE).await;
+
+        assert_eq!(supervised.status().await, ExtensionStatus::Stopped);
+        // Shutdown while Running must never be preceded by a spurious
+        // restart.
+        assert_eq!(attempt_count(tmp.path()), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_during_a_backoff_wait_stops_cleanly_with_no_restart_triggered() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "").unwrap();
+        // A big backoff relative to the ping interval: gives this test a
+        // wide, comfortable real-time window between "the supervisor has
+        // detected the crash and entered its backoff wait" and "the backoff
+        // would actually elapse and trigger a respawn" — shutdown must land
+        // inside that window without racing it.
+        let cfg = SupervisorConfig {
+            ping_interval: Duration::from_millis(30),
+            restart_backoff_base: Duration::from_secs(3),
+            ..fast_test_cfg()
+        };
+        let mut supervised = SupervisedExtension::spawn_with_config(
+            dies_after_handshake_spec("dies-once", tmp.path()),
+            cfg,
+        )
+        .await;
+        assert_eq!(supervised.status().await, ExtensionStatus::Running);
+        assert_eq!(attempt_count(tmp.path()), 1);
+
+        // The ping interval elapses, the already-exited process's transport
+        // is closed so the ping fails immediately, and the supervisor enters
+        // its (3s) backoff sleep.
+        wait_for_status(&supervised, Duration::from_secs(2), |s| {
+            matches!(s, ExtensionStatus::Restarting)
+        })
+        .await;
+        assert_eq!(
+            attempt_count(tmp.path()),
+            1,
+            "must not have respawned yet — still mid-backoff"
+        );
+
+        // Shutdown races the supervisor's `cancel.cancelled()` branch
+        // against its `sleep(backoff)` branch — cancellation is an
+        // immediate event, not gated on the 3s backoff, so it wins.
+        supervised.shutdown(TEST_GRACE).await;
+
+        assert_eq!(supervised.status().await, ExtensionStatus::Stopped);
+        assert_eq!(
+            attempt_count(tmp.path()),
+            1,
+            "shutdown mid-backoff must never let the queued restart happen"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_give_up_extension_never_affects_a_healthy_sibling() {
+        let (ctx, store, _tmp) = open_ctx().await;
+        let mut host = PluginHost::new();
+        host.add(extension_only(
+            "broken-plugin",
+            vec![never_spawns_spec("broken")],
+        ));
+        host.add(extension_only(
+            "healthy-plugin",
+            vec![ack_forever_spec("healthy", None)],
+        ));
+        store
+            .set_setting_raw("plugin.broken-plugin.enabled", "true")
+            .await
+            .unwrap();
+        store
+            .set_setting_raw("plugin.healthy-plugin.enabled", "true")
+            .await
+            .unwrap();
+
+        let mut ext_host = ExtensionHost::new();
+        ext_host.spawn_all(&host, &ctx).await;
+
+        // Checked immediately (no wait): the broken extension's own
+        // supervisor is independently retrying/backing off in the
+        // background (its status may already be `Failed` from the initial
+        // attempt or `Restarting` if its supervisor task got a scheduling
+        // turn first — either is "not Running", which is the only thing
+        // this test needs), but the healthy sibling must be completely
+        // unaffected either way.
+        let healthy = ext_host.get("healthy-plugin").await;
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].status, ExtensionStatus::Running);
+        let broken = ext_host.get("broken-plugin").await;
+        assert_eq!(broken.len(), 1);
+        assert!(
+            matches!(
+                broken[0].status,
+                ExtensionStatus::Failed(_) | ExtensionStatus::Restarting
+            ),
+            "the broken extension must be unhealthy, got {:?}",
+            broken[0].status
+        );
+
+        ext_host.shutdown_all(TEST_GRACE).await;
+        assert_eq!(
+            ext_host.get("healthy-plugin").await[0].status,
+            ExtensionStatus::Stopped
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_all_stops_every_proc_concurrently() {
+        // Three procs that never react to `extension/shutdown` themselves
+        // (the ack-forever loop just keeps acking anything it reads,
+        // including the shutdown notification) so every one of them must
+        // ride out the full `grace` hard-kill fallback in
+        // `ExtensionProc::shutdown` — sequential would take ~3x `grace`;
+        // concurrent (`join_all`) takes ~1x. No `start_paused` here: this
+        // test asserts real wall-clock concurrency, so `grace` is kept small
+        // to stay fast either way.
+        let grace = Duration::from_millis(200);
+        let (ctx, store, _tmp) = open_ctx().await;
+        let mut host = PluginHost::new();
+        host.add(extension_only(
+            "multi",
+            vec![
+                ack_forever_spec("one", None),
+                ack_forever_spec("two", None),
+                ack_forever_spec("three", None),
+            ],
+        ));
+        store
+            .set_setting_raw("plugin.multi.enabled", "true")
+            .await
+            .unwrap();
+
+        let mut ext_host = ExtensionHost::new();
+        ext_host.spawn_all(&host, &ctx).await;
+        for snap in ext_host.get("multi").await {
+            assert_eq!(snap.status, ExtensionStatus::Running);
+        }
+
+        let start = std::time::Instant::now();
+        ext_host.shutdown_all(grace).await;
+        let elapsed = start.elapsed();
+
+        for snap in ext_host.get("multi").await {
+            assert_eq!(snap.status, ExtensionStatus::Stopped);
+        }
+        assert!(
+            elapsed < grace * 2,
+            "shutdown_all of 3 procs each needing the full grace period took {elapsed:?} \
+             (>= 2x grace={grace:?}) — looks sequential, not concurrent"
         );
     }
 }

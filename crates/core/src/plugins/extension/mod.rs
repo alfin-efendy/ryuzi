@@ -16,10 +16,15 @@
 //! `DeclarativeConnector`), and [`proc::ExtensionProc`]/[`proc::ExtensionHost`]
 //! covering spawn + handshake + graceful shutdown for one subprocess. Every
 //! type here is shaped so the later slices only ADD behavior:
-//! - **DT4 (supervision)**: health via `extension/ping`
-//!   ([`protocol::METHOD_PING`], reserved but unused here) and
-//!   restart-with-backoff — add an `ExtensionStatus::Restarting` variant and
-//!   a loop owned by `ExtensionHost`.
+//! - **DT4 (supervision, implemented)**: `proc::supervise` is a background
+//!   task per spawned extension (owned by `proc::SupervisedExtension`, which
+//!   `ExtensionHost` now stores instead of a bare `ExtensionProc`) that
+//!   periodically sends `extension/ping` ([`protocol::METHOD_PING`]) via the
+//!   proc's `request(...)`, and on a failed/timed-out ping or an already-not-`Running`
+//!   status, restarts the subprocess with exponential, capped backoff, giving
+//!   up (`ExtensionStatus::Failed("restart-exhausted: ...")`) after too many
+//!   restarts in a sliding window. See `proc`'s module doc for the exact
+//!   consts and the shutdown-vs-restart race fix.
 //! - **DT5 (event dispatch)**: `event/<name>` notifications
 //!   ([`protocol::METHOD_EVENT_PREFIX`]) fanned out to every `ExtensionProc`
 //!   whose `confirmed_events` includes the firing `HookEvent`, using the
@@ -46,7 +51,7 @@ use async_trait::async_trait;
 use crate::harness::native::hooks::HookEvent;
 use crate::settings::SettingsStore;
 
-pub use proc::{ExtensionHost, ExtensionProc};
+pub use proc::{ExtensionHost, ExtensionProc, ExtensionSnapshot};
 pub use protocol::PROTOCOL_VERSION;
 
 /// Per-event dispatch budget an `[[extension]]` manifest entry gets when it
@@ -122,10 +127,22 @@ pub enum ExtensionStatus {
     Starting,
     /// Handshake succeeded — `confirmed_events`/`tools` are populated.
     Running,
-    /// Spawn, handshake, or protocol negotiation failed. Carries a
-    /// sanitized (secret-free) reason — see `proc`'s `sanitize_init_error`
-    /// — safe to surface in `plugin_doctor`/Cockpit. Never fatal to the
-    /// daemon: the rest of the plugin host keeps running.
+    /// DT4's supervisor (`proc::supervise`) has detected the previous
+    /// subprocess is unhealthy (failed/timed-out `extension/ping`, or an
+    /// initial/previous spawn that never reached `Running`) and is between
+    /// that detection and its next `spawn_and_handshake` attempt — no live
+    /// subprocess exists for this instant. Always transient: the next
+    /// observed status is either `Running` (a healthy respawn) or `Failed`
+    /// (the supervisor gave up — see [`ExtensionStatus::Failed`]'s
+    /// `restart-exhausted` reason).
+    Restarting,
+    /// Spawn, handshake, or protocol negotiation failed, OR (DT4) the
+    /// supervisor exhausted its restart budget (reason prefixed
+    /// `restart-exhausted:`). Carries a sanitized (secret-free) reason — see
+    /// `proc`'s `sanitize_init_error` — safe to surface in
+    /// `plugin_doctor`/Cockpit. Never fatal to the daemon: the rest of the
+    /// plugin host keeps running, and one extension's give-up never affects
+    /// any other extension or plugin.
     Failed(String),
     /// [`proc::ExtensionProc::shutdown`] completed (or the process was
     /// never started / had already failed before ever running).
