@@ -20,6 +20,7 @@ import { useNative } from "./store-native";
 import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 import { notifier, notifyIntentForEvent, isWindowFocused } from "@/lib/notify";
+import { enqueue, dequeue, removeById, type QueuedMessage } from "@/lib/queue";
 
 export type PendingApproval = {
   sessionPk: string;
@@ -64,6 +65,12 @@ type State = {
   >;
   /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
+  /** Per-session in-memory type-ahead queue (messages typed while running). */
+  queued: Record<string, QueuedMessage[]>;
+  enqueueMessage: (sessionPk: string, msg: QueuedMessage) => void;
+  removeQueued: (sessionPk: string, id: string) => void;
+  /** Send the head of a session's queue; on send-failure re-queue it at the front. */
+  sendNextQueued: (sessionPk: string) => Promise<void>;
   applyCoreEvent: (e: CoreEvent) => void;
   clearApproval: (requestId: string) => void;
   setFocused: (pk: string | null) => void;
@@ -117,6 +124,7 @@ export const useStore = create<State>((set, get) => ({
   sessions: [],
   transcripts: {},
   pendingApprovals: [],
+  queued: {},
   focusedSessionPk: null,
   selectedProjectId: null,
   lastSeq: {},
@@ -343,6 +351,19 @@ export const useStore = create<State>((set, get) => ({
     await get().refresh();
     return res.status === "ok";
   },
+  enqueueMessage: (sessionPk, msg) => set((st) => ({ queued: { ...st.queued, [sessionPk]: enqueue(st.queued[sessionPk], msg) } })),
+  removeQueued: (sessionPk, id) => set((st) => ({ queued: { ...st.queued, [sessionPk]: removeById(st.queued[sessionPk], id) } })),
+  sendNextQueued: async (sessionPk) => {
+    const { head, rest } = dequeue(get().queued[sessionPk]);
+    if (!head) return;
+    // Remove the head BEFORE awaiting so a second `result` can't re-send it.
+    set((st) => ({ queued: { ...st.queued, [sessionPk]: rest } }));
+    const ok = await get().send(sessionPk, head.text, head.options);
+    if (!ok) {
+      // Command-level rejection: put it back at the front so it stays visible.
+      set((st) => ({ queued: { ...st.queued, [sessionPk]: [head, ...(st.queued[sessionPk] ?? [])] } }));
+    }
+  },
   stop: async (sessionPk) => {
     const res = await commands.stopSession(sessionPk);
     if (res.status === "error") {
@@ -384,6 +405,7 @@ export const useStore = create<State>((set, get) => ({
           intent,
           get().sessions.find((s) => s.sessionPk === intent.sessionPk),
         );
+      drainQueueOnEvent(event);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
@@ -405,4 +427,16 @@ export function markFocusedSessionReadOnEvent(event: CoreEvent, focusedSessionPk
   if (activePk && activePk === focusedSessionPk) {
     useUi.getState().markRead(activePk, Date.now());
   }
+}
+
+/**
+ * Drain one queued message when a session's turn finishes *successfully*.
+ * Keyed on `result` only: an `error` turn emits no `result`, so the queue
+ * stays put (structural pause). Extracted so the decision is testable without
+ * a real Tauri event subscription.
+ */
+export function drainQueueOnEvent(event: CoreEvent): void {
+  if (event.kind !== "result") return;
+  const pk = (event as { session_pk?: string }).session_pk;
+  if (pk) void useStore.getState().sendNextQueued(pk);
 }

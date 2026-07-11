@@ -1,8 +1,9 @@
 import { test, expect, mock, spyOn } from "bun:test";
-import { useStore, markFocusedSessionReadOnEvent } from "./store";
+import { useStore, markFocusedSessionReadOnEvent, drainQueueOnEvent } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
 import { useUi } from "./store-ui";
+import type { QueuedMessage } from "./lib/queue";
 
 function reset() {
   useStore.setState({
@@ -709,4 +710,60 @@ test("markFocusedSessionReadOnEvent leaves read state untouched for events on a 
     "s1",
   );
   expect(useUi.getState().readAt.s2).toBeUndefined();
+});
+
+const qmsg = (id: string, text = id): QueuedMessage => ({ id, text, options: null });
+
+test("enqueueMessage appends per session; removeQueued removes by id", () => {
+  useStore.setState({ queued: {} });
+  useStore.getState().enqueueMessage("s1", qmsg("a"));
+  useStore.getState().enqueueMessage("s1", qmsg("b"));
+  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["a", "b"]);
+  useStore.getState().removeQueued("s1", "a");
+  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["b"]);
+});
+
+test("sendNextQueued sends the head and removes it on success", async () => {
+  const calls: Array<[string, string]> = [];
+  useStore.setState({
+    queued: { s1: [qmsg("a", "hello"), qmsg("b", "world")] },
+    send: async (pk, text) => {
+      calls.push([pk, text]);
+      return true;
+    },
+  });
+  await useStore.getState().sendNextQueued("s1");
+  expect(calls).toEqual([["s1", "hello"]]);
+  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["b"]);
+});
+
+test("sendNextQueued unshifts the head back when send fails", async () => {
+  useStore.setState({
+    queued: { s1: [qmsg("a", "hello")] },
+    send: async () => false,
+  });
+  await useStore.getState().sendNextQueued("s1");
+  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["a"]); // still queued
+});
+
+test("sendNextQueued on an empty queue does not call send", async () => {
+  let called = false;
+  useStore.setState({
+    queued: {},
+    send: async () => {
+      called = true;
+      return true;
+    },
+  });
+  await useStore.getState().sendNextQueued("s1");
+  expect(called).toBe(false);
+});
+
+test("drainQueueOnEvent drains on result but not on error", () => {
+  const drained: string[] = [];
+  useStore.setState({ sendNextQueued: async (pk) => void drained.push(pk) });
+  drainQueueOnEvent({ kind: "error", session_pk: "s1" } as never);
+  expect(drained).toEqual([]);
+  drainQueueOnEvent({ kind: "result", session_pk: "s1" } as never);
+  expect(drained).toEqual(["s1"]);
 });
