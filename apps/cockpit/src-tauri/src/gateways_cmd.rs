@@ -130,6 +130,17 @@ pub async fn add_runner(
     Ok(gateways)
 }
 
+/// Deletes the persisted `gateways` row (works for `local`'s WSL entries,
+/// `ssh` remotes, and paired `remote` runners alike — all three kinds live
+/// in the LOCAL engine's store, hence this always dispatches to `"local"` by
+/// default). For a paired runner, deleting the row is only half the job: the
+/// [`EngineManager`] also holds a live pinned `EngineClient` and a
+/// reconnecting SSE bridge task keyed by that same id (see `add_runner`,
+/// `load_remotes`). Without the `remove_runner` call below, that bridge
+/// would keep retrying the now-gone runner and its events would land in an
+/// orphaned store bucket until Cockpit restarts. `remove_runner` is a no-op
+/// for `"local"` and for any id that was never a live runner (ssh/wsl ids),
+/// so it's safe to call unconditionally after every successful delete.
 #[tauri::command]
 #[specta::specta]
 pub async fn remove_gateway(
@@ -138,9 +149,13 @@ pub async fn remove_gateway(
     id: String,
 ) -> R<Vec<GatewayInfo>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
-    client
+    let result = client
         .rpc("remove_gateway", serde_json::json!({ "id": id }))
-        .await
+        .await;
+    if result.is_ok() {
+        engine.remove_runner(&id);
+    }
+    result
 }
 
 #[tauri::command]

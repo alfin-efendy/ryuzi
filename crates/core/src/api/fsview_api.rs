@@ -205,9 +205,35 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
 /// Resolve `rel` inside `root`'s jail and enforce a byte-size cap before any
 /// content is read — escapes/absolute paths and oversize files both fail as
 /// a 400, and neither ever gets its bytes touched.
+///
+/// `fsview::jail` itself is lexical-only (it rejects absolute paths and `..`
+/// components but doesn't touch the filesystem), which is correct for its
+/// other callers (`list_dir`/`search_files`/`git_diff` may legitimately
+/// target non-existent or not-yet-existing paths). A file READ needs the
+/// stronger guarantee: canonicalize both `root` and the joined path and
+/// re-check with `starts_with`, so a symlink planted inside the session root
+/// that points outside it is caught too — mirroring `serve.rs`'s
+/// `get_attachment` jail (the other read surface in this crate) rather than
+/// changing `fsview::jail`'s shared lexical behavior. A canonicalize failure
+/// (missing file, dangling symlink, permission error) folds into the same
+/// not_found as a metadata miss, so a jail escape and a missing file are
+/// indistinguishable to the caller.
 async fn jailed_readable(root: &Path, rel: &str, cap: u64) -> Result<PathBuf, ApiError> {
     let path = fsview::jail(root, rel).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let meta = tokio::fs::metadata(&path)
+
+    let root_canon = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| ApiError::not_found(format!("cannot read {rel}: {e}")))?;
+    let target_canon = tokio::fs::canonicalize(&path)
+        .await
+        .map_err(|e| ApiError::not_found(format!("cannot read {rel}: {e}")))?;
+    if !target_canon.starts_with(&root_canon) {
+        return Err(ApiError::not_found(format!(
+            "cannot read {rel}: {rel} escapes the workspace"
+        )));
+    }
+
+    let meta = tokio::fs::metadata(&target_canon)
         .await
         .map_err(|e| ApiError::not_found(format!("cannot read {rel}: {e}")))?;
     if meta.len() > cap {
@@ -216,7 +242,7 @@ async fn jailed_readable(root: &Path, rel: &str, cap: u64) -> Result<PathBuf, Ap
             meta.len()
         )));
     }
-    Ok(path)
+    Ok(target_canon)
 }
 
 /// Session-workdir text read for the file viewer — jailed to the session's
@@ -549,6 +575,56 @@ mod tests {
         assert_eq!(err.status, 400);
         assert!(err.message.contains("too large"), "got: {}", err.message);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Symlink creation on Windows normally requires elevated privileges (or
+    // Developer Mode), unlike Unix — so this proves the canonicalize +
+    // starts_with jail escape check on the platform where it's cheap to set
+    // up. The check itself (`jailed_readable`'s canonicalize/starts_with
+    // logic) compiles and runs on every platform; only this symlink fixture
+    // is unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jailed_readable_rejects_a_symlink_escaping_the_root() {
+        let outside = fresh_dir("read-file-symlink-outside");
+        std::fs::write(outside.join("secret.txt"), "outside secret").unwrap();
+
+        let root = fresh_dir("read-file-symlink-root");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt")).unwrap();
+
+        let err = jailed_readable(&root, "link.txt", MAX_READ_BYTES)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, 404, "got: {err:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// `read_file` end-to-end through `dispatch`, proving the jail escape is
+    /// caught at the RPC layer too, not just in the `jailed_readable` helper.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_a_symlink_escaping_the_session_root() {
+        let s = state().await;
+        let outside = fresh_dir("read-file-rpc-symlink-outside");
+        std::fs::write(outside.join("secret.txt"), "outside secret").unwrap();
+
+        let dir = fresh_dir("read-file-rpc-symlink-root");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("link.txt")).unwrap();
+        insert_worktree_session(&s.cp, "sess-read-symlink", dir.to_str().unwrap()).await;
+
+        let err = dispatch(
+            &s,
+            "read_file",
+            json!({"session_pk": "sess-read-symlink", "rel": "link.txt"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 404, "got: {err:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { toast } from "sonner";
 import { commands, type CmdError, type GatewayEventInfo, type GatewayInfo, type Result } from "./bindings";
+import { useStore } from "./store";
 
 // Gateways domain store. The local host always exists (live telemetry); WSL
 // distros are detected; SSH remotes are persisted config with a TCP probe.
@@ -68,7 +69,25 @@ export const useGateways = create<GatewaysState>((set, get) => ({
   },
 
   remove: async (id) => {
-    applyResult(set, await commands.removeGateway("local", id), "Remove gateway");
+    const ok = applyResult(set, await commands.removeGateway("local", id), "Remove gateway");
+    // The Tauri command already aborted the runner's SSE bridge and dropped
+    // its EngineClient backend-side (`EngineManager::remove_runner`); the
+    // removed runner's sessions vanish from `useStore.sessions` on the next
+    // `refresh()` (it re-fetches from `listGateways`, so a gone runner is
+    // simply not in the fan-out list anymore). `transcripts`/`lastSeq` are
+    // keyed by `sessKey(runnerId, pk)` and never otherwise get an eviction
+    // pass, so prune this runner's entries here too rather than leaving them
+    // as orphaned memory for the rest of the session. (A few smaller
+    // per-session maps — `loaded`, `contextUsage`, `sessionCost` — and the
+    // `pendingApprovals` array are left as-is: same orphaned-but-harmless
+    // shape, not worth the extra surface for this fix.)
+    if (ok) {
+      const prefix = `${id}::`;
+      useStore.setState((st) => ({
+        transcripts: Object.fromEntries(Object.entries(st.transcripts).filter(([k]) => !k.startsWith(prefix))),
+        lastSeq: Object.fromEntries(Object.entries(st.lastSeq).filter(([k]) => !k.startsWith(prefix))),
+      }));
+    }
   },
 
   updateFs: async (id, fsMode, paths) => {

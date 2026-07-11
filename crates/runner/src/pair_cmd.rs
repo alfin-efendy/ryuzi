@@ -72,6 +72,16 @@ async fn mint(deps: &mut Deps) -> u8 {
             let scheme = status.scheme.as_deref().unwrap_or("http");
             let host = status.host.as_deref().unwrap_or("127.0.0.1");
             (deps.out)(&format!("address: {scheme}://{host}:{port}"));
+            // A wildcard bind (0.0.0.0 / ::) is what the daemon listens ON,
+            // not something a client can dial — the caller needs to swap in
+            // one of this host's actual reachable addresses.
+            let unspecified = host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_unspecified())
+                .unwrap_or(false);
+            if unspecified {
+                (deps.out)("  (replace 0.0.0.0 with this host's reachable address before dialing)");
+            }
             match &status.fingerprint {
                 Some(fp) => (deps.out)(&format!("fingerprint: {fp}")),
                 None => (deps.out)("fingerprint: (no TLS — loopback/plain http)"),
@@ -98,7 +108,23 @@ async fn mint(deps: &mut Deps) -> u8 {
             (deps.out)(&format!(
                 "address (once started): {listen_addr}:{control_port}"
             ));
-            (deps.out)("fingerprint: (no TLS — loopback/plain http)");
+            // Mirrors `tls::resolve_bind`'s own decision (loopback -> plain
+            // http, everything else -> TLS, unparsable -> treated as
+            // loopback): only claim "no TLS" for a bind that will actually
+            // come up plaintext. A non-loopback `listen_addr` WILL use TLS
+            // once started, so the fingerprint just isn't known yet — saying
+            // "no TLS" there would be actively wrong.
+            let will_use_tls = listen_addr
+                .parse::<std::net::IpAddr>()
+                .map(|ip| !ip.is_loopback())
+                .unwrap_or(false);
+            if will_use_tls {
+                (deps.out)(
+                    "fingerprint: (unknown until started — this is a non-loopback bind, so TLS will be used; run `ryuzi pair` again once the daemon is running to see it)",
+                );
+            } else {
+                (deps.out)("fingerprint: (no TLS — loopback/plain http)");
+            }
         }
     }
 

@@ -290,6 +290,19 @@ async addRunner(name: string, host: string, port: number, fingerprint: string, c
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Deletes the persisted `gateways` row (works for `local`'s WSL entries,
+ * `ssh` remotes, and paired `remote` runners alike — all three kinds live
+ * in the LOCAL engine's store, hence this always dispatches to `"local"` by
+ * default). For a paired runner, deleting the row is only half the job: the
+ * [`EngineManager`] also holds a live pinned `EngineClient` and a
+ * reconnecting SSE bridge task keyed by that same id (see `add_runner`,
+ * `load_remotes`). Without the `remove_runner` call below, that bridge
+ * would keep retrying the now-gone runner and its events would land in an
+ * orphaned store bucket until Cockpit restarts. `remove_runner` is a no-op
+ * for `"local"` and for any id that was never a live runner (ssh/wsl ids),
+ * so it's safe to call unconditionally after every successful delete.
+ */
 async removeGateway(runnerId: string | null, id: string) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remove_gateway", { runnerId, id }) };
@@ -824,10 +837,13 @@ async setProviderAccountRoute(runnerId: string | null, provider: string, strateg
 }
 },
 /**
- * Drive the full interactive OAuth flow: binds a loopback listener, opens
- * the provider's authorize URL in the system browser via
- * `tauri-plugin-opener`, and awaits the callback (up to 5 minutes) before
- * persisting the resulting connection.
+ * Drive the full interactive OAuth flow: a thin proxy to the daemon's
+ * `connect_oauth` RPC, which binds a loopback listener and awaits the
+ * callback (up to 5 minutes) before persisting the resulting connection.
+ * The provider's authorize URL is opened in the system browser
+ * client-side — by the per-runner SSE bridge
+ * (`engine_manager::spawn_bridge`'s `oauthAuthorizeUrl` arm) on receipt of
+ * `CoreEvent::OauthAuthorizeUrl` — not by this function directly.
  */
 async connectOauth(runnerId: string | null, provider: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {

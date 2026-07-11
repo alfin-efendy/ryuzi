@@ -136,6 +136,42 @@ impl EngineManager {
         self.start_bridge(runner_id, client, app_handle);
     }
 
+    /// Live-remove a paired runner (the "Remove runner" flow, mirror image of
+    /// [`EngineManager::add_runner`]): abort its SSE bridge task and drop its
+    /// `EngineClient` so it stops reconnecting and can no longer be dispatched
+    /// to, without a Cockpit restart. The row itself must already be deleted
+    /// (by the LOCAL engine's `remove_gateway` RPC) before this is called —
+    /// this method only updates in-memory state; it never talks to a daemon.
+    ///
+    /// `"local"` is never removable — it has no persisted `gateways` row and
+    /// is not user-removable, so this is a guarded no-op for it. Likewise a
+    /// no-op (nothing to abort/drop) for any `runner_id` that isn't currently
+    /// a live client, e.g. an `ssh`/`wsl` gateway id, which never had an
+    /// entry in these maps to begin with.
+    ///
+    /// Each `RwLock` write guard is held only long enough to `remove` from
+    /// its map — `abort()` runs afterwards with no lock held (it's a
+    /// non-blocking cancellation signal, not something that needs the lock,
+    /// and this keeps the critical sections free of anything that could
+    /// stall a concurrent `client()`/`start_bridge()` caller).
+    pub fn remove_runner(&self, runner_id: &str) {
+        if runner_id == "local" {
+            return;
+        }
+        let handle = self
+            .bridges
+            .write()
+            .expect("EngineManager::bridges lock poisoned")
+            .remove(runner_id);
+        self.clients
+            .write()
+            .expect("EngineManager::clients lock poisoned")
+            .remove(runner_id);
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+
     /// (Re)load paired remote runners: ask the LOCAL engine's backend-only
     /// `list_runner_credentials` RPC for every `remote`-kind row with its
     /// `device_token` decrypted (see module docs for why this never reaches
