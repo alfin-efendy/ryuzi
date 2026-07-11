@@ -16,6 +16,7 @@ import {
   type ProjectRuntimeInfo,
   type SessionRuntimeInfo,
   type ModelCost,
+  type OrchTask,
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useNative } from "./store-native";
@@ -73,6 +74,10 @@ type State = {
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
   /** Per-session in-memory type-ahead queue (messages typed while running). */
   queued: Record<string, QueuedMessage[]>;
+  /** Live orchestration task graph, keyed by root task id — the task strip's
+   *  data source. Upserted piecemeal by `orchTaskChanged` events and seeded
+   *  in bulk by `loadOrchTasks`. */
+  orchTasks: Record<string, OrchTask[]>;
   enqueueMessage: (sessionPk: string, msg: QueuedMessage) => void;
   removeQueued: (sessionPk: string, id: string) => void;
   /** Send the head of a session's queue; on send-failure re-queue it at the front. */
@@ -107,7 +112,13 @@ type State = {
   /** Resolves true only when the backend teardown actually succeeded. */
   end: (sessionPk: string) => Promise<boolean>;
   resolveApproval: (requestId: string, response: ApprovalResponse) => Promise<void>;
-  hydrateTranscript: (pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
+  hydrateTranscript: (pk: string, fetcher?: (pk: string) => Promise<Message[]>, force?: boolean) => Promise<void>;
+  /** Re-hydrates a session's transcript even when it's already `loaded` —
+   *  used after a terminal/blocked `orchTaskChanged` so a report or block
+   *  card posted into the home chat lands without a full reload. */
+  refetchTranscript: (pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
+  /** Fetches the full task graph under `rootId` (a fresh strip on mount). */
+  loadOrchTasks: (rootId: string) => Promise<void>;
   init: () => Promise<void>;
 };
 
@@ -171,6 +182,7 @@ export const useStore = create<State>((set, get) => ({
   projectRuntimeById: {},
   sessionRuntimeById: {},
   sessionCost: {},
+  orchTasks: {},
 
   applyCoreEvent: (e) =>
     set((st) => {
@@ -269,6 +281,25 @@ export const useStore = create<State>((set, get) => ({
           // The transcript notice arrives as a persisted message row; no
           // extra state to keep here.
           return {};
+        case "orchTaskChanged": {
+          // A root reports its OWN status change with root_id: null (it has
+          // no parent) — key the graph by the task's own id in that case.
+          const rootId = e.root_id ?? e.task_id;
+          const prev = st.orchTasks[rootId] ?? [];
+          const idx = prev.findIndex((t) => t.id === e.task_id);
+          const next =
+            idx >= 0
+              ? prev.map((t) => (t.id === e.task_id ? { ...t, status: e.status } : t))
+              : [...prev, { id: e.task_id, rootId: e.root_id, status: e.status } as OrchTask];
+          // A terminal/blocked change may have posted a bubble or report card
+          // into the focused home chat — refetch it so the row lands without
+          // waiting for an unrelated refresh.
+          if (e.status === "blocked" || e.status === "done" || e.status === "failed") {
+            const focused = get().focusedSessionPk;
+            if (focused) void get().refetchTranscript(focused);
+          }
+          return { orchTasks: { ...st.orchTasks, [rootId]: next } };
+        }
         default:
           return {};
       }
@@ -287,8 +318,8 @@ export const useStore = create<State>((set, get) => ({
     if (pk && !get().loaded[pk]) void get().hydrateTranscript(pk);
   },
 
-  hydrateTranscript: async (pk, fetcher) => {
-    if (get().loaded[pk]) return;
+  hydrateTranscript: async (pk, fetcher, force = false) => {
+    if (!force && get().loaded[pk]) return;
     const rows = fetcher
       ? await fetcher(pk)
       : await (async () => {
@@ -310,6 +341,16 @@ export const useStore = create<State>((set, get) => ({
         loaded: { ...st.loaded, [pk]: true },
       };
     });
+  },
+
+  // Same fetch as hydrateTranscript, but forced — bypasses the `loaded`
+  // short-circuit so a session already on screen picks up a row that landed
+  // out of band (e.g. an orchestration report posted by a background worker).
+  refetchTranscript: (pk, fetcher) => get().hydrateTranscript(pk, fetcher, true),
+
+  loadOrchTasks: async (rootId) => {
+    const res = await commands.orchTasks(rootId);
+    if (res.status === "ok") set((st) => ({ orchTasks: { ...st.orchTasks, [rootId]: res.data } }));
   },
 
   // Selecting a project clears the focused session so the center shows the "start a new session" composer.

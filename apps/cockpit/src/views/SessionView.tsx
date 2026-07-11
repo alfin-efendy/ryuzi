@@ -24,6 +24,7 @@ import { TranscriptFileContext } from "@/components/transcript/TranscriptFileCon
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
+import { TaskStrip } from "@/components/session/TaskStrip";
 import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { SessionCostPanel } from "@/components/session/SessionCostPanel";
 import { QueuedMessages } from "@/components/session/QueuedMessages";
@@ -48,6 +49,8 @@ export function SessionView() {
     loadSessionRuntime,
     setSessionPermMode,
     setSessionRuntime,
+    orchTasks,
+    loadOrchTasks,
   } = useStore();
   const enqueueMessage = useStore((s) => s.enqueueMessage);
   const nav = useNav();
@@ -102,6 +105,48 @@ export function SessionView() {
   useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
   }, [connectionsLoaded, hydrateConnections]);
+
+  // Home chats with a live orchestration mount a task strip above the
+  // transcript. `orch_list_roots` returns every root with no per-home filter,
+  // so the home→root mapping is resolved client-side: once per focused
+  // session, and again whenever the store's orch task graph grows a root this
+  // component hasn't seen yet (a fresh orchTaskChanged for a new goal).
+  const orchRootCount = Object.keys(orchTasks).length;
+  const [orchRootForHome, setOrchRootForHome] = useState<Record<string, string>>({});
+  const homeSessionPk = session?.kind === "chat" ? session.sessionPk : null;
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: orchRootCount is a deliberate re-run trigger (a new root appearing in the store), not read in the body
+  useEffect(() => {
+    if (!homeSessionPk) return;
+    let alive = true;
+    void commands.orchListRoots().then((res) => {
+      if (!alive || res.status !== "ok") return;
+      const live = res.data
+        .filter((t) => t.homeSessionPk === homeSessionPk && ["decomposing", "waiting", "judging"].includes(t.status))
+        .sort((a, b) => b.createdAt - a.createdAt)[0];
+      setOrchRootForHome((cur) => {
+        if (!live) {
+          if (!(homeSessionPk in cur)) return cur;
+          const next = { ...cur };
+          delete next[homeSessionPk];
+          return next;
+        }
+        return cur[homeSessionPk] === live.id ? cur : { ...cur, [homeSessionPk]: live.id };
+      });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [homeSessionPk, orchRootCount]);
+
+  const orchRootId = homeSessionPk ? orchRootForHome[homeSessionPk] : undefined;
+
+  // A fresh strip on mount: seed the full task graph (titles, agents) once
+  // the home→root mapping above resolves — orchTaskChanged only carries a
+  // status delta, not the row's display fields.
+  useEffect(() => {
+    if (orchRootId) void loadOrchTasks(orchRootId);
+  }, [orchRootId, loadOrchTasks]);
 
   // Refresh edit-card diff stats after every turn, independent of the right
   // panel (which only fetches while open/on its own "review" tab).
@@ -324,6 +369,8 @@ export function SessionView() {
 
         {/* Transcript, with the floating plan panel overlaying it */}
         <div className="relative flex min-h-0 flex-1 flex-col">
+          {/* Pinned orchestration task strip — only for a home chat with a live run */}
+          {orchRootId && <TaskStrip rootId={orchRootId} />}
           <TranscriptFileContext.Provider value={transcriptFileCtx}>
             <Transcript
               sessionPk={session.sessionPk}

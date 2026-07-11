@@ -83,6 +83,19 @@ describe("sidebar sessions", () => {
     expect(chatSessions(sessions).map((s) => s.sessionPk)).toEqual(["c1"]);
     expect(sessionsForProject(sessions, "proj", "", false, {}, {}, noFilter).map((s) => s.sessionPk)).toEqual(["p1"]);
   });
+
+  // C2: worker/review sessions carry a real projectId (unlike chat) but must
+  // never leak into either bucket — drill-down (via the task strip) is the
+  // only way to open them.
+  test("worker and review sessions never appear in sidebar buckets", () => {
+    const sessions = [
+      { sessionPk: "w1", projectId: "p", kind: "worker" },
+      { sessionPk: "r1", projectId: null, kind: "review" },
+      { sessionPk: "c1", projectId: null, kind: "chat" },
+    ] as any;
+    expect(chatSessions(sessions).map((s) => s.sessionPk)).toEqual(["c1"]);
+    expect(sessionsForProject(sessions, "p", "", false, {}, {}, noFilter)).toEqual([]);
+  });
 });
 
 // Distinct from the `sess` helper above (different field defaults); named to
