@@ -474,6 +474,21 @@ pub struct ToolPolicyRow {
     pub decision: String,
 }
 
+/// One app-control audit entry, surfaced in Cockpit's Settings → Audit feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditRow {
+    pub id: i64,
+    pub tool: String,
+    pub action: String,
+    pub decision: String,
+    /// The initiating `WriteOrigin` as a string (`user`|`agent`|`background_review`).
+    pub origin: String,
+    pub session_pk: Option<String>,
+    /// Unix ms.
+    pub at: i64,
+}
+
 /// A persisted transcript entry, one row per native-runtime event block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]

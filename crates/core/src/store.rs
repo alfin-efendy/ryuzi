@@ -2590,6 +2590,62 @@ impl Store {
         Ok(())
     }
 
+    /// Record one app-control mutation. `actor` and `origin` both carry the
+    /// `WriteOrigin` string (the legacy `actor` column stays populated for the
+    /// gateway-audit tooling; `origin` is the Phase-6 column). This accepts
+    /// any origin — it records who acted, it is not a guarded setter like
+    /// `set_tool_policy`. Reads are never audited — only mutations call this.
+    pub async fn record_audit(
+        &self,
+        origin: crate::domain::WriteOrigin,
+        session_pk: Option<&str>,
+        tool: &str,
+        action: &str,
+        decision: &str,
+    ) -> anyhow::Result<()> {
+        let origin_s = origin.as_str().to_string();
+        let session_pk = session_pk.map(|s| s.to_string());
+        let tool = tool.to_string();
+        let action = action.to_string();
+        let decision = decision.to_string();
+        let at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO audit(actor, action, tool, decision, at, session_pk, origin) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![origin_s, action, tool, decision, at, session_pk, origin_s],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// The most recent `limit` app-control audit rows, newest first.
+    pub async fn list_audit(&self, limit: u32) -> anyhow::Result<Vec<crate::domain::AuditRow>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, tool, action, decision, \
+                        COALESCE(origin, actor, 'user') AS origin, session_pk, at \
+                 FROM audit ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![limit], |r| {
+                    Ok(crate::domain::AuditRow {
+                        id: r.get(0)?,
+                        tool: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        action: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        decision: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        origin: r.get(4)?,
+                        session_pk: r.get(5)?,
+                        at: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Merge `patch` into the tool_call row's payload (SQLite `json_patch`,
     /// so the original `{name, input}` survives an `{output: …}` update),
     /// optionally flip status, and return the row's seq, the merged payload,
@@ -4952,6 +5008,42 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].project_id, "p2");
         assert_eq!(rows[0].decision, "rejectAlways");
+    }
+
+    #[tokio::test]
+    async fn record_audit_writes_rows_read_back_newest_first() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .record_audit(
+                WriteOrigin::Agent,
+                Some("sess-1"),
+                "app_jobs",
+                "create",
+                "allow",
+            )
+            .await
+            .unwrap();
+        store
+            .record_audit(
+                WriteOrigin::Agent,
+                Some("sess-1"),
+                "app_orchestrate",
+                "submit",
+                "allow",
+            )
+            .await
+            .unwrap();
+        let rows = store.list_audit(10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first.
+        assert_eq!(rows[0].tool, "app_orchestrate");
+        assert_eq!(rows[0].action, "submit");
+        assert_eq!(rows[0].origin, "agent");
+        assert_eq!(rows[0].session_pk.as_deref(), Some("sess-1"));
+        assert_eq!(rows[1].tool, "app_jobs");
+        // Limit is honored.
+        assert_eq!(store.list_audit(1).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
