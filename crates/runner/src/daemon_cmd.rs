@@ -130,7 +130,14 @@ async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<u16> {
         router_server: daemon.router_server.clone(),
         token: Some(token),
     };
-    ryuzi_core::serve::serve(state, control_port).await
+    // TODO(P2-7/P2-8): loopback-only for now — wire real TLS + the
+    // non-loopback-requires-TLS enforcement once the caller-side pieces land.
+    let opts = ryuzi_core::serve::ServeOpts {
+        addr: std::net::Ipv4Addr::LOCALHOST.into(),
+        port: control_port,
+        tls: None,
+    };
+    ryuzi_core::serve::serve(state, opts).await
 }
 
 async fn run_daemon(deps: &mut Deps) -> u8 {

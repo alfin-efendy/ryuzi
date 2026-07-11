@@ -185,8 +185,18 @@ pub(crate) mod tests_support {
 mod tests {
     use super::tests_support::state;
     use super::{params, ApiError};
-    use crate::serve::serve;
+    use crate::serve::{serve, ServeOpts};
     use serde_json::json;
+    use std::net::Ipv4Addr;
+
+    /// Plaintext-loopback `ServeOpts` for tests that don't exercise TLS.
+    fn opts(port: u16) -> ServeOpts {
+        ServeOpts {
+            addr: Ipv4Addr::LOCALHOST.into(),
+            port,
+            tls: None,
+        }
+    }
 
     /// Exercises the `params` decode helper directly — no command family
     /// wired up yet needs it, so this also keeps it from tripping the
@@ -220,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_method_is_404_with_error_envelope() {
-        let port = serve(state().await, 0).await.unwrap();
+        let port = serve(state().await, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/rpc/nope"))
             .bearer_auth("t")
@@ -235,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_projects_dispatches_empty() {
-        let port = serve(state().await, 0).await.unwrap();
+        let port = serve(state().await, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/rpc/list_projects"))
             .bearer_auth("t")
@@ -252,7 +262,7 @@ mod tests {
     async fn approvals_endpoint_resolves_a_registered_approval() {
         let s = state().await;
         let rx = s.cp.approvals_for_test_register("req-9");
-        let port = serve(s, 0).await.unwrap();
+        let port = serve(s, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/approvals/req-9"))
             .bearer_auth("t")

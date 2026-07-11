@@ -252,7 +252,12 @@ mod tests {
             cp: cp.clone(),
             token: Some(token.to_string()),
         };
-        let port = ryuzi_core::serve::serve(state, 0).await.unwrap();
+        let opts = ryuzi_core::serve::ServeOpts {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            tls: None,
+        };
+        let port = ryuzi_core::serve::serve(state, opts).await.unwrap();
         (format!("http://127.0.0.1:{port}"), cp)
     }
 

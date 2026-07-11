@@ -1,10 +1,11 @@
 //! End-to-end: a built daemon serving the control API — auth, rpc, SSE.
 
 use ryuzi_core::daemon::{build_daemon, BuildDaemonOpts};
-use ryuzi_core::serve::{serve, ApiState};
+use ryuzi_core::serve::{serve, ApiState, ServeOpts};
 use ryuzi_core::store::Store;
 use ryuzi_core::telemetry::NoopTelemetry;
 use serde_json::json;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -29,7 +30,11 @@ async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
             router_server: daemon.router_server.clone(),
             token: Some(token.clone()),
         },
-        0,
+        ServeOpts {
+            addr: Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            tls: None,
+        },
     )
     .await
     .unwrap();

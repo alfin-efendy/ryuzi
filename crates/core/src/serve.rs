@@ -16,6 +16,7 @@ use axum::{Json, Router};
 use futures::stream::Stream;
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 /// Wire protocol version reported by `/health` for remote-runner clients to
@@ -76,20 +77,51 @@ async fn require_token(
     }
 }
 
-/// Bind `127.0.0.1:port` and serve until the process exits. Falls back to an
-/// ephemeral port (0) if the fixed port is already busy (e.g. a stale
+/// Configuration for [`serve`]: which address/port to bind, and an optional
+/// TLS server config to serve over (remote-runner, Phase 2/3). `tls: None`
+/// preserves today's plaintext-loopback behavior; the caller (P2-7) is
+/// responsible for enforcing that non-loopback binds require `tls: Some`.
+pub struct ServeOpts {
+    pub addr: IpAddr,
+    pub port: u16,
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+}
+
+/// Bind `opts.addr:opts.port` and serve until the process exits. Falls back
+/// to an ephemeral port (0) if the fixed port is already busy (e.g. a stale
 /// `ryuzi serve`) — clients discover the real port from `daemon.json`, never
 /// hardcode it.
-pub async fn serve(state: ApiState, port: u16) -> anyhow::Result<u16> {
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+///
+/// Binds a plain [`std::net::TcpListener`] ourselves (rather than going
+/// through `axum_server::bind`/`bind_rustls`, which bind internally) so we
+/// can read the OS-chosen port via `local_addr()` before handing the
+/// listener off — that's what makes the ephemeral-port contract work. The
+/// service is built with `ConnectInfo<SocketAddr>` so downstream middleware
+/// (peer-IP checks, Phase 3) can see the connecting address. Serving always
+/// goes through `axum_server` (for both the TLS and plaintext branches) so
+/// there's a single service type regardless of `opts.tls`.
+pub async fn serve(state: ApiState, opts: ServeOpts) -> anyhow::Result<u16> {
+    let listener = match std::net::TcpListener::bind((opts.addr, opts.port)) {
         Ok(l) => l,
-        Err(_) if port != 0 => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
+        Err(_) if opts.port != 0 => std::net::TcpListener::bind((opts.addr, 0))?,
         Err(e) => return Err(e.into()),
     };
+    listener.set_nonblocking(true)?;
     let bound = listener.local_addr()?.port();
-    let app = router(state);
+    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let result = match opts.tls {
+            Some(cfg) => {
+                let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
+                axum_server::from_tcp_rustls(listener, tls_config)
+                    .serve(app)
+                    .await
+            }
+            None => axum_server::from_tcp(listener).serve(app).await,
+        };
+        if let Err(e) = result {
+            tracing::error!("serve: server task exited with error: {e}");
+        }
     });
     Ok(bound)
 }
@@ -291,6 +323,16 @@ mod tests {
     use crate::plugins::{CorePlugin, PluginSource, Registries};
     use async_trait::async_trait;
     use ryuzi_plugin_sdk::PluginManifest;
+    use std::net::Ipv4Addr;
+
+    /// Plaintext-loopback `ServeOpts` for tests that don't exercise TLS.
+    fn opts(port: u16) -> ServeOpts {
+        ServeOpts {
+            addr: Ipv4Addr::LOCALHOST.into(),
+            port,
+            tls: None,
+        }
+    }
 
     async fn test_cp() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -387,14 +429,14 @@ mod tests {
     #[tokio::test]
     async fn serve_binds_an_ephemeral_port() {
         let cp = test_cp().await;
-        let port = serve(no_auth_state(cp), 0).await.unwrap();
+        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
         assert!(port > 0);
     }
 
     #[tokio::test]
     async fn list_plugins_shows_anthropic_enabled_with_provider_capability() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(no_auth_state(cp), 0).await.unwrap();
+        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
 
         let body: Vec<Value> = reqwest::get(format!("http://127.0.0.1:{port}/plugins"))
             .await
@@ -415,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn get_plugin_returns_manifest_fields_plus_enabled_and_source() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(no_auth_state(cp), 0).await.unwrap();
+        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
 
         let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/anthropic"))
             .await
@@ -433,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_plugin_id_is_404_with_error_envelope() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(no_auth_state(cp), 0).await.unwrap();
+        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
 
         let resp = reqwest::get(format!("http://127.0.0.1:{port}/plugins/nope"))
             .await
@@ -449,7 +491,7 @@ mod tests {
         // Keep a handle to write the setting directly after the server (which
         // consumes an `Arc<ControlPlane>` into its router state) is started.
         let store = cp.store().clone();
-        let port = serve(no_auth_state(cp), 0).await.unwrap();
+        let port = serve(no_auth_state(cp), opts(0)).await.unwrap();
 
         let fetch = || {
             let url = format!("http://127.0.0.1:{port}/plugins");
@@ -487,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn authed_routes_reject_missing_or_wrong_token() {
         let state = test_state().await;
-        let port = serve(state, 0).await.unwrap();
+        let port = serve(state, opts(0)).await.unwrap();
         let client = reqwest::Client::new();
 
         let r = client
@@ -517,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn health_needs_no_token_and_reports_version() {
         let state = test_state().await;
-        let port = serve(state, 0).await.unwrap();
+        let port = serve(state, opts(0)).await.unwrap();
         let v: Value = reqwest::get(format!("http://127.0.0.1:{port}/health"))
             .await
             .unwrap()
@@ -532,9 +574,53 @@ mod tests {
     #[tokio::test]
     async fn busy_port_falls_back_to_ephemeral() {
         let state = test_state().await;
-        let first = serve(state.clone(), 0).await.unwrap();
+        let first = serve(state.clone(), opts(0)).await.unwrap();
         // Ask for the port that's now busy — must succeed on a different one.
-        let second = serve(test_state().await, first).await.unwrap();
+        let second = serve(test_state().await, opts(first)).await.unwrap();
         assert_ne!(first, second);
+    }
+
+    /// Builds a real ring-backed `rustls::ServerConfig` from a self-signed
+    /// `TlsMaterial` — same construction `tls::pair_is_valid` uses internally
+    /// to validate a cert/key pair, duplicated here (that helper is private)
+    /// so this test can hand a genuine `Arc<ServerConfig>` to `ServeOpts`.
+    fn ring_server_config(material: &crate::tls::TlsMaterial) -> Arc<rustls::ServerConfig> {
+        let cert = rustls::pki_types::CertificateDer::from(material.cert_der.clone());
+        let key = rustls::pki_types::PrivateKeyDer::try_from(material.key_der.clone())
+            .expect("valid private key DER");
+        let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("self-signed cert/key pair builds a ServerConfig");
+        Arc::new(cfg)
+    }
+
+    /// `serve` over TLS binds and returns a real port without panicking, on
+    /// the ephemeral-port path AND with a genuine `Arc<rustls::ServerConfig>`
+    /// wired in. A full TLS handshake round-trip is P2-9; this just proves
+    /// the `axum_server::from_tcp_rustls` branch stands up the listener and
+    /// the ephemeral-port contract still holds when `tls: Some`.
+    #[tokio::test]
+    async fn serve_binds_with_tls_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let material = crate::tls::load_or_generate(dir.path()).unwrap();
+        let tls_cfg = ring_server_config(&material);
+
+        let cp = test_cp().await;
+        let port = serve(
+            no_auth_state(cp),
+            ServeOpts {
+                addr: Ipv4Addr::LOCALHOST.into(),
+                port: 0,
+                tls: Some(tls_cfg),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(port > 0);
     }
 }

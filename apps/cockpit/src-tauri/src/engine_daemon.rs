@@ -110,7 +110,11 @@ async fn run_inner() -> i32 {
             router_server: daemon.router_server.clone(),
             token: Some(token),
         },
-        control_port,
+        ryuzi_core::serve::ServeOpts {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: control_port,
+            tls: None,
+        },
     )
     .await
     {
