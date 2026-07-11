@@ -116,7 +116,7 @@ export function RightPanel({
   useEffect(() => {
     const target = pendingReview?.sessionPk === sessionPk ? pendingReview : null;
     if (target === null) {
-      if (targetFetchSettled !== null) setTargetFetchSettled(null);
+      setTargetFetchSettled((settled) => (settled === null ? settled : null));
       return;
     }
 
