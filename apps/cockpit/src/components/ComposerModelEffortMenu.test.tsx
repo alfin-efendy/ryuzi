@@ -1,6 +1,10 @@
-import { expect, mock, test } from "bun:test";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, expect, mock, test } from "bun:test";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { ComposerModelEffortMenu } from "./ComposerModelEffortMenu";
+
+afterEach(() => {
+  cleanup();
+});
 
 const models = [
   {

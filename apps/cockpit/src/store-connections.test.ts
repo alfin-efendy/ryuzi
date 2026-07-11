@@ -1,8 +1,10 @@
-import { beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import type { ConnectionInfo } from "./bindings";
 import { commands } from "./bindings";
 import { useStore } from "./store";
 import { useConnections } from "./store-connections";
+
+const originalRefreshModelConfiguration = useStore.getState().refreshModelConfiguration;
 
 const connection = {
   id: "account-1",
@@ -25,6 +27,10 @@ beforeEach(() => {
   refreshModelConfiguration.mockClear();
   useStore.setState({ refreshModelConfiguration });
   useConnections.setState({ connections: [connection], catalog: [], loaded: true });
+});
+
+afterEach(() => {
+  useStore.setState({ refreshModelConfiguration: originalRefreshModelConfiguration });
 });
 
 test("rename uses the dedicated command, returns true, updates accounts, and refreshes model configuration once", async () => {

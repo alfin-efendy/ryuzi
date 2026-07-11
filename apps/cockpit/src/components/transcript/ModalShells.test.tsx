@@ -1,6 +1,10 @@
-import { expect, mock, test } from "bun:test";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, expect, mock, test } from "bun:test";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { Row } from "@/lib/transcript";
+
+afterEach(() => {
+  cleanup();
+});
 
 mock.module("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `asset://${path}`,

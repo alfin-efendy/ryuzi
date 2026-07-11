@@ -63,7 +63,7 @@ beforeEach(() => {
     selectedProjectId: null,
     end: endSession,
   });
-  useUi.setState({ pinned: {}, archived: {} });
+  useUi.setState({ pinned: {}, archived: {}, sessionFilter: { statuses: {}, unreadOnly: false } });
   useNav.setState({
     history: { back: [], current: { kind: "home" }, forward: [] },
     sidebarOpen: true,

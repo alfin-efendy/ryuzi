@@ -157,6 +157,7 @@ beforeEach(() => {
 // process don't inherit this file's fixtures (mirrors ModelPicker.test.tsx).
 afterEach(() => {
   cleanup();
+  useStore.setState({ projects: [], selectedProjectId: null, projectRuntimeById: {} });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
   useAgent.setState({ models: [], model: null, permMode: null });
   useModelStatuses.setState({ byKey: {} });

@@ -24,8 +24,7 @@ const models = (source.models ?? [])
         effort: option.effort,
         description: typeof option.description === "string" ? option.description : undefined,
       })),
-    default_reasoning_level:
-      typeof model.default_reasoning_level === "string" ? model.default_reasoning_level : null,
+    default_reasoning_level: typeof model.default_reasoning_level === "string" ? model.default_reasoning_level : null,
   }));
 
 await Bun.write(output, `${JSON.stringify({ models }, null, 2)}\n`);
