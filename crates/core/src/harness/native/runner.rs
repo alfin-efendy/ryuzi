@@ -1,6 +1,6 @@
 //! The native turn drain: one `run_turn` runs a prompt to completion, calling
 //! the model, executing tools, and persisting + streaming everything through
-//! the same [`CoreEvent`] surface the ACP harness uses.
+//! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
 use super::commands::CommandRegistry;
@@ -1696,7 +1696,6 @@ mod tests {
                 name: "p".into(),
                 workdir: "/w".into(),
                 source: None,
-                harness: "native".into(),
                 model: model.map(str::to_string),
                 effort: None,
                 perm_mode: PermMode::BypassPermissions,
@@ -1779,7 +1778,6 @@ mod tests {
                 "p",
                 Some("anthropic/model-b".into()),
                 PermMode::BypassPermissions,
-                "native",
             )
             .await
             .unwrap();
@@ -3028,7 +3026,6 @@ mod tests {
                 name: "p".into(),
                 workdir: dir.path().to_string_lossy().into(),
                 source: None,
-                harness: "native".into(),
                 model: None,
                 effort: None,
                 perm_mode: PermMode::Default,

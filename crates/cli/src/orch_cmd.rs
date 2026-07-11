@@ -160,7 +160,6 @@ async fn orch_inner(args: &[String], deps: &mut Deps) -> u8 {
 mod tests {
     use super::*;
     use crate::detect::Detected;
-    use ryuzi_core::sidecar::SidecarStatus;
 
     /// Captured stdout/stderr lines from a fake `Deps`.
     type Sink = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
@@ -178,11 +177,6 @@ mod tests {
                 found: true,
                 version: None,
             },
-            detect_claude: || Detected {
-                found: true,
-                version: None,
-            },
-            sidecar_status: Box::new(|| SidecarStatus::Override),
             build_registries: Box::new(|| Ok(ryuzi_core::Registries::new())),
         };
         (deps, out, err)
@@ -197,7 +191,6 @@ mod tests {
                 name: "p1".into(),
                 workdir: "/tmp/p1".into(),
                 source: None,
-                harness: "native".into(),
                 model: None,
                 effort: None,
                 perm_mode: ryuzi_core::PermMode::Default,

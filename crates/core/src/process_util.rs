@@ -30,6 +30,33 @@ pub fn no_window_std(cmd: &mut std::process::Command) -> &mut std::process::Comm
     cmd
 }
 
+/// Locate `bin` on PATH, honoring PATHEXT on Windows (npm shims install
+/// `pwsh.cmd` etc., not `.exe`).
+pub fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .map(|s| s.to_ascii_lowercase())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for ext in &exts {
+            let cand = dir.join(format!("{bin}{ext}"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

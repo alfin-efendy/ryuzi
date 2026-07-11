@@ -5,7 +5,7 @@ pub mod fields;
 pub mod store;
 
 pub use catalog::{all_fields, find_field, is_secret, CATALOG};
-pub use catalog::{GatewayDescriptor, ProviderCatalog, RuntimeDescriptor};
+pub use catalog::{GatewayDescriptor, ProviderCatalog};
 pub use fields::{ConfigField, FieldType, GLOBAL_FIELDS};
 pub use store::{csv, validate_setting, SettingsStore};
 

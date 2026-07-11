@@ -101,7 +101,6 @@ fn provider_plugin(d: &ProviderDescriptor) -> CorePlugin {
                 base_url: d.base_url.map(|s| s.to_string()),
                 models: models_to_defs(d.models),
             }),
-            runtime: None,
         },
         harness: None,
         gateway: None,

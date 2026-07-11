@@ -8,7 +8,7 @@ import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { useAgent } from "@/store-agent";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
@@ -43,11 +43,10 @@ export function HomeView() {
     [draftKey],
   );
   const isGit = project?.isGit ?? false;
-  const runtimes = useRuntimes((s) => s.runtimes);
-  // Ryuzi-only: every session runs the native runtime; the user picks a model.
-  const native = runtimeById(runtimes, "native");
-  const modelOptions = native?.models ?? [];
-  const selectedModel = nav.composerModel ?? project?.model ?? native?.model ?? "";
+  // Ryuzi-only: every session runs the native agent; the user picks a model.
+  const modelOptions = useAgent((s) => s.models);
+  const agentModel = useAgent((s) => s.model);
+  const selectedModel = nav.composerModel ?? project?.model ?? agentModel ?? "";
   const setComposerModel = useNav((s) => s.setComposerModel);
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
@@ -164,7 +163,6 @@ export function HomeView() {
     const t = draft.trim();
     if ((!t && composerFiles.attachments.length === 0) || !project) return;
     const opts = {
-      runtimeId: "native",
       model: nav.composerModel ?? null,
       context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,

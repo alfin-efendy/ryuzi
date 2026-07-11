@@ -10,9 +10,10 @@ struct Pending {
     tx: oneshot::Sender<ApprovalResponse>,
 }
 
-/// Shared registry of pending tool-permission requests. The ACP permission
-/// bridge registers a request id when it prompts the user; the UI resolves it
-/// (allow/deny) via [`ApprovalHub::resolve`].
+/// Shared registry of pending tool-permission requests. The native runtime's
+/// permission gate (see `harness::native::permission`) registers a request id
+/// when it prompts the user; the UI resolves it (allow/deny) via
+/// [`ApprovalHub::resolve`].
 pub struct ApprovalHub {
     pending: Mutex<HashMap<String, Pending>>,
 }
@@ -125,7 +126,7 @@ mod tests {
         assert!(!rx_a.await.unwrap().allowed());
         assert!(!rx_b.await.unwrap().allowed());
 
-        // sess-b and the unscoped (ACP-path) registration are untouched.
+        // sess-b and the unscoped (gateway/HTTP-driven) registration are untouched.
         assert!(hub.resolve_bool("req-3", true));
         assert!(rx_c.await.unwrap().allowed());
         assert!(hub.resolve_bool("req-4", true));

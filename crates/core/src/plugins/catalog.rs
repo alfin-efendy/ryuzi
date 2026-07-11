@@ -117,18 +117,14 @@ mod tests {
     /// Every id that already has a plugin identity elsewhere in the shared
     /// `PluginHost` namespace before catalog plugins are added — mirrors
     /// `install_builtins_tests::install_builtins_ids_never_collide_with_native_claude_code_or_discord`'s
-    /// fixture set (native/claude-code/discord builtins) plus every
-    /// provider/cli-agent id from `install_builtins` itself, since those are
-    /// the ids that any catalog manifest could collide with in a real host.
+    /// fixture set (native/discord builtins) plus every provider id from
+    /// `install_builtins` itself, since those are the ids that any catalog
+    /// manifest could collide with in a real host.
     fn all_code_builtin_ids() -> HashSet<String> {
         let mut ids: HashSet<String> = HashSet::new();
         ids.insert(crate::harness::native::NATIVE_ID.to_string());
-        ids.insert("claude-code".to_string());
         ids.insert("discord".to_string());
         for d in crate::llm_router::registry::CATALOG {
-            ids.insert(d.id.to_string());
-        }
-        for d in crate::runtimes::CATALOG {
             ids.insert(d.id.to_string());
         }
         ids

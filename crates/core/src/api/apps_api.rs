@@ -130,7 +130,6 @@ fn derive_auth(env: &[(String, String)]) -> (&'static str, Option<String>) {
 }
 
 async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
-    let agent_ids: Vec<&str> = crate::runtimes::CATALOG.iter().map(|d| d.id).collect();
     let mut out = Vec::new();
     for row in mcp::list_servers(cp.store()).await? {
         let tools = mcp::list_tools(cp.store(), &row.id)
@@ -142,13 +141,11 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<AppInfo>> {
                 perm: t.perm,
             })
             .collect();
-        let mut agent_access = Vec::new();
-        for aid in &agent_ids {
-            agent_access.push(AgentAccessInfo {
-                agent_id: aid.to_string(),
-                allowed: mcp::agent_allowed(cp.store(), &row.id, aid).await?,
-            });
-        }
+        // Native-only: "native" is the only agent id.
+        let agent_access = vec![AgentAccessInfo {
+            agent_id: "native".to_string(),
+            allowed: mcp::agent_allowed(cp.store(), &row.id, "native").await?,
+        }];
         out.push(AppInfo {
             initial: initial_of(&row.name),
             id: row.id,

@@ -15,8 +15,8 @@ export const PERM_MODES: { id: UiPermMode; label: string; desc: string }[] = [
 ];
 
 // The project row stores the engine's `PermMode`; the composer speaks the UI
-// four-mode vocabulary. These keep the two in sync (mirrors the Rust
-// `ui_perm_to_core` in crates/core/src/runtimes.rs).
+// four-mode vocabulary. These keep the two in sync (maps onto the engine's
+// PermMode at session start).
 export type CorePermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan";
 
 export function corePermToUi(mode: CorePermMode | string): UiPermMode {
@@ -102,3 +102,8 @@ export const PROVIDER_DEVICE_SUBTITLE: Record<string, string> = {
   qwen: "Free — sign in with your Qwen account. No API key needed.",
   "github-copilot": "Sign in with your GitHub account to use your Copilot subscription.",
 };
+
+// The one (native, in-process) agent. Identity only — model/perm-mode state
+// lives in store-agent. These values are the native agent's identity, defined
+// only here now that the runtime concept is gone.
+export const NATIVE_AGENT = { id: "native", name: "Ryuzi", color: "#7C5CFF", initial: "R" } as const;

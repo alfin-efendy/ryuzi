@@ -186,7 +186,6 @@ mod tests {
                 name: "p".into(),
                 workdir: "/w".into(),
                 source: None,
-                harness: "native".into(),
                 model: None,
                 effort: None,
                 perm_mode: PermMode::Plan,

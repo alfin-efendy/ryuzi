@@ -2,52 +2,124 @@ import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { CmdError, Result } from "@/bindings";
 
-// Settings → Agent: AgentLoopCard persists two numeric settings via
-// commands.getSetting/setSetting. A failed save must roll the input back to
-// the last CONFIRMED-persisted value — not to whatever the user just typed
-// (the bug this test guards: `onChange` mutates `values` on every keystroke,
-// so reading `values[key]` at commit time is never the pre-edit value).
+const ok = <T,>(data: T): Result<T, CmdError> => ({ status: "ok", data });
+
+// Settings → Agent renders three cards from one heading:
+//   • AgentSection  — default-model picker, gated on store-agent's `loaded`.
+//   • AgentLoopCard — two numeric settings via commands.getSetting/setSetting.
+//   • PermissionsCard — pulls in @/store (core-event subscription on load).
+// A single @/bindings mock therefore has to satisfy all three.
 const MAX_TURNS_KEY = "agent.max_provider_turns";
 
+type AgentSettings = { model: string | null; permMode: string | null };
+let getAgentSettingsImpl: () => Promise<Result<AgentSettings, CmdError>> = () =>
+  Promise.resolve(ok({ model: "anthropic/claude-opus-4", permMode: "ask" }));
+
+const getAgentSettings = mock(() => getAgentSettingsImpl());
+const setAgentSettings = mock(async (_model: string | null, _permMode: string | null) => ok(null));
+const listSelectableModels = mock(async () => ok(["smart", "anthropic/claude-opus-4"]));
+
+// AgentLoopCard: a failed save must roll the input back to the last CONFIRMED
+// value — not to whatever the user just typed (the bug this guards: `onChange`
+// mutates `values` on every keystroke, so reading `values[key]` at commit time
+// is never the pre-edit value).
 let setSettingImpl: (key: string, value: string) => Promise<Result<null, CmdError>> = () =>
   Promise.resolve({ status: "error", error: { message: "boom" } });
 
 const getSetting = mock((key: string): Promise<Result<string | null, CmdError>> => {
-  if (key === MAX_TURNS_KEY) return Promise.resolve({ status: "ok", data: "50" });
-  return Promise.resolve({ status: "ok", data: null });
+  if (key === MAX_TURNS_KEY) return Promise.resolve(ok("50"));
+  return Promise.resolve(ok(null));
 });
 const setSetting = mock((key: string, value: string): Promise<Result<null, CmdError>> => setSettingImpl(key, value));
-const listToolPolicies = mock(() => Promise.resolve({ status: "ok", data: [] }));
+const listToolPolicies = mock(() => Promise.resolve(ok([])));
+const deleteToolPolicy = mock(() => Promise.resolve(ok(null)));
 const pickDirectory = mock((): Promise<string | null> => Promise.resolve(null));
 
+// Mock the Tauri IPC boundary before the view (and the stores it pulls in) load.
 mock.module("@/bindings", () => ({
-  commands: { getSetting, setSetting, listToolPolicies, pickDirectory },
-  // PermissionsCard pulls in `@/store`, which subscribes to core events on
-  // module load (mirrors HomeView.test.tsx's bindings mock).
+  commands: {
+    getSetting,
+    setSetting,
+    pickDirectory,
+    listToolPolicies,
+    deleteToolPolicy,
+    getAgentSettings,
+    setAgentSettings,
+    listSelectableModels,
+  },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
-// SettingsView reads the app version and the autostart-at-login state on
-// mount; neither is under test here, so stub them out (mirrors HomeView.test.tsx
-// stubbing @tauri-apps/api/webview for a hook it doesn't otherwise exercise).
-mock.module("@tauri-apps/api/app", () => ({
-  getVersion: () => Promise.resolve("0.0.0"),
-}));
+mock.module("@tauri-apps/api/app", () => ({ getVersion: async () => "0.5.0" }));
 mock.module("@tauri-apps/plugin-autostart", () => ({
-  isEnabled: () => Promise.resolve(false),
-  enable: () => Promise.resolve(),
-  disable: () => Promise.resolve(),
+  isEnabled: async () => false,
+  enable: async () => {},
+  disable: async () => {},
 }));
 
 const { SettingsView } = await import("./SettingsView");
+const { useAgent } = await import("@/store-agent");
 
 beforeEach(() => {
   getSetting.mockClear();
   setSetting.mockClear();
   setSettingImpl = () => Promise.resolve({ status: "error", error: { message: "boom" } });
+  // Default: settings resolve immediately with a persisted default model, so
+  // existing tests that don't care about the loading window keep working.
+  getAgentSettingsImpl = () => Promise.resolve(ok({ model: "anthropic/claude-opus-4", permMode: "ask" }));
 });
 
 afterEach(() => {
   cleanup();
+  useAgent.setState({ models: [], model: null, permMode: null, loaded: false });
+  getAgentSettings.mockClear();
+  setAgentSettings.mockClear();
+  listSelectableModels.mockClear();
+});
+
+test("Agent section renders the default model picker, enabled once agent settings load", async () => {
+  render(<SettingsView />);
+  expect(screen.getByText("Agent")).toBeTruthy();
+  // load() populated the picker with the persisted default model.
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "Default model" }).textContent).toContain("claude-opus-4"));
+  expect(useAgent.getState().loaded).toBe(true);
+  expect((screen.getByRole("combobox", { name: "Default model" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+test("the permission-mode row was dropped from the Agent card", async () => {
+  render(<SettingsView />);
+  await waitFor(() => expect(getAgentSettings).toHaveBeenCalled());
+  expect(screen.queryByText("Permission mode")).toBeNull();
+  for (const label of ["Plan", "Ask", "Edit", "Full"]) {
+    expect(screen.queryByRole("button", { name: label })).toBeNull();
+  }
+});
+
+test("changing the default model persists it with the hydrated permMode via set_agent_settings", async () => {
+  render(<SettingsView />);
+  await waitFor(() => expect(useAgent.getState().model).toBe("anthropic/claude-opus-4"));
+  await useAgent.getState().setModel("smart");
+  expect(setAgentSettings).toHaveBeenCalledWith("smart", "ask");
+});
+
+test("the default model picker stays disabled when the agent-settings load fails, even though the model list is available", async () => {
+  // Promise.all in store-agent's load() settles both calls together; a
+  // real-world timeout/error on getAgentSettings can still land alongside a
+  // successful listSelectableModels response, so models.length > 0 while
+  // loaded stays false. The picker must render inert in that state, not
+  // silently accept a click that would round-trip null model/permMode.
+  getAgentSettingsImpl = () => Promise.resolve({ status: "error", error: { message: "boom" } });
+  render(<SettingsView />);
+
+  const picker = (await screen.findByRole("combobox", { name: "Default model" })) as HTMLButtonElement;
+  await waitFor(() => expect(listSelectableModels).toHaveBeenCalled());
+  expect(useAgent.getState().loaded).toBe(false);
+  expect(picker.disabled).toBe(true);
+});
+
+test("About tagline tells the native story, not Claude Code", async () => {
+  render(<SettingsView />);
+  expect(screen.queryByText(/drive Claude Code/)).toBeNull();
+  await waitFor(() => expect(screen.getByText(/drive the Ryuzi agent from chat and terminal/)).toBeTruthy());
 });
 
 test("failed save rolls back to the last persisted value, not the unsaved typed text", async () => {

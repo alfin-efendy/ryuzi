@@ -46,14 +46,13 @@ pub async fn update_project(
     project_id: String,
     model: Option<String>,
     perm_mode: PermMode,
-    harness: String,
 ) -> R<Project> {
     engine
         .rpc(
             "update_project",
             serde_json::json!({
                 "project_id": project_id, "model": model,
-                "perm_mode": perm_mode, "harness": harness,
+                "perm_mode": perm_mode,
             }),
         )
         .await

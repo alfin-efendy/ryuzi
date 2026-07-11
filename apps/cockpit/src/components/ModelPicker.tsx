@@ -5,7 +5,7 @@ import { groupModelOptions, withLeadingOption } from "@/lib/model-groups";
 import { useConnections } from "@/store-connections";
 import { useModelStatuses } from "@/store-model-statuses";
 import { useUi } from "@/store-ui";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { NATIVE_AGENT } from "@/constants";
 import { StatusDot } from "@/components/common/bits";
 
 type ModelPickerProps = {
@@ -31,8 +31,7 @@ export function ModelPicker({ value, onValueChange, models, leading, variant, pl
   const connections = useConnections((s) => s.connections);
   const byKey = useModelStatuses((s) => s.byKey);
   const hideInvalid = useUi((s) => s.hideInvalidModels);
-  const runtimes = useRuntimes((s) => s.runtimes);
-  const nativeColor = runtimeById(runtimes, "native")?.color ?? "var(--muted-foreground)";
+  const nativeColor = NATIVE_AGENT.color;
 
   const options = useMemo(() => {
     const grouped = groupModelOptions(models, catalog, connections, {

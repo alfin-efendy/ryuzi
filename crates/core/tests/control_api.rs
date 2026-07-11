@@ -4,7 +4,6 @@ use ryuzi_core::daemon::{build_daemon, BuildDaemonOpts};
 use ryuzi_core::serve::{serve, ApiState};
 use ryuzi_core::store::Store;
 use ryuzi_core::telemetry::NoopTelemetry;
-use ryuzi_core::AcpAdapterDescriptor;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -15,10 +14,9 @@ async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
 
     let daemon = build_daemon(BuildDaemonOpts {
         db_path,
-        adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
-        extra_harness_factories: vec![],
+        harness_factory: None,
     })
     .await
     .unwrap();
@@ -143,10 +141,9 @@ async fn daemon_start_autostarts_the_endpoint_server_when_configured() {
 
     let daemon = build_daemon(BuildDaemonOpts {
         db_path,
-        adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
-        extra_harness_factories: vec![],
+        harness_factory: None,
     })
     .await
     .unwrap();

@@ -26,7 +26,6 @@ use ryuzi_core::update::{
     ApplyInfo, CanaryCfg, CanaryHost, CanaryOutcome, Handoff, NotifyTarget, StageOpts, StageResult,
     TarStageHost, UpdateManager, UpdateManagerDeps, UreqHttp,
 };
-use ryuzi_core::AcpAdapterDescriptor;
 
 use crate::dispatch::Deps;
 
@@ -91,25 +90,11 @@ where
 }
 
 /// Factored out of `run_daemon` so `run_canary` can build an identical
-/// `BuildDaemonOpts` (same adapter/telemetry/gateway wiring) for its own
+/// `BuildDaemonOpts` (same telemetry/gateway wiring) for its own
 /// `build_daemon` call.
 fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
     BuildDaemonOpts {
         db_path: deps.db_path.clone(),
-        // Lazily resolves the ACP sidecar (may download). `build_daemon`
-        // calls this AT MOST ONCE, and only when the persisted
-        // `enabled_runtimes` setting includes "claude-code" — a
-        // zero-runtime daemon never touches the resolver or the network.
-        adapter: Box::new(|| {
-            let resolved = crate::sidecar_host::manager().resolve()?;
-            Ok(AcpAdapterDescriptor {
-                command: resolved.command,
-                args: resolved.args,
-                env: vec![],
-                // REQUIRED: the adapter refuses to start inside a nested Claude Code session.
-                env_remove: vec!["CLAUDECODE".to_string()],
-            })
-        }),
         telemetry: None,
         // `factory_entries()` is gated INSIDE `ryuzi-core` on ITS OWN
         // `discord` feature (see `gateway::discord::mod`'s doc on why the
@@ -120,7 +105,7 @@ fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
         // `not(feature = "discord")`; populated for every real `ryuzi-cli`
         // build (its `Cargo.toml` always requests `ryuzi-core/discord`).
         extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
-        extra_harness_factories: vec![],
+        harness_factory: None,
     }
 }
 

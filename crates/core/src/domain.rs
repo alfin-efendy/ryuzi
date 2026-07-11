@@ -64,7 +64,6 @@ pub struct Project {
     pub name: String,
     pub workdir: String,
     pub source: Option<String>,
-    pub harness: String,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub perm_mode: PermMode,
@@ -123,7 +122,7 @@ impl Default for SessionGitOptions {
     }
 }
 
-/// An MCP server the agent can use as tools (attached to an ACP session in Spec 3).
+/// An MCP server the native agent can use as tools (attached to a harness session).
 ///
 /// After plugin `${auth}`/setting substitution, a resolved `McpServerSpec`'s
 /// `transport` carries RESOLVED SECRETS in `Stdio::env`/`Http::headers` (API
@@ -201,7 +200,8 @@ pub struct ApprovalRequest {
     pub timeout_ms: Option<u64>,
 }
 
-/// The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+/// The user's decision on a tool-approval request from the native runtime's
+/// permission gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub enum ApprovalDecision {
@@ -278,7 +278,7 @@ pub struct ToolPolicyRow {
     pub decision: String,
 }
 
-/// A persisted transcript entry. Forward-compatible with ACP session/update blocks.
+/// A persisted transcript entry, one row per native-runtime event block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -435,17 +435,6 @@ pub enum CoreEvent {
         task_id: String,
         root_id: Option<String>,
         status: String,
-    },
-    /// A runtime npm install/update produced an output line.
-    RuntimeUpdateLog {
-        runtime_id: String,
-        line: String,
-    },
-    /// A runtime npm install/update finished (ok=false → message has detail).
-    RuntimeUpdateDone {
-        runtime_id: String,
-        ok: bool,
-        message: Option<String>,
     },
     /// Per-response context usage for a native session (drives the
     /// "% context left" indicator).
