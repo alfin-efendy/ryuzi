@@ -42,7 +42,7 @@ impl LlmStream for RouterLlmStream {
         effort_policy: Arc<TurnEffortPolicy>,
     ) -> anyhow::Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>> {
         let crate::llm_router::provenance::RoutedStream { events, .. } =
-            client::anthropic_messages_stream(&self.ctx, body, effort_policy).await?;
+            client::anthropic_messages_stream(&self.ctx, body, &effort_policy).await?;
         Ok(events)
     }
 }

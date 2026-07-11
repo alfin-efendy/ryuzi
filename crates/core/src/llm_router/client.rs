@@ -76,6 +76,9 @@ struct AnnotatedRouteTarget {
     reason: RouteSelectionReason,
 }
 
+type ProviderOrderCache =
+    std::collections::HashMap<(String, String, Vec<String>), (Vec<String>, RouteSelectionReason)>;
+
 pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Option<RouteTarget>> {
     Ok(route_models_for_body(store, requested, None)
         .await?
@@ -137,6 +140,24 @@ async fn route_models_for_body_matching(
     body: Option<&Value>,
     target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
 ) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
+    let mut provider_order_cache = ProviderOrderCache::new();
+    route_models_for_body_matching_with_cache(
+        store,
+        requested,
+        body,
+        target_allowed,
+        &mut provider_order_cache,
+    )
+    .await
+}
+
+async fn route_models_for_body_matching_with_cache(
+    store: &Store,
+    requested: &str,
+    body: Option<&Value>,
+    target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
+    provider_order_cache: &mut ProviderOrderCache,
+) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let conns = connections::list_connections(store).await?;
     let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
     let required = body
@@ -164,6 +185,7 @@ async fn route_models_for_body_matching(
                 &indexed.target,
                 target_allowed,
                 route_reason.clone(),
+                provider_order_cache,
             )
             .await?
             {
@@ -200,7 +222,10 @@ async fn route_models_for_body_matching(
             })
             .collect();
         let mut out = Vec::new();
-        for (conn, reason) in ordered_provider_connections(store, prov, model, candidates).await? {
+        for (conn, reason) in
+            ordered_provider_connections(store, prov, model, candidates, provider_order_cache)
+                .await?
+        {
             if let Some(desc) = registry::descriptor(&conn.provider) {
                 let Some((upstream_model, request_compatibility_effort)) =
                     resolved_requested_model(&conn, desc, requested, model, true)
@@ -243,8 +268,14 @@ async fn route_models_for_body_matching(
     let cross_provider_ordered = provider_order.len() > 1;
     for provider in provider_order {
         let candidates = grouped.remove(&provider).unwrap_or_default();
-        for (conn, account_reason) in
-            ordered_provider_connections(store, &provider, requested, candidates).await?
+        for (conn, account_reason) in ordered_provider_connections(
+            store,
+            &provider,
+            requested,
+            candidates,
+            provider_order_cache,
+        )
+        .await?
         {
             if let Some(desc) = registry::descriptor(&conn.provider) {
                 out.push(AnnotatedRouteTarget {
@@ -308,6 +339,7 @@ async fn expanded_route_targets(
     target: &routes::ModelRouteTarget,
     target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
     route_reason: RouteSelectionReason,
+    provider_order_cache: &mut ProviderOrderCache,
 ) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let mut candidates = Vec::new();
     for conn in enabled {
@@ -322,8 +354,14 @@ async fn expanded_route_targets(
             candidates.push(conn.clone());
         }
     }
-    let ordered =
-        ordered_provider_connections(store, &target.provider, &target.model, candidates).await?;
+    let ordered = ordered_provider_connections(
+        store,
+        &target.provider,
+        &target.model,
+        candidates,
+        provider_order_cache,
+    )
+    .await?;
     Ok(ordered
         .into_iter()
         .filter_map(|(conn, account_reason)| {
@@ -359,6 +397,7 @@ async fn route_continuation_targets(
     store: &Store,
     requested: &str,
     attempted: &std::collections::HashSet<(String, String)>,
+    provider_order_cache: &mut ProviderOrderCache,
 ) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let Some((family, model)) = requested.split_once('/') else {
         return Ok(Vec::new());
@@ -384,6 +423,7 @@ async fn route_continuation_targets(
             target,
             anthropic_messages_target_allowed,
             RouteSelectionReason::Ordered,
+            provider_order_cache,
         )
         .await?
         {
@@ -498,6 +538,7 @@ async fn ordered_provider_connections(
     provider: &str,
     scope: &str,
     candidates: Vec<connections::ConnectionRow>,
+    provider_order_cache: &mut ProviderOrderCache,
 ) -> anyhow::Result<Vec<(connections::ConnectionRow, RouteSelectionReason)>> {
     if candidates.len() <= 1 {
         return Ok(candidates
@@ -509,12 +550,20 @@ async fn ordered_provider_connections(
         .iter()
         .map(|conn| conn.id.clone())
         .collect::<Vec<_>>();
-    let (ordered_ids, strategy) =
-        routes::ordered_provider_connection_ids_with_strategy(store, provider, scope, &ids).await?;
-    let reason = if strategy == routes::ModelRouteStrategy::RoundRobin {
-        RouteSelectionReason::RoundRobin
+    let cache_key = (provider.to_string(), scope.to_string(), ids.clone());
+    let (ordered_ids, reason) = if let Some(cached) = provider_order_cache.get(&cache_key) {
+        cached.clone()
     } else {
-        RouteSelectionReason::Ordered
+        let (ordered_ids, strategy) =
+            routes::ordered_provider_connection_ids_with_strategy(store, provider, scope, &ids)
+                .await?;
+        let reason = if strategy == routes::ModelRouteStrategy::RoundRobin {
+            RouteSelectionReason::RoundRobin
+        } else {
+            RouteSelectionReason::Ordered
+        };
+        provider_order_cache.insert(cache_key, (ordered_ids.clone(), reason.clone()));
+        (ordered_ids, reason)
     };
     let mut by_id = candidates
         .into_iter()
@@ -1807,14 +1856,16 @@ fn deliver_probed(
 pub async fn anthropic_messages_stream(
     ctx: &UpstreamCtx,
     body: Value,
-    effort_policy: Arc<model_effort::TurnEffortPolicy>,
+    effort_policy: &model_effort::TurnEffortPolicy,
 ) -> anyhow::Result<RoutedStream> {
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let targets = route_models_for_body_matching(
+    let mut provider_order_cache = ProviderOrderCache::new();
+    let targets = route_models_for_body_matching_with_cache(
         &ctx.store,
         &requested,
         None,
         anthropic_messages_target_allowed,
+        &mut provider_order_cache,
     )
     .await?;
     if targets.is_empty() {
@@ -1833,7 +1884,15 @@ pub async fn anthropic_messages_stream(
                 break;
             }
             continued = true;
-            queue.extend(route_continuation_targets(&ctx.store, &requested, &attempted).await?);
+            queue.extend(
+                route_continuation_targets(
+                    &ctx.store,
+                    &requested,
+                    &attempted,
+                    &mut provider_order_cache,
+                )
+                .await?,
+            );
             if queue.is_empty() {
                 break;
             }
@@ -1869,7 +1928,7 @@ pub async fn anthropic_messages_stream(
                         let selection = selection_for_accepted_target(
                             &target,
                             &requested,
-                            &effort_policy,
+                            effort_policy,
                             accepted_reason(origin, &failures),
                         );
                         return Ok(RoutedStream {
@@ -1897,13 +1956,13 @@ pub async fn anthropic_messages_stream(
         // completions`, so — like Kiro — it's handled before the format
         // match via its own translation + upstream pipeline.
         if target.conn.provider == "openai-oauth" {
-            match codex_stream(ctx, &mut target, &attempt_body, &effort_policy, started).await {
+            match codex_stream(ctx, &mut target, &attempt_body, effort_policy, started).await {
                 Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
                     StreamProbe::Deliver { buffered, rest } => {
                         let selection = selection_for_accepted_target(
                             &target,
                             &requested,
-                            &effort_policy,
+                            effort_policy,
                             accepted_reason(origin, &failures),
                         );
                         return Ok(RoutedStream {
@@ -1935,7 +1994,7 @@ pub async fn anthropic_messages_stream(
         match target.desc.format {
             ApiFormat::Anthropic => {
                 strip_thinking(&mut attempt_body);
-                apply_anthropic_effort(&mut attempt_body, &target, &effort_policy);
+                apply_anthropic_effort(&mut attempt_body, &target, effort_policy);
                 let tool_map = claude_cloak_map_for(&target, &attempt_body);
                 let resp = match send_upstream(ctx, &mut target, &attempt_body).await {
                     Ok(resp) => resp,
@@ -1977,7 +2036,7 @@ pub async fn anthropic_messages_stream(
                         let selection = selection_for_accepted_target(
                             &target,
                             &requested,
-                            &effort_policy,
+                            effort_policy,
                             accepted_reason(origin, &failures),
                         );
                         return Ok(RoutedStream {
@@ -1998,7 +2057,7 @@ pub async fn anthropic_messages_stream(
                 apply_openai_effort(
                     &mut upstream_body,
                     &target,
-                    &effort_policy,
+                    effort_policy,
                     body.get("thinking").is_some(),
                 );
                 apply_max_completion_tokens(target.desc, &mut upstream_body);
@@ -2043,7 +2102,7 @@ pub async fn anthropic_messages_stream(
                         let selection = selection_for_accepted_target(
                             &target,
                             &requested,
-                            &effort_policy,
+                            effort_policy,
                             accepted_reason(origin, &failures),
                         );
                         return Ok(RoutedStream {
@@ -2065,7 +2124,18 @@ pub async fn anthropic_messages_stream(
 /// Non-streaming sibling: returns the full Anthropic message `Value`.
 pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Result<Value> {
     let requested = body["model"].as_str().unwrap_or("").to_string();
-    let targets = route_models_for_anthropic_messages(&ctx.store, &requested).await?;
+    let mut provider_order_cache = ProviderOrderCache::new();
+    let targets = route_models_for_body_matching_with_cache(
+        &ctx.store,
+        &requested,
+        None,
+        anthropic_messages_target_allowed,
+        &mut provider_order_cache,
+    )
+    .await?
+    .into_iter()
+    .map(|annotated| annotated.target)
+    .collect::<Vec<_>>();
     if targets.is_empty() {
         anyhow::bail!("no enabled connection serves model '{requested}'");
     }
@@ -2084,10 +2154,15 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
             }
             continued = true;
             queue.extend(
-                route_continuation_targets(&ctx.store, &requested, &attempted)
-                    .await?
-                    .into_iter()
-                    .map(|annotated| annotated.target),
+                route_continuation_targets(
+                    &ctx.store,
+                    &requested,
+                    &attempted,
+                    &mut provider_order_cache,
+                )
+                .await?
+                .into_iter()
+                .map(|annotated| annotated.target),
             );
             if queue.is_empty() {
                 break;
@@ -2837,7 +2912,7 @@ mod tests {
             })
         };
 
-        let rx = anthropic_messages_stream(&ctx, body(), policy)
+        let rx = anthropic_messages_stream(&ctx, body(), &policy)
             .await
             .unwrap();
         let _ = collect_stream(rx.events).await;
@@ -2849,7 +2924,7 @@ mod tests {
             configured: Default::default(),
             surfaces: Default::default(),
         });
-        let rx = anthropic_messages_stream(&ctx, body(), unsupported)
+        let rx = anthropic_messages_stream(&ctx, body(), &unsupported)
             .await
             .unwrap();
         let _ = collect_stream(rx.events).await;
@@ -2934,7 +3009,7 @@ mod tests {
         let routed = anthropic_messages_stream(
             &ctx,
             json!({"model":"anthropic/claude-t","messages":[]}),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
@@ -2992,7 +3067,7 @@ mod tests {
         let routed = anthropic_messages_stream(
             &ctx,
             json!({"model":"smart","messages":[]}),
-            utility_policy(&ctx, "smart").await,
+            utility_policy(&ctx, "smart").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3004,6 +3079,90 @@ mod tests {
             routed.selection.connection_id.as_str(),
             "first" | "second"
         ));
+    }
+
+    #[tokio::test]
+    async fn route_selection_duplicate_targets_advance_each_round_robin_cursor_once() {
+        let port = provenance_test_server(SSE_OK_STREAM, SSE_OK_STREAM).await;
+        let ctx = test_ctx().await;
+        add_provenance_account(&ctx, "first", "First", port, "first", "claude-t").await;
+        add_provenance_account(&ctx, "second", "Second", port, "second", "claude-t").await;
+        routes::save_provider_account_route(
+            &ctx.store,
+            "anthropic",
+            routes::ModelRouteStrategy::RoundRobin,
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "duplicate-rr".into(),
+                name: "duplicate-smart".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::RoundRobin,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-t".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-t".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let policy = utility_policy(&ctx, "duplicate-smart").await;
+        let request = || json!({"model":"duplicate-smart","messages":[]});
+
+        let first = anthropic_messages_stream(&ctx, request(), &policy)
+            .await
+            .unwrap();
+        assert_eq!(first.selection.connection_id, "first");
+        assert_eq!(
+            ctx.store
+                .get_setting("llm_provider_account_round_robin_cursor.anthropic.claude-t")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            ctx.store
+                .get_setting("llm_model_route_round_robin_cursor.duplicate-rr")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+
+        let second = anthropic_messages_stream(&ctx, request(), &policy)
+            .await
+            .unwrap();
+        assert_eq!(second.selection.connection_id, "second");
+        assert_eq!(
+            ctx.store
+                .get_setting("llm_provider_account_round_robin_cursor.anthropic.claude-t")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ctx.store
+                .get_setting("llm_model_route_round_robin_cursor.duplicate-rr")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
     }
 
     #[test]
@@ -3059,7 +3218,7 @@ mod tests {
         let routed = anthropic_messages_stream(
             &ctx,
             json!({"model":"anthropic/claude-t","messages":[]}),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3082,7 +3241,7 @@ mod tests {
         assert!(anthropic_messages_stream(
             &ctx,
             json!({"model":"anthropic/claude-t","messages":[]}),
-            utility_policy(&ctx, "anthropic/claude-t").await
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref()
         )
         .await
         .is_err());
@@ -3097,7 +3256,7 @@ mod tests {
         let routed = anthropic_messages_stream(
             &ctx,
             json!({"model":"anthropic/claude-t","messages":[]}),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3153,7 +3312,7 @@ mod tests {
         let routed = anthropic_messages_stream(
             &ctx,
             json!({"model":"anthropic/claude-t","messages":[]}),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3338,7 +3497,7 @@ mod tests {
                 "model": "anthropic/claude-t",
                 "messages": [{"role": "user", "content": "hi"}],
             }),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3421,10 +3580,10 @@ mod tests {
         let policy = utility_policy(&ctx, "anthropic/claude-t").await;
         let body = || json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]});
 
-        let first = anthropic_messages_stream(&ctx, body(), policy.clone())
+        let first = anthropic_messages_stream(&ctx, body(), &policy)
             .await
             .unwrap();
-        let second = anthropic_messages_stream(&ctx, body(), policy.clone())
+        let second = anthropic_messages_stream(&ctx, body(), &policy)
             .await
             .unwrap();
         assert_eq!(stream_text(&collect_stream(first.events).await), "first");
@@ -3462,7 +3621,7 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3514,7 +3673,7 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3573,7 +3732,7 @@ mod tests {
         let err = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .err()
@@ -3641,7 +3800,7 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3688,7 +3847,7 @@ mod tests {
         let rx = anthropic_messages_stream(
             &ctx,
             json!({"model": "anthropic/claude-t", "messages": [{"role": "user", "content": "hi"}]}),
-            utility_policy(&ctx, "anthropic/claude-t").await,
+            utility_policy(&ctx, "anthropic/claude-t").await.as_ref(),
         )
         .await
         .unwrap();
@@ -6075,7 +6234,7 @@ mod tests {
                 "model": "anthropic/claude-a",
                 "messages": [{"role": "user", "content": "hi"}],
             }),
-            utility_policy(&ctx, "anthropic/claude-a").await,
+            utility_policy(&ctx, "anthropic/claude-a").await.as_ref(),
         )
         .await
         .unwrap();

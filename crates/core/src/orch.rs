@@ -798,7 +798,7 @@ pub async fn decompose_goal(
         "stream": true,
     });
     let crate::llm_router::provenance::RoutedStream { mut events, .. } =
-        client::anthropic_messages_stream(&ctx, body, effort_policy).await?;
+        client::anthropic_messages_stream(&ctx, body, &effort_policy).await?;
     let mut text = String::new();
     while let Some(item) = events.recv().await {
         let ev = item?;
