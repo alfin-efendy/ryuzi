@@ -83,6 +83,10 @@ pub struct Daemon {
     /// The orch dispatcher's background loop (`orch::spawn_runner`), tracked
     /// for the same reason as `scheduler_handle`.
     orch_handle: JoinHandle<()>,
+    /// The background-rail drainer's loop (`background_rail::spawn_runner`),
+    /// tracked for the same reason as `scheduler_handle`/`orch_handle` — the
+    /// daemon is the single always-on engine host for it too.
+    rail_handle: JoinHandle<()>,
 }
 
 impl Daemon {
@@ -92,7 +96,7 @@ impl Daemon {
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
-    /// same as `stop()`), the router/fan-out/scheduler/orch handles are
+    /// same as `stop()`), the router/fan-out/scheduler/orch/rail handles are
     /// aborted, and the daemon is marked stopped (reusing the same
     /// idempotency flag `stop()` checks) before the error is returned.
     /// Marking it stopped here means a caller's own best-effort `stop()` on
@@ -126,6 +130,7 @@ impl Daemon {
                     self.fanout_handle.abort();
                     self.scheduler_handle.abort();
                     self.orch_handle.abort();
+                    self.rail_handle.abort();
                 }
                 return Err(e);
             }
@@ -163,8 +168,9 @@ impl Daemon {
     /// failing gateway can't block the rest of the shutdown),
     /// abort the router and approval fan-out broadcast-consumer loops (which
     /// also aborts any in-flight per-approval races the fan-out spawned —
-    /// see `spawn_approval_fanout`), abort the scheduler and orch loops, stop
-    /// the endpoint server, then flush telemetry. A second call is a no-op.
+    /// see `spawn_approval_fanout`), abort the scheduler, orch, and rail
+    /// loops, stop the endpoint server, then flush telemetry. A second call
+    /// is a no-op.
     pub async fn stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
@@ -176,6 +182,7 @@ impl Daemon {
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
         self.orch_handle.abort();
+        self.rail_handle.abort();
         self.router_server.stop().await;
         self.telemetry.shutdown();
     }
@@ -234,11 +241,13 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// → a second, inbound-only `Router` handed to every gateway via
 /// `Gateway::set_router` (Task 6 — see `router.rs`'s module doc for why two
 /// instances) → the approval fan-out spawned on another `cp.subscribe()`
-/// → the cron scheduler (`scheduler::spawn_runner`) and orch dispatcher
-/// (`orch::spawn_runner`) loops, spawned here because the daemon is the
-/// single always-on engine host for them (see `Daemon`'s `scheduler_handle`
-/// doc) → the local endpoint server (`RouterServer::new`), constructed but
-/// not started — `Daemon::start()` starts it only if `endpoint_autostart`
+/// → the cron scheduler (`scheduler::spawn_runner`), orch dispatcher
+/// (`orch::spawn_runner`), and background-rail drainer
+/// (`background_rail::spawn_runner`) loops, spawned here because the daemon
+/// is the single always-on engine host for them (see `Daemon`'s
+/// `scheduler_handle` doc) → the local endpoint server (`RouterServer::new`),
+/// constructed but not started — `Daemon::start()` starts it only if
+/// `endpoint_autostart`
 /// is set. One `Arc<Store>` is opened once and cloned throughout — no
 /// `Arc::try_unwrap` reclaiming.
 ///
@@ -271,7 +280,16 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
 
     let mut registries = Registries::new();
     registries.add_plugin(native_plugin());
-    crate::plugins::install_builtins(&mut registries);
+    crate::plugins::install_providers(&mut registries);
+    // Merge the (version-gated) remote catalog cache over the embedded
+    // catalog before anything is added to the host — `Registries::add_plugin`
+    // is first-registration-wins with no removal, so the winner per id must
+    // already be decided (see `catalog::merged_catalog_plugins`'s doc). An
+    // empty/unreadable cache degrades to the embedded catalog alone.
+    let remote = store.list_remote_catalog().await.unwrap_or_default();
+    for plugin in crate::plugins::catalog::merged_catalog_plugins(&remote) {
+        registries.add_plugin(plugin);
+    }
     crate::plugins::load_skill_pack_plugins(&mut registries);
     if let Some(factory) = opts.harness_factory {
         registries.harness = factory;
@@ -326,6 +344,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     // job_last_fired anchor is single-host-only — never spawn a second one.
     let scheduler_handle = crate::scheduler::spawn_runner(Arc::clone(&cp));
     let orch_handle = crate::orch::spawn_runner(Arc::clone(&cp));
+    let rail_handle = crate::background_rail::spawn_runner(Arc::clone(&cp));
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
 
     Ok(Daemon {
@@ -339,6 +358,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         fanout_handle,
         scheduler_handle,
         orch_handle,
+        rail_handle,
     })
 }
 
@@ -836,6 +856,48 @@ mod tests {
         assert_eq!(cfg["discord.guild_id"], "");
     }
 
+    #[tokio::test]
+    async fn build_daemon_merges_remote_catalog_cache_over_the_embedded_catalog() {
+        let (_guard, db_path) = temp_db_path();
+        const NEW_TOML: &str = "contract=1\nid=\"acme-remote\"\nname=\"Acme Remote\"\nversion=\"1.0.0\"\n[[mcp]]\nname=\"m\"\ntransport=\"http\"\nurl=\"https://x\"";
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            store
+                .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
+                    id: "acme-remote".to_string(),
+                    manifest_toml: NEW_TOML.to_string(),
+                    version: "1.0.0".to_string(),
+                    sequence: 1,
+                    blocked: false,
+                    blocked_reason: None,
+                    fetched_at: 0,
+                }])
+                .await
+                .unwrap();
+        }
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path: db_path.clone(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+
+        let ids: Vec<String> = daemon
+            .cp
+            .plugins()
+            .list()
+            .iter()
+            .map(|p| p.manifest.id.clone())
+            .collect();
+        assert!(
+            ids.contains(&"acme-remote".to_string()),
+            "remote catalog cache entry must be merged into the running host: {ids:?}"
+        );
+    }
+
     // ---------- (b)/(c)/(d) handle_approval unit tests ----------
 
     #[tokio::test]
@@ -1006,7 +1068,7 @@ mod tests {
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw_a), Arc::new(gw_b)];
 
         // Long-running "loops" standing in for the real router/fan-out/
-        // scheduler/orch tasks, so this test can assert that a failed
+        // scheduler/orch/rail tasks, so this test can assert that a failed
         // `start()` aborts them too.
         let router_handle = tokio::spawn(async {
             loop {
@@ -1028,6 +1090,11 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         });
+        let rail_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
 
         let daemon = Daemon {
             cp,
@@ -1040,6 +1107,7 @@ mod tests {
             fanout_handle,
             scheduler_handle,
             orch_handle,
+            rail_handle,
         };
 
         let err = daemon.start().await.unwrap_err();
@@ -1070,6 +1138,10 @@ mod tests {
         assert!(
             daemon.orch_handle.is_finished(),
             "start()'s rollback must abort the orch loop"
+        );
+        assert!(
+            daemon.rail_handle.is_finished(),
+            "start()'s rollback must abort the rail loop"
         );
 
         // A later explicit stop() (as `build_and_start` performs on a start
@@ -1471,6 +1543,7 @@ mod tests {
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
             orch_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
         };
 
         daemon.start().await.unwrap();
@@ -1529,6 +1602,11 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         });
+        let rail_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
 
         let daemon = Daemon {
             cp,
@@ -1541,6 +1619,7 @@ mod tests {
             fanout_handle,
             scheduler_handle,
             orch_handle,
+            rail_handle,
         };
 
         daemon.stop().await;
@@ -1551,7 +1630,7 @@ mod tests {
             1,
             "a second stop() must not re-invoke gateway.stop()"
         );
-        // Give the abort a moment to actually land, then assert all four
+        // Give the abort a moment to actually land, then assert all five
         // tracked loops are gone — stop() must not leave them running.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -1569,6 +1648,10 @@ mod tests {
         assert!(
             daemon.orch_handle.is_finished(),
             "stop() must abort the orch loop"
+        );
+        assert!(
+            daemon.rail_handle.is_finished(),
+            "stop() must abort the rail loop"
         );
     }
 
@@ -1835,10 +1918,10 @@ mod tests {
         );
     }
 
-    // ---------- (j) daemon hosts scheduler + orch loops (Task 10) ----------
+    // ---------- (j) daemon hosts scheduler + orch + rail loops (Tasks 10, 9) ----------
 
     #[tokio::test]
-    async fn daemon_hosts_and_stop_aborts_scheduler_and_orch_loops() {
+    async fn daemon_hosts_and_stop_aborts_scheduler_orch_and_rail_loops() {
         let (_guard, db_path) = temp_db_path();
         let daemon = build_daemon(BuildDaemonOpts {
             db_path,
@@ -1854,6 +1937,7 @@ mod tests {
             "scheduler loop must be live"
         );
         assert!(!daemon.orch_handle.is_finished(), "orch loop must be live");
+        assert!(!daemon.rail_handle.is_finished(), "rail loop must be live");
 
         daemon.stop().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1864,6 +1948,10 @@ mod tests {
         assert!(
             daemon.orch_handle.is_finished(),
             "stop() must abort the orch loop"
+        );
+        assert!(
+            daemon.rail_handle.is_finished(),
+            "stop() must abort the rail loop"
         );
     }
 }

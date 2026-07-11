@@ -100,10 +100,14 @@ two tabs (`Segmented`), backed by thin Tauri commands:
   stays available via **Add MCP server** (AddAppModal), and hand-adding a
   skill source via **Add skill source** (`SkillInstallModal`).
 
-There is no remote/community catalog beyond the embedded one — "Browse"
-only ever lists the 24 manifests baked into the binary plus the curated
-skill packs baked into `skills_install.rs`; a hosted plugin registry is a
-future track, not shipped behavior.
+"Browse" lists the embedded catalog (24 manifests baked into the binary)
+merged with any cached [remote catalog](#remote-catalog) entries — a signed
+`catalog.json` feed the daemon fetches, verifies, and version-gates over the
+embedded set — plus the curated skill packs baked into `skills_install.rs`.
+The remote feed can add new ids and override an embedded id's manifest at a
+strictly higher semver; it can never delete an embedded entry. A header
+"Refresh catalog" button and status line drive this on demand; see the
+linked section for the fetch cadence, signing, and publish flow.
 
 Installing a skill pack (Browse card or "Add skill source") goes through the
 two-phase tiered trust gate described in
@@ -914,3 +918,239 @@ Adding an entry to `crates/core/plugins/catalog/*.toml` (and
   (including against every built-in provider/`native`/`discord` id),
   requires every non-experimental entry to have `[[mcp]]`, and requires
   every `experimental` entry to have no `[[mcp]]`.
+
+---
+
+## Remote catalog
+
+The embedded catalog above ships inside the binary — adding or fixing an
+integration otherwise needs a full release. The remote catalog lets the
+daemon fetch a **signed** `catalog.json` feed at runtime and merge it over
+the embedded set, so new/updated integrations (and revocations) can ship
+between releases. Engine code: `crates/core/src/plugins/remote_catalog.rs`
+(fetch/verify/cache + the background cadence), `catalog_feed_key.rs` (the
+embedded public key), `catalog.rs`'s `merged_catalog_plugins` (the
+version-gated merge), and migration 24 in `store.rs` (the cache tables).
+Publish tooling: `scripts/catalog/*.ts` (this section's second half).
+
+### Feed format
+
+A feed is two files served side by side: `catalog.json` (the payload) and
+`catalog.json.sig` (a **raw, detached** 64-byte ed25519 signature over the
+exact bytes of `catalog.json` — not base64, not a PEM/DER wrapper, not a
+signature over a hash). `CatalogFeed` (`remote_catalog.rs`) deserializes:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schemaVersion` | integer | Must be `1` — any other value is rejected outright (`CatalogFeedError::UnsupportedSchema`). |
+| `sequence` | integer | Monotonic publish counter. A fetched feed whose `sequence` is **strictly less than** the last accepted one is rejected (`CatalogFeedError::Rollback`) — this is the anti-rollback/anti-replay guard; an equal or greater sequence is accepted (re-applying an unchanged feed is a no-op, not an error). Persisted in the `catalog_feed_state` table. |
+| `generatedAt` | integer | Epoch milliseconds; informational only (not checked). |
+| `entries` | `{id, manifestToml}[]` | One embedded-or-new catalog manifest per entry, as raw TOML text (the same format as `crates/core/plugins/catalog/*.toml`). `id` **must** equal the manifest TOML's own `id` field — the engine's merge (`merged_catalog_plugins`) rejects and logs (never applies) an entry whose declared feed id and manifest id disagree, to avoid overwriting the wrong embedded slot. |
+| `blocked` | `{id, reason, sinceSequence}[]` | A denylist of ids to revoke — see [The `blocked` denylist](#the-blocked-denylist) below. |
+
+### Signing
+
+The feed is verified with `CATALOG_FEED_PUBKEY`, a 32-byte ed25519 public
+key **compiled into the binary**
+(`crates/core/src/plugins/catalog_feed_key.rs`). The matching private key
+never ships anywhere — it lives only as the `CATALOG_FEED_PRIVATE_KEY` CI
+secret, consumed by the publish tooling below.
+
+`CATALOG_FEED_PUBKEY` currently ships as the **all-zero placeholder**
+(`[0u8; 32]`). That key is a valid *low-order* ed25519 point — a non-strict
+verify could be tricked into accepting a forged signature against it — so the
+engine rejects it two ways: an explicit all-zero guard **plus** `verify_strict`
+(which rejects low-order keys and non-canonical signatures). While the
+placeholder is in place **every fetch is rejected**
+(`CatalogFeedError::BadSignature`); the remote catalog is fail-closed and the
+embedded catalog still loads normally. Going live is a one-time human ops step:
+
+1. Run `bun scripts/catalog/keygen.ts` **once** (a second run makes an
+   unrelated keypair, not a recovery of the first). It prints:
+   - a Rust `[u8; 32]` array literal — the **public** key, safe to commit.
+   - a base64 string — the **private** key seed. Never commit it.
+2. Store the private key as the `CATALOG_FEED_PRIVATE_KEY` repo secret
+   (GitHub Settings → Secrets and variables → Actions).
+3. Paste the public key array into `CATALOG_FEED_PUBKEY`
+   (`catalog_feed_key.rs`) and ship that change in a normal PR.
+4. The next release's `catalog-feed` job (see
+   [Publish flow](#publish-flow) below) builds and uploads a feed the new
+   binary — carrying the new pubkey — can verify. Older, already-shipped
+   binaries keep verifying against whatever pubkey they were built with, so
+   rotating the key later means republishing a fresh signed feed once the
+   new pubkey has actually shipped, or older installs simply stop accepting
+   updates until they upgrade.
+
+Bun's WebCrypto (`crypto.subtle`, algorithm `"Ed25519"`) is what both
+`keygen.ts` and `build-feed.ts` use — no external signing dependency.
+Verified byte-for-byte interoperable with `ed25519-dalek` (the crate the
+engine verifies with): signing the same 32-byte seed and message with Bun's
+WebCrypto and with `ed25519_dalek::SigningKey::sign` produces the identical
+64-byte signature.
+
+### Fetch pipeline
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `catalog_feed_url` | `https://github.com/alfin-efendy/ryuzi/releases/latest/download/catalog.json` (`DEFAULT_CATALOG_FEED_URL`) | Override for a self-hosted feed. The `.sig` is always fetched from `<feed_url>.sig`. |
+| `catalog_fetch_interval_ms` | `21600000` (6h, `DEFAULT_CATALOG_FETCH_INTERVAL_MS`) | Background fetch cadence. |
+
+Both are plain settings-store keys, but neither is in the static
+`ConfigField` schema (`crates/core/src/settings/fields.rs`) — there's no
+Settings-screen form field for them yet. Set them via the `set_setting` RPC
+(Cockpit's generic `set_setting` Tauri command, or `POST /rpc/set_setting`
+with `{"key": "catalog_feed_url", "value": "..."}`) — that RPC writes
+through `Store::set_setting` directly, which (unlike the schema-validated
+`SettingsStore::set` most other settings go through) accepts any key, so an
+unregistered key like these two still persists. Read them back with
+`get_setting`.
+
+`RemoteCatalogManager` (`remote_catalog.rs`) owns the background cadence:
+fetch once on boot, then on a `catalog_fetch_interval_ms` timer, mirroring
+`UpdateManager`'s shape. It is wired into **`ryuzi serve` / `ryuzi __daemon`
+only** (`crates/cli/src/daemon_cmd.rs`) — Cockpit's own spawned
+`--engine-daemon` subprocess (`apps/cockpit/src-tauri/src/engine_daemon.rs`)
+does not start this timer. Cockpit still sees a live feed via two other
+paths: (a) if Cockpit attaches to an *already-running* `ryuzi serve`
+daemon (`connect_or_spawn` in `apps/cockpit/src-tauri/src/engine.rs` prefers
+an existing daemon over spawning its own), that daemon's timer is the one
+driving it; (b) either way, every daemon composition root
+(`daemon::build_daemon`) merges whatever is *already cached* in the shared
+SQLite store at startup, and exposes the `refresh_catalog` RPC (below) for
+an on-demand fetch regardless of which daemon is running.
+
+Every applied fetch (background or on-demand) re-runs the
+[blocked denylist sweep](#the-blocked-denylist) and, only if the
+*effective* merged catalog actually changed (new/removed/version-changed/
+blocked entries — not just a re-stamped `fetched_at` or an unchanged
+re-fetch), sets the daemon's in-memory `plugins_restart_required` flag —
+the same flag skill-pack installs/updates set, surfaced the same way (see
+[Daemon RPC methods](#daemon-rpc-methods-post-rpcmethod) above).
+
+### Verification and anti-rollback
+
+`fetch_and_cache` (`remote_catalog.rs`) never propagates a failure as an
+error — every failure path (non-2xx HTTP, bad signature, unsupported
+schema, rollback, unparsable entry) is caught, logged
+(`tracing::warn!`), and returns `FetchOutcome { applied: false, .. }`, so a
+transient network blip or a compromised/misconfigured feed can never crash
+the daemon or the background timer. An entry whose TOML fails to
+parse/validate is dropped individually (the rest of the feed still
+applies); an entry whose declared `id` doesn't match its manifest's own
+`id` is dropped the same way (see [Feed format](#feed-format) above).
+
+### Version-gated merge
+
+`merged_catalog_plugins` (`catalog.rs`) starts from the embedded catalog and,
+for every cached **non-blocked** remote row: parses+validates its manifest,
+rejects an id/manifest-id mismatch, then — keyed on the manifest's own
+`id` — either appends it (a new id) or replaces the embedded entry **only
+if** the remote manifest's semver is strictly greater (`semver_gt`; an
+unparsable version never wins, so the embedded entry survives). An embedded
+entry is never deleted, only shadowed by a higher-version override. This
+merge only runs in the daemon composition root
+(`daemon::build_daemon`) — the plain CLI (`ryuzi plugins list`, `ryuzi
+config`, ...) uses the embedded-only `install_builtins`/`catalog_plugins`
+path and never sees remote entries.
+
+### The `blocked` denylist
+
+A feed's `blocked` array revokes ids — including ids that were never in the
+embedded catalog at all (a purely remote entry can be blocked too). A
+blocked row:
+
+- Is **excluded entirely** from `merged_catalog_plugins`, even at an
+  absurdly high version — it can never override (or, if new, add) a plugin.
+- Makes `toggle_enabled` **refuse** to enable that id going forward
+  (`"blocked by catalog: {reason}"` — checked via `plugins::is_blocked`).
+- Gets **live auto-disabled** if it was already enabled: every applied
+  fetch runs `apply_blocked_denylist`, which force-sets
+  `plugin.<id>.enabled=false` for any currently-enabled blocked id (logged,
+  best-effort — a settings-write failure is logged and does not fail the
+  fetch).
+- Surfaces as an `error`-severity `"blocked"` finding in `plugin_doctor`
+  (`{id} was revoked by the catalog` / "Uninstall or stop using {id}") and
+  a `BlockedBadge` in Cockpit's Browse/Installed cards, independent of
+  whether the auto-disable sweep has already run.
+
+### Daemon RPC
+
+Two params-free methods, alongside the plugin RPC family (see
+[Daemon RPC methods](#daemon-rpc-methods-post-rpcmethod) above):
+
+| Method | Result | Notes |
+| --- | --- | --- |
+| `refresh_catalog` | `CatalogStatus` | Fetches, verifies, and caches the feed **right now** instead of waiting for the background cadence — the only way to get a fresh feed on a daemon with no timer (Cockpit's own `--engine-daemon`, see [Fetch pipeline](#fetch-pipeline)). Re-runs the blocked-denylist sweep and sets `plugins_restart_required` on an effective change, same as the background cadence. |
+| `catalog_status` | `CatalogStatus` | Read-only snapshot: no fetch. |
+
+`CatalogStatus`: `{ sequence, lastFetchAt, outcome, entries, blocked }` — the
+last accepted feed's sequence/fetch-time/outcome (`"ok"` or a failure
+message) plus cached non-blocked/blocked row counts. Cockpit's Browse tab
+renders this as a status line (`catalogStatusLabel` in `PluginsView.tsx`,
+e.g. `"Catalog seq 9 · 24 entries, 1 blocked · fetched 7/11/2026, 3:04 PM"`)
+next to a **Refresh catalog** button that calls `refresh_catalog` and toasts
+the result.
+
+### Publish flow
+
+`scripts/catalog/build-feed.ts` (Bun) builds and signs a feed:
+
+1. Reads every `crates/core/plugins/catalog/*.toml`, deriving each entry's
+   `id` from the manifest's own `id` field (never the filename) — this is
+   what guarantees entries can never fail the engine's id/manifest-id
+   mismatch check.
+2. Reads the optional `scripts/catalog/blocklist.json` — a JSON array of
+   `{"id": "...", "reason": "...", "sinceSequence"?: <int>}` — `[]` if the
+   file doesn't exist. `sinceSequence` defaults to the sequence being built
+   when omitted.
+3. Reads the current value from `scripts/catalog/sequence.txt` (`0` if the
+   file doesn't exist yet), increments it by one, and uses that as the
+   feed's `sequence` — then writes the incremented value back to
+   `sequence.txt` for the next run.
+4. Serializes the feed to JSON **exactly once**, signs those exact bytes
+   with the base64-seed private key from the `CATALOG_FEED_PRIVATE_KEY` env
+   var, and writes both the signed bytes (`catalog.json`) and the raw
+   64-byte signature (`catalog.json.sig`) — never re-serializing between
+   signing and writing, since the engine verifies the signature over the
+   exact downloaded bytes.
+
+Run it locally with a keypair from `keygen.ts`:
+
+```sh
+bun scripts/catalog/keygen.ts                        # once, to get a keypair
+export CATALOG_FEED_PRIVATE_KEY=<the printed base64>  # never commit this
+bun scripts/catalog/build-feed.ts
+# -> wrote catalog.json + catalog.json.sig — sequence N, 24 entries, 0 blocked
+```
+
+`catalog.json`/`catalog.json.sig` written at the repo root are gitignored
+(`/catalog.json`, `/catalog.json.sig` in `.gitignore`) — they're a release
+artifact, not tracked source. `scripts/catalog/sequence.txt` **is** tracked
+(it's the persisted publish counter); `scripts/catalog/blocklist.json` is
+optional and untracked unless a maintainer adds one.
+
+`scripts/catalog/ed25519.ts` holds the shared WebCrypto helpers (keypair
+generation, PKCS8⇄raw-seed conversion, sign, verify);
+`scripts/catalog/build-feed.test.ts` is a `bun test` round trip — sign a
+fixture feed with a freshly generated keypair, verify it with that
+keypair's public key, and assert a single tampered byte or an unrelated
+keypair fails verification.
+
+The release workflow's `catalog-feed` job (`.github/workflows/release.yml`)
+runs on every CLI release: guarded on the `CATALOG_FEED_PRIVATE_KEY` secret
+being present (a no-op, not a failure, when it isn't — mirroring
+`cockpit-release.yml`'s optional Apple codesigning), it runs
+`bun scripts/catalog/build-feed.ts` and uploads `catalog.json` +
+`catalog.json.sig` onto the release via `gh release upload`, matching the
+asset-upload pattern the `cockpit-release.yml` `publish` job and the
+`docker`/`npm` jobs already use.
+
+**Known limitation:** the workflow does not commit the incremented
+`scripts/catalog/sequence.txt` back to `main` — like `scripts/npm/
+set-version.ts`'s version stamps, the increment is local to that CI run and
+discarded with the runner. Until a maintainer bumps and commits
+`sequence.txt` by hand (or a follow-up automates that commit), every
+release's feed reuses the same `sequence`, which the anti-rollback check
+still accepts (only a *lower* sequence is rejected) but does not usefully
+track feed freshness/generation across releases the way a truly
+monotonically-advancing counter would.

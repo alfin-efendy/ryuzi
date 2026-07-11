@@ -172,6 +172,13 @@ pub struct JobInfo {
     pub notify_fail: bool,
     pub next_run_ms: Option<i64>,
     pub history: Vec<RunInfo>,
+    /// Model id this job's session starts with, overriding the project/agent
+    /// default. `None` when the job uses ordinary model resolution. Not yet
+    /// editable from the scheduler panel — set programmatically today (e.g.
+    /// by a future `app_jobs` tool); surfaced here so a later job editor can
+    /// read and round-trip it without another DTO change.
+    #[serde(default)]
+    pub model_override: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -187,6 +194,9 @@ pub struct JobInput {
     pub prompt: String,
     pub notify_success: bool,
     pub notify_fail: bool,
+    /// See `JobInfo::model_override`.
+    #[serde(default)]
+    pub model_override: Option<String>,
 }
 
 // --- gateways_api (moved verbatim from apps/cockpit/src-tauri/src/gateways_cmd.rs) ---
@@ -518,6 +528,16 @@ pub struct PluginInfo {
     pub installed_at: Option<i64>,
     pub updated_at: Option<i64>,
     pub trust_tier: Option<String>,
+    /// `embedded` | `remote` — which catalog source won for this id.
+    /// `None` for builtins and skill packs (never from either catalog).
+    pub catalog_source: Option<String>,
+    /// The remote catalog feed's `version` for this id, when a cached
+    /// `plugin_catalog_cache` row matches. `None` when the id was never seen
+    /// in a fetched feed.
+    pub catalog_version: Option<String>,
+    /// Set when the remote catalog's signed feed blocked (revoked) this id —
+    /// mirrors `RemoteCatalogRow.blocked_reason`. `None` when not blocked.
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -727,10 +747,26 @@ pub struct DoctorFinding {
     pub plugin_id: String,
     /// `warn` | `error`.
     pub severity: String,
-    /// `reconnect-required` | `missing-binary` | `attach-failed`.
+    /// `reconnect-required` | `missing-binary` | `attach-failed` | `blocked`.
     pub kind: String,
     pub message: String,
     pub suggested_action: String,
+}
+
+/// `refresh_catalog`/`catalog_status` rpc result — a thin snapshot of the
+/// `catalog_feed_state` row plus counts from the cached
+/// `plugin_catalog_cache` table (`crate::store::RemoteCatalogRow`). `sequence`
+/// stays a `u64` for the same reason `TrustPromptDto.total_bytes` does: no
+/// bindings-shape cost, since `export_bindings`'s `BigIntExportBehavior::Number`
+/// already renders it as a plain TS `number`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogStatus {
+    pub sequence: u64,
+    pub last_fetch_at: Option<i64>,
+    pub outcome: Option<String>,
+    pub entries: u32,
+    pub blocked: u32,
 }
 
 impl From<crate::plugins::doctor::DoctorFinding> for DoctorFinding {

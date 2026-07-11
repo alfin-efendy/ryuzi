@@ -34,6 +34,7 @@ const beginSkillInstall = mock(
 const confirmSkillInstall = mock((_token: string): Promise<Result<InstalledSkillPack, CmdError>> => ok(installedPack));
 const listPlugins = mock(() => ok([]));
 const pluginsRestartRequired = mock(() => ok(false));
+const catalogStatus = mock(() => ok({ sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 }));
 const toastError = mock((_message: string) => {});
 const toastSuccess = mock((_message: string) => {});
 
@@ -43,6 +44,7 @@ mock.module("@/bindings", () => ({
     confirmSkillInstall,
     listPlugins,
     pluginsRestartRequired,
+    catalogStatus,
   },
 }));
 mock.module("sonner", () => ({
@@ -68,6 +70,7 @@ beforeEach(() => {
   confirmSkillInstall.mockImplementation((_token: string) => ok(installedPack));
   listPlugins.mockClear();
   pluginsRestartRequired.mockClear();
+  catalogStatus.mockClear();
   toastError.mockClear();
   toastSuccess.mockClear();
   onClose.mockClear();

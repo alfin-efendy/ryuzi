@@ -108,6 +108,74 @@ pub fn catalog_plugins() -> Vec<CorePlugin> {
         .collect()
 }
 
+/// Embedded catalog merged with the (non-blocked) remote entries, version-
+/// gated: a remote entry replaces an embedded one with the same id ONLY if
+/// its manifest semver is strictly greater; new remote ids are appended;
+/// blocked remote rows are excluded entirely. Winner-per-id, computed BEFORE
+/// the host sees any of them — `Registries::add_plugin`/`PluginHost::add` is
+/// first-registration-wins with no removal, so an override can't be done by
+/// add-then-replace; the winner must already be decided by the time this
+/// returns.
+///
+/// Unparseable or invalid remote manifests — and entries whose declared feed
+/// id doesn't match their manifest's own `id` — are logged (`tracing::warn!`)
+/// and skipped rather than causing the whole merge to fail; a bad remote
+/// entry must never take down catalog installation, nor silently remove an
+/// embedded entry by overwriting the wrong slot.
+pub fn merged_catalog_plugins(remote: &[crate::store::RemoteCatalogRow]) -> Vec<CorePlugin> {
+    let mut out = catalog_plugins(); // embedded, PluginSource::Catalog
+    for row in remote
+        .iter()
+        .filter(|r| !r.blocked && !r.manifest_toml.is_empty())
+    {
+        let manifest = match PluginManifest::from_toml(&row.manifest_toml) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("remote catalog: skipping unparseable {}: {e}", row.id);
+                continue;
+            }
+        };
+        let plugin = match declarative_plugin(manifest, PluginSource::RemoteCatalog) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("remote catalog: skipping invalid {}: {e}", row.id);
+                continue;
+            }
+        };
+        // Defense against a publish-tooling bug: the feed's declared entry id
+        // (`row.id`) is a JSON field never cross-checked against the manifest
+        // TOML's own `id`. If they diverge, keying the override lookup on
+        // `row.id` would overwrite the wrong slot and DELETE a genuine
+        // embedded entry (violating the no-removal invariant). Reject the
+        // mismatch, and key every lookup below on the plugin's own manifest id.
+        if row.id != plugin.manifest.id {
+            tracing::warn!(
+                "remote catalog: entry id {:?} != manifest id {:?} — skipping",
+                row.id,
+                plugin.manifest.id
+            );
+            continue;
+        }
+        match out.iter().position(|p| p.manifest.id == plugin.manifest.id) {
+            None => out.push(plugin),
+            Some(i) => {
+                if semver_gt(&plugin.manifest.version, &out[i].manifest.version) {
+                    out[i] = plugin;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `a > b` as semver; unparseable versions never win (embedded kept).
+fn semver_gt(a: &str, b: &str) -> bool {
+    match (semver::Version::parse(a), semver::Version::parse(b)) {
+        (Ok(av), Ok(bv)) => av > bv,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +377,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn remote_row(id: &str, toml: &str, ver: &str) -> crate::store::RemoteCatalogRow {
+        crate::store::RemoteCatalogRow {
+            id: id.into(),
+            manifest_toml: toml.into(),
+            version: ver.into(),
+            sequence: 1,
+            blocked: false,
+            blocked_reason: None,
+            fetched_at: 0,
+        }
+    }
+
+    const NEW_TOML: &str = "contract=1\nid=\"acme-new\"\nname=\"Acme New\"\nversion=\"1.0.0\"\n[[mcp]]\nname=\"m\"\ntransport=\"http\"\nurl=\"https://x\"";
+
+    /// A minimal valid `id="github"` manifest override at `ver`, used to
+    /// exercise the version gate against the real embedded `github` entry.
+    fn github_override_toml(ver: &str) -> String {
+        format!(
+            "contract=1\nid=\"github\"\nname=\"GitHub Override\"\nversion=\"{ver}\"\n[[mcp]]\nname=\"m\"\ntransport=\"http\"\nurl=\"https://x\""
+        )
+    }
+
+    #[test]
+    fn merged_catalog_adds_new_remote_id() {
+        let merged = merged_catalog_plugins(&[remote_row("acme-new", NEW_TOML, "1.0.0")]);
+        assert!(merged
+            .iter()
+            .any(|p| p.manifest.id == "acme-new" && p.source == PluginSource::RemoteCatalog));
+        // embedded entries still present
+        assert!(merged.iter().any(|p| p.manifest.id == "github"));
+    }
+
+    #[test]
+    fn merged_catalog_version_gates_override_of_embedded() {
+        // A github override with an ABSURDLY high version wins; a low one loses.
+        let hi = github_override_toml("999.0.0");
+        let lo = github_override_toml("0.0.1");
+        let with_hi = merged_catalog_plugins(&[remote_row("github", &hi, "999.0.0")]);
+        assert_eq!(
+            with_hi
+                .iter()
+                .find(|p| p.manifest.id == "github")
+                .unwrap()
+                .source,
+            PluginSource::RemoteCatalog
+        );
+        let with_lo = merged_catalog_plugins(&[remote_row("github", &lo, "0.0.1")]);
+        assert_eq!(
+            with_lo
+                .iter()
+                .find(|p| p.manifest.id == "github")
+                .unwrap()
+                .source,
+            PluginSource::Catalog
+        );
+    }
+
+    #[test]
+    fn merged_catalog_excludes_blocked_row_even_with_higher_version() {
+        // A BLOCKED github override at an absurdly high version must NOT
+        // replace the embedded github — the blocked row is filtered out
+        // entirely, so the embedded entry survives untouched.
+        let hi = github_override_toml("999.0.0");
+        let mut blocked = remote_row("github", &hi, "999.0.0");
+        blocked.blocked = true;
+        blocked.blocked_reason = Some("publisher denylist".into());
+        let merged = merged_catalog_plugins(&[blocked]);
+        assert_eq!(
+            merged
+                .iter()
+                .find(|p| p.manifest.id == "github")
+                .unwrap()
+                .source,
+            PluginSource::Catalog,
+            "a blocked row must never override the embedded entry"
+        );
+    }
+
+    #[test]
+    fn merged_catalog_skips_entry_whose_feed_id_differs_from_manifest_id() {
+        // Publish-tooling bug: feed entry declares id="github" but its
+        // manifestToml actually declares id="acme-x" at a higher version.
+        // Keying the override on the feed id would DELETE embedded github.
+        // The mismatch guard must skip it: embedded github survives AND no
+        // "acme-x" plugin is added.
+        let toml = "contract=1\nid=\"acme-x\"\nname=\"Acme X\"\nversion=\"999.0.0\"\n[[mcp]]\nname=\"m\"\ntransport=\"http\"\nurl=\"https://x\"";
+        let merged = merged_catalog_plugins(&[remote_row("github", toml, "999.0.0")]);
+        let github = merged
+            .iter()
+            .find(|p| p.manifest.id == "github")
+            .expect("embedded github must survive an id-mismatched remote entry");
+        assert_eq!(
+            github.source,
+            PluginSource::Catalog,
+            "the mismatched remote entry must not overwrite the embedded github slot"
+        );
+        assert!(
+            !merged.iter().any(|p| p.manifest.id == "acme-x"),
+            "an id-mismatched remote entry must not be added under its real manifest id either"
+        );
     }
 
     #[test]

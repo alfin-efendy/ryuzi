@@ -30,6 +30,9 @@ pub struct JobRow {
     /// non-zero exit, or timeout skips the fire; stdout is otherwise appended
     /// to the prompt as context.
     pub pre_check: String,
+    /// Model id this job's session should start with, overriding the
+    /// project's/agent's default. `None` keeps the ordinary resolution.
+    pub model_override: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -175,7 +178,7 @@ fn parse_time(t: &str) -> Option<(u32, u32)> {
 // ---------------------------------------------------------------------------
 
 const JOB_COLS: &str =
-    "id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check";
+    "id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override";
 
 fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     Ok(JobRow {
@@ -192,6 +195,7 @@ fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         notify_success: r.get::<_, i64>(10)? != 0,
         notify_fail: r.get::<_, i64>(11)? != 0,
         pre_check: r.get(12)?,
+        model_override: r.get(13)?,
     })
 }
 
@@ -228,19 +232,20 @@ pub async fn upsert_job(store: &Store, job: JobRow) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
-                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
+                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,model_override,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
                  ON CONFLICT(id) DO UPDATE SET \
                    name=excluded.name, cron=excluded.cron, mode=excluded.mode, \
                    natural_text=excluded.natural_text, project_id=excluded.project_id, \
                    branch=excluded.branch, gateway=excluded.gateway, \
                    enabled=excluded.enabled, prompt=excluded.prompt, \
                    notify_success=excluded.notify_success, notify_fail=excluded.notify_fail, \
-                   pre_check=excluded.pre_check",
+                   pre_check=excluded.pre_check, model_override=excluded.model_override",
                 params![
                     job.id, job.name, job.cron, job.mode, job.natural_text, job.project_id,
                     job.branch, job.gateway, job.enabled as i64, job.prompt,
-                    job.notify_success as i64, job.notify_fail as i64, job.pre_check, now
+                    job.notify_success as i64, job.notify_fail as i64, job.pre_check,
+                    job.model_override, now
                 ],
             )
             .map(|_| ())
@@ -531,7 +536,15 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
     // Subscribe BEFORE starting so a fast turn can't slip past the listener.
     let mut rx = cp.subscribe();
     let session = match cp
-        .start_session(&job.project_id, &prompt, "scheduler", &[])
+        .start_session_with_prompt(
+            &job.project_id,
+            crate::harness::TurnPrompt::text(prompt.clone(), prompt.clone()),
+            "scheduler",
+            &[],
+            None,
+            None,
+            job.model_override.clone(),
+        )
         .await
     {
         Ok(s) => s,
@@ -640,6 +653,25 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
             note,
         )
         .await;
+        // Deliver a successful run's final text through the background rail
+        // when the job has a bound "home" chat (a `session_surfaces` row
+        // keyed by `(job.gateway, job.id)` — written by a future `app_jobs`
+        // tool or a test via `add_surface`). The rail is the ONLY delivery
+        // path: no direct/in-memory hand-off to that session. Absent a
+        // binding this is a no-op and the existing `add_event`/
+        // `JobRunChanged` notifications below are unchanged.
+        if status == "success" {
+            if let Some(text) = &final_text {
+                if let Ok(Some(home)) = cp2.store().resolve_by_conversation(&gateway, &job_id).await
+                {
+                    let block = format!("[SCHEDULED JOB — {job_name}]\n\n{text}");
+                    let _ = cp2
+                        .store()
+                        .enqueue_background_event(&home.session_pk, "job", &block)
+                        .await;
+                }
+            }
+        }
         if status != "success" || notify {
             let level = if status == "success" {
                 "success"
@@ -897,6 +929,7 @@ mod tests {
             notify_success: false,
             notify_fail: true,
             pre_check: "git status --short".into(),
+            model_override: None,
         };
         upsert_job(&store, job.clone()).await.unwrap();
         assert_eq!(get_job(&store, "j1").await.unwrap().unwrap(), job);
@@ -944,5 +977,236 @@ mod tests {
         delete_job(&store, "j1").await.unwrap();
         assert!(get_job(&store, "j1").await.unwrap().is_none());
         assert!(list_runs(&store, "j1", 10).await.unwrap().is_empty());
+    }
+
+    /// A minimal, otherwise-boring job row — tests that only care about one
+    /// field (like `model_override`) mutate the field they need instead of
+    /// repeating every field inline.
+    fn sample_job(id: &str) -> JobRow {
+        JobRow {
+            id: id.into(),
+            name: "test job".into(),
+            cron: "0 2 * * *".into(),
+            mode: "cron".into(),
+            natural_text: String::new(),
+            project_id: "p1".into(),
+            branch: "main".into(),
+            gateway: "local".into(),
+            enabled: true,
+            prompt: "do the thing".into(),
+            notify_success: false,
+            notify_fail: false,
+            pre_check: String::new(),
+            model_override: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn job_model_override_roundtrips() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let mut job = sample_job("j-mo");
+        job.model_override = Some("cheap/haiku".into());
+        upsert_job(&store, job.clone()).await.unwrap();
+        let got = get_job(&store, "j-mo").await.unwrap().unwrap();
+        assert_eq!(got.model_override.as_deref(), Some("cheap/haiku"));
+
+        // Clearing it back to None round-trips too (ON CONFLICT overwrite).
+        job.model_override = None;
+        upsert_job(&store, job.clone()).await.unwrap();
+        let got = get_job(&store, "j-mo").await.unwrap().unwrap();
+        assert_eq!(got.model_override, None);
+    }
+
+    // -----------------------------------------------------------------
+    // Rail-delivery test fixtures. Mirrors the fake-harness pattern each
+    // test module keeps privately (see `control::tests`, `background_rail`,
+    // `harness::native::runner`) rather than reaching into another module's
+    // private `#[cfg(test)] mod tests`.
+    // -----------------------------------------------------------------
+
+    /// Redirects `dirs::data_dir()`/HOME into a tempdir for the duration of a
+    /// test, so a chat session's scratch dir never touches the real state
+    /// dir. Process-global env — every test using it must be `#[serial]`.
+    struct SchedulerStateDirGuard {
+        _dir: tempfile::TempDir,
+    }
+    impl SchedulerStateDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            SchedulerStateDirGuard { _dir: dir }
+        }
+    }
+
+    /// A fake `HarnessSession` that persists a deterministic assistant reply
+    /// so `final_assistant_text` (and thus the rail delivery block) has
+    /// something real to read, without touching a live LLM.
+    struct FakeJobSession {
+        store: std::sync::Arc<Store>,
+        events: tokio::sync::broadcast::Sender<CoreEvent>,
+        session_pk: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::harness::HarnessSession for FakeJobSession {
+        async fn send_prompt(&self, prompt: crate::harness::TurnPrompt) -> anyhow::Result<()> {
+            let _ = self
+                .store
+                .insert_message(crate::domain::NewMessage::block(
+                    &self.session_pk,
+                    "user",
+                    "text",
+                    serde_json::json!({ "text": prompt.display }),
+                ))
+                .await;
+            if let Ok(seq) = self
+                .store
+                .insert_message(crate::domain::NewMessage::block(
+                    &self.session_pk,
+                    "assistant",
+                    "text",
+                    serde_json::json!({ "text": "done" }),
+                ))
+                .await
+            {
+                let _ = self.events.send(CoreEvent::Message {
+                    session_pk: self.session_pk.clone(),
+                    seq,
+                    role: "assistant".into(),
+                    block_type: "text".into(),
+                    payload: serde_json::json!({ "text": "done" }),
+                    tool_call_id: None,
+                    status: None,
+                    tool_kind: None,
+                });
+            }
+            Ok(())
+        }
+        async fn cancel(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn end(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn agent_session_id(&self) -> Option<String> {
+            Some("agent-fake".into())
+        }
+    }
+
+    struct FakeJobHarness;
+
+    #[async_trait::async_trait]
+    impl crate::harness::Harness for FakeJobHarness {
+        async fn start_session(
+            &self,
+            ctx: crate::harness::SessionCtx,
+        ) -> anyhow::Result<Box<dyn crate::harness::HarnessSession>> {
+            Ok(Box::new(FakeJobSession {
+                store: ctx.store.clone(),
+                events: ctx.events.clone(),
+                session_pk: ctx.session_pk.clone(),
+            }))
+        }
+    }
+
+    struct FakeJobHarnessFactory;
+
+    impl crate::harness::HarnessFactory for FakeJobHarnessFactory {
+        fn create(&self) -> anyhow::Result<std::sync::Arc<dyn crate::harness::Harness>> {
+            Ok(std::sync::Arc::new(FakeJobHarness))
+        }
+    }
+
+    /// Poll the rail (bounded) until a `kind='job'` row lands, claiming (and
+    /// thus returning) it — mirrors `harness::native::runner`'s
+    /// `wait_for_rail_row`.
+    async fn wait_for_job_rail_row(store: &Store) -> crate::domain::BackgroundEvent {
+        for _ in 0..200 {
+            if let Some(row) = store
+                .claim_deliverable_background_event("test-poll")
+                .await
+                .unwrap()
+            {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("no rail row appeared within the poll window");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn completed_job_delivers_to_its_home_session_via_rail() {
+        let _guard = SchedulerStateDirGuard::new();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let mut regs = crate::plugins::Registries::new();
+        regs.harness = std::sync::Arc::new(FakeJobHarnessFactory);
+        let cp = crate::control::ControlPlane::new(store, regs).await;
+
+        // A non-git project the job runs against — the fake harness needs no
+        // real repo, so any workdir will do.
+        cp.store()
+            .insert_project(crate::domain::Project {
+                project_id: "p-deliver".into(),
+                name: "demo".into(),
+                workdir: std::env::temp_dir().to_string_lossy().into_owned(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: Some(crate::paths::now_ms()),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+
+        // A chat that owns the job's delivery surface (keyed by job id).
+        let home = cp
+            .start_chat_session(
+                crate::harness::TurnPrompt::text("home", "home"),
+                "test",
+                &[],
+            )
+            .await
+            .unwrap();
+        // Let the home session's own startup + first turn settle to idle
+        // before the job fires, or the rail claim (idle-only) would never
+        // see it as a deliverable target.
+        for _ in 0..400 {
+            if cp
+                .store()
+                .get_session(&home.session_pk)
+                .await
+                .unwrap()
+                .map(|s| s.status == crate::domain::SessionStatus::Idle)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let mut job = sample_job("j-deliver");
+        job.project_id = "p-deliver".into();
+        job.gateway = "local".into();
+        upsert_job(cp.store(), job.clone()).await.unwrap();
+        cp.store()
+            .add_surface("local", "j-deliver", &home.session_pk)
+            .await
+            .unwrap();
+
+        execute_job(&cp, &job).await.unwrap();
+
+        let row = wait_for_job_rail_row(cp.store()).await;
+        assert_eq!(row.kind, "job");
+        assert_eq!(row.target_session_pk, home.session_pk);
+        assert!(
+            row.payload.contains("done"),
+            "expected the job's final assistant text in the rail payload, got: {}",
+            row.payload
+        );
     }
 }

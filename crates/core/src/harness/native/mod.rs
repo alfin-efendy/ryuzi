@@ -9,10 +9,12 @@
 //! See `docs/design/2026-07-05-native-agent-runtime-design.md`.
 
 pub mod agents;
+pub mod background;
 pub mod commands;
 pub mod context;
 pub mod context_manager;
 pub mod cost;
+pub mod delegation;
 pub mod format;
 pub mod hooks;
 pub mod iteration_budget;
@@ -26,6 +28,7 @@ pub mod runner;
 pub mod skills;
 pub mod snapshot;
 pub mod steer;
+pub mod summary_budget;
 pub mod tools;
 
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
@@ -194,6 +197,7 @@ impl Harness for NativeHarness {
                 memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
+                background: ctx.background,
             },
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),
@@ -371,6 +375,7 @@ mod tests {
             extra_skill_dirs: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
+            background: super::background::BackgroundRegistry::new(),
             store,
         }
     }

@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_23_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_28_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -885,6 +885,58 @@ fn migrations() -> Migrations<'static> {
                 updated_at INTEGER NOT NULL\
             )",
         ),
+        // Migration 27 — Phase 3 background rail (spec §4/§6): durable re-entry
+        // channel + jobs.model_override. Appended as the tail across merges with
+        // main (24 model-effort normalize, 25 route-state, 26 runtime-settings —
+        // none touch a sessions/jobs column this migration reads). Every
+        // statement is existence-guarded so the rewind-and-replay migration
+        // test's replay on an already-migrated DB is a no-op.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS background_events (\
+                    id TEXT PRIMARY KEY NOT NULL,\
+                    target_session_pk TEXT NOT NULL,\
+                    kind TEXT NOT NULL,\
+                    payload TEXT NOT NULL,\
+                    created_at INTEGER NOT NULL,\
+                    claimed_by TEXT,\
+                    delivered_at INTEGER\
+                );\
+                CREATE INDEX IF NOT EXISTS idx_background_events_target \
+                    ON background_events(target_session_pk, delivered_at);",
+            )?;
+            let has_override = tx
+                .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_override'")?
+                .exists([])?;
+            if !has_override {
+                tx.execute("ALTER TABLE jobs ADD COLUMN model_override TEXT", [])?;
+            }
+            Ok(())
+        }),
+        // Migration 28 — Remote catalog cache. `plugin_catalog_cache` holds the
+        // entries of the last verified signed feed (id, manifest TOML, semver,
+        // feed sequence, blocked flag+reason); `catalog_feed_state` is a single
+        // KV row tracking the last-accepted sequence + fetch outcome for
+        // anti-rollback and status. Appended as the tail after main's migration
+        // 27 (background rail). IF NOT EXISTS: the rewind-and-replay test re-runs
+        // this on an already-migrated DB, so it must be a no-op on replay.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_catalog_cache (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                manifest_toml TEXT NOT NULL,\
+                version TEXT NOT NULL,\
+                sequence INTEGER NOT NULL,\
+                blocked INTEGER NOT NULL DEFAULT 0,\
+                blocked_reason TEXT,\
+                fetched_at INTEGER NOT NULL\
+            );\
+            CREATE TABLE IF NOT EXISTS catalog_feed_state (\
+                id INTEGER PRIMARY KEY CHECK (id = 1),\
+                sequence INTEGER NOT NULL,\
+                updated_at INTEGER NOT NULL,\
+                outcome TEXT NOT NULL\
+            );",
+        ),
     ])
 }
 
@@ -1155,6 +1207,21 @@ pub struct PluginAttachStatus {
     pub last_attach_at: i64,
     pub outcome: String,
     pub reason: Option<String>,
+}
+
+/// One row of `plugin_catalog_cache`: an entry from the last verified signed
+/// remote catalog feed. `sequence` is the feed's monotonic anti-rollback
+/// counter at the time this entry was accepted; `blocked` + `blocked_reason`
+/// carry a publisher-issued denylist entry for this plugin id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCatalogRow {
+    pub id: String,
+    pub manifest_toml: String,
+    pub version: String,
+    pub sequence: u64,
+    pub blocked: bool,
+    pub blocked_reason: Option<String>,
+    pub fetched_at: i64,
 }
 
 /// Check out a pooled connection and run `f` on its dedicated blocking
@@ -2288,6 +2355,140 @@ impl Store {
         .await
     }
 
+    /// Enqueue a durable background-rail row (spec §6.1). Returns the new id.
+    pub async fn enqueue_background_event(
+        &self,
+        target_session_pk: &str,
+        kind: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        let id = crate::paths::new_id();
+        let (id2, target, kind, payload, now) = (
+            id.clone(),
+            target_session_pk.to_string(),
+            kind.to_string(),
+            payload.to_string(),
+            crate::paths::now_ms(),
+        );
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO background_events(id, target_session_pk, kind, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id2, target, kind, payload, now],
+            )
+            .map(|_| ())
+        })
+        .await?;
+        Ok(id)
+    }
+
+    /// Atomically claim the OLDEST undelivered, unclaimed rail row whose target
+    /// session is IDLE (the idle-only invariant, spec §6.1). Returns `None`
+    /// when nothing is deliverable. The claim + read run in one transaction so
+    /// two drainers never claim the same row.
+    pub async fn claim_deliverable_background_event(
+        &self,
+        claimer: &str,
+    ) -> anyhow::Result<Option<crate::domain::BackgroundEvent>> {
+        let claimer = claimer.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let picked: Option<String> = tx
+                .query_row(
+                    "SELECT be.id FROM background_events be \
+                     JOIN sessions s ON s.session_pk = be.target_session_pk \
+                     WHERE be.delivered_at IS NULL AND be.claimed_by IS NULL \
+                       AND s.status = 'idle' \
+                     ORDER BY be.created_at ASC LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(id) = picked else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE background_events SET claimed_by = ?2 WHERE id = ?1",
+                params![id, claimer],
+            )?;
+            let row = tx.query_row(
+                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                 FROM background_events WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(crate::domain::BackgroundEvent {
+                        id: r.get(0)?,
+                        target_session_pk: r.get(1)?,
+                        kind: r.get(2)?,
+                        payload: r.get(3)?,
+                        created_at: r.get(4)?,
+                        claimed_by: r.get(5)?,
+                        delivered_at: r.get(6)?,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(Some(row))
+        })
+        .await
+    }
+
+    /// Mark a claimed rail row delivered (its user turn has been injected).
+    pub async fn mark_background_delivered(&self, id: &str) -> anyhow::Result<()> {
+        let (id, now) = (id.to_string(), crate::paths::now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE background_events SET delivered_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Release a claim so the row is retried next tick (target went busy, or
+    /// delivery errored). Never touches `delivered_at`.
+    pub async fn release_background_claim(&self, id: &str) -> anyhow::Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE background_events SET claimed_by = NULL WHERE id = ?1 AND delivered_at IS NULL",
+                params![id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Remove every pending rail row targeting a session (session-end cascade,
+    /// spec §6.1: orphaned background work must not leak into a new chat).
+    /// Delivered rows are kept as an audit trail. Returns the count removed.
+    pub async fn delete_background_events_for_session(
+        &self,
+        target_session_pk: &str,
+    ) -> anyhow::Result<u64> {
+        let target = target_session_pk.to_string();
+        self.with_conn(move |c| {
+            Ok(c.execute(
+                "DELETE FROM background_events WHERE target_session_pk = ?1 AND delivered_at IS NULL",
+                params![target],
+            )? as u64)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn pending_background_count(&self) -> anyhow::Result<i64> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM background_events WHERE delivered_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+    }
+
     /// Bind a gateway conversation to a session (upsert on the `(gateway,
     /// conversation_id)` primary key).
     pub async fn add_surface(
@@ -2812,6 +3013,107 @@ impl Store {
                 .query_map([], map_plugin_attach_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    /// Replace the entire cached remote catalog with `rows` in one
+    /// transaction. Called after a signed feed fetch verifies successfully;
+    /// an empty slice clears the cache.
+    pub async fn upsert_remote_catalog(&self, rows: &[RemoteCatalogRow]) -> anyhow::Result<()> {
+        let rows = rows.to_vec();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            tx.execute("DELETE FROM plugin_catalog_cache", [])?;
+            for r in &rows {
+                tx.execute(
+                    "INSERT INTO plugin_catalog_cache(id, manifest_toml, version, sequence, \
+                         blocked, blocked_reason, fetched_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        r.id,
+                        r.manifest_toml,
+                        r.version,
+                        r.sequence as i64,
+                        r.blocked as i64,
+                        r.blocked_reason,
+                        r.fetched_at
+                    ],
+                )?;
+            }
+            tx.commit()
+        })
+        .await
+    }
+
+    pub async fn list_remote_catalog(&self) -> anyhow::Result<Vec<RemoteCatalogRow>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, manifest_toml, version, sequence, blocked, blocked_reason, fetched_at \
+                 FROM plugin_catalog_cache ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(RemoteCatalogRow {
+                        id: r.get(0)?,
+                        manifest_toml: r.get(1)?,
+                        version: r.get(2)?,
+                        sequence: r.get::<_, i64>(3)? as u64,
+                        blocked: r.get::<_, i64>(4)? != 0,
+                        blocked_reason: r.get(5)?,
+                        fetched_at: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Last-accepted feed sequence, or 0 if no feed has ever been accepted.
+    /// Used by the anti-rollback check before applying a newly fetched feed.
+    pub async fn get_catalog_feed_sequence(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .get_catalog_feed_state()
+            .await?
+            .map(|(seq, _, _)| seq)
+            .unwrap_or(0))
+    }
+
+    /// Returns `(sequence, updated_at, outcome)` for the single
+    /// `catalog_feed_state` row, or `None` if a feed fetch has never
+    /// completed.
+    pub async fn get_catalog_feed_state(&self) -> anyhow::Result<Option<(u64, i64, String)>> {
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT sequence, updated_at, outcome FROM catalog_feed_state WHERE id=1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Record the outcome of a feed fetch attempt (`"ok"`, or an error
+    /// classification) alongside the sequence that was accepted or last
+    /// known-good.
+    pub async fn set_catalog_feed_state(&self, sequence: u64, outcome: &str) -> anyhow::Result<()> {
+        let outcome = outcome.to_string();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO catalog_feed_state(id, sequence, updated_at, outcome) \
+                 VALUES (1, ?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET \
+                   sequence=excluded.sequence, updated_at=excluded.updated_at, outcome=excluded.outcome",
+                params![sequence as i64, updated_at, outcome],
+            )
+            .map(|_| ())
         })
         .await
     }
@@ -4541,7 +4843,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 26, "forward migration must land at v26");
+        assert_eq!(user_version, 28, "forward migration must land at v28");
     }
 
     #[tokio::test]
@@ -4682,7 +4984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_26_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_28_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -4698,24 +5000,26 @@ mod tests {
         // parent_session_pk, copies every existing column forward including
         // perm_mode; 23 plugin_installs + plugin_attach_status; 24 typed model
         // effort preferences + legacy normalization; 25 session_route_state;
-        // 26 session_runtime_settings —
-        // all convergent or CREATE TABLE IF NOT EXISTS) re-run on next open.
+        // 26 session_runtime_settings; 27 background_events + jobs.model_override;
+        // 28 plugin_catalog_cache + catalog_feed_state — CREATE TABLE IF NOT
+        // EXISTS; all convergent, existence-guarded, or CREATE TABLE IF NOT
+        // EXISTS) re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 26
-        // defined, wind back fourteen.
+        // this test starts failing its assertions). With migrations through 28
+        // defined, wind back sixteen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 14)
+            c.pragma_update(None, "user_version", v - 16)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v26 here, so `harness` was
+                    // The DB is fully migrated to v28 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -4766,14 +5070,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back six, and reopen so 21 (and the tail
-        // migrations 22–26) replay against it. Back SIX: the fully migrated
-        // tail is now v26, so
-        // rewinding to v20 is what makes migration 21 (native-only) replay.
+        // wind user_version back eight, and reopen so 21 (and the tail
+        // migrations 22–28) replay against it. Back EIGHT: the fully migrated
+        // tail is now v28, so rewinding to v20 is what makes migration 21
+        // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 6)
+            c.pragma_update(None, "user_version", v - 8)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -4890,6 +5194,30 @@ mod tests {
             .await
             .unwrap();
         assert!(route_state_exists);
+    }
+
+    #[tokio::test]
+    async fn migration_27_adds_background_events_and_job_model_override() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let (uv, has_bg, has_override) = store
+            .with_conn(|c| {
+                let uv: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                let has_bg = c
+                    .prepare(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_events'",
+                    )?
+                    .exists([])?;
+                let has_override = c
+                    .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_override'")?
+                    .exists([])?;
+                Ok((uv, has_bg, has_override))
+            })
+            .await
+            .unwrap();
+        assert_eq!(uv, 28, "forward migration must land at v28");
+        assert!(has_bg, "background_events table must exist");
+        assert!(has_override, "jobs.model_override column must exist");
     }
 
     #[tokio::test]
@@ -5264,6 +5592,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_rail_enqueue_claim_deliver_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        // An IDLE target and a RUNNING target.
+        let mk = |pk: &str, status: crate::domain::SessionStatus| crate::domain::Session {
+            session_pk: pk.into(),
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status,
+            perm_mode: crate::domain::PermMode::Default,
+            started_by: None,
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: crate::domain::SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        };
+        store
+            .insert_session(mk("idle-1", crate::domain::SessionStatus::Idle))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk("busy-1", crate::domain::SessionStatus::Running))
+            .await
+            .unwrap();
+
+        store
+            .enqueue_background_event("busy-1", "delegation", "{\"x\":1}")
+            .await
+            .unwrap();
+        let id_idle = store
+            .enqueue_background_event("idle-1", "delegation", "{\"x\":2}")
+            .await
+            .unwrap();
+
+        // Only the idle-target row is claimable.
+        let claimed = store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, id_idle);
+        assert_eq!(claimed.target_session_pk, "idle-1");
+        // A second claim finds nothing (the busy target is skipped, the idle row is now claimed).
+        assert!(store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .is_none());
+
+        store.mark_background_delivered(&claimed.id).await.unwrap();
+        assert_eq!(store.pending_background_count().await.unwrap(), 1); // busy row still pending
+
+        // Session-end cascade removes the busy target's row.
+        assert_eq!(
+            store
+                .delete_background_events_for_session("busy-1")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.pending_background_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn migration_23_creates_plugin_install_tables() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -5348,5 +5748,30 @@ mod tests {
         assert_eq!(got.outcome, "ok");
         assert_eq!(got.last_attach_at, 9);
         assert_eq!(store.list_plugin_attach().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_24_creates_catalog_tables_and_roundtrips() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(store.get_catalog_feed_sequence().await.unwrap(), 0);
+        let rows = vec![RemoteCatalogRow {
+            id: "acme".into(),
+            manifest_toml: "id=\"acme\"".into(),
+            version: "1.2.0".into(),
+            sequence: 5,
+            blocked: false,
+            blocked_reason: None,
+            fetched_at: 100,
+        }];
+        store.upsert_remote_catalog(&rows).await.unwrap();
+        store.set_catalog_feed_state(5, "ok").await.unwrap();
+        assert_eq!(store.get_catalog_feed_sequence().await.unwrap(), 5);
+        let got = store.list_remote_catalog().await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].version, "1.2.0");
+        // replace-all semantics: a second upsert with fewer rows clears the old set
+        store.upsert_remote_catalog(&[]).await.unwrap();
+        assert!(store.list_remote_catalog().await.unwrap().is_empty());
     }
 }

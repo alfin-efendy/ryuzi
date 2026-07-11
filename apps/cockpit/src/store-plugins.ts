@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, type DoctorFinding, type PluginInfo } from "./bindings";
+import { commands, type CatalogStatus, type DoctorFinding, type PluginInfo } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
 // embedded catalog, or user-authored — and this store mirrors the flattened
@@ -16,8 +16,12 @@ type PluginsState = {
    *  snapshot instead of triggering their own redundant fetches. */
   doctorFindings: DoctorFinding[];
   doctorLoaded: boolean;
+  /** Last accepted remote-catalog feed snapshot — `null` until the first
+   *  `catalog_status`/`refresh_catalog` call resolves. */
+  catalogStatus: CatalogStatus | null;
   load: () => Promise<void>;
   loadDoctor: () => Promise<void>;
+  refreshCatalog: () => Promise<void>;
   setEnabled: (id: string, on: boolean) => Promise<void>;
   uninstall: (id: string) => Promise<boolean>;
   update: (id: string, force: boolean) => Promise<void>;
@@ -42,6 +46,7 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   restartRequired: false,
   doctorFindings: [],
   doctorLoaded: false,
+  catalogStatus: null,
 
   load: async () => {
     const res = await commands.listPlugins();
@@ -52,12 +57,33 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     // it's silently skipped (the restart banner just stays as it was).
     const restartRes = await commands.pluginsRestartRequired();
     if (restartRes.status === "ok") set({ restartRequired: restartRes.data });
+
+    // Best-effort, same reasoning: the Browse tab's status line just stays
+    // stale (or empty) rather than blocking the plugin list on it.
+    const catalogRes = await commands.catalogStatus();
+    if (catalogRes.status === "ok") set({ catalogStatus: catalogRes.data });
   },
 
   loadDoctor: async () => {
     const res = await commands.pluginDoctor();
     if (res.status === "ok") set({ doctorFindings: res.data, doctorLoaded: true });
     else toast.error(`Doctor check failed: ${res.error.message}`);
+  },
+
+  refreshCatalog: async () => {
+    const res = await commands.refreshCatalog();
+    if (res.status === "error") {
+      toast.error(`Catalog refresh failed: ${res.error.message}`);
+      return;
+    }
+    set({ catalogStatus: res.data });
+    if (res.data.outcome === "ok") {
+      const blockedPart = res.data.blocked > 0 ? `, ${res.data.blocked} blocked` : "";
+      toast.success(`Catalog refreshed — ${res.data.entries} ${res.data.entries === 1 ? "entry" : "entries"}${blockedPart}`);
+    } else {
+      toast.warning("Catalog refresh did not apply — no verified feed available yet");
+    }
+    await get().load();
   },
 
   setEnabled: async (id, on) => {

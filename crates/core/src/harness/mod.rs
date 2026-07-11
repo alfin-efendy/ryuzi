@@ -44,6 +44,10 @@ pub struct SessionCtx {
     pub events: broadcast::Sender<CoreEvent>,
     /// Shared approval hub for tool-permission requests.
     pub approvals: Arc<ApprovalHub>,
+    /// Shared async-delegation capacity gate (spec §6.2). Populated from
+    /// `ControlPlane::background`; the native runner's `task` tool uses it to
+    /// bound `background: true` delegations against `max_concurrent_runs`.
+    pub background: Arc<crate::harness::native::background::BackgroundRegistry>,
     /// Persistence handle (transcript rows, agent_session_id updates).
     pub store: Arc<Store>,
 }
@@ -174,6 +178,7 @@ mod tests {
             extra_skill_dirs: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
+            background: crate::harness::native::background::BackgroundRegistry::new(),
             store,
         }
     }

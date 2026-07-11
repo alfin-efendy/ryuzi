@@ -1301,6 +1301,66 @@ async fn end_chat_session_removes_the_scratch_dir() {
 
 #[tokio::test]
 #[serial]
+async fn end_session_cancels_and_purges_orphaned_background_work() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    let pk = session.session_pk.clone();
+    wait_for_running_handle(&cp, &pk).await;
+
+    // Simulate an in-flight background delegation this session dispatched
+    // (Task 5's capacity gate) and a pending rail row still waiting for
+    // delivery (Task 2's durable queue) — the orphaned work `end_session`
+    // must clean up.
+    let reservation = cp.background().try_reserve(3, &pk).unwrap();
+    store
+        .enqueue_background_event(&pk, "delegation", "orphan-pending")
+        .await
+        .unwrap();
+    // A DELIVERED row is history, not orphaned work — it must survive.
+    let delivered_id = store
+        .enqueue_background_event(&pk, "delegation", "orphan-delivered")
+        .await
+        .unwrap();
+    store
+        .mark_background_delivered(&delivered_id)
+        .await
+        .unwrap();
+
+    cp.end_session(&pk).await.unwrap();
+
+    assert!(
+        reservation.token().is_cancelled(),
+        "end_session must cancel the session's in-flight background delegations"
+    );
+    assert_eq!(
+        store.pending_background_count().await.unwrap(),
+        0,
+        "end_session must purge the session's pending (undelivered) rail rows"
+    );
+    let delivered_row_id = delivered_id.clone();
+    let remaining: i64 = store
+        .with_conn(move |c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM background_events WHERE id = ?1",
+                rusqlite::params![delivered_row_id],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining, 1,
+        "delivered rows are kept as an audit trail, not purged on session end"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn resume_session_resumes_a_chat_session() {
     let _guard = StateDirGuard::new();
     let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
@@ -1424,6 +1484,7 @@ async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
             "test",
             &[],
             Some(git_opts(false, true, None, None)),
+            None,
             None,
         )
         .await
@@ -3148,6 +3209,7 @@ async fn user_named_branch_survives_end_session() {
             &[],
             Some(git_opts(true, true, Some("keep/me"), None)),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3192,6 +3254,7 @@ async fn engine_named_branch_is_deleted_on_end_session() {
             &[],
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3234,6 +3297,7 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
             &[],
             Some(git_opts(false, false, None, None)),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3271,6 +3335,19 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
         .unwrap()
         .unwrap();
     assert_eq!(stored.status, SessionStatus::Ended);
+}
+
+#[tokio::test]
+#[serial]
+async fn control_plane_exposes_a_shared_background_registry() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let cp = ControlPlane::new(store, registries(false)).await;
+    // The same registry the sessions receive is reachable off the control plane.
+    assert_eq!(cp.background().active(), 0);
+    let _r = cp.background().try_reserve(1, "s1").unwrap();
+    assert_eq!(cp.background().active(), 1);
 }
 
 #[tokio::test]

@@ -123,6 +123,7 @@ async fn assemble(cp: &ControlPlane) -> anyhow::Result<Vec<JobInfo>> {
             prompt: job.prompt,
             notify_success: job.notify_success,
             notify_fail: job.notify_fail,
+            model_override: job.model_override,
             history: runs
                 .into_iter()
                 .map(|r| RunInfo {
@@ -163,6 +164,7 @@ async fn create_job(state: &ApiState, input: JobInput) -> Result<Vec<JobInfo>, A
             notify_fail: input.notify_fail,
             // Wake-gate editing lands with the scheduler panel rework.
             pre_check: String::new(),
+            model_override: input.model_override,
         },
     )
     .await?;
@@ -195,6 +197,7 @@ async fn update_job(
             notify_success: input.notify_success,
             notify_fail: input.notify_fail,
             pre_check: existing.pre_check.clone(),
+            model_override: input.model_override,
         },
     )
     .await?;
@@ -250,6 +253,7 @@ mod tests {
             prompt: "do it".into(),
             notify_success: false,
             notify_fail: false,
+            model_override: None,
         }
     }
 

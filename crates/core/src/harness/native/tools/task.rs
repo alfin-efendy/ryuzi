@@ -62,7 +62,9 @@ impl Tool for Task {
          conversation, so each prompt must be fully self-contained. Sub-agents \
          cannot use `task` or `memory` themselves (unless the target agent is \
          a delegator like `orchestrator`). Choose exactly one form per call: \
-         never send a top-level `prompt` together with `tasks`."
+         never send a top-level `prompt` together with `tasks`. Add \
+         `background: true` (single form) to dispatch without blocking — the \
+         result re-enters the chat on completion."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -72,7 +74,8 @@ impl Tool for Task {
                     "properties": {
                         "description": {"type": "string", "description": "A short (3-5 word) label for the subtask."},
                         "prompt": {"type": "string", "description": "Single form: the full, self-contained task."},
-                        "subagent_type": {"type": "string", "description": "Single form: which sub-agent to use."}
+                        "subagent_type": {"type": "string", "description": "Single form: which sub-agent to use."},
+                        "background": {"type": "boolean", "description": "Single form only: run the subtask in the BACKGROUND — it does not block this turn; its result re-enters the chat when it finishes. Rejected (with a note) if too many background subagents are already running."}
                     },
                     "required": ["prompt"],
                     "not": {"required": ["tasks"]}
@@ -140,6 +143,28 @@ impl Tool for Task {
                     .get("subagent_type")
                     .and_then(|v| v.as_str())
                     .unwrap_or("general");
+                let background = input
+                    .get("background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if background {
+                    use super::BackgroundDispatch;
+                    return Ok(
+                        match spawner
+                            .run_background(super::SubtaskSpec {
+                                agent_type: ty.to_string(),
+                                prompt: prompt.to_string(),
+                            })
+                            .await
+                        {
+                            BackgroundDispatch::Dispatched { id } => ToolOutput::ok(format!(
+                                "Background subagent `{ty}` dispatched (id {id}). Its result will \
+                             re-enter this chat when it finishes — continue with other work."
+                            )),
+                            BackgroundDispatch::Rejected { note } => ToolOutput::ok(note),
+                        },
+                    );
+                }
                 match spawner.run(ty, prompt).await {
                     Ok(report) => Ok(ToolOutput::ok(report)),
                     Err(e) => Ok(ToolOutput::error(format!(
@@ -223,6 +248,11 @@ mod tests {
         fn available(&self) -> Vec<String> {
             vec!["general".into(), "explore".into()]
         }
+        async fn run_background(&self, _spec: SubtaskSpec) -> super::super::BackgroundDispatch {
+            super::super::BackgroundDispatch::Dispatched {
+                id: "bg-1".to_string(),
+            }
+        }
     }
 
     async fn ctx_with_spawner(dir: &std::path::Path) -> ToolCtx {
@@ -293,6 +323,44 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert_eq!(out.for_model, "echo: find it");
+    }
+
+    #[tokio::test]
+    async fn background_single_form_dispatches_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_spawner(dir.path()).await;
+        let out = Task
+            .execute(
+                &ctx,
+                json!({"subagent_type": "general", "prompt": "long job", "background": true}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.for_model);
+        assert!(out.for_model.contains("dispatched"), "{}", out.for_model);
+        // Not the synchronous echo — the turn was not blocked on the child.
+        assert!(!out.for_model.contains("echo: long job"));
+    }
+
+    #[tokio::test]
+    async fn batch_form_ignores_background_flag() {
+        // Batch form has no `background` handling — an errant `background`
+        // alongside `tasks` is silently ignored, not an error, and does NOT
+        // dispatch any background workers (EchoSpawner's `run_background`
+        // would return "bg-1"; its absence here proves `run_many` — the
+        // synchronous batch path — is what actually ran).
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_spawner(dir.path()).await;
+        let out = Task
+            .execute(
+                &ctx,
+                json!({"background": true, "tasks": [{"subagent_type": "general", "prompt": "job"}]}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.for_model);
+        assert!(out.for_model.contains("echo: job"), "{}", out.for_model);
+        assert!(!out.for_model.contains("dispatched"), "{}", out.for_model);
     }
 
     #[tokio::test]
