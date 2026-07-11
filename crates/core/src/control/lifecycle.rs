@@ -1078,6 +1078,21 @@ impl ControlPlane {
             let _ = handle.cancel().await;
             let _ = handle.end().await;
         }
+        // Cancel any in-flight background delegations this session dispatched
+        // and purge its pending rail rows — orphaned background work must not
+        // survive to leak into a new chat or be delivered to a dead session
+        // (spec §6.1). This runs AFTER the turn interrupt above: a still-running
+        // turn could spawn a new background worker, so the turn is stopped
+        // first, then its background children are cancelled, then their rail
+        // rows are dropped. A narrow race remains — a worker could reserve a
+        // fresh slot in the instant between `interrupt_for_session` and this
+        // delete — accepted as a known limitation rather than closed with a
+        // new locking mechanism.
+        self.background.interrupt_for_session(session_pk);
+        let _ = self
+            .store
+            .delete_background_events_for_session(session_pk)
+            .await;
         if let Some(session) = self.store.get_session(session_pk).await? {
             match session.project_id.as_deref() {
                 Some(project_id) => {
