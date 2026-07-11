@@ -130,6 +130,7 @@ const anthropicConnection: ConnectionInfo = {
   label: "Anthropic",
   priority: 0,
   enabled: true,
+  quotaCapability: null,
   baseUrl: null,
   models: ["claude-opus-4", "claude-sonnet-4"],
   keyMasked: "sk-…3fk9",

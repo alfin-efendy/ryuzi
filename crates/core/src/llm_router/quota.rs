@@ -19,6 +19,24 @@ pub const CODEX_RESET_CREDITS_URL: &str =
 pub const CODEX_RESET_CREDITS_CONSUME_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
+#[derive(Debug, Serialize, Deserialize, Type, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderQuotaCapability {
+    Claude,
+    Codex,
+}
+
+pub fn capability(row: &ConnectionRow) -> Option<ProviderQuotaCapability> {
+    if !connections::is_oauth(row) {
+        return None;
+    }
+    match row.provider.as_str() {
+        "anthropic-oauth" => Some(ProviderQuotaCapability::Claude),
+        "openai-oauth" => Some(ProviderQuotaCapability::Codex),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderQuotaInfo {
@@ -217,7 +235,7 @@ pub(crate) fn parse_anthropic_usage(data: &Value) -> Result<ProviderQuotaInfo> {
     }
 
     if info.quotas.is_empty() {
-        info.message = Some("Claude connected, but no quota windows were returned.".to_string());
+        info.message = Some("Provider quota unavailable".to_string());
     }
     Ok(info)
 }
@@ -374,8 +392,7 @@ pub(crate) fn parse_codex_usage(data: &Value) -> Result<ProviderQuotaInfo> {
     });
 
     if info.quotas.is_empty() {
-        info.message =
-            Some("ChatGPT connected, but no Codex quota windows were returned.".to_string());
+        info.message = Some("Provider quota unavailable".to_string());
     }
     Ok(info)
 }
@@ -414,22 +431,28 @@ pub(crate) fn parse_codex_reset_credits(data: &Value) -> CodexResetCreditsInfo {
 }
 
 pub(crate) fn parse_codex_reset_consume(data: &Value) -> CodexResetCreditResult {
-    let code = data.get("code").and_then(Value::as_str).map(str::to_string);
+    let code = match data.get("code").and_then(Value::as_str) {
+        Some("reset") => Some("reset".to_string()),
+        Some("no_credit") => Some("no_credit".to_string()),
+        _ => None,
+    };
     let windows_reset = to_u32(
         data.get("windows_reset")
             .or_else(|| data.get("windowsReset")),
     );
     let reset = code.as_deref() == Some("reset") || windows_reset > 0;
+    let message = if reset {
+        "Reset credit applied"
+    } else if code.as_deref() == Some("no_credit") {
+        "No reset credits available"
+    } else {
+        "Provider quota unavailable"
+    };
     CodexResetCreditResult {
         reset,
         code,
         windows_reset,
-        message: data
-            .get("message")
-            .or_else(|| data.get("error"))
-            .or_else(|| data.get("detail"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        message: Some(message.to_string()),
         redeem_request_id: None,
     }
 }
@@ -510,16 +533,16 @@ async fn response_json(resp: reqwest::Response) -> Result<(StatusCode, Value)> {
     Ok((status, data))
 }
 
-fn unavailable_message(provider: &str, status: StatusCode, data: &Value) -> ProviderQuotaInfo {
+fn unavailable_message(provider: &str, status: StatusCode, _data: &Value) -> ProviderQuotaInfo {
     let mut info = ProviderQuotaInfo::empty(provider);
-    let message = data
-        .get("message")
-        .or_else(|| data.get("error"))
-        .or_else(|| data.get("detail"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("Quota API temporarily unavailable ({status})."));
-    info.message = Some(message);
+    info.message = Some(
+        match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "Reconnect required",
+            StatusCode::TOO_MANY_REQUESTS => "Quota temporarily unavailable",
+            _ => "Provider quota unavailable",
+        }
+        .to_string(),
+    );
     info
 }
 
@@ -646,13 +669,7 @@ fn finish_codex_reset_result(
         return Ok(result);
     }
 
-    Err(anyhow!(
-        "{}",
-        result
-            .message
-            .clone()
-            .unwrap_or_else(|| format!("Codex reset credit request failed with status {status}"))
-    ))
+    Err(anyhow!("Provider quota unavailable"))
 }
 
 pub async fn consume_codex_reset_credit(
@@ -686,6 +703,80 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn connection(provider: &str, auth_type: &str) -> ConnectionRow {
+        ConnectionRow {
+            id: "quota-test".into(),
+            provider: provider.into(),
+            auth_type: auth_type.into(),
+            label: "Quota test".into(),
+            priority: 0,
+            enabled: true,
+            data: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn quota_capability_is_core_owned_and_auth_aware() {
+        assert_eq!(
+            capability(&connection("anthropic-oauth", "oauth")),
+            Some(ProviderQuotaCapability::Claude)
+        );
+        assert_eq!(
+            capability(&connection("openai-oauth", "oauth")),
+            Some(ProviderQuotaCapability::Codex)
+        );
+        assert_eq!(capability(&connection("anthropic-oauth", "api_key")), None);
+        assert_eq!(capability(&connection("openai-oauth", "api_key")), None);
+        assert_eq!(capability(&connection("anthropic", "oauth")), None);
+        assert_eq!(capability(&connection("qwen", "oauth")), None);
+    }
+
+    #[test]
+    fn unavailable_quota_message_never_copies_provider_body() {
+        const SENTINEL: &str = "secret-provider-body-sentinel";
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let info = unavailable_message(
+                "openai-oauth",
+                status,
+                &json!({"message": SENTINEL, "token": SENTINEL}),
+            );
+            let message = info.message.unwrap();
+            assert!(!message.contains(SENTINEL));
+            assert!(matches!(
+                message.as_str(),
+                "Reconnect required"
+                    | "Quota temporarily unavailable"
+                    | "Provider quota unavailable"
+            ));
+        }
+    }
+
+    #[test]
+    fn reset_credit_result_never_copies_provider_message() {
+        const SENTINEL: &str = "secret-provider-body-sentinel";
+        for payload in [
+            json!({"code": "reset", "windows_reset": 1, "message": SENTINEL}),
+            json!({"code": "no_credit", "message": SENTINEL}),
+            json!({"code": "upstream_error", "error": SENTINEL}),
+        ] {
+            let result = parse_codex_reset_consume(&payload);
+            let message = result.message.unwrap();
+            assert!(!message.contains(SENTINEL));
+            assert!(matches!(
+                message.as_str(),
+                "Reset credit applied"
+                    | "No reset credits available"
+                    | "Provider quota unavailable"
+            ));
+        }
+    }
 
     #[test]
     fn parses_claude_subscription_usage_windows() {
@@ -782,6 +873,6 @@ mod tests {
             "message": "upstream unavailable"
         }));
         let err = finish_codex_reset_result(StatusCode::BAD_GATEWAY, failed).unwrap_err();
-        assert_eq!(err.to_string(), "upstream unavailable");
+        assert_eq!(err.to_string(), "Provider quota unavailable");
     }
 }

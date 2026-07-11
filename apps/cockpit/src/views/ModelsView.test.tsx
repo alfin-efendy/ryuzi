@@ -22,6 +22,7 @@ const connection: ConnectionInfo = {
   label: "Work OpenAI",
   priority: 0,
   enabled: true,
+  quotaCapability: null,
   baseUrl: null,
   models: ["gpt-4.1", "o3"],
   keyMasked: "sk-…3fk9",
@@ -48,6 +49,7 @@ const claudeConnection: ConnectionInfo = {
   label: "Claude subscription",
   priority: 0,
   enabled: true,
+  quotaCapability: "claude",
   baseUrl: null,
   models: ["claude-opus-4-8"],
   keyMasked: null,
@@ -68,6 +70,7 @@ const cloudflareConnection: ConnectionInfo = {
   label: "Cloudflare",
   priority: 0,
   enabled: true,
+  quotaCapability: null,
   baseUrl: null,
   models: ["@cf/meta/llama-3.1-8b-instruct"],
   keyMasked: "sk-…abcd",
@@ -85,6 +88,7 @@ const anthropicApiConnection: ConnectionInfo = {
   label: "Team Anthropic",
   priority: 0,
   enabled: true,
+  quotaCapability: null,
   baseUrl: null,
   models: ["claude-sonnet-4-5"],
   keyMasked: "sk-…9f21",
@@ -191,6 +195,20 @@ mock.module("@/bindings", () => ({
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
     listRuntimes: () => Promise.resolve({ status: "ok", data: [] }),
+    projectRuntimeInfo: (projectId: string) =>
+      Promise.resolve({
+        status: "ok" as const,
+        data: {
+          projectId,
+          model: null,
+          storedEffort: null,
+          effectiveEffort: null,
+          effectiveEffortLabel: null,
+          effectiveSource: "none",
+          storedEffortStatus: "none",
+          modelInfo: null,
+        },
+      }),
     saveModelRoute,
     refreshProviderModels,
     deleteModelRoute: (_id: string) => Promise.resolve({ status: "ok", data: [] }),
@@ -619,7 +637,5 @@ test("route target adapter round-trips a slash-containing model id (cloudflare-a
 
   await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
   const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
-  expect(savedRoute.targets).toEqual([
-    { provider: "cloudflare-ai", model: "@cf/meta/llama-3.1-8b-instruct", effort: null },
-  ]);
+  expect(savedRoute.targets).toEqual([{ provider: "cloudflare-ai", model: "@cf/meta/llama-3.1-8b-instruct", effort: null }]);
 });

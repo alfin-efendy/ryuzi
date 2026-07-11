@@ -128,6 +128,43 @@ pub async fn update_connection(store: &Store, row: ConnectionRow) -> anyhow::Res
         .await
 }
 
+pub async fn rename_connection(store: &Store, id: &str, label: &str) -> anyhow::Result<()> {
+    let unknown_id = id.to_string();
+    let id = unknown_id.clone();
+    let label = label.to_string();
+    let updated_at = crate::paths::now_ms();
+    let affected = store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE provider_connections SET label=?2, updated_at=?3 WHERE id=?1",
+                params![id, label, updated_at],
+            )
+        })
+        .await?;
+    if affected == 0 {
+        return Err(anyhow::anyhow!("unknown connection: {unknown_id}"));
+    }
+    Ok(())
+}
+
+pub async fn set_connection_enabled(store: &Store, id: &str, enabled: bool) -> anyhow::Result<()> {
+    let unknown_id = id.to_string();
+    let id = unknown_id.clone();
+    let updated_at = crate::paths::now_ms();
+    let affected = store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE provider_connections SET enabled=?2, updated_at=?3 WHERE id=?1",
+                params![id, enabled as i64, updated_at],
+            )
+        })
+        .await?;
+    if affected == 0 {
+        return Err(anyhow::anyhow!("unknown connection: {unknown_id}"));
+    }
+    Ok(())
+}
+
 pub async fn remove_connection(store: &Store, id: &str) -> anyhow::Result<()> {
     let id = id.to_string();
     store
@@ -340,6 +377,74 @@ mod tests {
 
         remove_connection(&store, "c1").await.unwrap();
         assert_eq!(list_connections(&store).await.unwrap().len(), 1);
+    }
+
+    async fn raw_data(store: &Store, id: &str) -> String {
+        let id = id.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT data FROM provider_connections WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rename_connection_updates_label_without_rewriting_data_ciphertext() {
+        secrets::use_test_key_file();
+        let store = mem_store().await;
+        add_connection(&store, row("rename", "openai", 0))
+            .await
+            .unwrap();
+        let ciphertext = raw_data(&store, "rename").await;
+
+        rename_connection(&store, "rename", "Renamed account")
+            .await
+            .unwrap();
+
+        let renamed = get_connection(&store, "rename").await.unwrap().unwrap();
+        assert_eq!(renamed.label, "Renamed account");
+        assert_eq!(raw_data(&store, "rename").await, ciphertext);
+    }
+
+    #[tokio::test]
+    async fn set_connection_enabled_updates_flag_without_rewriting_data_ciphertext() {
+        secrets::use_test_key_file();
+        let store = mem_store().await;
+        add_connection(&store, row("enabled", "openai", 0))
+            .await
+            .unwrap();
+        let ciphertext = raw_data(&store, "enabled").await;
+
+        set_connection_enabled(&store, "enabled", false)
+            .await
+            .unwrap();
+
+        let disabled = get_connection(&store, "enabled").await.unwrap().unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(raw_data(&store, "enabled").await, ciphertext);
+    }
+
+    #[tokio::test]
+    async fn rename_connection_rejects_unknown_id() {
+        let store = mem_store().await;
+        let err = rename_connection(&store, "missing", "Missing")
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "unknown connection: missing");
+    }
+
+    #[tokio::test]
+    async fn set_connection_enabled_rejects_unknown_id() {
+        let store = mem_store().await;
+        let err = set_connection_enabled(&store, "missing", false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "unknown connection: missing");
     }
 
     #[tokio::test]

@@ -678,6 +678,22 @@ async updateConnection(id: string, label: string, enabled: boolean, apiKey: stri
     else return { status: "error", error: e  as any };
 }
 },
+async renameConnection(id: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rename_connection", { id, label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setConnectionEnabled(id: string, enabled: boolean) : Promise<Result<ConnectionInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_connection_enabled", { id, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async removeConnection(id: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remove_connection", { id }) };
@@ -1264,7 +1280,7 @@ export type CodexResetCreditInfo = { status: string; grantedAt: string | null; e
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
 export type CommandInfo = { name: string; description: string; agent: string | null }
-export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; baseUrl: string | null; models: string[]; 
+export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; baseUrl: string | null; models: string[]; 
 /**
  * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
  */
@@ -1498,6 +1514,7 @@ export type Project = { projectId: string; name: string; workdir: string; source
 isGit: boolean }
 export type ProjectRuntimeInfo = { projectId: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
+export type ProviderQuotaCapability = "claude" | "codex"
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type ReasoningEffortOption = { value: string; label: string; description: string | null }

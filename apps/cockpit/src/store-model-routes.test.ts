@@ -23,6 +23,7 @@ const connection: ConnectionInfo = {
   label: "OpenAI",
   priority: 0,
   enabled: true,
+  quotaCapability: null,
   baseUrl: null,
   models: ["gpt-5"],
   keyMasked: "sk-…",

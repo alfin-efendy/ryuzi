@@ -6,7 +6,9 @@ use ryuzi_core::llm_router::connections::{self, ConnectionData, ConnectionRow};
 use ryuzi_core::llm_router::models;
 use ryuzi_core::llm_router::oauth;
 use ryuzi_core::llm_router::probe;
-use ryuzi_core::llm_router::quota::{self, CodexResetCreditResult, ProviderQuotaInfo};
+use ryuzi_core::llm_router::quota::{
+    self, CodexResetCreditResult, ProviderQuotaCapability, ProviderQuotaInfo,
+};
 use ryuzi_core::llm_router::registry::{self, ApiFormat, ProviderCategory};
 use ryuzi_core::llm_router::routes::{
     self, ModelRouteInfo, ModelRouteStrategy, ProviderAccountRouteInfo,
@@ -55,6 +57,7 @@ pub struct ConnectionInfo {
     pub label: String,
     pub priority: i32,
     pub enabled: bool,
+    pub quota_capability: Option<ProviderQuotaCapability>,
     pub base_url: Option<String>,
     pub models: Vec<String>,
     /// e.g. "sk-…3fk9" — full key never leaves the backend after creation.
@@ -212,6 +215,7 @@ fn to_info(row: &ConnectionRow) -> ConnectionInfo {
         label: row.label.clone(),
         priority: row.priority as i32,
         enabled: row.enabled,
+        quota_capability: quota::capability(row),
         base_url: desc.and_then(|d| connections::effective_base_url(d, row)),
         models: desc
             .map(|d| connections::effective_models(d, row))
@@ -465,6 +469,62 @@ pub async fn update_connection(
     Ok(assemble(&cp).await?)
 }
 
+async fn rename_connection_inner(
+    cp: &ControlPlane,
+    id: String,
+    label: String,
+) -> R<Vec<ConnectionInfo>> {
+    let id = id.trim();
+    let label = label.trim();
+    if id.is_empty() {
+        return Err(CmdError {
+            message: "connection id cannot be empty".to_string(),
+        });
+    }
+    if label.is_empty() {
+        return Err(CmdError {
+            message: "connection label cannot be empty".to_string(),
+        });
+    }
+    connections::rename_connection(cp.store(), id, label).await?;
+    Ok(assemble(cp).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn rename_connection(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+    label: String,
+) -> R<Vec<ConnectionInfo>> {
+    rename_connection_inner(&cp, id, label).await
+}
+
+async fn set_connection_enabled_inner(
+    cp: &ControlPlane,
+    id: String,
+    enabled: bool,
+) -> R<Vec<ConnectionInfo>> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(CmdError {
+            message: "connection id cannot be empty".to_string(),
+        });
+    }
+    connections::set_connection_enabled(cp.store(), id, enabled).await?;
+    Ok(assemble(cp).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_connection_enabled(
+    cp: State<'_, Arc<ControlPlane>>,
+    id: String,
+    enabled: bool,
+) -> R<Vec<ConnectionInfo>> {
+    set_connection_enabled_inner(&cp, id, enabled).await
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn remove_connection(
@@ -686,8 +746,16 @@ pub async fn connection_provider_quota(
         .ok_or_else(|| CmdError {
             message: format!("unknown connection: {id}"),
         })?;
-    let http = quota_http_client()?;
-    Ok(quota::fetch_provider_quota(cp.store(), &http, &mut row).await?)
+    if quota::capability(&row).is_none() {
+        return Err(CmdError {
+            message: "Provider quota unavailable".to_string(),
+        });
+    }
+    let http = quota_http_client()
+        .map_err(|_| sanitize_quota_command_error(&row, anyhow::anyhow!("client")))?;
+    quota::fetch_provider_quota(cp.store(), &http, &mut row)
+        .await
+        .map_err(|error| sanitize_quota_command_error(&row, error))
 }
 
 #[tauri::command]
@@ -701,8 +769,27 @@ pub async fn reset_codex_credit(
         .ok_or_else(|| CmdError {
             message: format!("unknown connection: {id}"),
         })?;
-    let http = quota_http_client()?;
-    Ok(quota::consume_codex_reset_credit(cp.store(), &http, &mut row).await?)
+    if quota::capability(&row) != Some(ProviderQuotaCapability::Codex) {
+        return Err(CmdError {
+            message: "Provider quota unavailable".to_string(),
+        });
+    }
+    let http = quota_http_client()
+        .map_err(|_| sanitize_quota_command_error(&row, anyhow::anyhow!("client")))?;
+    quota::consume_codex_reset_credit(cp.store(), &http, &mut row)
+        .await
+        .map_err(|error| sanitize_quota_command_error(&row, error))
+}
+
+fn sanitize_quota_command_error(row: &ConnectionRow, _error: anyhow::Error) -> CmdError {
+    CmdError {
+        message: if row.data.needs_relogin == Some(true) {
+            "Reconnect required"
+        } else {
+            "Provider quota unavailable"
+        }
+        .to_string(),
+    }
 }
 
 #[tauri::command]
@@ -753,6 +840,153 @@ pub async fn set_provider_account_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_control_plane() -> (Arc<ControlPlane>, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        (
+            ControlPlane::new(store, ryuzi_core::Registries::new()).await,
+            tmp,
+        )
+    }
+
+    fn oauth_row(id: &str, provider: &str) -> ConnectionRow {
+        ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: "oauth".into(),
+            label: format!("{provider} account"),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                access_token: Some("access-token".into()),
+                ..Default::default()
+            },
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    async fn raw_connection_data(cp: &ControlPlane, id: &str) -> String {
+        let id = id.to_string();
+        cp.store()
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT data FROM provider_connections WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rename_connection_is_trimmed_and_field_scoped() {
+        let (cp, _tmp) = test_control_plane().await;
+        connections::add_connection(cp.store(), oauth_row("rename", "openai-oauth"))
+            .await
+            .unwrap();
+        let data = raw_connection_data(&cp, "rename").await;
+
+        let infos = rename_connection_inner(&cp, "rename".into(), "  Work Codex  ".into())
+            .await
+            .unwrap();
+
+        assert_eq!(infos[0].label, "Work Codex");
+        assert_eq!(raw_connection_data(&cp, "rename").await, data);
+    }
+
+    #[tokio::test]
+    async fn set_connection_enabled_is_field_scoped() {
+        let (cp, _tmp) = test_control_plane().await;
+        connections::add_connection(cp.store(), oauth_row("enabled", "openai-oauth"))
+            .await
+            .unwrap();
+        let data = raw_connection_data(&cp, "enabled").await;
+
+        let infos = set_connection_enabled_inner(&cp, "enabled".into(), false)
+            .await
+            .unwrap();
+
+        assert!(!infos[0].enabled);
+        assert_eq!(raw_connection_data(&cp, "enabled").await, data);
+    }
+
+    #[tokio::test]
+    async fn rename_and_enabled_commands_reject_missing_ids() {
+        let (cp, _tmp) = test_control_plane().await;
+        let rename = rename_connection_inner(&cp, "missing".into(), "Missing".into())
+            .await
+            .err()
+            .unwrap();
+        let enabled = set_connection_enabled_inner(&cp, "missing".into(), false)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(rename.message, "unknown connection: missing");
+        assert_eq!(enabled.message, "unknown connection: missing");
+    }
+
+    #[test]
+    fn connection_info_projects_core_quota_capability() {
+        let claude = to_info(&oauth_row("claude", "anthropic-oauth"));
+        let codex = to_info(&oauth_row("codex", "openai-oauth"));
+        let mut api_key = oauth_row("api", "openai-oauth");
+        api_key.auth_type = "api_key".into();
+
+        assert_eq!(
+            claude.quota_capability,
+            Some(quota::ProviderQuotaCapability::Claude)
+        );
+        assert_eq!(
+            codex.quota_capability,
+            Some(quota::ProviderQuotaCapability::Codex)
+        );
+        assert_eq!(to_info(&api_key).quota_capability, None);
+    }
+
+    #[test]
+    fn quota_command_errors_are_sanitized() {
+        const SENTINEL: &str = "secret-provider-error-sentinel";
+        let row = oauth_row("codex", "openai-oauth");
+        let error = sanitize_quota_command_error(&row, anyhow::anyhow!(SENTINEL));
+        assert_eq!(error.message, "Provider quota unavailable");
+        assert!(!error.message.contains(SENTINEL));
+
+        let mut relogin = row;
+        relogin.data.needs_relogin = Some(true);
+        assert_eq!(
+            sanitize_quota_command_error(&relogin, anyhow::anyhow!(SENTINEL)).message,
+            "Reconnect required"
+        );
+    }
+
+    #[test]
+    fn reconnect_oauth_accepts_only_redirect_oauth() {
+        for provider in ["anthropic-oauth", "openai-oauth"] {
+            assert!(validate_redirect_oauth_connection(&oauth_row("ok", provider)).is_ok());
+        }
+
+        let mut mismatched_api_key = oauth_row("api", "anthropic-oauth");
+        mismatched_api_key.auth_type = "api_key".into();
+        let rejected = [
+            mismatched_api_key,
+            oauth_row("unknown", "unknown-provider"),
+            oauth_row("kiro", "kiro"),
+            oauth_row("qwen", "qwen"),
+            oauth_row("github", "github-copilot"),
+            oauth_row("free", "mimo-free"),
+            oauth_row("api-provider", "openai"),
+        ];
+        for row in rejected {
+            let error = validate_redirect_oauth_connection(&row).unwrap_err();
+            assert_eq!(
+                error.message,
+                "This account does not use browser OAuth. Use the provider's device or add-account flow."
+            );
+        }
+    }
 
     fn status(code: u16) -> reqwest::StatusCode {
         reqwest::StatusCode::from_u16(code).unwrap()
@@ -1111,6 +1345,7 @@ pub async fn reconnect_oauth(
         .ok_or_else(|| CmdError {
             message: format!("unknown connection: {connection_id}"),
         })?;
+    validate_redirect_oauth_connection(&existing)?;
     let http = reqwest::Client::new();
     let app2 = app.clone();
     let provider_for_event = existing.provider.clone();
@@ -1136,6 +1371,22 @@ pub async fn reconnect_oauth(
     })?;
     refresh_models_best_effort(&cp, &mut row).await;
     Ok(assemble(&cp).await?)
+}
+
+fn validate_redirect_oauth_connection(row: &ConnectionRow) -> R<()> {
+    let redirect_oauth = connections::is_oauth(row)
+        && registry::descriptor(&row.provider).is_some_and(|descriptor| {
+            registry::oauth_config(&row.provider).is_some()
+                && descriptor.device_flow.is_none()
+                && descriptor.device_grant.is_none()
+        });
+    if !redirect_oauth {
+        return Err(CmdError {
+            message: "This account does not use browser OAuth. Use the provider's device or add-account flow."
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Start the manual (paste) OAuth fallback for environments where the
