@@ -491,6 +491,51 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
   ]);
 });
 
+test("durable system notice messages render live once and hydrate identically", async () => {
+  reset();
+  const event = {
+    kind: "message" as const,
+    session_pk: "s1",
+    seq: 1,
+    role: "system",
+    block_type: "notice",
+    payload: { text: "Account switched to Work Codex · round robin" },
+    tool_call_id: null,
+    status: null,
+    tool_kind: null,
+  };
+
+  useStore.getState().applyCoreEvent(event);
+  useStore.getState().applyCoreEvent(event);
+
+  const live = useStore.getState().transcripts.s1;
+  expect(live).toHaveLength(1);
+  expect(live[0]).toMatchObject({
+    seq: 1,
+    role: "system",
+    blockType: "notice",
+    text: "Account switched to Work Codex · round robin",
+  });
+  const createdAt = live[0].createdAt;
+  if (createdAt === null) throw new Error("live message events must receive a timestamp");
+
+  reset();
+  await useStore.getState().hydrateTranscript("s1", async () => [
+    {
+      sessionPk: "s1",
+      seq: 1,
+      role: "system",
+      blockType: "notice",
+      payload: event.payload,
+      toolCallId: null,
+      status: null,
+      toolKind: null,
+      createdAt,
+    },
+  ]);
+  expect(useStore.getState().transcripts.s1).toEqual(live);
+});
+
 test("tool_call events append once, then merge in place by toolCallId (same-seq update)", () => {
   reset();
   const s = useStore.getState();

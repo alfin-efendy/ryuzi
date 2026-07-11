@@ -128,3 +128,47 @@ test("running session effort changes are marked for the next turn", async ({ pag
     .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "update_project_runtime").at(-1)?.args)
     .toMatchObject({ projectId: "p-demo", model: "fixture/model-beta", effort: "ultra" });
 });
+
+test("route switch notices render live once and survive reload", async ({ page }) => {
+  await page.goto("/");
+
+  const homeTrigger = page.getByRole("button", { name: "Model and effort" });
+  await homeTrigger.click();
+  await page.getByText("Model Alpha", { exact: true }).click();
+  await homeTrigger.click();
+  await page.getByText("High", { exact: true }).click();
+  await page.getByPlaceholder("Do anything").fill("establish route baseline");
+  await page.getByTitle("Start session").click();
+
+  const switchNotices = page.getByText(/^(Switched to|Account switched to)/);
+  await expect(switchNotices).toHaveCount(0);
+  await page.getByTitle("Stop").click();
+  await expect(page.getByTitle("Send")).toBeVisible();
+
+  const sessionTrigger = page.getByRole("button", { name: "Model and effort" });
+  await sessionTrigger.click();
+  await page.getByText("Model Beta", { exact: true }).click();
+  await sessionTrigger.click();
+  await page.getByText("Ultra", { exact: true }).click();
+
+  const sendTurn = async (text: string) => {
+    await page.getByPlaceholder("Ask for follow-up changes").fill(text);
+    await page.getByTitle("Send").click();
+    await expect(page.getByTitle("Send")).toBeVisible();
+  };
+
+  await sendTurn("use the new model");
+  await expect(page.getByText("Switched to Model Beta · Ultra", { exact: true })).toHaveCount(1);
+
+  await sendTurn("rotate the account");
+  await expect(page.getByText("Account switched to Backup account · round robin", { exact: true })).toHaveCount(1);
+
+  await sendTurn("keep this route");
+  await expect(switchNotices).toHaveCount(2);
+
+  await page.reload();
+  await page.getByText("Untitled session", { exact: true }).click();
+  await expect(page.getByText("Switched to Model Beta · Ultra", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("Account switched to Backup account · round robin", { exact: true })).toHaveCount(1);
+  await expect(switchNotices).toHaveCount(2);
+});

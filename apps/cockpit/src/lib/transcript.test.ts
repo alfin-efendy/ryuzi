@@ -193,6 +193,18 @@ test("notice rows (e.g. compaction) get their own group, distinct from errors an
   expect(groups).toEqual([{ type: "notice", key: "s1", text: "Context compacted: ~100k → ~20k tokens" }]);
 });
 
+test("route switch copy groups as notices for model, account, failover, and combined changes", () => {
+  const notices = [
+    "Switched to 5.6 Sol · Ultra",
+    "Account switched to Work Codex · round robin",
+    "Account switched to Backup Codex · quota unavailable",
+    "Switched to Opus 4.1 via Backup Claude · authentication unavailable",
+  ];
+
+  const groups = groupRows(notices.map((text, index) => row({ seq: index + 1, role: "system", blockType: "notice", text })));
+  expect(groups).toEqual(notices.map((text, index) => ({ type: "notice", key: `s${index + 1}`, text })));
+});
+
 test("closeDanglingFence closes an odd number of line-start fences and leaves balanced ones alone", () => {
   expect(closeDanglingFence("```ts\nconst x = 1;")).toBe("```ts\nconst x = 1;\n```");
   expect(closeDanglingFence("```ts\nx\n```")).toBe("```ts\nx\n```");

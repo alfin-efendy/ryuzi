@@ -173,7 +173,35 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
   await page.addInitScript(
     (fixtures) => {
       const calls: Array<{ cmd: string; args: unknown }> = [];
-      let sessions = fixtures.list_sessions as (typeof SESSION)[];
+      const storageKey = "ryuzi.e2e.route-state.v1";
+      type MockMessage = {
+        sessionPk: string;
+        seq: number;
+        role: string;
+        blockType: string;
+        payload: { text: string };
+        toolCallId: null;
+        status: null;
+        toolKind: null;
+        createdAt: number;
+      };
+      type RouteIdentity = {
+        model: string | null;
+        effort: string | null;
+        connectionId: string;
+        connectionLabel: string;
+      };
+      type DurableState = {
+        sessions: (typeof SESSION)[];
+        messages: MockMessage[];
+        route: RouteIdentity | null;
+        routeRequests: number;
+      };
+      const stored = localStorage.getItem(storageKey);
+      const durable: DurableState = stored
+        ? (JSON.parse(stored) as DurableState)
+        : { sessions: fixtures.list_sessions as (typeof SESSION)[], messages: [], route: null, routeRequests: 0 };
+      let sessions = durable.sessions;
       let projectRuntime = fixtures.project_runtime_info as {
         projectId: string;
         model: string | null;
@@ -185,8 +213,79 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         modelInfo: (typeof SELECTABLE_MODELS)[number] | null;
       };
       let cbId = 1;
+      const eventHandlers = new Map<string, number[]>();
       const w = window as unknown as Record<string, unknown>;
       w.__mockCalls = calls;
+
+      const persist = () => {
+        durable.sessions = sessions;
+        localStorage.setItem(storageKey, JSON.stringify(durable));
+      };
+
+      const emitCoreEvent = (event: Record<string, unknown>) => {
+        for (const handler of eventHandlers.get("core-event-msg") ?? []) {
+          const callback = (window as unknown as Record<string, (payload: unknown) => void>)[`_${handler}`];
+          callback?.({ event: "core-event-msg", id: 0, payload: { event } });
+        }
+      };
+
+      const observeRoute = (sessionPk: string) => {
+        const modelInfo = (fixtures.list_runtimes as (typeof NATIVE_RUNTIME)[])[0].selectableModels.find(
+          (model) => model.requestValue === projectRuntime.model,
+        );
+        const useBackup = durable.routeRequests >= 2;
+        const current: RouteIdentity = {
+          model: projectRuntime.model,
+          effort: projectRuntime.effectiveEffort,
+          connectionId: useBackup ? "fixture-backup" : "fixture-account",
+          connectionLabel: useBackup ? "Backup account" : "Fixture account",
+        };
+        const previous = durable.route;
+        durable.route = current;
+        durable.routeRequests += 1;
+
+        let text: string | null = null;
+        if (previous) {
+          const modelChanged = previous.model !== current.model || previous.effort !== current.effort;
+          const accountChanged = previous.connectionId !== current.connectionId;
+          const effortLabel = modelInfo?.supported.find((option) => option.value === current.effort)?.label;
+          if (modelChanged) {
+            text = `Switched to ${modelInfo?.displayName ?? current.model ?? "Default model"}${effortLabel ? ` · ${effortLabel}` : ""}`;
+          } else if (accountChanged) {
+            text = `Account switched to ${current.connectionLabel} · round robin`;
+          }
+        }
+
+        if (text) {
+          const message: MockMessage = {
+            sessionPk,
+            seq: durable.messages.length + 1,
+            role: "system",
+            blockType: "notice",
+            payload: { text },
+            toolCallId: null,
+            status: null,
+            toolKind: null,
+            createdAt: Date.now(),
+          };
+          durable.messages.push(message);
+          persist();
+          emitCoreEvent({
+            kind: "message",
+            session_pk: message.sessionPk,
+            seq: message.seq,
+            role: message.role,
+            block_type: message.blockType,
+            payload: message.payload,
+            tool_call_id: message.toolCallId,
+            status: message.status,
+            tool_kind: message.toolKind,
+          });
+        } else {
+          persist();
+        }
+      };
+
       w.__TAURI_INTERNALS__ = {
         metadata: {
           currentWindow: { label: "main" },
@@ -200,12 +299,31 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         },
         invoke: (cmd: string, args: unknown) => {
           calls.push({ cmd, args });
+          if (cmd === "plugin:event|listen") {
+            const registration = args as { event: string; handler: number };
+            eventHandlers.set(registration.event, [...(eventHandlers.get(registration.event) ?? []), registration.handler]);
+            return Promise.resolve(registration.handler);
+          }
+          if (cmd === "plugin:event|unlisten") return Promise.resolve(null);
           if (cmd.startsWith("plugin:")) return Promise.resolve(null);
           if (cmd === "list_sessions") return Promise.resolve(sessions);
+          if (cmd === "list_messages") return Promise.resolve(durable.messages);
           if (cmd === "start_session") {
             const session = fixtures.start_session as typeof SESSION;
             sessions = [session];
+            persist();
+            observeRoute(session.sessionPk);
             return Promise.resolve(session);
+          }
+          if (cmd === "continue_session") {
+            observeRoute((args as { sessionPk: string }).sessionPk);
+            return Promise.resolve(null);
+          }
+          if (cmd === "stop_session") {
+            const { sessionPk } = args as { sessionPk: string };
+            sessions = sessions.map((session) => (session.sessionPk === sessionPk ? { ...session, status: "idle" as const } : session));
+            persist();
+            return Promise.resolve(null);
           }
           if (cmd === "project_runtime_info") return Promise.resolve(projectRuntime);
           if (cmd === "update_project_runtime") {
