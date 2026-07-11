@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { CmdError, Result } from "@/bindings";
 
 const gitDiff = mock((): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "" }));
@@ -19,9 +19,7 @@ const { useNav } = await import("@/store-nav");
 const { useDiff } = await import("@/store-diff");
 const { useUi } = await import("@/store-ui");
 
-const APP_DIFF = ["diff --git a/src/app.ts b/src/app.ts", "--- a/src/app.ts", "+++ b/src/app.ts", "@@ -1 +1 @@", "-old", "+new"].join(
-  "\n",
-);
+const APP_DIFF = ["diff --git a/src/app.ts b/src/app.ts", "--- a/src/app.ts", "+++ b/src/app.ts", "@@ -1 +1 @@", "-old", "+new"].join("\n");
 
 beforeEach(() => {
   useNav.setState({ rightOpen: true, rightTab: "review", rightMaximized: false });
@@ -68,6 +66,29 @@ test("completed diff clears an unmatched pending target", async () => {
   expect(screen.getByText("app.ts")).toBeTruthy();
 });
 
+test("pending review target stays pending while the diff fetch is still loading", async () => {
+  useDiff.setState({
+    bySession: { s1: { loading: true, error: null, files: [] } },
+    pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" },
+  });
+
+  render(<RightPanel sessionPk="s1" branch="main" running isGit />);
+
+  // Still loading — the pending target must not be cleared against the
+  // stale/empty file list while the fetch that should contain it is in flight.
+  expect(useDiff.getState().pendingReview).toEqual({ sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" });
+
+  act(() => {
+    useDiff.setState({
+      bySession: { s1: { loading: false, error: null, files: [{ dir: "src/", name: "app.ts", add: 1, del: 0, lines: [] }] } },
+    });
+  });
+
+  // Once loading settles with the matching file present, the target resolves.
+  expect(useDiff.getState().pendingReview).toBeNull();
+  expect(screen.getByText("app.ts")).toBeTruthy();
+});
+
 test("refreshing to fewer files clamps the selected review file", async () => {
   useDiff.setState({
     bySession: {
@@ -75,21 +96,39 @@ test("refreshing to fewer files clamps the selected review file", async () => {
         loading: false,
         error: null,
         files: [
-          { dir: "src/", name: "first.ts", add: 1, del: 0, lines: [] },
-          { dir: "src/", name: "second.ts", add: 1, del: 0, lines: [] },
+          { dir: "src/", name: "first.ts", add: 1, del: 0, lines: [["add", 1, "const first = true;"]] },
+          { dir: "src/", name: "second.ts", add: 1, del: 0, lines: [["add", 1, "const second = true;"]] },
         ],
       },
     },
   });
   const view = render(<RightPanel sessionPk="s1" branch="main" running isGit />);
-  fireEvent.click(screen.getByTitle("src/second.ts"));
-
-  useDiff.setState({
-    bySession: { s1: { loading: false, error: null, files: [{ dir: "src/", name: "first.ts", add: 1, del: 0, lines: [] }] } },
+  act(() => {
+    fireEvent.click(screen.getByTitle("src/second.ts"));
   });
-  view.rerender(<RightPanel sessionPk="s1" branch="main" running isGit />);
+  // Selecting second.ts moved the highlight and content pane off first.ts,
+  // proving the clamp assertions below aren't trivially true beforehand.
+  expect(screen.getByTitle("src/second.ts").className).toContain("bg-accent");
+  expect(screen.getByText("const second = true;")).toBeTruthy();
 
-  expect(screen.getByText("first.ts")).toBeTruthy();
+  act(() => {
+    useDiff.setState({
+      bySession: {
+        s1: {
+          loading: false,
+          error: null,
+          files: [{ dir: "src/", name: "first.ts", add: 1, del: 0, lines: [["add", 1, "const first = true;"]] }],
+        },
+      },
+    });
+    view.rerender(<RightPanel sessionPk="s1" branch="main" running isGit />);
+  });
+
+  // The clamped index now points at the surviving first.ts — its row is
+  // highlighted and its diff content (not stale second.ts content) is shown.
+  expect(screen.getByTitle("src/first.ts").className).toContain("bg-accent");
+  expect(screen.getByText("const first = true;")).toBeTruthy();
+  expect(screen.queryByText("const second = true;")).toBeNull();
 });
 
 test("Review error keeps Refresh available and retries", async () => {
