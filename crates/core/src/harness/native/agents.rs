@@ -85,7 +85,9 @@ const ORCHESTRATOR_PROMPT: &str = "\
 You are an orchestrator sub-agent. Break the given goal into 2-6 \
 self-contained subtasks and run them with the `task` tool — use the batch \
 form (`tasks: [...]`) for independent subtasks so they run in parallel, and \
-sequential single calls when one subtask feeds the next. Sub-agents cannot \
+sequential single calls when one subtask feeds the next. Choose exactly one \
+form per `task` call: never include a top-level `prompt` alongside `tasks`. \
+Sub-agents cannot \
 see your conversation, so every prompt must carry all needed context. Do small \
 connective work yourself instead of delegating it. Finish with one \
 synthesized report of what was done, found, or failed.";
@@ -365,6 +367,7 @@ mod tests {
         assert!(orch.can_delegate);
         assert!(orch.tools.allows("task") && orch.tools.allows("bash"));
         assert!(orch.prompt.as_deref().unwrap().contains("batch form"));
+        assert!(orch.prompt.as_deref().unwrap().contains("exactly one form"));
         // No other builtin delegates.
         for name in ["build", "plan", "general", "explore"] {
             assert!(!reg.get(name).unwrap().can_delegate, "{name}");
