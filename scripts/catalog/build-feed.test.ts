@@ -11,6 +11,7 @@ import {
   readSequence,
   serializeFeed,
   signFeedBytes,
+  writeFeed,
   writeSequence,
 } from "./build-feed.ts";
 
@@ -56,6 +57,59 @@ test("round trip: sign a fixture feed, verify with the matching public key", asy
   const otherKeyPair = await generateKeyPair();
   const otherPublicKeyRaw = await exportPublicKeyRaw(otherKeyPair.publicKey);
   expect(await verifyBytes(feedBytes, signature, otherPublicKeyRaw)).toBe(false);
+});
+
+// The round-trip test above only proves the IN-MEMORY bytes verify — it
+// never exercises the actual disk-write path (`writeFeed`, called by
+// `main()`). A future refactor that re-serialized between signing and
+// writing (e.g. `Bun.write(path, feed)` letting `Bun.write` re-stringify)
+// would regress byte-exactness silently until a live release failed
+// verification. This test closes that gap: it writes real files with
+// `writeFeed`, reads them back as raw bytes from disk, and verifies the
+// signature against those on-disk bytes — not the in-memory `feedBytes`.
+test("writeFeed: signature verifies against the exact bytes read back from catalog.json on disk", async () => {
+  const keyPair = await generateKeyPair();
+  const publicKeyRaw = await exportPublicKeyRaw(keyPair.publicKey);
+  const privateKeySeedBase64 = await exportPrivateKeySeedBase64(keyPair.privateKey);
+
+  const feed = buildFeedObject({
+    entries: [{ id: "acme", manifestToml: 'contract=1\nid="acme"\nname="Acme"\nversion="1.0.0"' }],
+    blocked: [{ id: "evil", reason: "revoked" }],
+    sequence: 3,
+    generatedAt: 1700000000000,
+  });
+
+  const dir = await tempDir();
+  const outJsonPath = join(dir, "catalog.json");
+  const outSigPath = join(dir, "catalog.json.sig");
+
+  const { jsonPath, sigPath } = await writeFeed(feed, privateKeySeedBase64, outJsonPath, outSigPath);
+  expect(jsonPath).toBe(outJsonPath);
+  expect(sigPath).toBe(outSigPath);
+
+  // Read the bytes actually written to disk — this is what the engine's
+  // `RemoteCatalogManager` downloads and verifies, so the test must too.
+  // Cast to `Uint8Array<ArrayBuffer>`: `Bun.file().bytes()` types its result
+  // as `Uint8Array<ArrayBufferLike>` (it could in principle back onto a
+  // `SharedArrayBuffer`), but a freshly read file never does — same
+  // type-only cast pattern as `toBufferSource` in `ed25519.ts`.
+  const onDiskJsonBytes = (await Bun.file(jsonPath).bytes()) as Uint8Array<ArrayBuffer>;
+  const onDiskSigBytes = (await Bun.file(sigPath).bytes()) as Uint8Array<ArrayBuffer>;
+
+  expect(onDiskSigBytes.length).toBe(64);
+  // Sanity: the on-disk JSON bytes match what serializeFeed would have
+  // produced in memory for the same feed object (confirms writeFeed didn't
+  // reformat/re-serialize on the way to disk).
+  expect(onDiskJsonBytes).toEqual(serializeFeed(feed) as Uint8Array<ArrayBuffer>);
+
+  expect(await verifyBytes(onDiskJsonBytes, onDiskSigBytes, publicKeyRaw)).toBe(true);
+
+  // Tamper with a single byte of the bytes read back from disk (simulating
+  // corruption, a bad transfer, or a re-serializing regression) and confirm
+  // verification against the on-disk signature now fails.
+  const tamperedOnDisk = new Uint8Array(onDiskJsonBytes);
+  tamperedOnDisk[0]! ^= 0xff;
+  expect(await verifyBytes(tamperedOnDisk, onDiskSigBytes, publicKeyRaw)).toBe(false);
 });
 
 test("serializeFeed emits the camelCase field names the engine's CatalogFeed deserializer expects", async () => {

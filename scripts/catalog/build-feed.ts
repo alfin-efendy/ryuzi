@@ -14,9 +14,9 @@
 // paths below.
 //
 // Byte-exactness matters: the engine verifies the signature over the EXACT
-// bytes of the downloaded catalog.json. `buildFeedBytes` below serializes
-// the feed exactly once; `main` signs and writes that same `Uint8Array` —
-// never re-serializes between signing and writing.
+// bytes of the downloaded catalog.json. `serializeFeed` below serializes
+// the feed exactly once; `writeFeed` signs and writes that same
+// `Uint8Array` — never re-serializes between signing and writing.
 import { importSigningKeyFromSeedBase64, signBytes } from "./ed25519.ts";
 
 export const DEFAULT_CATALOG_DIR = "crates/core/plugins/catalog";
@@ -177,6 +177,32 @@ export async function signFeedBytes(feedBytes: Uint8Array, privateKeySeedBase64:
   return signBytes(feedBytes, signingKey);
 }
 
+/**
+ * Serializes `feed` exactly once, signs those exact bytes, and writes both
+ * `catalog.json` and `catalog.json.sig` (the raw 64-byte detached signature,
+ * not base64) to `outJsonPath`/`outSigPath`. This is the sole write path —
+ * `main()` below calls it, and so does the on-disk byte-exactness test in
+ * `build-feed.test.ts`, which reads the two files back and re-verifies the
+ * signature against the bytes actually on disk (not just the in-memory
+ * ones `serializeFeed` produced). Preserving "serialize once, thread the
+ * same `Uint8Array` into both sign and write" here is what makes that
+ * property hold — do not reintroduce a second `serializeFeed` call.
+ */
+export async function writeFeed(
+  feed: CatalogFeed,
+  privateKeySeedBase64: string,
+  outJsonPath: string,
+  outSigPath: string,
+): Promise<{ jsonPath: string; sigPath: string }> {
+  const feedBytes = serializeFeed(feed);
+  const signature = await signFeedBytes(feedBytes, privateKeySeedBase64);
+
+  await Bun.write(outJsonPath, feedBytes);
+  await Bun.write(outSigPath, signature);
+
+  return { jsonPath: outJsonPath, sigPath: outSigPath };
+}
+
 async function main() {
   const privateKeySeedBase64 = process.env.CATALOG_FEED_PRIVATE_KEY;
   if (!privateKeySeedBase64) {
@@ -198,14 +224,10 @@ async function main() {
   const sequence = (await readSequence(sequencePath)) + 1;
 
   const feed = buildFeedObject({ entries, blocked, sequence, generatedAt: Date.now() });
-  const feedBytes = serializeFeed(feed);
-  const signature = await signFeedBytes(feedBytes, privateKeySeedBase64);
-
-  await Bun.write(outJsonPath, feedBytes);
-  await Bun.write(outSigPath, signature);
+  const { jsonPath, sigPath } = await writeFeed(feed, privateKeySeedBase64, outJsonPath, outSigPath);
   await writeSequence(sequencePath, sequence);
 
-  console.log(`wrote ${outJsonPath} + ${outSigPath} — sequence ${sequence}, ${entries.length} entries, ${feed.blocked.length} blocked`);
+  console.log(`wrote ${jsonPath} + ${sigPath} — sequence ${sequence}, ${entries.length} entries, ${feed.blocked.length} blocked`);
 }
 
 if (import.meta.main) {
