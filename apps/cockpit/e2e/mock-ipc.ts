@@ -471,9 +471,15 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
       };
 
       const emitCoreEvent = (event: Record<string, unknown>) => {
+        // The real CoreEventMsg envelope is `{ runnerId, event }` (bindings.ts) —
+        // store.ts's listener destructures both and keys per-session state by
+        // `sessKey(runnerId, session_pk)`. All fixture sessions here are started
+        // on the local runner (see LOCAL_RUNNER in src/lib/session-key.ts), so
+        // the mock must stamp the same id or the live event lands under a
+        // different composite key than the one the UI is reading from.
         for (const handler of eventHandlers.get("core-event-msg") ?? []) {
           const callback = (window as unknown as Record<string, (payload: unknown) => void>)[`_${handler}`];
-          callback?.({ event: "core-event-msg", id: 0, payload: { event } });
+          callback?.({ event: "core-event-msg", id: 0, payload: { runnerId: "local", event } });
         }
       };
 
