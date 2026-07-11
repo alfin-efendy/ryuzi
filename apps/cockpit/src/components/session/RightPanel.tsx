@@ -34,10 +34,24 @@ export function RightPanel({
   const [pathDraft, setPathDraft] = useState("");
   const [treeFilter, setTreeFilter] = useState("");
   const [treeRefresh, setTreeRefresh] = useState(0);
+  const [workdir, setWorkdir] = useState<string | null>(null);
   const diff = useDiff((s) => s.bySession[sessKey(runnerId, sessionPk)]) ?? EMPTY;
   const fetchDiff = useDiff((s) => s.fetch);
   const pendingReview = useDiff((s) => s.pendingReview);
   const setPendingReview = useDiff((s) => s.setPendingReview);
+
+  // Fetched once per session and reused both to open files from Review
+  // (below) and to resolve the file viewer's session-relative reads.
+  useEffect(() => {
+    let cancelled = false;
+    setWorkdir(null);
+    void commands.sessionWorkdir(runnerId, sessionPk).then((res) => {
+      if (!cancelled && res.status === "ok") setWorkdir(res.data);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [runnerId, sessionPk]);
 
   const activeFileTab = ui.tabs.find((t) => t.id === ui.activeTabId) ?? ui.tabs[0];
   // Explicit per-tab choice wins; otherwise previewable files default to View.
@@ -90,9 +104,13 @@ export function RightPanel({
   const reviewDel = diff.files.reduce((n, f) => n + f.del, 0);
 
   const openInFiles = async (f: ReviewFile) => {
-    const res = await commands.sessionWorkdir(runnerId, sessionPk);
-    if (res.status !== "ok") return;
-    ui.openFile(joinPath(res.data, `${f.dir}${f.name}`));
+    let root = workdir;
+    if (root === null) {
+      const res = await commands.sessionWorkdir(runnerId, sessionPk);
+      if (res.status !== "ok") return;
+      root = res.data;
+    }
+    ui.openFile(joinPath(root, `${f.dir}${f.name}`));
     nav.setRightTab("file");
   };
 
@@ -221,7 +239,8 @@ export function RightPanel({
         </>
       )}
 
-      {/* File tab — wired to the real readFile IPC via dock tabs */}
+      {/* File tab — reads go through the jailed fsview read_file*
+          RPC, resolved via dock tabs */}
       {nav.rightTab === "file" && (
         <>
           <div className="flex shrink-0 items-center gap-1.5 border-b border-border px-4 py-2.5 text-xs text-muted-foreground">
@@ -316,7 +335,7 @@ export function RightPanel({
           <div className="flex min-h-0 flex-1 overflow-hidden">
             <div className="flex min-w-0 flex-1 flex-col overflow-hidden text-xs">
               {activeFileTab ? (
-                <FileViewer path={activeFileTab.path} mode={fileMode} />
+                <FileViewer runnerId={runnerId} sessionPk={sessionPk} path={activeFileTab.path} mode={fileMode} workdir={workdir} />
               ) : (
                 <div className="flex flex-1 items-center justify-center font-sans text-[12.5px] text-muted-foreground">
                   Select a file from the tree.

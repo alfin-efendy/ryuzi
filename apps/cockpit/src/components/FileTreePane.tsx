@@ -13,7 +13,8 @@ export function collectOpenDirs(nodes: Node[]): string[] {
 }
 
 // Real lazy file tree over the session worktree; clicking a file opens it in
-// the dock's file viewer through the existing read_file path.
+// the dock's file viewer, which reads it through the jailed fsview
+// read_file RPC.
 export function FileTreePane({
   runnerId,
   sessionPk,

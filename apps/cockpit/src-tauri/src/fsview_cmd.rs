@@ -7,7 +7,7 @@ use crate::error::CmdError;
 use std::sync::Arc;
 use tauri::State;
 
-pub use ryuzi_core::api::fsview_api::{DirEntryInfo, WorktreeState};
+pub use ryuzi_core::api::fsview_api::{DirEntryInfo, MediaFile, WorktreeState};
 
 type R<T> = Result<T, CmdError>;
 type Engine<'a> = State<'a, Arc<EngineManager>>;
@@ -114,6 +114,45 @@ pub async fn search_files(
         .rpc(
             "search_files",
             serde_json::json!({ "project_id": project_id, "query": query }),
+        )
+        .await
+}
+
+/// Session-workdir text read for the file viewer — jailed and size-capped on
+/// the engine side (see `fsview_api::read_file`). Remote-safe: reads happen
+/// on the runner, never on this machine's disk.
+#[tauri::command]
+#[specta::specta]
+pub async fn read_file(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    rel: String,
+) -> R<String> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "read_file",
+            serde_json::json!({ "session_pk": session_pk, "rel": rel }),
+        )
+        .await
+}
+
+/// Session-workdir binary read for the file viewer's image/svg preview —
+/// jailed and size-capped on the engine side (see `fsview_api::read_file_base64`).
+#[tauri::command]
+#[specta::specta]
+pub async fn read_file_base64(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    rel: String,
+) -> R<MediaFile> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "read_file_base64",
+            serde_json::json!({ "session_pk": session_pk, "rel": rel }),
         )
         .await
 }

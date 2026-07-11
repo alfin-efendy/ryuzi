@@ -112,14 +112,6 @@ async deleteToolPolicy(runnerId: string | null, projectId: string, tool: string)
 async resolveApproval(runnerId: string | null, requestId: string, response: ApprovalResponse) : Promise<boolean> {
     return await TAURI_INVOKE("resolve_approval", { runnerId, requestId, response });
 },
-async readFile(path: string) : Promise<Result<string, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("read_file", { path }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 /**
  * Write pasted bytes into the attachments staging area and return the
  * absolute path — from there the file flows through the normal attachment
@@ -134,12 +126,19 @@ async stageAttachment(runnerId: string | null, name: string, dataBase64: string)
 }
 },
 /**
- * Read a media file as base64 for composer thumbnails (arbitrary user paths
- * sit outside the asset-protocol scope, so previews go through this instead).
+ * Read a media file as base64 for composer thumbnails: paths here are
+ * CLIENT-LOCAL (files the user picked/dropped to attach, staged via
+ * `stage_attachment`), never the session workdir — those arbitrary user
+ * paths sit outside the asset-protocol scope, so previews go through this
+ * instead. This reads THIS machine's disk unconditionally, which is correct
+ * even for a remote session: the attachment lives on the user's machine
+ * until it's uploaded. Session-workdir file reads (the file viewer) go
+ * through the jailed, size-capped `fsview::read_file`/`read_file_base64`
+ * RPCs instead — see `fsview_cmd.rs`.
  */
-async readFileBase64(path: string) : Promise<Result<MediaFile, CmdError>> {
+async readLocalMedia(path: string) : Promise<Result<MediaFile, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("read_file_base64", { path }) };
+    return { status: "ok", data: await TAURI_INVOKE("read_local_media", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -477,6 +476,31 @@ async searchFiles(runnerId: string | null, projectId: string, query: string) : P
 async revertFile(runnerId: string | null, sessionPk: string, path: string) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("revert_file", { runnerId, sessionPk, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Session-workdir text read for the file viewer — jailed and size-capped on
+ * the engine side (see `fsview_api::read_file`). Remote-safe: reads happen
+ * on the runner, never on this machine's disk.
+ */
+async readFile(runnerId: string | null, sessionPk: string, rel: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_file", { runnerId, sessionPk, rel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Session-workdir binary read for the file viewer's image/svg preview —
+ * jailed and size-capped on the engine side (see `fsview_api::read_file_base64`).
+ */
+async readFileBase64(runnerId: string | null, sessionPk: string, rel: string) : Promise<Result<MediaFile, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_file_base64", { runnerId, sessionPk, rel }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
