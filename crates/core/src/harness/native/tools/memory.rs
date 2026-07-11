@@ -1,9 +1,9 @@
 //! `memory` — persist durable facts across sessions.
 //!
 //! Thin tool surface over [`crate::harness::native::memory::MemoryStore`]:
-//! `add`/`replace`/`remove` on the global or project scope, plus an atomic
-//! `batch`. Sub-agents run with `ToolCtx.memory = None` (and the tool filtered
-//! out), mirroring hermes-agent's `skip_memory` for children.
+//! `add`/`replace`/`remove` on the global, user, or project scope, plus an
+//! atomic `batch`. Sub-agents run with `ToolCtx.memory = None` (and the tool
+//! filtered out), mirroring hermes-agent's `skip_memory` for children.
 
 use super::{PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::harness::native::memory as mem;
@@ -27,11 +27,10 @@ fn parse_op(v: &Value) -> anyhow::Result<Op> {
         .and_then(|a| a.as_str())
         .ok_or_else(|| anyhow::anyhow!("memory: `action` is required (add|replace|remove)"))?
         .to_string();
-    let scope = mem::MemoryScope::parse(
-        v.get("scope")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("memory: `scope` is required (global|project)"))?,
-    )?;
+    let scope =
+        mem::MemoryScope::parse(v.get("scope").and_then(|s| s.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("memory: `scope` is required (global|user|project)")
+        })?)?;
     Ok(Op {
         action,
         scope,
@@ -59,8 +58,9 @@ impl Tool for MemoryTool {
     }
     fn description(&self) -> &str {
         "Persist durable facts across sessions (user preferences, environment \
-         quirks, project conventions). Scopes: `global` (all projects) and \
-         `project`. Actions: `add` new entry; `replace`/`remove` the single \
+         quirks, project conventions). Scopes: `global` (all projects), \
+         `user` (about you — preferences/style), and `project`. Actions: \
+         `add` new entry; `replace`/`remove` the single \
          entry containing `match` (a unique substring). Pass `batch` for \
          several operations applied atomically. Each scope has a hard \
          character budget — keep entries short and consolidate when told the \
@@ -71,7 +71,7 @@ impl Tool for MemoryTool {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                "scope": {"type": "string", "enum": ["global", "project"]},
+                "scope": {"type": "string", "enum": ["global", "user", "project"]},
                 "text": {"type": "string", "description": "Entry text for add/replace."},
                 "match": {"type": "string", "description": "Unique substring of the target entry for replace/remove."},
                 "batch": {
@@ -81,7 +81,7 @@ impl Tool for MemoryTool {
                         "type": "object",
                         "properties": {
                             "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                            "scope": {"type": "string", "enum": ["global", "project"]},
+                            "scope": {"type": "string", "enum": ["global", "user", "project"]},
                             "text": {"type": "string"},
                             "match": {"type": "string"}
                         },
@@ -218,6 +218,30 @@ mod tests {
         assert_eq!(
             mem.load(MemoryScope::Global),
             vec!["prefers bun".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn add_persists_to_user_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_memory(dir.path()).await;
+        let out = MemoryTool
+            .execute(
+                &ctx,
+                json!({"action": "add", "scope": "user", "text": "prefers terse answers"}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.for_model);
+        assert!(
+            out.for_model.contains("user: 1 entries"),
+            "{}",
+            out.for_model
+        );
+        let mem = ctx.memory.as_ref().unwrap();
+        assert_eq!(
+            mem.load(MemoryScope::User),
+            vec!["prefers terse answers".to_string()]
         );
     }
 
