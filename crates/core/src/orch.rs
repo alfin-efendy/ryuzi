@@ -963,11 +963,21 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
     };
     let _ = set_task_session(store, &t.id, &session.session_pk).await;
     emit_changed(cp, &t.id, t.root_id.clone(), "running");
-    let (cp2, task_id, root_id, session_pk) = (
+    // Start bubble: labels the worker's agent in the home chat the moment it
+    // begins, so a live group-chat view sees who picked up the subtask. Best
+    // effort — a goal submitted without a home chat (CLI/tests) has no `home`
+    // to post into, and a failed post must never abort the worker.
+    if let Ok(Some(home)) = home_session(store, &t).await {
+        let _ = cp
+            .post_speaker_bubble(&home, &t.agent, "status", &format!("started: {}", t.title))
+            .await;
+    }
+    let (cp2, task_id, root_id, session_pk, task) = (
         cp.clone(),
         t.id.clone(),
         t.root_id.clone(),
         session.session_pk.clone(),
+        t.clone(),
     );
     tokio::spawn(async move {
         let outcome = watch_session(cp2.store(), rx, &session_pk).await;
@@ -978,6 +988,18 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
             }
             Err(e) => ("failed", None, Some(e)),
         };
+        // Report bubble: the worker's final assistant text, posted into the
+        // home chat BEFORE `finish_task` settles the row — mirrors the start
+        // bubble's best-effort/home-chat gating above. Only fires on success:
+        // `result` is `None` on the failed arm, so the tuple match below
+        // naturally skips a failed run.
+        if let (Ok(Some(home)), Some(report)) =
+            (home_session(cp2.store(), &task).await, result.clone())
+        {
+            let _ = cp2
+                .post_speaker_bubble(&home, &task.agent, "text", &report)
+                .await;
+        }
         match finish_task(cp2.store(), &task_id, "running", status, result, error).await {
             Ok(true) => emit_changed(&cp2, &task_id, root_id, status),
             _ => tracing::debug!("orch: task {task_id} outcome discarded (cancelled?)"),
@@ -1541,6 +1563,43 @@ mod tests {
                 "missing `{expected}` in {seen:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn worker_posts_start_and_report_bubbles_into_the_home_chat() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        // A real idle home chat to receive the bubbles.
+        let home = cp
+            .start_chat_session(crate::harness::TurnPrompt::text("hi", "hi"), "test", &[])
+            .await
+            .unwrap();
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            Some(&home.session_pk),
+        )
+        .await
+        .unwrap();
+        // Drive the plan to completion (EchoHarness ends the worker turn quickly).
+        drive_until(&cp, &root, "done", 10_000).await;
+        let rows = cp.store().list_messages(&home.session_pk).await.unwrap();
+        // A start bubble (status) and a report bubble (text), both labeled "build".
+        assert!(rows
+            .iter()
+            .any(|m| m.speaker.as_deref() == Some("build") && m.block_type == "status"));
+        assert!(rows
+            .iter()
+            .any(|m| m.speaker.as_deref() == Some("build") && m.block_type == "text"));
     }
 
     #[tokio::test]

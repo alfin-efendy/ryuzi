@@ -513,6 +513,43 @@ impl ControlPlane {
         }
     }
 
+    /// Post a labeled display bubble into a session's transcript (spec §8:
+    /// worker/orchestrator start/status/report bubbles). A DISPLAY row only —
+    /// written to the `messages` ledger via `insert_message`, NOT
+    /// `provider_turns`, so it never enters the model's history or perturbs
+    /// role alternation. Emits the live `CoreEvent::Message` so attached
+    /// surfaces render it immediately.
+    pub async fn post_speaker_bubble(
+        &self,
+        session_pk: &str,
+        speaker: &str,
+        block_type: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::json!({ "text": text });
+        let seq = self
+            .store
+            .insert_message(NewMessage::speaker_block(
+                session_pk,
+                speaker,
+                block_type,
+                payload.clone(),
+            ))
+            .await?;
+        let _ = self.events.send(CoreEvent::Message {
+            session_pk: session_pk.to_string(),
+            seq,
+            role: "assistant".to_string(),
+            block_type: block_type.to_string(),
+            payload,
+            tool_call_id: None,
+            status: None,
+            tool_kind: None,
+            speaker: Some(speaker.to_string()),
+        });
+        Ok(())
+    }
+
     /// Background half of `start_session_with_prompt`. Registers a
     /// cancellation token in `starting` for the duration of the phases so a
     /// stop/end that lands mid-startup can abort them cleanly.
