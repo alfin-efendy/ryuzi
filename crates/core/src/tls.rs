@@ -116,7 +116,10 @@ pub fn load_or_generate(dir: &Path) -> anyhow::Result<TlsMaterial> {
 /// real TLS listener — [`pair_is_valid`] and `daemon_cmd::start_control_api`
 /// (P2-7) both funnel through this rather than duplicating the
 /// `builder_with_provider(...).with_safe_default_protocol_versions()...`
-/// dance.
+/// dance. `pub` (not `pub(crate)`) so `tests/control_api.rs` (P2-9, an
+/// external integration-test crate that can only see `pub` items) can hand a
+/// genuine `Arc<ServerConfig>` to `serve::ServeOpts` without duplicating this
+/// construction — the same reasoning [`resolve_bind`] already applies.
 ///
 /// ALPN matters because `axum_server`'s `RustlsConfig::from_config` serves
 /// whatever protocols are negotiated — without `alpn_protocols` set, some
@@ -124,7 +127,7 @@ pub fn load_or_generate(dir: &Path) -> anyhow::Result<TlsMaterial> {
 /// builder finalizes the config before ALPN can be supplied to it, so this
 /// sets `alpn_protocols` on the built `ServerConfig` afterward (it's a plain
 /// public field, not part of the builder chain).
-pub(crate) fn server_config(
+pub fn server_config(
     material: &TlsMaterial,
 ) -> anyhow::Result<std::sync::Arc<rustls::ServerConfig>> {
     let cert = rustls::pki_types::CertificateDer::from(material.cert_der.clone());
