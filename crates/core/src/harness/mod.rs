@@ -1,9 +1,10 @@
 use crate::approval::ApprovalHub;
-use crate::domain::{CoreEvent, McpServerSpec, PermMode, SessionKind};
+use crate::domain::{CoreEvent, McpServerSpec, PermMode, Principal, SessionKind};
 use crate::store::Store;
 use async_trait::async_trait;
 
 pub mod native;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -36,10 +37,37 @@ pub struct SessionCtx {
     pub resume: Option<String>,
     /// MCP servers to attach (from the connector axis).
     pub mcp_servers: Vec<McpServerSpec>,
+    /// `McpServerSpec.name` → the plugin that attached that server, for
+    /// every server in `mcp_servers` sourced from a connector plugin (built
+    /// in `ControlPlane::attach_plugin_mcp_servers`, keyed at the same
+    /// binding site the servers themselves are resolved). A DB-configured
+    /// server (no plugin) simply has no entry here. The native runtime looks
+    /// this up per `mcp__<server>__<tool>` tool so approvals can attribute
+    /// the call to its plugin (see [`crate::domain::Principal`]).
+    pub mcp_principals: HashMap<String, Principal>,
     /// Extra skill directories contributed by enabled user plugins (see
     /// `crate::plugins::PluginHost::enabled_skill_dirs`), on top of the
     /// native runtime's usual worktree/global skill dirs.
     pub extra_skill_dirs: Vec<PathBuf>,
+    /// Live handle to the daemon's extension host (Track D) — every hook
+    /// fire site (`harness::native::hooks::fire_hook`) dispatches to it
+    /// alongside the on-disk script sink. `None` when the daemon has no
+    /// extension-capable plugins spawned (the common case, and every bare
+    /// test `SessionCtx`): every fire site then behaves exactly as it did
+    /// before Track D existed — see `ControlPlane::start_harness_session`
+    /// and `plugins::extension::ExtensionHost::is_empty`. A live handle, not
+    /// config, so it is never serialized.
+    pub extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
+    /// Sibling accessor to `extension_events`, threaded from the SAME
+    /// daemon-global extension host (Track D, DT6) — `None` under the exact
+    /// same condition (`ExtensionHost::is_empty`), so a session with no
+    /// extensions spawned builds its tool registry with zero extra work,
+    /// exactly like `extension_events: None` keeps every hook fire site a
+    /// true no-op. The native runtime's session start (mirroring
+    /// `connect_mcp_tools`) calls `session_tools()` through this to gather
+    /// every `Running`, `provides_tools` extension's tools and wrap them as
+    /// native `Tool`s via `harness::native::tools::extension::ExtensionTool`.
+    pub extension_tools: Option<Arc<dyn crate::plugins::extension::ExtensionTools>>,
     /// Event bus for normalized session output.
     pub events: broadcast::Sender<CoreEvent>,
     /// Shared approval hub for tool-permission requests.
@@ -175,7 +203,10 @@ mod tests {
             effort: None,
             resume: None,
             mcp_servers: vec![],
+            mcp_principals: HashMap::new(),
             extra_skill_dirs: vec![],
+            extension_events: None,
+            extension_tools: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: crate::harness::native::background::BackgroundRegistry::new(),

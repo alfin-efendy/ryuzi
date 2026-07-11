@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import {
   Badge,
   Button,
+  Combobox,
   FormField,
   Input,
   SettingsCard as Card,
@@ -14,7 +15,7 @@ import {
   SettingsCardTitle as CardTitle,
   Switch,
 } from "@ryuzi/ui";
-import { commands, events, type PluginDetail } from "@/bindings";
+import { commands, events, type ExtensionStatusEntry, type PluginDetail } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
@@ -37,46 +38,148 @@ function formatLedgerTimestamp(ms: number): string {
   return new Date(ms).toLocaleDateString();
 }
 
+/** Human label for an `ExtensionStatusEntry.status` value (Track D
+ *  observability, DT8). Pure and exported so it stays unit-testable without
+ *  mounting the view — mirrors `PluginsView.tsx`'s `catalogStatusLabel`
+ *  convention. */
+export function extensionStatusLabel(status: string): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "starting":
+      return "Starting";
+    case "restarting":
+      return "Restarting";
+    case "failed":
+      return "Failed";
+    case "stopped":
+      return "Stopped";
+    case "not-running":
+      return "Not running";
+    default:
+      return status;
+  }
+}
+
+/** `Pill` color variant for an `ExtensionStatusEntry.status` value — green-ish
+ *  "primary" for healthy/running, "warn" amber for a mid-restart/transient
+ *  state, "danger" red for failed, muted "secondary" for stopped/not-running. */
+export function extensionStatusPillVariant(status: string): "primary" | "warn" | "danger" | "secondary" {
+  switch (status) {
+    case "running":
+      return "primary";
+    case "starting":
+    case "restarting":
+      return "warn";
+    case "failed":
+      return "danger";
+    default:
+      return "secondary";
+  }
+}
+
 // One label+input+Save row, shared by the auth credential and every
 // manifest-declared settings field. Values are never pre-filled from the
 // engine (it never sends them back) — only a `valueSet` boolean decides the
 // placeholder, so a saved secret can only ever be replaced, never revealed.
+//
+// Widget-by-kind: `bool` renders a `Switch` that saves immediately on
+// toggle (no separate Save step — matches every other boolean setting in
+// Cockpit, e.g. the plugin's own "Enabled" switch above); a non-empty
+// `options` list renders a `Combobox` (enum/choice); `int` renders a
+// numeric `Input`; anything else renders the original text/password
+// `Input`. `onSave` always receives the value to persist explicitly (rather
+// than reading component state) so the Bool row's immediate save can pass
+// its freshly toggled value without racing the parent's async state update.
 function FieldRow({
   label,
   help,
+  kind = "string",
   secret,
   required,
   valueSet,
   value,
+  options = [],
+  defaultValue = null,
   onChange,
   onSave,
   saving,
 }: {
   label: string;
   help?: string;
+  /** `PluginFieldInfo.kind` — `"string" | "int" | "bool"` in practice, but
+   *  typed loosely (matches the DTO's plain `string`) so an unrecognized
+   *  value falls through to the default text/password `Input` rather than
+   *  failing a type check. */
+  kind?: string;
   secret: boolean;
   required: boolean;
   valueSet: boolean;
   value: string;
+  options?: string[];
+  defaultValue?: string | null;
   onChange: (v: string) => void;
-  onSave: () => void;
+  onSave: (v: string) => void;
   saving: boolean;
 }) {
+  const fieldLabel = required ? `${label} *` : label;
+  const placeholder = valueSet
+    ? "●●●● saved"
+    : defaultValue != null
+      ? `Default: ${defaultValue}`
+      : required
+        ? "Required — not set"
+        : "Optional — not set";
+
+  if (kind === "bool") {
+    const on = value === "true" || (value === "" && defaultValue === "true");
+    return (
+      <div className="border-b border-border px-[18px] py-3 last:border-b-0">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[13px] font-medium">{fieldLabel}</span>
+          <span className={saving ? "pointer-events-none opacity-40" : ""}>
+            <Switch
+              on={on}
+              onToggle={() => {
+                const next = on ? "false" : "true";
+                onChange(next);
+                onSave(next);
+              }}
+              label={label}
+            />
+          </span>
+        </div>
+        {help && <p className="m-0 mt-1.5 text-xs text-muted-foreground">{help}</p>}
+      </div>
+    );
+  }
+
   return (
     <div className="border-b border-border px-[18px] py-3 last:border-b-0">
       <div className="flex items-end gap-2">
-        <FormField label={required ? `${label} *` : label} className="min-w-0 flex-1">
-          <Input
-            type={secret ? "password" : "text"}
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
-            placeholder={valueSet ? "●●●● saved" : required ? "Required — not set" : "Optional — not set"}
-          />
+        <FormField label={fieldLabel} className="min-w-0 flex-1">
+          {options.length > 0 ? (
+            <Combobox
+              aria-label={label}
+              options={options.map((o) => ({ value: o, label: o }))}
+              value={value || null}
+              onValueChange={onChange}
+              placeholder={placeholder}
+              className="w-full"
+            />
+          ) : (
+            <Input
+              type={kind === "int" ? "number" : secret ? "password" : "text"}
+              value={value}
+              onChange={(e) => onChange(e.target.value)}
+              placeholder={placeholder}
+            />
+          )}
         </FormField>
         {/* Outside the FormField's <label> on purpose — button is a labelable
             element too, so nesting it inside would fold the label's (and
             hint's) text into "Save"'s accessible name. */}
-        <Button size="sm" onClick={onSave} disabled={saving || value.trim().length === 0}>
+        <Button size="sm" onClick={() => onSave(value)} disabled={saving || value.trim().length === 0}>
           {saving ? "Saving…" : "Save"}
         </Button>
       </div>
@@ -100,6 +203,7 @@ export function PluginDetailView({ id }: { id: string }) {
   const [oauthCode, setOauthCode] = useState("");
   const [oauthBusy, setOauthBusy] = useState<"begin" | "complete" | "disconnect" | null>(null);
   const [updatingPack, setUpdatingPack] = useState(false);
+  const [extensionEntries, setExtensionEntries] = useState<ExtensionStatusEntry[]>([]);
   // Scroll targets for the attach-failure banner's "Configure" affordance —
   // whichever of Authentication/Settings actually rendered (each ref only
   // attaches when its section is present, so an absent section reads as
@@ -130,6 +234,26 @@ export function PluginDetailView({ id }: { id: string }) {
   useEffect(() => {
     if (!doctorLoaded) void loadDoctor();
   }, [doctorLoaded, loadDoctor]);
+
+  // Extension (Track D "code plugin") status — DT8. `extension_status` is a
+  // params-free rpc returning every plugin's entries (mirrors `catalog_status`),
+  // so this view fetches it only when the plugin actually declares the
+  // capability, then filters down to its own `id` client-side (same pattern
+  // `doctorFindings.find((f) => f.pluginId === id ...)` above uses).
+  const isExtensionPlugin = detail?.info.capabilities.includes("extension") ?? false;
+  useEffect(() => {
+    if (!isExtensionPlugin) {
+      setExtensionEntries([]);
+      return;
+    }
+    let active = true;
+    void commands.extensionStatus(LOCAL_RUNNER).then((res) => {
+      if (active && res.status === "ok") setExtensionEntries(res.data.filter((e) => e.pluginId === id));
+    });
+    return () => {
+      active = false;
+    };
+  }, [isExtensionPlugin, id]);
 
   useEffect(() => {
     let active = true;
@@ -246,8 +370,12 @@ export function PluginDetailView({ id }: { id: string }) {
     await reloadPlugins();
   };
 
-  const saveField = async (key: string) => {
-    const value = (fieldValues[key] ?? "").trim();
+  // Takes the value explicitly (rather than reading `fieldValues[key]`
+  // itself) so a `FieldRow`'s immediate-save kinds (Bool's toggle) can pass
+  // their freshly computed value without racing `setFieldValues`'s async
+  // state update.
+  const saveField = async (key: string, rawValue: string) => {
+    const value = rawValue.trim();
     if (value.length === 0 || savingField) return;
     setSavingField(key);
     const res = await commands.setPluginSetting(LOCAL_RUNNER, key, value);
@@ -345,6 +473,7 @@ export function PluginDetailView({ id }: { id: string }) {
 
         <div className="mb-4 flex flex-wrap items-center gap-1.5">
           <PluginStatusBadge verified={info.verified} experimental={info.experimental} />
+          {info.capabilities.includes("extension") && <Pill variant="mono">Runs code</Pill>}
           {pinned && (
             <Pill variant="mono">
               <Pin aria-hidden size={9} strokeWidth={2} className="mr-1 inline align-[-1px]" />
@@ -561,12 +690,15 @@ export function PluginDetailView({ id }: { id: string }) {
                   key={f.key}
                   label={f.label}
                   help={f.help || undefined}
+                  kind={f.kind}
                   secret={f.secret}
                   required={f.required}
                   valueSet={f.valueSet}
                   value={fieldValues[f.key] ?? ""}
+                  options={f.options}
+                  defaultValue={f.default}
                   onChange={(v) => setFieldValues((m) => ({ ...m, [f.key]: v }))}
-                  onSave={() => void saveField(f.key)}
+                  onSave={(v) => void saveField(f.key, v)}
                   saving={savingField === f.key}
                 />
               ))}
@@ -586,6 +718,30 @@ export function PluginDetailView({ id }: { id: string }) {
                 <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{m.commandOrUrl}</span>
               </CardRow>
             ))}
+          </Card>
+        )}
+
+        {info.capabilities.includes("extension") && (
+          <Card className="mb-3">
+            <CardHeader>
+              <CardTitle>Extension</CardTitle>
+            </CardHeader>
+            {extensionEntries.length === 0 ? (
+              <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">No extension status reported yet.</div>
+            ) : (
+              extensionEntries.map((e) => (
+                <CardRow key={e.name}>
+                  <span className="w-[120px] shrink-0 truncate text-[13px] font-medium">{e.name}</span>
+                  <Pill variant={extensionStatusPillVariant(e.status)}>{extensionStatusLabel(e.status)}</Pill>
+                  {e.restartCount > 0 && (
+                    <span className="shrink-0 text-[11.5px] text-muted-foreground">
+                      {e.restartCount} restart{e.restartCount === 1 ? "" : "s"}
+                    </span>
+                  )}
+                  {e.lastError && <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">{e.lastError}</span>}
+                </CardRow>
+              ))
+            )}
           </Card>
         )}
 

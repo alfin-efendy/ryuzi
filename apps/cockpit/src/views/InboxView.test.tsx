@@ -11,8 +11,8 @@ test("renders one card per pending approval across sessions, newest first", () =
   useStore.setState({
     sessions: [],
     pendingApprovals: [
-      { runnerId: LOCAL_RUNNER, sessionPk: "s1", requestId: "r1", tool: "bash", summary: "Bash: ls", kind: "tool", input: {} },
-      { runnerId: LOCAL_RUNNER, sessionPk: "s2", requestId: "r2", tool: "edit", summary: "Edit: a.ts", kind: "tool", input: {} },
+      { runnerId: LOCAL_RUNNER, sessionPk: "s1", requestId: "r1", tool: "bash", summary: "Bash: ls", kind: "tool", input: {}, principal: null },
+      { runnerId: LOCAL_RUNNER, sessionPk: "s2", requestId: "r2", tool: "edit", summary: "Edit: a.ts", kind: "tool", input: {}, principal: null },
     ],
   });
   render(<InboxView />);

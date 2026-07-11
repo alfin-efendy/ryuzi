@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { DoctorFinding, PluginDetail } from "@/bindings";
+import type { DoctorFinding, ExtensionStatusEntry, PluginDetail } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The view fetches straight from `commands.pluginDetail` (bypassing the
@@ -15,6 +15,8 @@ const githubDetail: PluginDetail = {
     description: "Repos, issues, and pull requests via GitHub's official remote MCP server.",
     icon: "github",
     categories: ["vcs", "issues"],
+    slot: null,
+    ownsSlot: false,
     verified: true,
     experimental: false,
     enabled: false,
@@ -59,6 +61,8 @@ const ollamaDetail: PluginDetail = {
     description: "Local models via Ollama.",
     icon: "cpu",
     categories: ["model-provider"],
+    slot: null,
+    ownsSlot: false,
     verified: true,
     experimental: false,
     enabled: true,
@@ -87,6 +91,9 @@ const ollamaDetail: PluginDetail = {
       secret: false,
       required: false,
       valueSet: false,
+      kind: "string",
+      options: [],
+      default: null,
     },
   ],
   mcp: [],
@@ -102,6 +109,8 @@ const sandboxDetail: PluginDetail = {
     description: "Docs-only entry — no MCP surface.",
     icon: "box",
     categories: ["sandbox"],
+    slot: null,
+    ownsSlot: false,
     verified: false,
     experimental: true,
     enabled: false,
@@ -129,6 +138,45 @@ const sandboxDetail: PluginDetail = {
   publisher: "Vercel (no MCP surface)",
 };
 
+// A plugin declaring an `[[extension]]` (Track D "code plugin") capability —
+// exercises the Extension status card (DT8), gated on
+// `info.capabilities.includes("extension")`.
+const extensionDetail: PluginDetail = {
+  info: {
+    id: "acme-ext",
+    name: "Acme Ext",
+    description: "Ships a supervised extension subprocess.",
+    icon: "sparkles",
+    categories: [],
+    slot: null,
+    ownsSlot: false,
+    verified: false,
+    experimental: false,
+    enabled: true,
+    source: "catalog",
+    capabilities: ["extension"],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
+  },
+  auth: null,
+  settings: [],
+  mcp: [],
+  models: [],
+  homepage: null,
+  publisher: "Acme",
+};
+
 // Installed via the tracked git-clone path — carries a full
 // `plugin_installs` ledger row, exercising the Provenance block (source,
 // short commit, installed/updated timestamps) and the real (persisted)
@@ -143,6 +191,8 @@ const skillPackDetail: PluginDetail = {
     description: "A skill pack installed from a git source.",
     icon: "sparkles",
     categories: ["skills"],
+    slot: null,
+    ownsSlot: false,
     verified: false,
     experimental: false,
     enabled: true,
@@ -177,6 +227,8 @@ const oauthDetail: PluginDetail = {
     description: "HTTP MCP plugin authenticated through OAuth.",
     icon: "shield",
     categories: ["issues"],
+    slot: null,
+    ownsSlot: false,
     verified: true,
     experimental: false,
     enabled: true,
@@ -214,6 +266,80 @@ const oauthDetail: PluginDetail = {
   publisher: "Acme",
 };
 
+// A plugin exercising every `SettingField.kind` shape (Feature C3):
+// `verbose` is a Bool (renders a Switch), `tier` is an enum (`options`
+// non-empty, renders a Combobox), `retries` is a plain Int (renders a
+// numeric Input).
+const richFieldsDetail: PluginDetail = {
+  info: {
+    id: "acme-rich",
+    name: "Acme Rich",
+    description: "Exercises every settings field kind.",
+    icon: "sparkles",
+    categories: [],
+    slot: null,
+    ownsSlot: false,
+    verified: false,
+    experimental: false,
+    enabled: true,
+    source: "catalog",
+    capabilities: [],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
+  },
+  auth: null,
+  settings: [
+    {
+      key: "plugin.acme-rich.verbose",
+      label: "Verbose logging",
+      help: "Log extra diagnostic detail.",
+      secret: false,
+      required: false,
+      valueSet: false,
+      kind: "bool",
+      options: [],
+      default: null,
+    },
+    {
+      key: "plugin.acme-rich.tier",
+      label: "Tier",
+      help: "Pricing tier to target.",
+      secret: false,
+      required: false,
+      valueSet: false,
+      kind: "string",
+      options: ["free", "pro", "enterprise"],
+      default: "free",
+    },
+    {
+      key: "plugin.acme-rich.retries",
+      label: "Retries",
+      help: "",
+      secret: false,
+      required: false,
+      valueSet: false,
+      kind: "int",
+      options: [],
+      default: null,
+    },
+  ],
+  mcp: [],
+  models: [],
+  homepage: null,
+  publisher: "Acme",
+};
+
 const ok = <T,>(data: T) => Promise.resolve({ status: "ok" as const, data });
 const err = (message: string) => Promise.resolve({ status: "error" as const, error: { message } });
 
@@ -227,7 +353,9 @@ const pluginDetail = mock((_runnerId: string, id: string) => {
   if (id === "github") return ok(githubDetail);
   if (id === "ollama") return ok(ollamaDetail);
   if (id === "acme-oauth") return ok(oauthDetail);
+  if (id === "acme-rich") return ok(richFieldsDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
+  if (id === "acme-ext") return ok(extensionDetail);
   if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
   return err("unknown plugin");
 });
@@ -249,6 +377,8 @@ const pluginsRestartRequired = mock(() => ok(false));
 const catalogStatus = mock(() => ok({ sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 }));
 let doctorFindingsFixture: DoctorFinding[] = [];
 const pluginDoctor = mock(() => ok(doctorFindingsFixture));
+let extensionStatusFixture: ExtensionStatusEntry[] = [];
+const extensionStatus = mock(() => ok(extensionStatusFixture));
 const updatePlugin = mock((_runnerId: string, _id: string, _force: boolean) => ok({ kind: "updated" as const }));
 const setPluginPin = mock((_runnerId: string, id: string, pinned: boolean, _reason: string | null) => {
   if (id === "acme-pack") acmePackPinned = pinned;
@@ -290,6 +420,7 @@ mock.module("@/bindings", () => ({
     pluginDoctor,
     updatePlugin,
     setPluginPin,
+    extensionStatus,
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
@@ -317,7 +448,9 @@ beforeEach(() => {
   pluginDoctor.mockClear();
   updatePlugin.mockClear();
   setPluginPin.mockClear();
+  extensionStatus.mockClear();
   doctorFindingsFixture = [];
+  extensionStatusFixture = [];
   acmePackPinned = false;
   openUrl.mockClear();
   usePlugins.setState({
@@ -387,6 +520,48 @@ test("oauth plugins start Cockpit sign-in through beginPluginOauth", async () =>
 
   fireEvent.click(screen.getByRole("button", { name: "Connect" }));
   await waitFor(() => expect(beginPluginOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "acme-oauth"));
+});
+
+// ---------- Settings field render-by-kind (Feature C3) ----------
+
+test("a Bool settings field renders as a Switch and saves immediately on toggle", async () => {
+  render(<PluginDetailView id="acme-rich" />);
+  await screen.findByText("Acme Rich");
+
+  const sw = screen.getByRole("switch", { name: "Verbose logging" });
+  expect(sw.getAttribute("aria-checked")).toBe("false");
+
+  fireEvent.click(sw);
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith(LOCAL_RUNNER, "plugin.acme-rich.verbose", "true"));
+  // pluginDetail() never re-persists a value back, so the toggle stays a
+  // pending client-side flip rather than reflecting a re-fetched "true" —
+  // still, the reload must have happened (mount + post-save reload).
+  await waitFor(() => expect(pluginDetail).toHaveBeenCalledTimes(2));
+});
+
+test("an enum settings field (non-empty options) renders as a Combobox and saves the picked option", async () => {
+  render(<PluginDetailView id="acme-rich" />);
+  await screen.findByText("Acme Rich");
+
+  const combo = screen.getByRole("combobox", { name: "Tier" });
+  // Shows the manifest-declared default as an affordance when unset.
+  expect(combo.textContent).toContain("Default: free");
+
+  fireEvent.click(combo);
+  fireEvent.click(await screen.findByRole("option", { name: "pro" }));
+
+  const save = screen.getAllByRole("button", { name: "Save" })[0] as HTMLButtonElement;
+  expect(save.disabled).toBe(false);
+  fireEvent.click(save);
+  await waitFor(() => expect(setPluginSetting).toHaveBeenCalledWith(LOCAL_RUNNER, "plugin.acme-rich.tier", "pro"));
+});
+
+test("a plain Int settings field renders as a numeric Input", async () => {
+  render(<PluginDetailView id="acme-rich" />);
+  await screen.findByText("Acme Rich");
+
+  const retries = screen.getByPlaceholderText("Optional — not set") as HTMLInputElement;
+  expect(retries.type).toBe("number");
 });
 
 test("lists MCP servers with their transport and endpoint", async () => {
@@ -552,4 +727,77 @@ test("omits the attach-failed banner when doctor has no finding for this plugin"
   await screen.findByText("GitHub");
 
   expect(screen.queryByText("Attach failed")).toBeNull();
+});
+
+// ---------- Extension (Track D "code plugin") status card — DT8 ----------
+
+test("a non-extension plugin never calls extension_status and renders no Extension card", async () => {
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  expect(extensionStatus).not.toHaveBeenCalled();
+  expect(screen.queryByText("Extension")).toBeNull();
+  expect(screen.queryByText("Runs code")).toBeNull();
+});
+
+test("an extension-capable plugin fetches extension_status and shows the Runs code badge", async () => {
+  extensionStatusFixture = [];
+  render(<PluginDetailView id="acme-ext" />);
+  await screen.findByText("Acme Ext");
+
+  expect(screen.getByText("Runs code")).toBeTruthy();
+  expect(await screen.findByText("Extension")).toBeTruthy();
+  await waitFor(() => expect(extensionStatus).toHaveBeenCalled());
+  expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
+});
+
+test("renders a Running extension's status badge", async () => {
+  extensionStatusFixture = [
+    {
+      pluginId: "acme-ext",
+      name: "linter",
+      status: "running",
+      restartCount: 0,
+      lastError: null,
+      confirmedEvents: ["tool.before"],
+      toolCount: 2,
+    },
+  ];
+  render(<PluginDetailView id="acme-ext" />);
+  await screen.findByText("Acme Ext");
+
+  expect(await screen.findByText("linter")).toBeTruthy();
+  expect(screen.getByText("Running")).toBeTruthy();
+  expect(screen.queryByText(/restart/)).toBeNull();
+});
+
+test("renders a Failed extension's restart count and sanitized last error", async () => {
+  extensionStatusFixture = [
+    {
+      pluginId: "acme-ext",
+      name: "linter",
+      status: "failed",
+      restartCount: 5,
+      lastError: "linter: restart-exhausted: 5 restarts within 300s",
+      confirmedEvents: [],
+      toolCount: 0,
+    },
+  ];
+  render(<PluginDetailView id="acme-ext" />);
+  await screen.findByText("Acme Ext");
+
+  expect(await screen.findByText("Failed")).toBeTruthy();
+  expect(screen.getByText("5 restarts")).toBeTruthy();
+  expect(screen.getByText("linter: restart-exhausted: 5 restarts within 300s")).toBeTruthy();
+});
+
+test("extension_status entries for a different plugin are filtered out", async () => {
+  extensionStatusFixture = [
+    { pluginId: "other-plugin", name: "other", status: "running", restartCount: 0, lastError: null, confirmedEvents: [], toolCount: 0 },
+  ];
+  render(<PluginDetailView id="acme-ext" />);
+  await screen.findByText("Acme Ext");
+
+  expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
+  expect(screen.queryByText("other")).toBeNull();
 });

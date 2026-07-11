@@ -46,8 +46,15 @@ pub fn validate_setting(key: &str, value: &str) -> Option<String> {
     }
 }
 
-/// Validate a value against a plugin-declared [`SettingField`]'s `kind`.
+/// Validate a value against a plugin-declared [`SettingField`]'s `kind` and,
+/// when the field is an enum (`options` non-empty), against its members.
 fn validate_plugin_field(key: &str, value: &str, field: &SettingField) -> Option<String> {
+    if !field.options.is_empty() && !field.options.iter().any(|o| o == value) {
+        return Some(format!(
+            "{key} must be one of: {}",
+            field.options.join(", ")
+        ));
+    }
     match field.kind {
         FieldKind::Bool if value != "true" && value != "false" => {
             Some(format!("{key} must be true or false"))
@@ -89,12 +96,23 @@ impl SettingsStore {
     }
 
     /// The persisted row, if any (even an empty string); else the field's
-    /// schema default.
+    /// schema default — the static `find_field` catalog's default for a
+    /// global/gateway key, or (for a key not in that compile-time catalog)
+    /// the `default` a plugin declared on its `manifest.settings[]` field via
+    /// `crate::plugins::plugin_field`. Precedence: explicit stored value >
+    /// static catalog default > plugin field default > `None`. This is the
+    /// single read path `${setting:KEY}` substitution and required-field
+    /// checks (`declarative.rs::ensure_auth`, `missing_required` below) go
+    /// through, so a manifest `default` now actually takes effect instead of
+    /// only ever appearing as Cockpit placeholder text.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
         if let Some(v) = self.store.get_setting_raw(key).await? {
             return Ok(Some(v));
         }
-        Ok(find_field(key).and_then(|f| f.default).map(String::from))
+        if let Some(default) = find_field(key).and_then(|f| f.default) {
+            return Ok(Some(default.to_string()));
+        }
+        Ok(crate::plugins::plugin_field(key).and_then(|f| f.default))
     }
 
     /// Validate then persist a setting.
@@ -113,24 +131,58 @@ impl SettingsStore {
     /// Keys of required fields with no persisted value, in a stable order:
     /// required globals first (declaration order), then required fields of
     /// each enabled gateway (declaration order) — the order the wizard
-    /// prompts in.
-    pub async fn missing_required(&self) -> anyhow::Result<Vec<&'static str>> {
+    /// prompts in — then required plugin-declared `manifest.settings[]`
+    /// fields of every *enabled* plugin (sorted, since the backing registry
+    /// is a `HashMap`).
+    ///
+    /// Plugin fields return owned `String`s (unlike the `&'static str` global
+    /// and gateway keys) because they come from a runtime manifest, not a
+    /// compile-time schema.
+    pub async fn missing_required(&self) -> anyhow::Result<Vec<String>> {
         use crate::settings::catalog::CATALOG;
         use crate::settings::fields::GLOBAL_FIELDS;
 
         let mut out = Vec::new();
         for f in GLOBAL_FIELDS {
             if f.required && self.get(f.key).await?.is_none() {
-                out.push(f.key);
+                out.push(f.key.to_string());
             }
         }
         for id in csv(self.get("enabled_gateways").await?.as_deref()) {
             if let Some(gw) = CATALOG.gateway(&id) {
                 for f in gw.fields {
                     if f.required && self.get(f.key).await?.is_none() {
-                        out.push(f.key);
+                        out.push(f.key.to_string());
                     }
                 }
+            }
+        }
+        // Gated on the raw `plugin.<id>.enabled` setting — the same key
+        // `PluginHost::is_enabled`'s connector-only branch reads (mirrored
+        // rather than called: this facade never holds a
+        // `PluginHost`/`Registries` handle), so a disabled connector
+        // plugin's required fields don't block onboarding/`is_configured()`
+        // forever. This key is never set for gateway-capable plugins (their
+        // `is_enabled` reads `enabled_gateways` instead), so their fields —
+        // already covered by the gateway loop above — are correctly skipped
+        // here rather than double-counted. Harness-capable and manifest-only
+        // plugins (always-enabled regardless of this key) declare no
+        // required custom settings fields today; if one ever does, it would
+        // need `plugin.<id>.enabled=true` set explicitly for this loop to
+        // see it as enabled — a known simplification.
+        let mut plugin_required: Vec<(String, String)> = crate::plugins::plugin_fields_all()
+            .into_iter()
+            .filter(|(_, f)| f.required)
+            .map(|(plugin_id, f)| (plugin_id, f.key))
+            .collect();
+        plugin_required.sort();
+        for (plugin_id, key) in plugin_required {
+            let enabled_key = format!("plugin.{plugin_id}.enabled");
+            if self.get(&enabled_key).await?.as_deref() != Some("true") {
+                continue;
+            }
+            if self.get(&key).await?.is_none() {
+                out.push(key);
             }
         }
         Ok(out)
@@ -196,6 +248,7 @@ mod tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: Some(AuthSpec {
@@ -210,8 +263,11 @@ mod tests {
                 secret: false,
                 required: false,
                 kind: FieldKind::String,
+                options: Vec::new(),
+                default: None,
             }],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         };
@@ -221,6 +277,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         });
     }
@@ -266,6 +323,220 @@ mod tests {
             validate_setting("plugin.totally-unregistered-plugin.enabled", "true").as_deref(),
             Some("unknown setting: plugin.totally-unregistered-plugin.enabled")
         );
+    }
+
+    /// Register a plugin with one enum settings field (`options` non-empty)
+    /// — the `required` flag is parameterized so the same helper backs both
+    /// the enum-rejection test and the required-plugin-field enforcement
+    /// test.
+    fn register_enum_plugin(id: &str, required: bool) {
+        use crate::plugins::{CorePlugin, PluginHost, PluginSource};
+        use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
+
+        let manifest = PluginManifest {
+            contract: 1,
+            id: id.to_string(),
+            name: format!("Test Enum Plugin {id}"),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![SettingField {
+                key: format!("plugin.{id}.tier"),
+                label: "Tier".to_string(),
+                help: String::new(),
+                secret: false,
+                required,
+                kind: FieldKind::String,
+                options: vec!["free".to_string(), "pro".to_string()],
+                default: None,
+            }],
+            mcp: vec![],
+            extensions: vec![],
+            skills: vec![],
+            provider: None,
+        };
+        let mut host = PluginHost::new();
+        host.add(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: None,
+            source: PluginSource::Builtin,
+        });
+    }
+
+    #[test]
+    fn validate_setting_rejects_a_value_outside_a_registered_plugin_enum_options() {
+        let id = "task-c3-storetest-enum-plugin";
+        register_enum_plugin(id, false);
+
+        assert_eq!(validate_setting(&format!("plugin.{id}.tier"), "free"), None);
+        assert_eq!(validate_setting(&format!("plugin.{id}.tier"), "pro"), None);
+        assert_eq!(
+            validate_setting(&format!("plugin.{id}.tier"), "ultra").as_deref(),
+            Some(format!("plugin.{id}.tier must be one of: free, pro").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_required_includes_a_required_plugin_field_only_once_the_plugin_is_enabled() {
+        let id = "task-c3-storetest-required-plugin";
+        register_enum_plugin(id, true);
+        let key = format!("plugin.{id}.tier");
+
+        let (store, _tmp) = open_test_store().await;
+        let settings = SettingsStore::new(std::sync::Arc::new(store));
+
+        // Disabled by default: the required field must not block onboarding
+        // even though it's unset.
+        assert!(!settings
+            .missing_required()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k == &key));
+
+        // Enabling the plugin surfaces its unset required field as missing.
+        settings
+            .set(&format!("plugin.{id}.enabled"), "true")
+            .await
+            .unwrap();
+        assert!(settings
+            .missing_required()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k == &key));
+
+        // Setting a valid member value clears it.
+        settings.set(&key, "free").await.unwrap();
+        assert!(!settings
+            .missing_required()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k == &key));
+    }
+
+    /// Register a plugin with two settings fields: one carrying a `default`
+    /// (`required` parameterized) and a sibling with no `default`, to prove
+    /// the read-path fallback (this fix) is conditional on the field
+    /// actually declaring one.
+    fn register_plugin_with_default(id: &str, required: bool) {
+        use crate::plugins::{CorePlugin, PluginHost, PluginSource};
+        use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
+
+        let manifest = PluginManifest {
+            contract: 1,
+            id: id.to_string(),
+            name: format!("Test Default Plugin {id}"),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![
+                SettingField {
+                    key: format!("plugin.{id}.tier"),
+                    label: "Tier".to_string(),
+                    help: String::new(),
+                    secret: false,
+                    required,
+                    kind: FieldKind::String,
+                    options: Vec::new(),
+                    default: Some("free".to_string()),
+                },
+                SettingField {
+                    key: format!("plugin.{id}.nodefault"),
+                    label: "No Default".to_string(),
+                    help: String::new(),
+                    secret: false,
+                    required: false,
+                    kind: FieldKind::String,
+                    options: Vec::new(),
+                    default: None,
+                },
+            ],
+            mcp: vec![],
+            extensions: vec![],
+            skills: vec![],
+            provider: None,
+        };
+        let mut host = PluginHost::new();
+        host.add(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: None,
+            source: PluginSource::Builtin,
+        });
+    }
+
+    #[tokio::test]
+    async fn get_falls_back_to_a_registered_plugin_fields_default_when_unset() {
+        // Unique id — `plugin_field` is a process-wide registry, so a shared
+        // id could pick up state from another test's plugin in the same
+        // test binary.
+        let id = "task-c3-storetest-default-plugin";
+        register_plugin_with_default(id, false);
+        let key = format!("plugin.{id}.tier");
+        let no_default_key = format!("plugin.{id}.nodefault");
+
+        let (store, _tmp) = open_test_store().await;
+        let settings = SettingsStore::new(std::sync::Arc::new(store));
+
+        // Unset: falls back to the plugin field's declared default — this
+        // is the fix (previously `get` only consulted the static
+        // `find_field` catalog, which never covers `plugin.*` keys, so a
+        // manifest `default` had no effect on the read path at all).
+        assert_eq!(settings.get(&key).await.unwrap().as_deref(), Some("free"));
+        // A plugin field with no `default` still resolves to `None` when unset.
+        assert_eq!(settings.get(&no_default_key).await.unwrap(), None);
+
+        // An explicit stored value takes precedence over the plugin default.
+        settings.set(&key, "pro").await.unwrap();
+        assert_eq!(settings.get(&key).await.unwrap().as_deref(), Some("pro"));
+    }
+
+    #[tokio::test]
+    async fn missing_required_treats_a_required_plugin_field_with_a_default_as_satisfied() {
+        let id = "task-c3-storetest-required-default-plugin";
+        register_plugin_with_default(id, true);
+        let key = format!("plugin.{id}.tier");
+
+        let (store, _tmp) = open_test_store().await;
+        let settings = SettingsStore::new(std::sync::Arc::new(store));
+        settings
+            .set(&format!("plugin.{id}.enabled"), "true")
+            .await
+            .unwrap();
+
+        // Required, never explicitly set, but the field declares a
+        // `default` — `missing_required` calls the same `get()` used for
+        // substitution, so the default resolves it and it must not be
+        // reported as missing. This mirrors pre-existing behavior for
+        // static/global required fields with a schema default; it was
+        // simply unreachable for plugin fields before this fix.
+        assert!(!settings
+            .missing_required()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k == &key));
     }
 
     #[test]
@@ -330,7 +601,8 @@ mod tests {
             .missing_required()
             .await
             .unwrap()
-            .contains(&"workdir_root"));
+            .iter()
+            .any(|k| k == "workdir_root"));
         assert!(!settings.is_configured().await.unwrap());
         for (k, v) in [
             ("discord.token", "t"),

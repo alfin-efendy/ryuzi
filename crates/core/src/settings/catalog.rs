@@ -104,6 +104,7 @@ mod tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: Some(AuthSpec {
@@ -113,6 +114,7 @@ mod tests {
             }),
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         };
@@ -122,6 +124,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         });
 

@@ -27,6 +27,8 @@ fn fields_to_sdk(fields: &[ConfigField]) -> Vec<SettingField> {
                 FieldType::Int => FieldKind::Int,
                 FieldType::String | FieldType::Enum => FieldKind::String,
             },
+            options: f.one_of.iter().map(|s| s.to_string()).collect(),
+            default: f.default.map(str::to_string),
         })
         .collect()
 }
@@ -54,17 +56,20 @@ pub fn discord_plugin() -> CorePlugin {
             homepage: None,
             icon: Some("message-circle".to_string()),
             categories: vec!["chat-gateway".to_string()],
+            slot: None,
             verified: true,
             experimental: false,
             auth: None,
             settings: fields_to_sdk(crate::settings::catalog::DISCORD_FIELDS),
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         },
         harness: None,
         gateway,
         connector: None,
+        extension: None,
         source: PluginSource::Builtin,
     }
 }

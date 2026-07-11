@@ -703,11 +703,13 @@ mod tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         }
@@ -727,6 +729,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(NoopConnector)),
+            extension: None,
             source: PluginSource::Builtin,
         });
         ControlPlane::new(store, regs).await

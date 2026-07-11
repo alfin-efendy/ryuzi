@@ -24,6 +24,7 @@ pub mod catalog;
 pub mod catalog_feed_key;
 pub mod declarative;
 pub mod doctor;
+pub mod extension;
 pub mod host;
 pub mod oauth;
 pub mod providers;
@@ -33,7 +34,11 @@ use crate::settings::{csv, SettingsStore};
 use crate::store::Store;
 
 pub use doctor::{plugin_doctor, DoctorFinding};
-pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
+pub use extension::{
+    ExtensionCtx, ExtensionEvents, ExtensionFactory, ExtensionHost, ExtensionProc,
+    ExtensionSnapshot, ExtensionSpec, ExtensionStatus,
+};
+pub use host::{plugin_field, plugin_fields_all, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) — to `regs`. Factored out of
@@ -420,11 +425,13 @@ mod toggle_enabled_tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         }
@@ -436,6 +443,7 @@ mod toggle_enabled_tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -446,6 +454,7 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -456,6 +465,7 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -466,6 +476,7 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::Builtin,
         }
     }

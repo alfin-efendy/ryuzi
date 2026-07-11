@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod bash;
 pub mod edit;
+pub mod extension;
 pub mod glob;
 pub mod grep;
 pub mod ls;
@@ -172,6 +173,10 @@ impl Interaction {
                 summary: summary.to_string(),
                 approval_kind,
                 input,
+                // Plan/Question prompts are core-agent interactions, never a
+                // plugin's MCP tool call — `principal` is only ever resolved
+                // for `mcp__<server>__<tool>` calls via `permission::evaluate`.
+                principal: None,
             });
         tokio::select! {
             biased;
@@ -255,6 +260,11 @@ impl ToolOutput {
 pub struct PermissionSpec {
     pub key: String,
     pub summary: String,
+    /// Which plugin this call's tool belongs to, if any — attribution only,
+    /// carried through to the approval prompt (see
+    /// [`crate::domain::Principal`]). Built-in tools never set this; only
+    /// [`mcp::McpTool`] resolves one, from the mcp-server→plugin binding.
+    pub principal: Option<crate::domain::Principal>,
 }
 
 impl PermissionSpec {
@@ -262,7 +272,14 @@ impl PermissionSpec {
         PermissionSpec {
             key: key.into(),
             summary: summary.into(),
+            principal: None,
         }
+    }
+
+    /// Attach a resolved plugin principal (or clear it, given `None`).
+    pub fn with_principal(mut self, principal: Option<crate::domain::Principal>) -> Self {
+        self.principal = principal;
+        self
     }
 }
 
