@@ -30,6 +30,7 @@ pub mod providers;
 pub mod remote_catalog;
 
 use crate::settings::{csv, SettingsStore};
+use crate::store::Store;
 
 pub use doctor::{plugin_doctor, DoctorFinding};
 pub use host::{plugin_field, CorePlugin, PluginHost, PluginSource, Registries};
@@ -213,6 +214,15 @@ pub async fn toggle_enabled(
     let Some(plugin) = host.get(id) else {
         anyhow::bail!("unknown plugin: {id}");
     };
+    if enable {
+        let (blocked, reason) = is_blocked(&settings.store(), id).await;
+        if blocked {
+            anyhow::bail!(
+                "blocked by catalog: {}",
+                reason.unwrap_or_else(|| "revoked".into())
+            );
+        }
+    }
     if plugin.harness.is_some() {
         anyhow::bail!("{id} is always enabled");
     }
@@ -250,6 +260,56 @@ async fn toggle_csv(
         values.retain(|v| v != id);
     }
     settings.set(key, &values.join(",")).await
+}
+
+/// Whether the remote catalog's signed feed has blocked `id`, per the cached
+/// `plugin_catalog_cache` rows Task 3's fetch pipeline writes
+/// ([`remote_catalog::fetch_and_cache`]). A store read failure is treated as
+/// "not blocked" — a transient DB hiccup must never itself refuse an enable
+/// or manufacture a doctor finding.
+pub async fn is_blocked(store: &Store, id: &str) -> (bool, Option<String>) {
+    match store.list_remote_catalog().await {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|r| r.id == id && r.blocked)
+            .map(|r| (true, r.blocked_reason))
+            .unwrap_or((false, None)),
+        Err(_) => (false, None),
+    }
+}
+
+/// Live-disable every currently-enabled plugin whose id the feed blocked.
+/// Future enables are refused separately by [`toggle_enabled`]'s
+/// [`is_blocked`] short-circuit; this sweep only needs to handle plugins that
+/// were already enabled *before* the block took effect. No restart is
+/// needed — the session-attach loop re-reads [`PluginHost::is_enabled`] per
+/// session, so flipping the setting here takes effect on the next attach.
+///
+/// Best-effort per id: a single plugin's settings write failing is logged
+/// and does not abort the rest of the sweep.
+pub async fn apply_blocked_denylist(
+    store: &Store,
+    settings: &SettingsStore,
+    host: &PluginHost,
+) -> anyhow::Result<()> {
+    let blocked: Vec<String> = store
+        .list_remote_catalog()
+        .await?
+        .into_iter()
+        .filter(|r| r.blocked)
+        .map(|r| r.id)
+        .collect();
+    for id in blocked {
+        if host.get(&id).is_some() && host.is_enabled(settings, &id).await.unwrap_or(false) {
+            match settings.set(&format!("plugin.{id}.enabled"), "false").await {
+                Ok(()) => tracing::warn!("catalog: auto-disabled blocked plugin {id}"),
+                Err(e) => {
+                    tracing::warn!("catalog: failed to auto-disable blocked plugin {id}: {e}")
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -487,6 +547,58 @@ mod toggle_enabled_tests {
         assert_eq!(
             err.to_string(),
             "zep-toggle-test is experimental — nothing to enable"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_blocked_denylist_disables_enabled_and_refuses_toggle() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let mut host = PluginHost::new();
+        host.add(connector_only("acme"));
+
+        // Enable "acme" before it's ever blocked.
+        toggle_enabled(&host, &settings, "acme", true)
+            .await
+            .unwrap();
+        assert!(host.is_enabled(&settings, "acme").await.unwrap());
+
+        // The feed now blocks "acme" — seed the cached row Task 3's fetch
+        // pipeline would have written.
+        store
+            .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
+                id: "acme".to_string(),
+                manifest_toml: String::new(),
+                version: String::new(),
+                sequence: 1,
+                blocked: true,
+                blocked_reason: Some("revoked: compromised".to_string()),
+                fetched_at: 0,
+            }])
+            .await
+            .unwrap();
+
+        apply_blocked_denylist(&store, &settings, &host)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings
+                .get("plugin.acme.enabled")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("false"),
+            "apply_blocked_denylist must live-disable an already-enabled blocked plugin"
+        );
+        assert!(!host.is_enabled(&settings, "acme").await.unwrap());
+
+        let err = toggle_enabled(&host, &settings, "acme", true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked"),
+            "re-enabling a blocked plugin must be refused, got: {err}"
         );
     }
 

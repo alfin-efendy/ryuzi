@@ -368,7 +368,12 @@ impl RemoteCatalogManager {
             if after != before {
                 self.cp.mark_plugins_restart_required();
             }
-            // Task 6 wires: apply_blocked_denylist(&self.store, &self.settings, self.cp.plugins()).await;
+            let _ = crate::plugins::apply_blocked_denylist(
+                &self.store,
+                &self.settings,
+                self.cp.plugins(),
+            )
+            .await;
         }
         outcome
     }

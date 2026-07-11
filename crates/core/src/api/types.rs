@@ -713,7 +713,7 @@ pub struct DoctorFinding {
     pub plugin_id: String,
     /// `warn` | `error`.
     pub severity: String,
-    /// `reconnect-required` | `missing-binary` | `attach-failed`.
+    /// `reconnect-required` | `missing-binary` | `attach-failed` | `blocked`.
     pub kind: String,
     pub message: String,
     pub suggested_action: String,
