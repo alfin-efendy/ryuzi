@@ -553,6 +553,36 @@ test("connection detail back button routes to the account's vendor family, not i
   expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
 });
 
+test("connection detail exposes Codex reset from quota capability, not provider id", async () => {
+  const futureCodex = {
+    ...connection,
+    id: "future-codex",
+    provider: "future-oauth",
+    providerName: "Future Codex provider",
+    authType: "oauth",
+    quotaCapability: "codex" as const,
+  };
+  useConnections.setState({ catalog, connections: [futureCodex], loaded: true });
+  render(<ConnectionDetailView id="future-codex" />);
+
+  expect(await screen.findByText("Provider quota")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Reset credit" })).toBeTruthy();
+});
+
+test("connection detail hides quota when core reports no capability", () => {
+  const unsupported = {
+    ...connection,
+    id: "unsupported-oauth",
+    provider: "openai-oauth",
+    authType: "oauth",
+    quotaCapability: null,
+  };
+  useConnections.setState({ catalog, connections: [unsupported], loaded: true });
+  render(<ConnectionDetailView id="unsupported-oauth" />);
+
+  expect(screen.queryByText("Provider quota")).toBeNull();
+});
+
 test("warns when secrets fall back to a local file instead of the OS keychain", async () => {
   useEndpoint.setState({ status: { ...status, keychainStatus: "fileFallback" }, keys, loaded: true });
   render(<ModelsView />);

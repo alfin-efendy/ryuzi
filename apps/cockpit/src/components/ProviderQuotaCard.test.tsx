@@ -45,7 +45,7 @@ test("renders subscription quota windows and Codex reset control", () => {
 
   render(
     <ProviderQuotaCard
-      provider="openai-oauth"
+      capability="codex"
       quota={codexQuota}
       loading={false}
       resetting={false}
@@ -68,7 +68,7 @@ test("renders subscription quota windows and Codex reset control", () => {
 test("hides reset credit control for Claude subscription quotas", () => {
   render(
     <ProviderQuotaCard
-      provider="anthropic-oauth"
+      capability="claude"
       quota={{ ...codexQuota, provider: "anthropic-oauth", plan: "Claude Code", resetCredits: null }}
       loading={false}
       resetting={false}
@@ -86,7 +86,7 @@ test("keeps Codex reset control available before quota details load", () => {
 
   render(
     <ProviderQuotaCard
-      provider="openai-oauth"
+      capability="codex"
       quota={null}
       loading={false}
       resetting={false}

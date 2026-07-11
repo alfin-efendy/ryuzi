@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import { commands, type ProviderQuotaInfo } from "@/bindings";
+import { commands, type ProviderQuotaCapability, type ProviderQuotaInfo } from "@/bindings";
 import { useConnections } from "@/store-connections";
 import { useNav } from "@/store-nav";
 import { usesDeviceSignin } from "@/components/modals/deviceSignin";
@@ -38,11 +38,10 @@ export function ConnectionDetailView({ id }: { id: string }) {
   }, [loaded, hydrate]);
 
   const conn = connections.find((c) => c.id === id);
-  const supportsProviderQuota =
-    !!conn && conn.authType === "oauth" && (conn.provider === "anthropic-oauth" || conn.provider === "openai-oauth");
+  const quotaCapability: ProviderQuotaCapability | null = conn?.quotaCapability ?? null;
 
   const loadProviderQuota = useCallback(async () => {
-    if (!conn || !supportsProviderQuota) {
+    if (!conn || !quotaCapability) {
       setProviderQuota(null);
       return;
     }
@@ -54,12 +53,12 @@ export function ConnectionDetailView({ id }: { id: string }) {
       return;
     }
     toast.error(`Quota failed: ${result.error.message}`);
-  }, [conn, supportsProviderQuota]);
+  }, [conn, quotaCapability]);
 
   useEffect(() => {
-    if (supportsProviderQuota) void loadProviderQuota();
+    if (quotaCapability) void loadProviderQuota();
     else setProviderQuota(null);
-  }, [supportsProviderQuota, loadProviderQuota]);
+  }, [quotaCapability, loadProviderQuota]);
 
   // Seed the form fields once per connection — later hydrations (e.g. after
   // Save) shouldn't clobber an in-progress edit.
@@ -204,9 +203,9 @@ export function ConnectionDetailView({ id }: { id: string }) {
           </Button>
         </DetailHeader>
 
-        {supportsProviderQuota && (
+        {quotaCapability && (
           <ProviderQuotaCard
-            provider={conn.provider}
+            capability={quotaCapability}
             quota={providerQuota}
             loading={quotaLoading}
             resetting={resettingCredit}

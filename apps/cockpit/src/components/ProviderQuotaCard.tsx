@@ -1,5 +1,5 @@
 import { RefreshCw, RotateCcw } from "lucide-react";
-import type { ProviderQuotaInfo, QuotaWindowInfo } from "@/bindings";
+import type { ProviderQuotaCapability, ProviderQuotaInfo, QuotaWindowInfo } from "@/bindings";
 import { quotaColor } from "@/constants";
 import { QuotaTrack } from "@/components/common/bits";
 import {
@@ -29,10 +29,9 @@ function formatReset(value: string | null) {
   });
 }
 
-function quotaHint(provider: string) {
-  if (provider === "anthropic-oauth") return "Live quota from Claude subscription";
-  if (provider === "openai-oauth") return "Live quota from ChatGPT Codex subscription";
-  return "Live quota from the provider account";
+function quotaHint(capability: ProviderQuotaCapability) {
+  if (capability === "claude") return "Live quota from Claude subscription";
+  return "Live quota from ChatGPT Codex subscription";
 }
 
 function QuotaRow({ quota }: { quota: QuotaWindowInfo }) {
@@ -52,14 +51,14 @@ function QuotaRow({ quota }: { quota: QuotaWindowInfo }) {
 }
 
 export function ProviderQuotaCard({
-  provider,
+  capability,
   quota,
   loading,
   resetting,
   onRefresh,
   onResetCredit,
 }: {
-  provider: string;
+  capability: ProviderQuotaCapability;
   quota: ProviderQuotaInfo | null;
   loading: boolean;
   resetting: boolean;
@@ -67,7 +66,7 @@ export function ProviderQuotaCard({
   onResetCredit?: () => void;
 }) {
   const credits = quota?.resetCredits;
-  const canShowReset = provider === "openai-oauth" && !!onResetCredit;
+  const canShowReset = capability === "codex" && !!onResetCredit;
   const availableCredits = credits?.availableCount ?? 0;
 
   return (
@@ -75,7 +74,7 @@ export function ProviderQuotaCard({
       <CardHeader className="justify-between">
         <div className="min-w-0">
           <CardTitle>Provider quota</CardTitle>
-          <CardHint>{quotaHint(provider)}</CardHint>
+          <CardHint>{quotaHint(capability)}</CardHint>
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {canShowReset && (
