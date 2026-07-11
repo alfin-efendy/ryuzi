@@ -264,16 +264,25 @@ test("accounts: inline rename, switch, reorder, test, reset, and delete remain o
 
   await page.getByRole("button", { name: "Rename Codex Primary" }).click();
   const rename = page.getByRole("dialog", { name: "Rename account" });
+  await expect(rename.getByRole("textbox")).toHaveCount(1);
+  await expect(rename.getByRole("textbox", { name: "Account name" })).toBeVisible();
+  await expect(rename.getByRole("textbox", { name: /API key/i })).toHaveCount(0);
+  await expect(rename.getByRole("textbox", { name: /Base URL/i })).toHaveCount(0);
+  await expect(rename.getByText(/credential|secret|cloaking/i)).toHaveCount(0);
   await rename.getByRole("textbox", { name: "Account name" }).fill("  Main Codex  ");
   await rename.getByRole("button", { name: "Save" }).click();
   await expect(page.getByText("Main Codex", { exact: true })).toBeVisible();
-  await expect(page.getByRole("textbox", { name: /API key/i })).toHaveCount(0);
-  await expect(page.getByRole("textbox", { name: /Base URL/i })).toHaveCount(0);
 
   await page.getByRole("switch", { name: "Enabled Main Codex" }).click();
   await expect(page.getByRole("switch", { name: "Enabled Main Codex" })).toHaveAttribute("aria-checked", "false");
   await page.getByRole("button", { name: "Move Codex Backup up" }).click();
+  await expect
+    .poll(async () =>
+      page.getByRole("button", { name: /^Rename / }).evaluateAll((buttons) => buttons.map((button) => button.getAttribute("aria-label"))),
+    )
+    .toEqual(["Rename Codex Backup", "Rename Main Codex"]);
   await page.getByRole("button", { name: "Test Codex Backup" }).click();
+  await expect(page.getByText("Connection works", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "Reset credit for Codex Backup" }).click();
   const reset = page.getByRole("dialog", { name: "Reset credit?" });
@@ -328,8 +337,10 @@ test("accounts: late quota cannot repopulate an unmounted provider and reload st
   await expect(page.getByRole("progressbar", { name: "Codex Primary Codex primary quota" })).toHaveCount(0);
 
   await page.getByRole("button", { name: /^Codex 2 accounts/ }).click();
-  await expect(page.getByRole("progressbar", { name: "Codex Primary Codex primary quota" })).toBeVisible();
+  await expect(page.getByRole("progressbar", { name: "Codex Primary Codex primary quota" })).toHaveAttribute("aria-valuenow", "20");
+  await expect(page.getByRole("progressbar", { name: "Codex Primary Codex primary quota" })).not.toHaveAttribute("aria-valuenow", "99");
+  await expect(page.getByRole("button", { name: "Retry quota for Codex Primary" })).toHaveCount(0);
   await page.reload();
   await openProvider(page, "Codex");
-  await expect(page.getByRole("progressbar", { name: "Codex Primary Codex primary quota" })).toBeVisible();
+  await expect(page.getByRole("progressbar", { name: "Codex Primary Codex primary quota" })).toHaveAttribute("aria-valuenow", "20");
 });

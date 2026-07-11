@@ -371,11 +371,11 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
       const w = window as unknown as Record<string, unknown>;
       w.__mockCalls = calls;
       w.__resolveMockQuota = (id: string) => {
-        pendingQuota.get(id)?.(quotaFor(id));
+        pendingQuota.get(id)?.(quotaFor(id, 99));
         pendingQuota.delete(id);
       };
 
-      const quotaFor = (id: string) => ({
+      const quotaFor = (id: string, usedOverride?: number) => ({
         provider: id.startsWith("claude") ? "anthropic-oauth" : "openai-oauth",
         plan: id.startsWith("claude") ? "Claude Pro" : "ChatGPT Plus",
         message: null,
@@ -385,8 +385,8 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         quotas: [
           {
             label: id.startsWith("claude") ? "5 hour" : "Codex primary",
-            usedPercentage: id.endsWith("backup") ? 35 : 20,
-            remainingPercentage: id.endsWith("backup") ? 65 : 80,
+            usedPercentage: usedOverride ?? (id.endsWith("backup") ? 35 : 20),
+            remainingPercentage: 100 - (usedOverride ?? (id.endsWith("backup") ? 35 : 20)),
             resetAt: "2030-01-01T00:00:00Z",
           },
         ],
