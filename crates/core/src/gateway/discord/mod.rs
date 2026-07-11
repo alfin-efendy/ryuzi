@@ -795,6 +795,7 @@ mod tests {
                     approver_role_ids: vec!["r1".to_string()],
                     started_by: Some("u1".to_string()),
                     timeout_ms: Some(1000),
+                    principal: None,
                 },
             )
             .await

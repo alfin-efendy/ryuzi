@@ -164,11 +164,13 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `homepage` | string \| null | `None` | |
 | `icon` | string \| null | `None` | A lucide icon name. Cockpit maps a small explicit set (`message-circle`, `terminal`, `cpu`, `globe`, `database`, `search`, `cloud`, `server`, `webhook`, `key`, `mail`, `bot`) and falls back to a generic puzzle icon for everything else — including brand-name icons like `github`, `slack`, or `figma`, since `lucide-react` dropped brand/logo icons (see `apps/cockpit/src/lib/plugin-icons.ts`). |
 | `categories` | string[] | `[]` | See the vocabulary table below. Unknown labels are a non-fatal warning (`PluginManifest::warnings()`), never a validation error. |
+| `slot` | string \| null | `None` | Exclusive capability claim (first-registration-wins) — see [Exclusive capability slots](#exclusive-capability-slots). |
 | `verified` | bool | `false` | First-party/vendor-confirmed. Drives the `verified`/`experimental`/`community` status label (see below). |
 | `experimental` | bool | `false` | Docs-only entry with no working `[[mcp]]` server — see [Enabling](#enabling-plugins). |
 | `auth` | `[auth]` table \| null | `None` | See [Auth kinds](#auth-kinds-and-substitution). |
 | `settings` | `[[settings]]` array | `[]` | Extra non-auth settings fields. |
 | `mcp` | `[[mcp]]` array | `[]` | See [MCP server defs](#mcp-server-defs). |
+| `extensions` | `[[extension]]` array | `[]` | Supervised subprocess "code plugin" declarations (Track D) — see the `[[extension]]` reference below. |
 | `skills` | `[[skills]]` array | `[]` | See [Skills bundling](#skills-bundling). |
 | `provider` | `[provider]` table \| null | `None` | Model-provider capability block — see below. |
 
@@ -200,10 +202,58 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `secret` | bool | `false` | Redacted in the settings UI/API the same way `auth.setting` is. |
 | `required` | bool | `false` | See `ensure_auth`'s required-settings check below. |
 | `kind` | `"string"` \| `"int"` \| `"bool"` | `"string"` | No catalog entry currently uses anything but the default. |
+| `options` | string[] | `[]` | Non-empty makes this field an enum/choice: the persisted value must be one of these members, enforced at write time by `settings::store::validate_plugin_field`. `validate()` rejects a non-empty `options` paired with `kind != "string"` (`SettingOptionsRequireStringKind`). |
+| `default` | string \| null | `None` | Effective value used when no row is persisted yet. When `options` is non-empty, `default` (if set) must be one of its members — `validate()` rejects otherwise (`SettingDefaultNotInOptions`). |
+
+Example — an enum field with a default:
+
+```toml
+[[settings]]
+key = "plugin.acme.tier"
+label = "Tier"
+kind = "string"
+options = ["free", "pro", "enterprise"]
+default = "free"
+```
+
+Cockpit's plugin detail screen (`PluginDetailView.tsx`'s `FieldRow`) renders
+a field by `kind`/`options`: `kind = "bool"` is a self-saving `Switch`
+(using `default == "true"` for its initial toggle state when no row is
+set); a non-empty `options` list is a `Combobox` of those choices,
+regardless of `secret`; otherwise it's a plain `Input`, typed `number` when
+`kind = "int"` and password-masked when `secret = true` — `int` wins that
+tie-break, so a secret `int` field still renders as a plain number input,
+not masked. Outside the `bool`/`Combobox` cases, `default` is shown only as
+placeholder text (`"Default: <value>"`), never pre-filled into the input.
+On the read path (used for `${setting:KEY}` substitution),
+`SettingsStore::get` (`crates/core/src/settings/store.rs`) resolves a value
+in this order: the persisted row, then the static settings catalog's own
+default, then this field's manifest `default`, then `None`.
 
 ### `[[mcp]]`
 
 See [MCP server defs](#mcp-server-defs) for the full field table.
+
+### `[[extension]]`
+
+`ExtensionDef` (`ryuzi_plugin_sdk::manifest::ExtensionDef`) — a supervised
+subprocess "code plugin" declaration (Track D). See
+[Extension runtime](#extension-runtime-track-d) below for what actually
+runs one of these.
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `name` | string | *(required)* | Unique within this manifest's own `extensions` list — NOT globally, and a separate namespace from `[[mcp]]` server names (an extension and an MCP server may share a name). |
+| `command` | string | *(required)*, non-empty | The stdio binary to spawn, or a `${...}` placeholder (`${auth}`, `${setting:KEY}`) resolved the same way `McpServerDef::command` is. |
+| `args` | string[] | `[]` | |
+| `events` | string[] | `[]` | Hook events this extension subscribes to. Every entry must be a member of `KNOWN_HOOK_EVENTS` (`session.start`, `tool.before`, `tool.after`, `session.end`) — an unknown event is a hard `validate()` error (`ExtensionUnknownEvent`), unlike an unknown `categories`/`slot` value, which only warns. |
+| `provides_tools` | bool | `false` | If true, the host queries this extension for tool definitions at init and wires them into the session's tool registry. |
+| `timeout_ms` | integer \| null | `None` | Per-event response budget in milliseconds. When present, must be `> 0` and `<= 60000` (`MAX_EXTENSION_TIMEOUT_MS`), or `validate()` rejects it (`ExtensionTimeoutOutOfRange`). The runtime falls back to 5000ms (`DEFAULT_EVENT_TIMEOUT_MS`) when omitted. |
+
+`validate()` also rejects a duplicate `name` within one manifest
+(`DuplicateExtensionName`), an empty `command` (`ExtensionEmptyCommand`),
+and a `${auth}` placeholder in `command`/`args` with no `[auth]` block
+(`ExtensionAuthPlaceholderWithoutAuth`).
 
 ### `[[skills]]`
 
@@ -301,6 +351,34 @@ without breaking existing manifests.
 `model-provider`/`api-key`/`oauth`/`free` are provider-only labels generated
 by `providers.rs`, not something a third-party integration manifest needs —
 an integration's auth tier is described by `[auth].kind`, not by category.
+
+---
+
+## Exclusive capability slots
+
+A category (above) is a free-form, cosmetic tag any number of plugins may
+share. A `slot` is stricter: it's a plugin's claim to be *the* provider of
+one named capability — e.g. a Hermes memory backend declaring:
+
+```toml
+slot = "memory"
+```
+
+`ryuzi_plugin_sdk::categories::KNOWN_SLOTS` names three recognized slots —
+`memory`, `knowledge-graph`, `search` — but, like `categories`, an
+unrecognized slot name is only a non-fatal `PluginManifest::warnings()`
+entry, never a `validate()` error.
+
+Arbitration happens in `PluginHost::add` (`crates/core/src/plugins/host.rs`)
+at plugin-registration time, using the same first-registration-wins rule the
+host already uses for duplicate plugin `id`s: the first plugin registered
+that claims a given `slot` becomes its owner (`PluginHost::slot_owner(slot)`);
+every later plugin claiming the same slot is still registered as an ordinary
+plugin (its other capabilities work normally) but loses the slot claim, and
+is recorded in `PluginHost::slot_conflicts()`. `plugin_doctor`
+(`crates/core/src/plugins/doctor.rs`) surfaces every recorded conflict as a
+`"slot-conflict"` warning finding, attributed to the losing plugin, naming
+both the winner and the loser.
 
 ---
 
@@ -450,6 +528,32 @@ Docker daemon):
 
 Three entries are docs-only (`experimental = true`, no `[[mcp]]` at all —
 see [Enabling plugins](#enabling-plugins)): `ngrok`, `vercel-sandbox`, `zep`.
+
+---
+
+## Approval attribution
+
+When a plugin-provided tool (an MCP server's tool, or — Track D — an
+extension's `provides_tools` tool) needs approval, the approval prompt shows
+which plugin owns it. `crate::domain::Principal { plugin_id, plugin_name }`
+is "attribution only" (its own doc comment: it "carries no gating
+semantics") — resolved once, at the point a tool is bound to its owning
+plugin, never parsed back out of a tool name:
+
+- For an MCP server's tools: `ControlPlane::attach_plugin_mcp_servers`
+  (`crates/core/src/control/lifecycle.rs`) builds a `name -> Principal` map
+  from the manifest that contributed each `McpServerSpec`.
+- For an extension's tools (Track D): `ExtensionHost::spawn_all`
+  (`crates/core/src/plugins/extension/proc.rs`) resolves the owning plugin's
+  `Principal` once per plugin at spawn time; every `ext__<extension>__<tool>`
+  tool it provides carries that same `Principal` unconditionally — unlike an
+  MCP tool, which may have none if it was DB-configured with no owning
+  plugin.
+
+The `Principal` rides along on `domain::ApprovalRequest.principal` and the
+`approvalRequested` event Cockpit receives; Cockpit's `ApprovalCard`
+(`apps/cockpit/src/components/approval/ApprovalCard.tsx`) is what actually
+renders it, as a `via {pluginName}` pill next to the request.
 
 ---
 
@@ -822,17 +926,287 @@ MCP server) use hook scripts, not the manifest — see
 ```
 
 one executable per file, run in filename-sorted order, receiving the event
-payload as JSON on stdin. Only one event actually fires today: `tool.before`,
-a gating event dispatched from the native runner (`harness::native::runner`)
-before every tool call — a non-zero exit denies the action and the script's
-stdout becomes the shown reason. The `hooks::run` helper is event-name-generic
-(it would run any `.ryuzi/hooks/<event>/` directory's scripts), and
-`session.start`/`tool.after` event names exist in earlier design notes, but
-nothing in the native runner currently calls `hooks::run` for them — do not
-document them as observational hooks that fire; treat this as a future
-gap, not shipped behavior, until a call site exists. A missing hooks
-directory, or a script that isn't executable, is treated as "allow" — never
-a hard failure.
+payload as JSON on stdin. The typed event vocabulary (`hooks::HookEvent`) has
+four members, all dispatched from the native runtime (`harness::native`):
+
+| Event | Fires | Gating? | Payload |
+| --- | --- | --- | --- |
+| `session.start` | `NativeHarness::start_session`, after model/agent resolution | No (observational) | `{ session, project, model, work_dir }` |
+| `tool.before` | `harness::native::runner`, before every tool call | **Yes** | `{ tool, input }` |
+| `tool.after` | `harness::native::runner`, after the tool call resolves (Ok or Err) | No (observational) | `{ tool, input, result: { ok, output } }` or `{ tool, input, result: { ok: false, error } }` |
+| `session.end` | `NativeSession::end` — the sole teardown path reached from `ControlPlane::end_session` (never from a `stop_session` interrupt) | No (observational) | `{ session, reason }` |
+
+Only `tool.before` is gating: a non-zero exit denies the action and the
+script's stdout becomes the shown reason. Every other event is
+fire-and-forget — a non-zero exit from an observational hook is ignored
+(the remaining scripts still run, and the tool/session outcome is
+unaffected). `tool.after`'s `result.output`/`result.error` is truncated
+(2,000 bytes) before being written to the hook's stdin; it is not a
+secrets-scrubbed channel beyond that — it carries the same model-facing text
+the tool already returned to the LLM, not raw untouched process output. A
+missing hooks directory, or a script that isn't executable, is treated as
+"allow" — never a hard failure.
+
+On-disk scripts are one of TWO sinks for the same typed `HookEvent`
+vocabulary. `harness::native::hooks::fire_hook` — the one call site every
+`harness::native` hook fire site actually uses — runs the on-disk scripts
+(`run`, above) and, when the session has any spawned extension subscribed to
+the event, Track D's supervised extension subprocesses
+(`plugins::extension::events::ExtensionEvents::dispatch`) CONCURRENTLY, then
+combines their results: for `tool.before`, either sink denying denies the
+call (a script-deny always wins even if every extension allowed, and vice
+versa); every other event stays fire-and-forget from both sinks. A session
+with no extensions registered (`SessionCtx.extension_events: None`, the
+common case) skips the extension side entirely and behaves exactly as if
+Track D didn't exist. See [Extension runtime](#extension-runtime-track-d)
+below for what a subscribed extension actually receives and how it answers.
+
+---
+
+## Extension runtime (Track D)
+
+An **extension** (the `[[extension]]` manifest table above) is a supervised
+**subprocess**, never in-process plugin code: `plugins::extension`'s own
+module doc states this as a hard invariant — "every extension is a
+subprocess... no mechanism to load or execute plugin-supplied code any
+other way." It speaks JSON-RPC 2.0 over its own stdin/stdout, subscribes to
+the same `HookEvent` vocabulary [hook scripts](#hook-scripts) use, and —
+optionally — exposes tools into a session's tool registry.
+
+### Extension vs. `[[mcp]]`
+
+Both are subprocess integrations, but they cover different axes:
+
+| | `[[mcp]]` | `[[extension]]` |
+| --- | --- | --- |
+| Provides tools | Yes — that's its only job | Optional (`provides_tools`) |
+| Reacts to lifecycle events | No | Yes (`events[]`) |
+| Can gate/deny a tool call | No | Yes, if subscribed to `tool.before` |
+| Spawned | Per session, at attach | Once per daemon lifetime — every subscriber shares one long-lived process |
+
+### Protocol (`plugins::extension::protocol`)
+
+Every method is plain JSON-RPC 2.0 over stdio, framed one JSON object per
+line. The host speaks `PROTOCOL_VERSION = "1"`.
+
+| Method | Direction | Purpose |
+| --- | --- | --- |
+| `extension/initialize` | host -> extension | One-time startup handshake — see below. |
+| `event/<name>` | host -> extension | Fires a subscribed `HookEvent` (`event/tool.before`, `event/tool.after`, `event/session.start`, `event/session.end`), carrying the same JSON payload the on-disk script sink receives on stdin. |
+| `extension/ping` | host -> extension | Health probe (the supervisor below). |
+| `tool/call` | host -> extension | Invoke one `{ name, arguments }` tool this extension declared via `provides_tools`. |
+| `extension/shutdown` | host -> extension | Request a graceful stop. |
+
+**Handshake.** The host sends `extension/initialize` with
+`{ protocolVersion, host: { name, version }, events: [...], providesTools }`
+— `events` is every hook event this extension's manifest subscribes to,
+`providesTools` mirrors its `provides_tools` flag. A well-behaved extension
+replies `{ result: { ok: true, events: [...], tools: [...] } }` — `events`
+is which of the offered events it actually confirms (may be a subset),
+`tools` is present only when it declared `provides_tools`, each a
+`{ name, description?, inputSchema? }` def (`name` is the only required
+field; a missing/blank one is skipped, not fatal). `protocolVersion` in the
+response is checked only if the extension bothers to send one.
+
+**Event dispatch.** `event/<name>` carries the event's JSON payload verbatim
+as `params` — identical to what the on-disk script sink gets on stdin (see
+[Hook scripts](#hook-scripts) for the payload shape per event). For a
+gating event (`tool.before`), the extension answers
+`{ result: { deny: true, reason: "..." } }` to deny, or anything else
+(including an empty `{}` or `{"result":{"deny":false}}`) to allow.
+Non-gating events are sent the same way but the response is never awaited
+on the session's hot path (see Security below).
+
+**Tool calls.** `tool/call` carries `{ name, arguments }`; the extension
+replies `{ result: <value> }` (flattened the same way an MCP tool's reply
+is) or a JSON-RPC `error` object, surfaced to the model as a normal tool
+ERROR — a rejecting/timing-out/crashed extension never propagates a panic
+or a hang.
+
+### Security model (`plugins::extension::proc`)
+
+Every extension child is spawned with `Command::env_clear()`, **not** the
+daemon's inherited environment — this is deliberately stricter than the
+native MCP client (`harness::native::mcp_client`), which still layers onto
+the daemon's full inherited environment for `[[mcp]]` stdio servers. An
+extension child gets only:
+
+- a minimal safe base copied from the daemon's own environment when
+  present: `PATH`, `HOME`, `LANG` (`SAFE_BASE_ENV_VARS`);
+- exactly the extra `(key, value)` pairs its resolved `ExtensionSpec.env`
+  declares — always empty today, since `ryuzi_plugin_sdk::ExtensionDef` has
+  no `env` table of its own yet (only `command`/`args` can reference
+  `${auth}`/`${setting:KEY}`).
+
+**Fail-open on gating.** A `tool.before` dispatch to an extension is bounded
+by that extension's own `timeout_ms` (falling back to
+`DEFAULT_EVENT_TIMEOUT_MS` = 5000ms when the manifest omits it); a timeout,
+a crashed process, or a closed transport is treated as "did not deny" plus
+a `tracing::warn!` — a broken/slow extension can never brick the agent.
+Every subscribed extension for a gating event is dispatched CONCURRENTLY, so
+total wait is bounded by the single slowest extension's own timeout, not
+their sum; any one denying denies the call.
+
+**Fire-and-forget on observational events.** `session.start`/`tool.after`/
+`session.end` dispatches are never awaited on the caller's path at all —
+each subscribed extension's send is a detached background task, capped at
+32 concurrently in-flight sends across the whole host
+(`MAX_INFLIGHT_OBSERVATIONAL_SENDS`); a send that can't get a slot is
+dropped (logged), never queued.
+
+**Sanitized deny reasons.** A gating deny reason is shown to the user/agent,
+but an extension is less trusted than a hand-written script, so its reason
+gets extra screening: capped at 300 characters
+(`MAX_DENY_REASON_CHARS`), and wholesale replaced with a generic
+`"[reason withheld: it looked like it might contain a credential]"` marker
+if it contains a case-insensitive secret-shaped substring (`token`,
+`secret`, `password`, `apikey`, `bearer`, `credential`, ...).
+
+### Supervision (`plugins::extension::proc::supervise`)
+
+Each spawned extension is independently supervised — one giving up never
+touches any other extension, plugin, or the daemon:
+
+| Knob | Value | Const |
+| --- | --- | --- |
+| Health ping cadence | 30s | `PING_INTERVAL` |
+| Ping round-trip budget | 5s | `PING_TIMEOUT` |
+| Restart backoff, first attempt | 1s | `RESTART_BACKOFF_BASE` |
+| Restart backoff cap | 60s | `RESTART_BACKOFF_CAP` |
+| Max restart attempts before giving up | 5 | `MAX_RESTARTS_IN_WINDOW` |
+| ...inside a sliding window of | 5 minutes | `RESTART_WINDOW` |
+| Continuously-`Running` duration that resets the restart budget | 60s | `HEALTHY_RESET_AFTER` |
+| One-time handshake budget (distinct from the per-event `timeout_ms`) | 25s | `INIT_HANDSHAKE_TIMEOUT` |
+| Graceful-shutdown grace period before a hard kill | 5s | `SHUTDOWN_GRACE` |
+
+Backoff is exponential and capped: `min(1s * 2^attempt, 60s)` — 1s, 2s, 4s,
+8s, 16s, 32s, then clamped at 60s. Once `MAX_RESTARTS_IN_WINDOW` (5) restart
+*attempts* have happened inside the 5-minute `RESTART_WINDOW`, the
+supervisor gives up permanently: the extension's status becomes
+`Failed("restart-exhausted: 5 restarts within 300s")` and its task exits —
+it never respawns again without a daemon restart. An extension that stays
+`Running` continuously for `HEALTHY_RESET_AFTER` (60s) gets its restart
+history cleared, so an old, long-past burst of restarts never counts
+against a later, unrelated crash.
+
+### Trust — installing an extension-declaring plugin
+
+Installing (or updating into) a plugin pack whose manifest declares any
+`[[extension]]` entries **always** requires the two-phase trust gate
+(`begin_install` -> `confirm_install`, see
+[Two-phase tiered trust gate](#two-phase-tiered-trust-gate)) — it is never
+curated-immediate, even for a source in `CURATED_SKILL_SOURCES`:
+`skills_install.rs`'s `discovery_runs_code` reports `true` for any pack
+whose manifest has a non-empty `extensions` list, and `begin_install_with`
+only takes the curated-immediate branch when the source is curated **and**
+`discovery_runs_code` is `false` — so a code-running pack always falls
+through to `stage_for_trust_prompt` and `BeginInstall::NeedsConfirmation`.
+Cockpit's `SkillInstallModal` shows a "Runs code" warning badge and
+explanatory copy ("This plugin runs code in a supervised subprocess —
+review it carefully before trusting it.") for this case, distinct from (and
+in addition to) the existing "bundles hook scripts" warning. Updating an
+already-installed pack whose freshly re-cloned manifest runs code (whether
+an `[[extension]]` was newly added, or was already there) re-triggers the
+same confirmation on **every** such update, unconditionally — not just the
+first time a code-running version is seen, since the ledger has no reliable
+way to diff "the same acknowledged code" from "changed code." The raw,
+single-skill `install_skill` path (bypassing the trust-prompt UI) refuses
+outright, with an error naming the two-phase flow, for any source that
+isn't a curated, non-code pack — a hand-authored extension-bearing pack can
+never sneak in through it.
+
+### Observability
+
+`plugin_doctor` (`crates/core/src/plugins/doctor.rs`) adds four
+extension-specific finding kinds, gated on the daemon's `ExtensionHost`
+actually having spawned something for *any* plugin (so a thin client that
+never spawns extensions reports nothing):
+
+| `kind` | Severity | Trigger |
+| --- | --- | --- |
+| `not-running` | warn | Plugin is enabled and declares an extension, but the host has nothing spawned for it. |
+| `crashed` | warn | The extension's live status is `Restarting`. |
+| `init-failed` | error | The extension's status is `Failed(reason)` for a reason other than restart exhaustion. |
+| `restart-exhausted` | error | The extension's status is `Failed("restart-exhausted: ...")` — the supervisor gave up. |
+
+The `extension_status` RPC (params-free, dispatched by
+`api::extension_status_api`) returns a read-only
+`{ pluginId, name, status, restartCount, lastError, confirmedEvents,
+toolCount }[]` snapshot — `status` is one of `running` / `starting` /
+`restarting` / `failed` / `stopped` / the synthetic `not-running`;
+`lastError` is populated only when `status = "failed"`, with the same
+sanitized reason `plugin_doctor` uses. Cockpit's plugin detail screen
+(`PluginDetailView.tsx`) polls this and renders an "Extension" card per
+entry: name, a colored status pill, a restart count when non-zero, and the
+last error text when present.
+
+### Known limitations
+
+- **stdio transport only** — no HTTP/network transport for an extension;
+  every extension is a local subprocess the daemon spawns.
+- **No sandbox beyond environment isolation** — `env_clear()` + the
+  allowlist stop a secret leak, but there is no filesystem/network/CPU/
+  memory sandbox. An extension is trusted the same way an MCP server is:
+  the user installed it deliberately, past the trust-gate prompt above.
+- **Sequential startup handshakes** — extensions are spawned and
+  handshaken one at a time at daemon start, not concurrently.
+- **Cockpit's own in-process engine daemon does not run extension
+  supervision.** `ExtensionHost::spawn_all` is called once, as a detached
+  background task, only by the standalone `ryuzi serve` / `ryuzi __daemon`
+  runner (`crates/cli/src/daemon_cmd.rs`) — Cockpit's own spawned
+  `--engine-daemon` subprocess never calls it, so extensions only actually
+  run under a standalone `ryuzi` daemon (the same characteristic the
+  auto-update manager and the remote-catalog manager's background timer
+  already have — see [Fetch pipeline](#fetch-pipeline)). If Cockpit attaches
+  to an already-running `ryuzi serve` daemon instead of spawning its own,
+  that daemon's extensions (and their supervision) are the ones live.
+- **Child-exit detection is only as fast as the next health ping** — a
+  crashed extension isn't noticed until the next `PING_INTERVAL` (30s)
+  elapses and its ping fails (or immediately, if a gating/observational
+  dispatch happens to hit the dead transport first).
+
+### Worked example
+
+`ryuzi-plugin.toml`:
+
+```toml
+contract = 1
+id = "acme-linter"
+name = "Acme Linter"
+publisher = "acme"
+description = "Lints staged files before every bash/edit tool call."
+categories = ["observability"]
+
+[[extension]]
+name = "linter"
+command = "acme-linter-ext"
+args = ["--serve"]
+events = ["tool.before", "tool.after"]
+provides_tools = true
+timeout_ms = 5000
+```
+
+The `acme-linter-ext --serve` binary must speak JSON-RPC 2.0, one object per
+line, on stdin/stdout. A minimal well-behaved reply to
+`extension/initialize`:
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{
+  "ok": true,
+  "events": ["tool.before", "tool.after"],
+  "tools": [
+    {"name": "lint", "description": "Lint a file", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}}
+  ]
+}}
+```
+
+From then on it must answer `event/tool.before` (denying with
+`{"result":{"deny":true,"reason":"..."}}` when it wants to block a call),
+`event/tool.after` (result ignored), `extension/ping` (any non-error reply),
+and `tool/call` for `"lint"`
+(`{"result":{"content":[{"type":"text","text":"0 problems"}]}}`, mirroring
+MCP's own tool-result shape) — and, ideally, `extension/shutdown` by
+exiting on its own within the shutdown grace period (5s).
 
 ---
 

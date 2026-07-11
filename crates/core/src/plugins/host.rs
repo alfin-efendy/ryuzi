@@ -1,6 +1,6 @@
 //! `CorePlugin`/`PluginHost`: binds a `PluginManifest` to the runtime
 //! capabilities it provides, and `Registries`, the composition root for all
-//! three extension axes plus the plugin host itself.
+//! four extension axes plus the plugin host itself.
 //!
 //! This replaces the old `Integration` trait (`crate::integration`, deleted).
 //! Previously a host object implemented `Integration` and answered
@@ -32,6 +32,7 @@ use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 use crate::connector::{Connector, ConnectorRegistry};
 use crate::gateway::{GatewayFactory, GatewayRegistry};
 use crate::harness::HarnessFactory;
+use crate::plugins::extension::ExtensionFactory;
 use crate::settings::{csv, SettingsStore};
 
 /// Process-wide registry of every `plugin.*` settings key any installed
@@ -46,9 +47,9 @@ use crate::settings::{csv, SettingsStore};
 /// `Registries` handle. Registration is add-only and idempotent — the same
 /// key registered twice (e.g. across two `PluginHost`s in different tests)
 /// simply overwrites; tests that care about isolation use unique plugin ids.
-static PLUGIN_FIELDS: OnceLock<RwLock<HashMap<String, SettingField>>> = OnceLock::new();
+static PLUGIN_FIELDS: OnceLock<RwLock<HashMap<String, (String, SettingField)>>> = OnceLock::new();
 
-fn plugin_fields() -> &'static RwLock<HashMap<String, SettingField>> {
+fn plugin_fields() -> &'static RwLock<HashMap<String, (String, SettingField)>> {
     PLUGIN_FIELDS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -59,7 +60,23 @@ pub fn plugin_field(key: &str) -> Option<SettingField> {
         .read()
         .expect("PLUGIN_FIELDS lock poisoned")
         .get(key)
+        .map(|(_, field)| field.clone())
+}
+
+/// Every `plugin.*` settings field registered by an installed plugin,
+/// paired with the id of the plugin that declared it. Used by
+/// `crate::settings::store::SettingsStore::missing_required` to fold
+/// plugin-declared `required` fields into the same required-field
+/// aggregation used for global/gateway fields, gated on the owning plugin
+/// actually being enabled (a disabled plugin's required fields must not
+/// block onboarding).
+pub fn plugin_fields_all() -> Vec<(String, SettingField)> {
+    plugin_fields()
+        .read()
+        .expect("PLUGIN_FIELDS lock poisoned")
+        .values()
         .cloned()
+        .collect()
 }
 
 /// Register every `plugin.*` settings key `manifest` declares:
@@ -76,34 +93,44 @@ fn register_plugin_fields(manifest: &PluginManifest) {
         .write()
         .expect("PLUGIN_FIELDS lock poisoned");
     for f in &manifest.settings {
-        fields.insert(f.key.clone(), f.clone());
+        fields.insert(f.key.clone(), (manifest.id.clone(), f.clone()));
     }
     if let Some(auth) = &manifest.auth {
         if let Some(key) = &auth.setting {
             fields.insert(
                 key.clone(),
-                SettingField {
-                    key: key.clone(),
-                    label: format!("{} auth", manifest.name),
-                    help: String::new(),
-                    secret: true,
-                    required: false,
-                    kind: FieldKind::String,
-                },
+                (
+                    manifest.id.clone(),
+                    SettingField {
+                        key: key.clone(),
+                        label: format!("{} auth", manifest.name),
+                        help: String::new(),
+                        secret: true,
+                        required: false,
+                        kind: FieldKind::String,
+                        options: Vec::new(),
+                        default: None,
+                    },
+                ),
             );
         }
     }
     let enabled_key = format!("plugin.{}.enabled", manifest.id);
     fields.insert(
         enabled_key.clone(),
-        SettingField {
-            key: enabled_key,
-            label: format!("Enable {}", manifest.name),
-            help: String::new(),
-            secret: false,
-            required: false,
-            kind: FieldKind::Bool,
-        },
+        (
+            manifest.id.clone(),
+            SettingField {
+                key: enabled_key,
+                label: format!("Enable {}", manifest.name),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::Bool,
+                options: Vec::new(),
+                default: None,
+            },
+        ),
     );
 }
 
@@ -132,11 +159,18 @@ pub struct CorePlugin {
     pub harness: Option<Arc<dyn HarnessFactory>>,
     pub gateway: Option<Arc<dyn GatewayFactory>>,
     pub connector: Option<Arc<dyn Connector>>,
+    /// Supervised subprocess "code plugin" capability (Track D). Mirrors
+    /// `connector` in every way that matters here: a live instance (not a
+    /// factory-by-config), gated by [`PluginHost::is_enabled`] the same way,
+    /// and — like `connector` — deliberately NOT fanned into a registry by
+    /// [`Registries::add_plugin`]; it is consumed directly from the host
+    /// (`plugins::extension::ExtensionHost::spawn_all`).
+    pub extension: Option<Arc<dyn ExtensionFactory>>,
     pub source: PluginSource,
 }
 
 impl CorePlugin {
-    /// Which of the four extension axes this plugin advertises. `runtime`
+    /// Which of the five extension axes this plugin advertises. `runtime`
     /// means a live `HarnessFactory` (the native runtime).
     ///
     /// Single source of truth for `ryuzi_core::serve`'s `GET /plugins`
@@ -157,15 +191,37 @@ impl CorePlugin {
         if self.connector.is_some() {
             caps.push("connector");
         }
+        if self.extension.is_some() {
+            caps.push("extension");
+        }
         caps
     }
 }
 
+/// A losing claim for an already-owned [`PluginManifest::slot`]: `winner_id`
+/// registered first and owns `slot`; `loser_id` claimed the same slot later
+/// and was NOT registered as owner (it is still installed as a normal
+/// plugin — only its slot claim lost). Surfaced by
+/// `crate::plugins::doctor::plugin_doctor` as a `"slot-conflict"` finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotConflict {
+    pub slot: String,
+    pub winner_id: String,
+    pub loser_id: String,
+}
+
 /// Every installed plugin, keyed by `manifest.id`, kept in insertion order.
+/// Also arbitrates [`PluginManifest::slot`] claims: `slots` records the
+/// first plugin to claim each named slot (first-registration-wins, the same
+/// rule `add` itself uses for duplicate ids), and `slot_conflicts` records
+/// every later claimant for an already-owned slot instead of silently
+/// dropping it.
 #[derive(Default)]
 pub struct PluginHost {
     order: Vec<Arc<CorePlugin>>,
     by_id: HashMap<String, usize>,
+    slots: HashMap<String, String>,
+    slot_conflicts: Vec<SlotConflict>,
 }
 
 impl PluginHost {
@@ -176,6 +232,12 @@ impl PluginHost {
     /// Register a plugin. Returns `false` (and logs a warning) without
     /// installing it if `manifest.id` is already taken — the first
     /// registration for an id wins.
+    ///
+    /// If the manifest claims a `slot`, arbitrate it the same way: the first
+    /// plugin to claim a given slot name wins ([`PluginHost::slot_owner`]);
+    /// a later claimant is still registered as a normal plugin (its manifest
+    /// is unaffected), but the claim itself is recorded as a
+    /// [`SlotConflict`] rather than silently overwriting the owner.
     pub fn add(&mut self, plugin: CorePlugin) -> bool {
         if self.by_id.contains_key(&plugin.manifest.id) {
             tracing::warn!(
@@ -185,10 +247,41 @@ impl PluginHost {
             return false;
         }
         register_plugin_fields(&plugin.manifest);
+        if let Some(slot) = &plugin.manifest.slot {
+            match self.slots.get(slot) {
+                None => {
+                    self.slots.insert(slot.clone(), plugin.manifest.id.clone());
+                }
+                Some(winner_id) => {
+                    tracing::warn!(
+                        "plugin `{}` claims slot `{slot}`, already owned by `{winner_id}` — recording a slot conflict",
+                        plugin.manifest.id
+                    );
+                    self.slot_conflicts.push(SlotConflict {
+                        slot: slot.clone(),
+                        winner_id: winner_id.clone(),
+                        loser_id: plugin.manifest.id.clone(),
+                    });
+                }
+            }
+        }
         self.by_id
             .insert(plugin.manifest.id.clone(), self.order.len());
         self.order.push(Arc::new(plugin));
         true
+    }
+
+    /// The plugin id that won a named slot's arbitration (first
+    /// registration wins), or `None` if no installed plugin has claimed
+    /// `slot`.
+    pub fn slot_owner(&self, slot: &str) -> Option<&str> {
+        self.slots.get(slot).map(String::as_str)
+    }
+
+    /// Every losing slot claim recorded by [`PluginHost::add`], in the
+    /// order the conflicting plugin was registered.
+    pub fn slot_conflicts(&self) -> &[SlotConflict] {
+        &self.slot_conflicts
     }
 
     /// Look up an installed plugin by id.
@@ -207,10 +300,10 @@ impl PluginHost {
     ///   disabled)
     /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
     /// - experimental → always `false` (see below)
-    /// - manifest-only (no harness/gateway/connector capability) → always
-    ///   `true`
-    /// - connector-only → the setting `plugin.<id>.enabled == "true"`
-    ///   (defaults to `false`)
+    /// - manifest-only (no harness/gateway/connector/extension capability)
+    ///   → always `true`
+    /// - connector- and/or extension-capable → the setting
+    ///   `plugin.<id>.enabled == "true"` (defaults to `false`)
     pub async fn is_enabled(&self, settings: &SettingsStore, id: &str) -> anyhow::Result<bool> {
         let Some(plugin) = self.get(id) else {
             return Ok(false);
@@ -225,15 +318,15 @@ impl PluginHost {
         }
         if plugin.manifest.experimental {
             // Experimental catalog entries (ngrok/zep/vercel-sandbox) are
-            // docs-only: no harness/gateway/connector capability backs them,
-            // so there is nothing to actually enable. Report disabled
-            // unconditionally — this wins over the manifest-only fallback
-            // below even if a stray `plugin.<id>.enabled = true` setting
-            // exists. Real capabilities (providers) always hardcode
+            // docs-only: no harness/gateway/connector/extension capability
+            // backs them, so there is nothing to actually enable. Report
+            // disabled unconditionally — this wins over the manifest-only
+            // fallback below even if a stray `plugin.<id>.enabled = true`
+            // setting exists. Real capabilities (providers) always hardcode
             // `experimental = false`, so this never affects them.
             return Ok(false);
         }
-        if plugin.connector.is_none() {
+        if plugin.connector.is_none() && plugin.extension.is_none() {
             // Manifest-only plugin (e.g. a provider metadata entry
             // with no behavioral capability of its own) — always enabled.
             return Ok(true);
@@ -421,11 +514,13 @@ mod tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         }
@@ -437,6 +532,7 @@ mod tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -447,6 +543,7 @@ mod tests {
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -457,6 +554,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -467,6 +565,43 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
+            source: PluginSource::Builtin,
+        }
+    }
+
+    fn manifest_only_with_slot(id: &str, slot: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: PluginManifest {
+                slot: Some(slot.to_string()),
+                ..manifest(id)
+            },
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: None,
+            source: PluginSource::Builtin,
+        }
+    }
+
+    struct FakeExtensionFactory;
+    #[async_trait]
+    impl crate::plugins::extension::ExtensionFactory for FakeExtensionFactory {
+        async fn extensions(
+            &self,
+            _ctx: &crate::plugins::extension::ExtensionCtx,
+        ) -> anyhow::Result<Vec<crate::plugins::extension::ExtensionSpec>> {
+            Ok(vec![])
+        }
+    }
+
+    fn extension_only(id: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: manifest(id),
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: Some(Arc::new(FakeExtensionFactory)),
             source: PluginSource::Builtin,
         }
     }
@@ -507,6 +642,69 @@ mod tests {
         assert!(kept.harness.is_some(), "the FIRST registration must win");
         assert!(kept.gateway.is_none());
         assert_eq!(host.list().len(), 1);
+    }
+
+    // ---------- slot arbitration (Feature C2) ----------
+
+    #[test]
+    fn first_plugin_to_claim_a_slot_becomes_its_owner() {
+        let mut host = PluginHost::new();
+        assert!(host.add(manifest_only_with_slot("hermes-native", "memory")));
+
+        assert_eq!(host.slot_owner("memory"), Some("hermes-native"));
+        assert!(host.slot_conflicts().is_empty());
+    }
+
+    #[test]
+    fn slot_owner_is_none_for_an_unclaimed_slot() {
+        let host = PluginHost::new();
+        assert_eq!(host.slot_owner("memory"), None);
+    }
+
+    #[test]
+    fn second_claimant_for_an_owned_slot_is_recorded_as_a_conflict_not_owner() {
+        let mut host = PluginHost::new();
+        assert!(host.add(manifest_only_with_slot("mem0", "memory")));
+        assert!(
+            host.add(manifest_only_with_slot("cavemem", "memory")),
+            "a losing slot claim must not block normal plugin registration"
+        );
+
+        // First registration still owns the slot.
+        assert_eq!(host.slot_owner("memory"), Some("mem0"));
+
+        // The loser is recorded as a conflict, not registered as owner.
+        let conflicts = host.slot_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].slot, "memory");
+        assert_eq!(conflicts[0].winner_id, "mem0");
+        assert_eq!(conflicts[0].loser_id, "cavemem");
+
+        // The loser is still installed as a normal plugin — only its slot
+        // claim lost, its own registration did not.
+        assert!(host.get("cavemem").is_some());
+        assert_eq!(host.list().len(), 2);
+    }
+
+    #[test]
+    fn distinct_slots_have_independent_owners() {
+        let mut host = PluginHost::new();
+        assert!(host.add(manifest_only_with_slot("mem0", "memory")));
+        assert!(host.add(manifest_only_with_slot("graphiti", "knowledge-graph")));
+
+        assert_eq!(host.slot_owner("memory"), Some("mem0"));
+        assert_eq!(host.slot_owner("knowledge-graph"), Some("graphiti"));
+        assert!(host.slot_conflicts().is_empty());
+    }
+
+    #[test]
+    fn plugins_without_a_slot_claim_never_produce_a_conflict() {
+        let mut host = PluginHost::new();
+        assert!(host.add(manifest_only("a")));
+        assert!(host.add(manifest_only("b")));
+
+        assert!(host.slot_conflicts().is_empty());
+        assert_eq!(host.slot_owner("memory"), None);
     }
 
     // ---------- Registries::add_plugin ----------
@@ -643,6 +841,30 @@ mod tests {
         assert!(host.is_enabled(&settings, "github").await.unwrap());
     }
 
+    #[tokio::test]
+    async fn is_enabled_extension_only_plugin_defaults_false_until_setting_flips_true() {
+        let (store, settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        host.add(extension_only("acme-ext"));
+
+        assert!(
+            !host.is_enabled(&settings, "acme-ext").await.unwrap(),
+            "an extension-capable plugin (like a connector-capable one) must default to disabled"
+        );
+
+        store
+            .set_setting_raw("plugin.acme-ext.enabled", "true")
+            .await
+            .unwrap();
+        assert!(host.is_enabled(&settings, "acme-ext").await.unwrap());
+    }
+
+    #[test]
+    fn capabilities_reports_extension_when_the_axis_is_present() {
+        let plugin = extension_only("acme-ext");
+        assert_eq!(plugin.capabilities(), vec!["extension"]);
+    }
+
     // ---------- PluginHost::enabled_skill_dirs ----------
 
     #[tokio::test]
@@ -664,6 +886,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::SkillPack(base.path().to_path_buf()),
         };
         let mut host = PluginHost::new();
@@ -700,6 +923,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::SkillPack(base.path().to_path_buf()),
         });
         store
@@ -725,6 +949,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         });
 
@@ -759,6 +984,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::SkillPack(plugin_base.path().to_path_buf()),
         };
 

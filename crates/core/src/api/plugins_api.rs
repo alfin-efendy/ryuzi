@@ -41,7 +41,9 @@ use crate::serve::ApiState;
 use crate::settings::SettingsStore;
 use crate::store::{PluginOauthClient, RemoteCatalogRow, Store};
 use reqwest::Url;
-use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, SettingField};
+use ryuzi_plugin_sdk::{
+    AuthKind, AuthSpec, FieldKind, McpServerDef, McpTransportDef, SettingField,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -402,23 +404,37 @@ impl InstallLedgerFields {
     }
 }
 
+/// Enrichment inputs `plugin_info` needs beyond the plugin itself: the
+/// install ledger row, the cached remote-catalog row, and whether this
+/// plugin currently owns its manifest-claimed `slot` (Feature C2). Bundled
+/// into one struct so `plugin_info` doesn't creep past clippy's
+/// too-many-arguments lint as fields get added over time.
+struct PluginInfoContext<'a> {
+    install: Option<&'a crate::store::PluginInstallRecord>,
+    remote: Option<&'a RemoteCatalogRow>,
+    owns_slot: bool,
+}
+
 fn plugin_info(
     plugin: &CorePlugin,
     enabled: bool,
     configured: bool,
     kind: &str,
     installed: bool,
-    install: Option<&crate::store::PluginInstallRecord>,
-    remote: Option<&RemoteCatalogRow>,
+    ctx: PluginInfoContext<'_>,
 ) -> PluginInfo {
     let m = &plugin.manifest;
-    let ledger = InstallLedgerFields::from_option(install);
+    let ledger = InstallLedgerFields::from_option(ctx.install);
+    let remote = ctx.remote;
+    let owns_slot = ctx.owns_slot;
     PluginInfo {
         id: m.id.clone(),
         name: m.name.clone(),
         description: m.description.clone(),
         icon: m.icon.clone(),
         categories: m.categories.clone(),
+        slot: m.slot.clone(),
+        owns_slot,
         verified: m.verified,
         experimental: m.experimental,
         enabled,
@@ -450,6 +466,16 @@ fn auth_kind_label(kind: AuthKind) -> &'static str {
         AuthKind::ApiKey => "api-key",
         AuthKind::Token => "token",
         AuthKind::Oauth => "oauth",
+    }
+}
+
+/// `ryuzi_plugin_sdk::FieldKind` -> the camelCase-friendly label
+/// `PluginFieldInfo.kind` carries across the Tauri IPC boundary.
+fn field_kind_label(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::String => "string",
+        FieldKind::Int => "int",
+        FieldKind::Bool => "bool",
     }
 }
 
@@ -933,6 +959,9 @@ async fn build_settings_info(
             secret: f.secret,
             required: f.required,
             value_set: field_value_set(persisted.as_deref()),
+            kind: field_kind_label(f.kind).to_string(),
+            options: f.options.clone(),
+            default: f.default.clone(),
         });
     }
     Ok(out)
@@ -1177,8 +1206,22 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
         let record = installs.get(&plugin.manifest.id);
         let remote_row = remote.get(&plugin.manifest.id);
+        let owns_slot = plugin
+            .manifest
+            .slot
+            .as_deref()
+            .is_some_and(|s| cp.plugins().slot_owner(s) == Some(plugin.manifest.id.as_str()));
         out.push(plugin_info(
-            &plugin, enabled, configured, kind, installed, record, remote_row,
+            &plugin,
+            enabled,
+            configured,
+            kind,
+            installed,
+            PluginInfoContext {
+                install: record,
+                remote: remote_row,
+                owns_slot,
+            },
         ));
     }
     for pack in crate::skills_install::curated_skill_packs() {
@@ -1196,6 +1239,9 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             description: pack.description.to_string(),
             icon: Some("sparkles".to_string()),
             categories: vec!["skills".to_string()],
+            // A synthesized curated pack has no manifest to declare a slot.
+            slot: None,
+            owns_slot: false,
             verified: true,
             experimental: false,
             // A synthesized pack isn't a registered plugin, so `enabled` /
@@ -1253,6 +1299,11 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
         .into_iter()
         .find(|r| r.id == id);
 
+    let owns_slot = m
+        .slot
+        .as_deref()
+        .is_some_and(|s| cp.plugins().slot_owner(s) == Some(id));
+
     Ok(PluginDetail {
         info: plugin_info(
             &plugin,
@@ -1260,8 +1311,11 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
             configured,
             kind,
             installed,
-            record.as_ref(),
-            remote_row.as_ref(),
+            PluginInfoContext {
+                install: record.as_ref(),
+                remote: remote_row.as_ref(),
+                owns_slot,
+            },
         ),
         auth,
         settings: settings_info,
@@ -1626,11 +1680,13 @@ mod tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         }
@@ -1642,6 +1698,7 @@ mod tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -1652,6 +1709,7 @@ mod tests {
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
+            extension: None,
             source: PluginSource::Catalog,
         }
     }
@@ -1662,6 +1720,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::SkillPack(std::path::PathBuf::from("/tmp/whatever")),
         }
     }
@@ -1683,6 +1742,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -1716,6 +1776,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
         .capabilities()
@@ -1850,10 +1911,18 @@ mod tests {
 
     // ---------- plugin_info ----------
 
+    fn no_ctx(owns_slot: bool) -> PluginInfoContext<'static> {
+        PluginInfoContext {
+            install: None,
+            remote: None,
+            owns_slot,
+        }
+    }
+
     #[test]
     fn plugin_info_maps_identity_and_enabled_flag_through() {
         let plugin = harness_only("native");
-        let info = plugin_info(&plugin, true, false, "integration", false, None, None);
+        let info = plugin_info(&plugin, true, false, "integration", false, no_ctx(false));
         assert_eq!(info.id, "native");
         assert_eq!(info.name, "Plugin native");
         assert!(info.enabled);
@@ -1871,9 +1940,34 @@ mod tests {
         assert!(info.catalog_source.is_none());
         assert!(info.catalog_version.is_none());
         assert!(info.blocked_reason.is_none());
+        // No manifest `slot` claim → neither field is set.
+        assert!(info.slot.is_none());
+        assert!(!info.owns_slot);
 
-        let info_disabled = plugin_info(&plugin, false, false, "integration", false, None, None);
+        let info_disabled = plugin_info(&plugin, false, false, "integration", false, no_ctx(false));
         assert!(!info_disabled.enabled);
+    }
+
+    #[test]
+    fn plugin_info_reports_slot_and_owns_slot() {
+        let plugin = CorePlugin {
+            manifest: PluginManifest {
+                slot: Some("memory".to_string()),
+                ..manifest("mem0")
+            },
+            ..harness_only("mem0")
+        };
+        let owner = plugin_info(&plugin, true, false, "integration", false, no_ctx(true));
+        assert_eq!(owner.slot.as_deref(), Some("memory"));
+        assert!(owner.owns_slot);
+
+        let loser = plugin_info(&plugin, true, false, "integration", false, no_ctx(false));
+        assert_eq!(
+            loser.slot.as_deref(),
+            Some("memory"),
+            "the claim itself is still reported even when the plugin lost arbitration"
+        );
+        assert!(!loser.owns_slot);
     }
 
     // ---------- catalog_source_label ----------
@@ -1964,6 +2058,68 @@ mod tests {
         assert_eq!(auth_kind_label(AuthKind::ApiKey), "api-key");
         assert_eq!(auth_kind_label(AuthKind::Token), "token");
         assert_eq!(auth_kind_label(AuthKind::Oauth), "oauth");
+    }
+
+    #[test]
+    fn field_kind_label_maps_every_variant() {
+        assert_eq!(field_kind_label(FieldKind::String), "string");
+        assert_eq!(field_kind_label(FieldKind::Int), "int");
+        assert_eq!(field_kind_label(FieldKind::Bool), "bool");
+    }
+
+    // ---------- build_settings_info (Feature C3: kind/options/default) ----------
+
+    #[tokio::test]
+    async fn build_settings_info_carries_kind_options_and_default() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let fields = vec![
+            SettingField {
+                key: "plugin.acme.tier".to_string(),
+                label: "Tier".to_string(),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::String,
+                options: vec!["free".to_string(), "pro".to_string()],
+                default: Some("free".to_string()),
+            },
+            SettingField {
+                key: "plugin.acme.retries".to_string(),
+                label: "Retries".to_string(),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::Int,
+                options: vec![],
+                default: Some("3".to_string()),
+            },
+            SettingField {
+                key: "plugin.acme.verbose".to_string(),
+                label: "Verbose".to_string(),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::Bool,
+                options: vec![],
+                default: None,
+            },
+        ];
+
+        let out = build_settings_info(&store, &fields).await.unwrap();
+        assert_eq!(out.len(), 3);
+
+        assert_eq!(out[0].kind, "string");
+        assert_eq!(out[0].options, vec!["free".to_string(), "pro".to_string()]);
+        assert_eq!(out[0].default.as_deref(), Some("free"));
+
+        assert_eq!(out[1].kind, "int");
+        assert!(out[1].options.is_empty());
+        assert_eq!(out[1].default.as_deref(), Some("3"));
+
+        assert_eq!(out[2].kind, "bool");
+        assert!(out[2].options.is_empty());
+        assert_eq!(out[2].default, None);
     }
 
     #[test]

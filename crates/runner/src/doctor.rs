@@ -27,7 +27,7 @@ async fn doctor_inner(deps: &mut Deps) -> u8 {
         "git:    {}",
         render(git.found, &git.version).trim_end()
     ));
-    let missing: Vec<&'static str> = match crate::db::open_store(deps).await {
+    let missing: Vec<String> = match crate::db::open_store(deps).await {
         Ok(store) => {
             let settings = ryuzi_core::settings::SettingsStore::new(std::sync::Arc::new(store));
             match settings.missing_required().await {

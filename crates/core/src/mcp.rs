@@ -4,10 +4,11 @@
 //! agent sessions through `SessionCtx.mcp_servers`.
 
 use crate::domain::{McpServerSpec, McpTransport};
+use crate::stdio_jsonrpc::{self, ReadError};
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpServerRow {
@@ -354,10 +355,7 @@ pub struct ProbeResult {
 }
 
 /// Extract the JSON-RPC response with `id` from a line, if it is one.
-pub fn parse_response_line(line: &str, id: i64) -> Option<serde_json::Value> {
-    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    (v.get("id").and_then(|i| i.as_i64()) == Some(id)).then_some(v)
-}
+pub use crate::stdio_jsonrpc::parse_response_line;
 
 /// Pull `(name, description)` pairs out of a `tools/list` result.
 pub fn parse_tools_result(v: &serde_json::Value) -> Vec<(String, String)> {
@@ -439,28 +437,23 @@ async fn probe_stdio_inner(
     let stdout = child.stdout.take().expect("piped stdout");
     let mut lines = BufReader::new(stdout).lines();
 
-    let init = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
+    let init = stdio_jsonrpc::build_request(
+        1,
+        "initialize",
+        Some(serde_json::json!({
             "protocolVersion": "2025-06-18",
             "capabilities": {},
             "clientInfo": { "name": "ryuzi-cockpit", "version": env!("CARGO_PKG_VERSION") }
-        }
-    });
-    if let Err(e) = stdin.write_all(format!("{init}\n").as_bytes()).await {
+        })),
+    );
+    if let Err(e) = stdio_jsonrpc::write_line(&mut stdin, &init).await {
         return fail(format!("failed to write initialize: {e}"));
     }
 
-    let init_resp = loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                if let Some(v) = parse_response_line(&line, 1) {
-                    break v;
-                }
-            }
-            Ok(None) => return fail("server closed stdout during initialize".into()),
-            Err(e) => return fail(format!("read error: {e}")),
-        }
+    let init_resp = match stdio_jsonrpc::read_response(&mut lines, 1).await {
+        Ok(v) => v,
+        Err(ReadError::Closed) => return fail("server closed stdout during initialize".into()),
+        Err(ReadError::Io(e)) => return fail(format!("read error: {e}")),
     };
     if let Some(err) = init_resp.get("error") {
         return fail(format!("initialize error: {err}"));
@@ -470,24 +463,17 @@ async fn probe_stdio_inner(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let initialized =
-        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-    let _ = stdin.write_all(format!("{initialized}\n").as_bytes()).await;
+    let initialized = stdio_jsonrpc::build_notification("notifications/initialized", None);
+    let _ = stdio_jsonrpc::write_line(&mut stdin, &initialized).await;
 
-    let tools_req = serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
-    if let Err(e) = stdin.write_all(format!("{tools_req}\n").as_bytes()).await {
+    let tools_req = stdio_jsonrpc::build_request(2, "tools/list", None);
+    if let Err(e) = stdio_jsonrpc::write_line(&mut stdin, &tools_req).await {
         return fail(format!("failed to write tools/list: {e}"));
     }
-    let tools_resp = loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                if let Some(v) = parse_response_line(&line, 2) {
-                    break v;
-                }
-            }
-            Ok(None) => return fail("server closed stdout during tools/list".into()),
-            Err(e) => return fail(format!("read error: {e}")),
-        }
+    let tools_resp = match stdio_jsonrpc::read_response(&mut lines, 2).await {
+        Ok(v) => v,
+        Err(ReadError::Closed) => return fail("server closed stdout during tools/list".into()),
+        Err(ReadError::Io(e)) => return fail(format!("read error: {e}")),
     };
 
     let tools = parse_tools_result(&tools_resp);

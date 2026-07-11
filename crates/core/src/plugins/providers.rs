@@ -90,11 +90,13 @@ fn provider_plugin(d: &ProviderDescriptor) -> CorePlugin {
                 "model-provider".to_string(),
                 category_label(d.category).to_string(),
             ],
+            slot: None,
             verified: true,
             experimental: false,
             auth: Some(auth_spec(d.auth)),
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: Some(ProviderMeta {
                 format: format_label(d.format).to_string(),
@@ -105,6 +107,7 @@ fn provider_plugin(d: &ProviderDescriptor) -> CorePlugin {
         harness: None,
         gateway: None,
         connector: None,
+        extension: None,
         source: PluginSource::Builtin,
     }
 }

@@ -3,11 +3,12 @@
 //! execute MCP tools itself.
 
 use crate::domain::{McpServerSpec, McpTransport};
+use crate::stdio_jsonrpc::{self, ReadError};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout};
 use tokio::sync::Mutex;
 
@@ -29,12 +30,11 @@ pub struct McpToolDef {
 
 /// Build a `tools/call` JSON-RPC request.
 pub fn build_call_request(id: i64, tool: &str, arguments: &Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "tools/call",
-        "params": { "name": tool, "arguments": arguments }
-    })
+    stdio_jsonrpc::build_request(
+        id,
+        "tools/call",
+        Some(json!({ "name": tool, "arguments": arguments })),
+    )
 }
 
 /// Reduce an MCP `tools/call` result's `content` array to plain text.
@@ -111,29 +111,28 @@ impl McpConnection {
 
     async fn handshake(&self) -> anyhow::Result<()> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let init = json!({
-            "jsonrpc": "2.0", "id": id, "method": "initialize",
-            "params": {
+        let init = stdio_jsonrpc::build_request(
+            id,
+            "initialize",
+            Some(json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": { "name": "ryuzi-native", "version": env!("CARGO_PKG_VERSION") }
-            }
-        });
+            })),
+        );
         let resp = self.request(id, &init).await?;
         if let Some(err) = resp.get("error") {
             anyhow::bail!("mcp initialize error: {err}");
         }
         let mut stdin = self.stdin.lock().await;
-        let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        stdin
-            .write_all(format!("{initialized}\n").as_bytes())
-            .await?;
+        let initialized = stdio_jsonrpc::build_notification("notifications/initialized", None);
+        stdio_jsonrpc::write_line(&mut *stdin, &initialized).await?;
         Ok(())
     }
 
     async fn list_tools(&self) -> anyhow::Result<Vec<McpToolDef>> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let req = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list" });
+        let req = stdio_jsonrpc::build_request(id, "tools/list", None);
         let resp = self.request(id, &req).await?;
         let tools = resp
             .pointer("/result/tools")
@@ -165,21 +164,14 @@ impl McpConnection {
     async fn request(&self, id: i64, req: &Value) -> anyhow::Result<Value> {
         {
             let mut stdin = self.stdin.lock().await;
-            stdin.write_all(format!("{req}\n").as_bytes()).await?;
-            stdin.flush().await?;
+            stdio_jsonrpc::write_line(&mut *stdin, req).await?;
         }
         let mut reader = self.reader.lock().await;
         let read = async {
-            loop {
-                match reader.next_line().await {
-                    Ok(Some(line)) => {
-                        if let Some(v) = crate::mcp::parse_response_line(&line, id) {
-                            return Ok(v);
-                        }
-                    }
-                    Ok(None) => anyhow::bail!("mcp: server closed the connection"),
-                    Err(e) => anyhow::bail!("mcp: read error: {e}"),
-                }
+            match stdio_jsonrpc::read_response(&mut reader, id).await {
+                Ok(v) => Ok(v),
+                Err(ReadError::Closed) => anyhow::bail!("mcp: server closed the connection"),
+                Err(ReadError::Io(e)) => anyhow::bail!("mcp: read error: {e}"),
             }
         };
         tokio::time::timeout(Duration::from_secs(120), read)

@@ -36,16 +36,16 @@ async fn setup_inner(deps: &mut Deps) -> u8 {
         return 0;
     }
     for key in missing {
-        let hint = find_field(key)
+        let hint = find_field(&key)
             .map(|f| format!("{} — {}", f.label, f.help))
-            .unwrap_or_else(|| key.to_string());
+            .unwrap_or_else(|| key.clone());
         let raw = (deps.prompt)(&format!("{hint}\n{key} = "));
         let value = raw.trim();
         if value.is_empty() {
             (deps.out)(&format!("skipped {key}"));
             continue;
         }
-        if let Err(e) = settings.set(key, value).await {
+        if let Err(e) = settings.set(&key, value).await {
             (deps.err)(&format!("✗ {key}: {e}"));
             return 1;
         }

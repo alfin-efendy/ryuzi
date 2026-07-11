@@ -30,7 +30,18 @@ const oauthAuthInfo = {
 };
 
 function field(key: string, label: string, overrides: Partial<PluginFieldInfo> = {}): PluginFieldInfo {
-  return { key, label, help: "", secret: false, required: true, valueSet: false, ...overrides };
+  return {
+    key,
+    label,
+    help: "",
+    secret: false,
+    required: true,
+    valueSet: false,
+    kind: "string",
+    options: [],
+    default: null,
+    ...overrides,
+  };
 }
 
 function detailFixture(
@@ -43,6 +54,8 @@ function detailFixture(
       description: "Notion MCP",
       icon: null,
       categories: ["docs"],
+      slot: null,
+      ownsSlot: false,
       verified: true,
       experimental: overrides.experimental ?? false,
       enabled: false,

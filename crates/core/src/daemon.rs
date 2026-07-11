@@ -9,7 +9,9 @@
 //! loop that spawns it.
 
 use crate::control::ControlPlane;
-use crate::domain::{ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Surface};
+use crate::domain::{
+    ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Principal, Surface,
+};
 use crate::gateway::{Gateway, GatewayFactory};
 use crate::harness::native::native_plugin;
 use crate::harness::HarnessFactory;
@@ -184,6 +186,11 @@ impl Daemon {
         self.orch_handle.abort();
         self.rail_handle.abort();
         self.router_server.stop().await;
+        // Track D: gracefully stop every spawned extension subprocess. Safe
+        // even when nothing was ever spawned (every test daemon, or a real
+        // daemon whose entry never reached `spawn_extensions`) — see
+        // `ControlPlane::shutdown_extensions`'s doc.
+        self.cp.shutdown_extensions().await;
         self.telemetry.shutdown();
     }
 }
@@ -388,6 +395,7 @@ fn spawn_approval_fanout(
                     summary,
                     approval_kind,
                     input: _,
+                    principal,
                 }) => {
                     // Gateways only render binary tool prompts. Plan/Question
                     // prompts are Cockpit/CLI-only surfaces — a headless
@@ -419,6 +427,7 @@ fn spawn_approval_fanout(
                             &request_id,
                             &tool,
                             &summary,
+                            principal,
                         )
                         .await;
                     });
@@ -478,6 +487,7 @@ pub(crate) async fn schedule_non_tool_approval_cancel(
 ///   futures keep racing; only once every future has errored does the race
 ///   resolve to a deny. The whole race is wrapped in `tokio::time::timeout`;
 ///   elapsing also denies.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_approval(
     cp: &Arc<ControlPlane>,
     store: &Arc<Store>,
@@ -486,6 +496,7 @@ pub(crate) async fn handle_approval(
     request_id: &str,
     tool: &str,
     summary: &str,
+    principal: Option<Principal>,
 ) {
     let settings = SettingsStore::new(Arc::clone(store));
 
@@ -539,6 +550,7 @@ pub(crate) async fn handle_approval(
         approver_role_ids,
         started_by,
         timeout_ms: Some(timeout_ms),
+        principal,
     };
 
     let futs: Vec<_> = known_surfaces
@@ -898,6 +910,92 @@ mod tests {
         );
     }
 
+    /// Track D hermeticity: `build_daemon` must never spawn a real extension
+    /// subprocess, even when an enabled extension-capable plugin is present
+    /// in the composed `Registries` — extension spawning happens ONLY from
+    /// the daemon's real entry point (`crates/runner/src/daemon_cmd.rs`, via
+    /// `ControlPlane::spawn_extensions`), mirroring
+    /// `run_startup_maintenance`'s own hermeticity discipline (see that
+    /// method's doc). `cargo test`'s `build_daemon` calls must stay safe to
+    /// run in parallel without ever touching a real process tree.
+    ///
+    /// Proven two ways: (1) a marker file the fake extension's shell command
+    /// would touch on spawn must remain absent; (2) the constructed
+    /// `ExtensionHost` itself must report no spawned entry for the plugin.
+    /// `#[serial]` because this test overrides `$HOME` (the only way to feed
+    /// an extension-capable plugin into `build_daemon`'s real
+    /// `load_skill_pack_plugins` composition step, since `BuildDaemonOpts`
+    /// has no plugin-injection seam) — see `plugins::extension::proc`'s own
+    /// `#[serial]` env-var test for the same reasoning.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn build_daemon_never_spawns_extension_subprocesses() {
+        let (_guard, db_path) = temp_db_path();
+        let fake_home = tempfile::tempdir().unwrap();
+        let plugin_dir = fake_home.path().join(".config/ryuzi/plugins/marker-ext");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let marker = fake_home.path().join("spawned.marker");
+        let manifest_toml = format!(
+            "contract = 1\nid = \"marker-ext\"\nname = \"Marker Extension\"\n\n\
+             [[extension]]\nname = \"marker\"\ncommand = \"sh\"\n\
+             args = [\"-c\", \"touch '{}'\"]\nevents = [\"tool.before\"]\n",
+            marker.display()
+        );
+        std::fs::write(plugin_dir.join("ryuzi-plugin.toml"), manifest_toml).unwrap();
+        std::fs::write(
+            plugin_dir.join(".ryuzi-skill.json"),
+            r#"{"source":"https://example.test/marker","plugin_id":"marker-ext","installed_at":"2026-07-11T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            // `set_setting_raw` (not `SettingsStore::set`, which validates
+            // the key against `PLUGIN_FIELDS` — not yet populated for
+            // "marker-ext" this early) — mirrors
+            // `plugins::extension::proc`'s own tests seeding a plugin's
+            // enable flag.
+            store
+                .set_setting_raw("plugin.marker-ext.enabled", "true")
+                .await
+                .unwrap();
+        }
+
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", fake_home.path());
+        let result = build_daemon(BuildDaemonOpts {
+            db_path: db_path.clone(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await;
+        match previous_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let daemon = result
+            .expect("build_daemon must succeed even with an extension-capable plugin present");
+        assert!(
+            daemon.cp.plugins().get("marker-ext").is_some(),
+            "sanity: the extension-capable skill-pack plugin must have registered"
+        );
+
+        // Give any hypothetical stray spawn a moment to touch the marker
+        // before asserting its absence.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !marker.exists(),
+            "build_daemon must stay hermetic: it must never spawn a real extension subprocess"
+        );
+        assert!(
+            daemon.cp.extension_host().get("marker-ext").await.is_empty(),
+            "the constructed ExtensionHost must have no spawned entry until spawn_extensions() runs"
+        );
+    }
+
     // ---------- (b)/(c)/(d) handle_approval unit tests ----------
 
     #[tokio::test]
@@ -916,7 +1014,21 @@ mod tests {
         let last_req = gw.last_req.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-1", "Bash", "ls -la").await;
+        let principal = Principal {
+            plugin_id: "acme-connector".into(),
+            plugin_name: "Acme Connector".into(),
+        };
+        handle_approval(
+            &cp,
+            &store,
+            &gateways,
+            "s1",
+            "req-1",
+            "Bash",
+            "ls -la",
+            Some(principal.clone()),
+        )
+        .await;
 
         let parsed = parse_telemetry_lines(&lines);
         assert!(
@@ -939,6 +1051,12 @@ mod tests {
         assert_eq!(captured.timeout_ms, Some(300_000)); // default
         assert_eq!(captured.tool, "Bash");
         assert_eq!(captured.summary, "ls -la");
+        assert_eq!(
+            captured.principal,
+            Some(principal),
+            "the principal handle_approval was called with must survive into the ApprovalRequest \
+             handed to the gateway — the spec→event→request round trip"
+        );
     }
 
     #[tokio::test]
@@ -956,7 +1074,7 @@ mod tests {
         let gw = FakeGateway::new("discord", GwBehavior::SleepThenAllow(2_000));
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-2", "Bash", "sleep").await;
+        handle_approval(&cp, &store, &gateways, "s1", "req-2", "Bash", "sleep", None).await;
 
         let parsed = parse_telemetry_lines(&lines);
         assert!(
@@ -979,7 +1097,7 @@ mod tests {
         let calls = gw.calls.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-3", "Bash", "ls").await;
+        handle_approval(&cp, &store, &gateways, "s1", "req-3", "Bash", "ls", None).await;
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1012,7 +1130,17 @@ mod tests {
         let allow_gw = FakeGateway::new("allow-gw", GwBehavior::SleepThenAllow(50));
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(err_gw), Arc::new(allow_gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-race-1", "Bash", "ls").await;
+        handle_approval(
+            &cp,
+            &store,
+            &gateways,
+            "s1",
+            "req-race-1",
+            "Bash",
+            "ls",
+            None,
+        )
+        .await;
 
         let parsed = parse_telemetry_lines(&lines);
         assert!(
@@ -1037,7 +1165,17 @@ mod tests {
         let gw2 = FakeGateway::new("err-gw-2", GwBehavior::ErrImmediately);
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw1), Arc::new(gw2)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-race-2", "Bash", "ls").await;
+        handle_approval(
+            &cp,
+            &store,
+            &gateways,
+            "s1",
+            "req-race-2",
+            "Bash",
+            "ls",
+            None,
+        )
+        .await;
 
         let parsed = parse_telemetry_lines(&lines);
         assert!(
@@ -1184,6 +1322,7 @@ mod tests {
                 summary: "ls -la".into(),
                 approval_kind: crate::domain::ApprovalKind::Tool,
                 input: serde_json::json!({}),
+                principal: None,
             });
             let rx = self.approvals.register(request_id);
             let allow = rx.await.map(|r| r.allowed()).unwrap_or(false);
@@ -1280,6 +1419,7 @@ mod tests {
                         &request_id,
                         &tool,
                         &summary,
+                        None,
                     )
                     .await;
                 }
@@ -1332,6 +1472,7 @@ mod tests {
                 summary: "review the proposed plan".into(),
                 approval_kind: crate::domain::ApprovalKind::Plan,
                 input: serde_json::json!({ "plan": "do X" }),
+                principal: None,
             });
             let decision = rx
                 .await

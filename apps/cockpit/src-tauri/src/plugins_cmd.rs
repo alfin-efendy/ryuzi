@@ -8,8 +8,9 @@
 //! `cancel_plugin_install`), the skill/plugin distribution surface
 //! (`begin_skill_install` / `confirm_skill_install` / `update_plugin` /
 //! `update_all_plugins` / `set_plugin_pin` / `plugin_doctor` /
-//! `plugins_restart_required`), and the remote catalog surface
-//! (`refresh_catalog` / `catalog_status`).
+//! `plugins_restart_required`), the remote catalog surface
+//! (`refresh_catalog` / `catalog_status`), and the extension (Track D "code
+//! plugin") observability surface (`extension_status`).
 //!
 //! Behavior change from the pre-daemon version: `begin_plugin_oauth` and
 //! `begin_plugin_install` no longer open the system browser directly — the
@@ -42,9 +43,9 @@ use tokio::sync::oneshot;
 // way.
 #[allow(unused_imports)]
 pub use ryuzi_core::api::types::{
-    CatalogStatus, DoctorFinding, PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo,
-    PluginInstallBeginResult, PluginMcpInfo, PluginOauthBeginResult, SkillInstallBegin,
-    TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
+    CatalogStatus, DoctorFinding, ExtensionStatusEntry, PluginAuthInfo, PluginDetail,
+    PluginFieldInfo, PluginInfo, PluginInstallBeginResult, PluginMcpInfo, PluginOauthBeginResult,
+    SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -529,4 +530,18 @@ pub async fn refresh_catalog(engine: Engine<'_>) -> R<CatalogStatus> {
 #[specta::specta]
 pub async fn catalog_status(engine: Engine<'_>) -> R<CatalogStatus> {
     engine.rpc("catalog_status", serde_json::json!({})).await
+}
+
+// ---------- Extension (Track D "code plugin") observability: DT8 ----------
+
+/// Per-extension live state (running/starting/restarting/failed/stopped/
+/// not-running), restart count, and sanitized last error — one entry per
+/// extension the daemon's `ExtensionHost` currently knows about, across
+/// every enabled extension-capable plugin. Read-only, never mutates state
+/// (no spawn/restart/shutdown). `PluginDetailView` calls this for an
+/// extension-capable plugin and filters the result down to its own `id`.
+#[tauri::command]
+#[specta::specta]
+pub async fn extension_status(engine: Engine<'_>) -> R<Vec<ExtensionStatusEntry>> {
+    engine.rpc("extension_status", serde_json::json!({})).await
 }

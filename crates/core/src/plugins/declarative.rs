@@ -9,11 +9,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ryuzi_plugin_sdk::subst::{resolve, Resolver};
-use ryuzi_plugin_sdk::{AuthKind, McpServerDef, McpTransportDef, PluginManifest};
+use ryuzi_plugin_sdk::{AuthKind, ExtensionDef, McpServerDef, McpTransportDef, PluginManifest};
 use serde::Deserialize;
 
 use crate::connector::{Connector, ConnectorCtx};
 use crate::domain::{McpServerSpec, McpTransport};
+use crate::harness::native::hooks::HookEvent;
+use crate::plugins::extension::{ExtensionCtx, ExtensionFactory, ExtensionSpec};
 use crate::plugins::oauth::{needs_refresh, PluginOauthToken};
 
 use super::host::{CorePlugin, PluginSource};
@@ -32,9 +34,9 @@ struct PluginOauthRefreshResponse {
 
 /// Build a `CorePlugin` from a manifest. Harness and gateway capability can
 /// never come from a manifest alone (those require Rust code — see
-/// `harness::native`, `plugins::builtin::discord_plugin`); the only
-/// capability a declarative plugin can carry is a connector, and only when
-/// `manifest.mcp` is non-empty.
+/// `harness::native`, `plugins::builtin::discord_plugin`); a declarative
+/// plugin can carry a connector (when `manifest.mcp` is non-empty) and/or an
+/// extension (when `manifest.extensions` is non-empty).
 pub fn declarative_plugin(
     manifest: PluginManifest,
     source: PluginSource,
@@ -47,11 +49,19 @@ pub fn declarative_plugin(
             manifest: manifest.clone(),
         }))
     };
+    let extension: Option<Arc<dyn ExtensionFactory>> = if manifest.extensions.is_empty() {
+        None
+    } else {
+        Some(Arc::new(DeclarativeExtension {
+            manifest: manifest.clone(),
+        }))
+    };
     Ok(CorePlugin {
         manifest,
         harness: None,
         gateway: None,
         connector,
+        extension,
         source,
     })
 }
@@ -380,6 +390,126 @@ impl DeclarativeConnector {
             (false, None) => anyhow::anyhow!("configure {id}: OAuth login required"),
         }
     }
+}
+
+/// An extension factory whose entire behavior is "substitute placeholders
+/// into this manifest's `[[extension]]` entries" — mirrors
+/// `DeclarativeConnector`, but for Track D's subprocess extension axis
+/// instead of MCP connectors.
+struct DeclarativeExtension {
+    manifest: PluginManifest,
+}
+
+#[async_trait]
+impl ExtensionFactory for DeclarativeExtension {
+    async fn extensions(&self, ctx: &ExtensionCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
+        let resolver = self.resolver(ctx).await?;
+        self.manifest
+            .extensions
+            .iter()
+            .map(|extension| build_extension_spec(extension, &resolver))
+            .collect()
+    }
+}
+
+impl DeclarativeExtension {
+    /// Resolve the manifest's `[auth]` value the same way
+    /// `DeclarativeConnector::resolve_auth` does — duplicated rather than
+    /// shared because the two live behind different `Ctx` shapes
+    /// (`ConnectorCtx` carries `project_id`/`work_dir`; `ExtensionCtx`
+    /// deliberately does not — see its doc).
+    async fn resolve_auth(&self, ctx: &ExtensionCtx) -> anyhow::Result<Option<String>> {
+        let Some(auth) = &self.manifest.auth else {
+            return Ok(None);
+        };
+        if let Some(key) = &auth.setting {
+            if let Some(v) = ctx.settings.get(key).await? {
+                if !v.is_empty() {
+                    return Ok(Some(v));
+                }
+            }
+        }
+        if let Some(var) = &auth.env {
+            if let Ok(v) = std::env::var(var) {
+                if !v.is_empty() {
+                    return Ok(Some(v));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Build the (sync) `Resolver` backing placeholder substitution — same
+    /// pre-fetch-then-resolve-synchronously shape as
+    /// `DeclarativeConnector::resolver` (see its doc). `oauth_bearer_token`
+    /// is always `None`: HTTP-OAuth bearer injection is an MCP HTTP
+    /// transport concern (`${auth}` substitution alone covers everything an
+    /// extension's `command`/`args` can reference).
+    async fn resolver(&self, ctx: &ExtensionCtx) -> anyhow::Result<PreloadedResolver> {
+        let auth = self.resolve_auth(ctx).await?;
+        let mut settings = HashMap::new();
+        for key in extension_setting_keys(&self.manifest.extensions) {
+            if let Some(v) = ctx.settings.get(&key).await? {
+                settings.insert(key, v);
+            }
+        }
+        Ok(PreloadedResolver {
+            auth,
+            oauth_bearer_token: None,
+            settings,
+        })
+    }
+}
+
+/// Every distinct `${setting:KEY}` key referenced in any extension's
+/// `command` or `args` (mirrors `setting_keys`, the `[[mcp]]` equivalent).
+fn extension_setting_keys(extensions: &[ExtensionDef]) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for extension in extensions {
+        for s in std::iter::once(&extension.command).chain(extension.args.iter()) {
+            collect_setting_keys(s, &mut keys);
+        }
+    }
+    keys
+}
+
+/// Map one `ExtensionDef` to its resolved `ExtensionSpec`, substituting
+/// placeholders into `command`/`args` and parsing `events` into `HookEvent`s
+/// (already validated against the known vocabulary by
+/// `PluginManifest::validate`, so `HookEvent::from_str` cannot fail here in
+/// practice — a mismatch would mean the SDK's `KNOWN_HOOK_EVENTS` and
+/// `HookEvent::as_str` have drifted, which `hooks.rs`'s own vocabulary-sync
+/// test guards against).
+fn build_extension_spec(
+    extension: &ExtensionDef,
+    resolver: &PreloadedResolver,
+) -> anyhow::Result<ExtensionSpec> {
+    let command = resolve(&extension.command, resolver)?;
+    let args = extension
+        .args
+        .iter()
+        .map(|a| resolve(a, resolver))
+        .collect::<Result<Vec<_>, _>>()?;
+    let events = extension
+        .events
+        .iter()
+        .map(|e| {
+            e.parse::<HookEvent>()
+                .map_err(|err| anyhow::anyhow!("extension \"{}\": {err}", extension.name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let timeout_ms = extension
+        .timeout_ms
+        .unwrap_or(crate::plugins::extension::DEFAULT_EVENT_TIMEOUT_MS);
+    Ok(ExtensionSpec {
+        name: extension.name.clone(),
+        command,
+        args,
+        events,
+        provides_tools: extension.provides_tools,
+        timeout: std::time::Duration::from_millis(timeout_ms),
+        env: Vec::new(),
+    })
 }
 
 fn is_terminal_oauth_refresh_error(body: &str) -> bool {
@@ -1219,6 +1349,103 @@ name = "Meta Only"
         assert!(plugin.connector.is_none());
         assert!(plugin.harness.is_none());
         assert!(plugin.gateway.is_none());
+        assert!(plugin.extension.is_none());
+    }
+
+    // ---------- DeclarativeExtension (Track D, Slice DT3) ----------
+
+    fn ext_ctx(settings: SettingsStore) -> crate::plugins::extension::ExtensionCtx {
+        crate::plugins::extension::ExtensionCtx { settings }
+    }
+
+    const LINTER_EXTENSION_MANIFEST: &str = r#"
+contract = 1
+id = "acme-linter"
+name = "Acme Linter"
+
+[auth]
+kind = "token"
+setting = "plugin.acme-linter.token"
+
+[[extension]]
+name = "my-linter"
+command = "my-linter-ext"
+args = ["--serve", "--token=${auth}", "--host=${setting:plugin.acme-linter.host}"]
+events = ["tool.before", "tool.after"]
+provides_tools = true
+timeout_ms = 9000
+"#;
+
+    #[tokio::test]
+    async fn extensions_resolves_auth_and_setting_placeholders_in_args() {
+        let (store, settings, _tmp) = open_settings().await;
+        store
+            .set_setting_raw("plugin.acme-linter.token", "secret-tok")
+            .await
+            .unwrap();
+        store
+            .set_setting_raw("plugin.acme-linter.host", "acme.example.com")
+            .await
+            .unwrap();
+
+        let manifest = PluginManifest::from_toml(LINTER_EXTENSION_MANIFEST).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let factory = plugin
+            .extension
+            .clone()
+            .expect("an extension-bearing manifest gets an extension factory");
+
+        let specs = factory.extensions(&ext_ctx(settings)).await.unwrap();
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert_eq!(spec.name, "my-linter");
+        assert_eq!(spec.command, "my-linter-ext");
+        assert_eq!(
+            spec.args,
+            vec![
+                "--serve".to_string(),
+                "--token=secret-tok".to_string(),
+                "--host=acme.example.com".to_string(),
+            ]
+        );
+        assert_eq!(
+            spec.events,
+            vec![
+                crate::harness::native::hooks::HookEvent::ToolBefore,
+                crate::harness::native::hooks::HookEvent::ToolAfter,
+            ]
+        );
+        assert!(spec.provides_tools);
+        assert_eq!(spec.timeout, std::time::Duration::from_millis(9000));
+        assert!(
+            spec.env.is_empty(),
+            "the SDK's ExtensionDef has no env table yet — env must stay empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn extensions_default_timeout_when_manifest_omits_timeout_ms() {
+        let (_store, settings, _tmp) = open_settings().await;
+        let toml_str = r#"
+contract = 1
+id = "acme-bare"
+name = "Acme Bare"
+
+[[extension]]
+name = "bare"
+command = "bare-ext"
+"#;
+        let manifest = PluginManifest::from_toml(toml_str).unwrap();
+        let plugin = declarative_plugin(manifest, PluginSource::Catalog).unwrap();
+        let factory = plugin.extension.clone().unwrap();
+
+        let specs = factory.extensions(&ext_ctx(settings)).await.unwrap();
+        assert_eq!(
+            specs[0].timeout,
+            std::time::Duration::from_millis(crate::plugins::extension::DEFAULT_EVENT_TIMEOUT_MS)
+        );
+        assert!(specs[0].events.is_empty());
+        assert!(!specs[0].provides_tools);
     }
 
     #[test]
@@ -1235,11 +1462,13 @@ name = "Meta Only"
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         };
