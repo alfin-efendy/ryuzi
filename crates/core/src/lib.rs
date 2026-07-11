@@ -29,6 +29,7 @@ pub mod scheduler;
 pub mod serve;
 pub mod settings;
 pub mod skills_install;
+pub mod stdio_jsonrpc;
 pub mod store;
 pub mod telemetry;
 pub mod update;
