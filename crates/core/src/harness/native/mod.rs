@@ -370,6 +370,7 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
         ))),
         gateway: None,
         connector: None,
+        extension: None,
         source: PluginSource::Builtin,
     }
 }

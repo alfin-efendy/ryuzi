@@ -362,6 +362,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(NoopConnector)),
+            extension: None,
             source: PluginSource::Builtin,
         });
         ControlPlane::new(store, regs).await

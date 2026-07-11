@@ -107,6 +107,7 @@ fn provider_plugin(d: &ProviderDescriptor) -> CorePlugin {
         harness: None,
         gateway: None,
         connector: None,
+        extension: None,
         source: PluginSource::Builtin,
     }
 }

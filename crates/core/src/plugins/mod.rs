@@ -24,6 +24,7 @@ pub mod catalog;
 pub mod catalog_feed_key;
 pub mod declarative;
 pub mod doctor;
+pub mod extension;
 pub mod host;
 pub mod oauth;
 pub mod providers;
@@ -33,6 +34,9 @@ use crate::settings::{csv, SettingsStore};
 use crate::store::Store;
 
 pub use doctor::{plugin_doctor, DoctorFinding};
+pub use extension::{
+    ExtensionCtx, ExtensionFactory, ExtensionHost, ExtensionProc, ExtensionSpec, ExtensionStatus,
+};
 pub use host::{plugin_field, plugin_fields_all, CorePlugin, PluginHost, PluginSource, Registries};
 
 /// Add every generated manifest-only builtin — every model provider
@@ -438,6 +442,7 @@ mod toggle_enabled_tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -448,6 +453,7 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -458,6 +464,7 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -468,6 +475,7 @@ mod toggle_enabled_tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::Builtin,
         }
     }

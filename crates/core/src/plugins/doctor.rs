@@ -191,6 +191,7 @@ pub(crate) mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: crate::plugins::PluginSource::Builtin,
         }
     }

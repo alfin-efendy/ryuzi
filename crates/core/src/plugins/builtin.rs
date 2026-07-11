@@ -69,6 +69,7 @@ pub fn discord_plugin() -> CorePlugin {
         harness: None,
         gateway,
         connector: None,
+        extension: None,
         source: PluginSource::Builtin,
     }
 }

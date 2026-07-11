@@ -48,6 +48,26 @@ impl HookEvent {
     ];
 }
 
+impl std::str::FromStr for HookEvent {
+    type Err = String;
+
+    /// The inverse of [`HookEvent::as_str`] — used by Track D's declarative
+    /// extension binding (`plugins::extension`) to turn a manifest's
+    /// already-`validate()`d `events: Vec<String>` into typed `HookEvent`s.
+    /// `PluginManifest::validate` already rejects any string outside
+    /// `ryuzi_plugin_sdk::KNOWN_HOOK_EVENTS` (kept in sync with `as_str` by
+    /// `hook_event_vocabulary_matches_the_sdk_known_events`, below), so this
+    /// only errors on a value that bypassed validation (e.g. a hand-built
+    /// `ExtensionDef` in a test).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        HookEvent::ALL
+            .iter()
+            .find(|event| event.as_str() == s)
+            .copied()
+            .ok_or_else(|| format!("unknown hook event: {s}"))
+    }
+}
+
 /// The outcome of running an event's hooks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookResult {
@@ -223,5 +243,17 @@ mod tests {
         assert!(HookEvent::ToolBefore.is_gating());
         assert!(!HookEvent::ToolAfter.is_gating());
         assert!(!HookEvent::SessionEnd.is_gating());
+    }
+
+    #[test]
+    fn hook_event_from_str_round_trips_every_variant() {
+        for event in HookEvent::ALL {
+            assert_eq!(event.as_str().parse::<HookEvent>(), Ok(*event));
+        }
+    }
+
+    #[test]
+    fn hook_event_from_str_rejects_an_unknown_string() {
+        assert!("tool.beforee".parse::<HookEvent>().is_err());
     }
 }

@@ -1,6 +1,6 @@
 //! `CorePlugin`/`PluginHost`: binds a `PluginManifest` to the runtime
 //! capabilities it provides, and `Registries`, the composition root for all
-//! three extension axes plus the plugin host itself.
+//! four extension axes plus the plugin host itself.
 //!
 //! This replaces the old `Integration` trait (`crate::integration`, deleted).
 //! Previously a host object implemented `Integration` and answered
@@ -32,6 +32,7 @@ use ryuzi_plugin_sdk::{FieldKind, PluginManifest, SettingField};
 use crate::connector::{Connector, ConnectorRegistry};
 use crate::gateway::{GatewayFactory, GatewayRegistry};
 use crate::harness::HarnessFactory;
+use crate::plugins::extension::ExtensionFactory;
 use crate::settings::{csv, SettingsStore};
 
 /// Process-wide registry of every `plugin.*` settings key any installed
@@ -158,11 +159,18 @@ pub struct CorePlugin {
     pub harness: Option<Arc<dyn HarnessFactory>>,
     pub gateway: Option<Arc<dyn GatewayFactory>>,
     pub connector: Option<Arc<dyn Connector>>,
+    /// Supervised subprocess "code plugin" capability (Track D). Mirrors
+    /// `connector` in every way that matters here: a live instance (not a
+    /// factory-by-config), gated by [`PluginHost::is_enabled`] the same way,
+    /// and — like `connector` — deliberately NOT fanned into a registry by
+    /// [`Registries::add_plugin`]; it is consumed directly from the host
+    /// (`plugins::extension::ExtensionHost::spawn_all`).
+    pub extension: Option<Arc<dyn ExtensionFactory>>,
     pub source: PluginSource,
 }
 
 impl CorePlugin {
-    /// Which of the four extension axes this plugin advertises. `runtime`
+    /// Which of the five extension axes this plugin advertises. `runtime`
     /// means a live `HarnessFactory` (the native runtime).
     ///
     /// Single source of truth for `ryuzi_core::serve`'s `GET /plugins`
@@ -182,6 +190,9 @@ impl CorePlugin {
         }
         if self.connector.is_some() {
             caps.push("connector");
+        }
+        if self.extension.is_some() {
+            caps.push("extension");
         }
         caps
     }
@@ -289,10 +300,10 @@ impl PluginHost {
     ///   disabled)
     /// - gateway-capable → the `enabled_gateways` CSV setting contains `id`
     /// - experimental → always `false` (see below)
-    /// - manifest-only (no harness/gateway/connector capability) → always
-    ///   `true`
-    /// - connector-only → the setting `plugin.<id>.enabled == "true"`
-    ///   (defaults to `false`)
+    /// - manifest-only (no harness/gateway/connector/extension capability)
+    ///   → always `true`
+    /// - connector- and/or extension-capable → the setting
+    ///   `plugin.<id>.enabled == "true"` (defaults to `false`)
     pub async fn is_enabled(&self, settings: &SettingsStore, id: &str) -> anyhow::Result<bool> {
         let Some(plugin) = self.get(id) else {
             return Ok(false);
@@ -307,15 +318,15 @@ impl PluginHost {
         }
         if plugin.manifest.experimental {
             // Experimental catalog entries (ngrok/zep/vercel-sandbox) are
-            // docs-only: no harness/gateway/connector capability backs them,
-            // so there is nothing to actually enable. Report disabled
-            // unconditionally — this wins over the manifest-only fallback
-            // below even if a stray `plugin.<id>.enabled = true` setting
-            // exists. Real capabilities (providers) always hardcode
+            // docs-only: no harness/gateway/connector/extension capability
+            // backs them, so there is nothing to actually enable. Report
+            // disabled unconditionally — this wins over the manifest-only
+            // fallback below even if a stray `plugin.<id>.enabled = true`
+            // setting exists. Real capabilities (providers) always hardcode
             // `experimental = false`, so this never affects them.
             return Ok(false);
         }
-        if plugin.connector.is_none() {
+        if plugin.connector.is_none() && plugin.extension.is_none() {
             // Manifest-only plugin (e.g. a provider metadata entry
             // with no behavioral capability of its own) — always enabled.
             return Ok(true);
@@ -521,6 +532,7 @@ mod tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -531,6 +543,7 @@ mod tests {
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -541,6 +554,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -551,6 +565,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -564,6 +579,29 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
+            source: PluginSource::Builtin,
+        }
+    }
+
+    struct FakeExtensionFactory;
+    #[async_trait]
+    impl crate::plugins::extension::ExtensionFactory for FakeExtensionFactory {
+        async fn extensions(
+            &self,
+            _ctx: &crate::plugins::extension::ExtensionCtx,
+        ) -> anyhow::Result<Vec<crate::plugins::extension::ExtensionSpec>> {
+            Ok(vec![])
+        }
+    }
+
+    fn extension_only(id: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: manifest(id),
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: Some(Arc::new(FakeExtensionFactory)),
             source: PluginSource::Builtin,
         }
     }
@@ -803,6 +841,30 @@ mod tests {
         assert!(host.is_enabled(&settings, "github").await.unwrap());
     }
 
+    #[tokio::test]
+    async fn is_enabled_extension_only_plugin_defaults_false_until_setting_flips_true() {
+        let (store, settings, _tmp) = open_settings().await;
+        let mut host = PluginHost::new();
+        host.add(extension_only("acme-ext"));
+
+        assert!(
+            !host.is_enabled(&settings, "acme-ext").await.unwrap(),
+            "an extension-capable plugin (like a connector-capable one) must default to disabled"
+        );
+
+        store
+            .set_setting_raw("plugin.acme-ext.enabled", "true")
+            .await
+            .unwrap();
+        assert!(host.is_enabled(&settings, "acme-ext").await.unwrap());
+    }
+
+    #[test]
+    fn capabilities_reports_extension_when_the_axis_is_present() {
+        let plugin = extension_only("acme-ext");
+        assert_eq!(plugin.capabilities(), vec!["extension"]);
+    }
+
     // ---------- PluginHost::enabled_skill_dirs ----------
 
     #[tokio::test]
@@ -824,6 +886,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::SkillPack(base.path().to_path_buf()),
         };
         let mut host = PluginHost::new();
@@ -860,6 +923,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::SkillPack(base.path().to_path_buf()),
         });
         store
@@ -885,6 +949,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         });
 
@@ -919,6 +984,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::SkillPack(plugin_base.path().to_path_buf()),
         };
 
