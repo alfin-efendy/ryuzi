@@ -475,22 +475,32 @@ async fn save_runner(
 /// A paired remote runner row with its device token DECRYPTED. This is the
 /// wire shape of the backend-only `list_runner_credentials` RPC method.
 ///
-/// SECURITY: this method exists on the local engine's `/rpc/*` surface (the
-/// same bearer-`control_token`-gated loopback HTTP API every other RPC
-/// method uses), but — unlike every other gateways method — is deliberately
-/// NOT also wrapped by a Cockpit `#[tauri::command]` in
-/// `apps/cockpit/src-tauri/src/gateways_cmd.rs`, nor listed in `lib.rs`'s
-/// `collect_commands!`. Tauri only exposes a method to the webview's
-/// `invoke()` if it is a `#[tauri::command]` registered in
+/// SECURITY: this method exists on the local engine's `/rpc/*` surface,
+/// which `crate::serve::require_token`'s two-tier auth accepts a valid
+/// DEVICE token for from ANY peer — NOT loopback-only (only the daemon's own
+/// `control_token` is loopback-gated). On an engine bound non-loopback (a
+/// standalone runner with `listen_addr` set, or a hub's `ryuzi serve`), any
+/// device-token holder could otherwise call this and exfiltrate every paired
+/// runner's plaintext bearer token. `crate::serve::LOOPBACK_ONLY_METHODS`
+/// closes that gap by rejecting this method's name specifically for any
+/// non-loopback peer, enforced in `crate::serve::rpc` BEFORE `dispatch` (see
+/// `crate::serve::method_allowed_for_peer`) — so the invariant holds
+/// regardless of how any given daemon is bound, not just for Cockpit's
+/// always-loopback caller. Additionally — unlike every other gateways
+/// method — this one is deliberately NOT also wrapped by a Cockpit
+/// `#[tauri::command]` in `apps/cockpit/src-tauri/src/gateways_cmd.rs`, nor
+/// listed in `lib.rs`'s `collect_commands!`. Tauri only exposes a method to
+/// the webview's `invoke()` if it is a `#[tauri::command]` registered in
 /// `collect_commands!` — a plain RPC method with neither is simply
 /// unreachable from JS. The ONLY caller is
 /// `apps/cockpit/src-tauri/src/engine_manager.rs`'s
 /// `EngineManager::load_remotes`, which calls it directly via
-/// `EngineClient::rpc` from backend Rust code and uses the decrypted
-/// `device_token` solely to build a pinned `EngineClient` (its
-/// `Authorization` bearer header) — the token is never placed on an emitted
-/// Tauri event or returned by a `#[tauri::command]`. Do not add such a
-/// command; that would defeat this invariant.
+/// `EngineClient::rpc` from backend Rust code (always over loopback to its
+/// own local engine) and uses the decrypted `device_token` solely to build a
+/// pinned `EngineClient` (its `Authorization` bearer header) — the token is
+/// never placed on an emitted Tauri event or returned by a
+/// `#[tauri::command]`. Do not add such a command; that would defeat this
+/// invariant.
 #[derive(Debug, Clone, serde::Serialize)]
 struct RunnerCredentialInfo {
     id: String,
@@ -512,7 +522,23 @@ async fn list_runner_credentials(cp: &ControlPlane) -> anyhow::Result<Vec<Runner
         else {
             continue;
         };
-        let device_token = crate::llm_router::secrets::decrypt_field(&enc_token)?;
+        // A single corrupt/undecryptable token (tampered row, wrong/rotated
+        // keychain key, truncated blob, ...) must not fail the WHOLE call —
+        // that would block `EngineManager::load_remotes` from bridging every
+        // OTHER, perfectly healthy runner just because one row is bad. Log
+        // and skip the offending row instead, same as the missing-field
+        // `continue` above.
+        let device_token = match crate::llm_router::secrets::decrypt_field(&enc_token) {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!(
+                    runner_id = %row.id,
+                    error = %e,
+                    "list_runner_credentials: skipping runner with an undecryptable device token"
+                );
+                continue;
+            }
+        };
         out.push(RunnerCredentialInfo {
             id: row.id,
             name: row.name,
@@ -718,5 +744,51 @@ mod tests {
             remote.get("device_token").is_none(),
             "list_gateways must not expose device_token: {remote:?}"
         );
+    }
+
+    /// A single corrupt/undecryptable `device_token` on one `remote` row
+    /// must not fail the whole call — it should be logged and skipped, same
+    /// as the existing "missing host/port/fingerprint/token" `continue`
+    /// above it in the loop, so one bad row doesn't block every OTHER
+    /// runner from loading (see `EngineManager::load_remotes`, the only
+    /// caller). `"enc:AAAA"` decodes to a 3-byte blob — always shorter than
+    /// the 24-byte nonce `SecretCipher::decrypt` requires — so this fails
+    /// deterministically regardless of whether the test keychain yields a
+    /// real key or the headless-CI pass-through fallback.
+    #[tokio::test]
+    async fn list_runner_credentials_skips_a_row_with_a_corrupt_token() {
+        let s = state().await;
+        let good = save_a_runner(&s).await;
+        let good_id = find_remote(&good)["id"].as_str().unwrap().to_string();
+
+        gateways::upsert_row(
+            s.cp.store(),
+            gateways::GatewayRow {
+                id: "remote-corrupt".to_string(),
+                name: "bad-box".to_string(),
+                kind: "remote".to_string(),
+                host: Some("10.0.0.10".to_string()),
+                port: Some(7443),
+                username: None,
+                fs_mode: "projects".to_string(),
+                paths: vec![],
+                fingerprint: Some("otherfingerprint==".to_string()),
+                device_token: Some("enc:AAAA".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let creds = dispatch(&s, "list_runner_credentials", json!({}))
+            .await
+            .expect("a single corrupt row must not fail the whole call");
+        let creds = creds.as_array().unwrap();
+        assert_eq!(
+            creds.len(),
+            1,
+            "the corrupt row must be skipped, not returned: {creds:?}"
+        );
+        assert_eq!(creds[0]["id"], good_id);
+        assert_eq!(creds[0]["device_token"], "plaintext-device-token");
     }
 }

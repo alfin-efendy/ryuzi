@@ -418,15 +418,51 @@ async fn get_plugin(State(state): State<ApiState>, Path(id): Path<String>) -> im
     Json(value).into_response()
 }
 
+/// RPC methods that must never be reachable from a non-loopback peer, even
+/// with a valid device token. Currently just `list_runner_credentials`
+/// (`crate::api::gateways_api`), which returns every paired remote runner's
+/// device token DECRYPTED. `require_token`'s two-tier auth accepts a device
+/// token from ANY peer — only the daemon's own `control_token` is
+/// loopback-gated — so without this extra check, any device-token holder
+/// reachable over the network (e.g. a peer that only has ONE runner's token)
+/// could call this method on an engine bound non-loopback (a standalone
+/// runner with `listen_addr` set, or a hub's `ryuzi serve`) and exfiltrate
+/// the plaintext bearer tokens of every other paired runner. See
+/// [`method_allowed_for_peer`] for the enforcement point.
+const LOOPBACK_ONLY_METHODS: &[&str] = &["list_runner_credentials"];
+
+/// Pure decision behind the loopback gate on `POST /rpc/{method}`, factored
+/// out of [`rpc`] so the "loopback-only method from a non-loopback peer must
+/// be rejected" branch is unit-testable without standing up a real
+/// non-loopback socket (test servers only ever bind loopback) — same
+/// rationale as [`authorize`]. `true` means the call may proceed to
+/// `crate::api::dispatch`; methods not in [`LOOPBACK_ONLY_METHODS`] are
+/// always allowed, from any peer.
+fn method_allowed_for_peer(method: &str, peer_is_loopback: bool) -> bool {
+    peer_is_loopback || !LOOPBACK_ONLY_METHODS.contains(&method)
+}
+
 /// `POST /rpc/{method}` — the generic RPC entry point. `method` is a Rust
 /// snake_case command name (see `crate::api::dispatch`); the request body is
 /// that command's params object. Errors from `dispatch` are surfaced with
 /// the `ApiError`'s own status code, not always 500.
+///
+/// Before dispatching, [`method_allowed_for_peer`] enforces
+/// [`LOOPBACK_ONLY_METHODS`] using the same `ConnectInfo<SocketAddr>` peer
+/// address `require_token` reads. A disallowed call gets the same 404 shape
+/// `dispatch` returns for a genuinely unknown method name (see
+/// `ApiError::not_found` in `crate::api`) — so a non-loopback caller can't
+/// distinguish "this method doesn't exist" from "this method exists but you
+/// can't call it from here".
 async fn rpc(
     State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(method): Path<String>,
     Json(params): Json<Value>,
 ) -> impl IntoResponse {
+    if !method_allowed_for_peer(&method, peer.ip().is_loopback()) {
+        return rpc_unknown_method(&method);
+    }
     match crate::api::dispatch(&state, &method, params).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => (
@@ -436,6 +472,18 @@ async fn rpc(
         )
             .into_response(),
     }
+}
+
+/// Same 404 body `crate::api::dispatch` returns for `unknown method: {name}`
+/// — used both by that path (indirectly, via `dispatch`'s own `ApiError`)
+/// and directly by [`rpc`]'s loopback gate, so the two are indistinguishable
+/// to the caller.
+fn rpc_unknown_method(method: &str) -> axum::response::Response {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({ "error": format!("unknown method: {method}") })),
+    )
+        .into_response()
 }
 
 /// `POST /approvals/{request_id}` — resolve a pending tool-permission
@@ -1051,5 +1099,94 @@ mod tests {
 
         // A new window: the budget is back.
         assert!(limiter.allow(start + PAIR_RATE_WINDOW_MS));
+    }
+
+    // ---- Security fix: loopback-gate list_runner_credentials ----
+
+    #[test]
+    fn method_allowed_for_peer_gates_only_the_listed_methods() {
+        // The gated method: allowed only from loopback.
+        assert!(!method_allowed_for_peer("list_runner_credentials", false));
+        assert!(method_allowed_for_peer("list_runner_credentials", true));
+        // An ordinary method: allowed from anywhere, loopback or not.
+        assert!(method_allowed_for_peer("list_gateways", false));
+        assert!(method_allowed_for_peer("list_gateways", true));
+    }
+
+    /// `rpc`'s loopback gate, exercised against the real handler function
+    /// (not just the pure `method_allowed_for_peer` helper above) by
+    /// constructing its extractors directly with a non-loopback
+    /// `ConnectInfo` — a real non-loopback TCP peer can't be produced
+    /// against a `serve()`-bound test server, which only ever binds
+    /// loopback (see `authorize`'s tests for the same constraint), so this
+    /// calls `rpc` the same way axum's routing would, minus the socket.
+    /// Asserts the exact 404 body `crate::api::dispatch` would return for a
+    /// method that doesn't exist at all, so a non-loopback caller can't
+    /// distinguish "gated" from "unknown".
+    #[tokio::test]
+    async fn rpc_rejects_list_runner_credentials_from_a_non_loopback_peer() {
+        let state = test_state().await;
+        let non_loopback = SocketAddr::from(([203, 0, 113, 5], 12345));
+
+        let resp = rpc(
+            State(state),
+            ConnectInfo(non_loopback),
+            Path("list_runner_credentials".to_string()),
+            Json(json!({})),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "unknown method: list_runner_credentials");
+    }
+
+    /// The SAME non-loopback peer calling an ungated method must still reach
+    /// `dispatch` normally — the gate only touches
+    /// `LOOPBACK_ONLY_METHODS`, nothing else about `rpc`'s behavior.
+    #[tokio::test]
+    async fn rpc_allows_an_ungated_method_from_a_non_loopback_peer() {
+        let state = test_state().await;
+        let non_loopback = SocketAddr::from(([203, 0, 113, 5], 12345));
+
+        let resp = rpc(
+            State(state),
+            ConnectInfo(non_loopback),
+            Path("list_gateways".to_string()),
+            Json(json!({})),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// `list_runner_credentials` from a loopback peer is let through to
+    /// `dispatch` — driven through the REAL HTTP stack this time (`serve()`
+    /// + `reqwest`, both loopback), so this also exercises the genuine
+    /// `into_make_service_with_connect_info` wiring the direct-handler-call
+    /// tests above bypass. No runners are saved, so `dispatch` returns an
+    /// empty list rather than erroring.
+    #[tokio::test]
+    async fn rpc_allows_list_runner_credentials_from_a_loopback_peer() {
+        let state = test_state().await;
+        let port = serve(state, opts(0)).await.unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{port}/rpc/list_runner_credentials"
+            ))
+            .bearer_auth(TEST_CONTROL_TOKEN)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body, json!([]));
     }
 }
